@@ -1,0 +1,33 @@
+/*
+ * 12px box, per the mock. The glyph is drawn at 10px so the tick sits inside the border
+ * rather than touching it; `line-height: 1` because the UI font's default leading would
+ * push the tick a pixel low and make a column of them look ragged.
+ */
+.box {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--bg);
+  font-size: 10px;
+  line-height: 1;
+}
+
+/*
+ * Set boxes are `--accent` filled, with the glyph in `--bg`.
+ *
+ * `--bg` rather than a fixed white: the accent is a light orange in the dark theme and a
+ * darker one in the light theme, so a fixed foreground would fail contrast in one of them.
+ * The app's own ground inverts in exactly the right direction, which is also what the
+ * primary Commit button does with the same pair.
+ */
+.box[data-state='checked'],
+.box[data-state='partial'] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
