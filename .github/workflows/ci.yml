@@ -32,13 +32,14 @@ jobs:
   # ---------------------------------------------------------------------------------
   # The structural invariant, on its own so it answers in seconds.
   #
-  # `cide-headless` renders a live session from the vt100 mirror with zero Tauri linked;
-  # it is the standing proof that the domain core is frontend-free. If domain logic leaks
-  # into the app crate, or a core crate grows a tauri dependency to reach for an app
-  # handle, this is what says so.
+  # The rule is "only cide-app may depend on tauri", so the check is every workspace
+  # member except cide-app — not just cide-headless. Checking cide-headless alone reaches
+  # cide-core, cide-ipc and cide-pty and nothing else: cide-git, cide-fs, cide-search,
+  # cide-claude, cide-hook, cide-ide-mcp and xtask are outside its graph entirely, and a
+  # tauri dependency added to any of them would have passed that check green.
   # ---------------------------------------------------------------------------------
-  no-tauri-in-core:
-    name: cide-headless links no tauri
+  no-tauri-outside-app:
+    name: only cide-app links tauri
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -49,19 +50,65 @@ jobs:
         with:
           cache: "false"
 
-      - name: Assert cide-headless does not link tauri
+      - name: Assert only cide-app links tauri
         run: |
           set -euo pipefail
-          # dev edges included on purpose: a tauri dev-dependency would still mean the
-          # crate's tests can only run with the webview stack present, which is the thing
-          # this invariant exists to prevent.
-          tree="$(cargo tree -p cide-headless --edges normal,build,dev)"
-          echo "$tree"
-          if grep -qi 'tauri' <<<"$tree"; then
-            echo "::error file=crates/cide-headless/Cargo.toml::cide-headless has acquired a tauri dependency. Only cide-app may depend on tauri — the offending edge is in the tree above. Move the logic into a domain crate instead of reaching for an app handle."
+
+          # Crate names only. `--prefix none` drops the tree glyphs and awk keeps the name
+          # field, so the pattern never sees the checkout path — the earlier version of
+          # this job grepped the raw tree, which also contains every crate's directory, and
+          # a clone into a path with "tauri" in it would have failed the whole workspace.
+          # --no-dedupe because a deduplicated tree prints "(*)" in place of a repeated
+          # subtree, and the elided listing can be the one that names tauri.
+          # dev edges are included on purpose: a tauri dev-dependency still means the
+          # crate's tests only run where the webview stack is installed.
+          #
+          # `cargo tree` runs on its own line, not as the head of the piped grep: the
+          # trailing `|| true` (there so "no match" is not a failure) would otherwise also
+          # swallow a cargo that failed outright — a stale Cargo.lock under --locked, a
+          # renamed package — and hand back an empty result that reads as "clean".
+          webview_deps() {
+            local tree
+            tree="$(cargo tree --locked -p "$1" --edges normal,build,dev --prefix none --no-dedupe)"
+            awk '{print $1}' <<<"$tree" | sort -u | grep -E '^(tauri|wry|tao)(-|$)' || true
+          }
+
+          # Positive control, and the reason this job is not vacuous. Every assertion below
+          # is a grep for something that must NOT be there, so a detector that has quietly
+          # stopped detecting — a cargo tree flag that changed meaning, an output shape that
+          # no longer parses — reports every crate as clean and goes green forever. cide-app
+          # is the one crate that MUST match. If it does not, the detector is broken, and
+          # that is a failure rather than a pass.
+          if [ -z "$(webview_deps cide-app)" ]; then
+            echo '::error file=.github/workflows/ci.yml::the webview detector matched nothing in cide-app, the one crate that links tauri by definition. cargo tree output no longer parses this way, so every other crate would come back clean and this job would assert nothing. Fix the detector before trusting a green run.'
             exit 1
           fi
-          echo "ok: no tauri anywhere in the cide-headless graph"
+
+          # Enumerated from cargo metadata rather than listed here, for the same reason the
+          # ui job enumerates its check:* scripts: a hardcoded list stops covering a crate
+          # the moment someone adds one, and does it silently.
+          members="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,os,sys; md=json.load(sys.stdin); print("\n".join(p["name"] + " " + os.path.relpath(p["manifest_path"], md["workspace_root"]) for p in md["packages"]))')"
+
+          checked=0
+          violations=""
+          while read -r name manifest; do
+            [ -n "$name" ] || continue
+            if [ "$name" = cide-app ]; then
+              continue
+            fi
+            checked=$((checked + 1))
+            found="$(webview_deps "$name")"
+            if [ -n "$found" ]; then
+              violations="$violations $name"
+              echo "::error file=$manifest::$name pulls in the webview stack: $(tr '\n' ' ' <<<"$found")"
+            fi
+          done <<<"$members"
+
+          if [ -n "$violations" ]; then
+            echo "::error::Only cide-app may depend on tauri. Offenders:$violations. Move the logic into a domain crate instead of reaching for an app handle."
+            exit 1
+          fi
+          echo "ok: $checked workspace members checked, tauri confined to cide-app"
 
   # ---------------------------------------------------------------------------------
   # Rust: build, test, lint, format, and the two xtask gates.
@@ -104,40 +151,54 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
+      # `--locked` on every cargo invocation below, for the reason `--frozen-lockfile` is
+      # on the pnpm install: without it a Cargo.toml requirement that never reached
+      # Cargo.lock is not an error, it is a silent re-resolution, and CI reports green for
+      # a dependency graph no developer has. This is the same drift class the whole file
+      # exists to catch, and the frontend half was already guarded against it.
+      #
+      # `cargo --locked xtask ...` rather than `cargo xtask --locked ...`: xtask is a cargo
+      # alias for `run --quiet --package xtask --`, so a flag after `xtask` is an argument
+      # to the xtask binary. The global flag has to lead.
+      #
       # `contract-check` only parses crates/cide-app/src/{lib,emit}.rs and diffs the
       # command and event surface against contract/*.json, so it is nearly free and runs
       # before the expensive steps.
-      - name: cargo xtask contract-check
-        run: cargo xtask contract-check
+      - name: cargo --locked xtask contract-check
+        run: cargo --locked xtask contract-check
 
       # No ui/dist is built for this. tauri-codegen only embeds frontendDist when the
       # `custom-protocol` feature is on (that is `tauri build`); a plain cargo build sees
       # dev_url instead and embeds nothing. Building the frontend here to satisfy a
       # requirement that does not apply would put a pnpm install in front of every Rust
       # step. The ui job builds ui/dist and proves it builds.
-      - name: cargo build --workspace
-        run: cargo build --workspace
+      - name: cargo build --locked --workspace
+        run: cargo build --locked --workspace
 
       # `--ignored` is deliberately NOT passed, and must not be added.
       #
-      # The ignored tests in cide-claude (real_headless, real_hooks) and cide-ide-mcp
-      # (real_cli) spawn the real `claude` binary. They need it installed on PATH, a
-      # logged-in Anthropic account, network access, and they consume the developer's own
-      # API quota. A CI runner has none of the first three and has no business spending
-      # the last. Run them by hand: `cargo test --workspace -- --ignored`.
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      # Most of the ignored set — cide-claude's real_headless and real_hooks, cide-ide-mcp's
+      # real_cli and its one in-crate server test — spawns the real `claude` binary. They
+      # need it installed on PATH, a logged-in Anthropic account, network access, and they
+      # consume the developer's own API quota. A CI runner has none of the first three and
+      # has no business spending the last.
+      #
+      # The remainder is cide-pty's throughput soak, ignored because it moves 1 GiB through
+      # the mirror; it needs nothing CI lacks, only minutes CI should not spend on every
+      # push. Run any of them by hand: `cargo test --workspace -- --ignored`.
+      - name: cargo test --locked --workspace
+        run: cargo test --locked --workspace
 
-      - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # Last of the Rust steps because it shells out to `cargo test -p cide-ipc` to
       # regenerate the ts-rs bindings before diffing them against ui/src/ipc/generated.ts —
       # cheap only once the test binaries above are already built. A Rust field rename that
       # never reached the generated TypeScript fails here instead of surfacing as an
       # `undefined` in the webview at runtime.
-      - name: cargo xtask codegen --check
-        run: cargo xtask codegen --check
+      - name: cargo --locked xtask codegen --check
+        run: cargo --locked xtask codegen --check
 
   # ---------------------------------------------------------------------------------
   # Frontend: typecheck, the project's own check:* harness, and the production build.
@@ -166,8 +227,9 @@ jobs:
           cache-dependency-path: ui/pnpm-lock.yaml
 
       # --frozen-lockfile so a dependency that drifted from the lockfile is a failure and
-      # not a silent resolution. The versions in ui/package.json are pinned exactly, with
-      # no carets, precisely so that this is deterministic.
+      # not a silent resolution. Nearly every version in ui/package.json is pinned exactly
+      # to make that determinism cheap; `@tauri-apps/plugin-dialog` is the one caret left,
+      # and the lockfile is what holds it still.
       - name: pnpm install
         working-directory: ui
         run: pnpm install --frozen-lockfile

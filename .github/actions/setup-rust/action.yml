@@ -1,8 +1,8 @@
 name: Set up Rust
 description: >
   Installs the exact toolchain named by rust-toolchain.toml — never `stable` — and
-  optionally restores the cargo caches. Lives as a composite action because three jobs
-  need it and a copy-pasted third copy is how the version pin quietly forks.
+  optionally restores the cargo caches. Lives as a composite action because both Rust
+  jobs need it and a copy-pasted second copy is how the version pin quietly forks.
 
 inputs:
   cache:
