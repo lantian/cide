@@ -18,6 +18,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
+import { terminalKeyGate } from '@/keys/gate'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
 
@@ -90,6 +91,19 @@ export function createTerminal(): TerminalHandle {
   // which is exactly what the Claude Code console is.
   term.loadAddon(new UnicodeGraphemesAddon())
   term.unicode.activeVersion = '15-graphemes'
+
+  /*
+   * Entry point 1 of the key gate.
+   *
+   * This runs BEFORE xterm processes the key, and returning false is the only thing that
+   * stops `^P` being written to the PTY. A window listener — entry point 2, installed in
+   * `App` — is neither sufficient nor correct on its own here: by the time a keydown
+   * bubbles to the window, xterm has already forwarded the byte, and Ctrl+P and Ctrl+K
+   * both mean something to readline. So the decision has to precede byte forwarding, which
+   * is why the gate has two entry points and a test asserting they resolve every chord
+   * identically (`ui/scripts/check-key-gate.mjs`).
+   */
+  term.attachCustomKeyEventHandler(terminalKeyGate)
 
   const handle: TerminalHandle = {
     term,

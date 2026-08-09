@@ -29,6 +29,12 @@ import { createAppWindowDriver } from '@/layout/appWindowDriver'
 import { DetachedPaneWindow } from '@/windows/DetachedPaneWindow'
 import { SplitTree } from '@/layout/SplitTree'
 import { TabContent } from '@/layout/TabContent'
+import { Explorer } from '@/sidebar/Explorer'
+import { GitPanel } from '@/sidebar/GitPanel'
+import { OverlayHost } from '@/overlays/OverlayHost'
+import { useKeyGate } from '@/keys/useKeyGate'
+import { createDispatcher } from '@/keys/dispatch'
+import { buildKeymap } from '@/keys/keymap'
 import { PaneFrame } from '@/layout/PaneTitleBar'
 import { PaneBody } from '@/panes/PaneBody'
 import { liveHosts } from '@/layout/paneHosts'
@@ -37,6 +43,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   app as appApi,
   benchMode,
+  file as fileApi,
   diag,
   events,
   settings as settingsApi,
@@ -145,6 +152,8 @@ export function App() {
   const redockPane = useWorkspace((st) => st.redockPane)
 
   const [view, setView] = useState<ActivityView>('files')
+  /** Which overlay is up, if any. `null` is the ordinary state. */
+  const [overlay, setOverlay] = useState<'files' | 'commands' | null>(null)
   /**
    * The launch plan, keyed by pane.
    *
@@ -321,6 +330,49 @@ export function App() {
         : boot.role.project
   const activeProject = activeProjectId ? (boot?.workspace.projects[activeProjectId] ?? null) : null
 
+  /*
+   * Key context: the `when` clauses in the keymap are evaluated against this.
+   *
+   * Recomputed every render rather than memoised. It is six booleans, and a stale context is
+   * how a binding fires in a state its `when` clause excludes — worse than the arithmetic it
+   * would save.
+   */
+  const keyContext = {
+    projectOpen: activeProjectId !== null,
+    overlayOpen: overlay !== null,
+    editorFocused: false,
+    terminalFocused: overlay === null,
+    sidebarFiles: view === 'files',
+    sidebarGit: view === 'git',
+  }
+
+  /*
+   * The one dispatcher. The key gate and the command palette both call it, which is what
+   * stops a binding and its palette entry drifting into two different behaviours.
+   */
+  const runCommand = createDispatcher({
+    fallback: (command) => {
+      if (command === 'workbench.showFilePicker') setOverlay('files')
+      else if (command === 'workbench.showCommandPalette') setOverlay('commands')
+      else if (command === 'workbench.closeOverlay') setOverlay(null)
+      else diag.log(`command not handled by this window: ${command}`)
+    },
+    showSidebar: (next) => setView(next),
+  })
+
+  /*
+   * Entry point 2 of the key gate: the window listener.
+   *
+   * Entry point 1 is `terminalKeyGate`, attached to every terminal in `paneHosts`. Both are
+   * required and neither is sufficient: a window listener cannot stop `^P` reaching a PTY,
+   * because xterm has already written the byte by the time the event bubbles.
+   */
+  useKeyGate({
+    bindings: boot?.keymap ?? [],
+    context: keyContext,
+    run: runCommand,
+  })
+
   // The status bar reports the session the user is looking at, not "a" session. With two
   // Claude panes side by side, showing whichever reported last would make the token figure
   // flicker between two conversations and belong to neither.
@@ -382,6 +434,22 @@ export function App() {
               }
             }}
           />
+
+          {/*
+            * The sidebar. `files` and `git` are the two views that have a panel; `search`
+            * and `problems` are M8/M-later surfaces that do not exist yet, and the rail's
+            * `settings` opens a workspace tab rather than a panel, so all three render
+            * nothing here rather than an empty chrome that implies a missing feature.
+            */}
+          {view === 'files' && (
+            <Explorer
+              project={activeProjectId}
+              onOpenFile={(path) => {
+                if (activeProjectId) void fileApi.open(activeProjectId, path).then(() => hydrate())
+              }}
+            />
+          )}
+          {view === 'git' && <GitPanel project={activeProjectId} />}
 
           <div className={styles.content}>
             {/* An open project always has a console tab, so its `activeTab` is always live —
@@ -473,6 +541,45 @@ export function App() {
             )}
           </div>
         </div>
+
+        {/*
+          * Ctrl+P and Shift+Ctrl+P. Rendered last so the overlay stacks above the chrome
+          * without a z-index fight, and only when one is actually open — an always-mounted
+          * host would keep the picker's poll alive against a project nobody is looking at.
+          */}
+        {overlay !== null && activeProjectId && boot && (
+          <OverlayHost
+            project={activeProjectId}
+            commands={boot.commands}
+            keymap={buildKeymap(boot.keymap)}
+            context={keyContext}
+            actions={{
+              openFile: (path) => {
+                setOverlay(null)
+                void fileApi.open(activeProjectId, path).then(() => hydrate())
+              },
+              openFileInSplit: (path) => {
+                setOverlay(null)
+                void fileApi.open(activeProjectId, path).then(() => hydrate())
+              },
+              mentionFile: (path) => {
+                setOverlay(null)
+                // The IDE server's `at_mentioned` is per-pane and needs the focused Claude
+                // pane's id; that binding is not plumbed to this window yet, so this reports
+                // rather than pretending to have sent it.
+                diag.log(`mention not wired yet: ${path}`)
+              },
+              runCommand: (id) => {
+                setOverlay(null)
+                runCommand(id, null)
+              },
+              runCommandInNewSession: (id) => {
+                setOverlay(null)
+                runCommand(id, { newSession: true })
+              },
+            }}
+          />
+        )}
 
         <StatusBar
           claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
