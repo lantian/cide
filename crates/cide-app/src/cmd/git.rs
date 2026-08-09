@@ -20,10 +20,12 @@
 
 use std::path::PathBuf;
 
-use cide_git::{changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status};
+use cide_git::{
+    changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status, tree_status,
+};
 use cide_ipc::git::{
     BranchInfo, ChangesTree, CommitOutcome, CommitRequest, DiffSide, FileDiff, GitError,
-    PathSelection, PushOutcome, ShelfEntry, StashEntry,
+    PathSelection, PushOutcome, ShelfEntry, StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId};
 use tauri::State;
@@ -78,6 +80,34 @@ pub fn git_status(
     include_ignored: bool,
 ) -> Result<ChangesTree> {
     tree(&state, project, include_ignored)
+}
+
+/// Per-path status for the file tree, keyed by absolute path.
+///
+/// Separate from `fs_tree_rows` on purpose, and the separation is the requirement: the tree's
+/// first paint must not wait on git. A repository with a slow `git status` shows an untagged
+/// tree and then tags, never an empty pane — which is only possible while the rows and the
+/// tags are two independent round trips.
+///
+/// There is no `paths` argument. The map is bounded by the number of *changed* paths rather
+/// than by the size of the repository, so windowing the question would cost a round trip per
+/// scroll tick and save nothing underneath; see `cide_git::tree_status` for the full
+/// comparison. The frontend re-reads this on `cide://git-status` and on a `cide://fs-changed`
+/// that touched a git file, not on scroll and not on a timer.
+///
+/// `async` — the only git command here that is — because it is the only one the *watcher*
+/// drives rather than a user gesture. Tauri runs a synchronous command on the main thread, so
+/// a one-second status walk on a large checkout would freeze the window for a second every
+/// time it ran; every other command in this file runs once per click, while this one can run
+/// several times a second for as long as a build is writing files. The body has no await, so
+/// `command(async)` on a sync fn is exactly the right shape: it moves the walk onto the async
+/// runtime without making `git2`'s non-`Send` handles cross a suspension point.
+#[tauri::command(async, rename_all = "camelCase")]
+pub fn git_tree_status(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<TreeStatusMap> {
+    Ok(tree_status::tree_status(&roots(&state, project)?))
 }
 
 #[tauri::command(rename_all = "camelCase")]

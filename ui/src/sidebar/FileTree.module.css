@@ -47,6 +47,19 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The status-cap marker beside the meta figure. Mono, so it sits on the counter's baseline
+   and reads as a footnote on it rather than as a second value; `--yellow` rather than
+   `--red` because nothing is broken — some rows are simply untagged. Both themes define the
+   token. */
+.headerWarn {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  color: var(--yellow);
+  cursor: help;
+}
+
 .scroll {
   flex: 1;
   min-height: 0;

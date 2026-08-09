@@ -22,3 +22,13 @@ indexmap = { workspace = true }
 # canonical work-tree path, so the same repository gets the same id in every process and
 # across restarts without a registry to keep in sync.
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Tests only, and only `tests/tree_status.rs`. `tree_status` keys its map by the absolute path
+# a `TreeRow` carries, which is a claim about a crate this one does not and must not depend
+# on: the two walk different things (a `.git` index and a filesystem) and are testable apart
+# precisely because neither links the other. That leaves the join itself untested by either
+# side, and the join is where it breaks — one canonicalisation on the wrong side of the
+# boundary and every key is right and matches no row. A dev-dependency puts the two real
+# walkers in one test and nothing in the dependency graph the app ships.
+cide-fs = { workspace = true }
