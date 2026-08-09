@@ -212,6 +212,32 @@ mod tests {
         assert!(strays.is_empty(), "left temp files behind");
     }
 
+    #[test]
+    fn rejects_a_directory() {
+        let dir = tempdir();
+        let error = read(&dir).expect_err("a directory is not a document");
+        assert!(format!("{error}").contains("is a directory"), "{error}");
+    }
+
+    /// Pins what `writable` actually answers, because the tempting reading of it is wrong.
+    ///
+    /// It is `Permissions::readonly()` inverted — the mode bits and nothing else. It does
+    /// not know about ownership or about a read-only mount, so the field must not be
+    /// described (or relied on) as "this process can write this file".
+    #[cfg(unix)]
+    #[test]
+    fn writable_follows_the_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tempdir().join("readonly.txt");
+        fs::write(&path, "text\n").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod");
+        assert!(!read(&path).expect("read").writable);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(read(&path).expect("read").writable);
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_preserves_the_executable_bit() {

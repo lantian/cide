@@ -307,10 +307,13 @@ pub struct SplitOutcome {
 pub struct FileDoc {
     pub path: std::path::PathBuf,
     pub text: String,
-    /// False when the file is on a read-only mount or owned by another user.
+    /// False when the file's mode bits carry no write permission at all.
     ///
-    /// Advisory — the write is still attempted and can still fail — but it is what lets the
-    /// buffer open read-only rather than letting the user type for ten minutes into
-    /// something that cannot be saved.
+    /// This is exactly `Permissions::readonly()` inverted, and that is a narrower question
+    /// than "can this process write it": it reads the mode and nothing else, so a file
+    /// owned by another user with mode 0644, or any file on a read-only mount, still comes
+    /// back `true`. Purely advisory — the write is attempted regardless and reports its own
+    /// failure — but it catches the common `chmod -w` case early rather than letting the
+    /// user type for ten minutes into something that will not save.
     pub writable: bool,
 }

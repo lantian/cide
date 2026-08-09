@@ -73,6 +73,18 @@ interface Palette {
 }
 
 /**
+ * What a token resolves to when it resolves to nothing.
+ *
+ * One neutral grey for every role, and deliberately *not* each token's real value written
+ * out again: a per-role fallback table is a second palette, and the day someone adjusts
+ * `tokens.css` it becomes a palette that is wrong in a way only the minimap shows. This
+ * should never be reached — `EditorView` attaches its DOM to the parent before it builds
+ * its plugins, so the element is in the document and inheriting `:root` by the time the
+ * constructor reads it — and if it ever is, a grey map is a legible one.
+ */
+const UNRESOLVED = '#888'
+
+/**
  * Read the design tokens off a live element.
  *
  * `getComputedStyle` rather than a hardcoded table: the tokens are defined in
@@ -81,22 +93,22 @@ interface Palette {
  */
 function readPalette(el: HTMLElement): Palette {
   const style = getComputedStyle(el)
-  const read = (name: string, fallback: string): string => {
+  const read = (name: string): string => {
     const value = style.getPropertyValue(name).trim()
-    return value.length > 0 ? value : fallback
+    return value.length > 0 ? value : UNRESOLVED
   }
 
   const byClass = new Map<string, string>()
-  for (const [cls, token] of TOKEN_VAR_BY_CLASS) byClass.set(cls, read(token, '#888'))
+  for (const [cls, token] of TOKEN_VAR_BY_CLASS) byClass.set(cls, read(token))
 
   return {
     byClass,
-    plain: read(PLAIN_TOKEN, '#888'),
-    caret: read('--accent', '#d97757'),
+    plain: read(PLAIN_TOKEN),
+    caret: read('--accent'),
     // The rectangle is a wash over the bars rather than a block on top of them, so the
     // shape of the file stays legible inside the part being looked at.
-    viewportFill: read('--sel', '#2b3a55'),
-    viewportStroke: read('--border', '#2a2a31'),
+    viewportFill: read('--sel'),
+    viewportStroke: read('--border'),
   }
 }
 
@@ -127,6 +139,13 @@ class Minimap implements PluginValue {
     this.canvas.addEventListener('pointermove', this.onPointerMove)
     this.canvas.addEventListener('pointerup', this.onPointerUp)
     this.canvas.addEventListener('pointercancel', this.onPointerUp)
+    // Scrolling is not reliably a `ViewUpdate`. CodeMirror renders a margin above and below
+    // the visible range, so a scroll inside that margin changes neither the viewport nor the
+    // geometry and `update()` below is never called — while both things this canvas draws
+    // from the scroll position, the `--sel` rectangle and (past ~250 lines) which slice of
+    // the document is shown at all, have just moved. Without this the map jumps a screenful
+    // at a time instead of tracking.
+    view.scrollDOM.addEventListener('scroll', this.onScroll, { passive: true })
     view.dom.appendChild(this.canvas)
 
     // The tokens live on `<html data-theme>`, so that is what is watched. Watching the
@@ -160,6 +179,7 @@ class Minimap implements PluginValue {
   destroy(): void {
     if (this.frame !== 0) cancelAnimationFrame(this.frame)
     this.themeWatch.disconnect()
+    this.view.scrollDOM.removeEventListener('scroll', this.onScroll)
     this.canvas.removeEventListener('pointerdown', this.onPointerDown)
     this.canvas.removeEventListener('pointermove', this.onPointerMove)
     this.canvas.removeEventListener('pointerup', this.onPointerUp)
@@ -174,6 +194,10 @@ class Minimap implements PluginValue {
    * updates — would otherwise redraw the canvas once each. Reading DOM geometry inside the
    * frame is also what keeps this out of CodeMirror's measure cycle.
    */
+  private readonly onScroll = (): void => {
+    this.schedule()
+  }
+
   private schedule(): void {
     if (this.frame !== 0) return
     this.frame = requestAnimationFrame(() => {

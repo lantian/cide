@@ -46,7 +46,7 @@ import { cideHighlightStyle } from './highlight'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
 import { languageName, loadLanguage } from './languages'
-import { crlfThroughout, detectLineEnding, restoreLineEndings } from './lineEndings'
+import { detectLineEnding, restoreLineEndings, type LineEnding } from './lineEndings'
 import styles from './EditorSurface.module.css'
 
 /**
@@ -147,7 +147,7 @@ export function EditorSurface({
 
   // Captured per load, because after `EditorState.create` the buffer's endings are all `\n`
   // and the question can no longer be asked. See `lineEndings.ts`.
-  const crlfRef = useRef(false)
+  const endingRef = useRef<LineEnding>('LF')
   const dirtyRef = useRef(false)
 
   useEffect(() => {
@@ -156,7 +156,10 @@ export function EditorSurface({
 
     const source = doc
     const oversize = source.length > HIGHLIGHT_LIMIT_BYTES
-    crlfRef.current = crlfThroughout(source)
+    // `lineEnding` is memoized on the same `doc` this effect captured, so reusing it here is
+    // the same answer for one scan instead of two — and it keeps the readout and the bytes
+    // that get written from ever disagreeing about what the file was.
+    endingRef.current = lineEnding
     dirtyRef.current = false
 
     const languageSlot = new Compartment()
@@ -165,14 +168,16 @@ export function EditorSurface({
     const save = (view: EditorView): boolean => {
       if (readOnly) return false
       const saving = view.state.doc
-      const text = restoreLineEndings(saving.toString(), crlfRef.current)
+      const text = restoreLineEndings(saving.toString(), endingRef.current)
 
       // The baseline moves only once the write has landed, and this ordering is the whole
       // of it. Clearing the dirty flag optimistically reads better and is wrong: a write
       // that fails — read-only mount, disk full, the file replaced by a directory — would
-      // leave a tab that looks saved over a buffer that is not, and the next thing to
-      // consult that flag is the close confirmation. Staying dirty through a failed save is
-      // the only direction in which the mistake does not lose work.
+      // leave a tab that looks saved over a buffer that is not, and the dot in the tab strip
+      // is the only thing telling the user otherwise. Nothing currently *blocks* a close on
+      // that flag (`tab_close` does not consult it, and the `confirmCloseWithLiveSession`
+      // setting is unwired), so staying dirty through a failed save is not a belt-and-braces
+      // measure — it is the whole warning.
       void Promise.resolve(saveCb.current?.(text)).then(
         () => {
           baseline = saving

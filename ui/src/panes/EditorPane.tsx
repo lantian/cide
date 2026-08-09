@@ -47,6 +47,29 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
   const [conflict, setConflict] = useState(false)
   const dirtyRef = useRef(false)
 
+  /**
+   * Tell the workspace whether this file has unsaved edits.
+   *
+   * Deduplicated here as well as in the surface because there are two callers: the editor's
+   * own transitions, and a reload from disk. A reload has to report too — it replaces the
+   * buffer with the file's contents, so the tab is clean afterwards even though nothing in
+   * the editor transitioned. Without this the dot stayed lit for the life of the tab after
+   * a conflict was resolved with "Reload from disk", which is the one moment the dot is
+   * supposed to go out.
+   */
+  const reportDirty = useCallback(
+    (dirty: boolean) => {
+      if (dirtyRef.current === dirty) return
+      dirtyRef.current = dirty
+      if (project === undefined || tab === undefined) return
+      // Fire-and-forget: the dot is a hint, and a failed report must not interrupt typing.
+      // The authoritative answer to "are there unsaved changes" is the buffer itself, which
+      // is why nothing here waits for the round trip.
+      void fileApi.setDirty(project, tab, dirty).catch(() => {})
+    },
+    [project, tab],
+  )
+
   const read = useCallback(
     (bump: boolean) => {
       let cancelled = false
@@ -56,7 +79,7 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           if (cancelled) return
           setLoad({ kind: 'ready', text: doc.text, writable: doc.writable })
           setConflict(false)
-          dirtyRef.current = false
+          reportDirty(false)
           if (bump) setReloadKey((n) => n + 1)
         })
         .catch((error: unknown) => {
@@ -67,22 +90,10 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
         cancelled = true
       }
     },
-    [path],
+    [path, reportDirty],
   )
 
   useEffect(() => read(false), [read])
-
-  const onDirtyChange = useCallback(
-    (dirty: boolean) => {
-      dirtyRef.current = dirty
-      if (project === undefined || tab === undefined) return
-      // Fire-and-forget: the dot is a hint, and a failed report must not interrupt typing.
-      // The authoritative answer to "are there unsaved changes" is the buffer itself, which
-      // is why nothing here waits for the round trip.
-      void fileApi.setDirty(project, tab, dirty).catch(() => {})
-    },
-    [project, tab],
-  )
 
   /**
    * Write the buffer back.
@@ -121,6 +132,11 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
    */
   useEffect(() => {
     let unlisten: (() => void) | null = null
+    // `dropped` and not just the null check: `listen` resolves a tick or more after it is
+    // called, and a pane closed or split in that window would otherwise leave a subscription
+    // nobody can cancel, holding this closure — and the path it captured — for the life of
+    // the window. One editor pane per split per file makes that add up.
+    let dropped = false
     void events
       .onSessionTool((_session, paths) => {
         if (!paths.includes(path)) return
@@ -128,10 +144,14 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
         else read(true)
       })
       .then((fn) => {
-        unlisten = fn
+        if (dropped) fn()
+        else unlisten = fn
       })
       .catch(() => {})
-    return () => unlisten?.()
+    return () => {
+      dropped = true
+      unlisten?.()
+    }
   }, [path, read])
 
   if (load.kind === 'loading') {
@@ -172,7 +192,7 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           doc={load.text}
           reloadKey={reloadKey}
           readOnly={!load.writable}
-          onDirtyChange={onDirtyChange}
+          onDirtyChange={reportDirty}
           onSave={onSave}
         />
       </div>

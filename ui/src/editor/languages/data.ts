@@ -16,7 +16,7 @@
  * — it takes the buffer down.
  */
 import type { StringStream } from '@codemirror/language'
-import { atLineStart, grammar, type GrammarState, type HookResult } from '../streamGrammar'
+import { atLineStart, grammar, type HookResult } from '../streamGrammar'
 
 /** `"key":` — a quoted string with a colon after it, at any depth. */
 function quotedKey(stream: StringStream): HookResult {
@@ -56,20 +56,24 @@ export const toml = grammar({
   hook: tomlHook,
 })
 
-function yamlHook(stream: StringStream, state: GrammarState): HookResult {
+function yamlHook(stream: StringStream): HookResult {
   const first = atLineStart(stream)
-  // The scratch flag says "the rest of this line is a value", which is what keeps the
-  // `://` in a URL from being read as a second key on the same line.
-  if (first) state.flag = 0
 
   if (first && stream.match(/^(?:---|\.\.\.|%[A-Z]+.*)/)) return 'meta'
 
   // A key, optionally behind the `- ` of a list entry. The leading class excludes `:` so
   // the match cannot succeed having consumed nothing.
-  if (state.flag === 0 && stream.match(/^(?:-\s+)?[^\s#:][^:]*(?=:(?:\s|$))/)) {
-    state.flag = 1
-    return 'propertyName'
-  }
+  //
+  // Tried only at the head of the line, which is where a block-mapping key is, and this is
+  // load-bearing rather than tidy. `[^:]*` scans to the end of the line before its lookahead
+  // can fail, so running it once per token makes a long line quadratic: a 200,000-character
+  // line of punctuation is 200,000 token calls each scanning 200,000 characters, measured at
+  // 4.8 s against 20 ms for the same line at line-start only. CodeMirror parses under a time
+  // budget so that never froze the window — it just meant the colour never arrived and a
+  // core burned until the buffer closed. Gating on the line head also replaces the
+  // "rest of this line is a value" scratch flag that kept `://` in a URL from reading as a
+  // second key, since nothing past the head is tested at all now.
+  if (first && stream.match(/^(?:-\s+)?[^\s#:][^:]*(?=:(?:\s|$))/)) return 'propertyName'
 
   // An anchor or an alias — the one piece of YAML that is genuinely a reference.
   if (stream.match(/^[&*][A-Za-z0-9_-]+/)) return 'labelName'

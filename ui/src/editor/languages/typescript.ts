@@ -28,8 +28,12 @@ const TYPES = [
 
 function hook(stream: StringStream, state: GrammarState): HookResult {
   // Template literals. Tracked with the state's scratch flag rather than the quote slot
-  // because `${…}` inside one is code, and the generic string runner has no way to hand
-  // control back mid-string.
+  // because the generic string runner would apply this language's `'` and `"` rules to the
+  // body, and a backtick string is closed only by a backtick.
+  //
+  // `${…}` is *not* handled: an interpolation is code and is coloured here as string. Doing
+  // it properly needs a nesting depth in the state and a way to hand control back to the
+  // generic path mid-token, which is the point at which a lexer stops being the right tool.
   if (state.flag === 1) {
     while (!stream.eol()) {
       if (stream.peek() === '\\') {

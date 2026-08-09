@@ -69,7 +69,12 @@ pub fn tab_open_file(
 /// The dirty flag lives in the Rust-owned tree rather than in the editor component because
 /// it outlives the component: a tab switch unmounts nothing today, but a detached editor
 /// window is a different JavaScript realm, and the tab strip that draws the dot is in the
-/// other one. It is also what a close-confirmation has to consult, and that runs in Rust.
+/// other one.
+///
+/// Nothing yet *guards* on it. `tab_close` does not consult it and neither does
+/// `app_quit_requested`, so closing a tab with unsaved edits discards them without asking —
+/// the dot in the tab strip is the only warning there is. Putting the flag in the tree is
+/// what makes that guard writable in one place later; it is not that guard.
 #[tauri::command(rename_all = "camelCase")]
 pub fn tab_set_dirty(
     state: State<'_, WorkspaceState>,
