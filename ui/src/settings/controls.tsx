@@ -5,7 +5,7 @@
  * can be rendered from a fixture. The mock draws exactly three kinds of control — a toggle
  * row, a segmented choice and a small numeric field — and this file is all of them.
  */
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import styles from './controls.module.css'
 
 export interface ToggleProps {
@@ -124,12 +124,31 @@ export interface NumberFieldProps {
 /**
  * A bounded integer.
  *
- * Clamped here rather than trusted: these values reach a terminal's font metrics and a
- * scrollback allocation, and a pasted `999999` scrollback is a live session's memory. An
- * unparseable value is ignored rather than treated as zero, so deleting the contents to type
- * a new number does not momentarily set the setting to 0.
+ * Clamped, because these values reach a terminal's font metrics and a scrollback allocation
+ * and a pasted `999999` scrollback is a live session's memory — but clamped **on commit, not
+ * on every keystroke**. Clamping per keystroke reads as correct and makes the field
+ * unenterable: with `min=8`, typing `16` clamps the intermediate `1` to `8`, the controlled
+ * input snaps to "8", and the next keystroke produces "86". Every numeric setting on this
+ * screen behaves that way, so the half-typed value is held locally as text and only parsed
+ * when the user is finished with it.
+ *
+ * An unparseable commit is ignored rather than treated as zero: clearing the field to type a
+ * new number must not set a scrollback of 0 on the way past.
  */
 export function NumberField({ value, min, max, onChange, label }: NumberFieldProps) {
+  /** The text being typed, or `null` when the field is showing the stored value. */
+  const [draft, setDraft] = useState<string | null>(null)
+
+  const commit = (text: string) => {
+    setDraft(null)
+    const next = Number.parseInt(text, 10)
+    if (Number.isNaN(next)) return
+    const clamped = Math.min(max, Math.max(min, next))
+    // Guarded so that tabbing through an untouched field is not a workspace write and a
+    // broadcast to every window.
+    if (clamped !== value) onChange(clamped)
+  }
+
   return (
     <input
       className={styles.number}
@@ -138,11 +157,14 @@ export function NumberField({ value, min, max, onChange, label }: NumberFieldPro
       aria-label={label}
       min={min}
       max={max}
-      value={value}
-      onChange={(e) => {
-        const next = Number.parseInt(e.target.value, 10)
-        if (Number.isNaN(next)) return
-        onChange(Math.min(max, Math.max(min, next)))
+      value={draft ?? String(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        // Enter commits without waiting for focus to leave; Escape abandons the draft, which
+        // re-renders the stored value.
+        if (e.key === 'Enter') commit(e.currentTarget.value)
+        else if (e.key === 'Escape') setDraft(null)
       }}
     />
   )

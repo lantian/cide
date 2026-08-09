@@ -279,6 +279,19 @@ const LADDER: [Rung; 3] = [
 /// Set by the launcher to disable every workaround, for bisecting a rendering bug.
 const SUPPRESS: &str = "CIDE_NO_GRAPHICS_WORKAROUNDS";
 
+/// Whether the environment cide was *launched from* set [`SUPPRESS`].
+///
+/// Latched on first call, and the first call is [`apply_graphics_overrides`] at the top of
+/// `main` — deliberately, because that function sets [`SUPPRESS`] itself when the user has
+/// taken the ladder off automatic. After it runs, the live environment can no longer tell the
+/// user's own `CIDE_NO_GRAPHICS_WORKAROUNDS=1` from ours, and the screen draws a different and
+/// contradictory banner for each ("nothing below applies" versus "only what you chose
+/// applies"). Reading it once, first, is the only way to keep the two distinguishable.
+fn launch_suppressed() -> bool {
+    static LATCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LATCHED.get_or_init(|| std::env::var_os(SUPPRESS).is_some())
+}
+
 /// What the ladder asked for and what this process actually got.
 #[tauri::command(rename_all = "camelCase")]
 pub fn graphics_status(state: State<'_, WorkspaceState>) -> GraphicsStatus {
@@ -298,7 +311,11 @@ pub fn graphics_status(state: State<'_, WorkspaceState>) -> GraphicsStatus {
             })
             .collect(),
         automatic: !manual(&settings),
-        suppressed_by_env: std::env::var_os(SUPPRESS).is_some(),
+        // Not `env::var_os(SUPPRESS)`: `apply_graphics_overrides` sets that same variable in
+        // this process whenever the user has set any rung explicitly, so reading it live would
+        // report "your environment disabled everything" to every user who touched the ladder —
+        // which is both false and the opposite of what actually happened to their choices.
+        suppressed_by_env: launch_suppressed(),
     }
 }
 
@@ -324,25 +341,46 @@ fn manual(settings: &GraphicsSettings) -> bool {
 /// screen can say this out loud rather than leaving it to be discovered.
 ///
 /// A variable already present in the environment always wins, matching `graphics::apply`: a
-/// user who exported one knows something we do not.
+/// user who exported one knows something we do not. `CIDE_NO_GRAPHICS_WORKAROUNDS` in the
+/// launching environment is the strongest form of that and short-circuits everything here —
+/// it is the "give me stock behaviour" switch, and stock cannot mean "plus whatever
+/// `workspace.json` happens to say".
 ///
 /// Returns what it set, for the launcher's log.
 pub fn apply_graphics_overrides() -> Vec<(&'static str, &'static str)> {
-    let settings = stored_graphics();
-    let mut applied = Vec::new();
-    if !manual(&settings) {
-        return applied;
+    // `launch_suppressed` before `set_if_unset`, always: this is the call that latches it, and
+    // the loop below is what would otherwise poison the reading.
+    let suppressed = launch_suppressed();
+    overrides_for(suppressed, &stored_graphics())
+        .into_iter()
+        .filter(|key| set_if_unset(key, "1"))
+        .map(|key| (key, "1"))
+        .collect()
+}
+
+/// Which variables the stored ladder wants set, in ladder order.
+///
+/// Pure, so the decision is testable; [`apply_graphics_overrides`] is only the shell that puts
+/// the answer into the process environment.
+fn overrides_for(launch_suppressed: bool, settings: &GraphicsSettings) -> Vec<&'static str> {
+    // The escape hatch means *stock* behaviour, and stock includes not applying what is
+    // stored. Somebody bisecting a rendering bug with `CIDE_NO_GRAPHICS_WORKAROUNDS=1` must
+    // not be handed rungs out of a `workspace.json` they had no reason to look at — that is
+    // the one variable whose whole job is "give me the unmodified environment".
+    if launch_suppressed || !manual(settings) {
+        return Vec::new();
     }
 
-    if set_if_unset(SUPPRESS, "1") {
-        applied.push((SUPPRESS, "1"));
-    }
-    for rung in &LADDER {
-        if (rung.get)(&settings) == Some(true) && set_if_unset(rung.variable, "1") {
-            applied.push((rung.variable, "1"));
-        }
-    }
-    applied
+    // `SUPPRESS` first, because it is what stands `graphics::apply`'s automatic ladder down;
+    // the rungs after it are then the entire ladder.
+    let mut wanted = vec![SUPPRESS];
+    wanted.extend(
+        LADDER
+            .iter()
+            .filter(|rung| (rung.get)(settings) == Some(true))
+            .map(|rung| rung.variable),
+    );
+    wanted
 }
 
 /// The graphics settings on disk.
@@ -505,6 +543,52 @@ mod tests {
             ..GraphicsSettings::default()
         };
         assert!(manual(&settings));
+    }
+
+    #[test]
+    fn an_automatic_ladder_overrides_nothing() {
+        // Nothing set here means `graphics::apply`'s heuristic is left in charge, and setting
+        // SUPPRESS would silently disable it.
+        assert!(overrides_for(false, &GraphicsSettings::default()).is_empty());
+    }
+
+    #[test]
+    fn one_explicit_rung_stands_the_automatic_ladder_down_and_becomes_the_whole_ladder() {
+        let settings = GraphicsSettings {
+            disable_compositing_mode: Some(true),
+            ..GraphicsSettings::default()
+        };
+        assert_eq!(
+            overrides_for(false, &settings),
+            [SUPPRESS, "WEBKIT_DISABLE_COMPOSITING_MODE"],
+            "an explicit choice has to disable the heuristic, or a rung turned off would \
+             still be applied by it"
+        );
+    }
+
+    #[test]
+    fn a_ladder_turned_entirely_off_still_suppresses_the_heuristic() {
+        // The case the whole design exists for: the user says "no workarounds" and gets none,
+        // rather than getting the launcher's set-if-unset defaults anyway.
+        let settings = GraphicsSettings {
+            disable_dmabuf_renderer: Some(false),
+            ..GraphicsSettings::default()
+        };
+        assert_eq!(overrides_for(false, &settings), [SUPPRESS]);
+    }
+
+    #[test]
+    fn the_environment_escape_hatch_beats_the_stored_ladder() {
+        // `CIDE_NO_GRAPHICS_WORKAROUNDS=1` is documented — in `graphics.rs`, on
+        // `GraphicsStatus::suppressed_by_env` and on the screen — as disabling the lot
+        // regardless of what is stored. Applying stored rungs under it would make bisecting a
+        // rendering bug depend on a file the person bisecting never opened.
+        let settings = GraphicsSettings {
+            disable_compositing_mode: Some(true),
+            disable_nvidia_explicit_sync: Some(true),
+            ..GraphicsSettings::default()
+        };
+        assert!(overrides_for(true, &settings).is_empty());
     }
 
     #[test]

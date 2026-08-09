@@ -588,7 +588,17 @@ modules:
       env:
         CARGO_HOME: /run/build/cide/cargo
     build-commands:
-      - npm --prefix ui ci
+      # `npm install`, not `npm ci`. This repository ships only `ui/pnpm-lock.yaml`, and
+      # `npm ci` refuses to run at all without a `package-lock.json`:
+      #
+      #   npm error The `npm ci` command can only install with an existing package-lock.json
+      #
+      # — so the build died on its first command. npm rather than pnpm because the GNOME
+      # node22 SDK extension ships npm and not pnpm. The cost is that this is the one channel
+      # whose transitive dependency versions are not the lockfile's; direct versions are
+      # pinned exactly in ui/package.json, so the drift is confined to the tree below them.
+      # See docs/adr/0007-packaging-and-distribution.md.
+      - npm --prefix ui install --no-audit --no-fund
       - npm --prefix ui run build
       - cargo build --release --locked -p cide-app -p cide-hook -p cide-headless
       - install -Dm755 target/release/cide /app/bin/{command}
@@ -699,6 +709,21 @@ mod tests {
             "libgit2 is vendored; it must not also be a module"
         );
         assert!(!manifest.contains("name: openssl"));
+    }
+
+    #[test]
+    fn the_manifest_never_uses_npm_ci() {
+        // `npm ci` cannot run here: the repository has a pnpm lockfile and no
+        // `package-lock.json`, and npm exits with EUSAGE rather than falling back. It is the
+        // manifest's first build command, so the whole channel failed on it, and nothing in
+        // this repository would have noticed — flatpak-builder is the only thing that reads
+        // this file.
+        let manifest = flatpak_manifest(&info());
+        assert!(
+            !manifest.contains("npm --prefix ui ci"),
+            "npm ci needs a package-lock.json this repository does not have"
+        );
+        assert!(manifest.contains("npm --prefix ui install"));
     }
 
     #[test]

@@ -16,13 +16,37 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use cide_claude::headless::{self, Headless, ToolAccess};
-use cide_ipc::HeadlessRequest;
+use cide_ipc::{HeadlessError, HeadlessRequest};
 
 fn on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|d| d.join(bin))
         .find(|p| p.is_file())
+}
+
+/// What to do with a run that produced no result.
+///
+/// The distinction is the reason these tests are worth running. A rate limit, an expired
+/// login, a missing binary or a slow network says nothing about the output envelope, and
+/// failing on one gets the test disabled within a week. [`HeadlessError::Malformed`] is the
+/// exact opposite: the CLI ran, printed, and printed something the parser could not read —
+/// which is precisely the drift this file exists to catch, and the drift that leaves every
+/// unit test green while every commit message in the app comes back as an error.
+///
+/// Returns `None` when the caller should skip; panics when the envelope has moved.
+fn skip_or_fail(error: HeadlessError) -> Option<()> {
+    match error {
+        HeadlessError::Malformed { detail, head } => panic!(
+            "the CLI's output no longer matches the envelope `cide_claude::headless` parses \
+             ({detail}). Every headless feature is broken until the parser is updated. \
+             It printed:\n{head}"
+        ),
+        other => {
+            eprintln!("SKIP: {other}");
+            None
+        }
+    }
 }
 
 fn scratch() -> PathBuf {
@@ -52,9 +76,7 @@ fn a_one_shot_round_trips_through_the_real_cli() {
     let result = match headless::run(&claude, &run) {
         Ok(result) => result,
         Err(error) => {
-            // A rate limit or an expired login says nothing about the envelope, and failing
-            // on one would get this test disabled within a week.
-            eprintln!("SKIP: {error}");
+            skip_or_fail(error);
             return;
         }
     };
@@ -124,7 +146,7 @@ fn structured_output_comes_back_parsed() {
     let result = match headless::run(&claude, &run) {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("SKIP: {error}");
+            skip_or_fail(error);
             return;
         }
     };
