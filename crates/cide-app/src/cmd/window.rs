@@ -113,10 +113,10 @@ pub fn window_set_mode(
 
 /// Close a window, doing whatever that means for what the window is showing.
 ///
-/// `force` reaches only the `PerProject` shell case, where closing the window *is* closing
-/// the project and can therefore discard unsaved edits. Without it that case is refused with
-/// [`CoreError::UnsavedChanges`]; the caller shows `CloseConfirm` and asks again. Re-docking
-/// a detached pane loses nothing and never consults it.
+/// `force` reaches both shell cases, because both can discard unsaved edits: in
+/// `PerProject` the window *is* the project, and in `Stacked` closing it is a quit. Without
+/// it, either is refused with [`CoreError::UnsavedChanges`]; the caller shows `CloseConfirm`
+/// and asks again. Re-docking a detached pane loses nothing and never consults it.
 #[tauri::command(rename_all = "camelCase")]
 pub fn window_close(
     state: State<'_, WorkspaceState>,
@@ -172,12 +172,24 @@ pub fn window_close(
             // windows with it — left behind they would hold the process open showing panes
             // whose shell is gone.
             //
-            // `force` is deliberately not consulted here, and this is the one gap in the
-            // Rust-side guard. Quitting does not go through `close_project`, so there is no
-            // domain operation to refuse; the protection is `app_quit_requested`, which the
-            // caller is required to consult first. That is advisory rather than enforced —
-            // see the note in `app_quit_requested`.
-            WindowMode::Stacked => quit(&app),
+            // No `close_project` runs on this path, so there is no domain refusal to inherit
+            // and the check is made here instead. `force` has to mean the same thing through
+            // every close or it means nothing: a caller that omits it must not be able to
+            // reach a wider gesture that discards more.
+            //
+            // This closes the *command* path only. A close delivered by the window manager
+            // to a shell — Alt+F4, the compositor's own button — never reaches a command and
+            // is still unguarded; see `intercept_close`, and the note in
+            // `app_quit_requested`.
+            WindowMode::Stacked => {
+                if !force {
+                    let tabs = workspace::unsaved_tabs(&ws, None);
+                    if !tabs.is_empty() {
+                        return Err(CoreError::UnsavedChanges { tabs });
+                    }
+                }
+                quit(&app)
+            }
         },
     }
 
@@ -205,6 +217,12 @@ pub fn window_list(state: State<'_, WorkspaceState>) -> Vec<(WindowLabel, Window
 /// A shell keeps the native close. What that gesture means for a shell — close the project,
 /// or quit — is a decision for [`window_close`]'s caller, and answering it here would make
 /// Alt+F4 delete a project the user expected to find again.
+///
+/// That is also the one hole left in the unsaved-work guard, and it is named rather than
+/// papered over: [`window_close`] refuses unsaved edits, but Alt+F4 on a shell never reaches
+/// it. Closing the hole means `prevent_close` here plus a new event asking the frontend
+/// whether to proceed — and a veto whose answer never arrives is an app that cannot be quit,
+/// which is a worse failure than the one it fixes. See `app_quit_requested`.
 pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
     // Before `manage` there is no workspace to consult, and so no pane to strand.
     let Some(state) = app.try_state::<WorkspaceState>() else {

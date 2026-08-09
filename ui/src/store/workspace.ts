@@ -37,6 +37,7 @@ import {
   type SplitOutcome,
   type Tab,
   type TabId,
+  type UnsavedTab,
   type WindowMode,
   type Workspace,
 } from '@/ipc/client'
@@ -78,29 +79,47 @@ async function refused(
 }
 
 /**
- * The `Busy | AwaitingPermission` sessions bound to panes in one tab.
+ * What closing one tab would cost, asked before the command rather than after it.
  *
- * Answers `[]` without an IPC call when the tab has no session bound at all, which is every
- * file tab and every diff tab. The session ids come from the local mirror and the *states*
- * from Rust, because only the hook server knows which are mid-turn — and `app.quitRequested`
- * already applies the `confirmCloseWithLiveSession` setting, so this inherits it.
+ * Answers `{ unsaved: [], sessions: [] }` without an IPC call when the tab has no session
+ * bound at all, which is every file tab that has not been split and every diff tab. In that
+ * case the unsaved half is left to Rust's refusal, which already names the file — paying a
+ * round trip to be told the same thing on every `×` is the kind of cost that gets a guard
+ * deleted later.
+ *
+ * When there *is* a session bound the round trip happens anyway, and then **both** halves
+ * come back from it. That matters: a file tab split to hold a Claude pane can be dirty and
+ * mid-turn at the same time, and asking only about the session produced a dialog that said
+ * nothing about the buffer and a "Close anyway" that discarded it. The user opted in to
+ * losing a turn, not to losing their edits.
+ *
+ * The session ids come from the local mirror and the *states* from Rust, because only the
+ * hook server knows which are mid-turn — and `app.quitRequested` already applies the
+ * `confirmCloseWithLiveSession` setting, so the session half inherits it. The unsaved half
+ * deliberately does not; see `Settings::confirm_close_with_live_session` in Rust.
  */
-async function liveSessionsInTab(
+async function tabCloseRisk(
   boot: Bootstrap | null,
   project: ProjectId,
   tab: TabId,
-): Promise<SessionSummary[]> {
+): Promise<{ unsaved: UnsavedTab[]; sessions: SessionSummary[] }> {
+  const nothing = { unsaved: [], sessions: [] }
   const target = boot?.workspace.projects[project]?.tabs.find((t) => t.id === tab)
-  if (!target) return []
+  if (!target) return nothing
   const bound = new Set(
     Object.values(target.tree.panes)
       .map((pane) => pane.session)
       .filter((session): session is SessionId => session !== null),
   )
-  if (bound.size === 0) return []
+  if (bound.size === 0) return nothing
 
   const decision = await appApi.quitRequested(project)
-  return decision.blocking.filter((s) => bound.has(s.session))
+  return {
+    // Narrowed to this tab: the decision answers for the whole project, and listing a dirty
+    // file from a tab that is not closing would be a dialog about work that is not at risk.
+    unsaved: decision.unsaved.filter((u) => u.tab === tab),
+    sessions: decision.blocking.filter((s) => bound.has(s.session)),
+  }
 }
 
 interface WorkspaceStore {
@@ -242,21 +261,23 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await get().hydrate()
   },
   closeTab: async (project, tab, force = false) => {
-    // No pre-flight question here, unlike `closeProject`: the unsaved case comes back from
-    // Rust as a refusal that already names the file, so asking first would be a second round
-    // trip for an answer the failure path hands over anyway — and it would be the answer to
-    // a slightly older workspace.
+    // Mostly no pre-flight question here, unlike `closeProject`: the unsaved case comes back
+    // from Rust as a refusal that already names the file, so asking first would be a second
+    // round trip for an answer the failure path hands over anyway — and it would be the
+    // answer to a slightly older workspace.
     //
-    // Sessions are the exception, and they are asked about only when this tab actually has
-    // one bound. A file tab has no session, and paying an IPC round trip to be told so on
-    // every `×` is exactly the kind of cost that gets a guard removed later.
+    // Sessions are the exception, because Rust has no business refusing an interrupted turn,
+    // and they are asked about only when this tab actually has one bound. `tabCloseRisk`
+    // reports the unsaved files in the same breath: once that round trip is being made, a
+    // dialog that mentions only the session would let "Close anyway" discard a buffer the
+    // user was never shown.
     if (!force) {
-      const live = await liveSessionsInTab(get().boot, project, tab)
-      if (live.length > 0) {
+      const risk = await tabCloseRisk(get().boot, project, tab)
+      if (risk.sessions.length > 0 || risk.unsaved.length > 0) {
         requestCloseConfirm({
           scope: 'tab',
-          unsaved: [],
-          sessions: live,
+          unsaved: risk.unsaved,
+          sessions: risk.sessions,
           proceed: () => get().closeTab(project, tab, true),
         })
         return

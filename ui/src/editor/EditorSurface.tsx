@@ -173,11 +173,11 @@ export function EditorSurface({
       // The baseline moves only once the write has landed, and this ordering is the whole
       // of it. Clearing the dirty flag optimistically reads better and is wrong: a write
       // that fails — read-only mount, disk full, the file replaced by a directory — would
-      // leave a tab that looks saved over a buffer that is not, and the dot in the tab strip
-      // is the only thing telling the user otherwise. Nothing currently *blocks* a close on
-      // that flag, and Rust now *refuses* to close a tab carrying it without an explicit
-      // `force`, so staying dirty through a failed save is not a belt-and-braces measure —
-      // it is what puts the close confirmation in front of the user.
+      // leave a tab that looks saved over a buffer that is not. Rust *refuses* to close a
+      // tab carrying this flag without an explicit `force`, so staying dirty through a
+      // failed save is not a belt-and-braces measure — it is what puts the close
+      // confirmation in front of the user, and clearing it early is what would let the next
+      // `×` discard the write that never landed.
       void Promise.resolve(saveCb.current?.(text)).then(
         () => {
           baseline = saving

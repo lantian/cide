@@ -88,6 +88,11 @@ pub fn load(path: &Path) -> Workspace {
             // The stored `display_path` was abbreviated against whatever `$HOME` wrote the
             // file, which is not necessarily the one reading it.
             crate::workspace::refresh_display_paths(&mut workspace);
+            // `dirty` describes a buffer, and buffers do not survive the process — only the
+            // path is stored. A restored tab is showing the file as it is on disk, so the
+            // flag has to start false or `close_tab` refuses it over edits that no longer
+            // exist. See `workspace::clear_dirty_flags`.
+            crate::workspace::clear_dirty_flags(&mut workspace);
             workspace
         }
         // First launch, or the user deleted the file. Nothing to warn about, and nothing to
@@ -517,6 +522,62 @@ mod tests {
         save_atomic(&path, &workspace).expect("save");
 
         assert_eq!(load(&path), workspace);
+    }
+
+    /// The dirty flag describes a buffer, and buffers do not survive a quit. Restoring one
+    /// set would leave a tab that `close_tab` refuses over edits that exist nowhere — a
+    /// destructive confirmation with nothing behind it, and no gesture that clears it.
+    #[test]
+    fn a_file_tab_saved_dirty_loads_back_clean() {
+        let dir = TempDir::new("dirty-reset");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = fixture();
+        let project = workspace.projects.values_mut().next().expect("a project");
+        let pane = Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Editor,
+            role: PaneRole::Auxiliary,
+            session: None,
+            title: "main.rs".into(),
+        };
+        project.tabs.push(Tab {
+            id: TabId::new(),
+            kind: TabKind::File {
+                path: PathBuf::from("/home/dev/work/cide/src/main.rs"),
+                dirty: true,
+            },
+            tree: PaneTree {
+                root: LayoutNode::Leaf { pane: pane.id },
+                focused: pane.id,
+                maximized: None,
+                panes: IndexMap::from_iter([(pane.id, pane)]),
+            },
+        });
+
+        save_atomic(&path, &workspace).expect("save");
+
+        let loaded = load(&path);
+        let restored = loaded
+            .projects
+            .values()
+            .flat_map(|p| &p.tabs)
+            .find_map(|t| match &t.kind {
+                TabKind::File { dirty, .. } => Some(*dirty),
+                _ => None,
+            })
+            .expect("the file tab came back");
+        assert!(!restored, "a restored file tab starts clean");
+        // Everything else still round-trips: this clears one flag, not the tab.
+        assert_eq!(
+            loaded
+                .projects
+                .values()
+                .flat_map(|p| &p.tabs)
+                .filter(|t| matches!(t.kind, TabKind::File { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

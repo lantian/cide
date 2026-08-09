@@ -159,10 +159,17 @@ fn claude_version() -> Option<String> {
 /// # This is advice, not enforcement
 ///
 /// `tab_close`, `project_close` and `window_close` refuse unsaved work themselves and have
-/// to be told `force`. Quitting has no such chokepoint: the runtime tears the process down
-/// and no domain operation runs. So for the quit path specifically, a caller that never asks
-/// still loses buffers — which is why the editor writes through `file_write` on save rather
-/// than holding a buffer Rust cannot see, and why this command exists at all.
+/// to be told `force`, so every close that arrives as a *command* is enforced.
+///
+/// A close that does not arrive as a command is not. The window manager's own close on a
+/// shell window — Alt+F4, the compositor's button — goes to `WindowEvent::CloseRequested`,
+/// which `cmd::window::intercept_close` deliberately lets through for shells, and from there
+/// to `RunEvent::ExitRequested` and `lifecycle::shutdown`. No domain operation runs on that
+/// path and there is nothing to refuse. Vetoing it would mean `prevent_close` plus a new
+/// event asking the frontend for an answer, and a veto whose answer never comes is an app
+/// that cannot be quit — so the honest state is that this half is advisory, and the mitigation
+/// is that the editor writes through `file_write` on save rather than holding a buffer Rust
+/// cannot see.
 #[tauri::command(rename_all = "camelCase")]
 pub fn app_quit_requested(
     app: tauri::AppHandle,

@@ -621,6 +621,32 @@ pub fn refresh_display_paths(ws: &mut Workspace) {
     }
 }
 
+/// Mark every file tab clean. Called after loading, and only there.
+///
+/// `dirty` describes an *in-memory buffer*, and no buffer survives the process — the text
+/// lives in the editor component, `workspace.json` stores only the path. So a tab restored
+/// with the flag set is describing edits that no longer exist anywhere: the editor re-reads
+/// the file from disk and shows exactly what is on it.
+///
+/// Left set, that stale flag is worse than cosmetic now that [`close_tab`] enforces it. The
+/// tab could not be closed without a dialog offering to discard changes that are not there,
+/// with no gesture that clears it short of editing the file and saving — and a destructive
+/// confirmation the user learns is usually a lie is a confirmation they stop reading, which
+/// costs them the one time it is true.
+///
+/// Cleared here rather than by the editor reporting clean on mount: the editor's report is
+/// deduplicated against what it last said, so a pane that opens clean says nothing at all,
+/// and a file tab restored into a window nobody activates has no editor to report anything.
+pub fn clear_dirty_flags(ws: &mut Workspace) {
+    for p in ws.projects.values_mut() {
+        for t in &mut p.tabs {
+            if let TabKind::File { dirty, .. } = &mut t.kind {
+                *dirty = false;
+            }
+        }
+    }
+}
+
 pub fn validate(ws: &Workspace) -> Result<()> {
     let mut panes: HashSet<PaneId> = HashSet::new();
 
