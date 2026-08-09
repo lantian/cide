@@ -25,8 +25,15 @@
  * a polling timer somewhere else.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { diag, events, git as gitApi, type ProjectId } from '@/ipc/client'
 import {
+  diag,
+  events,
+  git as gitApi,
+  type PathSelection,
+  type ProjectId,
+} from '@/ipc/client'
+import {
+
   allFiles,
   allGroups,
   buildRows,
@@ -42,6 +49,19 @@ import {
 } from './model'
 import { storyFromQuery, type GitStory } from './fixture'
 import type { ChangeFile, ChangesTree, ShelfEntry } from './types'
+
+/**
+ * Whole-file selections for a list of paths.
+ *
+ * The panel ticks files; `cide-git` accepts a `PathSelection` per path so the same commands
+ * serve per-hunk and per-line staging. `whole` is what a ticked checkbox means, and `rev:
+ * null` means "against the current index" rather than a specific revision. Written as one
+ * adapter rather than inline at four call sites so that wiring the hunk gutter later changes
+ * one function.
+ */
+function wholeFiles(paths: string[]): PathSelection[] {
+  return paths.map((path) => ({ path, selection: { kind: 'whole' }, rev: null }))
+}
 
 const EMPTY: ChangesTree = { repos: [] }
 
@@ -332,7 +352,15 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
           // the bar, or when this repo never diverged in the first place.
           const expect = overwritten.current.has(unit.repo) ? null : (repo?.indexToken ?? null)
           const oid = await guarded('git commit', () =>
-            gitApi.commit(project, unit.repo, message, amend, unit.changelist, unit.paths, expect),
+            gitApi.commit(project, unit.repo, {
+              message,
+              amend,
+              changelist: unit.changelist,
+              selections: wholeFiles(unit.paths),
+              // `expect === null` is the waiver: the user chose Overwrite, or this repo
+              // never diverged. `force` is how cide-git spells the same thing.
+              force: expect === null,
+            }),
           )
           if (oid === undefined) {
             allOk = false
@@ -365,7 +393,7 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     void (async () => {
       setBusy('Unstaging…')
       for (const unit of units) {
-        await guarded('git unstage', () => gitApi.stagePaths(project, unit.repo, unit.paths, false))
+        await guarded('git unstage', () => gitApi.unstage(project, unit.repo, wholeFiles(unit.paths)))
       }
       setBusy(null)
       await refresh()
@@ -378,7 +406,7 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
       setBusy('Shelving…')
       const name = message.trim() === '' ? 'Shelved changes' : message.trim()
       for (const unit of units) {
-        await guarded('git shelve', () => gitApi.shelve(project, unit.repo, unit.paths, name))
+        await guarded('git shelve', () => gitApi.shelf.shelve(project, unit.repo, name, wholeFiles(unit.paths)))
       }
       setBusy(null)
       await refresh()
@@ -408,7 +436,7 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
       const file = row.file
       if (project === null || row.kind !== 'file' || file === undefined) return
       void guarded('git diff', () =>
-        gitApi.diffFile(project, row.repo, file.path, stagingArea ? 'staged' : 'worktree'),
+        gitApi.diffFile(project, row.repo, file.path, stagingArea ? 'staged' : 'unstaged'),
       )
     },
     [project, guarded, stagingArea],

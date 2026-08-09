@@ -115,7 +115,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
 
   async toggle(row) {
     const { project } = get()
-    if (project === null || !row.isDir) return
+    if (project === null || row.kind !== 'dir') return
 
     const call = row.expanded
       ? () => fsApi.collapse(project, row.path)
@@ -135,11 +135,14 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     const { project } = get()
     if (project === null) return
 
-    const index = await pendingCommand('fs_reveal', () => fsApi.reveal(project, path), -1)
+    // `fs_reveal` answers `null` for a path outside the index — a stale picker row, or a
+    // file deleted between the pick and the reveal. Treated as "nothing to scroll to"
+    // rather than coerced to a row number.
+    const index = await pendingCommand('fs_reveal', () => fsApi.reveal(project, path), null)
     // The project can be swapped out from under a reveal — `attach` is what a project switch
     // runs — and writing this count and this index into the new project's tree would scroll it
     // to a row belonging to the old one.
-    if (index < 0 || get().project !== project) return
+    if (index === null || index < 0 || get().project !== project) return
 
     // Revealing expands ancestors, so the flattening moved; everything cached is stale.
     resetCache()

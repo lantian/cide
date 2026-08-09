@@ -16,8 +16,27 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { ModalShell, Hint } from './ModalShell'
 import { kindBadge, matchCounter } from './format'
 import { isListKey, listAction } from './listKeys'
-import { pendingCommand, picker as pickerApi, type PickerFrame, type PickerHit, type ProjectId } from '@/ipc/client'
+import {
+  pendingCommand,
+  picker as pickerApi,
+  type PickerFrame,
+  type PickerRow,
+  type ProjectId,
+} from '@/ipc/client'
 import styles from './Overlay.module.css'
+
+/**
+ * The last path component, which is what the row draws large.
+ *
+ * `PickerRow` carries `text` (the path relative to its root, which is what was matched) and
+ * `value` (the absolute path, which is what opening one means). Neither is the basename, so
+ * it is derived here rather than asking Rust for a third field that is a substring of one it
+ * already sends.
+ */
+function basename(path: string): string {
+  const cut = path.lastIndexOf('/')
+  return cut === -1 ? path : path.slice(cut + 1)
+}
 
 /** 26px rows, from the mock. Fixed, so the virtualizer never has to measure. */
 const ROW_HEIGHT = 26
@@ -50,62 +69,52 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
   const [query, setQuery] = useState('')
   const [frame, setFrame] = useState<PickerFrame | null>(null)
   const [selected, setSelected] = useState(0)
-  const [session, setSession] = useState<string | null>(null)
+  /** Bumped per query so a late frame for an older query is dropped. */
+  const queryGeneration = useRef(0)
   const [failed, setFailed] = useState(false)
 
   const scrollRef = useRef<HTMLDivElement>(null)
-  /*
-   * The query the *user* has typed, readable from the frame handler without re-subscribing.
-   *
-   * The handler is installed once, at open, and closes over whatever `query` was then. A
-   * ref is the only way it can compare an arriving frame against the current query, and
-   * without that comparison a slow frame for `ma` repaints the list after the user has
-   * already typed `main` — the classic out-of-order search render.
-   */
-  const liveQuery = useRef('')
 
+  /*
+   * A poll, not a subscription.
+   *
+   * This component was built against a `picker.open(project, kind, onFrame)` channel that
+   * does not exist: the Rust side answers `picker_query` with a whole frame and reports
+   * `running` while the walk is still filling the index. Polling is therefore not a
+   * simplification, it is the protocol — and it is what makes the picker usable before
+   * indexing finishes, which is the property `cide-search`'s streaming injector exists for.
+   *
+   * `generation` guards against the classic out-of-order search render: a slow frame for
+   * `ma` must not repaint a list the user has already narrowed to `main`.
+   */
   useEffect(() => {
     let cancelled = false
-    let opened: string | null = null
+    const generation = ++queryGeneration.current
+    let timer: ReturnType<typeof setTimeout> | undefined
 
-    void pendingCommand(
-      'picker_open',
-      () =>
-        pickerApi.open(project, 'files', (incoming) => {
-          if (incoming.query !== liveQuery.current) return
+    const poll = () => {
+      void pendingCommand('picker_query', () => pickerApi.query(project, query), null).then(
+        (incoming) => {
+          if (cancelled || generation !== queryGeneration.current) return
+          if (incoming === null) {
+            setFailed(true)
+            return
+          }
           setFrame(incoming)
-        }),
-      null,
-    ).then((id) => {
-      if (id === null) {
-        if (!cancelled) setFailed(true)
-        return
-      }
-      opened = id
-      if (cancelled) {
-        // Opened after the overlay was already dismissed. Close it rather than leak the
-        // session: the Rust side is holding a walker and a channel for a window that is
-        // gone, and nothing else will ever ask it to stop.
-        void pendingCommand('picker_close', () => pickerApi.close(id), undefined)
-        return
-      }
-      setSession(id)
-    })
+          // Only while the index is still growing. A settled index is polled once.
+          if (incoming.running) timer = setTimeout(poll, 120)
+        },
+      )
+    }
+    poll()
 
     return () => {
       cancelled = true
-      const id = opened
-      if (id !== null) void pendingCommand('picker_close', () => pickerApi.close(id), undefined)
+      if (timer !== undefined) clearTimeout(timer)
     }
-  }, [project])
+  }, [project, query])
 
-  useEffect(() => {
-    liveQuery.current = query
-    if (session === null) return
-    void pendingCommand('picker_query', () => pickerApi.query(session, query), undefined)
-  }, [session, query])
-
-  const hits: PickerHit[] = useMemo(() => frame?.hits ?? [], [frame])
+  const hits: PickerRow[] = useMemo(() => frame?.items ?? [], [frame])
 
   const virtualizer = useVirtualizer({
     count: hits.length,
@@ -125,9 +134,9 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
       const hit = hits[selected]
       if (!hit) return
       onDismiss()
-      if (modifier === 'shift') onOpenInSplit(hit.path)
-      else if (modifier === 'alt') onMention(hit.path)
-      else onOpen(hit.path)
+      if (modifier === 'shift') onOpenInSplit(hit.value)
+      else if (modifier === 'alt') onMention(hit.value)
+      else onOpen(hit.value)
     },
     [hits, selected, onDismiss, onOpen, onOpenInSplit, onMention],
   )
@@ -179,18 +188,18 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
         </div>
       ) : hits.length === 0 ? (
         <div className={styles.status}>
-          {frame?.indexing === true ? 'Indexing…' : query === '' ? 'Type to search' : 'No matches'}
+          {frame?.running === true ? 'Indexing…' : query === '' ? 'Type to search' : 'No matches'}
         </div>
       ) : (
         <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
           {virtualizer.getVirtualItems().map((item) => {
             const hit = hits[item.index]
             if (!hit) return null
-            const badge = kindBadge(hit.name)
+            const badge = kindBadge(basename(hit.value))
             const tone = TONE_CLASS[badge.tone] ?? styles.toneFaint
             return (
               <div
-                key={hit.path}
+                key={hit.value}
                 className={item.index === selected ? `${styles.row} ${styles.rowSelected}` : styles.row}
                 data-audit="pickerRow"
                 style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
@@ -203,8 +212,8 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
                 }}
               >
                 <span className={`${styles.badge} ${tone}`}>{badge.label}</span>
-                <span className={styles.name}>{hit.name}</span>
-                <span className={styles.path}>{hit.relative}</span>
+                <span className={styles.name}>{basename(hit.value)}</span>
+                <span className={styles.path}>{hit.text}</span>
               </div>
             )
           })}

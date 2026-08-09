@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit",
     "check:format": "node scripts/check-status-format.mjs",
     "check:git": "node scripts/check-git-tree.mjs",
-    "check:render": "node scripts/check-git-render.mjs"
+    "check:render": "node scripts/check-git-render.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:picker": "node scripts/check-picker.mjs"
   },

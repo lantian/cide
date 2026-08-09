@@ -340,6 +340,9 @@ export const picker = {
    */
   rank: (query: string, items: PickerItem[], limit?: number) =>
     invoke<PickerFrame>('picker_rank', { query, items, limit: limit ?? null }),
+}
+
+/**
  * The Settings tab's surface.
  *
  * `set` takes a patch rather than the whole struct: two windows can have Settings open, and
@@ -559,6 +562,8 @@ export const events = {
     listen<{ project: ProjectId; status: FsStatus }>('cide://fs-status', (e) =>
       handler(e.payload.project, e.payload.status),
     ),
+
+  /**
    * A project's changes tree was recomputed.
    *
    * Fires after any git mutation cide made, in every window. Changes made *outside* cide —
@@ -725,188 +730,19 @@ export const file = {
   read: (path: string) => invoke<FileDoc>('file_read', { path }),
 
   write: (path: string, text: string) => invoke<void>('file_write', { path, text }),
- * Git — the M10 commit tool window (`ui/src/sidebar/GitPanel`).
- *
- * **None of these handlers is registered yet.** `cide-git` is a stub and the Rust side is
- * being written in parallel, so every call here rejects with Tauri's "command not found"
- * until it lands. They are absent from `contract/commands.json` for exactly that reason:
- * `contract-check` diffs the contract against the commands `cide-app` actually registers,
- * so listing them early would fail the gate rather than document intent. Whoever registers
- * `git_status` adds all eight names in the same change.
- *
- * The panel therefore treats a rejection as "no git data" and paints an empty tree — see
- * `useGitPanel`, which routes every call through one guard. That is not defensive
- * decoration: it is what lets the panel ship, be looked at, and be reviewed before the
- * backend exists.
- *
- * Returns are `unknown` rather than a DTO on purpose. The `ChangesTree` DTO is not in
- * `cide-ipc` yet, so `generated.ts` has nothing to import; `normalizeStatus` validates the
- * payload at the boundary instead. When the DTOs land, these signatures tighten to the
- * generated types and the normaliser becomes a thin cast.
- */
-export const git = {
-  /** The whole panel: every repo, changelist, submodule group and file. */
-  status: (projectId: ProjectId) => invoke<unknown>('git_status', { project: projectId }),
+}
 
-  /** One file's diff text. `side` picks the staged or the working-tree comparison. */
-  diffFile: (projectId: ProjectId, repo: string, path: string, side: 'staged' | 'worktree') =>
-    invoke<unknown>('git_diff_file', { project: projectId, repo, path, side }),
-
-  /** Whole-file staging. Hunk and line staging goes through `applyHunks`. */
-  stagePaths: (projectId: ProjectId, repo: string, paths: string[], staged: boolean) =>
-    invoke<void>('git_stage_paths', { project: projectId, repo, paths, staged }),
-
-  /** A synthesized unified diff applied to the index only (`ApplyLocation::Index`). */
-  applyHunks: (projectId: ProjectId, repo: string, patch: string) =>
-    invoke<void>('git_apply_hunks', { project: projectId, repo, patch }),
-
-  /**
-   * Commit one changelist. Returns the new commit's id.
-   *
-   * `expectIndex` is the index state the panel last saw. Rust refuses the commit if the
-   * real index has moved since — that refusal is what raises the "staging changed outside
-   * cide" bar instead of silently clobbering a `git add` someone ran in a bash pane.
-   */
-  commit: (
-    projectId: ProjectId,
-    repo: string,
-    message: string,
-    amend: boolean,
-    changelist: string | null,
-    paths: string[],
-    expectIndex: string | null,
-  ) =>
-    invoke<string>('git_commit', {
-      project: projectId,
-      repo,
-      message,
-      amend,
-      changelist,
-      paths,
-      expectIndex,
-    }),
-
-  push: (projectId: ProjectId, repo: string, remote: string | null, refspec: string | null) =>
-    invoke<void>('git_push', { project: projectId, repo, remote, refspec }),
-
-  changelistCreate: (projectId: ProjectId, repo: string, name: string) =>
-    invoke<void>('git_changelist_create', { project: projectId, repo, name }),
-
-  /** Shelve paths as our own patch. With no paths, shelves the whole selection's repo. */
-  shelve: (projectId: ProjectId, repo: string, paths: string[], name: string) =>
-    invoke<unknown>('git_shelve', { project: projectId, repo, paths, name }),
 /* --------------------------------------------------------------------------------------
- * M8 — file tree and pickers.
+ * Removed at integration: the provisional `git`, `fs` and `picker` namespaces and their
+ * hand-written `TreeRow` / `PickerFrame` / `TreeStatus` types.
  *
- * PENDING: none of the eight commands below exist in Rust yet; `cide-fs` and `cide-search`
- * are being built in parallel. They are declared here so the frontend can be written and
- * reviewed against the real names, and every caller in `ui/src/sidebar` and
- * `ui/src/overlays` goes through `pendingCommand()` so a missing handler degrades to an
- * empty tree and an empty picker rather than an unhandled rejection.
- *
- * The payload types below are likewise provisional. When `cide-ipc` gains `TreeRow`,
- * `TreeStatus`, `PickerKind`, `PickerHit` and `PickerFrame`, `cargo xtask codegen` will put
- * them in `generated.ts` and these local declarations should be DELETED in favour of the
- * generated ones — they are deliberately structural so that swap is a re-export, not a
- * rewrite. `contract/commands.json` is likewise not touched here: adding names with no Rust
- * handler behind them fails `cargo xtask contract-check` in this tree, and the entries
- * belong with whoever writes the handlers.
+ * Two agents built each of these in parallel — one the Rust half with real DTOs in
+ * `cide-ipc`, one the frontend half against guessed command names and `invoke<unknown>`.
+ * Both landed. The generated-DTO versions above are the real ones; these were scaffolding
+ * that existed only so the panels could be built and reviewed before their backend did.
+ * Keeping both would have left two `export const git` in one module and a `TreeRow` that
+ * shadows the generated type it was standing in for.
  * ------------------------------------------------------------------------------------ */
-
-/** Git status of a tree row. `clean` renders in `--text` with no tag letter. */
-export type TreeStatus = 'clean' | 'modified' | 'added' | 'deleted' | 'untracked' | 'ignored'
-
-/**
- * One row of the flattened file tree.
- *
- * Flattened and windowed on the Rust side: a 100k-file repository is one array of rows there
- * and never crosses the IPC boundary whole. `depth` is what the renderer indents by; the
- * tree structure itself is never sent.
- */
-export interface TreeRow {
-  /** Absolute path. Unique, and the identity the renderer keys on. */
-  path: string
-  /** Display name. For a root row this is the root's label, not necessarily its basename. */
-  name: string
-  /** 0 for a root row. A multi-root project contributes one depth-0 row per root. */
-  depth: number
-  isDir: boolean
-  /** Directories only; `false` for a collapsed directory and for every file. */
-  expanded: boolean
-  /** Whether a twisty should be drawn at all. */
-  hasChildren: boolean
-  status: TreeStatus
-}
-
-export type PickerKind = 'files' | 'commands' | 'symbols'
-
-/** One candidate. `indices` are match positions in `name`, for highlighting. */
-export interface PickerHit {
-  /** Absolute path — what `tab.open_file` takes. */
-  path: string
-  /** Basename, shown first and in `--text`. */
-  name: string
-  /** Path relative to the project root, shown after the name in `--dim`. */
-  relative: string
-  indices?: number[]
-}
-
-/**
- * A streamed frame of picker results.
- *
- * Frames rather than a return value because the index is built while the user is already
- * typing: the picker has to be usable before indexing finishes, so results arrive as they
- * are found. `matched` and `total` are what the mock's `6 of 2,418` counter reads.
- */
-export interface PickerFrame {
-  picker: string
-  /** Which query this frame answers. Frames for a stale query are dropped by the caller. */
-  query: string
-  hits: PickerHit[]
-  matched: number
-  total: number
-  /** True while the walker is still adding to the corpus. */
-  indexing: boolean
-}
-
-export const fs = {
-  /** Windowed: `[offset, offset + len)` of the flattened tree. Never ships the whole tree. */
-  treeRows: (project: ProjectId, offset: number, len: number) =>
-    invoke<TreeRow[]>('fs_tree_rows', { project, offset, len }),
-  treeCount: (project: ProjectId) => invoke<number>('fs_tree_count', { project }),
-  /** Returns the new total row count, so the caller can resize without a second call. */
-  expand: (project: ProjectId, path: string) => invoke<number>('fs_expand', { project, path }),
-  collapse: (project: ProjectId, path: string) => invoke<number>('fs_collapse', { project, path }),
-  /** Expands whatever is needed to make `path` visible and returns its row index. */
-  reveal: (project: ProjectId, path: string) => invoke<number>('fs_reveal', { project, path }),
-}
-
-export const picker = {
-  /**
-   * Open a picker session and start streaming frames into `onFrame`.
-   *
-   * A session rather than a query-response call: the walker keeps finding files after the
-   * first frame, and a `Vec` return would make the picker wait for a 100k-file repository
-   * to finish indexing before it could show anything.
-   */
-  open: (projectId: ProjectId, kind: PickerKind, onFrame: (frame: PickerFrame) => void) => {
-    const sink = new Channel<PickerFrame>()
-    sink.onmessage = onFrame
-    return invoke<string>('picker_open', { project: projectId, kind, sink })
-  },
-  query: (id: string, query: string) => invoke<void>('picker_query', { picker: id, query }),
-  close: (id: string) => invoke<void>('picker_close', { picker: id }),
-}
-
-/**
- * File-system events. PENDING, like the commands above.
- *
- * Subscribing to an event Rust never emits is inert — `listen` resolves and the handler is
- * simply never called — so these are wired now rather than left as a TODO, and the tree
- * starts refreshing itself the moment `cide-fs` begins emitting. `contract/events.json` is
- * not touched for the same reason `contract/commands.json` is not: `contract-check` reflects
- * over `emit.rs`, and the entries belong with the code that emits them.
- */
 export const fsEvents = {
   /** Debounced 300 ms in Rust. 5,000 touched files arrive as one event, not 5,000. */
   onChanged: (handler: (project: ProjectId, paths: string[]) => void) =>

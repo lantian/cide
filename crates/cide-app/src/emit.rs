@@ -172,6 +172,9 @@ pub fn fs_status(app: &AppHandle, project: cide_ipc::ProjectId, status: &cide_ip
     };
     if let Err(error) = app.emit(FS_STATUS, payload) {
         tracing::debug!(%error, "fs-status reached no window");
+    }
+}
+
 // --- git events ---------------------------------------------------------------------------
 
 /// The changes tree for one project was recomputed.

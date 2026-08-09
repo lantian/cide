@@ -14,7 +14,28 @@
 import { useEffect, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useFileTree } from './treeStore'
-import { isDegraded, type TreeRow, type TreeStatus } from '@/ipc/client'
+import { isDegraded, type TreeRow } from '@/ipc/client'
+
+/**
+ * The status letter a row carries in the mock: `M` blue, `A` green, `D` faint struck through.
+ *
+ * Declared here rather than imported because **nothing supplies it yet**. `TreeRow` comes
+ * from `cide-fs`, which indexes the filesystem and knows nothing about git; per-path status
+ * is `cide-git`'s. Joining them is integration work that neither milestone owned, so every
+ * row currently renders `clean` and the tag column stays empty. The styling below is kept
+ * intact so that wiring the join is a one-line change at `statusOf` rather than a redesign.
+ */
+export type TreeStatus = 'clean' | 'modified' | 'added' | 'deleted' | 'untracked' | 'ignored'
+
+/**
+ * Always `clean` until the git join lands. See `TreeStatus`.
+ *
+ * A function rather than a constant so the call site reads as a lookup that will one day
+ * consult something, and so the one place to change is obvious.
+ */
+function statusOf(_row: TreeRow): TreeStatus {
+  return 'clean'
+}
 import styles from './FileTree.module.css'
 
 /** 21px rows, from the mock. */
@@ -158,8 +179,8 @@ function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
    * a plain string, and `status.letter` on `undefined` throws *inside a render*, which unmounts
    * the whole tree rather than mis-drawing one row.
    */
-  const status = STATUS[row.status] ?? CLEAN
-  const twisty = row.isDir && row.hasChildren ? (row.expanded ? '▾' : '▸') : ''
+  const status = STATUS[statusOf(row)] ?? CLEAN
+  const twisty = (row.kind === 'dir') && row.hasChildren ? (row.expanded ? '▾' : '▸') : ''
 
   return (
     <div
@@ -170,7 +191,7 @@ function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
       title={row.path}
       onMouseDown={() => {
         onSelect()
-        if (row.isDir) void useFileTree.getState().toggle(row)
+        if ((row.kind === 'dir')) void useFileTree.getState().toggle(row)
         else onOpen?.(row.path)
       }}
     >
@@ -185,10 +206,10 @@ function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
        * surfaces agree about what a directory looks like.
        */}
       <span
-        className={row.isDir ? `${styles.glyph} ${styles.glyphDir}` : styles.glyph}
+        className={(row.kind === 'dir') ? `${styles.glyph} ${styles.glyphDir}` : styles.glyph}
         aria-hidden="true"
       >
-        {row.isDir ? '▤' : '▫'}
+        {(row.kind === 'dir') ? '▤' : '▫'}
       </span>
       <span
         className={
