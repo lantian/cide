@@ -1,0 +1,94 @@
+name: Set up Rust
+description: >
+  Installs the exact toolchain named by rust-toolchain.toml — never `stable` — and
+  optionally restores the cargo caches. Lives as a composite action because three jobs
+  need it and a copy-pasted third copy is how the version pin quietly forks.
+
+inputs:
+  cache:
+    description: >
+      Restore and save the cargo registry and target/ caches. Set to "false" for jobs that
+      only resolve the dependency graph and never compile — for those the cache costs more
+      to download than the work it saves.
+    required: false
+    default: "true"
+  cache-key:
+    description: >
+      Extra discriminator for the cache entry. Jobs whose target/ contents differ (clippy
+      vs. a plain build) otherwise evict each other's caches all day.
+    required: false
+    default: ""
+
+outputs:
+  channel:
+    description: The toolchain channel that was installed.
+    value: ${{ steps.pin.outputs.channel }}
+
+runs:
+  using: composite
+  steps:
+    # rust-toolchain.toml is the single source of truth for the compiler, its profile and
+    # its components. Parsed rather than restated: writing `1.92.0` here would mean a
+    # toolchain bump is two edits, and the day someone makes only one of them CI is
+    # testing a compiler nobody develops against.
+    #
+    # tomllib over a sed one-liner because the components list is a TOML array and the
+    # sed version would silently yield an empty component set — producing a toolchain with
+    # no clippy, whose `cargo clippy` failure reads as a missing binary rather than as a
+    # broken pin. python3 >= 3.11 is present on every current GitHub-hosted runner.
+    - name: Read the toolchain pin
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        eval "$(python3 - <<'PY'
+        import shlex, tomllib
+        with open("rust-toolchain.toml", "rb") as f:
+            t = tomllib.load(f)["toolchain"]
+        print("channel=" + shlex.quote(t["channel"]))
+        print("profile=" + shlex.quote(t.get("profile", "default")))
+        print("components=" + shlex.quote(",".join(t.get("components", []))))
+        PY
+        )"
+        if [ -z "${channel:-}" ]; then
+          echo "::error file=rust-toolchain.toml::no [toolchain] channel found" >&2
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        echo "profile=$profile" >> "$GITHUB_OUTPUT"
+        echo "components=$components" >> "$GITHUB_OUTPUT"
+        echo "pinned toolchain: $channel (profile=$profile, components=${components:-none})"
+
+    - name: Install the pinned toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        channel='${{ steps.pin.outputs.channel }}'
+        profile='${{ steps.pin.outputs.profile }}'
+        components='${{ steps.pin.outputs.components }}'
+        args=(toolchain install "$channel" --profile "$profile" --no-self-update)
+        # One --component flag per name. rustup does accept a comma-separated value, but
+        # only as a clap value-delimiter detail that has changed shape between releases.
+        IFS=',' read -ra comps <<<"$components"
+        for c in "${comps[@]}"; do
+          [ -n "$c" ] && args+=(--component "$c")
+        done
+        rustup "${args[@]}"
+        rustup default "$channel"
+        rustc --version
+        cargo --version
+
+    # Swatinem/rust-cache rather than a hand-rolled actions/cache over ~/.cargo and
+    # target/: this workspace pulls the whole webview stack (tauri, wry, tao, webkit
+    # bindings) plus vendored libgit2 and OpenSSL, and an unpruned target/ cache for that
+    # graph runs to gigabytes — it exceeds the repository cache budget within a handful of
+    # runs and then thrashes. This action caches the registry, prunes stale target/
+    # entries, and keys on Cargo.lock and the toolchain for us.
+    - name: Cache cargo
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        # The pin is part of the cache identity: artifacts built by 1.92.0 are not
+        # reusable by whatever the file says next.
+        prefix-key: v1-rust-${{ steps.pin.outputs.channel }}

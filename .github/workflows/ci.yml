@@ -1,0 +1,215 @@
+name: CI
+
+# Every gate in this repository was, until this file existed, a gate only because a human
+# remembered to run it. `cargo xtask codegen --check` and `cargo xtask contract-check` are
+# described throughout the source as "CI gates"; this is the CI that makes that true.
+on:
+  # Push is unrestricted rather than `branches: [main]`. This project's work happens on
+  # long-lived feature branches (m7-hooks-and-fixes, m8-m11-integration, agent worktrees)
+  # that may go days before a PR exists, and a gate that only fires at merge time is a
+  # gate that reports the breakage after the branch it broke has moved on. The cost is a
+  # duplicate run for a same-repo PR branch, which the concurrency group below does not
+  # collapse because push and pull_request carry different refs.
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A second push to a branch makes the first run's answer worthless, and the rust job is
+# minutes long. main is exempt: its runs are the record of what shipped.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace turns "assertion failed" into a location. Free on a green run.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------------
+  # The structural invariant, on its own so it answers in seconds.
+  #
+  # `cide-headless` renders a live session from the vt100 mirror with zero Tauri linked;
+  # it is the standing proof that the domain core is frontend-free. If domain logic leaks
+  # into the app crate, or a core crate grows a tauri dependency to reach for an app
+  # handle, this is what says so.
+  # ---------------------------------------------------------------------------------
+  no-tauri-in-core:
+    name: cide-headless links no tauri
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # `cargo tree` resolves the lockfile without compiling anything, so this job needs
+      # neither the webview system libraries nor a warm target/ — hence cache: "false".
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+
+      - name: Assert cide-headless does not link tauri
+        run: |
+          set -euo pipefail
+          # dev edges included on purpose: a tauri dev-dependency would still mean the
+          # crate's tests can only run with the webview stack present, which is the thing
+          # this invariant exists to prevent.
+          tree="$(cargo tree -p cide-headless --edges normal,build,dev)"
+          echo "$tree"
+          if grep -qi 'tauri' <<<"$tree"; then
+            echo "::error file=crates/cide-headless/Cargo.toml::cide-headless has acquired a tauri dependency. Only cide-app may depend on tauri — the offending edge is in the tree above. Move the logic into a domain crate instead of reaching for an app handle."
+            exit 1
+          fi
+          echo "ok: no tauri anywhere in the cide-headless graph"
+
+  # ---------------------------------------------------------------------------------
+  # Rust: build, test, lint, format, and the two xtask gates.
+  # ---------------------------------------------------------------------------------
+  rust:
+    name: rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # cide-app links the system webview. Tauri 2 is on the libsoup-3 stack, so this is
+      # webkit2gtk **4.1**, not 4.0 — 4.0 is the libsoup-2 build and links a second,
+      # incompatible copy of the same libraries.
+      #
+      # libwebkit2gtk-4.1-dev pulls gtk+-3.0, libsoup-3.0 and javascriptcoregtk-4.1 in
+      # transitively; they are named anyway so that a runner image dropping one fails here
+      # with the package name rather than three thousand lines later inside a build script
+      # that could not find a .pc file.
+      #
+      # Deliberately absent: patchelf, librsvg2-dev and the rest of the AppImage/deb
+      # bundling chain. Nothing in this workflow runs `tauri build` or `cargo xtask
+      # package`; adding them would slow every run for a capability no job uses.
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            pkg-config
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust
+
+      # First, because it needs no compilation at all: a run that is going to fail on
+      # formatting should say so in thirty seconds rather than after the webview stack.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      # `contract-check` only parses crates/cide-app/src/{lib,emit}.rs and diffs the
+      # command and event surface against contract/*.json, so it is nearly free and runs
+      # before the expensive steps.
+      - name: cargo xtask contract-check
+        run: cargo xtask contract-check
+
+      # No ui/dist is built for this. tauri-codegen only embeds frontendDist when the
+      # `custom-protocol` feature is on (that is `tauri build`); a plain cargo build sees
+      # dev_url instead and embeds nothing. Building the frontend here to satisfy a
+      # requirement that does not apply would put a pnpm install in front of every Rust
+      # step. The ui job builds ui/dist and proves it builds.
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      # `--ignored` is deliberately NOT passed, and must not be added.
+      #
+      # The ignored tests in cide-claude (real_headless, real_hooks) and cide-ide-mcp
+      # (real_cli) spawn the real `claude` binary. They need it installed on PATH, a
+      # logged-in Anthropic account, network access, and they consume the developer's own
+      # API quota. A CI runner has none of the first three and has no business spending
+      # the last. Run them by hand: `cargo test --workspace -- --ignored`.
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Last of the Rust steps because it shells out to `cargo test -p cide-ipc` to
+      # regenerate the ts-rs bindings before diffing them against ui/src/ipc/generated.ts —
+      # cheap only once the test binaries above are already built. A Rust field rename that
+      # never reached the generated TypeScript fails here instead of surfacing as an
+      # `undefined` in the webview at runtime.
+      - name: cargo xtask codegen --check
+        run: cargo xtask codegen --check
+
+  # ---------------------------------------------------------------------------------
+  # Frontend: typecheck, the project's own check:* harness, and the production build.
+  # ---------------------------------------------------------------------------------
+  ui:
+    name: ui
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # ui/package.json has no `packageManager` field, so pnpm/action-setup has nothing to
+      # infer from and the version has to be stated here. 9.15.4 is the release that wrote
+      # ui/pnpm-lock.yaml (lockfileVersion 9.0), and `--frozen-lockfile` below is only
+      # meaningful against the version that produced the lockfile. Adding
+      # "packageManager": "pnpm@9.15.4" to ui/package.json would delete this pin and this
+      # comment with it.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      # setup-node's built-in pnpm store cache; it must run *after* pnpm exists on PATH.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      # --frozen-lockfile so a dependency that drifted from the lockfile is a failure and
+      # not a silent resolution. The versions in ui/package.json are pinned exactly, with
+      # no carets, precisely so that this is deterministic.
+      - name: pnpm install
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm build` runs `tsc --noEmit` itself. This step is separate anyway so that a
+      # type error is reported as a type error, in its own annotation, rather than as a
+      # failed build several minutes into vite.
+      - name: pnpm exec tsc --noEmit
+        run: pnpm --dir ui exec tsc --noEmit
+
+      # This project has no JS test runner — the check:* scripts are the frontend's test
+      # suite. They compile the modules under test with the TypeScript already in
+      # node_modules and exercise the output, so they need `pnpm install` but not a build.
+      #
+      # Enumerated from package.json instead of listed here. A hardcoded list stops
+      # covering a check the moment someone adds `check:whatever`, and does it silently —
+      # the exact failure mode this whole file exists to end.
+      - name: Run every ui check:* script
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts="$(node -p "Object.keys(require('./ui/package.json').scripts ?? {}).filter(s => s.startsWith('check:')).join(' ')")"
+          if [ -z "$scripts" ]; then
+            echo "::error file=ui/package.json::no check:* scripts found. They are the frontend's only test suite — if they were renamed, this enumeration needs to follow them; if they were deleted, that should be a deliberate commit."
+            exit 1
+          fi
+          echo "found $(wc -w <<<"$scripts") check scripts: $scripts"
+          failed=""
+          for s in $scripts; do
+            echo "::group::pnpm --dir ui run $s"
+            # Every check runs even after one fails: they cover unrelated subsystems
+            # (key gate, git render, picker scoring) and stopping at the first hides the
+            # rest of the damage for a whole round trip.
+            if ! pnpm --dir ui run "$s"; then
+              failed="$failed $s"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failing ui checks:$failed"
+            exit 1
+          fi
+
+      - name: pnpm build
+        run: pnpm --dir ui build
