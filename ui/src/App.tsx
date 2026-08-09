@@ -434,6 +434,11 @@ export function App() {
                           project={activeProject.id}
                           primarySession={activeProject.primarySession}
                           diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}
+                          editor={
+                            tab.kind.kind === 'file'
+                              ? { tab: tab.id, path: tab.kind.path }
+                              : undefined
+                          }
                           restore={restorePlan.get(paneNode.id)}
                           onSessionBound={(session) =>
                             void bindSession(activeProject.id, tab.id, paneNode.id, session)

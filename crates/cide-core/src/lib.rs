@@ -18,6 +18,7 @@
 //! able to link a webview — that is the standing check that the rule is being kept.
 
 pub mod commands;
+pub mod document;
 pub mod error;
 pub mod keymap;
 pub mod layout;

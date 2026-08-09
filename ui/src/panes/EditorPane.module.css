@@ -1,0 +1,91 @@
+/*
+ * The file pane's own chrome: the conflict bar and the two states that are not a buffer.
+ * Everything about the editor itself lives in `editor/EditorSurface.module.css`.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.surface {
+  flex: 1;
+  min-height: 0;
+}
+
+/*
+ * Above the breadcrumb bar rather than over the buffer. A bar that overlays text hides the
+ * lines the user needs in order to decide, and this one is asking them to choose between
+ * two versions of exactly that text.
+ */
+.conflict {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--chrome);
+  font-size: 12px;
+  color: var(--text);
+}
+
+.conflictText {
+  flex: 1;
+  min-width: 0;
+  color: var(--yellow);
+}
+
+.conflictButton {
+  flex: none;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--chrome-hi);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.conflictButton:hover {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.conflictButton:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 100%;
+  padding: 16px;
+  background: var(--panel);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.noticeTitle {
+  font-size: 13px;
+  color: var(--text-hi);
+}
+
+.noticeWhy {
+  max-width: 60ch;
+  line-height: 1.5;
+  color: var(--faint);
+  /* A path or an OS message can be long and has no spaces to break on. */
+  overflow-wrap: anywhere;
+}

@@ -294,3 +294,23 @@ pub struct SplitOutcome {
     pub pane: PaneId,
     pub intent: SplitIntent,
 }
+
+/// A text file as the editor loads it. (M9)
+///
+/// The text is the file's bytes verbatim, line endings included. Normalising here would be
+/// the convenient thing and the wrong one: CodeMirror normalises again on `EditorState`
+/// creation, so the only place that can tell a CRLF file from an LF one is the side holding
+/// the original — and if that is not the editor, every save rewrites every line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileDoc {
+    pub path: std::path::PathBuf,
+    pub text: String,
+    /// False when the file is on a read-only mount or owned by another user.
+    ///
+    /// Advisory — the write is still attempted and can still fail — but it is what lets the
+    /// buffer open read-only rather than letting the user type for ten minutes into
+    /// something that cannot be saved.
+    pub writable: bool,
+}
