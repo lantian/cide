@@ -106,12 +106,10 @@ pub fn pane_close(
     project: ProjectId,
     tab: TabId,
     pane: PaneId,
+    force: bool,
 ) -> Result<Mutated, CoreError> {
     state
-        .update(|ws| {
-            let t = workspace::tab_mut(ws, project, tab)?;
-            layout::close(&mut t.tree, pane)
-        })
+        .update(|ws| workspace::close_pane(ws, project, tab, pane, force))
         .map(|()| Mutated { rev: state.rev() })
 }
 

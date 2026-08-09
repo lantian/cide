@@ -159,7 +159,7 @@ interface WorkspaceStore {
     side: Side,
     intent?: SplitIntent | null,
   ) => Promise<SplitOutcome>
-  closePane: (project: ProjectId, tab: TabId, pane: PaneId) => Promise<void>
+  closePane: (project: ProjectId, tab: TabId, pane: PaneId, force?: boolean) => Promise<void>
   focusPane: (project: ProjectId, tab: TabId, pane: PaneId) => Promise<void>
   maximizePane: (project: ProjectId, tab: TabId, pane: PaneId | null) => Promise<void>
   /** Committed on pointerup only — the drag itself writes to the DOM. */
@@ -303,12 +303,19 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await get().hydrate()
     return created
   },
-  closePane: async (project, tab, pane) => {
+  closePane: async (project, tab, pane, force = false) => {
     // Three steps, and the order is the whole of it.
     //
     // 1. The domain call, which may be refused — the project console's primary pane cannot
-    //    go, nor a tab's last — so nothing may be disposed until it has succeeded.
-    await paneApi.close(project, tab, pane)
+    //    go, nor a tab's last, nor an editor pane holding unsaved edits — so nothing may be
+    //    disposed until it has succeeded. The unsaved refusal parks the same dialog a tab
+    //    close does; discarding re-issues with `force: true`.
+    const parked = await refused(
+      'pane',
+      () => paneApi.close(project, tab, pane, force),
+      () => get().closePane(project, tab, pane, true),
+    )
+    if (parked) return
 
     // 2. Re-read and let React commit. The pane's `TerminalPane` unmounts here: its effect
     //    cleanup detaches the sink, clears the exit poll and parks the host. Disposing

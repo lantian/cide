@@ -40,7 +40,7 @@ export interface SessionLike {
 }
 
 /** What the user asked to close. Only the wording depends on it. */
-export type CloseScope = 'tab' | 'project' | 'window' | 'app'
+export type CloseScope = 'pane' | 'tab' | 'project' | 'window' | 'app'
 
 /** Everything a close would cost, in the shape `app.quitRequested` answers. */
 export interface CloseRisk {
@@ -63,7 +63,10 @@ export function atRisk(risk: CloseRisk): boolean {
 
 /** The heading. Names the single file when there is exactly one, because that is clearest. */
 export function confirmTitle(scope: CloseScope, risk: CloseRisk): string {
-  if (risk.unsaved.length === 1 && scope === 'tab') {
+  // A pane close discards one editor's buffer, so it names the file for the same reason a
+  // single-file tab close does: "1 file with unsaved changes" tells the user nothing they
+  // can act on when they are looking straight at it.
+  if (risk.unsaved.length === 1 && (scope === 'tab' || scope === 'pane')) {
     return `${risk.unsaved[0]!.title} has unsaved changes`
   }
   if (risk.unsaved.length > 0) {
@@ -138,6 +141,8 @@ export function count(n: number, noun: string): string {
 /** What the sentence is about: the thing being closed. */
 function subject(scope: CloseScope): string {
   switch (scope) {
+    case 'pane':
+      return 'this pane'
     case 'tab':
       return 'this tab'
     case 'project':

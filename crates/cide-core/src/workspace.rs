@@ -337,6 +337,44 @@ pub fn unsaved_in_tab(
 /// dialog, and calls it again with the user's answer. Two functions would put the choice of
 /// which to call in the hands of whoever wrote the call site, and the wrong choice there is
 /// silent — a bool is impossible to pass by accident and greps in one line.
+/// Close one pane, refusing to discard an editor's unsaved buffer.
+///
+/// The gap this closes: `layout::close` is a tree operation and knows nothing about
+/// documents, so closing an editor pane directly used to drop the buffer with no guard at
+/// all — while `close_tab` right below refused the same loss. A user could not close the
+/// tab, but could close the pane inside it, and lose exactly as much.
+///
+/// Only an `Editor` pane can hold unsaved text. A `File` tab has exactly one (`PaneBody`
+/// dispatches on the pane kind for this reason), so closing it *is* discarding the buffer
+/// even though the tab survives.
+pub fn close_pane(
+    ws: &mut Workspace,
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    force: bool,
+) -> Result<()> {
+    // Immutable borrow first, like `close_tab`: a refusal must leave `rev` untouched.
+    if !force {
+        let t = self::tab(ws, project, tab)?;
+        let is_editor = t
+            .tree
+            .panes
+            .get(&pane)
+            .is_some_and(|p| p.kind == PaneKind::Editor);
+        if is_editor && let Some(unsaved) = unsaved_in_tab(ws, project, tab)? {
+            return Err(CoreError::UnsavedChanges {
+                tabs: vec![unsaved],
+            });
+        }
+    }
+
+    let t = tab_mut(ws, project, tab)?;
+    crate::layout::close(&mut t.tree, pane)?;
+    bump(ws);
+    Ok(())
+}
+
 pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool) -> Result<()> {
     // Both checks run against an immutable borrow and precede every mutation, so a refusal
     // leaves the workspace exactly as it was — including `rev`, which a caller uses to
@@ -1440,6 +1478,93 @@ mod tests {
         .expect("opens");
 
         assert!(unsaved_tabs(&ws, None).is_empty());
+    }
+
+    #[test]
+    fn closing_an_editor_pane_refuses_to_discard_its_buffer() {
+        // The hole `close_pane` was written for: `close_tab` refused this loss while
+        // `pane_close` went straight to `layout::close`, so a user who could not close the
+        // tab could close the editor pane inside it and lose exactly as much.
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = open_tab(
+            &mut ws,
+            id,
+            TabKind::File {
+                path: PathBuf::from("/home/dev/work/cide/src/main.rs"),
+                dirty: true,
+            },
+            demo_pane(PaneKind::Editor, "main.rs", false),
+        )
+        .expect("opens");
+
+        // A second pane, so the refusal is about the buffer and not about `LastPane`.
+        let t = tab_mut(&mut ws, id, tab).expect("exists");
+        let editor = t.tree.focused;
+        layout::split(
+            &mut t.tree,
+            editor,
+            Axis::Row,
+            Side::After,
+            demo_pane(PaneKind::Claude, "claude", false),
+        )
+        .expect("splits");
+
+        let before = ws.rev;
+        let err = close_pane(&mut ws, id, tab, editor, false).expect_err("refuses");
+        assert!(
+            matches!(err, CoreError::UnsavedChanges { ref tabs } if tabs.len() == 1),
+            "expected UnsavedChanges naming the file, got {err:?}"
+        );
+        assert_eq!(ws.rev, before, "a refusal must not move rev");
+        assert!(
+            tab_mut(&mut ws, id, tab)
+                .expect("exists")
+                .tree
+                .panes
+                .contains_key(&editor),
+            "the pane must survive a refusal"
+        );
+
+        close_pane(&mut ws, id, tab, editor, true).expect("force discards");
+        assert!(
+            !tab_mut(&mut ws, id, tab)
+                .expect("exists")
+                .tree
+                .panes
+                .contains_key(&editor)
+        );
+    }
+
+    #[test]
+    fn closing_a_terminal_pane_beside_a_dirty_editor_is_not_refused() {
+        // The guard must not fire when nothing is at risk. Closing the Claude pane in a file
+        // tab discards no buffer, and a confirmation there is one the user learns to dismiss.
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = open_tab(
+            &mut ws,
+            id,
+            TabKind::File {
+                path: PathBuf::from("/home/dev/work/cide/src/main.rs"),
+                dirty: true,
+            },
+            demo_pane(PaneKind::Editor, "main.rs", false),
+        )
+        .expect("opens");
+
+        let t = tab_mut(&mut ws, id, tab).expect("exists");
+        let editor = t.tree.focused;
+        let claude = layout::split(
+            &mut t.tree,
+            editor,
+            Axis::Row,
+            Side::After,
+            demo_pane(PaneKind::Claude, "claude", false),
+        )
+        .expect("splits");
+
+        close_pane(&mut ws, id, tab, claude, false).expect("no buffer is at risk here");
     }
 
     #[test]

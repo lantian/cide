@@ -211,8 +211,18 @@ export const pane = {
     }),
 
   /** Rejected for the console's primary pane and for a tab's last pane. */
-  close: (projectId: ProjectId, tabId: TabId, paneId: PaneId) =>
-    invoke<{ rev: number }>('pane_close', { project: projectId, tab: tabId, pane: paneId }),
+  /**
+   * Rejected for the console's primary pane, for a tab's last pane, and — without `force` —
+   * for an editor pane holding unsaved edits. That last one is the same refusal `tab.close`
+   * makes: closing the pane inside a file tab discards exactly as much as closing the tab.
+   */
+  close: (projectId: ProjectId, tabId: TabId, paneId: PaneId, force = false) =>
+    invoke<{ rev: number }>('pane_close', {
+      project: projectId,
+      tab: tabId,
+      pane: paneId,
+      force,
+    }),
 
   focus: (projectId: ProjectId, tabId: TabId, paneId: PaneId) =>
     invoke<{ rev: number }>('pane_focus', { project: projectId, tab: tabId, pane: paneId }),

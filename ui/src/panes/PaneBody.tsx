@@ -62,9 +62,16 @@ export function PaneBody({
   restore,
   onSessionBound,
 }: PaneBodyProps): ReactNode {
-  // A file is a document too: no session, no spawn, nothing to resume. Checked before the
-  // diff case only because it is the cheaper test; the two are mutually exclusive. (M9)
-  if (editor) {
+  // A file is a document too: no session, no spawn, nothing to resume. (M9)
+  //
+  // Dispatched on the PANE kind, not the tab kind. Splitting a File tab creates a Claude
+  // pane — `default_intent` says so — and keying this on the tab would render a second
+  // independent `EditorPane` over the same path in it. Two editors over one file, each with
+  // its own CodeMirror state and neither aware of the other, against a single tab-level
+  // dirty flag: saving in one would clear the close guard while the other still held
+  // unsaved text. Keying on the pane means a File tab has exactly one editor, which is what
+  // makes one dirty flag per tab the right shape rather than a race.
+  if (editor && pane.kind === 'editor') {
     return <EditorPane path={editor.path} root={cwd} project={project} tab={editor.tab} />
   }
 

@@ -57,9 +57,39 @@ pub fn app_get_bootstrap(window: Window, state: State<'_, WorkspaceState>) -> Bo
         window: label,
         role,
         workspace,
-        keymap: keymap::resolve(&[]),
+        keymap: keymap::resolve(&user_keymap()),
         commands: commands::registry().to_vec(),
         capabilities: capabilities(),
+    }
+}
+
+/// The user's keybinding overrides, or none.
+///
+/// Read here rather than cached in managed state so a new window picks up an edited
+/// `keymap.json` without restarting the app — the file is a few hundred bytes and this runs
+/// once per window, not once per keystroke.
+///
+/// **This is the whole of what makes rebinding work.** Until it existed, `app_get_bootstrap`
+/// resolved against an empty user layer, so `~/.config/cide/keymap.json` reached neither
+/// entry point of the key gate: not after a restart, not at all. The layering, the conflict
+/// detector and the Settings → Keymap section were all built against a layer that was never
+/// populated.
+///
+/// A malformed file degrades to the defaults rather than failing the bootstrap. A user who
+/// has broken their JSON needs a working app to fix it in, and the alternative is an editor
+/// that will not start because of a comma.
+fn user_keymap() -> Vec<cide_ipc::Binding> {
+    let path = cide_core::persist::keymap_path();
+    match keymap::load_user(&path) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                %error,
+                "could not read keymap.json; running with default bindings only"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -231,4 +261,83 @@ fn live_sessions(
         }
         out
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression guard for the bug this function was written to fix.
+    ///
+    /// `app_get_bootstrap` used to resolve against an empty user layer, so a rebind in
+    /// `keymap.json` reached neither entry point of the key gate. Every piece of the
+    /// machinery — the layering, the conflict detector, the Settings section — was built
+    /// and tested against a layer nothing ever filled, which is why nothing caught it.
+    ///
+    /// This asserts the file is *read*: the narrow fact that no other test could see.
+    #[test]
+    fn a_user_binding_in_keymap_json_reaches_the_resolved_keymap() {
+        // `XDG_CONFIG_HOME` is what `persist::config_dir` consults, so pointing it at a temp
+        // directory is enough to isolate this from the developer's own keymap.
+        let dir = std::env::temp_dir().join(format!("cide-keymap-{}", std::process::id()));
+        // `persist::config_dir` appends `cide` to `XDG_CONFIG_HOME`, so the file lives one
+        // level below the directory this test hands it.
+        std::fs::create_dir_all(dir.join("cide")).expect("temp config dir");
+        std::fs::write(
+            dir.join("cide").join("keymap.json"),
+            r#"[{"key":"ctrl+alt+z","command":"workbench.showFilePicker"}]"#,
+        )
+        .expect("write keymap.json");
+
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: this test is the only one in this binary that touches the environment, and
+        // it restores the previous value before returning. Rust 2024 requires the block.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+
+        let user = user_keymap();
+        let resolved = keymap::resolve(&user);
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(user.len(), 1, "keymap.json was not read at all");
+        assert!(
+            resolved
+                .iter()
+                .any(|b| b.key == "ctrl+alt+z" && b.command == "workbench.showFilePicker"),
+            "the user's override did not survive resolution; resolved {} bindings",
+            resolved.len()
+        );
+    }
+
+    #[test]
+    fn a_broken_keymap_json_costs_the_overrides_and_not_the_app() {
+        // A user who has broken their JSON needs a working editor to fix it in. Failing the
+        // bootstrap would mean an app that will not start because of a trailing comma.
+        let dir = std::env::temp_dir().join(format!("cide-keymap-bad-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("cide")).expect("temp config dir");
+        std::fs::write(dir.join("cide").join("keymap.json"), "{ not json").expect("write");
+
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let user = user_keymap();
+        match previous {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            user.is_empty(),
+            "a malformed file must degrade, not propagate"
+        );
+        assert!(
+            !keymap::resolve(&user).is_empty(),
+            "the defaults must still be there"
+        );
+    }
 }
