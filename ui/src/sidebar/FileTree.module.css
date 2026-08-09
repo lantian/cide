@@ -1,0 +1,176 @@
+/*
+ * The 252px explorer.
+ *
+ * Widths and heights are the mock's: a 252px panel, a 30px uppercase 10.5px header with the
+ * meta figure right-aligned in mono, and 21px mono rows indented 12px per depth.
+ */
+
+.panel {
+  width: var(--w-sidebar-files);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+
+.header {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+  user-select: none;
+}
+
+.headerTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The meta figure. Mono and tabular so a growing count does not shift the label beside it. */
+.headerMeta {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.viewport {
+  position: relative;
+  width: 100%;
+}
+
+.row {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  /* The right padding is where the status tag sits; the left is the tree's own gutter, and
+     per-depth indentation is applied to the twisty as a margin rather than to the row, so
+     the selection band still spans the full width. */
+  padding: 0 8px 0 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: default;
+  color: var(--text);
+}
+
+.row:hover {
+  background: var(--chrome-hi);
+}
+
+.rowSelected,
+.rowSelected:hover {
+  background: var(--sel);
+}
+
+/*
+ * The twisty. A fixed 11px box so the glyph column lines up whether or not a row has one —
+ * without it, files sit one glyph-width left of their sibling folders.
+ */
+.twisty {
+  flex: none;
+  width: 11px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.glyph {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
+.glyphDir {
+  color: var(--dim);
+}
+
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag {
+  flex: none;
+  width: 9px;
+  text-align: right;
+  font-size: 10.5px;
+}
+
+/* Status colours, from the mock: M blue, A green, D faint and struck through. */
+.statusModified {
+  color: var(--blue);
+}
+
+.statusAdded {
+  color: var(--green);
+}
+
+.statusDeleted {
+  color: var(--faint);
+  text-decoration: line-through;
+}
+
+/* The `D` itself: faint, but not struck through — a one-glyph tag with a rule through it is
+   unreadable at 10.5px. */
+.tagDeleted {
+  color: var(--faint);
+}
+
+/* Beyond the mock, which draws no untracked or ignored row; see FileTree.tsx. */
+.statusUntracked {
+  color: var(--dim);
+}
+
+.statusIgnored {
+  color: var(--faint);
+}
+
+/* A row whose chunk has not landed yet. Occupies its height and draws nothing, so the
+   scrollbar never resizes as the window fills in. */
+.placeholder {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+}
+
+.notice {
+  padding: 12px 10px;
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.noticeCode {
+  font-family: var(--font-mono);
+  color: var(--faint);
+}

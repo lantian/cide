@@ -795,4 +795,165 @@ export const git = {
   /** Shelve paths as our own patch. With no paths, shelves the whole selection's repo. */
   shelve: (projectId: ProjectId, repo: string, paths: string[], name: string) =>
     invoke<unknown>('git_shelve', { project: projectId, repo, paths, name }),
+/* --------------------------------------------------------------------------------------
+ * M8 — file tree and pickers.
+ *
+ * PENDING: none of the eight commands below exist in Rust yet; `cide-fs` and `cide-search`
+ * are being built in parallel. They are declared here so the frontend can be written and
+ * reviewed against the real names, and every caller in `ui/src/sidebar` and
+ * `ui/src/overlays` goes through `pendingCommand()` so a missing handler degrades to an
+ * empty tree and an empty picker rather than an unhandled rejection.
+ *
+ * The payload types below are likewise provisional. When `cide-ipc` gains `TreeRow`,
+ * `TreeStatus`, `PickerKind`, `PickerHit` and `PickerFrame`, `cargo xtask codegen` will put
+ * them in `generated.ts` and these local declarations should be DELETED in favour of the
+ * generated ones — they are deliberately structural so that swap is a re-export, not a
+ * rewrite. `contract/commands.json` is likewise not touched here: adding names with no Rust
+ * handler behind them fails `cargo xtask contract-check` in this tree, and the entries
+ * belong with whoever writes the handlers.
+ * ------------------------------------------------------------------------------------ */
+
+/** Git status of a tree row. `clean` renders in `--text` with no tag letter. */
+export type TreeStatus = 'clean' | 'modified' | 'added' | 'deleted' | 'untracked' | 'ignored'
+
+/**
+ * One row of the flattened file tree.
+ *
+ * Flattened and windowed on the Rust side: a 100k-file repository is one array of rows there
+ * and never crosses the IPC boundary whole. `depth` is what the renderer indents by; the
+ * tree structure itself is never sent.
+ */
+export interface TreeRow {
+  /** Absolute path. Unique, and the identity the renderer keys on. */
+  path: string
+  /** Display name. For a root row this is the root's label, not necessarily its basename. */
+  name: string
+  /** 0 for a root row. A multi-root project contributes one depth-0 row per root. */
+  depth: number
+  isDir: boolean
+  /** Directories only; `false` for a collapsed directory and for every file. */
+  expanded: boolean
+  /** Whether a twisty should be drawn at all. */
+  hasChildren: boolean
+  status: TreeStatus
+}
+
+export type PickerKind = 'files' | 'commands' | 'symbols'
+
+/** One candidate. `indices` are match positions in `name`, for highlighting. */
+export interface PickerHit {
+  /** Absolute path — what `tab.open_file` takes. */
+  path: string
+  /** Basename, shown first and in `--text`. */
+  name: string
+  /** Path relative to the project root, shown after the name in `--dim`. */
+  relative: string
+  indices?: number[]
+}
+
+/**
+ * A streamed frame of picker results.
+ *
+ * Frames rather than a return value because the index is built while the user is already
+ * typing: the picker has to be usable before indexing finishes, so results arrive as they
+ * are found. `matched` and `total` are what the mock's `6 of 2,418` counter reads.
+ */
+export interface PickerFrame {
+  picker: string
+  /** Which query this frame answers. Frames for a stale query are dropped by the caller. */
+  query: string
+  hits: PickerHit[]
+  matched: number
+  total: number
+  /** True while the walker is still adding to the corpus. */
+  indexing: boolean
+}
+
+export const fs = {
+  /** Windowed: `[offset, offset + len)` of the flattened tree. Never ships the whole tree. */
+  treeRows: (project: ProjectId, offset: number, len: number) =>
+    invoke<TreeRow[]>('fs_tree_rows', { project, offset, len }),
+  treeCount: (project: ProjectId) => invoke<number>('fs_tree_count', { project }),
+  /** Returns the new total row count, so the caller can resize without a second call. */
+  expand: (project: ProjectId, path: string) => invoke<number>('fs_expand', { project, path }),
+  collapse: (project: ProjectId, path: string) => invoke<number>('fs_collapse', { project, path }),
+  /** Expands whatever is needed to make `path` visible and returns its row index. */
+  reveal: (project: ProjectId, path: string) => invoke<number>('fs_reveal', { project, path }),
+}
+
+export const picker = {
+  /**
+   * Open a picker session and start streaming frames into `onFrame`.
+   *
+   * A session rather than a query-response call: the walker keeps finding files after the
+   * first frame, and a `Vec` return would make the picker wait for a 100k-file repository
+   * to finish indexing before it could show anything.
+   */
+  open: (projectId: ProjectId, kind: PickerKind, onFrame: (frame: PickerFrame) => void) => {
+    const sink = new Channel<PickerFrame>()
+    sink.onmessage = onFrame
+    return invoke<string>('picker_open', { project: projectId, kind, sink })
+  },
+  query: (id: string, query: string) => invoke<void>('picker_query', { picker: id, query }),
+  close: (id: string) => invoke<void>('picker_close', { picker: id }),
+}
+
+/**
+ * File-system events. PENDING, like the commands above.
+ *
+ * Subscribing to an event Rust never emits is inert — `listen` resolves and the handler is
+ * simply never called — so these are wired now rather than left as a TODO, and the tree
+ * starts refreshing itself the moment `cide-fs` begins emitting. `contract/events.json` is
+ * not touched for the same reason `contract/commands.json` is not: `contract-check` reflects
+ * over `emit.rs`, and the entries belong with the code that emits them.
+ */
+export const fsEvents = {
+  /** Debounced 300 ms in Rust. 5,000 touched files arrive as one event, not 5,000. */
+  onChanged: (handler: (project: ProjectId, paths: string[]) => void) =>
+    listen<{ project: ProjectId; paths: string[] }>('cide://fs-changed', (e) =>
+      handler(e.payload.project, e.payload.paths),
+    ),
+
+  /** Walk progress, for the picker's `Indexing…` state and the explorer's meta counter. */
+  onIndexProgress: (handler: (project: ProjectId, indexed: number, total: number) => void) =>
+    listen<{ project: ProjectId; indexed: number; total: number }>(
+      'cide://fs-index-progress',
+      (e) => handler(e.payload.project, e.payload.indexed, e.payload.total),
+    ),
+}
+
+/**
+ * Run a command that may not exist in this build yet.
+ *
+ * Tauri answers an unregistered command with a rejected promise naming it, and an unhandled
+ * rejection inside a `useEffect` is a blank sidebar plus a console line nobody reads. This
+ * turns that into a value: `fallback` on failure, and one `diag.log` line the Rust log
+ * carries — at most once per command name, so a virtualizer scrolling over a missing
+ * `fs_tree_rows` does not write a thousand of them.
+ *
+ * Deliberately swallows *every* rejection, not only "command not found": Tauri does not
+ * distinguish the two on the wire, and a picker that throws on an unreadable path is no more
+ * useful to the user than one that returns nothing.
+ */
+export async function pendingCommand<T>(
+  name: string,
+  call: () => Promise<T>,
+  fallback: T,
+): Promise<T> {
+  try {
+    return await call()
+  } catch (e) {
+    if (!degraded.has(name)) {
+      degraded.add(name)
+      void diag.log(`[cide] ${name} unavailable, degrading: ${String(e)}`)
+    }
+    return fallback
+  }
+}
+
+const degraded = new Set<string>()
+
+/** True once `pendingCommand` has seen this command fail. Drives the sidebar's dim notice. */
+export function isDegraded(name: string): boolean {
+  return degraded.has(name)
 }

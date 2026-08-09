@@ -11,6 +11,8 @@
     "check:format": "node scripts/check-status-format.mjs",
     "check:git": "node scripts/check-git-tree.mjs",
     "check:render": "node scripts/check-git-render.mjs"
+    "check:keys": "node scripts/check-key-gate.mjs",
+    "check:picker": "node scripts/check-picker.mjs"
   },
   "//": "Versions are pinned exactly, with no carets. Vite 8 defaults to the Rolldown/Oxc pipeline, where the known breakage class is plugins reaching into Rollup internals \u2014 a caret range would let that arrive unannounced during a milestone.",
   "dependencies": {
@@ -24,6 +26,7 @@
     "@fontsource/ibm-plex-sans": "5.3.0",
     "@fontsource/jetbrains-mono": "5.3.0",
     "@lezer/highlight": "1.2.3",
+    "@tanstack/react-virtual": "3.13.12",
     "@tauri-apps/api": "2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@xterm/addon-clipboard": "0.2.0",

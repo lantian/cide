@@ -1,0 +1,225 @@
+/**
+ * The pure logic behind the overlays and the file tree: palette ranking, list navigation,
+ * the counter's digit grouping, and the row-window chunk arithmetic.
+ *
+ * The ranking half exists because `overlays/score.ts` is a *port* of
+ * `cide_core::commands::score`, and a port with no test is a copy that drifts. The
+ * assertions below are the same ones `commands.rs` makes about its own tiers, so a change on
+ * either side that breaks the agreement fails on this side too.
+ *
+ * The chunk arithmetic half exists because off-by-one errors there are invisible: a tree that
+ * asks for one chunk too few shows a band of blank rows only at particular scroll offsets.
+ *
+ * Same shape as `check-status-format.mjs` and `check-key-gate.mjs` — there is no JS test
+ * runner in this project, and these are pure functions the TypeScript in `node_modules` can
+ * compile on its own.
+ *
+ * Run: `pnpm --dir ui run check:picker`
+ */
+import { execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const out = mkdtempSync(join(tmpdir(), 'cide-picker-'))
+let failed = 0
+
+const eq = (actual, expected, what) => {
+  const a = JSON.stringify(actual)
+  const b = JSON.stringify(expected)
+  if (a !== b) {
+    failed += 1
+    console.error(`FAIL ${what}\n  actual:   ${a}\n  expected: ${b}`)
+  }
+}
+
+try {
+  execFileSync(
+    'node',
+    [
+      'node_modules/typescript/bin/tsc',
+      'src/overlays/score.ts',
+      'src/overlays/format.ts',
+      'src/overlays/listKeys.ts',
+      'src/sidebar/rowWindow.ts',
+      '--outDir', out,
+      '--rootDir', 'src',
+      '--module', 'commonjs',
+      '--moduleResolution', 'node10',
+      '--target', 'es2022',
+      '--strict',
+      '--exactOptionalPropertyTypes',
+      '--noUncheckedIndexedAccess',
+      '--lib', 'es2023',
+      // These four modules need no DOM, but `@types/react-dom` is auto-included from
+      // `node_modules/@types` and does not compile without it. Matches the project tsconfig.
+      '--skipLibCheck',
+    ],
+    { stdio: 'inherit' },
+  )
+
+  const require = createRequire(import.meta.url)
+  const { searchCommands } = require(join(out, 'overlays/score.js'))
+  const { groupDigits, matchCounter, basename, dirname, kindBadge } = require(
+    join(out, 'overlays/format.js'),
+  )
+  const { listAction, PAGE_ROWS } = require(join(out, 'overlays/listKeys.js'))
+  const { chunkOf, chunkRequest, chunksFor, chunksToEvict } = require(
+    join(out, 'sidebar/rowWindow.js'),
+  )
+
+  /* ----------------------------------------------------------------- palette ranking */
+
+  // Six of the seed commands the mock's palette lists, in registry order.
+  const TABLE = [
+    { id: 'pane.split.right', title: 'Split pane right', group: 'Window' },
+    { id: 'pane.split.down', title: 'Split pane down', group: 'Window' },
+    { id: 'claude.split.newSession', title: 'Split: new Claude session', group: 'Claude' },
+    { id: 'pane.promoteToTab', title: 'Promote pane to full tab', group: 'Window' },
+    { id: 'pane.detachToWindow', title: 'Detach pane into window', group: 'Window' },
+    { id: 'terminal.splitBelow', title: 'Split terminal below', group: 'Terminal' },
+    { id: 'theme.toggle', title: 'Toggle light/dark theme', group: 'View' },
+    // Not a seed command. It is here so `new` has a mid-word competitor — without one, the
+    // word-start assertion below is satisfied by any implementation that matches at all.
+    { id: 'session.renew', title: 'Renew session', group: 'Claude' },
+  ]
+  const ids = (query) => searchCommands(TABLE, query).map((c) => c.id)
+
+  eq(ids('').length, TABLE.length, 'an empty query lists the whole table')
+  eq(searchCommands(TABLE, '') === TABLE, false, 'an empty query returns a copy, not the table')
+  eq(ids('   '), ids(''), 'a whitespace query is an empty query')
+
+  // A title prefix must outrank everything else — the criterion `commands.rs` names.
+  eq(ids('split')[0], 'pane.split.right', 'a title prefix ranks first')
+  // `Split: new Claude session` also starts with `split`, so both prefix hits come before
+  // `Split terminal below`... which also starts with it. Table order breaks the tie.
+  eq(
+    ids('split'),
+    [
+      'pane.split.right',
+      'pane.split.down',
+      'claude.split.newSession',
+      'terminal.splitBelow',
+    ],
+    'equal scores keep table order',
+  )
+
+  // A word-start match beats a mid-word substring. `Split: new Claude session` matches `new`
+  // at a word start (tier 4); `Renew session` matches it inside `Renew` (tier 3).
+  // The tail is the subsequence tier — `new` reads out of `Split pa*ne* do*w*n` too — so only
+  // the first two positions are the claim being made.
+  eq(
+    ids('new').slice(0, 2),
+    ['claude.split.newSession', 'session.renew'],
+    'a word start after a colon outranks a mid-word substring',
+  )
+
+  // Earlier offsets rank first within a tier: `pane` starts at 6 in both `Split pane …`
+  // titles, at 7 in `Detach pane into window` and at 8 in `Promote pane to full tab`.
+  eq(
+    ids('pane'),
+    ['pane.split.right', 'pane.split.down', 'pane.detachToWindow', 'pane.promoteToTab'],
+    'offset orders within a tier',
+  )
+
+  // An id-only match still matches, below every title tier.
+  eq(ids('promotetotab'), ['pane.promoteToTab'], 'the id is searched')
+
+  // Subsequence is the last resort. `spr` finds `Split pane right`.
+  eq(ids('spr')[0], 'pane.split.right', 'subsequence matching')
+  eq(ids('zzz'), [], 'no match is empty')
+
+  eq(ids('SPLIT'), ids('split'), 'matching is case-insensitive')
+
+  /* ------------------------------------------------------------------------ formatting */
+
+  eq(groupDigits(0), '0', 'zero')
+  eq(groupDigits(999), '999', 'below the first group')
+  eq(groupDigits(1000), '1,000', 'the first group')
+  eq(groupDigits(2418), '2,418', "the mock's own figure")
+  eq(groupDigits(100000), '100,000', 'six digits')
+  eq(groupDigits(1234567), '1,234,567', 'two groups')
+  eq(matchCounter(6, 2418), '6 of 2,418', "the mock's counter, verbatim")
+
+  eq(basename('/a/b/c.rs'), 'c.rs', 'basename')
+  eq(basename('c.rs'), 'c.rs', 'basename of a bare name')
+  eq(dirname('/a/b/c.rs'), '/a/b', 'dirname')
+  eq(dirname('c.rs'), '', 'dirname of a bare name')
+
+  eq(kindBadge('lib.rs'), { label: 'RS', tone: 'accent' }, 'rust badge')
+  eq(kindBadge('Cargo.lock'), { label: 'LOCK', tone: 'faint' }, 'lock badge')
+  eq(kindBadge('App.module.css'), { label: 'CSS', tone: 'purple' }, 'the last extension wins')
+  // A leading dot is a hidden file, not an extension.
+  eq(kindBadge('.gitignore'), { label: '·', tone: 'faint' }, 'a dotfile gets the neutral mark')
+  eq(kindBadge('/x/y/Makefile'), { label: '·', tone: 'faint' }, 'no extension')
+
+  /* ------------------------------------------------------------------ list navigation */
+
+  const key = (name, mods = {}) => ({
+    key: name,
+    shiftKey: mods.shift === true,
+    altKey: mods.alt === true,
+    ctrlKey: mods.ctrl === true,
+    metaKey: mods.meta === true,
+  })
+
+  eq(listAction(key('ArrowDown'), 5, 0), { kind: 'select', index: 1 }, 'down moves')
+  eq(listAction(key('ArrowDown'), 5, 4), { kind: 'select', index: 0 }, 'down wraps')
+  eq(listAction(key('ArrowUp'), 5, 0), { kind: 'select', index: 4 }, 'up wraps')
+  eq(listAction(key('PageDown'), 100, 0), { kind: 'select', index: PAGE_ROWS }, 'page down')
+  eq(listAction(key('PageUp'), 100, 0), { kind: 'select', index: 100 - PAGE_ROWS }, 'page up wraps')
+  eq(listAction(key('Home'), 100, 40), { kind: 'select', index: 0 }, 'home')
+  eq(listAction(key('End'), 100, 40), { kind: 'select', index: 99 }, 'end')
+  eq(listAction(key('ArrowDown'), 0, 0), { kind: 'select', index: 0 }, 'movement in an empty list')
+  eq(listAction(key('Escape'), 5, 0), { kind: 'dismiss' }, 'escape dismisses')
+
+  eq(listAction(key('Enter'), 5, 0), { kind: 'accept', modifier: 'plain' }, '⏎')
+  eq(listAction(key('Enter', { shift: true }), 5, 0), { kind: 'accept', modifier: 'shift' }, '⇧⏎')
+  eq(listAction(key('Enter', { alt: true }), 5, 0), { kind: 'accept', modifier: 'alt' }, '⌥⏎')
+  eq(listAction(key('Enter', { ctrl: true }), 5, 0), { kind: 'accept', modifier: 'ctrl' }, '⌃⏎')
+  // The mock draws ⌘⏎; on Linux that binds to Ctrl, so both must reach the same action.
+  eq(listAction(key('Enter', { meta: true }), 5, 0), { kind: 'accept', modifier: 'ctrl' }, '⌘⏎ = ⌃⏎')
+  eq(listAction(key('Enter'), 0, 0), { kind: 'none' }, '⏎ on an empty list is not ours')
+  eq(listAction(key('a'), 5, 0), { kind: 'none' }, 'an ordinary character is not ours')
+
+  /* --------------------------------------------------------------- row-window chunking */
+
+  eq(chunkOf(0), 0, 'row 0 is in chunk 0')
+  eq(chunkOf(199), 0, 'the last row of chunk 0')
+  eq(chunkOf(200), 1, 'the first row of chunk 1')
+
+  eq(chunksFor(0, 0), [], 'an unmeasured range asks for nothing')
+  eq(chunksFor(5, 5), [], 'an empty range asks for nothing')
+  eq(chunksFor(10, 5), [], 'an inverted range asks for nothing')
+  eq(chunksFor(0, 1), [0], 'one row is one chunk')
+  eq(chunksFor(0, 200), [0], 'exactly one chunk')
+  eq(chunksFor(0, 201), [0, 1], 'one row past the boundary adds a chunk')
+  eq(chunksFor(199, 201), [0, 1], 'a range straddling a boundary')
+  eq(chunksFor(450, 810), [2, 3, 4], 'a range spanning three chunks')
+
+  eq(chunkRequest(0, 100000), { offset: 0, len: 200 }, 'a full chunk')
+  eq(chunkRequest(3, 650), { offset: 600, len: 50 }, 'the last chunk is clamped to the count')
+  eq(chunkRequest(4, 650), { offset: 800, len: 0 }, 'a chunk past the end asks for nothing')
+
+  eq(chunksToEvict([1, 2, 3], new Set(), 10), [], 'nothing to evict below the cap')
+  eq(chunksToEvict([1, 2, 3, 4], new Set(), 2), [1, 2], 'the two oldest go')
+  eq(
+    chunksToEvict([1, 2, 3, 4], new Set([1, 2]), 2),
+    [3, 4],
+    'visible chunks are never evicted, however old',
+  )
+  eq(
+    chunksToEvict([1, 2], new Set([1, 2]), 1),
+    [],
+    'the cap yields rather than evict what is on screen',
+  )
+
+  if (failed > 0) {
+    console.error(`\ncheck-picker: ${failed} failure(s)`)
+    process.exit(1)
+  }
+  console.log('check-picker: ok')
+} finally {
+  rmSync(out, { recursive: true, force: true })
+}

@@ -1,0 +1,47 @@
+/**
+ * React wiring for entry point 2.
+ *
+ * The gate is installed once per window and never reinstalled, because reinstalling swaps
+ * the singleton and a terminal created before the swap would be resolving against the old
+ * one's prefix machine. Everything that changes between renders — the keymap, the context
+ * flags, the dispatcher — is read through a ref at keystroke time instead.
+ *
+ * Entry point 1 is not installed here. It belongs at terminal construction, one line in
+ * `terminal/xterm.ts`:
+ *
+ * ```ts
+ * import { attachKeyGate } from '@/keys/gate'
+ * attachKeyGate(term)   // right after `new Terminal({...})`
+ * ```
+ *
+ * `terminal/xterm.ts` is another milestone's file, so that line is not applied here; see the
+ * M8 frontend report.
+ */
+import { useEffect, useRef } from 'react'
+import { installKeyGate } from './gate'
+import type { KeyBinding, KeyContext } from './keymap'
+
+export interface KeyGateWiring {
+  /** `Bootstrap.keymap`. `ResolvedBinding` satisfies `KeyBinding`. */
+  bindings: readonly KeyBinding[]
+  context: KeyContext
+  run: (command: string, args: unknown) => void
+  /** For a status-bar readout while a chord prefix is armed. */
+  onPending?: ((sequence: string | null) => void) | undefined
+}
+
+export function useKeyGate(wiring: KeyGateWiring): void {
+  const live = useRef(wiring)
+  live.current = wiring
+
+  useEffect(
+    () =>
+      installKeyGate({
+        bindings: () => live.current.bindings,
+        context: () => live.current.context,
+        run: (command, args) => live.current.run(command, args),
+        onPending: (sequence) => live.current.onPending?.(sequence),
+      }),
+    [],
+  )
+}
