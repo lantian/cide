@@ -213,6 +213,69 @@ fn a_root_below_the_work_tree_only_sees_its_own_changes() {
     );
 }
 
+/// The project root is *itself* the directory git named.
+///
+/// The degenerate case of the strip above: `git status` reports the unrecursed directory
+/// `scratch/`, and the project is opened on `scratch`, so the repo-relative entry resolves to
+/// exactly the root. Two things break at once if the empty remainder is joined blindly —
+/// `root.join("")` spells the key with a trailing separator, which matches no row, and the
+/// rollup's `dir == root` break never fires because the walk starts at the root's *parent*,
+/// so it climbs out of the project and marks `/` .
+#[test]
+fn a_root_that_is_itself_the_untracked_directory_is_keyed_as_its_own_row() {
+    let repo = TempRepo::new("tree-root-untracked");
+    repo.write("tracked.rs", b"one\n");
+    repo.commit_all("base");
+    // Never added, so git reports the directory rather than the file inside it.
+    repo.write("scratch/a.rs", b"new\n");
+
+    let root = repo.root.join("scratch");
+    let map = tree_status(std::slice::from_ref(&root));
+
+    assert_eq!(
+        map.statuses.get(&root.to_string_lossy().into_owned()),
+        Some(&TreeStatus::Untracked),
+        "the root's key must be spelled exactly as `cide-fs` spells the root row, with no \
+         trailing separator: {:?}",
+        map.statuses,
+    );
+    assert!(
+        map.statuses.keys().all(|k| Path::new(k).starts_with(&root)),
+        "the rollup must not climb out of the project when the entry *is* the root: {:?}",
+        map.statuses,
+    );
+}
+
+/// The same shape, but ignored — and this is the one a user sees.
+///
+/// A key with a trailing separator is not merely untidy: `statusAt` resolves a row inside an
+/// unrecursed directory by looking its *ancestors* up, and an ancestor spelled `…/sandbox/`
+/// is not the string `…/sandbox` that walk produces. Every row under the root would fall
+/// through to `clean`.
+#[test]
+fn a_root_that_is_itself_ignored_still_reaches_the_rows_inside_it() {
+    let repo = TempRepo::new("tree-root-ignored");
+    repo.write(".gitignore", b"sandbox/\n");
+    repo.write("tracked.rs", b"one\n");
+    repo.commit_all("base");
+    repo.write("sandbox/a.rs", b"new\n");
+
+    let root = repo.root.join("sandbox");
+    let map = tree_status(std::slice::from_ref(&root));
+
+    assert_eq!(
+        map.statuses.get(&root.to_string_lossy().into_owned()),
+        Some(&TreeStatus::Ignored),
+        "{:?}",
+        map.statuses,
+    );
+    assert_eq!(
+        resolve(&map, &root.join("a.rs")),
+        TreeStatus::Ignored,
+        "a row inside the root inherits it, which only works if the root's key matches",
+    );
+}
+
 #[test]
 fn a_symlinked_root_is_keyed_the_way_the_file_tree_spells_it() {
     // The failure this pins: git resolves the work tree to its canonical path, `cide-fs`
@@ -371,12 +434,17 @@ fn every_key_lands_on_a_row_the_file_index_actually_produced() {
     repo.write("src/edited.rs", b"one\n");
     repo.write("src/clean.rs", b"one\n");
     repo.write("docs/readme.md", b"docs\n");
+    // Both shapes of ignore rule, because the two walkers disagree about them on purpose and
+    // a fixture without them makes the orphan assertion below true by construction.
+    repo.write(".gitignore", b"build/\n*.log\n");
     repo.commit_all("base");
     repo.write("src/edited.rs", b"two\n");
     repo.write("src/added.rs", b"new\n");
     repo.git(&["add", "src/added.rs"]);
     repo.write("fresh/a.rs", b"new\n");
     repo.write("fresh/b.rs", b"new\n");
+    repo.write("build/out.o", b"\x00");
+    repo.write("src/debug.log", b"noise\n");
 
     let map = tree_status(&roots(&repo));
 
@@ -428,20 +496,39 @@ fn every_key_lands_on_a_row_the_file_index_actually_produced() {
          because `cide-fs` walks the filesystem rather than the index"
     );
 
-    // And the converse: no key names a path the walk never produced. A key that matches no row
-    // is invisible, which is exactly how a canonicalisation bug hides.
+    // And the converse: which keys can never match a row, and why.
+    //
+    // The guarantee is about *spelling* — a key for a path the walk did produce has to be
+    // byte-identical to that row's, which is where a canonicalisation bug hides. It is not
+    // "every key matches a row", and it deliberately cannot be: `cide-fs` applies the
+    // `.gitignore` files inside the root, while `git status` is asked for ignored paths on
+    // purpose so that a root opened *below* an ignore rule is still tagged. Every ignored
+    // entry inside this root is therefore weight on the wire that nothing can draw. That is
+    // one entry per ignored *directory* (unrecursed) and one per individually-ignored file,
+    // so a `build/`-shaped rule costs nothing and an `*.o`-shaped one is unbounded — and
+    // spends the `MAX_ENTRIES` budget ahead of real statuses. Asserted as an exception rather
+    // than left invisible.
     let walked: std::collections::HashSet<String> = rows
         .iter()
         .map(|row| row.path.to_string_lossy().into_owned())
         .chain(std::iter::once(repo.root.to_string_lossy().into_owned()))
         .collect();
-    let orphans: Vec<&String> = map
+    let orphans: Vec<(&String, &TreeStatus)> = map
         .statuses
-        .keys()
-        .filter(|k| !walked.contains(*k))
+        .iter()
+        .filter(|(k, _)| !walked.contains(*k))
         .collect();
     assert!(
-        orphans.is_empty(),
-        "these keys can never match a row: {orphans:?}"
+        orphans
+            .iter()
+            .all(|(_, status)| **status == TreeStatus::Ignored),
+        "a key that is not `ignored` must name a row the walk produced: {orphans:?}"
+    );
+    // The fixture has to actually contain the exception, or the assertion above proves
+    // nothing about a walk that stopped emitting ignored entries entirely.
+    assert!(
+        orphans.iter().any(|(k, _)| k.ends_with("/build")),
+        "the ignored-directory case went missing from the fixture: {:?}",
+        map.statuses,
     );
 }

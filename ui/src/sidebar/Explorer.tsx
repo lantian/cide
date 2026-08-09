@@ -77,7 +77,7 @@ export function Explorer({ project, onOpenFile }: ExplorerProps) {
    * arrives as `cide://git-status`; the other two arrive as `cide://fs-changed`, because the
    * watcher explicitly watches `HEAD`, `index` and the refs alongside the working tree.
    *
-   * Both are folded into one debounced refresh in the store rather than one call each: a
+   * Both are folded into one coalesced refresh in the store rather than one call each: a
    * single `git commit` fires the git event *and* rewrites `.git/index` and `HEAD`, so
    * refreshing per event would walk the repository three times for one gesture.
    *

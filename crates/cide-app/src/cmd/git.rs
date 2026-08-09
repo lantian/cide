@@ -94,7 +94,15 @@ pub fn git_status(
 /// scroll tick and save nothing underneath; see `cide_git::tree_status` for the full
 /// comparison. The frontend re-reads this on `cide://git-status` and on a `cide://fs-changed`
 /// that touched a git file, not on scroll and not on a timer.
-#[tauri::command(rename_all = "camelCase")]
+///
+/// `async` — the only git command here that is — because it is the only one the *watcher*
+/// drives rather than a user gesture. Tauri runs a synchronous command on the main thread, so
+/// a one-second status walk on a large checkout would freeze the window for a second every
+/// time it ran; every other command in this file runs once per click, while this one can run
+/// several times a second for as long as a build is writing files. The body has no await, so
+/// `command(async)` on a sync fn is exactly the right shape: it moves the walk onto the async
+/// runtime without making `git2`'s non-`Send` handles cross a suspension point.
+#[tauri::command(async, rename_all = "camelCase")]
 pub fn git_tree_status(
     state: State<'_, WorkspaceState>,
     project: ProjectId,

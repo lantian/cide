@@ -107,7 +107,18 @@ pub fn tree_status(roots: &[PathBuf]) -> TreeStatusMap {
                 let Ok(inside) = absolute.strip_prefix(&canonical_root) else {
                     continue;
                 };
-                if !mark(&mut map.statuses, root, &root.join(inside), *status) {
+                // `inside` is empty when the entry *is* the project root — a repository above
+                // the root reporting the root's own directory as untracked or ignored, which
+                // is what happens whenever a project is opened on a scratch directory inside
+                // a checkout. `root.join("")` spells that key with a trailing separator, and
+                // no `TreeRow` is ever spelled that way, so the root row and everything under
+                // it would silently read as clean.
+                let path = if inside.as_os_str().is_empty() {
+                    root.clone()
+                } else {
+                    root.join(inside)
+                };
+                if !mark(&mut map.statuses, root, &path, *status) {
                     map.truncated = true;
                     return map;
                 }
@@ -146,8 +157,17 @@ fn mark(
     // Up to and including the root, so that the top row of a multi-root project shows whether
     // that root has anything in it. `while let` on `parent()` alone would climb past the root
     // and out to `/`.
+    //
+    // The bound is `starts_with`, not the `dir == root` break alone. The break only fires if
+    // the climb ever *lands* on the root, and it does not when `path` is the root itself: the
+    // walk starts at `path.parent()`, which is already outside the project, and every step
+    // after it is further out. That case is reachable — a project opened on an untracked or
+    // ignored directory of a repository above it — and it used to mark `/` as modified.
     let mut at = path.parent();
     while let Some(dir) = at {
+        if !dir.starts_with(root) {
+            break;
+        }
         if into.len() >= MAX_ENTRIES {
             return false;
         }
@@ -176,9 +196,20 @@ fn collect(work_tree: &Path) -> crate::Result<Vec<(String, TreeStatus)>> {
     opts.include_untracked(true)
         // See the module header: recursing is what turns a fresh checkout into 100k entries.
         .recurse_untracked_dirs(false)
-        // Ignored *directories* only, which costs nothing — libgit2 has already decided the
-        // directory is ignored in order to skip it, and this only asks it to say so instead
-        // of dropping it. Recursing into one, by contrast, is a full walk of `target/`.
+        // Ignored paths cost nothing in the *walk* — libgit2 has already decided each one in
+        // order to skip it, and this only asks it to say so instead of dropping it. They are
+        // asked for because `cide-fs` does not read `.gitignore` files above a project root,
+        // so a root opened below an ignore rule has rows git calls ignored and nothing else
+        // can tag them.
+        //
+        // What they do cost is payload. `cide-fs` *does* apply the ignore files at and below
+        // the root, so an ignored path inside the root has no row and its entry can never be
+        // drawn — one entry per ignored directory (unrecursed, so `target/` is one) and one
+        // per individually-ignored file, which a glob like `*.o` makes unbounded. Those
+        // entries also spend the `MAX_ENTRIES` budget ahead of real statuses. Narrowing this
+        // to "ignored by a rule above the root" would mean re-deriving `cide-fs`'s rules here,
+        // in the crate that must not depend on it; pinned as an explicit exception by
+        // `every_key_lands_on_a_row_the_file_index_actually_produced` instead.
         .include_ignored(true)
         .recurse_ignored_dirs(false)
         .include_unmodified(false)
@@ -283,6 +314,19 @@ mod tests {
         // Never above the root, whatever else is on that filesystem.
         assert_eq!(map.get("/w"), None);
         assert_eq!(map.get("/"), None);
+    }
+
+    /// The climb has to be bounded by containment, not by ever meeting the root.
+    ///
+    /// `mark(root, root, ..)` starts its walk at the root's *parent*, so a `dir == root` break
+    /// is never reached and an unbounded `while let` walks out to `/`.
+    #[test]
+    fn marking_the_root_itself_does_not_climb_out_of_the_project() {
+        let root = Path::new("/w/app");
+        let mut map = BTreeMap::new();
+        assert!(mark(&mut map, root, root, TreeStatus::Untracked));
+        assert_eq!(map.get("/w/app"), Some(&TreeStatus::Untracked));
+        assert_eq!(map.len(), 1, "nothing above the project root: {map:?}");
     }
 
     #[test]

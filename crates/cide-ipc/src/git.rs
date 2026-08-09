@@ -203,9 +203,11 @@ pub enum TreeStatus {
 ///
 /// # Size
 ///
-/// Bounded by the number of *changed* paths plus their ancestor directories, not by the size
-/// of the repository: a 100k-file checkout with four edits ships a handful of entries. The
-/// pathological case — a whole-tree `sed -i` — is capped, and [`Self::truncated`] says so
+/// Bounded by the number of *changed* paths plus their ancestor directories, plus the paths
+/// git reports as ignored — not by the size of the repository: a 100k-file checkout with four
+/// edits ships a handful of entries, because an untracked or ignored *directory* travels as
+/// one entry and is not recursed into. The pathological cases — a whole-tree `sed -i`, or an
+/// ignore glob like `*.o` over an in-tree build — are capped, and [`Self::truncated`] says so
 /// rather than letting the tail read as clean.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
