@@ -8,6 +8,7 @@
 pub mod app;
 pub mod diag;
 pub mod git;
+pub mod file;
 pub mod lifecycle;
 pub mod pane;
 pub mod project;

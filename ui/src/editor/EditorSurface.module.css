@@ -1,0 +1,336 @@
+/*
+ * The editor pane.
+ *
+ * Two halves, as in `panes/DiffPane.module.css`: this pane's own chrome, and overrides for
+ * CodeMirror's global classes reached through `:global()`.
+ *
+ * The same specificity rule applies and for the same reason — CodeMirror injects its base
+ * theme into the document head at a position no stylesheet can rely on, so source order is
+ * not a safe tiebreak and every override below has to win on specificity. `.body` plus
+ * `.cm-editor` plus the original selector is three classes deep before the original's own
+ * contribution, which clears every rule overridden here. The exceptions are the two rules
+ * on `.cm-cide-minimap`, a class CodeMirror has never heard of and therefore never styles.
+ *
+ * Every colour is a token. The base theme hardcodes `#f5f5f5`, `#ddd`, `#1a1a1a` and a
+ * `#0079f2` selection, all of which would survive a theme switch and make the light palette
+ * unreadable.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+}
+
+/* --- breadcrumb bar, 28px from the mock ------------------------------------------------ */
+
+.breadcrumbs {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 28px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/*
+ * The trail clips from the left so the file name survives a narrow pane: `direction: rtl`
+ * moves the overflow to the start of the box, and the inner `ltr` puts the characters back
+ * the right way round. Without it a split three ways shows `crates › cide-…` and hides the
+ * one segment the user needs.
+ */
+.trail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+}
+
+.crumb {
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+.separator {
+  padding: 0 6px;
+  color: var(--border);
+}
+
+/* The last segment is the file itself, and the mock reads it before the path. */
+.crumb:last-child {
+  color: var(--dim);
+}
+
+.readout {
+  flex: none;
+  color: var(--faint);
+  /* `tabular-nums` keeps `Ln 9` and `Ln 128` from shifting the whole readout as the caret
+     crosses a power of ten. */
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- the buffer ------------------------------------------------------------------------ */
+
+.body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  /* The app root sets `user-select: none` so window chrome does not text-select on drag. */
+  user-select: text;
+}
+
+.body :global(.cm-editor) {
+  height: 100%;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.body :global(.cm-editor.cm-focused) {
+  /* The default is a dotted near-black outline, invisible on the dark palette and wrong on
+     the light one. The pane frame already draws focus. */
+  outline: none;
+}
+
+/*
+ * The scroller is inset by the minimap's width rather than the minimap being a flex sibling.
+ * A sibling would make the editor's own width depend on a `ViewPlugin` having mounted, and
+ * CodeMirror measures during construction — the first frame would be laid out at the wrong
+ * width and reflow.
+ *
+ * `--w-minimap` is 96px in `tokens.css` and `MINIMAP_WIDTH` in `minimap.ts` is the same
+ * number. They are separate because canvas cannot read a custom property; if one moves the
+ * other must.
+ */
+.body :global(.cm-scroller) {
+  margin-right: var(--w-minimap);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 21px;
+}
+
+.body :global(.cm-content) {
+  caret-color: var(--accent);
+  padding: 4px 0;
+}
+
+.body :global(.cm-line) {
+  padding: 0 10px;
+}
+
+.body :global(.cm-cursor),
+.body :global(.cm-dropCursor) {
+  border-left-color: var(--accent);
+  border-left-width: 2px;
+}
+
+/*
+ * Selection. CodeMirror draws it as absolutely positioned `.cm-selectionBackground` layers
+ * when `drawSelection` is on, and as a native `::selection` when the editor is unfocused,
+ * so both have to be told.
+ */
+.body :global(.cm-selectionBackground),
+.body :global(.cm-editor .cm-selectionBackground) {
+  background: var(--sel);
+}
+
+.body :global(.cm-content) ::selection {
+  background: var(--sel);
+}
+
+/* The caret's line, `--sel` per the mock. */
+.body :global(.cm-activeLine) {
+  background: var(--sel);
+}
+
+/* --- gutter, 56px and right-aligned ---------------------------------------------------- */
+
+.body :global(.cm-gutters) {
+  min-width: 56px;
+  background: var(--panel);
+  color: var(--faint);
+  border-right: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.body :global(.cm-lineNumbers .cm-gutterElement) {
+  min-width: 0;
+  padding: 0 12px 0 0;
+  text-align: right;
+}
+
+.body :global(.cm-activeLineGutter) {
+  background: var(--sel);
+  color: var(--dim);
+}
+
+/* --- syntax --------------------------------------------------------------------------- */
+
+/*
+ * The classes `highlight.ts` assigns. They carry `var()` rather than a literal, which is
+ * the entire reason `HighlightStyle` is built with `class:` instead of `color:` — a
+ * generated class would bake today's palette into a stylesheet at construction time and
+ * still be purple after the user switched to the light theme.
+ */
+.body :global(.cide-tk-keyword) {
+  color: var(--purple);
+}
+.body :global(.cide-tk-type) {
+  color: var(--cyan);
+}
+.body :global(.cide-tk-function) {
+  color: var(--blue);
+}
+.body :global(.cide-tk-string),
+.body :global(.cide-tk-attribute) {
+  color: var(--yellow);
+}
+.body :global(.cide-tk-comment) {
+  color: var(--faint);
+  font-style: italic;
+}
+.body :global(.cide-tk-control) {
+  color: var(--red);
+}
+.body :global(.cide-tk-number) {
+  color: var(--green);
+}
+.body :global(.cide-tk-property) {
+  color: var(--text);
+}
+.body :global(.cide-tk-operator) {
+  color: var(--dim);
+}
+.body :global(.cide-tk-heading) {
+  color: var(--accent);
+  font-weight: 600;
+}
+.body :global(.cide-tk-emphasis) {
+  color: var(--dim);
+  font-style: italic;
+}
+
+.body :global(.cm-matchingBracket) {
+  background: var(--chrome-hi);
+  outline: 1px solid var(--accent-dim);
+}
+
+.body :global(.cm-nonmatchingBracket) {
+  color: var(--red);
+}
+
+.body :global(.cm-selectionMatch) {
+  background: var(--accent-dim);
+}
+
+/* --- minimap --------------------------------------------------------------------------- */
+
+.body :global(.cm-cide-minimap) {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: var(--w-minimap);
+  height: 100%;
+  /* The mock puts the map behind a rule; `--border-soft` is the token it names. */
+  border-left: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  cursor: pointer;
+  /* A drag across the map must not select the text underneath it. */
+  touch-action: none;
+}
+
+/* --- find bar --------------------------------------------------------------------------- */
+
+/*
+ * A CodeMirror panel, so it lives inside `.cm-editor` above the scroller and is laid out by
+ * the editor rather than by this pane's flex column. The base theme gives `.cm-panels` a
+ * literal background and border; both are replaced here.
+ */
+.body :global(.cm-panels) {
+  background: var(--chrome);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.body :global(.cm-panels.cm-panels-top) {
+  border-bottom: 1px solid var(--border);
+}
+
+.findBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.findInput {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.findInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* An invalid regular expression is a state on the way to a valid one, so it is marked
+   rather than reported. */
+.findInput[data-invalid='true'] {
+  border-color: var(--red);
+}
+
+.findCount {
+  flex: none;
+  min-width: 8ch;
+  text-align: right;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.findButton {
+  flex: none;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.findButton:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+/* The two toggles carry state; the arrows and the close button do not and never light up. */
+.findButton[data-on='true'] {
+  border-color: var(--accent-dim);
+  background: var(--accent-dim);
+  color: var(--text-hi);
+}

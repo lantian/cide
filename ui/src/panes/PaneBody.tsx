@@ -15,6 +15,7 @@
  */
 import { useState, type ReactNode } from 'react'
 import { TerminalPane } from './TerminalPane'
+import { EditorPane } from './EditorPane'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
 import { ResumeSplash, RestoredShellBanner } from '@/windows/ResumeSplash'
 import type { DiffSpec, Pane, PaneRestore } from '@/ipc/client'
@@ -34,6 +35,14 @@ export interface PaneBodyProps {
    */
   diff?: DiffSpec | undefined
   /**
+   * Set when this pane's tab is a file, which makes it a document rather than a process.
+   *
+   * Deliberately the same shape as `diff` above: both say "this tab is not a terminal, here
+   * is what it is instead", and the tab id travels with the path because the editor reports
+   * the dirty dot back to the tab that draws it. (M9)
+   */
+  editor?: { tab: string; path: string } | undefined
+  /**
    * This pane's entry in the launch plan, when the workspace was restored.
    *
    * Absent for a pane created during the session — those always spawn, because the user
@@ -49,9 +58,16 @@ export function PaneBody({
   project,
   primarySession,
   diff,
+  editor,
   restore,
   onSessionBound,
 }: PaneBodyProps): ReactNode {
+  // A file is a document too: no session, no spawn, nothing to resume. Checked before the
+  // diff case only because it is the cheaper test; the two are mutually exclusive. (M9)
+  if (editor) {
+    return <EditorPane path={editor.path} root={cwd} project={project} tab={editor.tab} />
+  }
+
   // A diff is a document, not a process: it never spawns and has no session to adopt. The
   // `ClaudeMcp` case is the one that matters, because it is holding an agent turn open.
   if (diff && diff.origin.kind === 'claudeMcp' && project) {

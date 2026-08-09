@@ -23,6 +23,7 @@ import type {
   HeadlessRequest,
   HeadlessResult,
   KeymapReport,
+  FileDoc,
   PaneId,
   PaneRestore,
   PickerFrame,
@@ -698,4 +699,30 @@ export function windowLabel(): string {
 export function windowRole(): 'shell' | 'pane' | 'tab' {
   const prefix = windowLabel().split(':')[0]
   return prefix === 'pane' || prefix === 'tab' ? prefix : 'shell'
+}
+
+/**
+ * Files and file tabs. (M9)
+ *
+ * `read` and `write` are the only commands in the app that do arbitrary blocking IO on a
+ * path the user chose, and they are `async` on the Rust side for exactly that reason — a
+ * project on a stalled network mount would otherwise take the event loop, and with it every
+ * terminal in the window.
+ *
+ * The text crosses in both directions exactly as it sits on disk, line endings included.
+ * Normalising at this boundary would be convenient and would also destroy the only record
+ * of what a CRLF file's endings were; see `editor/lineEndings.ts`.
+ */
+export const file = {
+  /** Open a file tab, or activate the one already showing this path. */
+  open: (projectId: ProjectId, path: string) =>
+    invoke<TabId>('tab_open_file', { project: projectId, path }),
+
+  /** Record whether a file tab has unsaved edits. This is what draws the tab's dirty dot. */
+  setDirty: (projectId: ProjectId, id: TabId, dirty: boolean) =>
+    invoke<{ rev: number }>('tab_set_dirty', { project: projectId, tab: id, dirty }),
+
+  read: (path: string) => invoke<FileDoc>('file_read', { path }),
+
+  write: (path: string, text: string) => invoke<void>('file_write', { path, text }),
 }
