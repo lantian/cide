@@ -15,16 +15,23 @@
 //! the default suite in about 30 ms between them on an idle machine; the 100 000-file one is
 //! `#[ignore]`d for the inodes it writes rather than for the clock, and is run with
 //! `cargo test -p cide-fs --test large_repo -- --ignored --nocapture`. A test nobody runs
-//! would not be worth much on its own, which is why the small pair carries both properties
-//! and the big one exists to show they survive the scale.
+//! would not be worth much on its own, which is why the small pair carries the exactness and
+//! the ordering, and the big one exists to show they survive the scale.
+//!
+//! What the small pair does *not* carry is the timing: `first.at * 10 < build_time` is only
+//! meaningful where the walk is long enough to have a shape, so it is asserted at 100 000
+//! files and nowhere else. The default-suite ordering check is therefore structural rather
+//! than clock-based — a frame taken from inside the sink, mid-walk — which is what makes it
+//! able to fail. An earlier version asserted only the sampling thread's counts, and a
+//! `Index::build` mutant that injected everything after the walk passed it 12 times in 12.
 //!
 //! Nothing here touches a path outside [`cide_fs::testing::scratch`], and the tree is
 //! removed when the `Scratch` drops — including on a panic, since `Drop` runs while
 //! unwinding.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cide_fs::testing::{Scratch, scratch};
@@ -121,23 +128,50 @@ struct Sample {
     total: u32,
 }
 
+/// A frame the walk's *own sink* took, between two batches.
+#[derive(Debug, Clone, Copy)]
+struct MidWalk {
+    at: Duration,
+    matched: u32,
+    /// Files the sink had handed to the injector when the frame was taken, counted here
+    /// rather than read back from `frame.total`.
+    ///
+    /// The distinction is the difference between a test that fails and one that does not.
+    /// `frame.total` is `snapshot.item_count()`, which lags the injector's queue by however
+    /// much `tick` has not yet ingested — measured at 5 133 of 6 000 immediately after all
+    /// 6 000 had been pushed. A build that injected the entire corpus in one call therefore
+    /// still produces a short `frame.total`, and an assertion written against it passes for
+    /// exactly the build it was meant to catch.
+    injected: u32,
+}
+
 /// One walk, and everything observed while it ran.
 struct Walk {
     index: Index,
     matcher: Arc<NucleoMatcher>,
     injected: u32,
     samples: Vec<Sample>,
+    /// The first frame taken *from inside the walk's own sink*, with part of the corpus
+    /// injected. See [`walk_while_polling`] for why this and not [`Walk::partial_frames`]
+    /// is what proves the picker does not wait for the walk.
+    from_inside_the_walk: Option<MidWalk>,
     elapsed: Duration,
 }
 
 impl Walk {
-    /// Frames answered from an index the walk had not finished filling.
+    /// Frames the sampling thread took while the matcher held less than the whole corpus.
     ///
-    /// `matched > 0 && total < files` is the whole proof: `total` is how many candidates the
-    /// matcher has ever seen, so a frame reporting fewer than the corpus was taken while the
-    /// walk was still injecting — and `matched > 0` says the picker was already useful. This
-    /// is checked against the counts rather than against a flag the walking thread flips,
-    /// because the counts cannot lie about the ordering and a flag can.
+    /// `total` is how many candidates the matcher has ever seen, so `total < files` means
+    /// injection was still in flight and `matched > 0` means the picker was already useful.
+    ///
+    /// On its own that is weaker than it looks, and it is not what the streaming tests rest
+    /// on. Injection being incomplete does not imply the *walk* was incomplete: a build that
+    /// collected every entry and handed the sink one 100 000-item batch at the very end also
+    /// produces these frames, because 100 000 pushes are not instantaneous either. Measured —
+    /// a mutant of `Index::build` that does exactly that passed a `partial_frames`-only
+    /// assertion 12 times out of 12. What rules it out is [`Walk::from_inside_the_walk`],
+    /// which is sampled from a thread the walk has not finished, plus the 100k test's
+    /// `first.at * 10 < elapsed`, which the same mutant fails.
     fn partial_frames(&self, files: u32) -> Vec<Sample> {
         self.samples
             .iter()
@@ -147,22 +181,24 @@ impl Walk {
     }
 }
 
-/// Walk `corpus` repeatedly until one attempt catches the picker answering from a partial
-/// index, and return that attempt.
+/// Walk `corpus` repeatedly until one attempt catches the picker answering from an index the
+/// walk had not finished producing, and return that attempt.
 ///
 /// The retry is for the machine, not for the code. `nucleo` scores on its own thread pool,
 /// and on a box whose cores are all busy — a CI runner with `-j32`, or another test binary
 /// beside this one — that pool can go unscheduled for the entire walk, so every frame reads
 /// `(0, 0)` and the run observes nothing rather than observing a failure. Measured on a
 /// 32-core box under 2x oversubscription, about a quarter of attempts see nothing; five
-/// independent attempts put that at roughly one run in a thousand. A regression that made
-/// the picker wait for the walk fails all five, every time, because there is no window for
-/// it to slip through.
+/// independent attempts put that at roughly one run in a thousand.
+///
+/// A build that streams nothing — one that collects every entry and injects the lot after
+/// the walk — fails all five attempts, every time, because [`Walk::from_inside_the_walk`]
+/// can only be recorded from a sink call that still has entries coming after it.
 fn walk_until_partial(corpus: &Corpus, opts: BuildOptions, attempts: usize) -> Walk {
     let mut last = None;
     for _ in 0..attempts {
         let walk = walk_while_polling(corpus, opts);
-        if !walk.partial_frames(corpus.files).is_empty() {
+        if walk.from_inside_the_walk.is_some() && !walk.partial_frames(corpus.files).is_empty() {
             return walk;
         }
         last = Some(walk);
@@ -170,9 +206,9 @@ fn walk_until_partial(corpus: &Corpus, opts: BuildOptions, attempts: usize) -> W
     let walk = last.expect("at least one attempt");
     let seen: Vec<(u32, u32)> = walk.samples.iter().map(|s| (s.matched, s.total)).collect();
     panic!(
-        "in {attempts} walks the picker never matched against a partial index — every frame \
-         was empty or complete, which proves nothing about streaming. last run's samples \
-         (matched, total): {seen:?}"
+        "in {attempts} walks the picker never matched against an index the walk had not \
+         finished: from inside the walk {:?}, sampled (matched, total) {seen:?}",
+        walk.from_inside_the_walk
     );
 }
 
@@ -180,6 +216,16 @@ fn walk_until_partial(corpus: &Corpus, opts: BuildOptions, attempts: usize) -> W
 ///
 /// The query is set *before* the walk starts, which is the real sequence: the overlay opens
 /// on a project that has just been registered and starts asking immediately.
+///
+/// There are two observers, and only the second one settles the streaming question:
+///
+/// * a sampling thread, every millisecond, which says what the overlay's poll loop would
+///   have seen — but cannot distinguish "the walk is still running" from "the walk finished
+///   and the injection of its results is still running";
+/// * the sink itself, which `Index::build` calls once per batch *while the walk is
+///   producing more*, so a frame taken there with `total < files` was answered from an index
+///   the walk had not finished. That is the ordering the milestone claims, and it is the one
+///   a non-streaming build cannot fake.
 fn walk_while_polling(corpus: &Corpus, opts: BuildOptions) -> Walk {
     let matcher = Arc::new(NucleoMatcher::new());
     let injected = Arc::new(AtomicU32::new(0));
@@ -215,6 +261,10 @@ fn walk_while_polling(corpus: &Corpus, opts: BuildOptions) -> Walk {
         })
     };
 
+    let inside: Mutex<Option<MidWalk>> = Mutex::new(None);
+    let found = AtomicBool::new(false);
+    let files = corpus.files;
+
     let started = Instant::now();
     let index = Index::build(vec![corpus.root()], opts, &|batch: &[WalkItem]| {
         for item in batch.iter().filter(|i| !i.is_dir) {
@@ -224,6 +274,24 @@ fn walk_while_polling(corpus: &Corpus, opts: BuildOptions) -> Walk {
             ));
             injected.fetch_add(1, Ordering::Relaxed);
         }
+        // Query the picker from inside the walk. `Index::build` drives this closure from the
+        // channel its walker threads are still filling, so a hit here with fewer than
+        // `files` handed over means the picker answered while entries were still being
+        // discovered — not merely while an already-complete list was being injected, which
+        // is all the sampling thread outside can tell. Costs one `tick` per batch until the
+        // first hit and nothing afterwards.
+        let seen = injected.load(Ordering::Relaxed);
+        if !found.load(Ordering::Acquire) && seen < files {
+            let frame = matcher.frame(20);
+            if frame.matched > 0 {
+                *inside.lock().expect("sink mutex") = Some(MidWalk {
+                    at: started.elapsed(),
+                    matched: frame.matched,
+                    injected: seen,
+                });
+                found.store(true, Ordering::Release);
+            }
+        }
     });
     let elapsed = started.elapsed();
     walking.store(false, Ordering::Release);
@@ -232,19 +300,32 @@ fn walk_while_polling(corpus: &Corpus, opts: BuildOptions) -> Walk {
         index,
         injected: injected.load(Ordering::Relaxed),
         samples: observer.join().expect("observer thread"),
+        from_inside_the_walk: *inside.lock().expect("sink mutex"),
         elapsed,
         matcher,
     }
 }
 
 /// Poll until the worker settles, so a count assertion is about matching and not timing.
+///
+/// The millisecond sleep is the same one the sampling thread needs and for the same reason:
+/// a bare spin on `frame` holds `nucleo`'s mutex almost continuously and starves the pool
+/// that would settle it, which on a loaded box turns this into a minute-long spin ending in
+/// an assertion failure about counts that were never going to be right.
 fn settle(matcher: &NucleoMatcher) -> cide_ipc::PickerFrame {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let frame = matcher.frame(20);
-        if !frame.running || Instant::now() > deadline {
+        if !frame.running {
             return frame;
         }
+        assert!(
+            Instant::now() < deadline,
+            "the matcher never settled: {} of {} matched",
+            frame.matched,
+            frame.total
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -294,11 +375,12 @@ fn the_counter_is_exact_after_a_real_walk() {
 /// exists for — in the default suite.
 ///
 /// Two threads, not the default one-per-core. On a 32-core box a 6 000-file tree in tmpfs is
-/// walked in about the time one `frame` spends in `Nucleo::tick`, so the test becomes a race
-/// with the thing it is measuring rather than a proof of it. The alternative was to keep the
-/// default thread count and write ten times the files, which is what the `#[ignore]`d test
-/// below does; capping the walk's parallelism buys the same window for a tenth of the I/O.
-/// Nothing about the ordering being asserted depends on how many cores the walk gets.
+/// walked in about the time one `frame` spends in `Nucleo::tick`, so a single batch can carry
+/// the whole corpus and there is no mid-walk moment left to observe. The alternative was to
+/// keep the default thread count and write ten times the files, which is what the
+/// `#[ignore]`d test below does; capping the walk's parallelism buys the same window for a
+/// tenth of the I/O. Nothing about the ordering being asserted depends on how many cores the
+/// walk gets — only on there being more than one batch.
 #[test]
 fn the_picker_matches_before_a_six_thousand_file_walk_finishes() {
     let corpus = corpus("stream-6k", 60, 100, 10);
@@ -308,6 +390,18 @@ fn the_picker_matches_before_a_six_thousand_file_walk_finishes() {
     };
     let walk = walk_until_partial(&corpus, opts, 5);
 
+    // The load-bearing assertion. This frame was taken by `Index::build`'s sink, which runs
+    // between batches while the walker threads are still producing entries, and fewer than
+    // the whole corpus had been handed over when it matched.
+    let inside = walk
+        .from_inside_the_walk
+        .expect("walk_until_partial returns only walks that recorded one");
+    assert!(inside.matched > 0);
+    assert!(inside.injected < corpus.files);
+
+    // The sampling thread saw the same thing from outside, which is what the overlay's poll
+    // loop would have seen. Weaker on its own — see `Walk::partial_frames` — and kept as the
+    // outside view rather than as the proof.
     let partial = walk.partial_frames(corpus.files);
     let first = partial[0];
     assert!(first.matched > 0 && first.total < corpus.files);
@@ -341,16 +435,24 @@ fn a_hundred_thousand_real_files_stream_into_the_picker() {
     let walk = walk_until_partial(&corpus, BuildOptions::default(), 5);
     let partial = walk.partial_frames(corpus.files);
     let first = partial[0];
+    let inside = walk
+        .from_inside_the_walk
+        .expect("walk_until_partial returns only walks that recorded one");
     println!(
         "100k: generated in {generated:?}, built in {:?}, first non-empty frame at {:?} \
-         ({} of {} files injected), {} partial frames of {} samples",
+         ({} of {} files injected), {} partial frames of {} samples; from inside the walk \
+         {} matched of {} injected at {:?}",
         walk.elapsed,
         first.at,
         first.total,
         corpus.files,
         partial.len(),
         walk.samples.len(),
+        inside.matched,
+        inside.injected,
+        inside.at,
     );
+    assert!(inside.matched > 0 && inside.injected < corpus.files);
 
     // "Usable *before* indexing finishes" is only interesting if "before" means near the
     // start. Both bounds are ~20x looser than what this machine does idle (first match at

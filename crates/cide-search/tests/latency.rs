@@ -187,10 +187,13 @@ fn the_rust_half_of_a_keystroke_is_bounded_and_correct() {
     // preemption inflates even the fastest sample by 20x or more and every tighter or
     // higher percentile was flaky by construction.
     //
-    // Loose is not the same as worthless. The regression this guards against — a keystroke
-    // that scores the whole 100 000-candidate corpus, or copies the whole match set — costs
-    // ~200 ms, and fails this by an order of magnitude on any machine. The bounds that state
-    // the actual budget are in the `#[ignore]`d test below.
+    // Be clear about how little this catches. It is a floor check, and a floor is where the
+    // cheap keystrokes live: a `frame` mutated to loop on `tick` until the worker settled —
+    // i.e. every keystroke waiting on the whole 100 000-candidate corpus — still reported
+    // best 134 µs, median 2.2 ms, max 15.4 ms here and passed this line. What it does catch
+    // is a per-keystroke cost that no longer has a fast case at all. The properties with
+    // real teeth in this test are the structural ones below, which have no clock in them,
+    // and the distribution bounds are in the `#[ignore]`d test.
     assert!(
         t.best < FRAME_BUDGET + TICK_BUDGET,
         "the fastest keystroke of the run cost {:?} in the Rust half alone — that is a \
