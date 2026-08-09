@@ -84,6 +84,13 @@ impl FsRegistry {
             // an `indexing: true` it can watch, rather than a second walk of the same tree.
             return fs.status();
         }
+        // The flag is cleared by a guard rather than by a `store` at the end of the happy
+        // path. A panic anywhere in the walk would otherwise leave it set for ever, and the
+        // consequence is silent and total: every later `fs.index` takes the branch above and
+        // returns immediately, so the project keeps an empty tree, an empty picker and no
+        // watcher, with nothing anywhere saying why. Tauri catches the panic and the user
+        // sees one failed command; a retry has to be able to work.
+        let indexing_guard = IndexingGuard(Arc::clone(&fs));
 
         // A re-index of an already-indexed project starts from an empty picker, or the old
         // paths would be offered alongside the new ones for ever. The old watcher goes with
@@ -113,7 +120,7 @@ impl FsRegistry {
 
         *fs.index.write() = index;
         *fs.filter.write() = Arc::clone(&filter);
-        fs.indexing.store(false, Ordering::Release);
+        drop(indexing_guard);
 
         let config = WatchConfig {
             roots: root_paths,
@@ -130,6 +137,15 @@ impl FsRegistry {
         let status = fs.status();
         crate::emit::fs_status(app, project, &status);
         status
+    }
+}
+
+/// Clears `ProjectFs::indexing` however the walk ends, including by unwinding.
+struct IndexingGuard(Arc<ProjectFs>);
+
+impl Drop for IndexingGuard {
+    fn drop(&mut self) {
+        self.0.indexing.store(false, Ordering::Release);
     }
 }
 

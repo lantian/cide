@@ -531,7 +531,7 @@ impl Index {
             added.push(item);
             changed = true;
             if is_dir && !symlink {
-                added.extend(self.graft_subtree(&path, root));
+                added.extend(self.graft_subtree(&path, root, filter));
             }
         }
         if changed {
@@ -558,12 +558,21 @@ impl Index {
     }
 
     /// Walk a directory that has just appeared and insert everything under it.
-    fn graft_subtree(&mut self, path: &Path, root_index: u16) -> Vec<WalkItem> {
+    ///
+    /// The walk is rooted at the new directory, so `WalkBuilder` sees only the `.gitignore`
+    /// files at or below it — the project's own `.gitignore` is above the walk root and
+    /// `parents(false)` keeps it out. A `git clone` of a Rust project into the tree would
+    /// therefore index `target/` if the rule that ignores it lives in the project root. So
+    /// every entry is put through `Filter`, which does consult the ancestor matchers, before
+    /// it is grafted. Without this the index and the watcher disagree: `watch_tree` already
+    /// asks `Filter`, so those rows would appear in the tree and never be watched.
+    fn graft_subtree(&mut self, path: &Path, root_index: u16, filter: &Filter) -> Vec<WalkItem> {
         let root = Root::new(path);
         let mut entries = Vec::new();
         walk_root(&root, root_index, false, BuildOptions::default(), |batch| {
             entries.extend_from_slice(batch);
         });
+        entries.retain(|item| filter.admits(&item.path, item.is_dir));
         // The walk made `rel` relative to the new directory; the picker wants it relative to
         // the project root.
         for item in &mut entries {
@@ -1074,6 +1083,47 @@ mod tests {
         assert!(batches.len() > 1, "one batch is not streaming: {batches:?}");
         assert_eq!(batches.iter().sum::<usize>(), 2_000);
         assert_eq!(index.files(), 2_000);
+    }
+
+    /// A `git clone` into the tree arrives as one create event and a whole subtree, and that
+    /// subtree is walked from its own directory — where the project's `.gitignore` is an
+    /// ancestor the walk is told not to read. `Filter` is what puts it back.
+    #[test]
+    fn a_directory_that_appears_later_still_obeys_the_project_gitignore() {
+        let dir = scratch("index-graft-ignore");
+        tree(&dir);
+        let mut index = build(&dir);
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            index.dir_paths().iter().map(|p| p.as_path()),
+        );
+
+        // `target/` is ignored by the root `.gitignore`, which is above this walk's root.
+        std::fs::create_dir_all(dir.join("vendored/target/debug")).unwrap();
+        std::fs::create_dir_all(dir.join("vendored/src")).unwrap();
+        std::fs::write(dir.join("vendored/target/debug/a.o"), "").unwrap();
+        std::fs::write(dir.join("vendored/src/lib.rs"), "").unwrap();
+
+        let added = index.apply(
+            &FsChange {
+                paths: vec![dir.join("vendored")],
+                truncated: false,
+                git: false,
+            },
+            &filter,
+        );
+
+        assert!(index.contains(&dir.join("vendored/src/lib.rs")));
+        assert!(
+            !index.contains(&dir.join("vendored/target")),
+            "the project's own .gitignore has to reach a subtree grafted after the walk"
+        );
+        assert!(!index.contains(&dir.join("vendored/target/debug/a.o")));
+        let rels: Vec<&str> = added.iter().map(|i| i.rel.as_str()).collect();
+        assert!(
+            !rels.iter().any(|r| r.contains("target")),
+            "an ignored path was offered to the picker: {rels:?}"
+        );
     }
 
     #[test]

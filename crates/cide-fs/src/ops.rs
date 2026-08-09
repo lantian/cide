@@ -37,6 +37,22 @@ pub fn check_within(roots: &[PathBuf], path: &Path) -> Result<()> {
     Err(FsError::OutsideProject(path.display().to_string()))
 }
 
+/// Reject a path that *is* one of the roots.
+///
+/// [`check_within`] admits the root itself, which is right for reading and revealing and
+/// catastrophic for the operations that move things. In a multi-root project each root is a
+/// row of its own, so "select a row, press delete" reaches this with the root's path and
+/// would put the entire project directory in the trash — and the tree would not even redraw,
+/// because [`crate::Index`] deliberately refuses to remove a root node. The undo exists but
+/// it is a desktop trash the user has to go and find, which is not an undo anyone wants to
+/// need. Cheaper to refuse: nothing in the UI asks to delete a root on purpose.
+pub fn check_not_root(roots: &[PathBuf], path: &Path) -> Result<()> {
+    if roots.iter().any(|root| root == path) {
+        return Err(FsError::IsRoot(path.display().to_string()));
+    }
+    Ok(())
+}
+
 pub fn read_to_string(path: &Path) -> Result<String> {
     let meta = std::fs::metadata(path).map_err(|e| FsError::io(path, e))?;
     if meta.len() > MAX_READ {
@@ -141,6 +157,26 @@ mod tests {
             check_within(&roots, Path::new("relative/a.rs")),
             Err(FsError::InvalidPath(_))
         ));
+    }
+
+    #[test]
+    fn a_root_is_inside_the_project_but_still_refuses_to_be_moved() {
+        let roots = vec![
+            PathBuf::from("/home/u/project"),
+            PathBuf::from("/home/u/other"),
+        ];
+        // `check_within` says yes to a root — that is what makes `fs.read`/`fs.reveal` work
+        // on it — which is exactly why the move operations need the second check.
+        assert!(check_within(&roots, Path::new("/home/u/project")).is_ok());
+        assert!(matches!(
+            check_not_root(&roots, Path::new("/home/u/project")),
+            Err(FsError::IsRoot(_))
+        ));
+        assert!(matches!(
+            check_not_root(&roots, Path::new("/home/u/other")),
+            Err(FsError::IsRoot(_))
+        ));
+        assert!(check_not_root(&roots, Path::new("/home/u/project/src")).is_ok());
     }
 
     #[test]

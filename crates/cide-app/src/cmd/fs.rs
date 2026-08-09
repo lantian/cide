@@ -168,6 +168,7 @@ pub fn fs_rename(
     let roots = fs.root_paths();
     ops::check_within(&roots, &from)?;
     ops::check_within(&roots, &to)?;
+    ops::check_not_root(&roots, &from)?;
     ops::rename(&from, &to)
 }
 
@@ -176,6 +177,11 @@ pub fn fs_rename(
 /// Trash rather than `unlink`, and the reason is worth stating where it can be read: a file
 /// tree's delete is one keystroke away from a misclick, and the freedesktop trash is the only
 /// undo a file manager offers. See `cide_fs::trash`.
+///
+/// Every path is checked before any path is moved, so a selection with one bad entry in it
+/// trashes nothing rather than half of itself. Once the moves start, a failure part way
+/// through cannot be undone — the paths already trashed are reported in the error so the
+/// caller knows what actually moved rather than assuming nothing did.
 #[tauri::command(rename_all = "camelCase")]
 pub fn fs_delete(
     registry: State<'_, FsRegistry>,
@@ -184,12 +190,26 @@ pub fn fs_delete(
 ) -> Result<Vec<PathBuf>, FsError> {
     let fs = project_fs(&registry, project)?;
     let roots = fs.root_paths();
-    let mut trashed = Vec::with_capacity(paths.len());
     for path in &paths {
         ops::check_within(&roots, path)?;
+        ops::check_not_root(&roots, path)?;
     }
+    let mut trashed = Vec::with_capacity(paths.len());
     for path in &paths {
-        trashed.push(ops::delete(path)?);
+        match ops::delete(path) {
+            Ok(dest) => trashed.push(dest),
+            Err(err) => {
+                tracing::warn!(
+                    failed = %path.display(),
+                    already_trashed = trashed.len(),
+                    "a multi-path delete stopped part way through"
+                );
+                return Err(FsError::PartialDelete {
+                    trashed: trashed.iter().map(|p| p.display().to_string()).collect(),
+                    error: err.to_string(),
+                });
+            }
+        }
     }
     Ok(trashed)
 }

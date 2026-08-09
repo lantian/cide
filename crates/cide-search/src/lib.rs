@@ -75,6 +75,15 @@ pub trait Matcher: Send + Sync {
 }
 
 /// The `nucleo`-backed implementation.
+///
+/// # Lock order
+///
+/// `query` → `inner` → `highlight` / `injector`, and never the other way round. Two Tauri
+/// worker threads answering two keystrokes really do run [`Matcher::query`] and
+/// [`Matcher::frame`] against the same matcher concurrently, and `frame` taking `inner`
+/// before `query` while `query` held `query` and waited on `inner` was a permanent hang of
+/// both threads — `parking_lot` guards have no timeout, so the picker never came back. Any
+/// new method must take these in the order they are declared here.
 pub struct NucleoMatcher {
     inner: Mutex<Nucleo<Candidate>>,
     /// Held separately from the worker so that injection never waits on a query. Behind an
@@ -168,13 +177,18 @@ impl Matcher for NucleoMatcher {
 
     fn frame(&self, limit: usize) -> PickerFrame {
         let limit = limit.min(MAX_FRAME);
+        // `query` before `inner`, which is the order `query()` takes them in. Taking them the
+        // other way round deadlocks against a concurrent keystroke; see the lock-order note
+        // on the struct. Holding the guard for the whole frame is also what makes the echoed
+        // query honest: it is the query the pattern below was actually parsed from, not one a
+        // keystroke landing mid-frame has already replaced.
+        let query = self.query.lock();
         let mut nucleo = self.inner.lock();
         // 10ms: long enough to finish a small query outright, short enough that the IPC
         // thread is never held for a frame's worth of time.
         let status = nucleo.tick(10);
         self.dirty.store(false, Ordering::Release);
 
-        let query = self.query.lock().clone();
         let snapshot = nucleo.snapshot();
         let matched = snapshot.matched_item_count();
         let total = snapshot.item_count();
@@ -207,7 +221,7 @@ impl Matcher for NucleoMatcher {
             matched,
             total,
             running: status.running,
-            query,
+            query: query.clone(),
         }
     }
 
@@ -386,6 +400,53 @@ mod tests {
         let empty = rank("", &items, 10);
         assert_eq!(empty.matched, 3, "an empty query matches everything");
         assert_eq!(empty.items.len(), 3);
+    }
+
+    /// Two threads doing what two Tauri workers do when the user types quickly.
+    ///
+    /// `picker_query` calls `query` then `frame`, and Tauri runs commands on a pool, so two
+    /// keystrokes overlap as a matter of course. Before the lock order was fixed this wedged
+    /// both threads permanently within a few hundred iterations: `frame` held `inner` and
+    /// waited for `query`, `query` held `query` and waited for `inner`.
+    ///
+    /// The threads are deliberately not joined — a regression deadlocks them for ever, and a
+    /// `join` would hang the whole test binary instead of failing this one test.
+    #[test]
+    fn a_query_and_a_frame_on_two_threads_do_not_wedge_each_other() {
+        use std::sync::mpsc;
+
+        let matcher = std::sync::Arc::new(NucleoMatcher::new());
+        for i in 0..2_000 {
+            matcher.push(Candidate::new(
+                format!("src/file{i}.rs"),
+                format!("/root/{i}"),
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        for worker in 0..2 {
+            let matcher = std::sync::Arc::clone(&matcher);
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for i in 0..300 {
+                    if worker == 0 {
+                        matcher.query(&format!("file{i}"));
+                    } else {
+                        let _ = matcher.frame(20);
+                    }
+                }
+                let _ = tx.send(worker);
+            });
+        }
+        drop(tx);
+
+        let mut finished = 0;
+        while finished < 2 {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(_) => finished += 1,
+                Err(_) => panic!("deadlock: {finished} of 2 workers finished"),
+            }
+        }
     }
 
     /// The milestone's headline property: the picker answers before indexing finishes.
