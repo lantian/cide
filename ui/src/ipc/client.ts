@@ -391,3 +391,76 @@ export function windowRole(): 'shell' | 'pane' | 'tab' {
   const prefix = windowLabel().split(':')[0]
   return prefix === 'pane' || prefix === 'tab' ? prefix : 'shell'
 }
+
+/**
+ * Git — the M10 commit tool window (`ui/src/sidebar/GitPanel`).
+ *
+ * **None of these handlers is registered yet.** `cide-git` is a stub and the Rust side is
+ * being written in parallel, so every call here rejects with Tauri's "command not found"
+ * until it lands. They are absent from `contract/commands.json` for exactly that reason:
+ * `contract-check` diffs the contract against the commands `cide-app` actually registers,
+ * so listing them early would fail the gate rather than document intent. Whoever registers
+ * `git_status` adds all eight names in the same change.
+ *
+ * The panel therefore treats a rejection as "no git data" and paints an empty tree — see
+ * `useGitPanel`, which routes every call through one guard. That is not defensive
+ * decoration: it is what lets the panel ship, be looked at, and be reviewed before the
+ * backend exists.
+ *
+ * Returns are `unknown` rather than a DTO on purpose. The `ChangesTree` DTO is not in
+ * `cide-ipc` yet, so `generated.ts` has nothing to import; `normalizeStatus` validates the
+ * payload at the boundary instead. When the DTOs land, these signatures tighten to the
+ * generated types and the normaliser becomes a thin cast.
+ */
+export const git = {
+  /** The whole panel: every repo, changelist, submodule group and file. */
+  status: (projectId: ProjectId) => invoke<unknown>('git_status', { project: projectId }),
+
+  /** One file's diff text. `side` picks the staged or the working-tree comparison. */
+  diffFile: (projectId: ProjectId, repo: string, path: string, side: 'staged' | 'worktree') =>
+    invoke<unknown>('git_diff_file', { project: projectId, repo, path, side }),
+
+  /** Whole-file staging. Hunk and line staging goes through `applyHunks`. */
+  stagePaths: (projectId: ProjectId, repo: string, paths: string[], staged: boolean) =>
+    invoke<void>('git_stage_paths', { project: projectId, repo, paths, staged }),
+
+  /** A synthesized unified diff applied to the index only (`ApplyLocation::Index`). */
+  applyHunks: (projectId: ProjectId, repo: string, patch: string) =>
+    invoke<void>('git_apply_hunks', { project: projectId, repo, patch }),
+
+  /**
+   * Commit one changelist. Returns the new commit's id.
+   *
+   * `expectIndex` is the index state the panel last saw. Rust refuses the commit if the
+   * real index has moved since — that refusal is what raises the "staging changed outside
+   * cide" bar instead of silently clobbering a `git add` someone ran in a bash pane.
+   */
+  commit: (
+    projectId: ProjectId,
+    repo: string,
+    message: string,
+    amend: boolean,
+    changelist: string | null,
+    paths: string[],
+    expectIndex: string | null,
+  ) =>
+    invoke<string>('git_commit', {
+      project: projectId,
+      repo,
+      message,
+      amend,
+      changelist,
+      paths,
+      expectIndex,
+    }),
+
+  push: (projectId: ProjectId, repo: string, remote: string | null, refspec: string | null) =>
+    invoke<void>('git_push', { project: projectId, repo, remote, refspec }),
+
+  changelistCreate: (projectId: ProjectId, repo: string, name: string) =>
+    invoke<void>('git_changelist_create', { project: projectId, repo, name }),
+
+  /** Shelve paths as our own patch. With no paths, shelves the whole selection's repo. */
+  shelve: (projectId: ProjectId, repo: string, paths: string[], name: string) =>
+    invoke<unknown>('git_shelve', { project: projectId, repo, paths, name }),
+}

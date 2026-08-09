@@ -1,0 +1,60 @@
+.list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--panel);
+}
+
+/*
+ * Two lines rather than the tree's 23px: a shelf entry is named by a person and its name
+ * is a sentence, where a file row is a path. Cramming both onto one line would ellipsize
+ * the only thing that tells two shelves apart.
+ */
+.entry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: default;
+}
+
+.entry:hover {
+  background: var(--chrome-hi);
+}
+
+.entry:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
+.empty {
+  margin: 0;
+  padding: 12px;
+  color: var(--faint);
+  font-size: 12px;
+}

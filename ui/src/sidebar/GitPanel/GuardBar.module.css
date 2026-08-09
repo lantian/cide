@@ -1,0 +1,68 @@
+/*
+ * Sits directly above the commit controls, not at the top of the panel: it is about the
+ * commit that is about to happen, and next to the button is the one place it cannot be
+ * scrolled past. Yellow rather than red — the working tree is fine, two views of the index
+ * merely disagree.
+ */
+.bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 4px 10px;
+  background: var(--chrome-hi);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.glyph {
+  flex: none;
+  color: var(--yellow);
+  font-size: 12px;
+}
+
+.text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Which repository, in a multi-root workspace. Mono because it is a path fragment. */
+.repo {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+/*
+ * Both actions are equally weighted. Neither is safe enough to be the default: reload
+ * discards the panel's ticks, overwrite discards someone's `git add`, and drawing one as
+ * primary would be a recommendation this code is not in a position to make.
+ */
+.action {
+  flex: none;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.action:hover {
+  border-color: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}

@@ -1,0 +1,105 @@
+/*
+ * 420px, from the mock's git sidebar. The width is a token rather than a literal because
+ * the explorer's 252px is the same measurement in the same place, and a layout that reads
+ * one from a token and the other from a number drifts.
+ */
+.panel {
+  width: var(--w-sidebar-git);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/* 30px, matching the explorer's header so the two sidebars swap without the content
+   below them moving by a pixel. */
+.header {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Commit / Shelf, as one segmented control rather than two loose buttons: they are
+   mutually exclusive, and the shared track is what says so before either is read. */
+.segmented {
+  display: flex;
+  padding: 2px;
+  gap: 2px;
+  border-radius: 5px;
+  background: var(--panel-2);
+}
+
+.segment {
+  height: 18px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.segment:hover {
+  color: var(--text);
+}
+
+.segmentOn,
+.segmentOn:hover {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+.segment:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* The branch, mono and purple — the same treatment the status bar gives it. */
+.branch {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--purple);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * One line, never a dialog: a git command that is missing or failed is information, and
+ * the panel keeps working around it.
+ */
+.note {
+  flex: none;
+  margin: 0;
+  padding: 5px 10px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--faint);
+  font-size: 11px;
+  /* A backend error can be long; it must not widen the panel or wrap into three lines. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.noteWarn {
+  color: var(--yellow);
+}

@@ -1,0 +1,166 @@
+.tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /*
+   * Never horizontally: a long path must ellipsize inside the row. A 420px panel that
+   * scrolls sideways hides the checkbox column, which is the one column that has to stay
+   * visible at all times.
+   */
+  overflow-x: hidden;
+  padding: 4px 0;
+  background: var(--panel);
+}
+
+/* 23px rows, from the mock. The gap is the space between twisty, box and name. */
+.row {
+  height: 23px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 10px;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.row:hover {
+  background: var(--chrome-hi);
+}
+
+/* Keyboard focus has to be visible in a tree whose selection is drawn as checkboxes: the
+   ticks say what will be committed, and only this says what Space will act on. */
+.row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.groupRow {
+  background: var(--panel-2);
+}
+
+.groupRow:hover {
+  background: var(--chrome-hi);
+}
+
+.twisty {
+  width: 9px;
+  flex: none;
+  color: var(--faint);
+  font-size: 9px;
+  text-align: center;
+}
+
+/*
+ * The box's hit target, padded out to a comfortable size without changing the 12px the
+ * mock draws. Negative margins keep the extra padding from shifting the name.
+ */
+.checkHit {
+  display: grid;
+  place-items: center;
+  padding: 5px 4px;
+  margin: -5px -4px;
+  cursor: pointer;
+  flex: none;
+}
+
+.groupName {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The active changelist is where new changes land and what Commit defaults to, so it is
+   the one group name drawn at full strength. */
+.groupName[data-active] {
+  color: var(--text);
+}
+
+.groupName[data-kind='repo'] {
+  color: var(--text-hi);
+}
+
+/* A submodule is a repository inside a changelist; the colour says so before the indent
+   does, which matters because it sits at the same depth as a plain file. */
+.groupName[data-kind='submodule'] {
+  color: var(--purple);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* Counters are mono, per the type rules. Right-aligned, as the mock has them. */
+.count {
+  margin-left: auto;
+  padding-left: 8px;
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.fileName {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  flex: none;
+}
+
+/*
+ * The explorer's palette, so a file is the same colour in both trees: M blue, A green,
+ * D faint and struck through. Renamed is purple because it is a move rather than an edit,
+ * and unversioned is yellow — a warning, not an error, since nothing is wrong with a file
+ * git has not been told about yet.
+ */
+.fileName[data-status='modified'] {
+  color: var(--blue);
+}
+.fileName[data-status='added'] {
+  color: var(--green);
+}
+.fileName[data-status='deleted'] {
+  color: var(--faint);
+  text-decoration: line-through;
+}
+.fileName[data-status='renamed'] {
+  color: var(--purple);
+}
+.fileName[data-status='unversioned'] {
+  color: var(--yellow);
+}
+.fileName[data-status='ignored'] {
+  color: var(--faint);
+}
+.fileName[data-status='conflicted'] {
+  color: var(--red);
+}
+
+/* The directory gives way first: the file name is what identifies the row. */
+.dir {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.partialTag {
+  flex: none;
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px solid var(--accent-dim);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  line-height: 14px;
+  color: var(--accent);
+}
+
+.empty {
+  margin: 0;
+  padding: 12px;
+  color: var(--faint);
+  font-size: 12px;
+}

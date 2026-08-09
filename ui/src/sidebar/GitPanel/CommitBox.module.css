@@ -1,0 +1,150 @@
+.footer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 10px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 18px;
+}
+
+.amend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+/*
+ * The one real <input type=checkbox> in the panel — the tree's boxes are tri-state and
+ * drawn by hand, but this one is binary and belongs to a label, so the platform control is
+ * both smaller and better behaved. `accent-color` tints it with the app's accent without
+ * giving up the native focus ring or the keyboard behaviour.
+ */
+.checkbox {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* `2 modified`, in --accent per the mock. Mono because it leads with a counter. */
+.summary {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * 104px, outlined --accent, from the mock. Fixed height rather than auto-growing: the
+ * buttons below must not move while someone types, and a box that grows into the tree
+ * would push rows around during a refresh.
+ */
+.message {
+  height: 104px;
+  flex: none;
+  resize: none;
+  padding: 7px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 17px;
+  /* The rest of the app forbids text selection; a text field has to opt back in. */
+  user-select: text;
+}
+
+.message::placeholder {
+  color: var(--faint);
+}
+
+.message:focus {
+  outline: none;
+  border-color: var(--accent-hi);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.commit,
+.push {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+/*
+ * Accent fill with the app's own ground as the label.
+ *
+ * `--bg` rather than a literal white: the accent is a light orange in the dark theme and a
+ * darker one in the light theme, so a fixed label colour would fail contrast in one of the
+ * two. The ground inverts in exactly the direction needed, and the tree's checkboxes use
+ * the same pair.
+ */
+.commit {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 500;
+}
+
+.commit:hover:not(:disabled) {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+}
+
+.push {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+}
+
+.push:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.commit:disabled,
+.push:disabled {
+  /* Dimmed rather than hidden: the button is the answer to "how do I commit", and it has
+     to still be there when the reason it is unavailable is an empty message. */
+  opacity: 0.45;
+  cursor: default;
+}
+
+.commit:focus-visible,
+.push:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Visible to assistive technology only — the textarea's placeholder is not a label. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
