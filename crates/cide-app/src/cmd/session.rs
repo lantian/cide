@@ -63,13 +63,49 @@ fn base_env(spec: SpawnSpec) -> SpawnSpec {
 
 /// Whether this program is the Claude Code CLI, and so has hooks worth registering.
 ///
-/// Matched on the file name rather than the whole path: it may be invoked as `claude`, as an
-/// absolute path into a version directory, or through a shim.
+/// Matched on the file name, which is enough because the frontend spawns the bare string
+/// `claude` and lets `PATH` resolve it.
+///
+/// **The limitation is worth stating, because breaking it is silent.** `claude` on this
+/// machine resolves to `~/.local/share/claude/versions/2.1.226`, whose file name is a version
+/// number and matches nothing here. That is harmless today — the resolution happens in the
+/// OS, after this decision — but the moment anything passes an absolute path as the program
+/// (a configurable CLI location in Settings, say), this returns false, no `--settings` is
+/// attached, and every session runs with no hooks: no token figures, no fast buffer reload,
+/// and a close confirm that cannot tell busy from idle. Nothing fails; the features simply
+/// are not there. A change to what is passed as `program` needs a change here too.
 fn program_is_claude(program: &str) -> bool {
     std::path::Path::new(program)
         .file_name()
         .map(|n| n == "claude")
         .unwrap_or(false)
+}
+
+/// The conversation arguments for a Claude child.
+///
+/// Order matters and a wrong one fails silently, so this is a function with tests rather
+/// than a run of `.arg()` calls inline in a Tauri command.
+///
+/// `--fork-session` composing with `--session-id` was an open question in the plan, with a
+/// fallback designed around it possibly not working. It was checked against 2.1.226: the
+/// combination is accepted, the id we pass **is** honoured, the fork inherits the parent's
+/// history, and the parent's transcript survives untouched beside the fork's. Both remain
+/// independently resumable. So the id stays ours and no hook-learned correction is needed.
+///
+/// `fork` without `resume` is meaningless — there is nothing to branch from — and is treated
+/// as a plain new session rather than passed through to be rejected by the CLI.
+fn claude_args(id: SessionId, resume: Option<SessionId>, fork: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(parent) = resume {
+        args.push("--resume".into());
+        args.push(parent.to_string());
+        if fork {
+            args.push("--fork-session".into());
+        }
+    }
+    args.push("--session-id".into());
+    args.push(id.to_string());
+    args
 }
 
 /// The inline `--settings` JSON, or `None` when `cide-hook` cannot be located.
@@ -130,21 +166,9 @@ pub fn session_spawn(
     // what lets a restored pane resume with `--resume <id>` and no extra bookkeeping.
     let id = SessionId::new();
     if is_claude {
-        if let Some(parent) = resume {
-            spec = spec.arg("--resume").arg(parent.to_string());
-            if fork {
-                // Verified against 2.1.226 rather than assumed, because the plan flagged it
-                // as unknown and the failure would be silent: `--fork-session` does compose
-                // with `--session-id`, the id we pass *is* honoured, and the parent's
-                // transcript is left intact beside the fork's own. Both are independently
-                // resumable afterwards.
-                //
-                // This is the operation a terminal multiplexer structurally cannot offer —
-                // splitting a conversation to try two approaches from a shared history.
-                spec = spec.arg("--fork-session");
-            }
+        for a in claude_args(id, resume, fork) {
+            spec = spec.arg(a);
         }
-        spec = spec.arg("--session-id").arg(id.to_string());
     }
 
     // `CLAUDE_CODE_SSE_PORT` is load-bearing, not a hint. It makes a port match alone mark our
@@ -416,5 +440,84 @@ pub fn session_list(registry: State<'_, SessionRegistry>) -> Vec<SessionId> {
 pub fn session_kill(registry: State<'_, SessionRegistry>, session: SessionId) {
     if let Some(s) = registry.get(session) {
         s.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_session_only_names_itself() {
+        let id = SessionId::new();
+        assert_eq!(
+            claude_args(id, None, false),
+            vec!["--session-id".to_string(), id.to_string()]
+        );
+    }
+
+    #[test]
+    fn resuming_names_the_parent_before_naming_the_new_session() {
+        // `--resume <parent>` and `--session-id <ours>` both take a uuid, so a swapped order
+        // is still a valid command line that resumes the wrong conversation.
+        let id = SessionId::new();
+        let parent = SessionId::new();
+        assert_eq!(
+            claude_args(id, Some(parent), false),
+            vec![
+                "--resume".to_string(),
+                parent.to_string(),
+                "--session-id".to_string(),
+                id.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn forking_branches_from_the_parent_and_keeps_our_id() {
+        let id = SessionId::new();
+        let parent = SessionId::new();
+        assert_eq!(
+            claude_args(id, Some(parent), true),
+            vec![
+                "--resume".to_string(),
+                parent.to_string(),
+                "--fork-session".to_string(),
+                "--session-id".to_string(),
+                id.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn forking_with_nothing_to_fork_from_is_an_ordinary_new_session() {
+        // Rather than passing `--fork-session` alone for the CLI to reject. A split that
+        // asked to branch a project with no primary session should still give the user a
+        // working pane.
+        let id = SessionId::new();
+        assert_eq!(
+            claude_args(id, None, true),
+            vec!["--session-id".to_string(), id.to_string()]
+        );
+    }
+
+    #[test]
+    fn the_program_string_the_frontend_actually_sends_is_recognised() {
+        // `specFor` in TerminalPane.tsx sends exactly this, letting PATH resolve it.
+        assert!(program_is_claude("claude"));
+        assert!(program_is_claude("/usr/local/bin/claude"));
+        assert!(!program_is_claude("/bin/bash"));
+        assert!(!program_is_claude("claude-hook"));
+    }
+
+    #[test]
+    fn a_version_resolved_path_is_not_recognised_and_that_is_a_known_limit() {
+        // Documented rather than fixed, because it cannot be fixed by name-matching: this is
+        // what `claude` resolves to on a real install, and its file name is a version number.
+        // Nothing cide spawns takes this form today. If that ever changes, hooks silently
+        // stop registering — see `program_is_claude`.
+        assert!(!program_is_claude(
+            "/home/u/.local/share/claude/versions/2.1.226"
+        ));
     }
 }

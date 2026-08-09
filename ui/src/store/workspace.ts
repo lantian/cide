@@ -9,6 +9,7 @@
  * The only genuinely local state is transient chrome: which overlay is open, whether a
  * splitter is mid-drag. Those never outlive the window and never need to agree with anyone.
  */
+import { rememberSpawnPlan } from '@/layout/spawnPlans'
 import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
 import {
@@ -29,6 +30,7 @@ import {
   type Side,
   type SplitId,
   type SplitIntent,
+  type SplitOutcome,
   type Tab,
   type TabId,
   type WindowMode,
@@ -66,7 +68,7 @@ interface WorkspaceStore {
     axis: Axis,
     side: Side,
     intent?: SplitIntent | null,
-  ) => Promise<PaneId>
+  ) => Promise<SplitOutcome>
   closePane: (project: ProjectId, tab: TabId, pane: PaneId) => Promise<void>
   focusPane: (project: ProjectId, tab: TabId, pane: PaneId) => Promise<void>
   maximizePane: (project: ProjectId, tab: TabId, pane: PaneId | null) => Promise<void>
@@ -152,6 +154,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
 
   splitPane: async (project, tab, pane, axis, side, intent = null) => {
     const created = await paneApi.split(project, tab, pane, axis, side, intent)
+    // Recorded before the hydrate that makes the pane renderable, so the spawn plan is
+    // already in place by the time `TerminalPane` mounts and asks for one. The other order
+    // races: the pane appears, spawns a fresh session, and the fork is lost.
+    if (created.intent.kind === 'forkPrimary' || created.intent.kind === 'mirror') {
+      rememberSpawnPlan(created.pane, created.intent)
+    }
     await get().hydrate()
     return created
   },

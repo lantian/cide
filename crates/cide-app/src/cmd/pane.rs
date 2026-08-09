@@ -13,7 +13,7 @@
 use cide_core::{CoreError, layout, workspace};
 use cide_ipc::{
     Axis, Direction, Pane, PaneId, PaneKind, PaneRole, ProjectId, SessionId, Side, SplitId,
-    SplitIntent, TabId, TabKind,
+    SplitIntent, SplitOutcome, TabId, TabKind,
 };
 use tauri::{Manager, State};
 
@@ -83,13 +83,14 @@ pub fn pane_split(
     axis: Axis,
     side: Side,
     intent: Option<SplitIntent>,
-) -> Result<PaneId, CoreError> {
+) -> Result<SplitOutcome, CoreError> {
     state.update(|ws| {
         let name = workspace::project(ws, project)?.name.clone();
         let t = workspace::tab_mut(ws, project, tab)?;
         let intent = intent.unwrap_or_else(|| default_intent(&t.kind, axis));
         let fresh = pane_for(&intent, &name);
-        layout::split(&mut t.tree, pane, axis, side, fresh)
+        let pane = layout::split(&mut t.tree, pane, axis, side, fresh)?;
+        Ok(SplitOutcome { pane, intent })
     })
 }
 

@@ -68,9 +68,11 @@ export function createAppPaneDriver(): PaneAuditDriver | null {
       const { project, tab } = ids()
       // `null` intent asks the domain for the tab's own default, which is the behaviour a
       // user gets; forcing one here would test a path the app never takes.
-      return useWorkspace
+      // The audit only needs the pane id; the resolved intent is for the spawn path.
+      const { pane: created } = await useWorkspace
         .getState()
         .splitPane(project, tab, pane as PaneId, axis as Axis, 'after', null)
+      return created
     },
 
     async close(pane: string) {

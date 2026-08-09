@@ -22,6 +22,8 @@ import type { DiffSpec, Pane, PaneRestore } from '@/ipc/client'
 export interface PaneBodyProps {
   /** The project this pane belongs to, so its child reaches the right IDE server. */
   project?: string | undefined
+  /** The project's primary session — what a `forkPrimary` split branches from. */
+  primarySession?: string | undefined
   pane: Pane
   cwd: string
   /**
@@ -45,6 +47,7 @@ export function PaneBody({
   pane,
   cwd,
   project,
+  primarySession,
   diff,
   restore,
   onSessionBound,
@@ -78,7 +81,13 @@ export function PaneBody({
       return (
         <>
           <RestoredShellBanner />
-          <TerminalPane pane={pane} cwd={cwd} project={project} onSessionBound={onSessionBound} />
+          <TerminalPane
+            pane={pane}
+            cwd={cwd}
+            project={project}
+            primarySession={primarySession}
+            onSessionBound={onSessionBound}
+          />
         </>
       )
     }
@@ -93,5 +102,11 @@ export function PaneBody({
     )
   }
 
-  return <TerminalPane pane={pane} cwd={cwd} project={project} onSessionBound={onSessionBound} />
+  return <TerminalPane
+            pane={pane}
+            cwd={cwd}
+            project={project}
+            primarySession={primarySession}
+            onSessionBound={onSessionBound}
+          />
 }

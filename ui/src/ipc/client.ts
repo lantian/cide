@@ -24,6 +24,7 @@ import type {
   Side,
   SplitId,
   SplitIntent,
+  SplitOutcome,
   TabId,
   WindowMode,
   Workspace,
@@ -121,7 +122,7 @@ export const pane = {
     side: Side,
     intent: SplitIntent | null = null,
   ) =>
-    invoke<PaneId>('pane_split', {
+    invoke<SplitOutcome>('pane_split', {
       project: projectId,
       tab: tabId,
       pane: paneId,

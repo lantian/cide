@@ -432,6 +432,7 @@ export function App() {
                           pane={paneNode}
                           cwd={activeProject.roots[0]?.path ?? PROJECT_ROOT}
                           project={activeProject.id}
+                          primarySession={activeProject.primarySession}
                           diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}
                           restore={restorePlan.get(paneNode.id)}
                           onSessionBound={(session) =>

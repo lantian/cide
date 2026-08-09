@@ -279,3 +279,18 @@ pub struct SessionSummary {
 pub struct QuitDecision {
     pub blocking: Vec<SessionSummary>,
 }
+
+/// What a split produced.
+///
+/// The resolved intent travels back with the pane id because the caller may not know it: a
+/// `None` intent asks the domain for the tab's default, and the frontend still has to spawn
+/// the right thing afterwards. Returning only the id would leave it guessing — and guessing
+/// `NewClaude` where the domain said `ForkPrimary` starts a fresh conversation where the
+/// user asked to branch an existing one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SplitOutcome {
+    pub pane: PaneId,
+    pub intent: SplitIntent,
+}

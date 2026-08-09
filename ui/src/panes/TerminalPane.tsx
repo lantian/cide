@@ -11,6 +11,7 @@
 import { useEffect, useRef } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
+import { takeSpawnPlan } from '@/layout/spawnPlans'
 import { session as sessionApi, type Geometry, type Pane } from '@/ipc/client'
 
 export interface TerminalSpec {
@@ -19,7 +20,7 @@ export interface TerminalSpec {
   cwd: string
   /** Decides which IDE server this child is told about. See `session.spawn`. */
   project?: string | undefined
-  /** Continue an existing conversation; with `fork`, branch from it. */
+  /** Continue an existing conversation; with `fork`, branch from it instead. */
   resume?: string | undefined
   fork?: boolean | undefined
 }
@@ -30,6 +31,13 @@ export interface TerminalPaneProps {
   cwd: string
   /** The project this pane belongs to, so its child reaches the right IDE server. */
   project?: string | undefined
+  /**
+   * The project's primary session, which is what a `forkPrimary` split branches from.
+   *
+   * Passed in rather than looked up here, so this component keeps knowing nothing about the
+   * shape of the workspace.
+   */
+  primarySession?: string | undefined
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
   onSessionBound?: ((session: string) => void) | undefined
   className?: string | undefined
@@ -141,6 +149,7 @@ export function TerminalPane({
   pane,
   cwd,
   project,
+  primarySession,
   onSessionBound,
   className,
   onExit,
@@ -158,6 +167,8 @@ export function TerminalPane({
   projectRef.current = project
   const kindRef = useRef(pane.kind)
   kindRef.current = pane.kind
+  const primaryRef = useRef(primarySession)
+  primaryRef.current = primarySession
   const domainSession = pane.session
 
   useEffect(() => {
@@ -173,6 +184,20 @@ export function TerminalPane({
 
     const spec = specFor({ ...pane, kind: kindRef.current }, cwdRef.current, projectRef.current)
     if (spec === null) return
+
+    // A split may have asked for something a pane's `kind` cannot express. Taken here, once:
+    // StrictMode mounts this effect twice in development, and a plan that survived a read
+    // would fork twice and orphan one of the children.
+    const plan = takeSpawnPlan(paneId)
+    if (plan?.kind === 'mirror') {
+      // No process at all. A mirror is a second sink on a session that already exists, so
+      // adopting the id is the whole operation — spawning here would start a rival child
+      // and the two panes would diverge instead of showing one conversation.
+      if (!getHost(paneId).sessionId) getHost(paneId).sessionId = plan.session
+    } else if (plan?.kind === 'forkPrimary' && primaryRef.current) {
+      spec.resume = primaryRef.current
+      spec.fork = true
+    }
 
     try {
       fit.fit()
