@@ -247,9 +247,11 @@ impl Index {
     /// Walk the roots and build the tree, streaming batches of entries to `sink` as they
     /// are found.
     ///
-    /// The sink runs on the walker's threads, so it must be cheap and it must not take a
-    /// lock the caller holds. Injecting into a lock-free `nucleo` queue is exactly the shape
-    /// it is meant for.
+    /// The sink runs on *this* thread, once per batch, draining the channel the walker
+    /// threads fill — not on the walker threads themselves, so it is never called
+    /// concurrently with itself. It still has to be cheap: every millisecond it spends is a
+    /// millisecond the channel backs up behind it. Injecting into a lock-free `nucleo` queue
+    /// is exactly the shape it is meant for.
     pub fn build(
         roots: Vec<Root>,
         opts: BuildOptions,
