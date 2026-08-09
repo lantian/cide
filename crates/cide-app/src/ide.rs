@@ -256,7 +256,10 @@ fn close_diff_tab_by_name(app: &AppHandle, project: ProjectId, tab_name: &str) {
 
     if let Some(tab) = target
         && let Err(error) = state.update(|ws| {
-            cide_core::workspace::close_tab(ws, project, tab)?;
+            // `force`: the tab being withdrawn is a `Diff`, which has no dirty flag and
+            // therefore no unsaved edits to lose — and the CLI has already stopped waiting
+            // on it, so refusing would leave a tab on screen that answers nothing.
+            cide_core::workspace::close_tab(ws, project, tab, true)?;
             Ok(())
         })
     {

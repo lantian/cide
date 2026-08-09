@@ -129,8 +129,12 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
         onChange={(v) => patch({ keepSessionsOnWindowClose: v })}
       />
       <ToggleRow
+        // The hint's second sentence is not decoration. This toggle governs *sessions* only:
+        // unsaved editor buffers are confirmed whatever it says, because an interrupted turn
+        // resumes and discarded edits do not come back. A user who turns this off and later
+        // loses a buffer would rightly blame this row for saying nothing about the limit.
         label="Confirm before closing a project with a live session"
-        hint="“Live” means a session is working or waiting for permission — not merely that a process exists."
+        hint="“Live” means a session is working or waiting for permission — not merely that a process exists. Unsaved files are always confirmed."
         checked={settings.confirmCloseWithLiveSession}
         onChange={(v) => patch({ confirmCloseWithLiveSession: v })}
       />

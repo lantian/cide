@@ -112,11 +112,17 @@ pub fn window_set_mode(
 }
 
 /// Close a window, doing whatever that means for what the window is showing.
+///
+/// `force` reaches only the `PerProject` shell case, where closing the window *is* closing
+/// the project and can therefore discard unsaved edits. Without it that case is refused with
+/// [`CoreError::UnsavedChanges`]; the caller shows `CloseConfirm` and asks again. Re-docking
+/// a detached pane loses nothing and never consults it.
 #[tauri::command(rename_all = "camelCase")]
 pub fn window_close(
     state: State<'_, WorkspaceState>,
     app: AppHandle,
     label: WindowLabel,
+    force: bool,
 ) -> Result<Mutated, CoreError> {
     let ws = state.snapshot();
     let Some(role) = ws.windows.get(&label).cloned() else {
@@ -154,7 +160,7 @@ pub fn window_close(
             WindowMode::PerProject => {
                 state.update(|ws| {
                     for id in &projects {
-                        workspace::close_project(ws, *id)?;
+                        workspace::close_project(ws, *id, force)?;
                     }
                     Ok(())
                 })?;
@@ -165,6 +171,12 @@ pub fn window_close(
             // Closing it is therefore a quit, and a quit has to take the detached-pane
             // windows with it — left behind they would hold the process open showing panes
             // whose shell is gone.
+            //
+            // `force` is deliberately not consulted here, and this is the one gap in the
+            // Rust-side guard. Quitting does not go through `close_project`, so there is no
+            // domain operation to refuse; the protection is `app_quit_requested`, which the
+            // caller is required to consult first. That is advisory rather than enforced —
+            // see the note in `app_quit_requested`.
             WindowMode::Stacked => quit(&app),
         },
     }

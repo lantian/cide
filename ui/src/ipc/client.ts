@@ -29,6 +29,7 @@ import type {
   PickerFrame,
   PickerItem,
   ProjectId,
+  QuitDecision,
   SessionState,
   Settings as SettingsDto,
   SettingsPatch,
@@ -39,6 +40,7 @@ import type {
   SplitOutcome,
   TabId,
   TreeRow,
+  UnsavedTab,
   WindowMode,
   Workspace,
 } from './generated'
@@ -110,13 +112,34 @@ export const app = {
       currentWidth: window.innerWidth,
       currentHeight: window.innerHeight,
     }),
+
+  /**
+   * What closing would cost: unsaved file tabs, and Claude turns it would interrupt.
+   *
+   * Ask before closing anything wider than a tab — a project, a window, the app — and show
+   * `CloseConfirm` only when the answer is not `clear`. `project` narrows it to one project;
+   * omit it for the whole application.
+   *
+   * The unsaved half is always reported. The session half is governed by the
+   * `confirmCloseWithLiveSession` setting, because a lost turn is recoverable
+   * (`claude --resume`) and a lost buffer is not.
+   */
+  quitRequested: (projectId?: ProjectId) =>
+    invoke<QuitDecision>('app_quit_requested', { project: projectId ?? null }),
 }
 
 export const project = {
   /** Open a project over one or more roots. Returns the new project's id. */
   open: (paths: string[], name?: string) =>
     invoke<ProjectId>('project_open', { paths, name: name ?? null }),
-  close: (id: ProjectId) => invoke<{ rev: number }>('project_close', { project: id }),
+  /**
+   * Close a project, its tabs and its windows.
+   *
+   * Rejected with `unsavedChanges` when any of its file tabs is dirty, unless `force` —
+   * see `unsavedChanges()` below for reading the refusal.
+   */
+  close: (id: ProjectId, force = false) =>
+    invoke<{ rev: number }>('project_close', { project: id, force }),
   reorder: (from: number, to: number) => invoke<{ rev: number }>('project_reorder', { from, to }),
 }
 
@@ -127,9 +150,36 @@ export const tab = {
 
   activate: (projectId: ProjectId, id: TabId) =>
     invoke<{ rev: number }>('tab_activate', { project: projectId, tab: id }),
-  /** Rejected with `TabPinned` for the project console — the rule lives in Rust. */
-  close: (projectId: ProjectId, id: TabId) =>
-    invoke<{ rev: number }>('tab_close', { project: projectId, tab: id }),
+
+  /**
+   * Close a tab. Both refusals live in Rust, and both are enforcement rather than courtesy:
+   *
+   * * `tabPinned` for the project console.
+   * * `unsavedChanges` for a file tab with unsaved edits, unless `force` is passed.
+   *
+   * `force` defaults to false so that no call site loses a buffer by omission. Pass true
+   * only after the user has seen `CloseConfirm` naming the file and chosen to discard.
+   */
+  close: (projectId: ProjectId, id: TabId, force = false) =>
+    invoke<{ rev: number }>('tab_close', { project: projectId, tab: id, force }),
+}
+
+/**
+ * Read a rejected command as the domain's unsaved-work refusal.
+ *
+ * Returns the tabs that would have been lost, or `null` for every other failure. This is the
+ * one place that knows the shape `CoreError` serialises to — `{ kind, detail }` — because
+ * `CoreError` lives in `cide-core` and `generated.ts` carries only the `cide-ipc` DTOs, so
+ * there is no generated type to narrow against. Structural, not `as`: the payload comes
+ * from another process and a cast would assert rather than check.
+ */
+export function unsavedChanges(error: unknown): UnsavedTab[] | null {
+  if (typeof error !== 'object' || error === null) return null
+  const { kind, detail } = error as { kind?: unknown; detail?: unknown }
+  if (kind !== 'unsavedChanges') return null
+  if (typeof detail !== 'object' || detail === null) return null
+  const { tabs } = detail as { tabs?: unknown }
+  return Array.isArray(tabs) ? (tabs as UnsavedTab[]) : null
 }
 
 /**
@@ -229,7 +279,15 @@ export const windows = {
 
   setMode: (mode: WindowMode) => invoke<{ rev: number }>('window_set_mode', { mode }),
 
-  close: (label: string) => invoke<{ rev: number }>('window_close', { label }),
+  /**
+   * Close a window, which means whatever the window is showing.
+   *
+   * In per-project mode the window *is* the project, so this can discard unsaved edits and
+   * is rejected with `unsavedChanges` without `force`. Re-docking a detached pane loses
+   * nothing and never consults it.
+   */
+  close: (label: string, force = false) =>
+    invoke<{ rev: number }>('window_close', { label, force }),
 }
 
 /**

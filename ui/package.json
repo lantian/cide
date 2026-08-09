@@ -12,7 +12,8 @@
     "check:git": "node scripts/check-git-tree.mjs",
     "check:render": "node scripts/check-git-render.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
-    "check:picker": "node scripts/check-picker.mjs"
+    "check:picker": "node scripts/check-picker.mjs",
+    "check:close": "node scripts/check-close-confirm.mjs"
   },
   "//": "Versions are pinned exactly, with no carets. Vite 8 defaults to the Rolldown/Oxc pipeline, where the known breakage class is plugins reaching into Rollup internals \u2014 a caret range would let that arrive unannounced during a milestone.",
   "dependencies": {

@@ -282,16 +282,54 @@ pub struct SessionSummary {
     pub state: SessionState,
 }
 
-/// Whether closing may proceed, and what it would interrupt.
+/// A file tab whose buffer holds edits that have not been written to disk.
 ///
-/// `blocking` is empty when nothing is `Busy` or `AwaitingPermission` — the common case, and
-/// the one where no dialog should appear at all. A confirmation that fires whenever a
-/// process exists is one users learn to dismiss without reading, which is worse than none.
+/// The path travels with it for the same reason [`SessionSummary`] carries a pane title: a
+/// dialog that says "3 unsaved files" and cannot say *which* gives the user no basis to
+/// choose between discarding and going back. `title` is the basename the tab strip already
+/// shows, so the dialog and the strip name the same thing; `path` disambiguates the two
+/// `mod.rs` the user has open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UnsavedTab {
+    pub tab: TabId,
+    pub project: ProjectId,
+    pub project_name: String,
+    #[ts(type = "string")]
+    pub path: std::path::PathBuf,
+    /// The tab strip's label — the file's basename.
+    pub title: String,
+}
+
+/// Whether closing may proceed, and what it would cost.
+///
+/// Both lists are empty in the common case, and that is the case where no dialog should
+/// appear at all. A confirmation that fires whenever a process exists is one users learn to
+/// dismiss without reading, which is worse than none.
+///
+/// The two lists are separate because the two risks are not the same risk, and the
+/// confirmation has to word them differently:
+///
+/// * `unsaved` is **destruction**. Those edits exist nowhere else; closing loses them.
+///   Always reported, whatever the settings say — see `Settings::
+///   confirm_close_with_live_session`, which is about sessions and has no authority here.
+/// * `blocking` is **interruption**. A `Busy` or `AwaitingPermission` session loses its
+///   turn, not its transcript: the conversation resumes with `claude --resume`. This list
+///   is governed by that setting, and is empty when the user has turned it off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct QuitDecision {
     pub blocking: Vec<SessionSummary>,
+    pub unsaved: Vec<UnsavedTab>,
+}
+
+impl QuitDecision {
+    /// Whether anything at all is at risk. `false` means close without asking.
+    pub fn is_clear(&self) -> bool {
+        self.blocking.is_empty() && self.unsaved.is_empty()
+    }
 }
 
 /// What a split produced.
