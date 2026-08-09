@@ -551,8 +551,15 @@ mod tests {
     }
 
     /// `load` clears file-tab dirty flags by design; the demo carries a dirty file tab. So the
-    /// fixture is compared after that same single transformation rather than by laundering
-    /// whatever came back off disk, which would hide a dropped tab along with the flag.
+    /// fixture is compared after that same transformation rather than by laundering whatever
+    /// came back off disk, which would hide a dropped tab along with the flag.
+    ///
+    /// `load` also calls `refresh_display_paths`, which is deliberately *not* replayed here:
+    /// it recomputes `display_path` from the primary root against the current `$HOME`, and the
+    /// fixture's value came from that same function in this same process, so replaying it
+    /// would be a no-op. The consequence is worth naming — `display_path` is the one field
+    /// these round trips do not really check, because `load` would rebuild it even if serde
+    /// dropped it. Anything that needs to pin that field has to compare the bytes on disk.
     fn as_loaded(ws: &Workspace) -> Workspace {
         let mut expected = ws.clone();
         crate::workspace::clear_dirty_flags(&mut expected);
@@ -594,15 +601,34 @@ mod tests {
         let path = dir.join("workspace.json");
 
         let mut workspace = crate::workspace::demo_workspace();
-        let (project_id, tab_id, pane_id) = {
+        let (project_id, tab_id, pane_id, session) = {
             let (id, p) = workspace.projects.first().expect("a demo project");
             let console = &p.tabs[0];
-            // The last pane of the four-pane console. `take_pane` refuses a tab's only pane
-            // and the console's lone primary, and going through `detach_pane` rather than
-            // inserting into `detached` by hand keeps the fixture one `validate` accepts.
-            let pane = *console.tree.panes.keys().last().expect("a pane");
-            (*id, console.id, pane)
+            // The last console pane that *carries a session*, not simply the last pane. The
+            // console's last pane is the session-less diff, and detaching that one leaves the
+            // session assertion below comparing `None` to `None` — green no matter what serde
+            // did to the field, which is the one thing this test exists to catch. `take_pane`
+            // only refuses a tab's sole leaf, and the console has four, so any of them is
+            // detachable. Going through `detach_pane` rather than inserting into `detached` by
+            // hand keeps the fixture one `validate` accepts.
+            let (pane, kept) = console
+                .tree
+                .panes
+                .iter()
+                .rev()
+                .find(|(_, pane)| pane.session.is_some())
+                .expect("a console pane bound to a session");
+            (*id, console.id, *pane, kept.session)
         };
+        // Stated as an assertion rather than left to the `find` above: if the demo ever stops
+        // giving its console panes sessions, this test must fail loudly instead of quietly
+        // round-tripping a `None` and still reporting that the binding survives.
+        assert!(
+            session.is_some(),
+            "the detached pane is bound to a live session, which is what makes losing it cost \
+             something"
+        );
+
         crate::workspace::detach_pane(&mut workspace, project_id, tab_id, pane_id).expect("detach");
         let detached = workspace.projects[&project_id].detached.clone();
         assert_eq!(detached.len(), 1, "the fixture really did detach a pane");
@@ -614,6 +640,13 @@ mod tests {
         assert_eq!(
             loaded.projects[&project_id].detached, detached,
             "the detached pane, its key, its kind and its session all come back"
+        );
+        // Spelled out separately from the map equality above so that a dropped `session`
+        // names itself in the failure rather than showing up as a whole-`Pane` diff — and so
+        // the claim in this test's doc comment is actually carried by an assertion.
+        assert_eq!(
+            loaded.projects[&project_id].detached[&pane_id].session, session,
+            "the pane comes back still bound to its conversation"
         );
         assert_eq!(loaded, as_loaded(&workspace));
 
