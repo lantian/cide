@@ -15,6 +15,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   Axis,
   Bootstrap,
+  DiffAnswer,
   Direction,
   PaneId,
   PaneRestore,
@@ -201,6 +202,32 @@ export const windows = {
   close: (label: string) => invoke<{ rev: number }>('window_close', { label }),
 }
 
+/**
+ * Claude Code's IDE integration.
+ *
+ * `openDiff` blocks the agent's turn, so a tab opened by `diffContent` is one the model is
+ * sitting still waiting on. Every route out of that tab has to end in `answer` or in the
+ * Rust-side cancellation the close paths perform — an unanswered diff is a conversation
+ * that never resumes, with nothing on screen to say why.
+ */
+export const claude = {
+  /**
+   * The two documents for a pending diff.
+   *
+   * Fetched rather than carried on the tab: `DiffSpec` is persisted to `workspace.json`, and
+   * proposed file contents have no business in a saved layout.
+   */
+  diffContent: (projectId: ProjectId, requestId: string) =>
+    invoke<{ original: string; proposed: string }>('claude_diff_content', {
+      project: projectId,
+      requestId,
+    }),
+
+  /** Answer a diff. `acceptedEdited` carries the buffer the user actually has on screen. */
+  answer: (projectId: ProjectId, requestId: string, outcome: DiffAnswer) =>
+    invoke<void>('claude_diff_result', { project: projectId, requestId, outcome }),
+}
+
 export const diag = {
   /** Pull `len` bytes as raw octets — the fast custom-protocol path. */
   echoBytes: async (len: number): Promise<ArrayBuffer> => {
@@ -230,8 +257,21 @@ export function benchMode(): boolean {
 }
 
 export const session = {
-  spawn: (opts: { program: string; args: string[]; cwd: string; geometry: Geometry }) =>
-    invoke<SessionId>('session_spawn', opts),
+  /**
+   * Spawn a child.
+   *
+   * `project` is what puts `CLAUDE_CODE_SSE_PORT` in the child's environment. Omitting it
+   * does not merely skip a nicety: without that variable a `claude` started here falls back
+   * to picking among every lockfile in the shared `~/.claude/ide` directory and can bind to
+   * another editor entirely.
+   */
+  spawn: (opts: {
+    program: string
+    args: string[]
+    cwd: string
+    geometry: Geometry
+    project?: string | undefined
+  }) => invoke<SessionId>('session_spawn', opts),
 
   /**
    * Attach a sink to a session.

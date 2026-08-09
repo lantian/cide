@@ -314,6 +314,7 @@ export function App() {
       <DetachedPaneWindow
         pane={detachedPane}
         cwd={owner.roots[0]?.path ?? PROJECT_ROOT}
+        project={project}
         onRedock={() => void redockPane(boot.window)}
       />
     )
@@ -397,6 +398,8 @@ export function App() {
                         <PaneBody
                           pane={paneNode}
                           cwd={activeProject.roots[0]?.path ?? PROJECT_ROOT}
+                          project={activeProject.id}
+                          diff={tab.kind.kind === 'diff' ? tab.kind.spec : undefined}
                           restore={restorePlan.get(paneNode.id)}
                           onSessionBound={(session) =>
                             void bindSession(activeProject.id, tab.id, paneNode.id, session)

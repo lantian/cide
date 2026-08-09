@@ -71,6 +71,14 @@ pub fn shutdown(app: &AppHandle) {
         None => tracing::error!("no workspace state to flush during shutdown"),
     }
 
+    // Before the children are signalled. A `claude` blocked on `openDiff` has to receive its
+    // rejection over a socket that is still open; killing it first would end the turn with a
+    // transport error where a plain "the user did not accept it" was available, and killing
+    // it *after* would leave the rejection racing the SIGKILL.
+    if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
+        servers.stop_all();
+    }
+
     let Some(registry) = app.try_state::<SessionRegistry>() else {
         tracing::error!("no session registry during shutdown; children may outlive the app");
         return;

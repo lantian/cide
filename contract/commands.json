@@ -2,6 +2,8 @@
   "app_get_bootstrap",
   "app_ready",
   "app_restore_plan",
+  "claude_diff_content",
+  "claude_diff_result",
   "diag_bench_report",
   "diag_echo_bytes",
   "diag_log",

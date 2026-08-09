@@ -15,12 +15,22 @@
  */
 import { useState, type ReactNode } from 'react'
 import { TerminalPane } from './TerminalPane'
+import { ClaudeDiffPane } from './ClaudeDiffPane'
 import { ResumeSplash, RestoredShellBanner } from '@/windows/ResumeSplash'
-import type { Pane, PaneRestore } from '@/ipc/client'
+import type { DiffSpec, Pane, PaneRestore } from '@/ipc/client'
 
 export interface PaneBodyProps {
+  /** The project this pane belongs to, so its child reaches the right IDE server. */
+  project?: string | undefined
   pane: Pane
   cwd: string
+  /**
+   * Set when this pane's tab is a diff, which makes it a document rather than a process.
+   *
+   * A `ClaudeMcp` diff additionally holds an agent turn open, so the pane it renders is the
+   * only thing standing between the model and an answer.
+   */
+  diff?: DiffSpec | undefined
   /**
    * This pane's entry in the launch plan, when the workspace was restored.
    *
@@ -31,7 +41,27 @@ export interface PaneBodyProps {
   onSessionBound?: ((session: string) => void) | undefined
 }
 
-export function PaneBody({ pane, cwd, restore, onSessionBound }: PaneBodyProps): ReactNode {
+export function PaneBody({
+  pane,
+  cwd,
+  project,
+  diff,
+  restore,
+  onSessionBound,
+}: PaneBodyProps): ReactNode {
+  // A diff is a document, not a process: it never spawns and has no session to adopt. The
+  // `ClaudeMcp` case is the one that matters, because it is holding an agent turn open.
+  if (diff && diff.origin.kind === 'claudeMcp' && project) {
+    return (
+      <ClaudeDiffPane
+        project={project}
+        requestId={diff.origin.requestId}
+        oldPath={diff.oldPath}
+        newPath={diff.newPath}
+      />
+    )
+  }
+
   // A pane that is already bound to a session has nothing to decide: the child is running
   // and the terminal attaches to it.
   const bound = pane.session !== null
@@ -48,7 +78,7 @@ export function PaneBody({ pane, cwd, restore, onSessionBound }: PaneBodyProps):
       return (
         <>
           <RestoredShellBanner />
-          <TerminalPane pane={pane} cwd={cwd} onSessionBound={onSessionBound} />
+          <TerminalPane pane={pane} cwd={cwd} project={project} onSessionBound={onSessionBound} />
         </>
       )
     }
@@ -63,5 +93,5 @@ export function PaneBody({ pane, cwd, restore, onSessionBound }: PaneBodyProps):
     )
   }
 
-  return <TerminalPane pane={pane} cwd={cwd} onSessionBound={onSessionBound} />
+  return <TerminalPane pane={pane} cwd={cwd} project={project} onSessionBound={onSessionBound} />
 }

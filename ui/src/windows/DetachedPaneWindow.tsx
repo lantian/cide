@@ -28,6 +28,14 @@ export interface DetachedPaneWindowProps {
   pane: Pane
   /** The project's primary root, passed through to the pane unchanged. */
   cwd: string
+  /**
+   * The project this pane belongs to.
+   *
+   * A detached pane arrives with a live session and does not spawn, so this is belt and
+   * braces — but the guard below is the only thing preventing a spawn here, and a child born
+   * without `CLAUDE_CODE_SSE_PORT` would bind to whichever lockfile it happened to find.
+   */
+  project?: string | undefined
   /** Put the pane back in its home tab and close this window. */
   onRedock?: (() => void) | undefined
 }
@@ -51,7 +59,12 @@ function needsSession(pane: Pane): boolean {
   }
 }
 
-export function DetachedPaneWindow({ pane, cwd, onRedock }: DetachedPaneWindowProps): ReactNode {
+export function DetachedPaneWindow({
+  pane,
+  cwd,
+  project,
+  onRedock,
+}: DetachedPaneWindowProps): ReactNode {
   // A pane can only be detached after it has spawned, so this is the state that should not
   // occur rather than one a user reaches. It is still rendered rather than ignored: letting
   // `TerminalPane` fall through to a spawn would start a child whose id no window records,
@@ -98,7 +111,7 @@ export function DetachedPaneWindow({ pane, cwd, onRedock }: DetachedPaneWindowPr
             {orphaned ? (
               <p className={styles.orphan}>This pane has no session. Redock it to start one.</p>
             ) : (
-              <TerminalPane pane={pane} cwd={cwd} />
+              <TerminalPane pane={pane} cwd={cwd} project={project} />
             )}
           </PaneFrame>
         </div>

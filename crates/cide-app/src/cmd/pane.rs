@@ -15,7 +15,7 @@ use cide_ipc::{
     Axis, Direction, Pane, PaneId, PaneKind, PaneRole, ProjectId, SessionId, Side, SplitId,
     SplitIntent, TabId, TabKind,
 };
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::workspace_state::WorkspaceState;
 
@@ -203,13 +203,15 @@ pub fn pane_swap(
 /// `claude --session-id`, so a persisted pane knows which conversation to resume.
 #[tauri::command(rename_all = "camelCase")]
 pub fn pane_bind_session(
+    app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
+    registry: State<'_, crate::state::SessionRegistry>,
     project: ProjectId,
     tab: TabId,
     pane: PaneId,
     session: SessionId,
 ) -> Result<Mutated, CoreError> {
-    state
+    let out = state
         .update(|ws| {
             let t = workspace::tab_mut(ws, project, tab)?;
             let Some(p) = t.tree.panes.get_mut(&pane) else {
@@ -218,5 +220,19 @@ pub fn pane_bind_session(
             p.session = Some(session);
             Ok(())
         })
-        .map(|()| Mutated { rev: state.rev() })
+        .map(|()| Mutated { rev: state.rev() })?;
+
+    // This is the only point at which a pid and a pane are both known, which is what the IDE
+    // server needs: `claude` announces itself with `ide_connected{pid}`, and that pid is the
+    // join key deciding which pane a selection or an `@`-mention belongs to. Attributing by
+    // tab name or cwd instead would break the moment a project has two Claude panes, which is
+    // the normal case here.
+    if let Some(servers) = app.try_state::<crate::ide::IdeServers>()
+        && let Some(s) = registry.get(session)
+        && let Some(pid) = s.child_pid()
+    {
+        servers.bind_pane(project, pid, pane);
+    }
+
+    Ok(out)
 }

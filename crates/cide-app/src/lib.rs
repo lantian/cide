@@ -6,6 +6,7 @@
 pub mod cmd;
 pub mod emit;
 pub mod graphics;
+pub mod ide;
 pub mod lifecycle;
 pub mod state;
 pub mod windows;
@@ -140,8 +141,24 @@ pub fn run() {
         );
     }
 
+    // A failure here costs IDE integration, not the app: without it panes still spawn, the
+    // terminal still works, and Claude prints its diffs as text in the pane the way it does
+    // in any other terminal. Refusing to launch over it would trade a degraded feature for
+    // no editor at all.
+    let ide = match ide::IdeServers::new() {
+        Ok(servers) => Some(servers),
+        Err(error) => {
+            tracing::error!(%error, "could not start the IDE subsystem; panes will run without it");
+            None
+        }
+    };
+
+    builder = builder.manage(SessionRegistry::default());
+    if let Some(ide) = ide {
+        builder = builder.manage(ide);
+    }
+
     builder
-        .manage(SessionRegistry::default())
         // Loaded before the first window exists, so `app.get_bootstrap` can answer from a
         // real tree on the very first call rather than serving defaults and correcting
         // itself a frame later.
@@ -172,6 +189,8 @@ pub fn run() {
             cmd::project::tab_close,
             cmd::session::session_spawn,
             cmd::session::session_attach,
+            cmd::session::claude_diff_content,
+            cmd::session::claude_diff_result,
             cmd::session::session_ack,
             cmd::session::session_detach,
             cmd::session::session_scrollback,

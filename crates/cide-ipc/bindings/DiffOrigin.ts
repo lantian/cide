@@ -3,4 +3,4 @@
 /**
  * Where a diff came from, which decides what happens when the user answers it.
  */
-export type DiffOrigin = { "kind": "git" } | { "kind": "claudeMcp", request_id: string, };
+export type DiffOrigin = { "kind": "git" } | { "kind": "claudeMcp", requestId: string, };

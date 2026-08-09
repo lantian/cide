@@ -18,7 +18,7 @@ pub use settings::{
     ClaudeSettings, EditorSettings, GraphicsSettings, Settings, TerminalRenderer, TerminalSettings,
 };
 pub use workspace::{
-    DiffOrigin, DiffSpec, Direction, LayoutNode, MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project,
+    DiffAnswer, DiffOrigin, DiffSpec, Direction, LayoutNode, MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project,
     ProjectRoot, SettingsSection, Tab, TabKind, WindowRole, Workspace,
 };
 
@@ -187,7 +187,7 @@ pub enum PaneRole {
 /// This enum *is* the multiplexing model: "one session but splittable" resolves as one
 /// **primary** session plus panes that each declare what they want.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
 #[ts(export)]
 pub enum SplitIntent {
     /// `claude --session-id <fresh uuid>` — renders the splash until first input.

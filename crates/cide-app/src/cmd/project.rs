@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use cide_core::CoreError;
 use cide_core::workspace;
 use cide_ipc::{Pane, PaneId, PaneKind, PaneRole, ProjectId, TabId, TabKind};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::workspace_state::WorkspaceState;
 
@@ -23,12 +23,26 @@ pub struct Mutated {
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn project_open(
+    app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     paths: Vec<String>,
     name: Option<String>,
 ) -> Result<ProjectId, CoreError> {
     let roots: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    state.update(|ws| workspace::open_project(ws, roots, name))
+    let id = state.update(|ws| workspace::open_project(ws, roots, name))?;
+
+    // Started here rather than lazily at first spawn, because the lockfile has to exist
+    // before any `claude` in this project looks for one. `open_project` also *activates* an
+    // already-open path instead of opening it twice, so `ensure` is by design idempotent.
+    if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
+        let roots = state.with(|ws| {
+            workspace::project(ws, id)
+                .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        servers.ensure(&app, id, roots);
+    }
+    Ok(id)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -37,10 +51,31 @@ pub fn project_close(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
 ) -> Result<Mutated, CoreError> {
+    // Read before the mutation: once the project is gone the diff tabs are gone with it, and
+    // with them the only record of which agent turns are still blocked waiting on them.
+    let blocked = app
+        .try_state::<crate::ide::IdeServers>()
+        .map(|_| crate::ide::pending_request_ids(&state, project))
+        .unwrap_or_default();
+
     let out = state.update(|ws| {
         workspace::close_project(ws, project)?;
         Ok(Mutated { rev: ws.rev })
     })?;
+
+    if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
+        // Reject first, stop second. `stop` would cancel these anyway, but doing it here
+        // records the accurate reason — the project closed — rather than reporting a
+        // shutdown to an agent whose editor is still running.
+        crate::ide::cancel_for_tabs(
+            &servers,
+            project,
+            blocked,
+            cide_ide_mcp::CancelReason::ProjectClosed,
+        );
+        servers.stop(project);
+    }
+
     // Closing a project drops the window roles that showed parts of it. Those windows are
     // still on screen until something takes them down, and a detached one would sit there
     // blank with an unreachable child behind it.
@@ -116,10 +151,28 @@ pub fn tab_close(
     project: ProjectId,
     tab: TabId,
 ) -> Result<Mutated, CoreError> {
+    // Closing a diff tab **rejects** it, and this is a deliberate divergence worth naming.
+    //
+    // The protocol's `TAB_CLOSED` means accepted-as-proposed — verified against the real CLI,
+    // which writes the model's version on receiving it — and that is what VS Code sends when
+    // its diff tab is closed. cide does not, because the two gestures are not the same thing
+    // here: the diff pane carries explicit Reject / Accept as proposed / Accept controls, so
+    // a user who means to accept has a button that says so. A `×` on a tab reads as dismiss,
+    // and resolving a dismissal as acceptance would write a file change on a gesture nobody
+    // makes with that intent. Rejection is recoverable; a write is not.
+    let dismissed = crate::ide::request_id_for_tab(&state, project, tab);
+
     let out = state.update(|ws| {
         workspace::close_tab(ws, project, tab)?;
         Ok(Mutated { rev: ws.rev })
     })?;
+
+    if let Some(request_id) = dismissed
+        && let Some(servers) = app.try_state::<crate::ide::IdeServers>()
+    {
+        crate::ide::resolve_or_cancel(&servers, project, &request_id, None);
+    }
+
     // Same reason as `project_close`: a tab can own detached windows, and their roles have
     // just been pruned.
     crate::cmd::window::reconcile(&app, &state)?;

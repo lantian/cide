@@ -63,7 +63,7 @@ impl Default for Workspace {
 /// mappings from `ProjectId` to `WindowRole::Shell` over identical state — which is why
 /// flipping the setting touches no project, tab, pane or session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
 #[ts(export)]
 pub enum WindowRole {
     /// N projects in `Stacked` mode, exactly one in `PerProject`.
@@ -148,7 +148,7 @@ pub struct Tab {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
 #[ts(export)]
 pub enum TabKind {
     /// The pinned project console. Always `tabs[0]`; `tab.close` on it is an error.
@@ -205,7 +205,7 @@ pub struct DiffSpec {
 
 /// Where a diff came from, which decides what happens when the user answers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
 #[ts(export)]
 pub enum DiffOrigin {
     /// Opened from the git panel. Closing it is just closing a tab.
@@ -216,6 +216,31 @@ pub enum DiffOrigin {
     /// answered, so every way the user can make this tab go away has to resolve the
     /// pending future. See `cide-ide-mcp::diff_broker`.
     ClaudeMcp { request_id: String },
+}
+
+/// How the user answered a diff that Claude Code is blocked on.
+///
+/// The three outcomes are the protocol's, and the difference between them is what gets
+/// written to disk — so this is one of the few wire types where a wrong mapping destroys
+/// work rather than degrading a view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[ts(export)]
+pub enum DiffAnswer {
+    /// Accepted after the user edited it in cide's own diff view.
+    ///
+    /// Carries the buffer as it stands on screen, which the CLI reads from `content[1].text`
+    /// and writes verbatim. This is the outcome that makes the diff pane an editor rather
+    /// than a viewer, and the reason it reads its document at click time instead of trusting
+    /// the proposal it was handed.
+    AcceptedEdited { contents: String },
+    /// Accepted exactly as the model proposed it. The file becomes the model's version.
+    AcceptedAsIs,
+    /// Rejected. The file is not touched.
+    ///
+    /// Also the answer for every way a diff can disappear without being answered — a closed
+    /// tab, pane, window or project — because rejection is recoverable and a write is not.
+    Rejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]

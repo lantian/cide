@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 cide-core = { workspace = true }
 cide-ipc = { workspace = true }
+cide-ide-mcp = { workspace = true }
 cide-pty = { workspace = true }
 
 tauri = { workspace = true }
@@ -31,6 +32,8 @@ tauri-plugin-store = { workspace = true }
 tauri-plugin-window-state = { workspace = true }
 
 dashmap = { workspace = true }
+# The IDE server is async; `ide.rs` owns a runtime for it rather than making the app async.
+tokio = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -584,6 +584,7 @@ name = "cide-app"
 version = "0.1.0"
 dependencies = [
  "cide-core",
+ "cide-ide-mcp",
  "cide-ipc",
  "cide-pty",
  "dashmap",
@@ -603,6 +604,7 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-plugin-window-state",
  "thiserror 2.0.19",
+ "tokio",
  "tracing",
  "uuid",
 ]

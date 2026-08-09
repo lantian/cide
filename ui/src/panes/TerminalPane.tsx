@@ -17,12 +17,16 @@ export interface TerminalSpec {
   program: string
   args: string[]
   cwd: string
+  /** Decides which IDE server this child is told about. See `session.spawn`. */
+  project?: string | undefined
 }
 
 export interface TerminalPaneProps {
   pane: Pane
   /** Where a fresh child is spawned — the project's primary root. */
   cwd: string
+  /** The project this pane belongs to, so its child reaches the right IDE server. */
+  project?: string | undefined
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
   onSessionBound?: ((session: string) => void) | undefined
   className?: string | undefined
@@ -65,12 +69,12 @@ function plausible(cols: number, rows: number): boolean {
 }
 
 /** What a pane of each kind runs. A diff pane has no process at all. */
-function specFor(pane: Pane, cwd: string): TerminalSpec | null {
+function specFor(pane: Pane, cwd: string, project?: string): TerminalSpec | null {
   switch (pane.kind) {
     case 'claude':
-      return { program: 'claude', args: [], cwd }
+      return { program: 'claude', args: [], cwd, project }
     case 'shell':
-      return { program: DEFAULT_SHELL, args: ['-l'], cwd }
+      return { program: DEFAULT_SHELL, args: ['-l'], cwd, project }
     default:
       return null
   }
@@ -130,7 +134,14 @@ async function sessionFor(paneId: string, spec: TerminalSpec, geometry: Geometry
   return p
 }
 
-export function TerminalPane({ pane, cwd, onSessionBound, className, onExit }: TerminalPaneProps) {
+export function TerminalPane({
+  pane,
+  cwd,
+  project,
+  onSessionBound,
+  className,
+  onExit,
+}: TerminalPaneProps) {
   const paneId = pane.id
   const boundRef = useRef<string | null>(null)
   // Held in refs so a changed callback identity cannot tear the session down and respawn it.
@@ -140,6 +151,8 @@ export function TerminalPane({ pane, cwd, onSessionBound, className, onExit }: T
   exitCb.current = onExit
   const cwdRef = useRef(cwd)
   cwdRef.current = cwd
+  const projectRef = useRef(project)
+  projectRef.current = project
   const kindRef = useRef(pane.kind)
   kindRef.current = pane.kind
   const domainSession = pane.session
@@ -155,7 +168,7 @@ export function TerminalPane({ pane, cwd, onSessionBound, className, onExit }: T
       getHost(paneId).sessionId = domainSession
     }
 
-    const spec = specFor({ ...pane, kind: kindRef.current }, cwdRef.current)
+    const spec = specFor({ ...pane, kind: kindRef.current }, cwdRef.current, projectRef.current)
     if (spec === null) return
 
     try {
