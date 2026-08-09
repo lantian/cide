@@ -361,8 +361,8 @@ mod tests {
     use super::*;
 
     use cide_ipc::{
-        Axis, LayoutNode, Pane, PaneKind, PaneRole, PaneTree, Project, ProjectRoot,
-        SettingsSection, Tab, TabKind, WindowRole,
+        Axis, DiffOrigin, DiffSpec, LayoutNode, Pane, PaneKind, PaneRole, PaneTree, Project,
+        ProjectRoot, SettingsSection, Tab, TabKind, WindowRole,
     };
     use cide_ipc::{PaneId, ProjectId, SessionId, SplitId, TabId, WindowLabel};
     use indexmap::IndexMap;
@@ -521,6 +521,204 @@ mod tests {
 
         save_atomic(&path, &workspace).expect("save");
 
+        assert_eq!(load(&path), workspace);
+    }
+
+    /// The shape `demo_workspace` claims, asserted on **both** sides of a round trip.
+    ///
+    /// A helper rather than assertions written once after the load: checked only afterwards,
+    /// a fixture that drifted down to two projects would still pass, and the test would go on
+    /// reporting a green round trip for something smaller than the criterion names.
+    fn assert_demo_shape(ws: &Workspace, when: &str) {
+        assert_eq!(ws.projects.len(), 3, "three projects {when}");
+        assert_eq!(pane_count(ws), 12, "twelve panes {when}");
+        let first = ws.projects.values().next().expect("a project");
+        assert_eq!(
+            first.roots.len(),
+            2,
+            "the first project is multi-root {when}"
+        );
+    }
+
+    /// Panes living in tabs. Detached panes are counted separately where it matters, so that
+    /// detaching one in a test does not silently keep this total at twelve.
+    fn pane_count(ws: &Workspace) -> usize {
+        ws.projects
+            .values()
+            .flat_map(|p| &p.tabs)
+            .map(|t| t.tree.panes.len())
+            .sum()
+    }
+
+    /// `load` clears file-tab dirty flags by design; the demo carries a dirty file tab. So the
+    /// fixture is compared after that same transformation rather than by laundering whatever
+    /// came back off disk, which would hide a dropped tab along with the flag.
+    ///
+    /// `load` also calls `refresh_display_paths`, which is deliberately *not* replayed here:
+    /// it recomputes `display_path` from the primary root against the current `$HOME`, and the
+    /// fixture's value came from that same function in this same process, so replaying it
+    /// would be a no-op. The consequence is worth naming — `display_path` is the one field
+    /// these round trips do not really check, because `load` would rebuild it even if serde
+    /// dropped it. Anything that needs to pin that field has to compare the bytes on disk.
+    fn as_loaded(ws: &Workspace) -> Workspace {
+        let mut expected = ws.clone();
+        crate::workspace::clear_dirty_flags(&mut expected);
+        expected
+    }
+
+    /// The round trip the acceptance criterion actually names: three projects, twelve panes,
+    /// multi-root.
+    ///
+    /// `fixture()` above is two projects, five panes and one root each, so before this test
+    /// multi-root was never serialised at all. `demo_workspace` is the same fixture
+    /// `cide-headless` renders and the validate tests exercise, which is why it is reused here
+    /// instead of a fourth hand-built workspace that could drift away from all three.
+    #[test]
+    fn the_demo_workspace_round_trips_with_its_multi_root_shape_intact() {
+        let dir = TempDir::new("demo-round-trip");
+        let path = dir.join("workspace.json");
+        let workspace = crate::workspace::demo_workspace();
+        assert_demo_shape(&workspace, "before the save");
+
+        save_atomic(&path, &workspace).expect("save");
+        let loaded = load(&path);
+
+        assert_demo_shape(&loaded, "after the load");
+        assert_eq!(
+            loaded.projects.values().next().expect("a project").roots,
+            workspace.projects.values().next().expect("a project").roots,
+            "both roots come back, in order, with their labels"
+        );
+        assert_eq!(loaded, as_loaded(&workspace));
+    }
+
+    /// `Project::detached` is `#[serde(default)]`, so a field lost to a rename or a typo
+    /// deserialises as an empty map instead of failing loudly — and a torn-out pane holds a
+    /// live `SessionId`, so losing it silently orphans a running conversation.
+    #[test]
+    fn a_detached_pane_map_survives_a_round_trip() {
+        let dir = TempDir::new("demo-detached");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = crate::workspace::demo_workspace();
+        let (project_id, tab_id, pane_id, session) = {
+            let (id, p) = workspace.projects.first().expect("a demo project");
+            let console = &p.tabs[0];
+            // The last console pane that *carries a session*, not simply the last pane. The
+            // console's last pane is the session-less diff, and detaching that one leaves the
+            // session assertion below comparing `None` to `None` — green no matter what serde
+            // did to the field, which is the one thing this test exists to catch. `take_pane`
+            // only refuses a tab's sole leaf, and the console has four, so any of them is
+            // detachable. Going through `detach_pane` rather than inserting into `detached` by
+            // hand keeps the fixture one `validate` accepts.
+            let (pane, kept) = console
+                .tree
+                .panes
+                .iter()
+                .rev()
+                .find(|(_, pane)| pane.session.is_some())
+                .expect("a console pane bound to a session");
+            (*id, console.id, *pane, kept.session)
+        };
+        // Stated as an assertion rather than left to the `find` above: if the demo ever stops
+        // giving its console panes sessions, this test must fail loudly instead of quietly
+        // round-tripping a `None` and still reporting that the binding survives.
+        assert!(
+            session.is_some(),
+            "the detached pane is bound to a live session, which is what makes losing it cost \
+             something"
+        );
+
+        crate::workspace::detach_pane(&mut workspace, project_id, tab_id, pane_id).expect("detach");
+        let detached = workspace.projects[&project_id].detached.clone();
+        assert_eq!(detached.len(), 1, "the fixture really did detach a pane");
+        assert_eq!(pane_count(&workspace), 11, "the pane left its tab");
+
+        save_atomic(&path, &workspace).expect("save");
+        let loaded = load(&path);
+
+        assert_eq!(
+            loaded.projects[&project_id].detached, detached,
+            "the detached pane, its key, its kind and its session all come back"
+        );
+        // Spelled out separately from the map equality above so that a dropped `session`
+        // names itself in the failure rather than showing up as a whole-`Pane` diff — and so
+        // the claim in this test's doc comment is actually carried by an assertion.
+        assert_eq!(
+            loaded.projects[&project_id].detached[&pane_id].session, session,
+            "the pane comes back still bound to its conversation"
+        );
+        assert_eq!(loaded, as_loaded(&workspace));
+
+        // The assertion above is only worth writing because the failure it guards is silent.
+        // Renaming the key stands in for any way the field could go missing — a schema change,
+        // a serde rename — and shows what `#[serde(default)]` does with it: no error, no
+        // warning, just a project that has forgotten a pane holding a live session.
+        let raw = fs::read_to_string(&path).expect("read the file back");
+        assert!(
+            raw.contains(r#""detached""#),
+            "the map is written, not skipped"
+        );
+        let mangled: Workspace =
+            serde_json::from_str(&raw.replace(r#""detached""#, r#""detachedPanes""#))
+                .expect("a workspace missing `detached` still deserialises");
+        assert!(
+            mangled.projects[&project_id].detached.is_empty(),
+            "a missing `detached` defaults to empty rather than failing, which is the point"
+        );
+    }
+
+    /// `DiffOrigin` has struct variants, and a `serde(tag)` enum with struct variants needs
+    /// `rename_all_fields` on top of `rename_all` — the outer one does not reach inside a
+    /// variant. Nothing round-tripped this type, and the failure is invisible from Rust: a
+    /// `request_id` key deserialises back into Rust perfectly well while every other reader of
+    /// the wire format sees the wrong name. Hence the assertion on the bytes, not just on
+    /// equality.
+    #[test]
+    fn a_claude_mcp_diff_tab_round_trips_with_camel_case_fields() {
+        let dir = TempDir::new("diff-origin");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = fixture();
+        let pane = Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Diff,
+            role: PaneRole::Auxiliary,
+            session: None,
+            title: "main.rs — diff".into(),
+        };
+        let project = workspace.projects.values_mut().next().expect("a project");
+        project.tabs.push(Tab {
+            id: TabId::new(),
+            kind: TabKind::Diff {
+                spec: DiffSpec {
+                    title: "main.rs".into(),
+                    old_path: PathBuf::from("/home/dev/work/cide/src/main.rs"),
+                    new_path: PathBuf::from("/home/dev/work/cide/src/main.rs.new"),
+                    origin: DiffOrigin::ClaudeMcp {
+                        request_id: "req-42".into(),
+                    },
+                },
+            },
+            tree: PaneTree {
+                root: LayoutNode::Leaf { pane: pane.id },
+                focused: pane.id,
+                maximized: None,
+                panes: IndexMap::from_iter([(pane.id, pane)]),
+            },
+        });
+
+        save_atomic(&path, &workspace).expect("save");
+
+        let raw = fs::read_to_string(&path).expect("read the file back");
+        assert!(
+            raw.contains(r#""requestId": "req-42""#),
+            "the blocked request's id is spelled camelCase on the wire; got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("request_id"),
+            "a snake_case key means `rename_all_fields` is missing"
+        );
         assert_eq!(load(&path), workspace);
     }
 
