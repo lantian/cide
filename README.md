@@ -175,17 +175,41 @@ their auth by inheriting the environment.
 
 ## Milestones
 
-| | | status |
-| --- | --- | --- |
-| M0 | Runnable window, PTY panes, IPC gate | **done** |
-| M1 | Domain core, IPC contract, codegen gate | **done** |
-| M2 | PTY core: correct under load | |
-| M3 | Shell chrome: header, rail, tab strip, status bar, themes | **done** |
-| M4 | The pinned Claude tab: split tree, host registry | **done** |
-| M5 | Detach, re-dock, window modes, quit/restore | **code complete, audit unrun** |
-| M6 | IDE MCP server: openDiff, selection, @-mentions | |
-| M7 | Hooks, statusline, session state machine, fork/mirror | |
-| M8 | File tree, watcher, Ctrl+P, command palette, keymap | |
-| M9 | Editor: CodeMirror, minimap, breadcrumbs | |
-| M10 | IDEA git commit tool window | |
-| M11 | Settings, headless lane, packaging | |
+Every milestone was audited against the acceptance criteria in the plan — the `✅` line
+under each one, not "is there code". Three words are used, and the distinction between
+them is the point:
+
+- **verified** — the criteria are met and something checks them.
+- **unwitnessed** — met in code and tests, but at least one criterion can only be judged
+  in a running window, and the GUI has never been launched in this repository. Not a
+  failure; a category the old table had no word for.
+- **partial** — a named criterion is not met. The gap is listed.
+
+| | | status | what is missing |
+| --- | --- | --- | --- |
+| M0 | Runnable window, PTY panes, IPC gate | **unwitnessed** | the window itself, the TUI's box-drawing/truecolor/alt-screen, and the committed BENCH.md figures — all need a window. `xtask bench-ipc` does not benchmark: it prints where to run it. Push rows carry no p99. |
+| M1 | Domain core, IPC contract, codegen gate | **partial** | the serde round-trip uses a 2-project/5-pane single-root fixture; the 3-project/12-pane multi-root workspace exists but is never serialised. No CI runs the gates. |
+| M2 | PTY core: correct under load | **partial** | a dead child produces no visible change: `TerminalPane` declares `onExit` and no caller passes it, and `— exited —` appears only in a comment. 1 GiB and the credit machinery are verified; the *pane shows it* half is not built. |
+| M3 | Shell chrome | **unwitnessed** | the screenshot diff was replaced by a geometry table. 48/48 dimensions pass; colour and glyph fidelity are checked by nothing. |
+| M4 | The pinned Claude tab | **unwitnessed** | the mock's exact 2×2 has never been assembled by anything — the four pane kinds exist separately. Splitter drag and reflow need a window. |
+| M5 | Detach, re-dock, window modes, quit/restore | **partial** | re-dock does **not** restore the pane's original tree position, and says so in `workspace.rs:495`. The `CIDE_AUDIT_WINDOWS` harness has never been run. |
+| M6 | IDE MCP server | **partial** | `selection_changed` has a handler and no producer — nothing in `cide-app` calls it, and there is no command for it. `@`-mention from Ctrl+P reports instead of sending. `openDiff` round-trips against the real CLI in all three outcomes. |
+| M7 | Hooks, statusline, state machine, fork/mirror | **partial** | fork and mirror are wired end to end but **reachable by no gesture** — no keybinding, no palette entry. The forked uuid comes from `--session-id`, not from the `SessionStart` hook the criterion names. |
+| M8 | File tree, watcher, Ctrl+P, palette, keymap | **partial** | no 100k-file repository is ever walked (largest is 20k); keystroke-to-paint is unmeasured even in the half that needs no window. |
+| M9 | Editor: CodeMirror, minimap, breadcrumbs | **partial** | **zero automated tests.** No check script compiles anything under `ui/src/editor/`. The minimap has never been painted. |
+| M10 | IDEA git commit tool window | **partial** | the 500-case property corpus generates CRLF and trailing-newline only. Binary, submodules and intent-to-add are three hand-written cases, two of which do not make the byte-identical comparison the criterion asks for. |
+| M11 | Settings, headless lane, packaging | **partial** | **rebinding a key cannot work**: `app_get_bootstrap` resolves the keymap against an empty user layer, so `~/.config/cide/keymap.json` never reaches either gate entry point. No AppImage has ever been built — `xtask package` prints a plan. |
+
+### The short version
+
+Nothing is finished. M0, M3 and M4 are as done as they can be without a window; everything
+else has at least one named criterion outstanding. The four that are functional gaps rather
+than missing verification, worst first:
+
+1. **Rebinding a key does nothing** (M11) — the user keymap is never loaded.
+2. **A file tab holds N editor panes against one dirty flag**, so saving in one pane clears
+   the close guard while another holds unsaved text, and `pane_close` drops a buffer with no
+   guard at all. Moving dirty ownership to the pane is a DTO change.
+3. **Fork and mirror have no gesture** (M7) — the hardest feature in the project is
+   unreachable.
+4. **A dead child is invisible** (M2) — `onExit` is declared and never passed.
