@@ -70,6 +70,13 @@ pub fn shelve(root: &Path, name: &str, selections: &[PathSelection]) -> Result<S
     let mut files = Vec::new();
 
     for selection in selections {
+        // `renames(true)` is inert in this combination: `file_diff` passes a pathspec, and
+        // libgit2 filters the rename's other side out before `find_similar` runs. A shelved
+        // rename is therefore written as a whole-new-file patch. Kept rather than deleted
+        // because it states the intent, and the day `file_diff` widens its diff it starts
+        // working — at which point the rollback below has to grow the old path too, or the
+        // entry restores a rename whose source is already gone. See
+        // `tests/patch_props.rs::a_rename_is_only_detected_when_both_sides_are_in_the_diff`.
         let request = DiffRequest::new(DiffSide::Combined)
             .binary(true)
             .renames(true);

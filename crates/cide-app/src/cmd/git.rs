@@ -135,8 +135,20 @@ pub fn git_diff_file(
 ) -> Result<FileDiff> {
     let root = repo_root(&state, project, repo)?;
     let handle = cide_git::repo::open(&root)?;
-    // Renames are looked for here and not during staging: the panel wants to *show* a rename,
+    // Renames are asked for here and not during staging: the panel wants to *show* a rename,
     // and the staging path refuses one anyway.
+    //
+    // The flag does not currently do anything, and this is the honest record of that rather
+    // than a silent dead call. `file_diff` passes a pathspec, libgit2 applies it while building
+    // the diff, and `find_similar` then has only one side of the rename to look at — so a
+    // renamed file comes back `Added`, with no `oldPath` and with `partialOk: true`. The panel
+    // therefore offers per-line staging of a rename's new side. Nothing is corrupted (staging
+    // re-diffs without renames and writes a valid whole-new-file patch), and the changed-files
+    // list still labels the row `Renamed`, because `status.rs` detects renames by a different
+    // mechanism. Fixing it means widening this diff to the whole repo before the similarity
+    // pass, on a call the UI makes on every file click, which is a cost worth deciding on
+    // deliberately. `cide-git/tests/patch_props.rs::a_rename_is_only_detected_when_both_sides_are_in_the_diff`
+    // pins the mechanism and fails here when it changes.
     let request = diff::DiffRequest::new(side).renames(true);
     let file = diff::file_diff(&handle, &path, request)?
         .ok_or(GitError::NoSuchChange { path: path.clone() })?;

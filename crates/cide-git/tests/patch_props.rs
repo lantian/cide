@@ -40,10 +40,25 @@
 //! comes back with the right reason, and that whole-file staging of the same path still
 //! matches `git add`. The last is what makes a refusal safe rather than a dead end.
 //!
+//! # Every category checks that it is still itself
+//!
+//! A category that stops being what it is named for does not fail a comparison: it produces a
+//! different, still-correct patch that both appliers still agree on. So the property the name
+//! makes is asserted per case, on the comparable categories as well as the refusing ones —
+//! [`part_delta`] for the mode header and the exec bit, [`assert_intent_to_add`] for the index
+//! entry `git add -N` leaves, [`check_refusal`] for the other four — and the multi-file span is
+//! counted and guarded at the end.
+//!
+//! This is not theoretical. Before those assertions existed, deleting the `chmod` from
+//! [`mode_part`] and deleting the `git add -N` from [`generate`] each left the whole run green
+//! to the line, counts included, with 66 "mode" cases that were plain text edits and 51
+//! "intent-to-add" cases that were ordinary untracked additions.
+//!
 //! Per-category counts are printed at the end of the run and guarded: every category has to
-//! appear, and every comparable category has to actually compare in the majority of its cases,
-//! so one of them quietly turning into all-refusals or all-empties is a failure and not a
-//! silently smaller corpus.
+//! appear, every comparable category has to actually compare in the majority of its cases, and
+//! most multi-file cases have to apply a patch that really covers more than one path — so one
+//! of them quietly turning into all-refusals, all-empties or a second `text` is a failure and
+//! not a silently smaller corpus.
 //!
 //! Cases are generated from a seeded [`Rng`]; the seed is printed on failure, so a bad case is
 //! reproduced by re-running rather than by re-rolling. `CIDE_GIT_CASES` overrides the count.
@@ -603,6 +618,94 @@ fn delta_for(repo: &git2::Repository, path: &str, request: DiffRequest) -> Optio
         .find(|file| file.path == path)
 }
 
+/// The delta for one part of a comparable case, with the property its category is *named* for
+/// checked before anything is synthesized.
+///
+/// The refusal categories get this in [`check_refusal`]; the comparable ones had nothing like
+/// it, and a category that stops being itself does not fail a comparison — it produces a
+/// slightly different, still-correct patch that both appliers still agree on. Verified by
+/// mutation, twice: deleting the `chmod` from [`mode_part`] leaves 66 "mode" cases that are
+/// plain text edits, and deleting the `git add -N` from [`generate`] leaves 51 "intent-to-add"
+/// cases that are ordinary untracked additions. Both runs were green to the line, counts
+/// included, before these assertions existed.
+fn part_delta(
+    repo: &git2::Repository,
+    part: &Part,
+    request: DiffRequest,
+    what: &str,
+) -> Option<RawFile> {
+    if part.shape == Shape::IntentToAdd {
+        assert_intent_to_add(repo, part.path, what);
+    }
+
+    let file = delta_for(repo, part.path, request);
+    // `mutate` can undo its own edit — insert at `n`, then remove at `n` — so a plain
+    // modification is the one shape whose case may legitimately have nothing to diff.
+    if part.shape == Shape::Modified {
+        return file;
+    }
+    let file = file.unwrap_or_else(|| {
+        panic!(
+            "{what}: {:?} produced no delta at {} — the case set nothing up",
+            part.shape, part.path
+        )
+    });
+
+    if matches!(part.shape, Shape::ModifiedAndChmod | Shape::ChmodOnly) {
+        // Both halves. The modes are what the index comparison would notice; the header
+        // lines are what `synthesize` has to carry through and what a rewritten header
+        // drops, and they are only in the corpus because of this category.
+        assert_eq!(
+            (file.old_mode, file.new_mode),
+            // Named, not defaulted: a wildcard arm would quietly assert "the bit came off"
+            // about any path a future mode case reached for.
+            match part.path {
+                MODE_OFF => (0o100644, 0o100755),
+                MODE_ON => (0o100755, 0o100644),
+                other => panic!("{what}: {other} is not one of the mode-case paths"),
+            },
+            "{what}: the exec bit did not flip at {}",
+            part.path
+        );
+        assert!(
+            contains(&file.header, b"\nold mode ") && contains(&file.header, b"\nnew mode "),
+            "{what}: libgit2 rendered no mode header for {}:\n{}",
+            part.path,
+            String::from_utf8_lossy(&file.header)
+        );
+    }
+    Some(file)
+}
+
+/// The empty blob, `git hash-object -t blob /dev/null`.
+const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+/// `git add -N` leaves an index entry holding the empty blob with the intent-to-add bit set.
+///
+/// Nothing downstream can tell that apart from an ordinary untracked file: the delta, the
+/// pre-image, the synthesized patch and the resulting index are identical, so the category
+/// name was a claim no assertion made. The index entry is the only place the difference
+/// exists, so it is where it has to be checked.
+fn assert_intent_to_add(repo: &git2::Repository, path: &str, what: &str) {
+    let index = repo.index().expect("index");
+    let entry = index
+        .get_path(Path::new(path), 0)
+        .unwrap_or_else(|| panic!("{what}: {path} has no index entry, so it is not intent-to-add"));
+    assert!(
+        entry.flags_extended & git2::IndexEntryExtendedFlag::INTENT_TO_ADD.bits() != 0,
+        "{what}: {path} is in the index without the intent-to-add bit"
+    );
+    assert_eq!(
+        entry.id.to_string(),
+        EMPTY_BLOB,
+        "{what}: {path}'s pre-image is not the empty blob"
+    );
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Rename detection is a pass over the deltas *of one diff*, so both sides have to be in it.
 ///
 /// [`diff::file_diff`] passes a pathspec, and libgit2 applies it while building the diff —
@@ -692,8 +795,10 @@ fn select(rng: &mut Rng, file: &RawFile) -> BTreeSet<(usize, usize)> {
 /// What became of one generated case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// A patch was synthesized and both appliers agreed on the index it produces.
-    Compared,
+    /// A patch was synthesized and both appliers agreed on the index it produces. Carries how
+    /// many paths that one patch covered, because a multi-file case whose second path drew an
+    /// empty selection is a single-file case wearing the label.
+    Compared { paths: usize },
     /// There was nothing to synthesize and the whole-file path was checked instead.
     Whole,
     /// Refused — correctly, and for the reason the category expects.
@@ -706,6 +811,8 @@ enum Outcome {
 struct Counts {
     generated: u32,
     compared: u32,
+    /// Of `compared`, the ones whose single patch covered more than one path.
+    spanned: u32,
     whole: u32,
     refused: u32,
     empty: u32,
@@ -744,7 +851,12 @@ fn synthesized_patches_agree_with_git_apply_cached() {
             .expect("every category is in ALL")];
         slot.generated += 1;
         match outcome {
-            Outcome::Compared => slot.compared += 1,
+            Outcome::Compared { paths } => {
+                slot.compared += 1;
+                if paths > 1 {
+                    slot.spanned += 1;
+                }
+            }
             Outcome::Whole => slot.whole += 1,
             Outcome::Refused => {
                 slot.refused += 1;
@@ -758,10 +870,12 @@ fn synthesized_patches_agree_with_git_apply_cached() {
 
     for (category, count) in Category::ALL.iter().zip(counts.iter()) {
         eprintln!(
-            "[props] {:<14} {:>4} generated  {:>4} compared  {:>4} whole  {:>4} refused  {:>4} empty",
+            "[props] {:<14} {:>4} generated  {:>4} compared ({:>3} spanning >1 path)  {:>4} whole  \
+             {:>4} refused  {:>4} empty",
             category.name(),
             count.generated,
             count.compared,
+            count.spanned,
             count.whole,
             count.refused,
             count.empty
@@ -772,27 +886,40 @@ fn synthesized_patches_agree_with_git_apply_cached() {
         "[props] {compared} compared, {marker_refusals} refused for marker ordering, of {total}"
     );
 
+    // Both of these are ratios, and a ratio needs a denominator. Written as `x < total / 5`
+    // they were unsatisfiable below five cases — `total / 5` is 0, and nothing is fewer than
+    // none — so `CIDE_GIT_CASES=2` could not pass however well the code behaved. Multiplying
+    // out instead of dividing keeps the meaning identical at every size that already worked
+    // (at 500 both forms are `compared >= 167` and `marker_refusals <= 99`) and makes the
+    // small ones merely weak rather than impossible.
+    //
     // A run where almost nothing produced a patch would pass vacuously. A third rather than a
     // half, now that a fifth of the corpus is categories whose right answer is a refusal and
     // which therefore have no index to compare at all.
     assert!(
-        u64::from(compared) > total / 3,
+        u64::from(compared) * 3 > total,
         "only {compared} of {total} cases produced a comparable patch"
     );
     // The no-newline refusal is a real, narrow case; if it starts swallowing most of the
     // corpus then the rule has grown too broad and the tests above stopped covering anything.
     assert!(
-        u64::from(marker_refusals) < total / 5,
+        u64::from(marker_refusals) * 5 < total.max(5),
         "{marker_refusals} of {total} cases were refused for marker ordering"
     );
 
     // Per category, because the totals above are dominated by the text cases and would stay
     // green with a category generating nothing, comparing nothing, or refusing everything.
     //
-    // The floor only applies to a full run: the rarest category is one case in twenty, so
-    // `CIDE_GIT_CASES=20` is a smoke test and would fail a coverage claim it was never asked
-    // to make. Everything below it holds at any size.
-    let floor = if total >= 200 { (total / 40) as u32 } else { 0 };
+    // The floor only applies to a long run: `CIDE_GIT_CASES=20` is a smoke test and would fail
+    // a coverage claim it was never asked to make.
+    //
+    // 300 and not 200, which is where this was and which did not work: the gate and the floor
+    // were picked independently and did not meet. At exactly 200 the submodule cases come out
+    // at 4 against a floor of 5, so `CIDE_GIT_CASES=200` — the one size the code itself named —
+    // failed. Category counts are noisy at that length; 300 is where `total / 40` has real
+    // headroom (the rarest category is 10 against a floor of 7), and it holds for every size
+    // from there to 2000, which was checked rather than assumed.
+    let floor = if total >= 300 { (total / 40) as u32 } else { 0 };
     for (category, count) in Category::ALL.iter().zip(counts.iter()) {
         assert!(
             count.generated >= floor,
@@ -814,13 +941,42 @@ fn synthesized_patches_agree_with_git_apply_cached() {
                 "{} did not refuse every case",
                 category.name()
             ),
-            None => assert!(
-                count.compared + count.whole > count.generated / 2,
-                "{} compared only {} of {} cases: {count:?}",
-                category.name(),
-                count.compared + count.whole,
+            // A majority — but "majority" of two cases is a claim about the dice, not about
+            // the synthesizer. `CIDE_GIT_CASES=10` gives the mode category two cases, and one
+            // of them drawing an empty selection failed this. Below eight, the useful claim is
+            // that the category produced a patch at all.
+            None => {
+                let good = count.compared + count.whole;
+                let want = if count.generated >= 8 {
+                    count.generated / 2 + 1
+                } else {
+                    1
+                };
+                assert!(
+                    good >= want,
+                    "{} compared {good} of {} cases, wanted {want}: {count:?}",
+                    category.name(),
+                    count.generated
+                );
+            }
+        }
+        // The one property `multi-file` exists for. A case whose second path happened to draw
+        // an empty selection applies a one-path patch and still counts as compared, so without
+        // this the category could shrink to `text` with a longer name and every guard above
+        // would stay green.
+        if *category == Category::MultiFile {
+            let want = if count.generated >= 8 {
+                count.generated / 2 + 1
+            } else {
+                1
+            };
+            assert!(
+                count.spanned >= want,
+                "only {} of {} multi-file cases applied a patch spanning more than one path, \
+                 wanted {want}",
+                count.spanned,
                 count.generated
-            ),
+            );
         }
     }
 }
@@ -910,7 +1066,7 @@ fn compare(corpus: &Corpus, case: &Case, rng: &mut Rng, seed: u64) -> Outcome {
     let mut whole: Option<&'static str> = None;
 
     for part in &case.parts {
-        let Some(file) = delta_for(&git_repo, part.path, case.request) else {
+        let Some(file) = part_delta(&git_repo, part, case.request, &what) else {
             continue;
         };
 
@@ -1020,7 +1176,7 @@ fn compare(corpus: &Corpus, case: &Case, rng: &mut Rng, seed: u64) -> Outcome {
     repo.restore_index(&before);
 
     assert_eq!(ours, theirs, "{what}: index differs\n{}", show(&text));
-    Outcome::Compared
+    Outcome::Compared { paths: ready.len() }
 }
 
 /// Apply through `Repository::apply(ApplyLocation::Index)`, then read back both the index
@@ -1172,8 +1328,9 @@ fn selecting_everything_reproduces_libgit2s_own_patch_bytes() {
         }
 
         let git_repo = git2::Repository::open(&corpus.repo.root).expect("open");
+        let what = case.describe(seed);
         for part in &case.parts {
-            let Some(file) = delta_for(&git_repo, part.path, case.request) else {
+            let Some(file) = part_delta(&git_repo, part, case.request, &what) else {
                 continue;
             };
             let all = patch::every_change(&file);
@@ -1186,8 +1343,7 @@ fn selecting_everything_reproduces_libgit2s_own_patch_bytes() {
             assert_eq!(
                 String::from_utf8_lossy(&ours),
                 String::from_utf8_lossy(&file.render()),
-                "{} did not round-trip at {}",
-                case.describe(seed),
+                "{what} did not round-trip at {}",
                 part.path
             );
         }
