@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 cide-core = { workspace = true }
 cide-ipc = { workspace = true }
+cide-claude = { workspace = true }
 cide-ide-mcp = { workspace = true }
 cide-pty = { workspace = true }
 

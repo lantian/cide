@@ -1,3 +1,6 @@
 [
+  "cide://session-state",
+  "cide://session-status",
+  "cide://session-tool",
   "cide://workspace-changed"
 ]

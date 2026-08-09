@@ -567,16 +567,31 @@ fn spawn_coalescer(
 
                         while pending.len() >= MAX_FRAME {
                             let rest = pending.split_off(MAX_FRAME);
-                            broadcast(&sinks, &vt, &policy, Frame::Bytes(std::mem::replace(&mut pending, rest)));
+                            broadcast(
+                                &sinks,
+                                &vt,
+                                &policy,
+                                Frame::Bytes(std::mem::replace(&mut pending, rest)),
+                            );
                         }
                         if pending.len() >= FLUSH_BYTES {
-                            broadcast(&sinks, &vt, &policy, Frame::Bytes(std::mem::take(&mut pending)));
+                            broadcast(
+                                &sinks,
+                                &vt,
+                                &policy,
+                                Frame::Bytes(std::mem::take(&mut pending)),
+                            );
                             first_byte_at = None;
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         if !pending.is_empty() {
-                            broadcast(&sinks, &vt, &policy, Frame::Bytes(std::mem::take(&mut pending)));
+                            broadcast(
+                                &sinks,
+                                &vt,
+                                &policy,
+                                Frame::Bytes(std::mem::take(&mut pending)),
+                            );
                             first_byte_at = None;
                         }
                         // Service credit even with nothing to send, so a sink that choked
@@ -585,7 +600,12 @@ fn spawn_coalescer(
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         if !pending.is_empty() {
-                            broadcast(&sinks, &vt, &policy, Frame::Bytes(std::mem::take(&mut pending)));
+                            broadcast(
+                                &sinks,
+                                &vt,
+                                &policy,
+                                Frame::Bytes(std::mem::take(&mut pending)),
+                            );
                         }
                         exited.store(true, Ordering::Release);
                         broadcast(&sinks, &vt, &policy, Frame::Eof);
@@ -1092,7 +1112,11 @@ mod tests {
         for _ in 0..10 {
             h.tick();
         }
-        assert_eq!(log.lock().len(), 1, "ticks are leaking empty frames to sinks");
+        assert_eq!(
+            log.lock().len(),
+            1,
+            "ticks are leaking empty frames to sinks"
+        );
     }
 
     #[test]

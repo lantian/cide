@@ -47,6 +47,21 @@ macro_rules! uuid_id {
                 Self(u)
             }
         }
+
+        /// Parse one back from its `Display` form.
+        ///
+        /// Needed because these ids make round trips outside our own types: a Claude Code
+        /// hook reports `session_id` as a string, and the IDE protocol names panes the same
+        /// way. Parsing rather than accepting the string keeps an id that we did not mint —
+        /// a `claude` a user started by hand in a cide shell — from being treated as a
+        /// session this app owns.
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(Self(s.parse::<Uuid>()?))
+            }
+        }
     };
 }
 

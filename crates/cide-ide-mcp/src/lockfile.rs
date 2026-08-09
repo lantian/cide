@@ -262,6 +262,22 @@ pub fn sweep_stale() -> usize {
     }
 }
 
+/// The pid encoded in one of our temp filenames, if this is one.
+///
+/// [`write_atomically`] names its temp `.<port>.lock.<pid>.tmp`, which is what makes an
+/// abandoned one identifiable at all: the contents may be a partial write with no parseable
+/// `ideName`, so the name is the only evidence available. Three things must match — the
+/// leading dot, the `.lock` stem and the `.tmp` suffix — so an unrelated dotfile is not a
+/// candidate however it happens to end.
+fn temp_file_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (stem, pid) = rest.rsplit_once('.')?;
+    if !stem.ends_with(".lock") {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 fn sweep_stale_in(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
@@ -270,6 +286,22 @@ fn sweep_stale_in(dir: &Path) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
+
+        // Abandoned temp files first, because they are not `.lock` and would otherwise be
+        // skipped by the extension check below and accumulate for the life of the account.
+        // One is left behind whenever a process dies between `open(2)` and `rename(2)`.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && let Some(pid) = temp_file_pid(name)
+        {
+            // Safe by construction, and safe even in the impossible case that some other
+            // tool adopted this exact naming: a temp file whose owning process is gone is
+            // abandoned by definition, and nothing will ever rename it into place.
+            if !pid_is_alive(pid) && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+
         if path.extension() != Some(OsStr::new("lock")) {
             continue;
         }
@@ -682,6 +714,62 @@ mod tests {
         let lock = Lockfile::publish(41248, vec![]).expect("publish");
         assert!(lock.path().exists());
         assert!(!tmp.exists(), "the temp file must not survive the rename");
+    }
+
+    #[test]
+    fn a_temp_file_from_a_dead_process_is_swept() {
+        // Left behind by a crash between `open(2)` and `rename(2)`. Nothing else removes it:
+        // it is not a `.lock`, so the extension check skips it, and it holds a real auth
+        // token, so one accumulates per hard kill for the life of the account.
+        let home = TempHome::new();
+        let dir = home.ide_dir();
+        fs::create_dir_all(&dir).expect("dir");
+
+        let dead = a_dead_pid();
+        let abandoned = dir.join(format!(".41250.lock.{dead}.tmp"));
+        fs::write(&abandoned, "partial").expect("write");
+
+        assert_eq!(sweep_stale(), 1);
+        assert!(
+            !abandoned.exists(),
+            "an abandoned temp file survived the sweep"
+        );
+    }
+
+    #[test]
+    fn a_temp_file_from_a_live_process_is_left_alone() {
+        // Another cide, publishing right now. Removing its temp mid-write would make its
+        // `rename` fail and cost it IDE integration entirely.
+        let home = TempHome::new();
+        let dir = home.ide_dir();
+        fs::create_dir_all(&dir).expect("dir");
+
+        let live = dir.join(format!(".41251.lock.{}.tmp", std::process::id()));
+        fs::write(&live, "in flight").expect("write");
+
+        assert_eq!(sweep_stale(), 0);
+        assert!(
+            live.exists(),
+            "a live process's temp file was deleted from under it"
+        );
+    }
+
+    #[test]
+    fn only_our_own_temp_shape_is_a_candidate() {
+        // The sweep runs in a directory shared with every other editor, so the name has to be
+        // specific. All three of the leading dot, the `.lock` stem and the `.tmp` suffix are
+        // required; anything else is somebody else's file.
+        assert_eq!(temp_file_pid(".41234.lock.9182.tmp"), Some(9182));
+
+        for other in [
+            "41234.lock.9182.tmp",  // not hidden
+            ".41234.lock.9182",     // no .tmp
+            ".41234.json.9182.tmp", // not a lockfile temp
+            ".vimrc.swp.tmp",       // no pid at all
+            ".41234.lock.notapid.tmp",
+        ] {
+            assert_eq!(temp_file_pid(other), None, "{other} was treated as ours");
+        }
     }
 
     #[test]

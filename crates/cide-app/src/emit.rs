@@ -45,3 +45,85 @@ pub fn workspace_changed(app: &AppHandle, workspace: &Workspace) {
         tracing::debug!(%error, "workspace broadcast reached no window");
     }
 }
+
+// --- session events ---------------------------------------------------------------------
+//
+// These do not carry the workspace, and deliberately not `rev` either: they say nothing
+// about the tree. A session changing state does not reorder a tab or move a pane, so
+// broadcasting a revision with them would make every window re-hydrate its whole workspace
+// on every tool call — several times a second during an active turn.
+
+/// A session moved between idle, busy, awaiting permission, or exited.
+pub const SESSION_STATE: &str = "cide://session-state";
+
+/// Live model, token and cost figures from the statusline.
+///
+/// The statusline is the only supported source for these. Nothing else the CLI exposes
+/// reports token usage as it accrues.
+pub const SESSION_STATUS: &str = "cide://session-status";
+
+/// A tool touched files. The fast path for reloading an open editor buffer.
+///
+/// Separate from the `notify` watcher rather than replacing it: this arrives sooner and
+/// names the file exactly, but only covers edits the CLI made through its own tools. A
+/// `sed -i` in a shell pane, or `cargo fmt`, is still the watcher's job.
+pub const SESSION_TOOL: &str = "cide://session-tool";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionStateChanged {
+    session: String,
+    state: cide_ipc::SessionState,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionStatus {
+    session: String,
+    /// The statusline's own JSON, forwarded whole.
+    ///
+    /// Not destructured into typed fields here. Its shape is the CLI's and is not versioned;
+    /// a release that adds a figure should reach the status bar rather than be dropped by a
+    /// deserialiser that had not heard of it.
+    status: serde_json::Value,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTool {
+    session: String,
+    paths: Vec<String>,
+}
+
+pub fn session_state(app: &AppHandle, session: &str, state: cide_ipc::SessionState) {
+    let payload = SessionStateChanged {
+        session: session.to_owned(),
+        state,
+    };
+    if let Err(error) = app.emit(SESSION_STATE, payload) {
+        tracing::debug!(%error, "session-state reached no window");
+    }
+}
+
+pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value) {
+    let payload = SessionStatus {
+        session: session.to_owned(),
+        status,
+    };
+    if let Err(error) = app.emit(SESSION_STATUS, payload) {
+        tracing::debug!(%error, "session-status reached no window");
+    }
+}
+
+pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+    let payload = SessionTool {
+        session: session.to_owned(),
+        paths,
+    };
+    if let Err(error) = app.emit(SESSION_TOOL, payload) {
+        tracing::debug!(%error, "session-tool reached no window");
+    }
+}

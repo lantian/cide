@@ -63,7 +63,11 @@ impl Default for Workspace {
 /// mappings from `ProjectId` to `WindowRole::Shell` over identical state — which is why
 /// flipping the setting touches no project, tab, pane or session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 #[ts(export)]
 pub enum WindowRole {
     /// N projects in `Stacked` mode, exactly one in `PerProject`.
@@ -148,7 +152,11 @@ pub struct Tab {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 #[ts(export)]
 pub enum TabKind {
     /// The pinned project console. Always `tabs[0]`; `tab.close` on it is an error.
@@ -205,7 +213,11 @@ pub struct DiffSpec {
 
 /// Where a diff came from, which decides what happens when the user answers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 #[ts(export)]
 pub enum DiffOrigin {
     /// Opened from the git panel. Closing it is just closing a tab.
@@ -224,7 +236,11 @@ pub enum DiffOrigin {
 /// written to disk — so this is one of the few wire types where a wrong mapping destroys
 /// work rather than degrading a view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 #[ts(export)]
 pub enum DiffAnswer {
     /// Accepted after the user edited it in cide's own diff view.

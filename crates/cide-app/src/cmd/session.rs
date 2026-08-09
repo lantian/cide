@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use cide_ipc::{Geometry, SessionId};
 use cide_pty::{Geometry as PtyGeometry, PtySession, Sink, SpawnSpec};
-use tauri::{Manager, State};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
+use tauri::{Manager, State};
 
 use crate::state::{AttachmentKey, SessionRegistry};
 
@@ -61,6 +61,32 @@ fn base_env(spec: SpawnSpec) -> SpawnSpec {
         .env_remove("CI")
 }
 
+/// Whether this program is the Claude Code CLI, and so has hooks worth registering.
+///
+/// Matched on the file name rather than the whole path: it may be invoked as `claude`, as an
+/// absolute path into a version directory, or through a shim.
+fn program_is_claude(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .map(|n| n == "claude")
+        .unwrap_or(false)
+}
+
+/// The inline `--settings` JSON, or `None` when `cide-hook` cannot be located.
+///
+/// Looked up beside our own executable, which is where every packaging format this project
+/// ships puts the two binaries together.
+fn hook_settings() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let hook = exe.parent()?.join("cide-hook");
+    if !hook.exists() {
+        return None;
+    }
+    let settings =
+        cide_claude::inline_settings(&hook.to_string_lossy(), &cide_claude::StatusLine::Ours);
+    serde_json::to_string(&settings).ok()
+}
+
 /// Convert a wire geometry into the PTY crate's own, which clamps and derives pixel dims.
 fn pty_geometry(g: Geometry) -> PtyGeometry {
     PtyGeometry::new(g.cols, g.rows, g.cell_width, g.cell_height)
@@ -81,6 +107,19 @@ pub fn session_spawn(
         spec = spec.arg(a);
     }
     let mut spec = base_env(spec);
+    // Only Claude children get the settings payload. A shell has no hooks to register, and
+    // handing it a `--settings` argument would simply be a bad argv.
+    let is_claude = program_is_claude(&spec.program);
+
+    // Minted before the spawn, not after, because for a Claude pane this id *is* the value
+    // passed to `--session-id`. That equality is what makes everything downstream work: a
+    // hook reports the CLI's `session_id`, and unless the CLI was told to use ours, every
+    // frame it sends names a uuid this process has never heard of and is dropped. It is also
+    // what lets a restored pane resume with `--resume <id>` and no extra bookkeeping.
+    let id = SessionId::new();
+    if is_claude {
+        spec = spec.arg("--session-id").arg(id.to_string());
+    }
 
     // `CLAUDE_CODE_SSE_PORT` is load-bearing, not a hint. It makes a port match alone mark our
     // lockfile valid — skipping the cwd-containment, pid-liveness and PID-ancestry checks —
@@ -97,13 +136,33 @@ pub fn session_spawn(
         spec = spec.env("CLAUDE_CODE_SSE_PORT", port.to_string());
     }
 
+    // Hooks are what make the status bar's token figures, the fast buffer reload and the
+    // busy-vs-idle close confirm possible. They are registered inline via `--settings`
+    // rather than by editing `~/.claude/settings.json`, which is the user's file and would
+    // otherwise carry cide's hooks into every `claude` they ever run.
+    if let Some(server) = app.try_state::<crate::hooks::HookServer>() {
+        spec = spec.env(
+            "CIDE_HOOK_SOCK",
+            server.socket().to_string_lossy().to_string(),
+        );
+
+        if is_claude {
+            match hook_settings() {
+                Some(json) => spec = spec.arg("--settings").arg(json),
+                // Without an absolute path to `cide-hook` the child cannot run it: its cwd is
+                // the project root and its PATH is the user's. Skipping the flag leaves a
+                // working session with no hooks, which is the right way to fail here.
+                None => tracing::warn!("cannot locate cide-hook; this session reports no state"),
+            }
+        }
+    }
+
     let session = PtySession::spawn(spec).map_err(|e| SessionError::Pty(e.to_string()))?;
 
     // The pid→pane binding is not done here: a session exists before it belongs to a pane,
     // and `pane_bind_session` is the one place that knows both. Binding early would have to
     // invent a pane id and then correct it.
 
-    let id = SessionId::new();
     registry.insert(id, session);
     Ok(id)
 }

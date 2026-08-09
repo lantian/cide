@@ -1538,6 +1538,102 @@ mod tests {
         validate(&ws).expect("valid after a round trip");
     }
 
+    /// M5's stated check: three projects, six live sessions, flip the mode, zero deaths.
+    ///
+    /// The guarantee has two halves and only one of them is here. This half is that the flip
+    /// is a *window* operation: it rewrites `ws.windows` and touches no project, tab, pane or
+    /// session binding, so every `SessionId` a pane held before the flip it still holds
+    /// after. The other half — that destroying an OS window does not kill the child behind
+    /// it — is structural rather than testable at this layer: sessions are owned by a
+    /// process-global registry, and `windows::destroy` closes a webview and nothing else.
+    /// That is the whole reason the registry exists.
+    #[test]
+    fn flipping_the_mode_with_live_sessions_loses_none_of_them() {
+        let mut ws = Workspace::default();
+        let mut expected: Vec<(PaneId, SessionId)> = Vec::new();
+
+        for path in ["/home/dev/a", "/home/dev/b", "/home/dev/c"] {
+            let project = open(&mut ws, path);
+            let console = console_tab(&ws, project).expect("every project has a console");
+
+            // Two panes per project, both bound: the console's own pane and a split.
+            let second = split_console(&mut ws, project);
+            let t = tab_mut(&mut ws, project, console).expect("exists");
+            let ids: Vec<PaneId> = t.tree.panes.keys().copied().collect();
+            assert_eq!(ids.len(), 2, "the console should now hold two panes");
+
+            for pane in ids {
+                let session = SessionId::new();
+                t.tree
+                    .panes
+                    .get_mut(&pane)
+                    .expect("just enumerated")
+                    .session = Some(session);
+                expected.push((pane, session));
+            }
+            let _ = second;
+        }
+        assert_eq!(expected.len(), 6, "three projects, six live sessions");
+
+        let bindings = |ws: &Workspace| -> Vec<(PaneId, SessionId)> {
+            let mut found: Vec<_> = ws
+                .projects
+                .values()
+                .flat_map(|p| p.tabs.iter())
+                .flat_map(|t| t.tree.panes.iter())
+                .filter_map(|(id, pane)| pane.session.map(|s| (*id, s)))
+                .collect();
+            found.sort();
+            found
+        };
+
+        let mut before = expected.clone();
+        before.sort();
+        assert_eq!(bindings(&ws), before, "setup did not bind what it meant to");
+
+        set_window_mode(&mut ws, WindowMode::PerProject).expect("flips");
+        assert_eq!(ws.windows.len(), 3, "one window per project");
+        assert_eq!(
+            bindings(&ws),
+            before,
+            "a flip to PerProject moved a session"
+        );
+        validate(&ws).expect("valid in PerProject");
+
+        set_window_mode(&mut ws, WindowMode::Stacked).expect("flips back");
+        assert_eq!(ws.windows.len(), 1, "back to a single shell");
+        assert_eq!(
+            bindings(&ws),
+            before,
+            "a flip back to Stacked moved a session"
+        );
+        validate(&ws).expect("valid in Stacked");
+    }
+
+    #[test]
+    fn a_detached_window_survives_a_mode_flip() {
+        // Detached windows are orthogonal to the mode — they show one pane, not a project
+        // mapping — so a flip must carry them across untouched. Dropping one would strand a
+        // live session with a window role naming a pane nothing renders.
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/home/dev/a");
+        let console = console_tab(&ws, project).expect("exists");
+        let pane = split_console(&mut ws, project);
+        let label = detach_pane(&mut ws, project, console, pane).expect("detaches");
+
+        assert!(ws.windows.contains_key(&label));
+        set_window_mode(&mut ws, WindowMode::PerProject).expect("flips");
+        assert!(
+            ws.windows.contains_key(&label),
+            "the detached window was dropped by a mode flip"
+        );
+        assert!(
+            ws.projects[&project].detached.contains_key(&pane),
+            "the detached pane lost its holding entry"
+        );
+        validate(&ws).expect("valid");
+    }
+
     #[test]
     fn stacked_mode_keeps_the_active_project_it_already_had() {
         let mut ws = Workspace::default();

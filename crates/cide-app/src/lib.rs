@@ -6,6 +6,7 @@
 pub mod cmd;
 pub mod emit;
 pub mod graphics;
+pub mod hooks;
 pub mod ide;
 pub mod lifecycle;
 pub mod state;
@@ -227,6 +228,21 @@ pub fn run() {
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());
+
+            // Before any pane spawns, because a child that starts without `CIDE_HOOK_SOCK`
+            // in its environment never reports at all — there is no later moment at which it
+            // can be told where to send hooks.
+            match hooks::HookServer::start(app.handle().clone()) {
+                Ok(server) => {
+                    app.manage(server);
+                }
+                // Costs live token figures, the fast buffer reload, and a close confirm that
+                // can tell busy from idle. Claude Code runs fine with no hooks configured, so
+                // this degrades rather than refusing to launch.
+                Err(error) => {
+                    tracing::error!(%error, "no hook socket; sessions will report no state")
+                }
+            }
 
             restore_windows(app.handle())?;
             Ok(())

@@ -103,7 +103,8 @@ impl IdeServers {
 
         // Taken once, here, because `events()` hands the receiver over: a second caller would
         // silently take the stream from this pump and diffs would stop reaching the UI.
-        self.rt.spawn(pump(app.clone(), project, events, broker.clone()));
+        self.rt
+            .spawn(pump(app.clone(), project, events, broker.clone()));
 
         self.servers.insert(
             project,
@@ -314,13 +315,16 @@ pub fn request_id_for_tab(
 ) -> Option<String> {
     state.with(|ws| {
         let p = cide_core::workspace::project(ws, project).ok()?;
-        p.tabs.iter().find(|t| t.id == tab).and_then(|t| match &t.kind {
-            TabKind::Diff { spec } => match &spec.origin {
-                DiffOrigin::ClaudeMcp { request_id } => Some(request_id.clone()),
+        p.tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .and_then(|t| match &t.kind {
+                TabKind::Diff { spec } => match &spec.origin {
+                    DiffOrigin::ClaudeMcp { request_id } => Some(request_id.clone()),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        })
+            })
     })
 }
 
