@@ -1,0 +1,85 @@
+/*
+ * Content mode C from the mock: a 190px nav down the left, the section on the right at
+ * 34px/44px padding.
+ */
+
+.tab {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.nav {
+  width: 190px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+
+.navItem {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.navItem:hover {
+  color: var(--text);
+}
+
+/* Selected wins over hover so the row does not lose its background on pointer-over. */
+.navItemActive,
+.navItemActive:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.navItem:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.pane {
+  flex: 1;
+  min-width: 0;
+  /* The nav must not scroll with the section: a long keymap listing would otherwise carry the
+     seven headings off the top of the window. */
+  overflow-y: auto;
+  padding: 34px 44px;
+}
+
+.title {
+  margin: 0 0 6px;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+.description {
+  margin: 0 0 22px;
+  max-width: 620px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.body {
+  max-width: 620px;
+}
+
+.loading {
+  font-size: 13px;
+  color: var(--dim);
+}

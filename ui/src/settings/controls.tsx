@@ -1,0 +1,191 @@
+/**
+ * The Settings screen's form vocabulary.
+ *
+ * Presentational only: nothing here reads the store or the IPC surface, so the whole screen
+ * can be rendered from a fixture. The mock draws exactly three kinds of control — a toggle
+ * row, a segmented choice and a small numeric field — and this file is all of them.
+ */
+import { useState, type ReactNode } from 'react'
+import styles from './controls.module.css'
+
+export interface ToggleProps {
+  checked: boolean
+  onChange: (next: boolean) => void
+  /** The accessible name. Visible text lives in the row, so the control needs its own. */
+  label: string
+  disabled?: boolean | undefined
+}
+
+/**
+ * The 34x19 pill with a 15px knob, `--accent` when on.
+ *
+ * A `button` with `role="switch"` rather than a styled checkbox: a checkbox brings its own
+ * indeterminate state and a label association this layout does not use, and hiding one behind
+ * a pill is how a control ends up unreachable from the keyboard.
+ */
+export function Toggle({ checked, onChange, label, disabled }: ToggleProps) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled === true}
+      className={checked ? `${styles.pill} ${styles.pillOn}` : styles.pill}
+      onClick={() => onChange(!checked)}
+    >
+      <span className={styles.knob} aria-hidden="true" />
+    </button>
+  )
+}
+
+export interface RowProps {
+  label: string
+  /** The italic second line under the label in the mock. */
+  hint?: string | undefined
+  control: ReactNode
+}
+
+/** One line of the settings form: text on the left, one control hard right. */
+export function Row({ label, hint, control }: RowProps) {
+  return (
+    <div className={styles.row}>
+      <div className={styles.rowText}>
+        <div className={styles.label}>{label}</div>
+        {hint !== undefined && <div className={styles.hint}>{hint}</div>}
+      </div>
+      <div className={styles.control}>{control}</div>
+    </div>
+  )
+}
+
+/** A toggle row: the pair the mock uses for every boolean. */
+export function ToggleRow({
+  label,
+  hint,
+  checked,
+  onChange,
+  disabled,
+}: Omit<RowProps, 'control'> & Omit<ToggleProps, 'label'>) {
+  return (
+    <Row
+      label={label}
+      hint={hint}
+      control={
+        <Toggle label={label} checked={checked} onChange={onChange} disabled={disabled} />
+      }
+    />
+  )
+}
+
+export interface SegmentedProps<T extends string> {
+  value: T
+  options: readonly { value: T; label: string }[]
+  onChange: (next: T) => void
+  label: string
+}
+
+/** A small exclusive choice — theme, terminal renderer. */
+export function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+}: SegmentedProps<T>) {
+  return (
+    <div className={styles.segmented} role="radiogroup" aria-label={label}>
+      {options.map((option) => {
+        const active = option.value === value
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            className={active ? `${styles.segment} ${styles.segmentActive}` : styles.segment}
+            onClick={() => onChange(option.value)}
+          >
+            {option.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+export interface NumberFieldProps {
+  value: number
+  min: number
+  max: number
+  onChange: (next: number) => void
+  label: string
+}
+
+/**
+ * A bounded integer.
+ *
+ * Clamped, because these values reach a terminal's font metrics and a scrollback allocation
+ * and a pasted `999999` scrollback is a live session's memory — but clamped **on commit, not
+ * on every keystroke**. Clamping per keystroke reads as correct and makes the field
+ * unenterable: with `min=8`, typing `16` clamps the intermediate `1` to `8`, the controlled
+ * input snaps to "8", and the next keystroke produces "86". Every numeric setting on this
+ * screen behaves that way, so the half-typed value is held locally as text and only parsed
+ * when the user is finished with it.
+ *
+ * An unparseable commit is ignored rather than treated as zero: clearing the field to type a
+ * new number must not set a scrollback of 0 on the way past.
+ */
+export function NumberField({ value, min, max, onChange, label }: NumberFieldProps) {
+  /** The text being typed, or `null` when the field is showing the stored value. */
+  const [draft, setDraft] = useState<string | null>(null)
+
+  const commit = (text: string) => {
+    setDraft(null)
+    const next = Number.parseInt(text, 10)
+    if (Number.isNaN(next)) return
+    const clamped = Math.min(max, Math.max(min, next))
+    // Guarded so that tabbing through an untouched field is not a workspace write and a
+    // broadcast to every window.
+    if (clamped !== value) onChange(clamped)
+  }
+
+  return (
+    <input
+      className={styles.number}
+      type="number"
+      inputMode="numeric"
+      aria-label={label}
+      min={min}
+      max={max}
+      value={draft ?? String(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => commit(e.target.value)}
+      onKeyDown={(e) => {
+        // Enter commits without waiting for focus to leave; Escape abandons the draft, which
+        // re-renders the stored value.
+        if (e.key === 'Enter') commit(e.currentTarget.value)
+        else if (e.key === 'Escape') setDraft(null)
+      }}
+    />
+  )
+}
+
+/** A titled block of rows. */
+export function Group({ title, children }: { title?: string | undefined; children: ReactNode }) {
+  return (
+    <section className={styles.group}>
+      {title !== undefined && <h3 className={styles.groupTitle}>{title}</h3>}
+      {children}
+    </section>
+  )
+}
+
+/** A block of prose that explains something the controls cannot. */
+export function Note({ title, children }: { title?: string | undefined; children: ReactNode }) {
+  return (
+    <div className={styles.note}>
+      {title !== undefined && <div className={styles.noteTitle}>{title}</div>}
+      {children}
+    </div>
+  )
+}

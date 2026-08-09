@@ -32,12 +32,14 @@ import { TabContent } from '@/layout/TabContent'
 import { PaneFrame } from '@/layout/PaneTitleBar'
 import { PaneBody } from '@/panes/PaneBody'
 import { liveHosts } from '@/layout/paneHosts'
+import { SettingsTab } from '@/settings/SettingsTab'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   app as appApi,
   benchMode,
   diag,
   events,
+  settings as settingsApi,
   type PaneRestore,
   type ProjectId,
   type TabId,
@@ -367,7 +369,19 @@ export function App() {
         <div className={styles.body}>
           {/* The badge only renders on a dirty tree, so the audit has to ask for one or it
               measures a state the chrome never shows it. */}
-          <ActivityRail active={view} gitDirty={auditMode()} onSelect={setView} />
+          <ActivityRail
+            active={view}
+            gitDirty={auditMode()}
+            onSelect={(next) => {
+              setView(next)
+              // The rail's ⚙ is the only gesture that reaches Settings until the command
+              // palette lands, and Settings is a workspace tab rather than a sidebar view —
+              // so this one entry opens (or re-activates) the project's tab.
+              if (next === 'settings' && activeProjectId) {
+                void settingsApi.openTab(activeProjectId).then(() => hydrate())
+              }
+            }}
+          />
 
           <div className={styles.content}>
             {/* An open project always has a console tab, so its `activeTab` is always live —
@@ -404,7 +418,13 @@ export function App() {
               <TabContent
                 tabs={activeProject.tabs}
                 activeTab={activeProject.activeTab}
-                renderTree={(tab) => (
+                renderTree={(tab) =>
+                  // A settings tab has a pane tree — every tab does, which is the invariant
+                  // that makes "promote pane to tab" one code path — but nothing to render
+                  // into it. The screen replaces the tree rather than living inside a pane.
+                  tab.kind.kind === 'settings' ? (
+                    <SettingsTab project={activeProject.id} section={tab.kind.section} />
+                  ) : (
                   <SplitTree
                     tree={tab.tree}
                     onFocus={(id) => void focusPane(activeProject.id, tab.id, id)}
@@ -442,7 +462,8 @@ export function App() {
                       </PaneFrame>
                     )}
                   />
-                )}
+                  )
+                }
               />
             )}
           </div>

@@ -585,10 +585,12 @@ version = "0.1.0"
 dependencies = [
  "cide-claude",
  "cide-core",
+ "cide-fs",
  "cide-git",
  "cide-ide-mcp",
  "cide-ipc",
  "cide-pty",
+ "cide-search",
  "dashmap",
  "libc",
  "parking_lot",
@@ -645,12 +647,11 @@ name = "cide-fs"
 version = "0.1.0"
 dependencies = [
  "cide-ipc",
- "globset",
+ "cide-search",
  "ignore",
+ "libc",
  "notify",
  "notify-debouncer-full",
- "parking_lot",
- "rayon",
  "serde",
  "thiserror 2.0.19",
  "tracing",
@@ -738,9 +739,6 @@ dependencies = [
  "cide-ipc",
  "nucleo",
  "parking_lot",
- "serde",
- "thiserror 2.0.19",
- "tracing",
 ]
 
 [[package]]

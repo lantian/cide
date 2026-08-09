@@ -1,0 +1,182 @@
+/*
+ * The Settings screen's form vocabulary: a toggle row, a segmented control, a numeric field.
+ *
+ * Every dimension here is the mock's: the pill is 34x19 with a 15px knob, and the knob's
+ * travel is 34 - 15 - 2 - 2 = 15px, so the 2px inset is the same on both ends.
+ */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* The last row in a group should not draw a rule into the whitespace below it. */
+.row:last-child {
+  border-bottom: 0;
+}
+
+.rowText {
+  flex: 1;
+  /* Without this a long description makes the flex item refuse to shrink, and the control
+     is pushed off the right edge of the pane instead of the text wrapping. */
+  min-width: 0;
+}
+
+.label {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.hint {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 3px;
+}
+
+.control {
+  flex: none;
+}
+
+/* --- the pill --- */
+
+.pill {
+  width: 34px;
+  height: 19px;
+  flex: none;
+  position: relative;
+  border: 0;
+  padding: 0;
+  border-radius: 10px;
+  background: var(--border);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.pillOn {
+  background: var(--accent);
+}
+
+.pill:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.pill:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  /* --text-hi is near-white in the dark theme and near-black in the light one, which reads
+     against both the --border track and the --accent one. A hardcoded white would vanish
+     into the light theme's pale track. */
+  background: var(--text-hi);
+  transition: transform 120ms ease;
+}
+
+.pillOn .knob {
+  transform: translateX(15px);
+}
+
+/* --- segmented control --- */
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-2);
+}
+
+.segment {
+  height: 24px;
+  min-width: 62px;
+  padding: 0 11px;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.segment + .segment {
+  border-left: 1px solid var(--border);
+}
+
+.segment:hover {
+  color: var(--text);
+}
+
+.segmentActive,
+.segmentActive:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.segment:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* --- numeric field --- */
+
+.number {
+  width: 74px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  /* Counters and measurements are mono throughout this app. */
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.number:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+/* --- grouping --- */
+
+.group {
+  margin-bottom: 28px;
+}
+
+.groupTitle {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin: 0 0 6px;
+}
+
+/* A block of prose or a warning inside a section. */
+.note {
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 5px;
+  background: var(--panel);
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dim);
+  margin-bottom: 18px;
+}
+
+.noteTitle {
+  color: var(--text);
+  margin-bottom: 4px;
+}

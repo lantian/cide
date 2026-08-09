@@ -8,15 +8,21 @@
 //! This crate must never depend on `tauri`.
 
 pub mod git;
+pub mod headless;
 pub mod ids;
 pub mod keymap;
 pub mod settings;
+pub mod settings_ops;
 pub mod workspace;
 
+pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
 pub use settings::{
     ClaudeSettings, EditorSettings, GraphicsSettings, Settings, TerminalRenderer, TerminalSettings,
+};
+pub use settings_ops::{
+    GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,
 };
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, LayoutNode, MAX_RATIO, MIN_RATIO, Pane, PaneTree,

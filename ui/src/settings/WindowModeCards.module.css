@@ -1,0 +1,133 @@
+/*
+ * The two 242px radio cards from the mock, and the miniature diagrams inside them.
+ *
+ * The diagrams are built from divs and tokens rather than drawn as SVG, for one reason: they
+ * are pictures of this application's own chrome, and a themed SVG needs its palette threaded
+ * through `currentColor` or duplicated per theme. Divs inherit the tokens for free, so the
+ * miniature repaints with the real thing when the theme flips.
+ */
+
+.cards {
+  display: flex;
+  gap: 14px;
+  margin: 2px 0 26px;
+}
+
+.card {
+  width: 242px;
+  flex: none;
+  padding: 12px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: inherit;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.card:hover {
+  border-color: var(--dim);
+}
+
+.cardActive,
+.cardActive:hover {
+  border-color: var(--accent);
+  background: var(--chrome-hi);
+}
+
+.card:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.cardLabel {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 10px;
+}
+
+.radio {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--dim);
+  display: grid;
+  place-items: center;
+}
+
+.cardActive .radio {
+  border-color: var(--accent);
+}
+
+.radioDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.cardHint {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 5px;
+}
+
+/* --- the miniatures --- */
+
+.diagram {
+  height: 74px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  padding: 9px;
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+/* One miniature window: a header strip over a body. */
+.window {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.windowBar {
+  height: 11px;
+  flex: none;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 3px;
+}
+
+/* One project tab in the miniature header. */
+.chip {
+  height: 6px;
+  flex: 1;
+  min-width: 0;
+  border-radius: 1px;
+  background: var(--border);
+}
+
+.chipActive {
+  background: var(--accent);
+}
+
+.windowBody {
+  flex: 1;
+  background: var(--panel);
+}

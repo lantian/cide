@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=cide
+GenericName=IDE
+Comment=A Claude-Code-native IDE
+Exec=cide %U
+Icon=dev.cide.ide
+Terminal=false
+Categories=Development;IDE;
+Keywords=claude;ide;editor;terminal;git;
+StartupNotify=true
+StartupWMClass=cide
