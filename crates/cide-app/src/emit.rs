@@ -127,3 +127,36 @@ pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
         tracing::debug!(%error, "session-tool reached no window");
     }
 }
+
+// --- git events ---------------------------------------------------------------------------
+
+/// The changes tree for one project was recomputed.
+///
+/// Carries the whole tree rather than a delta, for the same reason `workspace_changed` does:
+/// the commit tool window is a tri-state tree where moving one file changes the state of every
+/// group above it, and a patch protocol between two windows that can both mutate is a source
+/// of divergence for no measurable gain. It does not carry `rev` — a commit touches no part of
+/// the workspace tree, and broadcasting a revision here would make every window re-hydrate its
+/// whole workspace on every `git add`.
+pub const GIT_STATUS: &str = "cide://git-status";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStatus {
+    project: cide_ipc::ProjectId,
+    tree: cide_ipc::git::ChangesTree,
+}
+
+pub fn git_status(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    tree: &cide_ipc::git::ChangesTree,
+) {
+    let payload = GitStatus {
+        project,
+        tree: tree.clone(),
+    };
+    if let Err(error) = app.emit(GIT_STATUS, payload) {
+        tracing::debug!(%error, "git-status reached no window");
+    }
+}

@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 cide-ipc = { workspace = true }
+# For `persist::state_dir()` only. The sidecar lives under the same `$XDG_STATE_HOME/cide`
+# as `workspace.json`, and a second copy of the XDG resolution here is a second answer to
+# "where does cide keep things" waiting to drift from the first.
+cide-core = { workspace = true }
 git2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,3 +18,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
 indexmap = { workspace = true }
+# `RepoId` is a uuid newtype and this crate derives one deterministically from the
+# canonical work-tree path, so the same repository gets the same id in every process and
+# across restarts without a registry to keep in sync.
+uuid = { workspace = true }

@@ -30,6 +30,21 @@ import type {
   Workspace,
 } from './generated'
 
+import type {
+  BranchInfo,
+  ChangesTree,
+  CommitOutcome,
+  CommitRequest,
+  DiffSide,
+  FileDiff,
+  LineRef,
+  PathSelection,
+  PushOutcome,
+  RepoId,
+  ShelfEntry,
+  StashEntry,
+} from './generated'
+
 export type * from './generated'
 
 export type SessionId = string
@@ -379,6 +394,137 @@ export const events = {
     listen<{ session: string; paths: string[] }>('cide://session-tool', (e) =>
       handler(e.payload.session, e.payload.paths),
     ),
+
+  /**
+   * A project's changes tree was recomputed.
+   *
+   * Fires after any git mutation cide made, in every window. Changes made *outside* cide —
+   * a `git add` in a bash pane — do not fire it; those arrive through the filesystem
+   * watcher, which is what the panel's own refresh is wired to.
+   */
+  onGitStatus: (handler: (project: ProjectId, tree: ChangesTree) => void) =>
+    listen<{ project: ProjectId; tree: ChangesTree }>('cide://git-status', (e) =>
+      handler(e.payload.project, e.payload.tree),
+    ),
+}
+
+/**
+ * The commit tool window's whole surface.
+ *
+ * Every mutation answers with the new `ChangesTree` rather than an acknowledgement. The panel
+ * is a tri-state tree in which moving one file changes the state of every group above it, so
+ * a call that returned `{ok: true}` would be followed at once by a second asking what
+ * happened — and the frame in between shows a tree that is visibly wrong.
+ *
+ * `repo` is always required, even for a single-root project: a project can hold several roots
+ * and each root its submodules, and every one of them is a repository with its own index.
+ */
+export const git = {
+  /** `includeIgnored` walks ignored files, which on a repo with a big `target/` is slow. */
+  status: (project: ProjectId, includeIgnored = false) =>
+    invoke<ChangesTree>('git_status', { project, includeIgnored }),
+
+  branchInfo: (project: ProjectId, repo: RepoId) =>
+    invoke<BranchInfo>('git_branch_info', { project, repo }),
+
+  /**
+   * One file's diff. `side` picks the pair: `staged` is HEAD→index, `unstaged` is
+   * index→working tree, `combined` is HEAD→working tree and is what the changelist panel
+   * shows.
+   *
+   * Carry the returned `rev` back on any `PathSelection` built from this diff. Staging
+   * refuses a mismatch, which is what stops a selection made while Claude was editing from
+   * being applied to lines that have since moved.
+   */
+  diffFile: (project: ProjectId, repo: RepoId, path: string, side: DiffSide) =>
+    invoke<FileDiff>('git_diff_file', { project, repo, path, side }),
+
+  /** Which lines a selection resolves to, without applying it — for the tri-state boxes. */
+  resolveSelection: (
+    project: ProjectId,
+    repo: RepoId,
+    side: DiffSide,
+    selection: PathSelection,
+  ) => invoke<LineRef[]>('git_resolve_selection', { project, repo, side, selection }),
+
+  stage: (project: ProjectId, repo: RepoId, selections: PathSelection[]) =>
+    invoke<ChangesTree>('git_stage', { project, repo, selections }),
+
+  unstage: (project: ProjectId, repo: RepoId, selections: PathSelection[]) =>
+    invoke<ChangesTree>('git_unstage', { project, repo, selections }),
+
+  /** **Destroys uncommitted work.** Confirm before calling; Rust will not ask. */
+  rollback: (project: ProjectId, repo: RepoId, selections: PathSelection[]) =>
+    invoke<ChangesTree>('git_rollback', { project, repo, selections }),
+
+  /**
+   * Rejected with `indexChangedExternally` when someone ran `git add` outside cide. That is
+   * the guard bar, not a failure: offer `adoptIndex` (reload) or re-send with
+   * `request.force` (overwrite).
+   */
+  commit: (project: ProjectId, repo: RepoId, request: CommitRequest) =>
+    invoke<CommitOutcome>('git_commit', { project, repo, request }),
+
+  /** Shells out to `git push` when a credential helper is configured or the remote is HTTPS. */
+  push: (
+    project: ProjectId,
+    repo: RepoId,
+    remote: string | null = null,
+    refspec: string | null = null,
+    setUpstream = false,
+  ) => invoke<PushOutcome>('git_push', { project, repo, remote, refspec, setUpstream }),
+
+  /** The "reload" half of the guard bar: accept the index as it now stands. */
+  adoptIndex: (project: ProjectId, repo: RepoId) =>
+    invoke<ChangesTree>('git_adopt_index', { project, repo }),
+
+  /** IDEA's "use Git staging area instead". In this mode cide never rebuilds the index. */
+  setUseStagingArea: (project: ProjectId, repo: RepoId, enabled: boolean) =>
+    invoke<ChangesTree>('git_set_use_staging_area', { project, repo, enabled }),
+
+  changelist: {
+    create: (project: ProjectId, repo: RepoId, name: string, comment = '') =>
+      invoke<ChangesTree>('git_changelist_create', { project, repo, name, comment }),
+    rename: (project: ProjectId, repo: RepoId, id: string, name: string, comment = '') =>
+      invoke<ChangesTree>('git_changelist_rename', { project, repo, id, name, comment }),
+    /** Its paths fall back to the default list; the default list itself cannot be deleted. */
+    delete: (project: ProjectId, repo: RepoId, id: string) =>
+      invoke<ChangesTree>('git_changelist_delete', { project, repo, id }),
+    movePaths: (project: ProjectId, repo: RepoId, id: string, paths: string[]) =>
+      invoke<ChangesTree>('git_changelist_move_paths', { project, repo, id, paths }),
+    /** Only *new* changes join the newly active list; existing ones stay where they are. */
+    setActive: (project: ProjectId, repo: RepoId, id: string) =>
+      invoke<ChangesTree>('git_changelist_set_active', { project, repo, id }),
+  },
+
+  /** cide's own patch files. Separate from the stash, which is git's — see `git.stash`. */
+  shelf: {
+    list: (project: ProjectId, repo: RepoId) =>
+      invoke<ShelfEntry[]>('git_shelf_list', { project, repo }),
+    shelve: (project: ProjectId, repo: RepoId, name: string, selections: PathSelection[]) =>
+      invoke<ShelfEntry>('git_shelve', { project, repo, name, selections }),
+    /** `keep` leaves the patch on the shelf — IDEA's "unshelve and keep". */
+    unshelve: (project: ProjectId, repo: RepoId, id: string, keep = false) =>
+      invoke<ChangesTree>('git_unshelve', { project, repo, id, keep }),
+    patch: (project: ProjectId, repo: RepoId, id: string) =>
+      invoke<string>('git_shelf_patch', { project, repo, id }),
+    drop: (project: ProjectId, repo: RepoId, id: string) =>
+      invoke<ShelfEntry[]>('git_shelf_drop', { project, repo, id }),
+  },
+
+  /** Real `git stash` entries, which a terminal can also see. */
+  stash: {
+    list: (project: ProjectId, repo: RepoId) =>
+      invoke<StashEntry[]>('git_stash_list', { project, repo }),
+    save: (project: ProjectId, repo: RepoId, message: string, includeUntracked = false) =>
+      invoke<ChangesTree>('git_stash_save', { project, repo, message, includeUntracked }),
+    pop: (project: ProjectId, repo: RepoId, index: number) =>
+      invoke<ChangesTree>('git_stash_pop', { project, repo, index }),
+    apply: (project: ProjectId, repo: RepoId, index: number) =>
+      invoke<ChangesTree>('git_stash_apply', { project, repo, index }),
+    drop: (project: ProjectId, repo: RepoId, index: number) =>
+      invoke<StashEntry[]>('git_stash_drop', { project, repo, index }),
+  },
 }
 
 /** The window label this webview was opened with, e.g. `shell:<uuid>`. */

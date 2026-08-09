@@ -585,6 +585,7 @@ version = "0.1.0"
 dependencies = [
  "cide-claude",
  "cide-core",
+ "cide-git",
  "cide-ide-mcp",
  "cide-ipc",
  "cide-pty",
@@ -660,6 +661,7 @@ name = "cide-git"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "cide-core",
  "cide-ipc",
  "git2",
  "indexmap 2.14.0",
@@ -667,6 +669,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
