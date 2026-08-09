@@ -205,6 +205,49 @@ try {
     false,
     'a collapsed changelist renders no file rows',
   )
+  /*
+   * The rollup a review caught: a group's descendant-file set has to come out of the
+   * payload, not out of the rows already emitted. Every assertion above expands everything,
+   * which is exactly the shape in which the rows-derived version looked right.
+   */
+  const changesCollapsed = rowsCollapsed.find((r) => r.label === 'Changes')
+  eq(
+    changesCollapsed.files.length,
+    3,
+    'a collapsed changelist still owns its files, or its own checkbox reads unchecked over '
+      + 'ticked files and a click on it does nothing',
+  )
+  eq(
+    m.checkState(changesCollapsed, defaults, () => false),
+    'checked',
+    'and its tri-state is computed over them',
+  )
+
+  // `Changes` open, the submodule inside it shut: the case where reading the emitted rows
+  // back would drop the submodule's file and draw a full tick over an untouched submodule.
+  const subShut = new Set([...openAll(one)].filter((id) => !id.includes('sub')))
+  const changesSubShut = m.buildRows(one, subShut).find((r) => r.label === 'Changes')
+  eq(changesSubShut.files.length, 3, "a collapsed submodule's files still roll up into its changelist")
+  const ownOnly = new Set([m.fileRowId('/w/app', 'a.rs'), m.fileRowId('/w/app', 'src/b.rs')])
+  eq(
+    m.checkState(changesSubShut, ownOnly, () => false),
+    'partial',
+    'a changelist whose submodule is unticked is partial, not checked — the group must not '
+      + 'claim a full tick over a submodule nobody looked at',
+  )
+  eq(
+    m.toggleRow(changesSubShut, new Set()).size,
+    3,
+    'and ticking it reaches inside the collapsed submodule',
+  )
+
+  // The repo row has the same rule, and it is the row most likely to be expanded over
+  // collapsed children.
+  const reposOpenGroupsShut = new Set([m.repoRowId('/w/app'), m.repoRowId('/w/lib')])
+  const repoRow = m.buildRows(two, reposOpenGroupsShut).find((r) => r.kind === 'repo')
+  eq(repoRow.files.length, 5, 'an expanded repo whose changelists are shut still owns every file')
+  eq(repoRow.count, 5, 'and still counts them')
+
   const units = m.commitUnits(one, defaults)
   eq(units.length, 1, 'one repo, one commit')
   eq(

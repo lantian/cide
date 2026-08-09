@@ -92,8 +92,6 @@ export function buildRows(tree: ChangesTree, expanded: ReadonlySet<string>): Row
   for (const repo of tree.repos) {
     if (multi) {
       const id = repoRowId(repo.root)
-      // Pushed before its children exist, then patched below: the repo's descendant file
-      // set is the union of its groups', which is only known after they have been walked.
       const row: Row = {
         id,
         kind: 'repo',
@@ -101,20 +99,16 @@ export function buildRows(tree: ChangesTree, expanded: ReadonlySet<string>): Row
         label: repo.label,
         repo: repo.root,
         expandable: true,
-        files: [],
+        // Read out of the payload, never back off the rows just emitted. A collapsed group
+        // emits no file rows at all, so a rows-derived set would leave an expanded repo
+        // whose changelists are shut owning nothing: an unchecked-looking box over ticked
+        // files, and a click on it that silently does nothing.
+        files: allFileIds(repo),
+        count: countFiles(repo.groups),
       }
       rows.push(row)
-      if (!expanded.has(id)) {
-        // A collapsed repo still owns its files — the header's checkbox must show their
-        // state, and ticking it must reach them, even though no row for them exists.
-        row.files = allFileIds(repo)
-        row.count = row.files.length
-        continue
-      }
-      const start = rows.length
+      if (!expanded.has(id)) continue
       for (const group of repo.groups) walkGroup(rows, repo.root, group, [group.id], 1, expanded)
-      row.files = rows.slice(start).flatMap((r) => (r.kind === 'file' ? [r.id] : []))
-      row.count = countFiles(repo.groups)
     } else {
       for (const group of repo.groups) walkGroup(rows, repo.root, group, [group.id], 0, expanded)
     }
@@ -140,16 +134,16 @@ function walkGroup(
     expandable: true,
     count: countGroup(group),
     ...(group.active === true ? { active: true } : {}),
-    files: [],
+    // Same rule as the repo row: from the payload, not from the rows below. A changelist
+    // holding a *collapsed* submodule emits no rows for that submodule's files, and a
+    // rows-derived set would draw the changelist as a full `✓` while the submodule inside
+    // it is untouched — the group claiming to contain more than the commit will.
+    files: groupFileIds(root, group),
   }
   rows.push(row)
 
-  if (!expanded.has(id)) {
-    row.files = groupFileIds(root, group)
-    return
-  }
+  if (!expanded.has(id)) return
 
-  const start = rows.length
   // Submodules before files: a submodule's changes are a group, and burying it under a
   // long file list is how a submodule pointer gets committed without being read.
   for (const child of group.groups ?? []) {
@@ -170,7 +164,6 @@ function walkGroup(
       files: [fileRowId(root, file.path)],
     })
   }
-  row.files = rows.slice(start).flatMap((r) => (r.kind === 'file' ? [r.id] : []))
 }
 
 function groupFileIds(root: string, group: ChangeGroup): string[] {

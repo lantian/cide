@@ -9,8 +9,10 @@
  * {view === 'git' && <GitPanel project={activeProjectId} />}
  * ```
  *
- * The model and the fixtures are exported too, for the check script under `ui/scripts` and
- * for anyone wiring the stories into a layout audit later.
+ * The hook, the story selector and the wire types come with it, for anyone wiring the
+ * stories into a layout audit later. `model.ts` deliberately does *not*: it is imported by
+ * file path from `ui/scripts/check-git-tree.mjs`, which compiles that one module with tsc
+ * and imports the output, so routing it through a barrel would only drag React in.
  */
 export { GitPanel, type GitPanelProps } from './GitPanel'
 export { useGitPanel, type GitPanelActions, type GitPanelModel } from './useGitPanel'

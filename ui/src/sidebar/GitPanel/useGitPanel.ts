@@ -118,25 +118,44 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
   const picked = useMemo(() => selectedFiles(tree, selected), [tree, selected])
 
   /**
+   * Which operation the line under the toolbar is currently about.
+   *
+   * Only that operation may clear it. Every write path ends in `await refresh()`, so a
+   * blanket "any success clears the line" would wipe *why the commit failed* a few
+   * milliseconds after showing it — the one message in this panel worth reading, replaced
+   * by nothing at all because the status read that followed it went fine.
+   */
+  const shownFor = useRef<string | null>(null)
+
+  const note = useCallback((what: string, line: string | null) => {
+    if (line === null && shownFor.current !== what) return
+    shownFor.current = line === null ? null : what
+    setUnavailable(line)
+  }, [])
+
+  /**
    * Run a git call, or record why it could not run.
    *
    * Returns `undefined` on failure so callers branch on a value rather than on a `catch`.
    * That keeps every call site one line and makes an unguarded one visible in review.
    */
-  const guarded = useCallback(async <T,>(what: string, call: () => Promise<T>) => {
-    try {
-      const value = await call()
-      setUnavailable(null)
-      return value
-    } catch (e) {
-      const detail = e instanceof Error ? e.message : String(e)
-      setUnavailable(`${what} unavailable — ${detail}`)
-      // Also to the app's stderr: the panel shows one line, and the reason a command is
-      // missing is usually longer than one line.
-      void diag.log(`git panel: ${what} failed: ${detail}`)
-      return undefined
-    }
-  }, [])
+  const guarded = useCallback(
+    async <T,>(what: string, call: () => Promise<T>) => {
+      try {
+        const value = await call()
+        note(what, null)
+        return value
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e)
+        note(what, `${what} unavailable — ${detail}`)
+        // Also to the app's stderr: the panel shows one line, and the reason a command is
+        // missing is usually longer than one line.
+        void diag.log(`git panel: ${what} failed: ${detail}`)
+        return undefined
+      }
+    },
+    [note],
+  )
 
   /**
    * Adopt a new payload without losing what the user was doing.
@@ -169,10 +188,20 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     setTree(next)
     // A repo that stopped diverging drops its answer, so the next real divergence raises
     // the bar again instead of being suppressed by an answer to an older one.
+    const stillDiverged = new Set(
+      next.repos.flatMap((r) => (r.indexDiverged === true ? [r.root] : [])),
+    )
+    // …and it drops its *waiver* with it. `overwritten` used to be cleared only by a
+    // successful commit, so "Overwrite" answered at 10:00 and never committed was still
+    // armed at 14:00 — by which time the bar had come and gone. The next real `git add` in
+    // a bash pane would then raise a fresh bar the user had not answered, and a commit sent
+    // `expectIndex: null` anyway and clobbered it. That is the exact silent clobber this
+    // guard exists to prevent, so the waiver dies with the divergence it answered.
+    for (const root of overwritten.current) {
+      if (!stillDiverged.has(root)) overwritten.current.delete(root)
+    }
     setAnswered((prev) => {
-      const still = new Set(
-        next.repos.flatMap((r) => (r.indexDiverged === true && prev.has(r.root) ? [r.root] : [])),
-      )
+      const still = new Set([...prev].filter((root) => stillDiverged.has(root)))
       return still.size === prev.size ? prev : still
     })
   }, [])
@@ -211,14 +240,23 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
 
   useEffect(() => {
     if (story) return
+    // `gone` rather than just holding the unlisten in a variable: `listen` resolves a tick
+    // or two after the effect runs, so a panel unmounted in between (the sidebar switching
+    // back to Files) would never see the handle and would leave a listener firing
+    // `git_status` on every tool event for the rest of the session, one more per remount.
+    let gone = false
     let unlisten: (() => void) | null = null
     void events
       .onSessionTool(() => schedule())
       .then((fn) => {
-        unlisten = fn
+        if (gone) fn()
+        else unlisten = fn
       })
       .catch((e) => diag.log(`git panel: tool events unavailable: ${String(e)}`))
-    return () => unlisten?.()
+    return () => {
+      gone = true
+      unlisten?.()
+    }
   }, [schedule, story])
 
   const toggleCheck = useCallback((row: Row) => setSelected((prev) => toggleRow(row, prev)), [])
@@ -256,6 +294,13 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
   /** The ticks, split by repo, with the changelist named when they all came from one. */
   const units = useMemo(() => commitUnits(tree, selected), [tree, selected])
 
+  /** Repos whose index moved under us and whose bar has not been answered yet. */
+  const diverged = useMemo(
+    () =>
+      tree.repos.flatMap((r) => (r.indexDiverged === true && !answered.has(r.root) ? [r.root] : [])),
+    [tree, answered],
+  )
+
   const commit = useCallback(
     (push: boolean) => {
       if (project === null || units.length === 0) return
@@ -264,7 +309,27 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
         let allOk = true
         for (const unit of units) {
           const repo = tree.repos.find((r) => r.root === unit.repo)
-          // `null` waives the index check — the user chose "overwrite" on the guard bar.
+          /*
+           * An unanswered guard bar stops the commit here rather than at the backend.
+           *
+           * `expectIndex: null` means "waive the check and overwrite", and it is *also*
+           * what an absent `indexToken` produces — so a backend that forgets to populate
+           * the token would turn the guard off for every commit rather than for the one
+           * the user waived. Refusing locally makes the outcome the same whether or not
+           * the token is there: while the bar is up and unanswered, no commit is sent.
+           */
+          if (diverged.includes(unit.repo)) {
+            const label = repo?.label ?? unit.repo
+            note(
+              'git commit',
+              `git commit refused — ${label}'s index changed outside cide; `
+                + 'answer Reload or Overwrite first',
+            )
+            allOk = false
+            break
+          }
+          // `null` waives the index check. Only reached when the user chose "Overwrite" on
+          // the bar, or when this repo never diverged in the first place.
           const expect = overwritten.current.has(unit.repo) ? null : (repo?.indexToken ?? null)
           const oid = await guarded('git commit', () =>
             gitApi.commit(project, unit.repo, message, amend, unit.changelist, unit.paths, expect),
@@ -292,7 +357,7 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
         await refresh()
       })()
     },
-    [project, units, tree, message, amend, guarded, refresh],
+    [project, units, tree, diverged, message, amend, guarded, note, refresh],
   )
 
   const unstage = useCallback(() => {
@@ -347,10 +412,6 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
       )
     },
     [project, guarded, stagingArea],
-  )
-
-  const diverged = tree.repos.flatMap((r) =>
-    r.indexDiverged === true && !answered.has(r.root) ? [r.root] : [],
   )
 
   return {
