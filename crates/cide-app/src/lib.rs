@@ -181,6 +181,7 @@ pub fn run() {
             cmd::diag::diag_bench_report,
             cmd::diag::diag_log,
             cmd::git::git_status,
+            cmd::git::git_tree_status,
             cmd::git::git_branch_info,
             cmd::git::git_diff_file,
             cmd::git::git_resolve_selection,

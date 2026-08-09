@@ -64,6 +64,7 @@ pub mod sidecar;
 pub mod stage;
 pub mod stash;
 pub mod status;
+pub mod tree_status;
 
 use cide_ipc::git::GitError;
 

@@ -663,6 +663,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "cide-core",
+ "cide-fs",
  "cide-ipc",
  "git2",
  "indexmap 2.14.0",

@@ -50,6 +50,7 @@
   "git_stash_pop",
   "git_stash_save",
   "git_status",
+  "git_tree_status",
   "git_unshelve",
   "git_unstage",
   "graphics_status",

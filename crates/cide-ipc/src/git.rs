@@ -148,6 +148,78 @@ pub struct ChangesTree {
     pub repos: Vec<RepoChanges>,
 }
 
+// --- the file tree's status column --------------------------------------------------------
+
+/// The status the file tree draws in its one-letter tag column.
+///
+/// Deliberately *not* [`FileState`]. The commit panel needs both sides of the index because a
+/// tri-state checkbox is a function of the pair; the file tree has one 9px column and has to
+/// answer "what happened to this path" with a single letter. Two types rather than one lossy
+/// shared one, because collapsing the pair is exactly the bug `ChangeEntry` exists to avoid
+/// and re-deriving that collapse in TypeScript would put the rule somewhere it cannot be
+/// tested against a real repository.
+///
+/// The variants are the mock's — `M` blue, `A` green, `D` faint and struck through — plus
+/// the two the tree can hold that the mock does not draw. Every one of them is reachable;
+/// see `cide_git::tree_status` for what produces each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TreeStatus {
+    /// Tracked and unchanged. Never travels in a [`TreeStatusMap`] — absence means this, and
+    /// a 100k-file repository would otherwise ship 100k entries saying nothing.
+    Clean,
+    /// Changed against HEAD, or conflicted. Also what a directory gets when something under
+    /// it changed.
+    Modified,
+    /// New in the index.
+    Added,
+    /// Deleted on one side while the path is still on disk — `git rm --cached`. A path
+    /// deleted from the working tree has no row to tag, so this is the case that makes the
+    /// mock's `D` reachable at all.
+    Deleted,
+    /// Present on disk, unknown to git.
+    Untracked,
+    /// Ignored by git but still walked by `cide-fs`. Reachable because the walk deliberately
+    /// does not consult `.gitignore` files *above* a project root (see `cide_fs::filter`),
+    /// so a root opened inside an ignored directory shows rows git considers ignored.
+    Ignored,
+}
+
+/// Per-path git status for the file tree, keyed by the same absolute path a [`TreeRow`]
+/// carries.
+///
+/// [`TreeRow`]: crate::TreeRow
+///
+/// # Why absolute paths and not repo-relative ones
+///
+/// Every other path on this wire is repo-relative, because that is how git stores them. This
+/// one is not, and the reason is that its only consumer is the file tree, whose rows are
+/// keyed by absolute path. Doing the rebasing in Rust — where the project's roots, the work
+/// trees above them and the submodules below them are all known — keeps the frontend's lookup
+/// a plain map hit. The alternative puts prefix arithmetic over three coordinate systems into
+/// TypeScript, where it cannot be tested against a real repository and would silently produce
+/// an untagged tree the first time a root was a symlink.
+///
+/// # Size
+///
+/// Bounded by the number of *changed* paths plus their ancestor directories, not by the size
+/// of the repository: a 100k-file checkout with four edits ships a handful of entries. The
+/// pathological case — a whole-tree `sed -i` — is capped, and [`Self::truncated`] says so
+/// rather than letting the tail read as clean.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TreeStatusMap {
+    /// Absolute path → status. Paths absent from the map are [`TreeStatus::Clean`], except
+    /// under a directory that is itself `untracked` or `ignored`, whose descendants inherit
+    /// it — see `ui/src/sidebar/treeStatus.ts`.
+    pub statuses: std::collections::BTreeMap<String, TreeStatus>,
+    /// The cap was hit and the map is a prefix in path order. The entries present are still
+    /// correct; paths after the cut are simply untagged.
+    pub truncated: bool,
+}
+
 // --- diffs ------------------------------------------------------------------------------
 
 /// Which pair of trees a diff compares.

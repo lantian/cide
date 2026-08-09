@@ -20,10 +20,12 @@
 
 use std::path::PathBuf;
 
-use cide_git::{changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status};
+use cide_git::{
+    changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status, tree_status,
+};
 use cide_ipc::git::{
     BranchInfo, ChangesTree, CommitOutcome, CommitRequest, DiffSide, FileDiff, GitError,
-    PathSelection, PushOutcome, ShelfEntry, StashEntry,
+    PathSelection, PushOutcome, ShelfEntry, StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId};
 use tauri::State;
@@ -78,6 +80,26 @@ pub fn git_status(
     include_ignored: bool,
 ) -> Result<ChangesTree> {
     tree(&state, project, include_ignored)
+}
+
+/// Per-path status for the file tree, keyed by absolute path.
+///
+/// Separate from `fs_tree_rows` on purpose, and the separation is the requirement: the tree's
+/// first paint must not wait on git. A repository with a slow `git status` shows an untagged
+/// tree and then tags, never an empty pane — which is only possible while the rows and the
+/// tags are two independent round trips.
+///
+/// There is no `paths` argument. The map is bounded by the number of *changed* paths rather
+/// than by the size of the repository, so windowing the question would cost a round trip per
+/// scroll tick and save nothing underneath; see `cide_git::tree_status` for the full
+/// comparison. The frontend re-reads this on `cide://git-status` and on a `cide://fs-changed`
+/// that touched a git file, not on scroll and not on a timer.
+#[tauri::command(rename_all = "camelCase")]
+pub fn git_tree_status(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<TreeStatusMap> {
+    Ok(tree_status::tree_status(&roots(&state, project)?))
 }
 
 #[tauri::command(rename_all = "camelCase")]

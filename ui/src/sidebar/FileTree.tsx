@@ -10,32 +10,19 @@
  * so a second root is simply another top-level row in the same flattened list — which is
  * also why the indentation is computed from `row.depth` rather than from any nesting the
  * renderer tracks itself.
+ *
+ * The status tags come from a **second, independent** source: `gitStatusStore`, over
+ * `git_tree_status`. A row's status is not a field on `TreeRow` — `cide-fs` walks the
+ * filesystem and knows nothing about git — and keeping the two fetches apart is what lets the
+ * tree paint before git has answered. A repository with a slow `git status` shows an untagged
+ * tree that gains tags, never an empty pane.
  */
 import { useEffect, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useFileTree } from './treeStore'
-import { isDegraded, type TreeRow } from '@/ipc/client'
-
-/**
- * The status letter a row carries in the mock: `M` blue, `A` green, `D` faint struck through.
- *
- * Declared here rather than imported because **nothing supplies it yet**. `TreeRow` comes
- * from `cide-fs`, which indexes the filesystem and knows nothing about git; per-path status
- * is `cide-git`'s. Joining them is integration work that neither milestone owned, so every
- * row currently renders `clean` and the tag column stays empty. The styling below is kept
- * intact so that wiring the join is a one-line change at `statusOf` rather than a redesign.
- */
-export type TreeStatus = 'clean' | 'modified' | 'added' | 'deleted' | 'untracked' | 'ignored'
-
-/**
- * Always `clean` until the git join lands. See `TreeStatus`.
- *
- * A function rather than a constant so the call site reads as a lookup that will one day
- * consult something, and so the one place to change is obvious.
- */
-function statusOf(_row: TreeRow): TreeStatus {
-  return 'clean'
-}
+import { useGitStatus } from './gitStatusStore'
+import { letterFor, statusAt } from './treeStatus'
+import { isDegraded, type TreeRow, type TreeStatus, type TreeStatusMap } from '@/ipc/client'
 import styles from './FileTree.module.css'
 
 /** 21px rows, from the mock. */
@@ -48,31 +35,32 @@ const PENDING_COMMANDS = ['fs_tree_count', 'fs_tree_rows', 'fs_expand', 'fs_coll
 const INDENT = 12
 
 /**
- * The status letter and the class that colours it.
+ * Which colour class a status paints the name and the letter with.
  *
- * `untracked` and `ignored` are beyond the mock, which draws neither — the plan lists only
- * M, A, D and clean. They are given the quietest treatment that is still distinguishable
- * (dim, and faint) and no letter, rather than being invented into the tag column: a `?` the
- * mock does not have would be a decision made here rather than transcribed.
+ * The *letter* is not here — `letterFor()` in `treeStatus.ts` owns that, because whether a row
+ * gets one depends on its kind as well as its status, and that rule is worth testing under
+ * node rather than asserting about in a screenshot.
+ *
+ * `deleted` is the one entry with two different classes. The name is struck through, from the
+ * mock; the letter is not, because a one-glyph `D` with a rule through it at 10.5px is
+ * unreadable.
  */
 interface StatusStyle {
-  /** The letter in the right-aligned tag column. Empty for a row that has none. */
-  letter: string
   /** Applied to the filename. Carries the line-through for a deleted path. */
   nameClass: string | undefined
-  /** Applied to the letter. Never struck through — a struck-out `D` is unreadable. */
+  /** Applied to the letter. */
   letterClass: string | undefined
 }
 
-const CLEAN: StatusStyle = { letter: '', nameClass: undefined, letterClass: undefined }
+const CLEAN: StatusStyle = { nameClass: undefined, letterClass: undefined }
 
 const STATUS: Readonly<Record<TreeStatus, StatusStyle>> = {
   clean: CLEAN,
-  modified: { letter: 'M', nameClass: styles.statusModified, letterClass: styles.statusModified },
-  added: { letter: 'A', nameClass: styles.statusAdded, letterClass: styles.statusAdded },
-  deleted: { letter: 'D', nameClass: styles.statusDeleted, letterClass: styles.tagDeleted },
-  untracked: { letter: '', nameClass: styles.statusUntracked, letterClass: undefined },
-  ignored: { letter: '', nameClass: styles.statusIgnored, letterClass: undefined },
+  modified: { nameClass: styles.statusModified, letterClass: styles.statusModified },
+  added: { nameClass: styles.statusAdded, letterClass: styles.statusAdded },
+  deleted: { nameClass: styles.statusDeleted, letterClass: styles.tagDeleted },
+  untracked: { nameClass: styles.statusUntracked, letterClass: undefined },
+  ignored: { nameClass: styles.statusIgnored, letterClass: undefined },
 }
 
 export interface FileTreeProps {
@@ -85,6 +73,16 @@ export function FileTree({ onOpen }: FileTreeProps) {
   const chunks = useFileTree((s) => s.chunks)
   const degraded = useFileTree((s) => s.degraded)
   const revealTo = useFileTree((s) => s.revealTo)
+  /*
+   * Subscribed at the panel and threaded down rather than read inside `Row`. Two reasons:
+   * the rows are not memoized, so a per-row subscription would be one zustand listener per
+   * visible row torn down and rebuilt on every scroll tick; and the map arriving has to
+   * repaint the rows already on screen, which only a re-render of this component does.
+   *
+   * Note what is *not* here: any wait. `count` and `chunks` come from `treeStore` and paint
+   * on their own schedule, so a slow `git status` costs late tags and never a late tree.
+   */
+  const statuses = useGitStatus((s) => s.status.statuses)
   const [selected, setSelected] = useState<string | null>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -149,6 +147,7 @@ export function FileTree({ onOpen }: FileTreeProps) {
             <Row
               key={row.path}
               row={row}
+              statuses={statuses}
               top={item.start}
               height={item.size}
               selected={row.path === selected}
@@ -164,6 +163,7 @@ export function FileTree({ onOpen }: FileTreeProps) {
 
 interface RowProps {
   row: TreeRow
+  statuses: TreeStatusMap['statuses']
   top: number
   height: number
   selected: boolean
@@ -171,16 +171,19 @@ interface RowProps {
   onOpen: ((path: string) => void) | undefined
 }
 
-function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
+function Row({ row, statuses, top, height, selected, onSelect, onOpen }: RowProps) {
+  const isDir = row.kind === 'dir'
+  const tone = statusAt(statuses, row.path)
+  const letter = letterFor(tone, isDir)
   /*
-   * `?? CLEAN` even though the type says the lookup is total. `TreeStatus` is this side's
-   * guess at a DTO `cide-ipc` has not declared yet, so the compiler is checking the guess and
-   * not the wire: a Rust variant this table does not name (`renamed`, `conflicted`) arrives as
-   * a plain string, and `status.letter` on `undefined` throws *inside a render*, which unmounts
-   * the whole tree rather than mis-drawing one row.
+   * `?? CLEAN` even though `TreeStatus` says the lookup is total. The compiler is checking a
+   * generated type against a value that arrived over IPC, not the value itself: a Rust variant
+   * added to the enum without regenerating — or an older backend against a newer webview —
+   * lands here as a plain string, and reading `.nameClass` off `undefined` throws *inside a
+   * render*, which unmounts the whole tree rather than mis-drawing one row.
    */
-  const status = STATUS[statusOf(row)] ?? CLEAN
-  const twisty = (row.kind === 'dir') && row.hasChildren ? (row.expanded ? '▾' : '▸') : ''
+  const status = STATUS[tone] ?? CLEAN
+  const twisty = isDir && row.hasChildren ? (row.expanded ? '▾' : '▸') : ''
 
   return (
     <div
@@ -191,7 +194,7 @@ function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
       title={row.path}
       onMouseDown={() => {
         onSelect()
-        if ((row.kind === 'dir')) void useFileTree.getState().toggle(row)
+        if (isDir) void useFileTree.getState().toggle(row)
         else onOpen?.(row.path)
       }}
     >
@@ -206,10 +209,10 @@ function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
        * surfaces agree about what a directory looks like.
        */}
       <span
-        className={(row.kind === 'dir') ? `${styles.glyph} ${styles.glyphDir}` : styles.glyph}
+        className={isDir ? `${styles.glyph} ${styles.glyphDir}` : styles.glyph}
         aria-hidden="true"
       >
-        {(row.kind === 'dir') ? '▤' : '▫'}
+        {isDir ? '▤' : '▫'}
       </span>
       <span
         className={
@@ -222,11 +225,16 @@ function Row({ row, top, height, selected, onSelect, onOpen }: RowProps) {
         className={
           status.letterClass === undefined ? styles.tag : `${styles.tag} ${status.letterClass}`
         }
-        /* The letter is the only signal for a colour-blind user, and it is not text a screen
-           reader should read as part of the filename. */
-        aria-label={status.letter === '' ? undefined : `status ${status.letter}`}
+        /*
+         * Labelled from the *status*, not from the letter. Colour is the only signal a
+         * directory rollup, an untracked file and an ignored file have — none of them draws a
+         * letter — so keying the label off the glyph would leave exactly the rows with no
+         * visual text as the rows with no accessible text either. It stays on this span rather
+         * than the name so a screen reader does not read it as part of the filename.
+         */
+        aria-label={tone === 'clean' ? undefined : `git status ${tone}`}
       >
-        {status.letter}
+        {letter}
       </span>
     </div>
   )

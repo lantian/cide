@@ -56,6 +56,7 @@ import type {
   RepoId,
   ShelfEntry,
   StashEntry,
+  TreeStatusMap,
 } from './generated'
 
 export type * from './generated'
@@ -591,6 +592,23 @@ export const git = {
   /** `includeIgnored` walks ignored files, which on a repo with a big `target/` is slow. */
   status: (project: ProjectId, includeIgnored = false) =>
     invoke<ChangesTree>('git_status', { project, includeIgnored }),
+
+  /**
+   * Per-path status for the **file tree**, keyed by the absolute path a `TreeRow` carries.
+   *
+   * Not `status()` in a different shape: that returns the commit panel's tri-state tree, both
+   * sides of the index per path, repo-relative. This returns one letter per path, already
+   * rebased onto the project's roots and already rolled up into the directories above each
+   * change.
+   *
+   * There is no `paths` argument and it is not called per scroll. The map is bounded by the
+   * number of *changed* paths rather than by the size of the repository, so it is read once
+   * per invalidation — `git.onGitStatus` and `events.onFsChanged` — and looked up locally.
+   * Every project it is asked about is answered: a root with no repository above it simply
+   * has an empty map.
+   */
+  treeStatus: (project: ProjectId) =>
+    invoke<TreeStatusMap>('git_tree_status', { project }),
 
   branchInfo: (project: ProjectId, repo: RepoId) =>
     invoke<BranchInfo>('git_branch_info', { project, repo }),
