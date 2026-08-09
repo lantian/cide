@@ -125,3 +125,67 @@ impl From<serde_json::Error> for CoreError {
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cide_ipc::{ProjectId, TabId};
+    use std::path::PathBuf;
+
+    /// Pin the bytes `ui/src/ipc/client.ts`'s `unsavedChanges()` reads.
+    ///
+    /// That function narrows `{ kind, detail }` by hand, because `generated.ts` is built
+    /// from `cide-ipc` and `CoreError` lives here — there is no generated type for it to
+    /// check against. So nothing else in the tree would notice this enum's serde attributes
+    /// changing, and the way it fails is the bad way: `unsavedChanges()` answers `null`, the
+    /// store re-throws instead of confirming, and the close guard is a `×` that reports an
+    /// error nobody reads.
+    ///
+    /// Asserted as JSON rather than by round-tripping through `Deserialize`, which would
+    /// agree with itself whatever the tags were.
+    #[test]
+    fn the_unsaved_refusal_keeps_the_wire_shape_the_frontend_reads() {
+        let tab = TabId::new();
+        let project = ProjectId::new();
+        let error = CoreError::UnsavedChanges {
+            tabs: vec![cide_ipc::UnsavedTab {
+                tab,
+                project,
+                project_name: "cide".into(),
+                path: PathBuf::from("/home/dev/work/cide/src/main.rs"),
+                title: "main.rs".into(),
+            }],
+        };
+
+        let value = serde_json::to_value(&error).expect("serialises");
+        assert_eq!(
+            value["kind"], "unsavedChanges",
+            "the tag the frontend matches"
+        );
+        let row = &value["detail"]["tabs"][0];
+        assert_eq!(row["tab"], tab.to_string());
+        assert_eq!(row["project"], project.to_string());
+        // From `UnsavedTab`'s own `rename_all`, not from this enum's `rename_all_fields` —
+        // that one covers the *variant's* fields (`tabs`), which happen to be single words
+        // today. Both are asserted here because the frontend cannot tell them apart: it
+        // reads one object, and either attribute going missing empties the dialog's rows.
+        assert_eq!(row["projectName"], "cide");
+        assert!(row.get("project_name").is_none(), "no snake_case leak");
+        assert!(
+            value["detail"]["tabs"].is_array(),
+            "the variant field keeps its name"
+        );
+        assert_eq!(row["path"], "/home/dev/work/cide/src/main.rs");
+        assert_eq!(row["title"], "main.rs");
+    }
+
+    /// A unit variant carries no `detail`, which is what makes the `kind` check above
+    /// sufficient on its own — a caller that reads `detail` unconditionally would break on
+    /// every other refusal `tab_close` can answer with.
+    #[test]
+    fn a_unit_refusal_carries_only_its_tag() {
+        let value = serde_json::to_value(CoreError::TabPinned).expect("serialises");
+        assert_eq!(value["kind"], "tabPinned");
+        assert!(value.get("detail").is_none());
+    }
+}
