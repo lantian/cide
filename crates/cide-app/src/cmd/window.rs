@@ -228,10 +228,43 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
     let Some(state) = app.try_state::<WorkspaceState>() else {
         return false;
     };
-    if !matches!(
-        state.snapshot().windows.get(label),
-        Some(WindowRole::DetachedPane { .. })
-    ) {
+    let snapshot = state.snapshot();
+    let role = snapshot.windows.get(label).cloned();
+
+    // A shell window holding unsaved edits.
+    //
+    // This is the one close path with no command behind it: Alt+F4 and the compositor's own
+    // button are delivered straight to the event loop, so there is no `Err` for the frontend
+    // to catch and no `force` for it to pass. Without this, every other guard in the project
+    // is bypassed by the most ordinary gesture there is for closing a window.
+    //
+    // Refusing here and telling the frontend is the whole mechanism: it raises the same
+    // `CloseConfirm` the command paths raise, and discarding re-issues `window_close` with
+    // `force: true`, which does have a command behind it.
+    //
+    // **The accepted risk, stated because it is real.** A veto whose answer never arrives is
+    // a window that cannot be closed: if the webview is wedged, the dialog never paints and
+    // Alt+F4 stops working. The escape is to signal the process, which runs the same shutdown
+    // ladder as a clean quit and flushes the workspace.
+    //
+    // That is the deliberate direction. An unclosable window is recoverable in one command;
+    // a discarded buffer is not recoverable at all, and this project has chosen the
+    // recoverable failure every other time the question has come up — a cancelled diff
+    // rejects rather than accepts, a dismissed diff tab rejects rather than writes. A
+    // heuristic escape ("honour a second Alt+F4") was considered and rejected: pressing twice
+    // is something people do out of habit, so it would discard buffers on a reflex.
+    if let Some(WindowRole::Shell { projects, .. }) = &role {
+        let unsaved: Vec<_> = projects
+            .iter()
+            .flat_map(|p| workspace::unsaved_tabs(&snapshot, Some(*p)))
+            .collect();
+        if !unsaved.is_empty() {
+            crate::emit::close_blocked(app, label, unsaved);
+            return true;
+        }
+    }
+
+    if !matches!(role, Some(WindowRole::DetachedPane { .. })) {
         return false;
     }
 

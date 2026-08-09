@@ -1,4 +1,5 @@
 [
+  "cide://close-blocked",
   "cide://fs-changed",
   "cide://fs-status",
   "cide://git-status",

@@ -588,6 +588,18 @@ export const events = {
     ),
 
   /**
+   * A window-manager close was refused because it would discard unsaved work.
+   *
+   * The only refusal that arrives as an event rather than an `Err`: Alt+F4 and the
+   * compositor's own close button never reach a command, so there is no call whose
+   * rejection the caller could catch.
+   */
+  onCloseBlocked: (handler: (window: string, unsaved: UnsavedTab[]) => void) =>
+    listen<{ window: string; unsaved: UnsavedTab[] }>('cide://close-blocked', (e) =>
+      handler(e.payload.window, e.payload.unsaved),
+    ),
+
+  /**
    * A tool touched files.
    *
    * The fast path for reloading an open buffer — it arrives sooner than the watcher and

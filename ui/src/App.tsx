@@ -33,7 +33,7 @@ import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
-import { useCloseConfirm } from '@/chrome/closeConfirmStore'
+import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -46,6 +46,7 @@ import {
   app as appApi,
   benchMode,
   file as fileApi,
+  windows as windowApi,
   diag,
   events,
   settings as settingsApi,
@@ -202,6 +203,28 @@ export function App() {
     void events
       .onSessionStatus((session, status) => {
         useSessionStatus.getState().set(session, status as StatusPayload)
+      })
+      .then((fn) => {
+        unlisten = fn
+      })
+    return () => unlisten?.()
+  }, [])
+
+  // A window-manager close the Rust side refused. It raises the same dialog the command
+  // paths raise; discarding re-issues `window_close` with `force: true`, which does have a
+  // command behind it.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    void events
+      .onCloseBlocked((label, unsaved) => {
+        requestCloseConfirm({
+          scope: 'window',
+          unsaved,
+          sessions: [],
+          proceed: async () => {
+            await windowApi.close(label, true)
+          },
+        })
       })
       .then((fn) => {
         unlisten = fn

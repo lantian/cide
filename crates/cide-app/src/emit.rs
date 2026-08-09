@@ -207,3 +207,35 @@ pub fn git_status(
         tracing::debug!(%error, "git-status reached no window");
     }
 }
+
+/// A window-manager close was refused because it would discard unsaved work.
+///
+/// The only path that needs an event rather than an error. Alt+F4 and the compositor's own
+/// close button never reach a command, so there is no call whose `Err` the frontend could
+/// catch — the refusal has to travel the other way. Everything else (`tab_close`,
+/// `project_close`, `window_close`) refuses in its return value, which is stronger: a
+/// command that is never issued cannot lose anything.
+pub const CLOSE_BLOCKED: &str = "cide://close-blocked";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseBlocked {
+    window: cide_ipc::WindowLabel,
+    unsaved: Vec<cide_ipc::UnsavedTab>,
+}
+
+pub fn close_blocked(
+    app: &AppHandle,
+    window: &cide_ipc::WindowLabel,
+    unsaved: Vec<cide_ipc::UnsavedTab>,
+) {
+    let payload = CloseBlocked {
+        window: window.clone(),
+        unsaved,
+    };
+    if let Err(error) = app.emit(CLOSE_BLOCKED, payload) {
+        // If no window is listening the close is about to happen anyway; there is nothing
+        // useful to do and nothing to warn about.
+        tracing::debug!(%error, "close-blocked reached no window");
+    }
+}
