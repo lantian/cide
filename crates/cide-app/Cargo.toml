@@ -1,0 +1,47 @@
+[package]
+name = "cide-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# THE ONLY crate that may depend on `tauri`.
+#
+# Everything here is glue by policy: command handlers that unwrap arguments, call into a
+# domain crate and wrap the result. If a handler grows logic, that logic belongs in
+# cide-core. `cide-headless` linking the same domain crates without tauri is the standing
+# check that this rule is being kept.
+[[bin]]
+name = "cide"
+path = "src/main.rs"
+
+[dependencies]
+cide-core = { workspace = true }
+cide-ipc = { workspace = true }
+cide-pty = { workspace = true }
+
+tauri = { workspace = true }
+tauri-plugin-clipboard-manager = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-log = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+tauri-plugin-os = { workspace = true }
+tauri-plugin-process = { workspace = true }
+tauri-plugin-store = { workspace = true }
+tauri-plugin-window-state = { workspace = true }
+
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Unix-only, and gated so the crate still compiles for a target that has no signals at all.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+signal-hook = { workspace = true }
+
+[build-dependencies]
+tauri-build = { workspace = true }

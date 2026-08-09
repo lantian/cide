@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "detached-window",
+  "description": "Permissions for a window hosting a single detached pane or tab. Narrower than a shell window: it never opens projects, so it needs no dialog or store access.",
+  "windows": ["pane:*", "tab:*"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-title",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-start-resize-dragging",
+    "core:webview:allow-internal-toggle-devtools",
+    "clipboard-manager:default",
+    "os:default",
+    "log:default"
+  ]
+}

@@ -1,0 +1,109 @@
+/*
+ * A `pane:<uuid>` window: a 34px header and a pane that takes everything else.
+ *
+ * The header is the app header's height and colours without its contents. Matching the
+ * height matters beyond looks — the two window kinds sit side by side on the desktop, and a
+ * detached pane whose bar is a few pixels off reads as a different application.
+ */
+.window {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+.header {
+  height: var(--h-header);
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 0 12px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+/* `flex: none` plus a cap: the title clips itself rather than squeezing the redock button,
+   which is the one control this window has. */
+.title {
+  flex: none;
+  max-width: 55%;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filler {
+  flex: 1;
+  align-self: stretch;
+}
+
+.redock {
+  flex: none;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.redock:hover {
+  background: var(--chrome-hi);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* There is no other chrome in this window, so the sole control has to show its focus. Drawn
+   inside the box because the header clips nothing but has no room for an outset ring. */
+.redock:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * One stretched grid cell, the same shape `SplitTree`'s leaf wrapper uses, so the pane fills
+ * the window in both axes without this file dictating how a pane is built. No padding: the
+ * pane occupies the window exactly as a maximized pane occupies a tab.
+ */
+.body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  background: var(--panel-2);
+}
+
+/*
+ * The pane title bar's three actions, withheld.
+ *
+ * Maximize is a flag on a tab's pane tree, detach is what this window already is, and close
+ * addresses a pane through the tab it sits in — a detached pane sits in the project's
+ * `detached` map instead. None of the three can be honoured from here, and a control that
+ * cannot be honoured is worse than an absent one. `display: none` rather than a disabled
+ * look so they leave the tab order and the accessibility tree with them.
+ *
+ * The selector reaches into `PaneTitleBar`'s markup because that component has no prop for
+ * withholding its actions; the attribute it hooks is the stable one the pane audit already
+ * locates the bar with. If that prop is added, delete this rule.
+ */
+.body [data-audit='paneTitle'] button {
+  display: none;
+}
+
+.orphan {
+  margin: 0;
+  padding: 18px 20px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 19px;
+}

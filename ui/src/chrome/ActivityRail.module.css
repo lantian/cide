@@ -1,0 +1,71 @@
+/*
+ * The rail's width reuses --h-rail because the spec asks for that token by name: the mock
+ * calls its 42px module "rail" regardless of axis. The token therefore couples this
+ * horizontal measurement to a name that reads as a height — anyone retuning --h-rail for a
+ * bar's height also resizes this rail's width.
+ */
+.rail {
+  width: var(--h-rail);
+  flex: none;
+  background: var(--chrome);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 2px;
+  color: var(--dim);
+}
+
+.item {
+  width: 28px;
+  height: 28px;
+  /* A column flex item shrinks by default; the spacer's zero basis means a short window
+     would take the whole deficit out of these boxes and break the mock's 28px. */
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  cursor: pointer;
+  /* Anchors the git badge, which the mock positions against the button box. */
+  position: relative;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
+}
+
+.item:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+/* Selected wins over hover, so the accent does not drop back to --text on pointer-over. */
+.itemActive,
+.itemActive:hover {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+/* The glyphs are the only affordance in this rail, so focus has to be visible. Drawn
+   inside the 28px box, matching the header and tab strip, so it cannot widen the rail. */
+.item:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Pushes the trailing items (settings) to the bottom of the rail. */
+.spacer {
+  flex: 1;
+}
+
+.badge {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}

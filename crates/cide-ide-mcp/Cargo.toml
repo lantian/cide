@@ -1,0 +1,28 @@
+[package]
+name = "cide-ide-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cide-ipc = { workspace = true }
+# The lockfile's `authToken` is a bearer credential, so its bytes come from the OS CSPRNG
+# rather than from a uuid. See `lockfile::random_token`.
+getrandom = { workspace = true }
+# For `kill(pid, 0)`: the only way to tell whether a lockfile's owner still exists.
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# The broker's cancel paths are all async; `#[tokio::test]` is what exercises them.
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,0 +1,8 @@
+# `cargo xtask <task>` — the repository's own automation.
+#
+# Without this alias every doc comment, README line and CI step that says
+# `cargo xtask codegen` is wrong: cargo has no built-in `xtask` subcommand, and the crate
+# would have to be invoked as `cargo run -p xtask --`. The alias is the entire mechanism
+# behind the xtask pattern.
+[alias]
+xtask = "run --quiet --package xtask --"

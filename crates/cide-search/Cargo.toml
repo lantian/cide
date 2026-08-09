@@ -1,0 +1,14 @@
+[package]
+name = "cide-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cide-ipc = { workspace = true }
+nucleo = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }

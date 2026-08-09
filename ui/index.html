@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cide</title>
+  </head>
+  <body>
+    <!--
+      One document for every window. The role — shell, detached pane, detached tab — comes
+      from the `?window=<label>` query parameter that `windows.rs` bakes into the URL.
+      There is exactly one webview per OS window; the pane grid is DOM.
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,146 @@
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  position: relative;
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+/* M0 placeholder for the 42px activity rail. */
+.rail {
+  width: var(--h-rail);
+  flex: none;
+  background: var(--chrome);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 2px;
+  color: var(--dim);
+}
+
+.railIcon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.railIconActive {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+.railSpacer {
+  flex: 1;
+}
+
+.content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-2);
+}
+
+.tabstrip {
+  height: var(--h-tabstrip);
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 13px;
+  cursor: pointer;
+  background: var(--panel);
+  border: 0;
+  border-bottom: 2px solid var(--accent);
+  color: var(--text-hi);
+  font-weight: 500;
+  font-size: 12.5px;
+  font-family: inherit;
+}
+
+.tabSwatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  background: var(--accent);
+  display: inline-block;
+}
+
+.pinned {
+  font-size: 9.5px;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  line-height: 13px;
+  letter-spacing: 0.04em;
+}
+
+/* The bench overlay — M0 only. */
+.bench {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  justify-content: center;
+  padding-top: 96px;
+  z-index: 30;
+}
+
+.benchCard {
+  width: 760px;
+  max-height: 70%;
+  overflow: auto;
+  background: var(--chrome);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+  padding: 16px 20px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: pre;
+  user-select: text;
+}
+
+.benchButton {
+  position: absolute;
+  right: 16px;
+  bottom: 38px;
+  z-index: 20;
+  padding: 5px 10px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  cursor: pointer;
+  background: var(--chrome);
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: inherit;
+}
+
+.benchButton:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}

@@ -1,0 +1,124 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cide-ipc",
+    "crates/cide-core",
+    "crates/cide-pty",
+    "crates/cide-claude",
+    "crates/cide-ide-mcp",
+    "crates/cide-git",
+    "crates/cide-fs",
+    "crates/cide-search",
+    "crates/cide-hook",
+    "crates/cide-headless",
+    "crates/cide-app",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lantian/cide"
+
+# Single source of truth for every third-party version. Individual crates say
+# `foo = { workspace = true }` and never pin a version themselves.
+#
+# NOTE: `wry` and `tao` are deliberately absent. Tauri 2.11.5 pins wry ^0.55 / tao ^0.35
+# while crates.io latest is 0.56 / 0.36; because these are 0.x, a direct dependency here
+# would silently fork the graph into two incompatible webview stacks. See docs/adr/0001.
+[workspace.dependencies]
+# --- internal ---
+cide-ipc = { path = "crates/cide-ipc" }
+cide-core = { path = "crates/cide-core" }
+cide-pty = { path = "crates/cide-pty" }
+cide-claude = { path = "crates/cide-claude" }
+cide-ide-mcp = { path = "crates/cide-ide-mcp" }
+cide-git = { path = "crates/cide-git" }
+cide-fs = { path = "crates/cide-fs" }
+cide-search = { path = "crates/cide-search" }
+
+# --- shell (only cide-app may depend on tauri) ---
+tauri = { version = "2.11.5", features = ["protocol-asset"] }
+tauri-build = { version = "2.6.3", features = [] }
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-opener = "2.5.4"
+tauri-plugin-store = "2.4.4"
+tauri-plugin-window-state = "2.4.1"
+tauri-plugin-os = "2.3.2"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-log = "2.9.0"
+
+# --- terminal ---
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
+crossbeam-channel = "0.5.16"
+
+# --- git / fs / search ---
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2", "vendored-openssl"] }
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
+ignore = "0.4.33"
+globset = "0.4.20"
+nucleo = "0.5.0"
+tree-sitter = "0.26.11"
+
+# --- async / mcp ---
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+tokio-tungstenite = "0.30.0"
+# `WebSocketStream`'s `Stream`/`Sink` impls come from here, so driving a socket at all needs
+# the traits named. Already in the graph as tokio-tungstenite's own dependency.
+futures-util = { version = "0.3.33", default-features = false, features = ["std", "sink"] }
+subtle = "2.6.1"
+
+# --- data ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ts-rs = { version = "12.0.1", features = [
+    "serde-compat",
+    "no-serde-warnings",
+    "indexmap-impl",   # project and window order is meaningful — see cide-ipc::Workspace
+    "serde-json-impl", # keybinding `args` are opaque JSON
+    "uuid-impl",
+] }
+indexmap = { version = "2.14.0", features = ["serde"] }
+dashmap = "6"
+parking_lot = "0.12.5"
+smallvec = "1"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+blake3 = "1.8.6"
+rayon = "1.12.0"
+
+# --- process lifecycle ---
+# A GTK main loop makes a signal handler a hostile place to do work: almost nothing is
+# legal inside one, and taking the workspace lock from a handler deadlocks whenever the
+# interrupted thread already held it. signal-hook's handler writes to a self-pipe and
+# nothing else, which is what lets the shutdown path run on an ordinary thread.
+signal-hook = "0.4.4"
+# For `kill(2)`. `PtySession` can only SIGKILL, and the shutdown ladder needs SIGHUP and
+# SIGTERM first so a `claude` gets to finish writing its transcript.
+libc = "0.2.189"
+# Randomness for the IDE lockfile's auth token. Already in the graph transitively via uuid,
+# so naming it directly costs nothing and makes the credential's source explicit.
+getrandom = "0.4.3"
+
+# --- diagnostics ---
+thiserror = "2.0.19"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.dev]
+# The webview + libgit2 + tree-sitter make a fully-unoptimised dev build painful to use.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true

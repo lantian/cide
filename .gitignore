@@ -1,0 +1,31 @@
+# Build output. `target/` alone is 19 GB against 2.3 MB of source.
+/target/
+**/*.rs.bk
+
+# Frontend
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+/ui/*.tsbuildinfo
+
+# Tauri generates these into the app crate at build time.
+/crates/cide-app/gen/
+
+# Editor and tool state that is per-machine, not per-project.
+/.idea/
+/.vscode/
+*.swp
+*~
+
+# Local permission grants and machine-specific settings. `.claude/settings.json`
+# would be shared configuration and is deliberately not ignored; this file is not.
+/.claude/settings.local.json
+
+# Runtime state cide itself writes. None of it belongs in the repo, and
+# workspace.json in particular records absolute paths from one machine.
+/.cide/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

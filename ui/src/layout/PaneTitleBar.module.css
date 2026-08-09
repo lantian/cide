@@ -1,0 +1,99 @@
+/*
+ * The pane frame and its 26px title bar.
+ *
+ * The frame carries a border in *both* focus states and only changes its colour. Boxes are
+ * `border-box`, so toggling between `0` and `1px` would leave the frame where it is and
+ * take two pixels out of its *content* box instead — the pane body would change size on
+ * every focus change, and every terminal in the tab would refit for a click.
+ */
+.frame {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+.frameFocused {
+  border-color: var(--accent-dim);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  /* The pane host inside is `position: absolute; inset: 0` and resolves against this. */
+  position: relative;
+}
+
+.bar {
+  height: var(--h-panetitle);
+  flex: none;
+  display: flex;
+  align-items: center;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.index {
+  flex: none;
+  color: var(--faint);
+}
+
+.title {
+  flex: 1;
+  text-align: center;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.titleFocused {
+  color: var(--text-hi);
+}
+
+/* `flex: none` so a long title clips itself rather than squeezing the action cluster. */
+.actions {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  color: var(--dim);
+  /*
+   * Full bar height rather than the height of an 11.5px glyph. The bar centres its
+   * children, which would leave these buttons about eleven pixels tall and force the user
+   * to hit a target the size of the character; stretching costs nothing visually, since
+   * the buttons paint no background.
+   */
+  align-self: stretch;
+}
+
+.action {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+}
+
+.action:hover {
+  color: var(--text-hi);
+}
+
+.actionOn {
+  color: var(--accent);
+}
+
+.actionDisabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.actionDisabled:hover {
+  color: inherit;
+}

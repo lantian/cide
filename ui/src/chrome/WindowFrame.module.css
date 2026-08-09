@@ -1,0 +1,109 @@
+/*
+ * The window's own perimeter, standing in for the resize borders KDE stops drawing once
+ * the window is built `decorations(false)`.
+ *
+ * Nothing here paints. The grips are transparent hit targets over the top few pixels of
+ * whatever the app renders underneath, so no token is referenced and none should be: a
+ * visible border would be a second frame around the one the design already draws.
+ */
+
+.frame {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  /* The grips are pinned to this box, so it must not be the one that scrolls. */
+  overflow: hidden;
+
+  /*
+   * 4px edges and 12x12 corners are the smallest targets that still land reliably with a
+   * mouse; KDE's own CSD shadow-borders are in the same range. Local rather than in
+   * tokens.css because nothing outside this file has an opinion about them.
+   */
+  --grip-edge: 4px;
+  --grip-corner: 12px;
+}
+
+/*
+ * Children own their own layout. This only lifts the automatic `min-height: auto` that a
+ * flex item carries, so a child holding a scrolling region shrinks to the frame instead of
+ * forcing the whole column taller than the window.
+ */
+.frame > * {
+  min-height: 0;
+}
+
+.grip {
+  position: absolute;
+  background: transparent;
+  /*
+   * Above the app content, and above overlays too: the border being replaced sits outside
+   * the window on a decorated system, where no dialog can ever cover it. A 4px strip that
+   * stops working because a palette is open would be a regression against the frame KDE
+   * used to draw.
+   */
+  z-index: 1000;
+  /* Keep the browser's own pan/zoom gestures off a target the compositor is about to grab. */
+  touch-action: none;
+}
+
+/* Corners must outrank the two edges crossing them, or the diagonal is unreachable. */
+.nw,
+.ne,
+.sw,
+.se {
+  z-index: 1001;
+  width: var(--grip-corner);
+  height: var(--grip-corner);
+}
+
+.n,
+.s {
+  left: 0;
+  right: 0;
+  height: var(--grip-edge);
+  cursor: ns-resize;
+}
+
+.e,
+.w {
+  top: 0;
+  bottom: 0;
+  width: var(--grip-edge);
+  cursor: ew-resize;
+}
+
+.n {
+  top: 0;
+}
+.s {
+  bottom: 0;
+}
+.w {
+  left: 0;
+}
+.e {
+  right: 0;
+}
+
+.nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+.se {
+  bottom: 0;
+  right: 0;
+  cursor: nwse-resize;
+}
+.ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+.sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}

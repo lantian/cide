@@ -1,0 +1,15 @@
+[package]
+name = "cide-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Wire DTOs only. Zero logic, and deliberately no `tauri` dependency — this crate is
+# what `cide-headless` and the codegen xtask consume without linking a webview.
+[dependencies]
+indexmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ts-rs = { workspace = true }
+uuid = { workspace = true }

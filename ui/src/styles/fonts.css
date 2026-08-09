@@ -1,0 +1,34 @@
+/*
+ * Self-hosted typefaces.
+ *
+ * The design mock loads these from Google Fonts. That cannot work here: the app's CSP
+ * names no external host in `font-src`, so a `<link>` to fonts.googleapis.com fails
+ * silently and every surface falls back to the system stack — which looks *almost* right,
+ * and is therefore worse than an obvious break.
+ *
+ * Only the weights the design actually uses are imported. The mock's font request asks for
+ * IBM Plex Sans 450 as well, but nothing in it renders at 450, and each unused weight is
+ * another file in the bundle.
+ *
+ *   IBM Plex Sans  400 body · 500 active tabs and labels · 600 settings headings
+ *   JetBrains Mono 400 code and paths · 500 emphasis · 700 transcript bold
+ *
+ * `@fontsource` ships woff2 alongside a stylesheet with the right `@font-face` blocks and
+ * `font-display: swap`; Vite rewrites the relative `files/` URLs at build time, so the
+ * fonts end up in `dist/assets` and are served over the app protocol like any other asset.
+ *
+ * Each weight brings every Unicode subset — latin, latin-ext, cyrillic, cyrillic-ext,
+ * greek, vietnamese — which is 30 files rather than 6. That is deliberate. Each subset is a
+ * separate `@font-face` with its own `unicode-range`, so a browser downloads only the ones
+ * it actually has to render; the cost is disk in the bundle, not bandwidth or parse time.
+ * Trimming to latin would save a little of the former and silently degrade any pane
+ * showing Cyrillic to the fallback stack.
+ */
+
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';

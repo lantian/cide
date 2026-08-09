@@ -1,0 +1,270 @@
+/*
+ * The native diff pane.
+ *
+ * Two things live here. The first is the pane's own chrome — path header, body, action bar
+ * — and is ordinary CSS Modules. The second is a set of overrides for CodeMirror's own
+ * classes, which are global and therefore reached through `:global()`.
+ *
+ * Those overrides all carry a longer selector than the rule they replace. CodeMirror ships
+ * its defaults through `EditorView.baseTheme`, which injects a stylesheet into the document
+ * head at a position this file cannot rely on, so source order is not a safe tiebreak.
+ * Specificity is. Every base-theme selector overridden below is at most three classes deep
+ * (`&` and `&light`/`&dark` each expand to a single generated class), and the pattern used
+ * here — `.body` plus `.cm-mergeView` plus the original selector — is at least four, so it
+ * wins outright rather than by luck. Adding an override means checking the rule it displaces
+ * still fits that: the two packages do contain deeper selectors, `.cm-selectionLayer` and
+ * the tooltip rules among them, which none of these touch.
+ *
+ * Every colour is a token. The base theme hardcodes `#f3f3f3`, `#222`, `#2a2`, `#d43` and
+ * friends, which are the exact values that would survive a theme switch and make the light
+ * palette unreadable.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.header {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  height: var(--h-panetitle);
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--chrome);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.arrow {
+  flex: none;
+  color: var(--faint);
+}
+
+/* Pushed to the right so a long path clips against it rather than shifting it. */
+.headerNote {
+  flex: none;
+  margin-left: auto;
+  padding-left: 8px;
+  color: var(--faint);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  /* The app root sets `user-select: none` so window chrome does not text-select on drag. */
+  user-select: text;
+}
+
+.actions {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--chrome);
+}
+
+.button {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 10px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--chrome-hi);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.button:hover {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.accept {
+  border-color: var(--accent-dim);
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.accept:hover {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+  color: var(--bg);
+}
+
+.reject {
+  color: var(--red);
+}
+
+.reject:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/*
+ * The oversize path: no editor, so the summary has to carry the whole explanation of why
+ * the user is looking at a sentence instead of a diff.
+ */
+.oversize {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 16px;
+  text-align: center;
+}
+
+.oversizeCount {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-hi);
+}
+
+.oversizeWhy {
+  font-size: 12px;
+  color: var(--dim);
+  max-width: 46ch;
+  line-height: 1.5;
+}
+
+/* ---- CodeMirror overrides ------------------------------------------------------------ */
+
+/*
+ * The merge view is the scroll container. `@codemirror/merge` forces
+ * `height: auto !important` on both editors' scrollers so the two sides can be aligned row
+ * for row; without a bounded, scrollable `.cm-mergeView` the pane grows to the height of
+ * the file and the pane's own layout is destroyed.
+ */
+.body :global(.cm-mergeView) {
+  height: 100%;
+  overflow: auto;
+}
+
+.body :global(.cm-mergeView .cm-editor) {
+  background: var(--panel);
+  color: var(--dim);
+}
+
+.body :global(.cm-mergeView .cm-editor.cm-focused) {
+  /* The default is a dotted near-black outline, invisible on the dark palette. */
+  outline: none;
+}
+
+.body :global(.cm-mergeView .cm-scroller) {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.body :global(.cm-mergeView .cm-content) {
+  caret-color: var(--accent);
+}
+
+.body :global(.cm-mergeView) ::selection {
+  background: var(--sel);
+}
+
+.body :global(.cm-mergeView .cm-gutters) {
+  background: var(--panel-2);
+  color: var(--faint);
+  border-right: 1px solid var(--border-soft);
+}
+
+.body :global(.cm-mergeView .cm-activeLineGutter) {
+  background: transparent;
+}
+
+/* Removed: the original side's changed lines. */
+.body :global(.cm-mergeView .cm-editor.cm-merge-a .cm-changedLine) {
+  background-color: var(--diff-del-bg);
+  color: var(--red);
+}
+
+/* Added: the proposed side's changed lines. */
+.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-changedLine) {
+  background-color: var(--diff-add-bg);
+  color: var(--green);
+}
+
+/*
+ * Within a changed line, the characters that actually differ. A 2px underline rather than a
+ * fill, matching the base theme's shape, so the line background still reads as the row's
+ * add/remove state.
+ */
+.body :global(.cm-mergeView .cm-editor.cm-merge-a .cm-changedText) {
+  background: linear-gradient(var(--red), var(--red)) bottom / 100% 2px no-repeat;
+}
+
+.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-changedText) {
+  background: linear-gradient(var(--green), var(--green)) bottom / 100% 2px no-repeat;
+}
+
+.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-deletedText) {
+  background: var(--diff-del-bg);
+}
+
+/* The 3px change ribbon beside the line numbers. */
+.body :global(.cm-mergeView .cm-editor.cm-merge-a .cm-changedLineGutter) {
+  background: var(--red);
+}
+
+.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-changedLineGutter) {
+  background: var(--green);
+}
+
+.body :global(.cm-mergeView .cm-editor .cm-deletedLineGutter) {
+  background: var(--red);
+}
+
+/* Collapsed runs of unchanged context; clicking one expands it. */
+.body :global(.cm-mergeView .cm-editor .cm-collapsedLines) {
+  color: var(--faint);
+  background: var(--panel-2);
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.body :global(.cm-mergeView .cm-editor .cm-collapsedLines:hover) {
+  color: var(--text);
+}
+
+/* The per-chunk revert column between the two editors. */
+.body :global(.cm-mergeView .cm-merge-revert) {
+  background: var(--chrome);
+  border-left: 1px solid var(--border-soft);
+  border-right: 1px solid var(--border-soft);
+}
+
+.body :global(.cm-mergeView .cm-merge-revert button) {
+  color: var(--faint);
+}
+
+.body :global(.cm-mergeView .cm-merge-revert button:hover) {
+  color: var(--accent);
+}

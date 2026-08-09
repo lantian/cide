@@ -1,0 +1,18 @@
+[package]
+name = "cide-headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The standing proof that the core is frontend-free: it renders a live session from the
+# vt100 mirror to stdout with zero Tauri linked. If this ever stops compiling, domain
+# logic has leaked into the app crate.
+[[bin]]
+name = "cide-headless"
+path = "src/main.rs"
+
+[dependencies]
+cide-core = { workspace = true }
+cide-ipc = { workspace = true }
+cide-pty = { workspace = true }

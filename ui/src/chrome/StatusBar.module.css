@@ -1,0 +1,84 @@
+.bar {
+  height: var(--h-status);
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 12px;
+  background: var(--chrome);
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  /*
+   * A status bar that wraps would eat a second 24px row, and one that overflows visibly
+   * would widen the window past the pane grid. It clips instead.
+   */
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.left,
+.right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/*
+ * The left group absorbs the slack the mock spends on a separate flex:1 spacer — same
+ * pixels, and it keeps the inter-group distance at exactly one 16px gap once the bar is
+ * squeezed, where a spacer plus two gaps would leave 32px. min-width:0 is what allows a
+ * flex item to shrink below its content, so this is the side that gives way; the right
+ * group holds the readouts a user is actually watching.
+ */
+.left {
+  flex: 1 1 auto;
+  min-width: 0;
+  /*
+   * min-width:0 lets this box shrink past its own content, and every slot inside it but
+   * the branch refuses to shrink, so past that point the counts would paint straight over
+   * the right-hand readouts. Clipping at the group edge keeps the overflow invisible.
+   */
+  overflow: hidden;
+}
+
+.right {
+  flex: none;
+}
+
+/* Only the branch may give way; the counts and diagnostics keep their content width. */
+.left > * {
+  flex: none;
+}
+
+.branch {
+  color: var(--purple);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.errors {
+  color: var(--red);
+}
+
+.warnings {
+  color: var(--yellow);
+}
+
+/*
+ * Diagnostics with no language server behind them. Faint rather than dim so the row reads
+ * as absent data at a glance instead of as a count that happens to be low.
+ */
+.unknown {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  color: var(--faint);
+}
+
+.claude {
+  color: var(--accent);
+}

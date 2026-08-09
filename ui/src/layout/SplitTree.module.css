@@ -1,0 +1,84 @@
+/*
+ * The Claude tab's pane tree.
+ *
+ * A split is a nested `display: grid` with an `Nfr var(--w-splitter) Mfr` template, which
+ * is why the splitter is a real grid track rather than an absolutely positioned overlay:
+ * the track *is* the 6px gap, so the panes either side need no compensating margin and
+ * nothing overlaps a terminal's hit area.
+ */
+.tree {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  /* One stretched cell, so the root node fills the tab whether it is a leaf or a split. */
+  display: grid;
+  background: var(--panel-2);
+}
+
+/*
+ * `min-*: 0` on both boxes is load-bearing. A grid item's automatic minimum size is its
+ * content, so a terminal with a long line would push its `fr` track wider than its share
+ * and the ratio would silently stop meaning what it says.
+ */
+.split {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+/*
+ * The wrapper the caller's pane is rendered into. A single-cell grid rather than a block:
+ * the pane stretches to fill it in both axes without this file dictating anything about
+ * how the caller builds a pane.
+ */
+.leaf {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+.splitter {
+  background: var(--border-soft);
+  position: relative;
+  /*
+   * Above the panes, or half of the widened hit area below is dead. A `PaneSlot` is
+   * `position: relative`, so the pane after the divider in DOM order paints over anything
+   * positioned before it at the same level: measured in Chrome, a point 2px right of a
+   * vertical divider hit the terminal, not the splitter. The tab panel sets `z-index: 0`
+   * and is therefore a stacking context, so this cannot escape past the window chrome.
+   */
+  z-index: 1;
+  user-select: none;
+  /* Pointer capture on a touch screen only works if the browser is not busy scrolling. */
+  touch-action: none;
+}
+
+/*
+ * The visual track is 6px because the mock says so, but a 6px pointer target is a poor one.
+ * This widens the hit area to 12px without moving anything: the pseudo-element is out of
+ * flow, so it costs no layout and cannot change a track size.
+ */
+.splitter::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+}
+
+.splitterVertical {
+  cursor: col-resize;
+}
+
+.splitterHorizontal {
+  cursor: row-resize;
+}
+
+.splitter:hover,
+.splitterActive {
+  background: var(--accent-dim);
+}
+
+/* The splitter is in the tab order, so its keyboard focus has to be visible. */
+.splitter:focus-visible {
+  background: var(--accent);
+  outline: none;
+}

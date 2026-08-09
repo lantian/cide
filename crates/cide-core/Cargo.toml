@@ -1,0 +1,21 @@
+[package]
+name = "cide-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The domain. Owns everything durable: the workspace tree, settings, keymap, the command
+# registry and persistence. Deliberately has no `tauri` dependency so `cide-headless` can
+# link it without a webview — that is the standing proof the core is frontend-free.
+[dependencies]
+cide-ipc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+ts-rs = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }

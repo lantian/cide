@@ -1,0 +1,210 @@
+.header {
+  height: var(--h-header);
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Traffic lights. A macOS motif, but the window ships without WM decorations, so there is
+   no system close button to fall back on. */
+.lights {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 0 12px;
+}
+
+.light {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* The only literal colours in the design: the traffic lights read as themselves in both
+   themes, so they are deliberately not tokens. */
+.close {
+  background: #e0655b;
+}
+
+.minimize {
+  background: #dfae68;
+}
+
+.zoom {
+  background: #7fb069;
+}
+
+.tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/*
+ * The tab is a row, not a button: it holds two independent actions (activate, close), and
+ * a button inside a button is invalid markup that browsers reflow into siblings. The
+ * padding and gap the mock states stay on this row, where the layout audit reads them off
+ * the computed style; the two buttons reach back over the padding rather than owning it.
+ */
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 100%;
+  /* Tabs overflow the strip rather than squashing: the container clips, and a shrunk tab
+     would eat its own padding and break the measured widths. */
+  flex: none;
+  padding: 0 14px;
+  border-top: 2px solid transparent;
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.tabActive,
+.tabActive:hover {
+  background: var(--panel);
+  border-top-color: var(--accent);
+  color: var(--text-hi);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+/*
+ * The mock's tab is one box the pointer can hit anywhere, so each button is pulled out over
+ * its side of the row's padding and re-adds it internally. Net geometry is the mock's
+ * 14 | dot | 9 | name | 9 | path | 9 | × | 14, with no dead strip at either end.
+ *
+ * `letter-spacing: inherit` is not redundant: the UA sheet forces `letter-spacing: normal`
+ * on form controls, which would swallow the active tab's .01em before it reached the text.
+ */
+.tabOpen {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 100%;
+  margin-left: -14px;
+  padding: 0 0 0 14px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  cursor: inherit;
+}
+
+.tabClose {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  margin-right: -14px;
+  padding: 0 14px 0 0;
+  background: transparent;
+  border: 0;
+  color: var(--faint);
+  font: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.tabClose:hover {
+  color: var(--text);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 2px;
+}
+
+.path {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  font-weight: 400;
+}
+
+.add {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  flex: none;
+  padding: 0 11px;
+  background: transparent;
+  border: 0;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.add:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+/*
+ * The one element that starts a window drag. `data-tauri-drag-region` does not inherit, so
+ * it sits here rather than on the header, where it would turn every tab and button into a
+ * drag handle instead of a control.
+ */
+.filler {
+  flex: 1;
+  align-self: stretch;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px 0 12px;
+  color: var(--dim);
+}
+
+.action {
+  width: 26px;
+  height: 22px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+/* The mock sets this one glyph a pixel larger than its two neighbours. */
+.actionSplit {
+  font-size: 13px;
+}
+
+/* This chrome has no other affordances, so every control has to show where focus is. The
+   ring is drawn inside the control because the tab strip clips its overflow, and an
+   outset ring on the first or last tab would be cut in half. */
+.header button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}

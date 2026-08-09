@@ -1,0 +1,128 @@
+//! Application-lifecycle commands.
+
+use cide_core::{commands, keymap};
+use cide_ipc::{Bootstrap, Capabilities, WindowLabel, WindowRole};
+use tauri::{AppHandle, State, Window};
+
+use crate::workspace_state::WorkspaceState;
+
+/// Called by the frontend once it has painted its first frame.
+///
+/// Kept even though windows are now created visible: it is the one place that reports the
+/// window's real geometry, and a window that loads its frontend but never gets a layout is
+/// otherwise indistinguishable from a working one until you notice every PTY stuck at its
+/// fallback 80x24.
+#[tauri::command]
+pub fn app_ready(app: AppHandle, window: Window) {
+    crate::windows::reveal(&app, window.label());
+
+    let label = window.label().to_string();
+    match (
+        window.is_visible(),
+        window.outer_size(),
+        window.scale_factor(),
+    ) {
+        (Ok(visible), Ok(size), Ok(scale)) => {
+            eprintln!(
+                "[cide] window {label}: visible={visible} outer={}x{} scale={scale}",
+                size.width, size.height
+            );
+        }
+        _ => eprintln!("[cide] window {label}: geometry unavailable"),
+    }
+}
+
+/// Everything a window needs to paint, in one round trip.
+///
+/// One call rather than four: a window that has to ask separately for its role, the
+/// workspace, the keymap and the command list will render three intermediate states on the
+/// way, and on the slow IPC path that is visible as flicker.
+#[tauri::command]
+pub fn app_get_bootstrap(window: Window, state: State<'_, WorkspaceState>) -> Bootstrap {
+    let workspace = state.snapshot();
+    let label = WindowLabel(window.label().to_string());
+
+    // A window with no stored role is one the user just opened, before any project exists.
+    // That is the empty frame with a `+` in its header, not an error.
+    let role = workspace
+        .windows
+        .get(&label)
+        .cloned()
+        .unwrap_or(WindowRole::Shell {
+            projects: Vec::new(),
+            active: None,
+        });
+
+    Bootstrap {
+        window: label,
+        role,
+        workspace,
+        keymap: keymap::resolve(&[]),
+        commands: commands::registry().to_vec(),
+        capabilities: capabilities(),
+    }
+}
+
+/// Resize the window until its webview viewport is exactly `width` x `height`.
+///
+/// Needed because a window's size and its viewport are not the same number here. GTK draws
+/// client-side decorations with an invisible shadow border around the surface — 26px a side
+/// on this desktop — so asking for a 1440x900 window yields a 1492x952 surface and a
+/// 1388x848 viewport. The inset is a property of the desktop, not something to hard-code,
+/// so the caller reports the viewport it actually got and this corrects by the difference.
+///
+/// Used by the layout audit, whose whole premise is comparing against a mock stated at a
+/// specific size. Measuring 1388x848 and reporting it as 1440x900 would be the kind of
+/// quiet inaccuracy the audit exists to catch elsewhere.
+#[tauri::command(rename_all = "camelCase")]
+pub fn window_set_viewport(
+    window: Window,
+    width: f64,
+    height: f64,
+    current_width: f64,
+    current_height: f64,
+) {
+    let Ok(size) = window.inner_size() else {
+        return;
+    };
+    let Ok(scale) = window.scale_factor() else {
+        return;
+    };
+    let logical = size.to_logical::<f64>(scale);
+
+    // The inset is whatever the surface carries beyond what the webview can paint.
+    let inset_x = logical.width - current_width;
+    let inset_y = logical.height - current_height;
+    let _ = window.set_size(tauri::LogicalSize::new(width + inset_x, height + inset_y));
+}
+
+/// What this build can actually do, so the frontend never offers a dead control.
+fn capabilities() -> Capabilities {
+    Capabilities {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        claude_version: claude_version(),
+        // No language server ships in v1, so `getDiagnostics` answers empty and the status
+        // bar's error and warning counts are a placeholder. Saying so here is what stops the
+        // frontend from rendering a confident `✗ 0` that means "we did not look".
+        diagnostics: false,
+        // Wired in M6.
+        ide_protocol: false,
+    }
+}
+
+/// `claude --version`, or `None` when the binary is not on `PATH`.
+///
+/// Recorded because the IDE-integration protocol is unversioned and the CLI self-updates:
+/// knowing which version a session was spawned against is the only way to tell a protocol
+/// change from a bug in this code.
+fn claude_version() -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}

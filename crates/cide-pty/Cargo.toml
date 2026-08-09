@@ -1,0 +1,20 @@
+[package]
+name = "cide-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# PTY sessions: spawn, blocking reader/writer threads, byte coalescing, and an always-on
+# vt100 screen mirror that makes detach/reattach gapless.
+#
+# Deliberately no tokio: portable-pty's API is blocking, and pretending otherwise means
+# either a thread pool per session or blocking the async runtime.
+[dependencies]
+cide-ipc = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

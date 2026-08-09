@@ -1,0 +1,141 @@
+/*
+ * Design tokens, transcribed verbatim from the design mock.
+ *
+ * The names are the mock's names. Nothing here is renamed to suit a utility framework —
+ * that is precisely why this project uses plain custom properties plus CSS Modules rather
+ * than Tailwind, whose `@theme` only generates utilities for namespaced token names and
+ * would need a hand-maintained 24-token bridge that silently drifts.
+ *
+ * Theme is an explicit app setting, so `data-theme` on <html> is authoritative. There is
+ * no `prefers-color-scheme` block: this is a desktop app with its own Appearance section,
+ * not a page that should follow the browser.
+ */
+
+:root,
+[data-theme='dark'] {
+  --bg: #111113;
+  --chrome: #1a1a1e;
+  --chrome-hi: #232329;
+  --panel: #151518;
+  --panel-2: #0e0e10;
+  --border: #2a2a31;
+  --border-soft: #202027;
+  --text: #d7d7dd;
+  --text-hi: #f2f2f5;
+  --dim: #84848f;
+  --faint: #5c5c66;
+  --accent: #d97757;
+  --accent-hi: #e89476;
+  --accent-dim: #7a4432;
+  --blue: #7aa2f7;
+  --green: #8fbf7a;
+  --purple: #b48ead;
+  --yellow: #dfae68;
+  --red: #e06c75;
+  --cyan: #6fb3c0;
+  --sel: #2b3a55;
+  --shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+
+  /* Diff row backgrounds, from the mock's inline rgba() values. */
+  --diff-add-bg: rgba(143, 191, 122, 0.1);
+  --diff-del-bg: rgba(224, 108, 117, 0.1);
+}
+
+[data-theme='light'] {
+  --bg: #f5f3f0;
+  --chrome: #e8e4de;
+  --chrome-hi: #dcd7cf;
+  --panel: #fbfaf8;
+  --panel-2: #efece7;
+  --border: #d8d2c9;
+  --border-soft: #e3ded6;
+  --text: #2c2926;
+  --text-hi: #14120f;
+  --dim: #726c64;
+  --faint: #9a938a;
+  --accent: #c25f3d;
+  --accent-hi: #a94d2d;
+  --accent-dim: #e8c7b8;
+  --blue: #3b62b8;
+  --green: #4d7c3f;
+  --purple: #8250a0;
+  --yellow: #a3730f;
+  --red: #b3352f;
+  --cyan: #2f7481;
+  --sel: #cfdcf2;
+  --shadow: 0 24px 60px rgba(60, 45, 30, 0.18);
+
+  --diff-add-bg: rgba(77, 124, 63, 0.12);
+  --diff-del-bg: rgba(179, 53, 47, 0.1);
+}
+
+:root {
+  /*
+   * Fonts are bundled locally in M3. The CSP has no external host in `font-src`, so a
+   * Google Fonts <link> would fail silently and leave the app on the fallback stack.
+   */
+  --font-ui: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+
+  /* Fixed chrome heights from the mock. */
+  --h-header: 34px;
+  --h-rail: 42px;
+  --h-tabstrip: 30px;
+  --h-status: 24px;
+  --h-panetitle: 26px;
+  --w-sidebar-files: 252px;
+  --w-sidebar-git: 420px;
+  --w-minimap: 96px;
+  --w-splitter: 6px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  /*
+   * Painted explicitly rather than relying on window transparency: on Linux
+   * `transparent(true)` needs a running compositor and renders opaque black without one.
+   */
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  /* A desktop chrome that rubber-bands or text-selects on drag reads as a web page. */
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Content areas opt back in. */
+.selectable {
+  user-select: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--dim);
+  background-clip: content-box;
+}

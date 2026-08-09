@@ -1,0 +1,56 @@
+/*
+ * The tab stack: every tab of the active project, one of them visible.
+ *
+ * See TabContent.tsx for why inactive tabs are hidden rather than unmounted, and why the
+ * hiding is `visibility` and not `display`.
+ */
+
+/*
+ * `flex: 1` and `min-height: 0` together. The stack sits in the workspace column below the
+ * tab strip; a flex item's default `min-height: auto` refuses to shrink below its content,
+ * so without the override a tall pane grid pushes the column past the window and takes the
+ * status bar off screen with it.
+ *
+ * `position: relative` is what the panels' `inset: 0` resolves against. Overflow is clipped
+ * rather than scrolled because this container is shared by every tab at once: a scrollbar
+ * here narrows all of them, so one tab whose content overruns its box would fire a resize
+ * through every terminal in the project, including the ones nobody is looking at.
+ */
+.stack {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/*
+ * Every panel, active or not, is absolutely positioned at the container's full size. Taking
+ * them all out of flow is the point: a hidden tab is measured exactly as if it were showing,
+ * so its terminals keep a correct column and row count and switching to it needs no refit.
+ * It also means activating a tab changes no box anywhere, so no layout runs on the switch.
+ *
+ * `visibility: hidden` — never `display: none`, which zeroes those measurements — and never
+ * unmounted, which destroys the panes.
+ */
+.panel {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  visibility: hidden;
+  z-index: 0;
+}
+
+/*
+ * `visibility: hidden` already removes a panel from hit-testing, so the stacking order is
+ * belt and braces. It is stated anyway: if a later change ever swaps the hiding mechanism
+ * for opacity or a transition, an explicit z-index is the difference between a working tab
+ * and one whose clicks land in the tab underneath it.
+ */
+.panelActive {
+  visibility: visible;
+  z-index: 1;
+}

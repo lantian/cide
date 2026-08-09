@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "shell-window",
+  "description": "Permissions for a main shell window, which hosts one or more projects depending on the windowMode setting.",
+  "windows": ["shell:*"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-title",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-start-resize-dragging",
+    "core:webview:allow-internal-toggle-devtools",
+    "dialog:default",
+    "opener:default",
+    "os:default",
+    "process:default",
+    "store:default",
+    "clipboard-manager:default",
+    "log:default"
+  ]
+}

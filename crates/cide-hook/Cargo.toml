@@ -1,0 +1,18 @@
+[package]
+name = "cide-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A tiny second binary that Claude Code invokes as a hook command. It reads the hook
+# payload on stdin and forwards it to the running IDE over a unix socket.
+#
+# It is a separate binary rather than a subcommand of the app so that spawning a hook
+# costs a ~1 MB process, not a webview.
+[[bin]]
+name = "cide-hook"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
