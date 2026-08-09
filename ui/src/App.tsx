@@ -32,6 +32,8 @@ import { TabContent } from '@/layout/TabContent'
 import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
+import { CloseConfirm } from '@/chrome/CloseConfirm'
+import { useCloseConfirm } from '@/chrome/closeConfirmStore'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -154,6 +156,15 @@ export function App() {
   const [view, setView] = useState<ActivityView>('files')
   /** Which overlay is up, if any. `null` is the ordinary state. */
   const [overlay, setOverlay] = useState<'files' | 'commands' | null>(null)
+  /*
+   * A close that Rust refused because it would discard unsaved work.
+   *
+   * The store parks the refusal here and re-issues the command with `force: true` if the
+   * user chooses to discard, so no call site needs to know this dialog exists. The dialog
+   * is the courtesy; `CoreError::UnsavedChanges` is the enforcement — a dialog that fails
+   * to render fails open, and a buffer would be gone.
+   */
+  const pendingClose = useCloseConfirm((s) => s.pending)
   /**
    * The launch plan, keyed by pane.
    *
@@ -578,6 +589,16 @@ export function App() {
                 runCommand(id, { newSession: true })
               },
             }}
+          />
+        )}
+
+        {pendingClose && (
+          <CloseConfirm
+            scope={pendingClose.scope}
+            unsaved={pendingClose.unsaved}
+            sessions={pendingClose.sessions}
+            onCancel={() => useCloseConfirm.getState().dismiss()}
+            onDiscard={() => void useCloseConfirm.getState().confirm()}
           />
         )}
 
