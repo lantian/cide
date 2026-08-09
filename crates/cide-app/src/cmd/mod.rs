@@ -11,4 +11,5 @@ pub mod lifecycle;
 pub mod pane;
 pub mod project;
 pub mod session;
+pub mod settings;
 pub mod window;

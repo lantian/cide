@@ -10,6 +10,9 @@
 //!   three-file change that a reviewer can see.
 //! * `bench-ipc`          — measure the PTY transport. See `BENCH.md`; this is the M0
 //!   GO/NO-GO gate.
+//! * `package`            — preflight the Linux packaging and print the plan; `--write`
+//!   regenerates the Flatpak files and `--check` gates them. It builds nothing unless asked
+//!   with `--run`. See `package.rs` and `docs/adr/0007`.
 //!
 //! Both gates are line-oriented lints over source text rather than macro reflection or a
 //! linked-in `cide-app`. That is a deliberate trade: `generate_handler!` expands inside a
@@ -25,6 +28,8 @@ use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+mod package;
+
 const USAGE: &str = "\
 cargo xtask <task>
 
@@ -32,6 +37,11 @@ Tasks:
   codegen [--check]        regenerate ui/src/ipc/generated.ts from cide-ipc
   contract-check [--write] diff the live command/event surface against contract/*.json
   bench-ipc                measure IPC throughput (M0 GO/NO-GO gate)
+  package [targets] [...]  preflight the Linux packaging and print the plan
+                             targets: --appimage --deb --flatpak (default: all)
+                             --write  regenerate packaging/flatpak/*
+                             --check  fail if those files are stale (CI gate)
+                             --run    actually build; otherwise nothing is built
   help                     show this message
 ";
 
@@ -72,6 +82,41 @@ fn main() -> ExitCode {
             flags(&rest, &["--write"]).and_then(|f| contract_check(f.contains("--write")))
         }
         "bench-ipc" => bench_ipc(),
+        "package" => flags(
+            &rest,
+            &[
+                "--appimage",
+                "--deb",
+                "--flatpak",
+                "--write",
+                "--check",
+                "--run",
+            ],
+        )
+        .and_then(|f| {
+            // Naming no target means all of them, which is what someone typing `package`
+            // to see the state of things wants. Naming one means only that one.
+            let named = f.contains("--appimage") || f.contains("--deb") || f.contains("--flatpak");
+            let targets = if named {
+                package::Targets {
+                    appimage: f.contains("--appimage"),
+                    deb: f.contains("--deb"),
+                    flatpak: f.contains("--flatpak"),
+                }
+            } else {
+                package::Targets::ALL
+            };
+            let root = workspace_root()?;
+            package::package(
+                &root,
+                package::Options {
+                    targets,
+                    write: f.contains("--write"),
+                    check: f.contains("--check"),
+                    run: f.contains("--run"),
+                },
+            )
+        }),
         "help" | "-h" | "--help" => {
             print!("{USAGE}");
             Ok(())

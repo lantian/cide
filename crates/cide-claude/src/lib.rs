@@ -15,10 +15,12 @@
 //! silently bill a Console organisation for a user on a Claude Max plan. Children inherit
 //! their authentication by inheriting the environment, which is all they need.
 
+pub mod headless;
 pub mod hook;
 pub mod settings;
 pub mod state;
 
+pub use headless::{Headless, ToolAccess};
 pub use hook::{HookEvent, HookFrame};
 pub use settings::{StatusLine, inline_settings};
 pub use state::{is_permission_request, next_state};

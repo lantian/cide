@@ -1,0 +1,147 @@
+/* Shared styling for the two sections that render data rather than a form: the keymap
+   listing and the graphics ladder. */
+
+.keyChip {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.filter {
+  width: 100%;
+  max-width: 320px;
+  height: 26px;
+  padding: 0 9px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.filter:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.table th {
+  text-align: left;
+  font-weight: 400;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  padding: 0 10px 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.table td {
+  padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text);
+  vertical-align: top;
+}
+
+.command {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.layer {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* A binding the user's own file contributed, so it is visible at a glance what has been
+   overridden — which is the whole reason `ResolvedBinding` carries its layer. */
+.layerUser {
+  color: var(--accent);
+}
+
+.conflict {
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--red);
+  border-radius: 5px;
+  background: var(--panel);
+  padding: 9px 12px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.problem {
+  border-left-color: var(--yellow);
+}
+
+.clean {
+  font-size: 12px;
+  color: var(--green);
+  margin-bottom: 18px;
+}
+
+.path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  margin-top: 16px;
+  word-break: break-all;
+}
+
+/* --- the graphics ladder --- */
+
+.rung {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.rungText {
+  flex: 1;
+  min-width: 0;
+}
+
+.rungLabel {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.rungVar {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  margin-top: 2px;
+}
+
+.rungCost {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 4px;
+}
+
+.restart {
+  display: inline-block;
+  margin-top: 5px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--sel);
+  color: var(--text);
+  font-size: 11px;
+}

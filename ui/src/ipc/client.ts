@@ -17,10 +17,17 @@ import type {
   Bootstrap,
   DiffAnswer,
   Direction,
+  GraphicsStatus,
+  HeadlessRequest,
+  HeadlessResult,
+  KeymapReport,
   PaneId,
   PaneRestore,
   ProjectId,
   SessionState,
+  Settings as SettingsDto,
+  SettingsPatch,
+  SettingsSection,
   Side,
   SplitId,
   SplitIntent,
@@ -228,6 +235,54 @@ export const claude = {
   /** Answer a diff. `acceptedEdited` carries the buffer the user actually has on screen. */
   answer: (projectId: ProjectId, requestId: string, outcome: DiffAnswer) =>
     invoke<void>('claude_diff_result', { project: projectId, requestId, outcome }),
+}
+
+/**
+ * The Settings tab's surface.
+ *
+ * `set` takes a patch rather than the whole struct: two windows can have Settings open, and
+ * "the user did not touch this" has to be distinguishable from "the user set this to false"
+ * or whichever saved last would overwrite the other's fields.
+ *
+ * There is no `settings.onChanged` listener. Settings live inside the workspace, so a write
+ * arrives in every window through `cide://workspace-changed` like any other mutation — a
+ * second event would give two windows two orderings of one change.
+ *
+ * Note what is *not* here: the window mode. Changing it opens and closes real OS windows, so
+ * it stays `windows.setMode`; see `SettingsPatch` in the Rust DTOs.
+ */
+export const settings = {
+  get: () => invoke<SettingsDto>('settings_get'),
+
+  /** Apply a partial update and get the settings as they now stand. */
+  set: (patch: SettingsPatch) => invoke<SettingsDto>('settings_set', { patch }),
+
+  /** Open the project's Settings tab, or activate the one it already has. */
+  openTab: (projectId: ProjectId, section: SettingsSection | null = null) =>
+    invoke<TabId>('tab_open_settings', { project: projectId, section }),
+
+  /** The resolved keymap, its conflicts, and anything wrong in the user's overrides file. */
+  keymap: () => invoke<KeymapReport>('keymap_report'),
+
+  /**
+   * The Linux graphics ladder: what is stored, and what this process actually got.
+   *
+   * The two can differ, and saying so is the point. These variables are read while the
+   * webview is being created, so a change made here takes effect on the next launch and
+   * never on this one.
+   */
+  graphics: () => invoke<GraphicsStatus>('graphics_status'),
+}
+
+/**
+ * The non-interactive Claude lane: one prompt in, one answer out.
+ *
+ * Not a session — no pane, no PTY, no hooks, and no entry in the user's `/resume` picker.
+ * Used for commit-message generation, "explain this selection" and palette one-shots.
+ */
+export const headless = {
+  run: (projectId: ProjectId, request: HeadlessRequest) =>
+    invoke<HeadlessResult>('claude_headless', { project: projectId, request }),
 }
 
 export const diag = {
