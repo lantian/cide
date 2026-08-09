@@ -1,6 +1,7 @@
 [
   "cide://fs-changed",
   "cide://fs-status",
+  "cide://git-status",
   "cide://session-state",
   "cide://session-status",
   "cide://session-tool",

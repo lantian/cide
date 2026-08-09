@@ -21,6 +21,10 @@
 # would be shared configuration and is deliberately not ignored; this file is not.
 /.claude/settings.local.json
 
+# Agent worktrees live inside the repo. Without this, a single `git add -A` during a
+# parallel run commits six complete copies of the source tree — and git happily lets you.
+/.claude/worktrees/
+
 # Runtime state cide itself writes. None of it belongs in the repo, and
 # workspace.json in particular records absolute paths from one machine.
 /.cide/
