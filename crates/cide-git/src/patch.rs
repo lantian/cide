@@ -40,6 +40,25 @@
 //! line while selecting something after it. That selection describes a file that both does
 //! and does not end in a newline; [`synthesize`] refuses it as
 //! [`PartialRefusal::NoNewlineOrdering`] rather than emitting a patch no tool can read.
+//!
+//! A marker is *per side*, not per patch, which is why [`Closed`] tracks two bits rather than
+//! one offset. libgit2 really does emit a marker in the middle of a hunk: for an old file of
+//! `b` with no terminator and a new one of `b\nc`, its own output is
+//!
+//! ```text
+//! @@ -1 +1,2 @@
+//! -b
+//! \ No newline at end of file
+//! +b
+//! +c
+//! \ No newline at end of file
+//! ```
+//!
+//! — which is valid, because the first marker ends the *old* file and only `+` lines follow
+//! it. The rule that has to hold is therefore "no later line touches a side an earlier marker
+//! closed", and nothing weaker: checking only that the last marker lands at the end of the
+//! patch accepts the corrupt selection of `+c` alone, which turns the deletion into a context
+//! line, strands its marker, and stages `bc` where the user asked for `b\nc`.
 
 use std::collections::BTreeSet;
 
@@ -159,13 +178,20 @@ pub fn synthesize(file: &RawFile, chosen: &BTreeSet<Position>) -> Result<Option<
 
     let mut body = Vec::new();
     let mut delta: i64 = 0;
-    // Where the last `\ No newline` marker was written, as (byte offset just past it). A
-    // marker is only legal at the very end of the patch, so remembering the last one and
-    // checking it at the end is the whole validation.
-    let mut marker_end: Option<usize> = None;
+    // Which sides an already-written `\ No newline` marker has ended. Carried across hunks
+    // because the file's last line is not necessarily in the last hunk we emit.
+    let mut closed = Closed::default();
 
     for (index, hunk) in file.hunks.iter().enumerate() {
-        let Some(emitted) = emit_hunk(hunk, index, chosen, delta, &mut marker_end, &mut body)?
+        let Some(emitted) = emit_hunk(
+            &file.path,
+            hunk,
+            index,
+            chosen,
+            delta,
+            &mut closed,
+            &mut body,
+        )?
         else {
             continue;
         };
@@ -175,29 +201,51 @@ pub fn synthesize(file: &RawFile, chosen: &BTreeSet<Position>) -> Result<Option<
     if body.is_empty() {
         return Ok(None);
     }
-    if let Some(end) = marker_end
-        && end != body.len()
-    {
-        // The marker landed somewhere other than the end of the patch: the selection
-        // describes a file that both does and does not end in a newline.
-        return Err(GitError::PartialRefused {
-            path: file.path.clone(),
-            reason: PartialRefusal::NoNewlineOrdering,
-        });
-    }
 
     let mut out = file.header.clone();
     out.extend_from_slice(&body);
     Ok(Some(out))
 }
 
+/// Which sides of a patch a `\ No newline at end of file` marker has already ended.
+///
+/// The marker after a line L says "the file L belongs to ends here, with no terminator". L is
+/// part of the old file when its *emitted* origin is `-` or ` `, and part of the new file when
+/// it is `+` or ` `. So once a marker is written, no later line may belong to a side that
+/// marker closed — a context line after a marker on a context line is a file that both does
+/// and does not end where the patch says it does.
+///
+/// The emitted origin is the one that counts, not the original: an unselected deletion is
+/// re-emitted as context, which turns a marker that only ended the old file into one that ends
+/// both.
+#[derive(Debug, Clone, Copy, Default)]
+struct Closed {
+    old: bool,
+    new: bool,
+}
+
+impl Closed {
+    /// Record a marker written after a line emitted with `origin`.
+    fn close(&mut self, origin: u8) {
+        self.old |= origin != b'+';
+        self.new |= origin != b'-';
+    }
+
+    /// Whether emitting a line with `origin` would now strand an earlier marker.
+    fn strands(self, origin: u8) -> bool {
+        (self.old && origin != b'+') || (self.new && origin != b'-')
+    }
+}
+
 /// Append one hunk if anything in it was selected. Returns its contribution to `delta`.
+#[allow(clippy::too_many_arguments)]
 fn emit_hunk(
+    path: &str,
     hunk: &RawHunk,
     index: usize,
     chosen: &BTreeSet<Position>,
     delta: i64,
-    marker_end: &mut Option<usize>,
+    closed: &mut Closed,
     out: &mut Vec<u8>,
 ) -> Result<Option<i64>> {
     let mut lines: Vec<(u8, &crate::diff::RawLine)> = Vec::with_capacity(hunk.lines.len());
@@ -268,11 +316,17 @@ fn emit_hunk(
     out.push(b'\n');
 
     for (origin, raw) in lines {
+        if closed.strands(origin) {
+            return Err(GitError::PartialRefused {
+                path: path.to_string(),
+                reason: PartialRefusal::NoNewlineOrdering,
+            });
+        }
         out.push(origin);
         out.extend_from_slice(&raw.content);
         if let Some(marker) = &raw.eofnl {
             out.extend_from_slice(marker);
-            *marker_end = Some(out.len());
+            closed.close(origin);
         }
     }
 
@@ -490,6 +544,71 @@ mod tests {
                 path: "f.txt".into(),
                 reason: PartialRefusal::NoNewlineOrdering
             }
+        );
+    }
+
+    /// Two markers in one hunk, which is what libgit2 prints when neither the old nor the new
+    /// file ends in a newline. Deselecting the deletion turns it into context, and that
+    /// context line's marker now claims the *new* file ends there too — with two more lines
+    /// after it. Checking only the last marker's position let this through, and `git apply
+    /// --cached` accepted it and staged `bc`.
+    #[test]
+    fn a_marker_on_a_context_line_refuses_anything_after_it() {
+        let f = file(vec![hunk(
+            1,
+            1,
+            1,
+            2,
+            vec![
+                unterminated(b'-', "b"),
+                line(b'+', "b"),
+                unterminated(b'+', "c"),
+            ],
+        )]);
+        let err = synthesize(&f, &BTreeSet::from([(0, 1), (0, 2)])).unwrap_err();
+        assert_eq!(
+            err,
+            GitError::PartialRefused {
+                path: "f.txt".into(),
+                reason: PartialRefusal::NoNewlineOrdering
+            }
+        );
+        // The same shape with only the trailing addition picked is the gesture a user makes
+        // ("stage just the new line") and is refused for the same reason.
+        let err = synthesize(&f, &BTreeSet::from([(0, 2)])).unwrap_err();
+        assert!(matches!(
+            err,
+            GitError::PartialRefused {
+                reason: PartialRefusal::NoNewlineOrdering,
+                ..
+            }
+        ));
+    }
+
+    /// A marker on a deletion ends the *old* file only, so additions may follow it. This is
+    /// libgit2's own output for an unterminated old file, and refusing it — which the
+    /// last-marker-position rule did — cost a legitimate selection for no safety.
+    #[test]
+    fn a_marker_on_a_deletion_still_allows_additions_after_it() {
+        let f = file(vec![hunk(
+            1,
+            2,
+            1,
+            2,
+            vec![
+                line(b' ', "x"),
+                unterminated(b'-', "b"),
+                line(b'+', "c"),
+                line(b'+', "d"),
+            ],
+        )]);
+        let patch = synthesize(&f, &BTreeSet::from([(0, 1), (0, 2)]))
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(patch).unwrap();
+        assert!(
+            text.ends_with(" x\n-b\n\\ No newline at end of file\n+c\n"),
+            "{text}"
         );
     }
 

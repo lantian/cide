@@ -517,6 +517,49 @@ fn committing_one_changelist_leaves_the_other_untouched() {
     assert_eq!(fixes_view.changes[0].path, "b.txt");
 }
 
+/// `rebuild_index` clears the index to HEAD before it knows whether there is anything to
+/// commit, so the emptiness has to be answered first — otherwise clicking Commit on a
+/// changelist that holds nothing silently drops whatever the index was holding.
+#[test]
+fn committing_an_empty_changelist_leaves_the_index_alone() {
+    let repo = TempRepo::new("empty-changelist");
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a.txt", b"two\n");
+
+    stage::stage(&repo.root, &[selection("a.txt", Selection::Whole)]).expect("stage");
+    let fixes = changelist::update(&repo.root, |data| data.create("Fixes", "")).unwrap();
+    changelist::update(&repo.root, |data| {
+        data.move_paths(&fixes, &["a.txt".to_string()])
+    })
+    .unwrap();
+
+    let error = commit::commit(
+        &repo.root,
+        &CommitRequest {
+            message: "nothing here".into(),
+            amend: false,
+            changelist: None,
+            selections: None,
+            force: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, GitError::NothingToCommit);
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]).trim(),
+        "a.txt",
+        "a refused commit unstaged a file it never named"
+    );
+    // …and the guard must not now accuse the user of staging behind cide's back.
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    assert!(
+        !status::repo_changes(&info, status::StatusRequest::default())
+            .unwrap()
+            .index_changed_externally
+    );
+}
+
 #[test]
 fn unstaging_selected_lines_puts_back_exactly_those() {
     let repo = TempRepo::new("unstage");
@@ -571,6 +614,96 @@ fn rolling_an_untracked_file_back_removes_it() {
 
     stage::rollback(&repo.root, &[selection("junk.txt", Selection::Whole)]).expect("rollback");
     assert!(!repo.root.join("junk.txt").exists());
+}
+
+/// libgit2 takes *pathspecs*, not paths, in `checkout_head` and `reset_default`. A file whose
+/// name contains an fnmatch metacharacter would otherwise drag its neighbours along — and on
+/// the rollback path that means overwriting a file the user never named with its HEAD content.
+#[test]
+fn a_glob_shaped_filename_only_rolls_back_itself() {
+    let repo = TempRepo::new("glob-rollback");
+    repo.write("a[1].txt", b"one\n");
+    repo.write("a1.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a[1].txt", b"bracket edit\n");
+    repo.write("a1.txt", b"plain edit\n");
+
+    stage::rollback(&repo.root, &[selection("a[1].txt", Selection::Whole)]).expect("rollback");
+
+    assert_eq!(repo.read("a[1].txt"), b"one\n".to_vec());
+    assert_eq!(
+        repo.read("a1.txt"),
+        b"plain edit\n".to_vec(),
+        "rolling back `a[1].txt` destroyed uncommitted work in `a1.txt`"
+    );
+}
+
+#[test]
+fn a_glob_shaped_filename_only_unstages_itself() {
+    let repo = TempRepo::new("glob-unstage");
+    repo.write("a[1].txt", b"one\n");
+    repo.write("a1.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a[1].txt", b"bracket edit\n");
+    repo.write("a1.txt", b"plain edit\n");
+    stage::stage(
+        &repo.root,
+        &[
+            selection("a[1].txt", Selection::Whole),
+            selection("a1.txt", Selection::Whole),
+        ],
+    )
+    .expect("stage");
+
+    stage::unstage(&repo.root, &[selection("a[1].txt", Selection::Whole)]).expect("unstage");
+
+    let staged = repo.git(&["diff", "--cached", "--name-only"]);
+    assert_eq!(
+        staged.lines().collect::<Vec<_>>(),
+        vec!["a1.txt"],
+        "unstaging `a[1].txt` also unstaged its neighbour"
+    );
+}
+
+/// The corrupting case behind [`PartialRefusal::NoNewlineOrdering`], end to end.
+///
+/// Old file `b` with no terminator, new file `b\nc` also with none, so libgit2 prints two
+/// markers in one hunk. Staging only the added line turns the deletion into context and
+/// strands the first marker; `git apply --cached` *accepts* that patch and stages `bc`.
+#[test]
+fn staging_past_a_stranded_marker_is_refused_rather_than_corrupting_the_blob() {
+    let repo = TempRepo::new("two-markers");
+    repo.write("f.txt", b"b");
+    repo.commit_all("base");
+    repo.write("f.txt", b"b\nc");
+
+    let file = raw(&repo, "f.txt", DiffSide::Unstaged);
+    let additions: Vec<(usize, usize)> = file.hunks[0]
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.origin == b'+')
+        .map(|(i, _)| (0usize, i))
+        .collect();
+    assert_eq!(additions.len(), 2, "{file:#?}");
+    let last = *additions.last().unwrap();
+
+    for chosen in [BTreeSet::from([last]), additions.iter().copied().collect()] {
+        assert_eq!(
+            patch::synthesize(&file, &chosen).unwrap_err(),
+            GitError::PartialRefused {
+                path: "f.txt".into(),
+                reason: PartialRefusal::NoNewlineOrdering
+            }
+        );
+    }
+
+    // Selecting everything is the whole file, and that still round-trips byte for byte.
+    let all = patch::every_change(&file);
+    let text = patch::synthesize(&file, &all).unwrap().unwrap();
+    let (ok, output) = repo.try_git_stdin(&["apply", "--cached", "-"], &text);
+    assert!(ok, "git refused the full patch:\n{output}");
+    assert_eq!(repo.git(&["show", ":f.txt"]), "b\nc");
 }
 
 #[test]

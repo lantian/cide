@@ -11,6 +11,12 @@
 //! stage and path for every entry — by the `git` binary rather than by the library under
 //! test, so libgit2 is never the judge of its own work.
 //!
+//! Agreement is necessary and not sufficient: two appliers of one bad patch agree on the wrong
+//! answer. So every case is also checked against [`expected_blob`], which builds the content
+//! the selection *means* out of the pre-image and the diff, with no reference to the patch
+//! under test. That is the check that fails when a synthesized patch applies cleanly and
+//! stages something else — the shape of bug that the agreement check alone let through.
+//!
 //! Cases are generated from a seeded [`Rng`]; the seed is printed on failure, so a bad case is
 //! reproduced by re-running rather than by re-rolling. `CIDE_GIT_CASES` overrides the count.
 
@@ -145,6 +151,13 @@ fn synthesized_patches_agree_with_git_apply_cached() {
             continue;
         }
 
+        // The pre-image the patch will be applied to, read before anything touches the index.
+        let pre = diff::index_blob(&git_repo, PATH)
+            .expect("index blob")
+            .map(|oid| git_repo.find_blob(oid).expect("blob").content().to_vec())
+            .unwrap_or_default();
+        let (expected, representable) = expected_blob(&pre, &file, &chosen);
+
         let text = match patch::synthesize(&file, &chosen) {
             Ok(Some(text)) => text,
             Ok(None) => {
@@ -163,14 +176,32 @@ fn synthesized_patches_agree_with_git_apply_cached() {
             Err(error) => panic!("seed {seed} ({:?}): {error}", generated.shape),
         };
         drop(git_repo);
+        assert!(
+            representable,
+            "seed {seed} ({:?}, trailing={}): the selection describes a file with an \
+             unterminated line in the middle, and synthesize emitted a patch for it anyway\n{}",
+            generated.shape,
+            generated.trailing,
+            show(&text)
+        );
 
         let before = repo.save_index();
-        let ours = apply_with_libgit2(&repo, &text).unwrap_or_else(|e| {
+        let (ours, staged) = apply_with_libgit2(&repo, &text).unwrap_or_else(|e| {
             panic!(
                 "seed {seed}: libgit2 refused our own patch: {e}\n{}",
                 show(&text)
             )
         });
+        assert_eq!(
+            String::from_utf8_lossy(&staged),
+            String::from_utf8_lossy(&expected),
+            "seed {seed} ({:?}, {:?}, trailing={}): the patch applied cleanly and staged \
+             content the selection does not describe\n{}",
+            generated.shape,
+            generated.eol,
+            generated.trailing,
+            show(&text)
+        );
         repo.restore_index(&before);
 
         let (ok, output) =
@@ -212,15 +243,91 @@ fn synthesized_patches_agree_with_git_apply_cached() {
     );
 }
 
-/// Apply through `Repository::apply(ApplyLocation::Index)` and read the index back with git.
-fn apply_with_libgit2(repo: &TempRepo, text: &[u8]) -> Result<String, String> {
+/// Apply through `Repository::apply(ApplyLocation::Index)`, then read back both the index
+/// listing (with the `git` binary) and the staged blob's bytes.
+fn apply_with_libgit2(repo: &TempRepo, text: &[u8]) -> Result<(String, Vec<u8>), String> {
     let git_repo = git2::Repository::open(&repo.root).map_err(|e| e.to_string())?;
     let parsed = git2::Diff::from_buffer(text).map_err(|e| e.to_string())?;
     git_repo
         .apply(&parsed, git2::ApplyLocation::Index, None)
         .map_err(|e| format!("{:?}: {}", e.class(), e.message()))?;
+    let staged = diff::index_blob(&git_repo, PATH)
+        .map_err(|e| e.to_string())?
+        .map(|oid| {
+            git_repo
+                .find_blob(oid)
+                .map(|b| b.content().to_vec())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
     drop(git_repo);
-    Ok(repo.index_state())
+    Ok((repo.index_state(), staged))
+}
+
+/// The blob `chosen` describes, built from the pre-image and the diff and *not* from the patch
+/// under test.
+///
+/// This is the independent oracle. Walking the old file and keeping context, keeping selected
+/// additions, dropping unselected ones and keeping unselected deletions is the definition of
+/// what partial staging means; the patch is only a way to say it to git.
+///
+/// The second return value is whether the result is a file that can exist at all. A line
+/// without a terminator can only be the last one, so a reconstruction that puts one in the
+/// middle means the selection is unrepresentable and `synthesize` must refuse it — which is
+/// exactly the `\ No newline` case, stated here in terms of content rather than of markers.
+fn expected_blob(pre: &[u8], file: &RawFile, chosen: &BTreeSet<(usize, usize)>) -> (Vec<u8>, bool) {
+    let lines = split_keeping_terminators(pre);
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut cursor = 0usize;
+
+    for (index, hunk) in file.hunks.iter().enumerate() {
+        // libgit2 reports the line *before* an empty old range, so a pure insertion at
+        // `old_start` lands after that line; a non-empty range starts one earlier, 0-based.
+        let start = if hunk.old_lines > 0 {
+            hunk.old_start as usize - 1
+        } else {
+            hunk.old_start as usize
+        };
+        kept.extend(
+            lines[cursor.min(lines.len())..start.min(lines.len())]
+                .iter()
+                .copied(),
+        );
+        for (line, raw) in hunk.lines.iter().enumerate() {
+            let keep = match raw.origin {
+                b'+' => chosen.contains(&(index, line)),
+                b'-' => !chosen.contains(&(index, line)),
+                _ => true,
+            };
+            if keep {
+                kept.push(&raw.content);
+            }
+        }
+        cursor = start + hunk.old_lines as usize;
+    }
+    kept.extend(lines[cursor.min(lines.len())..].iter().copied());
+
+    let representable = kept
+        .iter()
+        .enumerate()
+        .all(|(i, piece)| i + 1 == kept.len() || piece.ends_with(b"\n"));
+    (kept.concat(), representable)
+}
+
+/// Split into lines, each still carrying its terminator; the last may have none.
+fn split_keeping_terminators(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            out.push(&bytes[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push(&bytes[start..]);
+    }
+    out
 }
 
 fn show(text: &[u8]) -> String {

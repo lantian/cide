@@ -155,6 +155,27 @@ fn add_or_remove(repo: &Repository, index: &mut git2::Index, path: &str) -> Resu
     }
 }
 
+/// Escape a literal path so libgit2 matches it and nothing else.
+///
+/// `checkout_head` and `reset_default` both take *pathspecs*, and libgit2 runs them through
+/// `fnmatch`. Every path this crate passes came out of a diff and names one exact file, so a
+/// file literally called `a[1].txt` would otherwise also match — and drag `a1.txt` along.
+/// Verified against the libgit2 this crate links, by `tests/staging.rs`: unescaped, a rollback
+/// of `a[1].txt` overwrites `a1.txt` with its HEAD content and destroys whatever was in it.
+///
+/// `checkout_head` also takes `disable_pathspec_match`, which is used *as well*; `reset_default`
+/// has no such flag, which is why the escaping exists rather than the flag alone.
+fn escape_pathspec(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn apply(repo: &Repository, text: &[u8], location: ApplyLocation) -> Result<()> {
     let diff = Diff::from_buffer(text).map_err(|e| GitError::PatchRejected {
         detail: e.message().to_string(),
@@ -198,7 +219,8 @@ pub fn unstage(root: &Path, selections: &[PathSelection]) -> Result<()> {
 
     // `reset_default` with a `None` target removes the entries outright, which is the right
     // answer on an unborn branch: there is no HEAD content to go back to.
-    repo.reset_default(head.as_ref(), resets.iter().map(String::as_str))
+    let specs: Vec<String> = resets.iter().map(|p| escape_pathspec(p)).collect();
+    repo.reset_default(head.as_ref(), specs.iter().map(String::as_str))
         .wrap()?;
 
     for text in &keeps {
@@ -251,7 +273,13 @@ pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
         .collect();
     if !tracked.is_empty() {
         let mut checkout = CheckoutBuilder::new();
-        checkout.force().remove_untracked(false);
+        // `disable_pathspec_match` is what makes each entry an exact file name. Without it
+        // libgit2 fnmatches them, and rolling back `a[1].txt` also force-overwrites `a1.txt`
+        // — someone else's uncommitted work, destroyed by a gesture that never named it.
+        checkout
+            .force()
+            .remove_untracked(false)
+            .disable_pathspec_match(true);
         for path in &tracked {
             checkout.path(path);
         }
@@ -275,4 +303,19 @@ pub fn rollback(root: &Path, selections: &[PathSelection]) -> Result<()> {
         }
     }
     changelist::record_index(root, &repo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_pathspec;
+
+    #[test]
+    fn pathspec_escaping_covers_every_fnmatch_metacharacter() {
+        assert_eq!(escape_pathspec("src/main.rs"), "src/main.rs");
+        assert_eq!(escape_pathspec("a[1].txt"), "a\\[1\\].txt");
+        assert_eq!(escape_pathspec("q?x*y.txt"), "q\\?x\\*y.txt");
+        // A backslash in a filename is legal on Linux and would otherwise escape the
+        // character after it.
+        assert_eq!(escape_pathspec("we\\ird"), "we\\\\ird");
+    }
 }

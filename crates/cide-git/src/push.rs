@@ -124,6 +124,13 @@ fn push_via_binary(
 ) -> Result<PushOutcome> {
     let mut command = Command::new("git");
     command.current_dir(root).arg("push");
+    // These commands are synchronous, so a `git` that blocks on a prompt freezes the window
+    // with no way to answer it. When cide was started from a terminal, git finds that
+    // terminal on `/dev/tty` — a terminal the user is not looking at — and waits there
+    // forever. `GIT_TERMINAL_PROMPT=0` turns that wait into an immediate, readable failure.
+    // GUI credential helpers are unaffected: this only disables git's *own* tty prompting,
+    // which is the whole reason the binary route exists rather than libgit2's callback.
+    command.env("GIT_TERMINAL_PROMPT", "0");
     if set_upstream {
         command.arg("--set-upstream");
     }

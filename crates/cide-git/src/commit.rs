@@ -81,19 +81,33 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
             Some(explicit) => explicit.clone(),
             None => default_selections(root, &sidecar, &list)?,
         };
+        // Answered before the reset, not after. `rebuild_index` clears the index down to HEAD,
+        // so committing an empty changelist would otherwise throw away whatever the index held
+        // and *then* report that there was nothing to commit.
+        if selections.is_empty() && merge_heads.is_empty() {
+            return Err(GitError::NothingToCommit);
+        }
         rebuild_index(&repo, head_tree.as_ref(), &selections)?;
         selections.iter().map(|s| s.path.clone()).collect()
     };
 
-    let outcome = write_commit(&repo, request, &merge_heads, committed.len() as u32)?;
+    let outcome = match write_commit(&repo, request, &merge_heads, committed.len() as u32) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The index is already whatever `rebuild_index` made it, so the fingerprint from
+            // before this call describes an index that no longer exists. Leaving it would
+            // raise the external-staging bar on cide's own write.
+            let _ = changelist::record_index(root, &repo);
+            return Err(error);
+        }
+    };
 
     if !merge_heads.is_empty() {
         repo.cleanup_state().wrap()?;
     }
 
     // The index now equals the tree that was just committed, so this is the fingerprint the
-    // next commit will compare against. Recording it *after* the commit rather than before
-    // is what makes a failed commit leave the guard in its previous, still-true state.
+    // next commit will compare against.
     changelist::record_index(root, &repo)?;
 
     // The committed paths no longer have changes, so their changelist assignments are dead.
