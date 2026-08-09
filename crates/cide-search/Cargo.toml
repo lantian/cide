@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 cide-ipc = { workspace = true }
 nucleo = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+# `Nucleo::tick` needs `&mut`, so the worker sits behind a mutex while the injector does
+# not. `parking_lot`'s guards are what keep that cheap enough to take on every keystroke.
 parking_lot = { workspace = true }

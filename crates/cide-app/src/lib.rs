@@ -5,6 +5,8 @@
 
 pub mod cmd;
 pub mod emit;
+// M8: one file index, picker and watcher per project.
+pub mod files;
 pub mod graphics;
 pub mod hooks;
 pub mod ide;
@@ -155,6 +157,10 @@ pub fn run() {
     };
 
     builder = builder.manage(SessionRegistry::default());
+    // Empty until a project asks to be indexed; managed from the start so that a `fs.*`
+    // command arriving before any `fs.index` answers `NoIndex` rather than failing to
+    // resolve its state.
+    builder = builder.manage(files::FsRegistry::default());
     if let Some(ide) = ide {
         builder = builder.manage(ide);
     }
@@ -207,6 +213,21 @@ pub fn run() {
             cmd::window::window_set_mode,
             cmd::window::window_close,
             cmd::window::window_list,
+            cmd::fs::fs_index,
+            cmd::fs::fs_close,
+            cmd::fs::fs_status,
+            cmd::fs::fs_tree_count,
+            cmd::fs::fs_tree_rows,
+            cmd::fs::fs_expand,
+            cmd::fs::fs_collapse,
+            cmd::fs::fs_reveal,
+            cmd::fs::fs_read_file,
+            cmd::fs::fs_write_file,
+            cmd::fs::fs_create,
+            cmd::fs::fs_rename,
+            cmd::fs::fs_delete,
+            cmd::picker::picker_query,
+            cmd::picker::picker_rank,
         ])
         .on_window_event(|window, event| {
             // A close from the window manager — Alt+F4, the compositor's own button — never

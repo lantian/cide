@@ -22,6 +22,13 @@ pub use workspace::{
     Project, ProjectRoot, SettingsSection, Tab, TabKind, WindowRole, Workspace,
 };
 
+// --- M8: file tree, watcher, pickers ---
+pub mod fs;
+pub mod search;
+
+pub use fs::{FsChange, FsStatus, TreeRow, TreeRowKind, WatchBackend, WatchStatus};
+pub use search::{PickerFrame, PickerItem, PickerRow};
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 

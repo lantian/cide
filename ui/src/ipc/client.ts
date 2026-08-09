@@ -17,8 +17,12 @@ import type {
   Bootstrap,
   DiffAnswer,
   Direction,
+  FsChange,
+  FsStatus,
   PaneId,
   PaneRestore,
+  PickerFrame,
+  PickerItem,
   ProjectId,
   SessionState,
   Side,
@@ -26,6 +30,7 @@ import type {
   SplitIntent,
   SplitOutcome,
   TabId,
+  TreeRow,
   WindowMode,
   Workspace,
 } from './generated'
@@ -230,6 +235,90 @@ export const claude = {
     invoke<void>('claude_diff_result', { project: projectId, requestId, outcome }),
 }
 
+/**
+ * The file tree, the watcher and file operations. (M8)
+ *
+ * The tree is a **windowed row list**, not a tree: `count()` sizes the scroller and
+ * `rows(offset, len)` fills the viewport. Expansion state lives in Rust, because it is what
+ * decides the flattening — a frontend that owned it would have to send it back on every
+ * window request.
+ *
+ * `index` is deliberately not part of `project.open`. A large repository takes seconds to
+ * walk, and a project that appears instantly with a tree that fills in beats one that hangs
+ * before it appears. Call it after opening, and `close` when the project closes.
+ */
+export const fs = {
+  /** Walk the project's roots and start watching. Safe to call twice; the second is a no-op. */
+  index: (projectId: ProjectId) => invoke<FsStatus>('fs_index', { project: projectId }),
+
+  /** Drop the index and stop watching. Call on project close. */
+  close: (projectId: ProjectId) => invoke<boolean>('fs_close', { project: projectId }),
+
+  status: (projectId: ProjectId) => invoke<FsStatus>('fs_status', { project: projectId }),
+
+  /** Total visible rows — the virtual scroller's range. */
+  treeCount: (projectId: ProjectId) => invoke<number>('fs_tree_count', { project: projectId }),
+
+  /** The rows in `[offset, offset + len)`. Clamped in Rust; past the end is `[]`, not an error. */
+  treeRows: (projectId: ProjectId, offset: number, len: number) =>
+    invoke<TreeRow[]>('fs_tree_rows', { project: projectId, offset, len }),
+
+  /** Returns the new row count, so the scroller can resize without a second call. */
+  expand: (projectId: ProjectId, path: string) =>
+    invoke<number>('fs_expand', { project: projectId, path }),
+
+  collapse: (projectId: ProjectId, path: string) =>
+    invoke<number>('fs_collapse', { project: projectId, path }),
+
+  /**
+   * Expand everything above a path and return the row it now sits on.
+   *
+   * `null` when the path has no row — gitignored, or deleted. Scroll to the number; show
+   * nothing on `null` rather than guessing a position.
+   */
+  reveal: (projectId: ProjectId, path: string) =>
+    invoke<number | null>('fs_reveal', { project: projectId, path }),
+
+  readFile: (projectId: ProjectId, path: string) =>
+    invoke<string>('fs_read_file', { project: projectId, path }),
+
+  /** Atomic: written to a temporary file in the same directory and renamed over. */
+  writeFile: (projectId: ProjectId, path: string, contents: string) =>
+    invoke<void>('fs_write_file', { project: projectId, path, contents }),
+
+  create: (projectId: ProjectId, path: string, directory = false) =>
+    invoke<void>('fs_create', { project: projectId, path, directory }),
+
+  rename: (projectId: ProjectId, from: string, to: string) =>
+    invoke<void>('fs_rename', { project: projectId, from, to }),
+
+  /** Moves to the desktop trash — never `unlink`. Returns where each path landed. */
+  delete: (projectId: ProjectId, paths: string[]) =>
+    invoke<string[]>('fs_delete', { project: projectId, paths }),
+}
+
+/**
+ * The fuzzy pickers.
+ *
+ * `query` is a poll, not a subscription: the index is still filling while the user types, so
+ * the frame carries `running` and the overlay asks again while it is true. `matched` and
+ * `total` are the two numbers in the `6 of 2,418` counter, and they climb during a walk.
+ */
+export const picker = {
+  /** Query a project's file index. Usable before `fs.index` has finished. */
+  query: (projectId: ProjectId, query: string, limit?: number) =>
+    invoke<PickerFrame>('picker_query', { project: projectId, query, limit: limit ?? null }),
+
+  /**
+   * Rank a list supplied here — the command palette.
+   *
+   * Same scoring as the file picker on purpose: two overlays that rank one query differently
+   * reads as a bug even when both answers are defensible.
+   */
+  rank: (query: string, items: PickerItem[], limit?: number) =>
+    invoke<PickerFrame>('picker_rank', { query, items, limit: limit ?? null }),
+}
+
 export const diag = {
   /** Pull `len` bytes as raw octets — the fast custom-protocol path. */
   echoBytes: async (len: number): Promise<ArrayBuffer> => {
@@ -378,6 +467,29 @@ export const events = {
   onSessionTool: (handler: (session: string, paths: string[]) => void) =>
     listen<{ session: string; paths: string[] }>('cide://session-tool', (e) =>
       handler(e.payload.session, e.payload.paths),
+    ),
+
+  /**
+   * One coalesced burst of filesystem change, already ignore-filtered. (M8)
+   *
+   * A whole `cargo build` is one of these. `truncated` means the burst was larger than the
+   * watcher holds, so the paths are a prefix and anything you care about should be re-read.
+   * `git` means `HEAD`, the index or a ref moved — the branch readout and the git panel.
+   */
+  onFsChanged: (handler: (project: ProjectId, change: FsChange) => void) =>
+    listen<{ project: ProjectId; change: FsChange }>('cide://fs-changed', (e) =>
+      handler(e.payload.project, e.payload.change),
+    ),
+
+  /**
+   * Indexing started or finished, or the watcher degraded.
+   *
+   * `watch.backend === 'polling'` is the degraded mode: `watch.reason` is a sentence written
+   * for a banner, and it names the sysctl that fixes it.
+   */
+  onFsStatus: (handler: (project: ProjectId, status: FsStatus) => void) =>
+    listen<{ project: ProjectId; status: FsStatus }>('cide://fs-status', (e) =>
+      handler(e.payload.project, e.payload.status),
     ),
 }
 

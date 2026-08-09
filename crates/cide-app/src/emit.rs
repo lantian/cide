@@ -127,3 +127,50 @@ pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
         tracing::debug!(%error, "session-tool reached no window");
     }
 }
+
+// --- file system events (M8) ------------------------------------------------------------
+//
+// No `rev` either, and for the same reason: a file changing on disk moves no pane. The file
+// tree and the open editors listen; nothing else has to.
+
+/// One coalesced burst of filesystem change, already filtered through the walk's ignore
+/// rules. A `cargo build` is one of these, not fifty thousand.
+pub const FS_CHANGED: &str = "cide://fs-changed";
+
+/// A project's index or watcher changed state: indexing started or finished, or the watcher
+/// degraded to polling and the banner has to say why.
+pub const FS_STATUS: &str = "cide://fs-status";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsChanged {
+    project: cide_ipc::ProjectId,
+    change: cide_ipc::FsChange,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsStatusChanged {
+    project: cide_ipc::ProjectId,
+    status: cide_ipc::FsStatus,
+}
+
+pub fn fs_changed(app: &AppHandle, project: cide_ipc::ProjectId, change: &cide_ipc::FsChange) {
+    let payload = FsChanged {
+        project,
+        change: change.clone(),
+    };
+    if let Err(error) = app.emit(FS_CHANGED, payload) {
+        tracing::debug!(%error, "fs-changed reached no window");
+    }
+}
+
+pub fn fs_status(app: &AppHandle, project: cide_ipc::ProjectId, status: &cide_ipc::FsStatus) {
+    let payload = FsStatusChanged {
+        project,
+        status: status.clone(),
+    };
+    if let Err(error) = app.emit(FS_STATUS, payload) {
+        tracing::debug!(%error, "fs-status reached no window");
+    }
+}

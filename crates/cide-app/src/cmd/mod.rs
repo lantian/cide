@@ -12,3 +12,7 @@ pub mod pane;
 pub mod project;
 pub mod session;
 pub mod window;
+
+// --- M8 ---
+pub mod fs;
+pub mod picker;

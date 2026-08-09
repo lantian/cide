@@ -8,11 +8,20 @@ license.workspace = true
 [dependencies]
 cide-ipc = { workspace = true }
 ignore = { workspace = true }
-globset = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-parking_lot = { workspace = true }
-rayon = { workspace = true }
+
+# `getuid` for the XDG trash's `$topdir/.Trash-$uid`, and `localtime_r` for the local
+# timestamp a `.trashinfo` file has to carry. Both are libc calls with no crate-level
+# equivalent already in this graph, and pulling `chrono` in to format one line of ISO 8601
+# would be a poor trade.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# `tests/streaming.rs` is the only place the walk and the picker meet without the app in
+# between, which is what makes it worth the dependency edge in this direction.
+cide-search = { workspace = true }
