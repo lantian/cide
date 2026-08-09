@@ -6,6 +6,10 @@
 //! * `tabs[0]` is the pinned Claude console, always present and never movable. The rule is
 //!   enforced by index rather than by [`TabKind::closable`] alone, so no frontend bug can
 //!   lose a project's console.
+//! * A [`TabKind::File`] tab whose `dirty` flag is set does not close. [`close_tab`] and
+//!   [`close_project`] take a `force` flag and refuse without it, for the same reason the
+//!   console is pinned here rather than in the frontend: a dialog is a courtesy, and a
+//!   courtesy is not a guard.
 //! * A project always has at least one root, and `roots[0]` supplies `display_path`.
 //! * `active_tab` always names a tab that exists.
 //! * `ws.windows` is a *derived* view: it is nothing but a mapping from projects onto
@@ -23,8 +27,8 @@ use std::path::{Path, PathBuf};
 
 use cide_ipc::{
     Axis, DiffOrigin, DiffSpec, Pane, PaneId, PaneKind, PaneRole, Project, ProjectId, ProjectRoot,
-    SessionId, SettingsSection, Side, Tab, TabId, TabKind, WindowLabel, WindowMode, WindowRole,
-    Workspace,
+    SessionId, SettingsSection, Side, Tab, TabId, TabKind, UnsavedTab, WindowLabel, WindowMode,
+    WindowRole, Workspace,
 };
 use indexmap::IndexMap;
 
@@ -146,7 +150,24 @@ pub fn activate_project(ws: &mut Workspace, project: ProjectId) {
 ///
 /// Sessions are owned by the core, not by the project record, so nothing here kills a
 /// child process; the caller decides that separately.
-pub fn close_project(ws: &mut Workspace, id: ProjectId) -> Result<()> {
+///
+/// `force` is the opt-in that discards unsaved edits. Without it, a project holding a dirty
+/// file tab is refused with [`CoreError::UnsavedChanges`] naming every such tab: closing a
+/// project closes its tabs, so the same data loss is reachable here as through
+/// [`close_tab`], and guarding only the narrower gesture would leave the wider one open.
+pub fn close_project(ws: &mut Workspace, id: ProjectId, force: bool) -> Result<()> {
+    if !ws.projects.contains_key(&id) {
+        return Err(CoreError::NoSuchProject(id));
+    }
+    // Checked before the removal, not after: once the project is out of the map its tabs are
+    // gone with it and there is nothing left to name in the refusal.
+    if !force {
+        let tabs = unsaved_tabs(ws, Some(id));
+        if !tabs.is_empty() {
+            return Err(CoreError::UnsavedChanges { tabs });
+        }
+    }
+
     // `shift_remove`, not `swap_remove`: insertion order is the header tab order.
     if ws.projects.shift_remove(&id).is_none() {
         return Err(CoreError::NoSuchProject(id));
@@ -259,17 +280,85 @@ pub fn open_tab(
     Ok(id)
 }
 
+/// Every file tab with unsaved edits, in header order then tab order.
+///
+/// `only` narrows to one project; `None` answers for the whole workspace, which is what the
+/// quit path asks. Both callers want the same list in the same shape, and a second traversal
+/// that agreed with this one by inspection is a second traversal that stops agreeing.
+///
+/// A tab is unsaved when it is a [`TabKind::File`] whose `dirty` flag is set. Nothing else
+/// in the tree can hold unwritten work: a diff tab's edits are answered rather than saved,
+/// and a terminal has no buffer.
+pub fn unsaved_tabs(ws: &Workspace, only: Option<ProjectId>) -> Vec<UnsavedTab> {
+    let mut out = Vec::new();
+    for (id, p) in &ws.projects {
+        if only.is_some_and(|wanted| wanted != *id) {
+            continue;
+        }
+        for t in &p.tabs {
+            if let Some(unsaved) = describe_unsaved(*id, p, t) {
+                out.push(unsaved);
+            }
+        }
+    }
+    out
+}
+
+/// One tab's unsaved state, or `None` when it holds nothing to lose.
+///
+/// Errors rather than answering `None` for an id that does not exist, so a caller cannot
+/// read "no such tab" as "nothing at risk" — that mistake fails open, which is the one
+/// direction this guard must never fail.
+pub fn unsaved_in_tab(
+    ws: &Workspace,
+    project: ProjectId,
+    tab: TabId,
+) -> Result<Option<UnsavedTab>> {
+    let p = self::project(ws, project)?;
+    let t = p
+        .tabs
+        .iter()
+        .find(|t| t.id == tab)
+        .ok_or(CoreError::NoSuchTab(tab))?;
+    Ok(describe_unsaved(project, p, t))
+}
+
 /// Close a tab, activating the tab to its left if it was the active one, and dropping any
 /// window detached from it.
 ///
-/// `tabs[0]` is the pinned console and returns [`CoreError::TabPinned`].
-pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Result<()> {
-    let p = project_mut(ws, project)?;
-    let index = index_of_tab(p, tab)?;
+/// Two refusals, and they are refusals rather than frontend courtesies for the same reason:
+///
+/// * `tabs[0]` is the pinned console — [`CoreError::TabPinned`].
+/// * a [`TabKind::File`] tab with `dirty` set, unless `force` — [`CoreError::UnsavedChanges`],
+///   carrying the tab so the caller can name the file it is about to lose.
+///
+/// `force` is a *bool* rather than a second function (`close_tab_discarding`) because the
+/// call sites are the same call sites: the frontend calls this, is refused, shows the
+/// dialog, and calls it again with the user's answer. Two functions would put the choice of
+/// which to call in the hands of whoever wrote the call site, and the wrong choice there is
+/// silent — a bool is impossible to pass by accident and greps in one line.
+pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool) -> Result<()> {
+    // Both checks run against an immutable borrow and precede every mutation, so a refusal
+    // leaves the workspace exactly as it was — including `rev`, which a caller uses to
+    // decide whether a snapshot it holds is stale.
+    //
+    // The pinned check is first because the console is never a file tab, so reporting
+    // `UnsavedChanges` for it could not happen today; ordering it deliberately means the
+    // answer does not depend on that staying true.
+    let index = index_of_tab(self::project(ws, project)?, tab)?;
     if index == 0 {
         return Err(CoreError::TabPinned);
     }
+    // Through the shared query rather than reading `tab.kind` here: `unsaved_in_tab` is what
+    // the rest of the app asks, and a guard that decides "unsaved" its own way is a guard
+    // that will one day disagree with the dialog it triggers.
+    if !force && let Some(unsaved) = unsaved_in_tab(ws, project, tab)? {
+        return Err(CoreError::UnsavedChanges {
+            tabs: vec![unsaved],
+        });
+    }
 
+    let p = project_mut(ws, project)?;
     p.tabs.remove(index);
     if p.active_tab == tab {
         // Removal has already shifted the right-hand neighbour into `index`, so `index - 1`
@@ -793,6 +882,26 @@ fn validate_windows(ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
+/// Describe `t` as an [`UnsavedTab`], or `None` if it is not a dirty file tab.
+///
+/// The one place that decides what "unsaved" means, so [`unsaved_tabs`] and
+/// [`unsaved_in_tab`] cannot answer differently about the same tab — which they would
+/// eventually, as one of them grew a case the other did not.
+fn describe_unsaved(id: ProjectId, p: &Project, t: &Tab) -> Option<UnsavedTab> {
+    let TabKind::File { path, dirty: true } = &t.kind else {
+        return None;
+    };
+    Some(UnsavedTab {
+        tab: t.id,
+        project: id,
+        project_name: p.name.clone(),
+        path: path.clone(),
+        // `TabKind::title` rather than a second basename computation here: the dialog names
+        // the tab the user is looking at, so it has to be the string the tab strip drew.
+        title: t.kind.title(),
+    })
+}
+
 /// The header dot for a project about to be opened.
 ///
 /// The first unused colour rather than `len % palette`: closing a project frees its colour,
@@ -1010,6 +1119,20 @@ mod tests {
         demo_pane(PaneKind::Shell, "test : bash", true)
     }
 
+    /// Open a file tab over `path`, clean or dirty. What `tab_open_file` followed by
+    /// `tab_set_dirty` produces, without the app layer.
+    fn open_file(ws: &mut Workspace, project: ProjectId, path: &str, dirty: bool) -> TabId {
+        let path = PathBuf::from(path);
+        let title = basename(&path);
+        open_tab(
+            ws,
+            project,
+            TabKind::File { path, dirty },
+            demo_pane(PaneKind::Editor, &title, false),
+        )
+        .expect("a file tab opens")
+    }
+
     fn depth(node: &LayoutNode) -> usize {
         match node {
             LayoutNode::Leaf { .. } => 1,
@@ -1104,7 +1227,7 @@ mod tests {
         let mut ws = Workspace::default();
         let a = open(&mut ws, "/home/dev/a");
         let b = open(&mut ws, "/home/dev/b");
-        close_project(&mut ws, a).expect("closes");
+        close_project(&mut ws, a, false).expect("closes");
         let c = open(&mut ws, "/home/dev/c");
 
         assert_ne!(
@@ -1120,8 +1243,206 @@ mod tests {
         let id = open(&mut ws, "/home/dev/work/cide");
         let console = console_tab(&ws, id).expect("exists");
 
-        assert_eq!(close_tab(&mut ws, id, console), Err(CoreError::TabPinned));
+        assert_eq!(
+            close_tab(&mut ws, id, console, false),
+            Err(CoreError::TabPinned)
+        );
         assert_eq!(project(&ws, id).expect("exists").tabs.len(), 1);
+    }
+
+    // --- the unsaved-close guard ---------------------------------------------------
+    //
+    // These are the tests for the defect that a file tab with unsaved edits closed silently
+    // and the edits were gone. The rule lives here, in the domain, rather than in the
+    // dialog: the dialog is what a user sees, this is what makes it impossible to skip.
+
+    #[test]
+    fn a_dirty_file_tab_does_not_close_without_force() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", true);
+        let rev = ws.rev;
+
+        let refused = close_tab(&mut ws, id, tab, false);
+
+        // The refusal *names* the file. A caller told only "no" cannot write the dialog,
+        // and a dialog that says "1 item" gives the user nothing to decide on.
+        let Err(CoreError::UnsavedChanges { tabs }) = refused else {
+            panic!("a dirty tab must not close without force, got {refused:?}");
+        };
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].tab, tab);
+        assert_eq!(tabs[0].project, id);
+        assert_eq!(tabs[0].title, "main.rs");
+        assert_eq!(
+            tabs[0].path,
+            PathBuf::from("/home/dev/work/cide/src/main.rs")
+        );
+
+        assert_eq!(
+            project(&ws, id).expect("exists").tabs.len(),
+            2,
+            "still open"
+        );
+        assert_eq!(
+            ws.rev, rev,
+            "a refused mutation does not advance the revision"
+        );
+        validate(&ws).expect("nothing was half-done");
+    }
+
+    #[test]
+    fn a_dirty_file_tab_closes_when_forced() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", true);
+
+        close_tab(&mut ws, id, tab, true).expect("force discards the buffer");
+        assert_eq!(project(&ws, id).expect("exists").tabs.len(), 1);
+        validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn a_clean_file_tab_closes_without_force() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", false);
+
+        // The other half of the rule, and the half that keeps the dialog worth reading: a
+        // confirmation that fires when nothing is at risk is one users dismiss unread.
+        close_tab(&mut ws, id, tab, false).expect("nothing is at risk");
+        assert_eq!(project(&ws, id).expect("exists").tabs.len(), 1);
+    }
+
+    #[test]
+    fn saving_a_tab_clears_the_refusal() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", true);
+        assert!(close_tab(&mut ws, id, tab, false).is_err());
+
+        // What `tab_set_dirty(false)` does after a successful write.
+        let TabKind::File { dirty, .. } = &mut tab_mut(&mut ws, id, tab).expect("exists").kind
+        else {
+            panic!("a file tab");
+        };
+        *dirty = false;
+
+        close_tab(&mut ws, id, tab, false).expect("a saved tab closes like any other");
+    }
+
+    #[test]
+    fn a_project_holding_a_dirty_tab_does_not_close_and_names_every_one() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        open_file(&mut ws, id, "/home/dev/work/cide/a.rs", true);
+        open_file(&mut ws, id, "/home/dev/work/cide/clean.rs", false);
+        open_file(&mut ws, id, "/home/dev/work/cide/b.rs", true);
+
+        // Closing a project closes its tabs, so the same buffers are at stake as in
+        // `close_tab`. Guarding only the narrower gesture would leave the wider one open.
+        let Err(CoreError::UnsavedChanges { tabs }) = close_project(&mut ws, id, false) else {
+            panic!("a project holding unsaved work must not close without force");
+        };
+        assert_eq!(
+            tabs.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs"],
+            "every dirty tab, and only the dirty ones"
+        );
+        assert!(ws.projects.contains_key(&id), "the project is still open");
+
+        close_project(&mut ws, id, true).expect("force discards them");
+        assert!(!ws.projects.contains_key(&id));
+        validate(&ws).expect("valid");
+    }
+
+    #[test]
+    fn unsaved_tabs_answers_for_one_project_or_for_all_of_them() {
+        let mut ws = Workspace::default();
+        let a = open(&mut ws, "/home/dev/a");
+        let b = open(&mut ws, "/home/dev/b");
+        open_file(&mut ws, a, "/home/dev/a/one.rs", true);
+        open_file(&mut ws, b, "/home/dev/b/two.rs", true);
+        open_file(&mut ws, b, "/home/dev/b/three.rs", false);
+
+        assert_eq!(
+            unsaved_tabs(&ws, Some(a))
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one.rs"]
+        );
+        // The whole-workspace answer, which is what the quit path asks for.
+        assert_eq!(
+            unsaved_tabs(&ws, None)
+                .iter()
+                .map(|t| t.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one.rs", "two.rs"]
+        );
+        assert!(unsaved_tabs(&Workspace::default(), None).is_empty());
+    }
+
+    #[test]
+    fn only_dirty_file_tabs_count_as_unsaved() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        // A console, a full Claude tab and a diff tab. None of them holds a buffer: a diff
+        // is answered rather than saved, and a terminal has nothing to write.
+        open_tab(
+            &mut ws,
+            id,
+            TabKind::ClaudeFull {
+                title: "one".into(),
+            },
+            aux_pane(),
+        )
+        .expect("opens");
+        open_tab(
+            &mut ws,
+            id,
+            TabKind::Diff {
+                spec: DiffSpec {
+                    title: "main.rs".into(),
+                    old_path: PathBuf::from("/home/dev/work/cide/src/main.rs"),
+                    new_path: PathBuf::from("/home/dev/work/cide/src/main.rs.new"),
+                    origin: DiffOrigin::Git,
+                },
+            },
+            demo_pane(PaneKind::Diff, "main.rs — diff", false),
+        )
+        .expect("opens");
+
+        assert!(unsaved_tabs(&ws, None).is_empty());
+    }
+
+    #[test]
+    fn unsaved_in_tab_reports_an_unknown_tab_rather_than_answering_none() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let ghost = TabId::new();
+
+        // Failing open here would be the whole bug back again: a caller reading "no such
+        // tab" as "nothing at risk" closes over a buffer it never looked at.
+        assert_eq!(
+            unsaved_in_tab(&ws, id, ghost),
+            Err(CoreError::NoSuchTab(ghost))
+        );
+    }
+
+    #[test]
+    fn the_pinned_console_is_refused_as_pinned_not_as_unsaved() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        open_file(&mut ws, id, "/home/dev/work/cide/src/main.rs", true);
+
+        // Two refusals can apply to one project; the console's own reason is the one that
+        // has to come back, or the frontend offers to discard edits that were never at risk.
+        assert_eq!(
+            close_tab(&mut ws, id, console, false),
+            Err(CoreError::TabPinned)
+        );
     }
 
     #[test]
@@ -1160,7 +1481,7 @@ mod tests {
         .expect("opens");
 
         assert_eq!(project(&ws, id).expect("exists").active_tab, second);
-        close_tab(&mut ws, id, second).expect("a full tab closes");
+        close_tab(&mut ws, id, second, false).expect("a full tab closes");
         assert_eq!(project(&ws, id).expect("exists").active_tab, first);
         validate(&ws).expect("still valid");
     }
@@ -1188,7 +1509,7 @@ mod tests {
         )
         .expect("opens");
 
-        close_tab(&mut ws, id, doomed).expect("closes");
+        close_tab(&mut ws, id, doomed, false).expect("closes");
         assert_eq!(project(&ws, id).expect("exists").active_tab, kept);
     }
 
@@ -1219,7 +1540,7 @@ mod tests {
         let extra = split_console(&mut ws, id);
         let stray = detach_pane(&mut ws, id, console, extra).expect("detaches");
 
-        close_tab(&mut ws, id, doomed).expect("closes");
+        close_tab(&mut ws, id, doomed, false).expect("closes");
         assert!(!ws.windows.contains_key(&detached));
         assert!(
             ws.windows.contains_key(&stray),
@@ -1319,7 +1640,7 @@ mod tests {
 
         // Closing the home tab drops windows detached *from* it, but this pane's window is
         // keyed on the pane, and the pane is still alive in the project.
-        close_tab(&mut ws, id, home).expect("closes");
+        close_tab(&mut ws, id, home, false).expect("closes");
         if ws.windows.contains_key(&label) {
             redock_pane(&mut ws, &label).expect("redocks into the console");
             let console = console_tab(&ws, id).expect("exists");
@@ -1716,7 +2037,7 @@ mod tests {
             },
         );
 
-        close_project(&mut ws, a).expect("closes");
+        close_project(&mut ws, a, false).expect("closes");
         assert!(!ws.windows.contains_key(&detached));
         assert!(ws.projects.contains_key(&b));
         validate(&ws).expect("valid");
@@ -1736,7 +2057,7 @@ mod tests {
             },
         );
 
-        close_project(&mut ws, a).expect("closes");
+        close_project(&mut ws, a, false).expect("closes");
         assert!(ws.windows.contains_key(&detached));
         validate(&ws).expect("valid");
     }
@@ -1746,7 +2067,7 @@ mod tests {
         let mut ws = Workspace::default();
         let a = open(&mut ws, "/home/dev/a");
 
-        close_project(&mut ws, a).expect("closes");
+        close_project(&mut ws, a, false).expect("closes");
 
         // Dropping the window would leave the app with nothing on screen. What the user
         // should see is the empty frame with a `+` in its header, which is a shell holding
@@ -1787,7 +2108,7 @@ mod tests {
             Err(CoreError::NoSuchProject(ghost_project))
         );
         assert_eq!(
-            close_project(&mut ws, ghost_project),
+            close_project(&mut ws, ghost_project, false),
             Err(CoreError::NoSuchProject(ghost_project))
         );
         assert_eq!(
@@ -1799,7 +2120,7 @@ mod tests {
             Err(CoreError::NoSuchTab(ghost_tab))
         );
         assert_eq!(
-            close_tab(&mut ws, id, ghost_tab),
+            close_tab(&mut ws, id, ghost_tab, false),
             Err(CoreError::NoSuchTab(ghost_tab))
         );
     }
@@ -1838,7 +2159,7 @@ mod tests {
         )
         .expect("opens");
         assert_eq!(ws.rev, 2);
-        close_tab(&mut ws, id, full).expect("closes");
+        close_tab(&mut ws, id, full, false).expect("closes");
         assert_eq!(ws.rev, 3);
         assert_eq!(bump(&mut ws), 4);
     }

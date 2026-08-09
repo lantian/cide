@@ -175,9 +175,9 @@ export function EditorSurface({
       // that fails — read-only mount, disk full, the file replaced by a directory — would
       // leave a tab that looks saved over a buffer that is not, and the dot in the tab strip
       // is the only thing telling the user otherwise. Nothing currently *blocks* a close on
-      // that flag (`tab_close` does not consult it, and the `confirmCloseWithLiveSession`
-      // setting is unwired), so staying dirty through a failed save is not a belt-and-braces
-      // measure — it is the whole warning.
+      // that flag, and Rust now *refuses* to close a tab carrying it without an explicit
+      // `force`, so staying dirty through a failed save is not a belt-and-braces measure —
+      // it is what puts the close confirmation in front of the user.
       void Promise.resolve(saveCb.current?.(text)).then(
         () => {
           baseline = saving

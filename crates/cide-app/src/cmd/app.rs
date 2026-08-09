@@ -127,36 +127,78 @@ fn claude_version() -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// What closing would interrupt.
+/// What closing would cost: unsaved buffers, and interrupted Claude turns.
 ///
 /// Answers for the whole app when `project` is `None`, and for one project otherwise. The
-/// frontend asks before it closes anything and shows a confirmation only when the answer is
-/// non-empty.
+/// caller asks before it closes anything and confirms only when the answer is non-empty —
+/// see `QuitDecision::is_clear`.
 ///
-/// "Live" is `Busy | AwaitingPermission`, never "a process exists" — see
-/// `cide_claude::state`. A session sitting at a prompt has nothing to lose by being closed,
-/// and warning about it would train people to dismiss the dialog.
+/// # The two halves are governed differently, and deliberately so
 ///
-/// With no hook server running, the answer is empty rather than pessimistic: without hooks
-/// there is no evidence any session is busy, and inventing one would put a dialog in front of
-/// every close for the life of that run.
+/// **Unsaved file tabs** are always reported. This is destruction: the edits exist in no
+/// other place, and a quit takes them with it. `Settings::confirm_close_with_live_session`
+/// does not suppress them, because that setting is about *sessions* — its label in the
+/// Settings tab reads "Confirm before closing a project with a live session" — and a user
+/// who turns it off has said something about agent turns, not about their own typing.
+/// Reading it as authority over unsaved buffers would let one toggle, worded about
+/// something else, silently disable the only guard against losing work.
+///
+/// **Live sessions** are reported only when that setting is on. "Live" is
+/// `Busy | AwaitingPermission`, never "a process exists" — see `cide_claude::state`. A
+/// session sitting at a prompt has nothing to lose by being closed, and warning about it
+/// would train people to dismiss the dialog. Even a busy one loses only its turn: the
+/// conversation is keyed by `SessionId` and resumes with `claude --resume`. That is
+/// recoverable, so it is reasonable for a user to switch the warning off, and the setting
+/// defaults off because that is what the design mock's toggle shows.
+///
+/// With no hook server running, the session half is empty rather than pessimistic: without
+/// hooks there is no evidence any session is busy, and inventing one would put a dialog in
+/// front of every close for the life of that run. The unsaved half is unaffected — it is
+/// read from the workspace tree, which is always there.
+///
+/// # This is advice, not enforcement
+///
+/// `tab_close`, `project_close` and `window_close` refuse unsaved work themselves and have
+/// to be told `force`. Quitting has no such chokepoint: the runtime tears the process down
+/// and no domain operation runs. So for the quit path specifically, a caller that never asks
+/// still loses buffers — which is why the editor writes through `file_write` on save rather
+/// than holding a buffer Rust cannot see, and why this command exists at all.
 #[tauri::command(rename_all = "camelCase")]
 pub fn app_quit_requested(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: Option<cide_ipc::ProjectId>,
 ) -> cide_ipc::QuitDecision {
+    let unsaved = state.with(|ws| cide_core::workspace::unsaved_tabs(ws, project));
+
+    let blocking = live_sessions(&app, &state, project);
+    cide_ipc::QuitDecision { blocking, unsaved }
+}
+
+/// The `Busy | AwaitingPermission` sessions a close would interrupt.
+///
+/// Empty when the user has turned `confirm_close_with_live_session` off, or when no hook
+/// server is running. Split out of [`app_quit_requested`] so that the setting is consulted
+/// in exactly one place and the unsaved-tab half cannot accidentally inherit it.
+fn live_sessions(
+    app: &tauri::AppHandle,
+    state: &State<'_, WorkspaceState>,
+    project: Option<cide_ipc::ProjectId>,
+) -> Vec<cide_ipc::SessionSummary> {
+    if !state.with(|ws| ws.settings.confirm_close_with_live_session) {
+        return vec![];
+    }
     let Some(hooks) = app.try_state::<crate::hooks::HookServer>() else {
-        return cide_ipc::QuitDecision { blocking: vec![] };
+        return vec![];
     };
 
     let live: std::collections::HashSet<cide_ipc::SessionId> =
         hooks.live_sessions().into_iter().collect();
     if live.is_empty() {
-        return cide_ipc::QuitDecision { blocking: vec![] };
+        return vec![];
     }
 
-    let blocking = state.with(|ws| {
+    state.with(|ws| {
         let mut out = Vec::new();
         for (id, p) in &ws.projects {
             if project.is_some_and(|only| only != *id) {
@@ -181,7 +223,5 @@ pub fn app_quit_requested(
             }
         }
         out
-    });
-
-    cide_ipc::QuitDecision { blocking }
+    })
 }

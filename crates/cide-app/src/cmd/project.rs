@@ -45,11 +45,17 @@ pub fn project_open(
     Ok(id)
 }
 
+/// Close a project, its tabs and its windows.
+///
+/// `force` is the caller's statement that the user has been shown, and accepted, whatever
+/// unsaved edits the project holds. Without it a dirty file tab anywhere in the project is
+/// [`CoreError::UnsavedChanges`] — see `cide_core::workspace::close_project`.
 #[tauri::command(rename_all = "camelCase")]
 pub fn project_close(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
+    force: bool,
 ) -> Result<Mutated, CoreError> {
     // Read before the mutation: once the project is gone the diff tabs are gone with it, and
     // with them the only record of which agent turns are still blocked waiting on them.
@@ -59,7 +65,7 @@ pub fn project_close(
         .unwrap_or_default();
 
     let out = state.update(|ws| {
-        workspace::close_project(ws, project)?;
+        workspace::close_project(ws, project, force)?;
         Ok(Mutated { rev: ws.rev })
     })?;
 
@@ -141,15 +147,22 @@ pub fn tab_activate(
 
 /// Close a tab.
 ///
-/// Returns [`CoreError::TabPinned`] for the project console. The frontend also declines to
-/// draw a close button on it, but that is a courtesy — this is the enforcement, so no UI
-/// bug can lose a project's console.
+/// Two refusals come back from the domain, and both are enforcement rather than courtesy:
+///
+/// * [`CoreError::TabPinned`] for the project console. The frontend also declines to draw a
+///   close button on it, but that is the courtesy — this is why no UI bug can lose it.
+/// * [`CoreError::UnsavedChanges`] for a file tab with unsaved edits, unless `force`. The
+///   frontend answers that by showing `CloseConfirm` naming the file, and calls again with
+///   `force: true` if the user chooses to discard. A `×` on a tab is one click away from a
+///   lost afternoon, and the only thing standing between the two is this refusal — the
+///   dialog is not, because a dialog that fails to render fails open.
 #[tauri::command(rename_all = "camelCase")]
 pub fn tab_close(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     tab: TabId,
+    force: bool,
 ) -> Result<Mutated, CoreError> {
     // Closing a diff tab **rejects** it, and this is a deliberate divergence worth naming.
     //
@@ -163,7 +176,7 @@ pub fn tab_close(
     let dismissed = crate::ide::request_id_for_tab(&state, project, tab);
 
     let out = state.update(|ws| {
-        workspace::close_tab(ws, project, tab)?;
+        workspace::close_tab(ws, project, tab, force)?;
         Ok(Mutated { rev: ws.rev })
     })?;
 

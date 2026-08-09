@@ -79,10 +79,79 @@ export function ModalShell({
   const showBlockCaret = caretAtEnd
 
   return (
+    <OverlayCard label={label} onDismiss={onDismiss}>
+      <div className={styles.inputRow}>
+        <span
+          className={promptAccent === true ? `${styles.prompt} ${styles.promptAccent}` : styles.prompt}
+          aria-hidden="true"
+        >
+          {prompt}
+        </span>
+        <div className={styles.field}>
+          <input
+            ref={input}
+            className={showBlockCaret ? `${styles.input} ${styles.inputHiddenCaret}` : styles.input}
+            data-audit="overlayInput"
+            value={value}
+            placeholder={placeholder}
+            spellCheck={false}
+            autoComplete="off"
+            autoCorrect="off"
+            aria-label={label}
+            onChange={(ev) => onChange(ev.target.value)}
+            onKeyDown={onKeyDown}
+          />
+          {showBlockCaret && (
+            // `ch` is exact here because the field is monospaced; see Overlay.module.css.
+            <span
+              className={styles.caret}
+              style={{ left: `${value.length}ch` }}
+              aria-hidden="true"
+            />
+          )}
+        </div>
+        {counter !== undefined && (
+          <span className={styles.counter} data-audit="overlayCounter">
+            {counter}
+          </span>
+        )}
+      </div>
+
+      <div className={styles.list} ref={scrollRef} data-audit="overlayList">
+        {children}
+      </div>
+
+      <div className={styles.footer} data-audit="overlayFooter">
+        {footer}
+      </div>
+    </OverlayCard>
+  )
+}
+
+/**
+ * The scrim and the 620px card, without an opinion about what goes inside them.
+ *
+ * Extracted from `ModalShell` when the close confirmation arrived: that dialog wants the
+ * same ground, width, radius, shadow and scrim, and none of the search apparatus above —
+ * no input, no counter, no scroll container for a virtualizer. Copying the two elements
+ * would have been three lines and a second definition of what an overlay looks like in this
+ * app, which is how the file picker and the confirmation end up 4px apart after someone
+ * adjusts one of them.
+ */
+export function OverlayCard({
+  label,
+  onDismiss,
+  children,
+}: {
+  label: string
+  onDismiss: () => void
+  children: ReactNode
+}) {
+  return (
     // Click-through to dismiss is on the scrim only; `stopPropagation` on the card keeps a
     // click inside from closing it. A `<div>` rather than `<dialog>`: `showModal()` moves
     // the element into the top layer and takes focus itself, which fights the focus rule
-    // above and puts the overlay outside the token-scoped `data-theme` subtree.
+    // in `ModalShell` and puts the overlay outside the token-scoped `data-theme` subtree.
     <div className={styles.scrim} data-audit="overlayScrim" onMouseDown={onDismiss}>
       <div
         className={styles.card}
@@ -92,52 +161,7 @@ export function ModalShell({
         aria-label={label}
         onMouseDown={(ev) => ev.stopPropagation()}
       >
-        <div className={styles.inputRow}>
-          <span
-            className={promptAccent === true ? `${styles.prompt} ${styles.promptAccent}` : styles.prompt}
-            aria-hidden="true"
-          >
-            {prompt}
-          </span>
-          <div className={styles.field}>
-            <input
-              ref={input}
-              className={
-                showBlockCaret ? `${styles.input} ${styles.inputHiddenCaret}` : styles.input
-              }
-              data-audit="overlayInput"
-              value={value}
-              placeholder={placeholder}
-              spellCheck={false}
-              autoComplete="off"
-              autoCorrect="off"
-              aria-label={label}
-              onChange={(ev) => onChange(ev.target.value)}
-              onKeyDown={onKeyDown}
-            />
-            {showBlockCaret && (
-              // `ch` is exact here because the field is monospaced; see Overlay.module.css.
-              <span
-                className={styles.caret}
-                style={{ left: `${value.length}ch` }}
-                aria-hidden="true"
-              />
-            )}
-          </div>
-          {counter !== undefined && (
-            <span className={styles.counter} data-audit="overlayCounter">
-              {counter}
-            </span>
-          )}
-        </div>
-
-        <div className={styles.list} ref={scrollRef} data-audit="overlayList">
-          {children}
-        </div>
-
-        <div className={styles.footer} data-audit="overlayFooter">
-          {footer}
-        </div>
+        {children}
       </div>
     </div>
   )

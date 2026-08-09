@@ -3,5 +3,6 @@ import type { PaneId } from "./PaneId";
 import type { ProjectId } from "./ProjectId";
 import type { SplitId } from "./SplitId";
 import type { TabId } from "./TabId";
+import type { UnsavedTab } from "./UnsavedTab";
 
-export type CoreError = { "kind": "tabPinned" } | { "kind": "panePrimary" } | { "kind": "lastTab" } | { "kind": "lastPane" } | { "kind": "noRoots" } | { "kind": "noSuchProject", "detail": ProjectId } | { "kind": "noSuchTab", "detail": TabId } | { "kind": "noSuchPane", "detail": PaneId } | { "kind": "noSuchSplit", "detail": SplitId } | { "kind": "noSuchCommand", "detail": string } | { "kind": "indexOutOfRange", "detail": { index: number, len: number, } } | { "kind": "invariant", "detail": string } | { "kind": "io", "detail": string } | { "kind": "serde", "detail": string };
+export type CoreError = { "kind": "tabPinned" } | { "kind": "unsavedChanges", "detail": { tabs: Array<UnsavedTab>, } } | { "kind": "panePrimary" } | { "kind": "lastTab" } | { "kind": "lastPane" } | { "kind": "noRoots" } | { "kind": "noSuchProject", "detail": ProjectId } | { "kind": "noSuchTab", "detail": TabId } | { "kind": "noSuchPane", "detail": PaneId } | { "kind": "noSuchSplit", "detail": SplitId } | { "kind": "noSuchCommand", "detail": string } | { "kind": "indexOutOfRange", "detail": { index: number, len: number, } } | { "kind": "invariant", "detail": string } | { "kind": "io", "detail": string } | { "kind": "serde", "detail": string };

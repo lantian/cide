@@ -12,11 +12,14 @@
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
 import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
+import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
+import type { CloseScope } from '@/chrome/closeConfirm'
 import {
   app as appApi,
   events,
   pane as paneApi,
   session as sessionApi,
+  unsavedChanges,
   windows as windowApi,
   project as projectApi,
   tab as tabApi,
@@ -27,6 +30,7 @@ import {
   type Project,
   type ProjectId,
   type SessionId,
+  type SessionSummary,
   type Side,
   type SplitId,
   type SplitIntent,
@@ -46,6 +50,59 @@ function nextFrame(): Promise<void> {
   })
 }
 
+/**
+ * Run a close command, turning the domain's unsaved-work refusal into a confirmation.
+ *
+ * Returns true when the close was *not* performed and a dialog is now up; false when it
+ * went through. Any other failure re-throws — a close that fails for an unrelated reason is
+ * not something to swallow behind a dialog about unsaved files.
+ *
+ * A shared helper rather than a copy in each close path: the two are one sentence apart and
+ * the difference between them is the scope word, so a copy would eventually differ in
+ * whether it re-throws — and the version that swallows loses errors silently.
+ */
+async function refused(
+  scope: CloseScope,
+  run: () => Promise<unknown>,
+  proceed: () => Promise<void>,
+): Promise<boolean> {
+  try {
+    await run()
+    return false
+  } catch (e) {
+    const unsaved = unsavedChanges(e)
+    if (!unsaved) throw e
+    requestCloseConfirm({ scope, unsaved, sessions: [], proceed })
+    return true
+  }
+}
+
+/**
+ * The `Busy | AwaitingPermission` sessions bound to panes in one tab.
+ *
+ * Answers `[]` without an IPC call when the tab has no session bound at all, which is every
+ * file tab and every diff tab. The session ids come from the local mirror and the *states*
+ * from Rust, because only the hook server knows which are mid-turn — and `app.quitRequested`
+ * already applies the `confirmCloseWithLiveSession` setting, so this inherits it.
+ */
+async function liveSessionsInTab(
+  boot: Bootstrap | null,
+  project: ProjectId,
+  tab: TabId,
+): Promise<SessionSummary[]> {
+  const target = boot?.workspace.projects[project]?.tabs.find((t) => t.id === tab)
+  if (!target) return []
+  const bound = new Set(
+    Object.values(target.tree.panes)
+      .map((pane) => pane.session)
+      .filter((session): session is SessionId => session !== null),
+  )
+  if (bound.size === 0) return []
+
+  const decision = await appApi.quitRequested(project)
+  return decision.blocking.filter((s) => bound.has(s.session))
+}
+
 interface WorkspaceStore {
   /** Null until the first `app.getBootstrap` resolves. */
   boot: Bootstrap | null
@@ -56,10 +113,24 @@ interface WorkspaceStore {
   subscribe: () => Promise<() => void>
   /** Open a project and re-read the tree. */
   openProject: (paths: string[]) => Promise<void>
-  closeProject: (id: ProjectId) => Promise<void>
+  /**
+   * Close a project. Confirms first when it holds unsaved edits or a session mid-turn.
+   *
+   * `force` is the answer coming back from that confirmation and is never passed by a call
+   * site that has not shown it — see `closeTab`.
+   */
+  closeProject: (id: ProjectId, force?: boolean) => Promise<void>
   newClaudeTab: (project: ProjectId) => Promise<TabId>
   activateTab: (project: ProjectId, tab: TabId) => Promise<void>
-  closeTab: (project: ProjectId, tab: TabId) => Promise<void>
+  /**
+   * Close a tab, confirming first if that would lose something.
+   *
+   * Call sites pass two arguments and get the guard for free: with unsaved edits in the tab
+   * this parks a `PendingClose` and resolves without closing, and the dialog's answer calls
+   * back in with `force: true`. The refusal itself comes from Rust, so a call site that
+   * bypassed this store still could not discard a buffer.
+   */
+  closeTab: (project: ProjectId, tab: TabId, force?: boolean) => Promise<void>
 
   splitPane: (
     project: ProjectId,
@@ -134,8 +205,31 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await projectApi.open(paths)
     await get().hydrate()
   },
-  closeProject: async (id) => {
-    await projectApi.close(id)
+  closeProject: async (id, force = false) => {
+    // Asked *before* the command, unlike `closeTab`, because a project close can be blocked
+    // by something Rust does not refuse: a Claude session mid-turn. Rust has no business
+    // refusing that — an interrupted turn is recoverable and the user may have turned the
+    // warning off — so the only way to warn about it is to ask.
+    if (!force) {
+      const decision = await appApi.quitRequested(id)
+      if (decision.unsaved.length > 0 || decision.blocking.length > 0) {
+        requestCloseConfirm({
+          scope: 'project',
+          unsaved: decision.unsaved,
+          sessions: decision.blocking,
+          proceed: () => get().closeProject(id, true),
+        })
+        return
+      }
+    }
+    // Still guarded on the way out: a buffer can go dirty between the question and the
+    // answer, and the refusal is the thing that makes that race harmless.
+    const parked = await refused(
+      'project',
+      () => projectApi.close(id, force),
+      () => get().closeProject(id, true),
+    )
+    if (parked) return
     await get().hydrate()
   },
   newClaudeTab: async (project) => {
@@ -147,8 +241,33 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await tabApi.activate(project, tab)
     await get().hydrate()
   },
-  closeTab: async (project, tab) => {
-    await tabApi.close(project, tab)
+  closeTab: async (project, tab, force = false) => {
+    // No pre-flight question here, unlike `closeProject`: the unsaved case comes back from
+    // Rust as a refusal that already names the file, so asking first would be a second round
+    // trip for an answer the failure path hands over anyway — and it would be the answer to
+    // a slightly older workspace.
+    //
+    // Sessions are the exception, and they are asked about only when this tab actually has
+    // one bound. A file tab has no session, and paying an IPC round trip to be told so on
+    // every `×` is exactly the kind of cost that gets a guard removed later.
+    if (!force) {
+      const live = await liveSessionsInTab(get().boot, project, tab)
+      if (live.length > 0) {
+        requestCloseConfirm({
+          scope: 'tab',
+          unsaved: [],
+          sessions: live,
+          proceed: () => get().closeTab(project, tab, true),
+        })
+        return
+      }
+    }
+    const parked = await refused(
+      'tab',
+      () => tabApi.close(project, tab, force),
+      () => get().closeTab(project, tab, true),
+    )
+    if (parked) return
     await get().hydrate()
   },
 

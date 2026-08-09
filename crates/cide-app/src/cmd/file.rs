@@ -71,10 +71,12 @@ pub fn tab_open_file(
 /// window is a different JavaScript realm, and the tab strip that draws the dot is in the
 /// other one.
 ///
-/// Nothing yet *guards* on it. `tab_close` does not consult it and neither does
-/// `app_quit_requested`, so closing a tab with unsaved edits discards them without asking —
-/// the dot in the tab strip is the only warning there is. Putting the flag in the tree is
-/// what makes that guard writable in one place later; it is not that guard.
+/// It is also the guard. `cide_core::workspace::close_tab` refuses a tab carrying this flag
+/// unless the caller passes `force`, `close_project` refuses a project holding one, and
+/// `app_quit_requested` reports every one of them by name. Setting it therefore has a
+/// consequence beyond the dot in the tab strip: an editor that stops reporting a clean save
+/// leaves a tab the user can no longer close without a dialog, and one that stops reporting
+/// a dirty buffer takes the guard down with it.
 #[tauri::command(rename_all = "camelCase")]
 pub fn tab_set_dirty(
     state: State<'_, WorkspaceState>,

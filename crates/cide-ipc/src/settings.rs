@@ -36,6 +36,19 @@ pub struct Settings {
     /// "Confirm before closing a project with a live session." *Live* means a session is
     /// `Busy` or `AwaitingPermission` — not merely that a process exists, which would warn
     /// constantly.
+    ///
+    /// Read by `cide_app::cmd::app::app_quit_requested`, and by nothing else. Its whole
+    /// authority is over the `blocking` half of `QuitDecision`: off, and a close no longer
+    /// asks about an agent mid-turn.
+    ///
+    /// It governs **sessions only**, and specifically not unsaved file tabs, which are
+    /// reported whatever it says. The two are different kinds of loss. Interrupting a turn
+    /// costs the turn — the conversation is keyed by `SessionId` and resumes with
+    /// `claude --resume` — so a user may reasonably decide they do not want to be asked.
+    /// Discarding an unsaved buffer costs the work outright, with nothing to resume from,
+    /// and a toggle whose label says "live session" must not quietly turn that guard off
+    /// too. If unsaved edits ever need their own toggle, that is a second field with its own
+    /// wording, not a second meaning stapled to this one.
     pub confirm_close_with_live_session: bool,
 
     pub editor: EditorSettings,
