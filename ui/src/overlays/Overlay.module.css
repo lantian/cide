@@ -1,0 +1,276 @@
+/*
+ * The one 620px modal shell, shared by the file picker and the command palette.
+ *
+ * Every number here is transcribed from the mock's overlay spec: 620px wide, `--chrome`
+ * ground, a 1px `--border` outline, 9px radius, `--shadow`, 96px from the top of the window
+ * over `rgba(0,0,0,.42)`. The two overlays differ in their rows and their prompt glyph and
+ * in nothing else, which is why there is one shell and not two.
+ */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  /*
+   * The one literal colour in this file. It is a scrim opacity, not a surface colour: no
+   * token names it, and it must be the same in both themes — a light-theme scrim built from
+   * a light token would not darken anything.
+   */
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 96px;
+}
+
+.card {
+  width: 620px;
+  /* The mock is drawn at 1440px. Below ~660px the fixed width would overflow the window and
+     clip the counter, so it yields — the layout inside is already flexible. */
+  max-width: calc(100vw - 32px);
+  /* 96px above, and the same gutter below as at the sides, so a full list never runs off. */
+  max-height: calc(100vh - 96px - 32px);
+  display: flex;
+  flex-direction: column;
+  background: var(--chrome);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+  /* The list's rows are square-cornered; without this they paint over the card's radius. */
+  overflow: hidden;
+}
+
+.inputRow {
+  flex: none;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.prompt {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1;
+  color: var(--dim);
+  user-select: none;
+}
+
+/* The palette's `>` is accent; the picker's `›` is not. */
+.promptAccent {
+  color: var(--accent);
+}
+
+.field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.input {
+  width: 100%;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  padding: 0;
+  color: var(--text-hi);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+/* Only while the block caret is drawn — see `ModalShell`, which falls back to the native
+   caret whenever the insertion point is not at the end of the value. */
+.inputHiddenCaret {
+  caret-color: transparent;
+}
+
+/*
+ * The mock's block caret.
+ *
+ * Positioned in `ch` units, which is exact because the field is monospaced: the caret's own
+ * font must therefore match the input's, or `1ch` here would measure a different advance
+ * than the text it is following. CSS has `caret-shape: block` for this, but WebKitGTK 2.52
+ * does not implement it.
+ */
+.caret {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1ch;
+  height: 17px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  background: var(--accent);
+  pointer-events: none;
+  animation: caretBlink 1.06s steps(1, end) infinite;
+}
+
+@keyframes caretBlink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.counter {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* The virtualizer's spacer: one tall relatively-positioned box the absolute rows sit in. */
+.viewport {
+  position: relative;
+  width: 100%;
+}
+
+.row {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 14px;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.rowSelected {
+  background: var(--sel);
+}
+
+.badge {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  /* A fixed box so the filenames line up whatever the badge says — `TOML` is four glyphs
+     and `·` is one, and without this the second column would jitter down the list. */
+  width: 34px;
+  text-align: center;
+}
+
+.toneAccent {
+  color: var(--accent);
+}
+.toneBlue {
+  color: var(--blue);
+}
+.toneCyan {
+  color: var(--cyan);
+}
+.toneYellow {
+  color: var(--yellow);
+}
+.toneGreen {
+  color: var(--green);
+}
+.tonePurple {
+  color: var(--purple);
+}
+.toneDim {
+  color: var(--dim);
+}
+.toneFaint {
+  color: var(--faint);
+}
+
+.name {
+  flex: none;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.rowSelected .name {
+  color: var(--text-hi);
+}
+
+/* The dim path. Shrinks and ellipsises first, because the filename is the thing being
+   chosen and a truncated name is a row the user cannot identify. */
+.path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* Command palette: the group sits right-aligned, before the key chip. */
+.group {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.chip {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 15px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--dim);
+}
+
+.footer {
+  flex: none;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 14px;
+  border-top: 1px solid var(--border);
+  color: var(--faint);
+  font-size: 11px;
+  user-select: none;
+}
+
+.footerKey {
+  font-family: var(--font-mono);
+  color: var(--dim);
+  margin-right: 4px;
+}
+
+.status {
+  padding: 16px 14px;
+  color: var(--dim);
+  font-size: 12.5px;
+}
+
+/* Reserved for the frame after `picker_open` resolves but before the first frame lands. */
+.statusFaint {
+  color: var(--faint);
+}
