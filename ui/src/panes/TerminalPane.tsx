@@ -19,6 +19,9 @@ export interface TerminalSpec {
   cwd: string
   /** Decides which IDE server this child is told about. See `session.spawn`. */
   project?: string | undefined
+  /** Continue an existing conversation; with `fork`, branch from it. */
+  resume?: string | undefined
+  fork?: boolean | undefined
 }
 
 export interface TerminalPaneProps {

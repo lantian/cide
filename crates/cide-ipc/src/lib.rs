@@ -251,3 +251,31 @@ pub enum Theme {
     Dark,
     Light,
 }
+
+/// A session that would be interrupted by closing something.
+///
+/// Carries enough to name it on screen without a second round trip. A dialog that says "3
+/// sessions are busy" and cannot say *which* leaves the user no way to decide, so the pane
+/// title and project name travel with the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SessionSummary {
+    pub session: SessionId,
+    pub project: ProjectId,
+    pub project_name: String,
+    pub pane_title: String,
+    pub state: SessionState,
+}
+
+/// Whether closing may proceed, and what it would interrupt.
+///
+/// `blocking` is empty when nothing is `Busy` or `AwaitingPermission` — the common case, and
+/// the one where no dialog should appear at all. A confirmation that fires whenever a
+/// process exists is one users learn to dismiss without reading, which is worse than none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct QuitDecision {
+    pub blocking: Vec<SessionSummary>,
+}

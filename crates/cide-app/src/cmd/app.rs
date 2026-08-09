@@ -2,7 +2,7 @@
 
 use cide_core::{commands, keymap};
 use cide_ipc::{Bootstrap, Capabilities, WindowLabel, WindowRole};
-use tauri::{AppHandle, State, Window};
+use tauri::{AppHandle, Manager, State, Window};
 
 use crate::workspace_state::WorkspaceState;
 
@@ -125,4 +125,63 @@ fn claude_version() -> Option<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!text.is_empty()).then_some(text)
+}
+
+/// What closing would interrupt.
+///
+/// Answers for the whole app when `project` is `None`, and for one project otherwise. The
+/// frontend asks before it closes anything and shows a confirmation only when the answer is
+/// non-empty.
+///
+/// "Live" is `Busy | AwaitingPermission`, never "a process exists" — see
+/// `cide_claude::state`. A session sitting at a prompt has nothing to lose by being closed,
+/// and warning about it would train people to dismiss the dialog.
+///
+/// With no hook server running, the answer is empty rather than pessimistic: without hooks
+/// there is no evidence any session is busy, and inventing one would put a dialog in front of
+/// every close for the life of that run.
+#[tauri::command(rename_all = "camelCase")]
+pub fn app_quit_requested(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: Option<cide_ipc::ProjectId>,
+) -> cide_ipc::QuitDecision {
+    let Some(hooks) = app.try_state::<crate::hooks::HookServer>() else {
+        return cide_ipc::QuitDecision { blocking: vec![] };
+    };
+
+    let live: std::collections::HashSet<cide_ipc::SessionId> =
+        hooks.live_sessions().into_iter().collect();
+    if live.is_empty() {
+        return cide_ipc::QuitDecision { blocking: vec![] };
+    }
+
+    let blocking = state.with(|ws| {
+        let mut out = Vec::new();
+        for (id, p) in &ws.projects {
+            if project.is_some_and(|only| only != *id) {
+                continue;
+            }
+            for tab in &p.tabs {
+                for pane in tab.tree.panes.values() {
+                    let Some(session) = pane.session else {
+                        continue;
+                    };
+                    if !live.contains(&session) {
+                        continue;
+                    }
+                    out.push(cide_ipc::SessionSummary {
+                        session,
+                        project: *id,
+                        project_name: p.name.clone(),
+                        pane_title: pane.title.clone(),
+                        state: hooks.state(session),
+                    });
+                }
+            }
+        }
+        out
+    });
+
+    cide_ipc::QuitDecision { blocking }
 }

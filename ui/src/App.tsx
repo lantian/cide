@@ -13,6 +13,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { AppHeader } from '@/chrome/AppHeader'
 import { ActivityRail, type ActivityView } from '@/chrome/ActivityRail'
 import { StatusBar } from '@/chrome/StatusBar'
+import {
+  formatClaude,
+  useSessionStatus,
+  type StatusPayload,
+} from '@/store/sessionStatus'
 import { TabStrip } from '@/chrome/TabStrip'
 import { WindowFrame } from '@/chrome/WindowFrame'
 import { auditMode, formatAuditReport, runLayoutAudit } from '@/chrome/layoutAudit'
@@ -32,6 +37,7 @@ import {
   app as appApi,
   benchMode,
   diag,
+  events,
   type PaneRestore,
   type ProjectId,
   type TabId,
@@ -161,6 +167,20 @@ export function App() {
     void useWorkspace
       .getState()
       .subscribe()
+      .then((fn) => {
+        unlisten = fn
+      })
+    return () => unlisten?.()
+  }, [])
+
+  // Live token and cost figures. Subscribed once per window; the bar below picks whichever
+  // session the focused pane holds.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    void events
+      .onSessionStatus((session, status) => {
+        useSessionStatus.getState().set(session, status as StatusPayload)
+      })
       .then((fn) => {
         unlisten = fn
       })
@@ -299,6 +319,19 @@ export function App() {
         : boot.role.project
   const activeProject = activeProjectId ? (boot?.workspace.projects[activeProjectId] ?? null) : null
 
+  // The status bar reports the session the user is looking at, not "a" session. With two
+  // Claude panes side by side, showing whichever reported last would make the token figure
+  // flicker between two conversations and belong to neither.
+  const statusBySession = useSessionStatus((s) => s.bySession)
+  const focusedSession = (() => {
+    const tab = activeProject?.tabs.find((t) => t.id === activeProject.activeTab)
+    if (!tab) return undefined
+    return tab.tree.panes[tab.tree.focused]?.session ?? undefined
+  })()
+  const claudeReadout = focusedSession
+    ? formatClaude(statusBySession[focusedSession])
+    : undefined
+
   // A `pane:<uuid>` window shows exactly one pane. It shares the workspace mirror with the
   // shell window but none of its chrome: no project tabs, no rail, no status bar.
   if (boot?.role.kind === 'detachedPane') {
@@ -415,7 +448,7 @@ export function App() {
         </div>
 
         <StatusBar
-          claude={boot?.capabilities.claudeVersion ?? undefined}
+          claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
           cursor={`rev ${boot?.workspace.rev ?? 0}`}
         />
 

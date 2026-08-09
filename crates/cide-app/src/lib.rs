@@ -165,6 +165,7 @@ pub fn run() {
         // itself a frame later.
         .manage(WorkspaceState::load())
         .invoke_handler(tauri::generate_handler![
+            cmd::app::app_quit_requested,
             cmd::app::app_ready,
             cmd::app::app_get_bootstrap,
             cmd::app::window_set_viewport,

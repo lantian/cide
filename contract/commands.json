@@ -1,5 +1,6 @@
 [
   "app_get_bootstrap",
+  "app_quit_requested",
   "app_ready",
   "app_restore_plan",
   "claude_diff_content",

@@ -20,6 +20,7 @@ import type {
   PaneId,
   PaneRestore,
   ProjectId,
+  SessionState,
   Side,
   SplitId,
   SplitIntent,
@@ -271,6 +272,14 @@ export const session = {
     cwd: string
     geometry: Geometry
     project?: string | undefined
+    /** Continue an existing conversation. With `fork`, the parent to branch from. */
+    resume?: SessionId | undefined
+    /**
+     * Branch instead of continuing: the new session shares history up to this point and
+     * then diverges, leaving the parent's transcript intact. Verified against the real CLI
+     * — the id we pass is honoured and both sessions stay independently resumable.
+     */
+    fork?: boolean | undefined
   }) => invoke<SessionId>('session_spawn', opts),
 
   /**
@@ -338,6 +347,36 @@ export const events = {
   onWorkspaceChanged: (handler: (workspace: Workspace) => void) =>
     listen<{ rev: number; workspace: Workspace }>('cide://workspace-changed', (e) =>
       handler(e.payload.workspace),
+    ),
+
+  /**
+   * A session moved between idle, busy, awaiting permission or exited.
+   *
+   * Carries no `rev`, deliberately: a session going busy does not move a pane, and
+   * re-hydrating the whole workspace on every tool call would repaint the tree several
+   * times a second during a turn.
+   */
+  onSessionState: (handler: (session: string, state: SessionState) => void) =>
+    listen<{ session: string; state: SessionState }>('cide://session-state', (e) =>
+      handler(e.payload.session, e.payload.state),
+    ),
+
+  /** Live model, token and cost figures from the statusline. */
+  onSessionStatus: (handler: (session: string, status: unknown) => void) =>
+    listen<{ session: string; status: unknown }>('cide://session-status', (e) =>
+      handler(e.payload.session, e.payload.status),
+    ),
+
+  /**
+   * A tool touched files.
+   *
+   * The fast path for reloading an open buffer — it arrives sooner than the watcher and
+   * names the file exactly. It does *not* replace the watcher: a `sed -i` in a shell pane
+   * or a `cargo fmt` never goes through a Claude Code tool.
+   */
+  onSessionTool: (handler: (session: string, paths: string[]) => void) =>
+    listen<{ session: string; paths: string[] }>('cide://session-tool', (e) =>
+      handler(e.payload.session, e.payload.paths),
     ),
 }
 

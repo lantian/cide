@@ -92,7 +92,17 @@ fn pty_geometry(g: Geometry) -> PtyGeometry {
     PtyGeometry::new(g.cols, g.rows, g.cell_width, g.cell_height)
 }
 
+/// Spawn a child for a pane.
+///
+/// `resume` continues an existing conversation; `resume` with `fork` branches from it, so
+/// the new session shares history up to this point and then diverges while the parent is
+/// left untouched. Both are ignored for anything that is not the Claude CLI.
 #[tauri::command(rename_all = "camelCase")]
+// A Tauri command's parameters are its wire shape: the frontend passes a flat object and the
+// macro destructures it. Grouping these into a struct to satisfy the lint would add a type
+// that exists only to be immediately taken apart, and would change the JSON the frontend
+// sends. `pane_split` carries the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub fn session_spawn(
     app: tauri::AppHandle,
     registry: State<'_, SessionRegistry>,
@@ -101,6 +111,8 @@ pub fn session_spawn(
     cwd: String,
     geometry: Geometry,
     project: Option<cide_ipc::ProjectId>,
+    resume: Option<SessionId>,
+    fork: bool,
 ) -> Result<SessionId, SessionError> {
     let mut spec = SpawnSpec::new(program, PathBuf::from(cwd)).geometry(pty_geometry(geometry));
     for a in args {
@@ -118,6 +130,20 @@ pub fn session_spawn(
     // what lets a restored pane resume with `--resume <id>` and no extra bookkeeping.
     let id = SessionId::new();
     if is_claude {
+        if let Some(parent) = resume {
+            spec = spec.arg("--resume").arg(parent.to_string());
+            if fork {
+                // Verified against 2.1.226 rather than assumed, because the plan flagged it
+                // as unknown and the failure would be silent: `--fork-session` does compose
+                // with `--session-id`, the id we pass *is* honoured, and the parent's
+                // transcript is left intact beside the fork's own. Both are independently
+                // resumable afterwards.
+                //
+                // This is the operation a terminal multiplexer structurally cannot offer —
+                // splitting a conversation to try two approaches from a shared history.
+                spec = spec.arg("--fork-session");
+            }
+        }
         spec = spec.arg("--session-id").arg(id.to_string());
     }
 
