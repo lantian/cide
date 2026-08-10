@@ -191,9 +191,22 @@
   cursor: pointer;
 }
 
-.action:hover {
+.action:hover:not(:disabled) {
   background: var(--chrome-hi);
   color: var(--text);
+}
+
+/*
+ * An unavailable action. Dimmed to --faint and pointer-blocked, so the difference between
+ * "you may click this" and "you may not" is visible before the click rather than after it —
+ * the hover highlight above is suppressed for the same reason.
+ *
+ * Not `opacity`, which would fade the glyph against both themes' chrome by different amounts;
+ * --faint is the token both themes already use for de-emphasised chrome text.
+ */
+.action:disabled {
+  color: var(--faint);
+  cursor: default;
 }
 
 /* The mock sets this one glyph a pixel larger than its two neighbours. */

@@ -125,7 +125,30 @@
   user-select: text;
 }
 
+/*
+ * The manual "Run IPC bench (M0 gate)" trigger.
+ *
+ * Hidden by default, and that default is the fix. App.tsx renders this button on every launch
+ * that is not the layout audit — i.e. every normal launch — where it floats over the bottom
+ * right of the workspace and covers whatever pane is under it. It belongs behind `CIDE_BENCH`
+ * with the rest of the bench surface (`benchMode()`, `?bench=1`).
+ *
+ * The real fix is the guard in App.tsx (`benchMode() && !auditMode() && …`); this file cannot
+ * make that edit, so the visibility is inverted here instead. `.benchButtonArmed` is the class
+ * that guarded version applies, and it is what puts the button back on screen.
+ *
+ * Why not detect bench mode from CSS alone: `benchMode()` reads `?bench=1` off the URL, and no
+ * element carries that as an attribute — nothing sets `data-bench` on <html>, and the only
+ * DOM difference bench mode produces is the *absence* of terminals, which `:has()` could only
+ * test by asserting a pane tree shape that changes every milestone. Until App.tsx is updated,
+ * `CIDE_BENCH=1` therefore loses the manual re-run button but keeps the automatic run and its
+ * `diag.benchReport` output, which is what the gate actually reads. Losing a convenience under
+ * a debug flag beats painting over the workspace on every ordinary launch.
+ */
 .benchButton {
+  /* The inversion. Everything below is the button's original appearance, unchanged; only its
+     default visibility moved. */
+  display: none;
   position: absolute;
   right: 16px;
   bottom: 38px;
@@ -138,6 +161,15 @@
   border: 1px solid var(--border);
   color: var(--dim);
   font-family: inherit;
+}
+
+/*
+ * The reveal, applied alongside `.benchButton` by the `benchMode()`-guarded version. Written
+ * as a compound selector rather than a second standalone class so it wins on specificity
+ * (0,2,0) instead of on source order, which a bundler is free to rearrange.
+ */
+.benchButton.benchButtonArmed {
+  display: block;
 }
 
 .benchButton:hover {
