@@ -61,6 +61,7 @@
   "git_unstage",
   "graphics_status",
   "keymap_report",
+  "pane_add_row",
   "pane_bind_session",
   "pane_close",
   "pane_focus",

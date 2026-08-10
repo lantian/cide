@@ -74,9 +74,32 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
     }
 }
 
+/// Which gesture an axis names, now that a tab is a column of rows.
+///
+/// Re-routed here rather than in `cide-core` on purpose: `layout::split` still stacks a tile
+/// inside one cell and is still the right primitive, and keeping the routing in the command
+/// layer is what lets every shipped gesture — the header `⊞`, `pane.split.right`,
+/// `pane.split.down`, `claude.fork`, `claude.mirror`, `claude.split.newSession`,
+/// `terminal.splitBelow` — build rows with no keymap, contract or frontend change at all.
+fn apply_split(
+    tree: &mut cide_ipc::PaneTree,
+    pane: PaneId,
+    axis: Axis,
+    side: Side,
+    fresh: Pane,
+) -> Result<PaneId, CoreError> {
+    match axis {
+        Axis::Row => layout::add_tile(tree, pane, side, fresh),
+        Axis::Col => layout::add_row(tree, Some(pane), side, fresh),
+    }
+}
+
 /// Split a pane in two.
 ///
-/// A `None` intent asks for the tab's default — see [`default_intent`].
+/// Sideways adds a *tile* to the pane's row; downwards adds a full-width *row* below it,
+/// rather than stacking inside the pane's own cell — see [`apply_split`]. A `None` intent
+/// asks for the tab's default, which is unchanged: a shell sideways, a new session
+/// downwards ([`default_intent`]).
 #[tauri::command(rename_all = "camelCase")]
 #[allow(clippy::too_many_arguments)]
 pub fn pane_split(
@@ -93,7 +116,33 @@ pub fn pane_split(
         let t = workspace::tab_mut(ws, project, tab)?;
         let intent = intent.unwrap_or_else(|| default_intent(&t.kind, axis));
         let fresh = pane_for(&intent, &name);
-        let pane = layout::split(&mut t.tree, pane, axis, side, fresh)?;
+        let pane = apply_split(&mut t.tree, pane, axis, side, fresh)?;
+        Ok(SplitOutcome { pane, intent })
+    })
+}
+
+/// A new full-width row holding one pane.
+///
+/// `after: None` appends at the bottom. `intent: None` asks for the tab's default, which is
+/// the same one splitting downwards has always used — see [`default_intent`].
+///
+/// Like [`pane_split`], this leaves `session: None`: the frontend measures the pane and
+/// spawns the child at the right size, then calls [`pane_bind_session`].
+#[tauri::command(rename_all = "camelCase")]
+pub fn pane_add_row(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    tab: TabId,
+    after: Option<PaneId>,
+    side: Side,
+    intent: Option<SplitIntent>,
+) -> Result<SplitOutcome, CoreError> {
+    state.update(|ws| {
+        let name = workspace::project(ws, project)?.name.clone();
+        let t = workspace::tab_mut(ws, project, tab)?;
+        let intent = intent.unwrap_or_else(|| default_intent(&t.kind, Axis::Col));
+        let fresh = pane_for(&intent, &name);
+        let pane = layout::add_row(&mut t.tree, after, side, fresh)?;
         Ok(SplitOutcome { pane, intent })
     })
 }
@@ -153,7 +202,12 @@ pub fn pane_maximize(
         .map(|()| Mutated { rev: state.rev() })
 }
 
-/// Move a divider. Returns the value actually stored, which may be clamped.
+/// Move a divider. `ratio` is the **pair share** — the first of the two members this divider
+/// separates within its row, not the split node's `a`-share.
+///
+/// The two are the same number for every two-pane tab and for the shipped console, which is
+/// why the wire shape is unchanged and no caller had to move. Returns the value actually
+/// stored, which may be clamped.
 #[tauri::command(rename_all = "camelCase")]
 pub fn pane_set_ratio(
     state: State<'_, WorkspaceState>,
@@ -240,4 +294,118 @@ pub fn pane_bind_session(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cide_core::layout::{MIN_TILE, add_row, add_tile, leaves, new_tree, validate};
+    use cide_ipc::{LayoutNode, PaneTree};
+
+    fn fresh() -> Pane {
+        pane_for(&SplitIntent::Shell, "cide")
+    }
+
+    /// A console tab holding one row of `n` tiles.
+    fn tree_of(n: usize) -> PaneTree {
+        let first = Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Claude,
+            role: PaneRole::Primary,
+            session: None,
+            title: "cide : claude".into(),
+        };
+        let mut tree = new_tree(first);
+        let mut last = tree.focused;
+        for _ in 1..n {
+            last = add_tile(&mut tree, last, Side::After, fresh()).expect("a tile joins");
+        }
+        tree
+    }
+
+    /// The tab's rows, each as the pane ids it holds in reading order.
+    fn rows(tree: &PaneTree) -> Vec<Vec<PaneId>> {
+        fn walk(node: &LayoutNode, out: &mut Vec<Vec<PaneId>>) {
+            match node {
+                LayoutNode::Split {
+                    axis: Axis::Col,
+                    a,
+                    b,
+                    ..
+                } => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+                other => out.push(leaves(other)),
+            }
+        }
+        let mut out = Vec::new();
+        walk(&tree.root, &mut out);
+        out
+    }
+
+    #[test]
+    fn pane_split_with_col_adds_a_row_rather_than_stacking() {
+        // The whole point of routing in this layer: `pane.split.down` used to stack a tile
+        // inside one cell of a four-tile row. It must now span the tab.
+        let mut tree = tree_of(4);
+        let third = leaves(&tree.root)[2];
+
+        let added = apply_split(&mut tree, third, Axis::Col, Side::After, fresh())
+            .expect("splitting downwards adds a row");
+
+        let shape = rows(&tree);
+        assert_eq!(shape.len(), 2, "a tab of two rows, not a stacked cell");
+        assert_eq!(shape[0].len(), 4, "row one keeps all four tiles");
+        assert_eq!(shape[1], vec![added], "row two holds the new pane alone");
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn pane_split_with_row_adds_a_tile_to_the_row() {
+        let mut tree = tree_of(2);
+        let first = leaves(&tree.root)[0];
+
+        apply_split(&mut tree, first, Axis::Row, Side::After, fresh()).expect("adds a tile");
+
+        let shape = rows(&tree);
+        assert_eq!(shape.len(), 1, "still one row");
+        assert_eq!(shape[0].len(), 3);
+    }
+
+    #[test]
+    fn pane_add_row_returns_a_session_less_pane_and_its_intent() {
+        // What this layer contributes over the core: the resolved intent, and a pane with no
+        // session on it — the frontend measures the slot and spawns the child at that size.
+        let mut tree = tree_of(1);
+        let intent = default_intent(&TabKind::ClaudeHome, Axis::Col);
+        assert_eq!(
+            intent,
+            SplitIntent::NewClaude,
+            "the console still answers a downwards split with a session"
+        );
+        let pane = pane_for(&intent, "cide");
+        assert!(pane.session.is_none());
+        assert_eq!(pane.role, PaneRole::Auxiliary);
+
+        let id = add_row(&mut tree, None, Side::After, pane).expect("a row is added");
+        assert_eq!(tree.focused, id);
+        assert!(tree.panes[&id].session.is_none());
+        assert_eq!(rows(&tree).len(), 2);
+    }
+
+    #[test]
+    fn a_row_refuses_an_eleventh_tile_through_the_command_layer_too() {
+        let mut tree = tree_of(10);
+        let last = *leaves(&tree.root).last().expect("panes");
+
+        let Err(CoreError::Invariant(msg)) =
+            apply_split(&mut tree, last, Axis::Row, Side::After, fresh())
+        else {
+            panic!("an eleventh tile must be refused");
+        };
+        assert!(msg.contains("add a row instead"), "{msg}");
+        // The floor that refusal protects is the one the frontend mirrors as a literal.
+        assert!((MIN_TILE - 0.1).abs() < f32::EPSILON);
+    }
 }

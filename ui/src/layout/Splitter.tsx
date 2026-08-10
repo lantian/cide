@@ -1,5 +1,5 @@
 /**
- * One divider between the two children of a split.
+ * One divider between two adjacent members of a chain.
  *
  * The single most important performance decision in the pane grid lives here: **a drag
  * writes `gridTemplateColumns` / `gridTemplateRows` straight to the parent grid's DOM node
@@ -13,6 +13,12 @@
  * The consequence is that between `pointerdown` and the snapshot coming back, the DOM is
  * ahead of the model. `SplitTree` re-asserts the template from props on every render it
  * makes while no drag is in flight, which is what puts the two back in agreement.
+ *
+ * Since M11 the grid this divides holds a whole *chain* — `2n - 1` tracks, one per member
+ * with a divider between each pair — so the arithmetic below works in shares rather than in
+ * one ratio. The property that buys is exact: `applyDrag` copies every fraction outside the
+ * dragged pair bit for bit, so a divider in one row provably cannot move another row's
+ * tiles. That used to depend on the tree happening to be shaped as columns.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
@@ -26,11 +32,20 @@ import type {
 import type { Axis, SplitId } from '@/ipc/generated'
 import styles from './SplitTree.module.css'
 
-/** The domain's clamp, mirrored from `cide-core`'s `MIN_RATIO` / `MAX_RATIO`. */
-export const MIN_RATIO = 0.1
-export const MAX_RATIO = 0.9
+/**
+ * A member's floor, mirrored from `cide-core`'s `MIN_TILE`.
+ *
+ * Still the same two literals the file has always carried: `cide-core` sets
+ * `MIN_TILE = MIN_RATIO = 0.1` precisely so that a share floor and the stored ratio band are
+ * the same number, and neither side has to compute a function of the chain's arity.
+ */
+export const MIN_TILE = 0.1
+export const MAX_TILE = 1 - MIN_TILE
 
-/** Arrow-key nudge, as a fraction of the split. */
+/** The stored band, unchanged. Kept for the `aria-value*` on a two-member chain. */
+export const MIN_RATIO = MIN_TILE
+export const MAX_RATIO = MAX_TILE
+
 /**
  * How long a keyboard nudge waits before it reaches the domain.
  *
@@ -40,35 +55,64 @@ export const MAX_RATIO = 0.9
  */
 const KEY_COMMIT_DELAY = 120
 
+/** Arrow-key nudge, as a fraction of the pair. */
 const KEY_STEP = 0.02
 
-export function clampRatio(ratio: number): number {
-  return Math.min(MAX_RATIO, Math.max(MIN_RATIO, ratio))
-}
-
 /**
- * The track list for a split: the two children with the splitter's fixed track between them.
+ * The track list for a chain: every member's `fr`, with the splitter's fixed track between
+ * each adjacent pair.
  *
  * Fractions rather than the mock's literal `1.35fr … 1fr` — the same used track sizes, since
- * `fr` is relative and both children resolve against the same free space.
+ * `fr` is relative and every member resolves against the same free space.
  */
-export function splitTemplate(ratio: number): string {
-  return `${ratio}fr var(--w-splitter) ${1 - ratio}fr`
+export function trackTemplate(f: number[]): string {
+  return f.map((w) => `${w}fr`).join(' var(--w-splitter) ')
 }
 
 /** Write the template for `axis` onto a grid element, bypassing React entirely. */
-export function applyTemplate(grid: HTMLElement, axis: Axis, ratio: number): void {
-  const template = splitTemplate(ratio)
+export function applyTracks(grid: HTMLElement, axis: Axis, f: number[]): void {
+  const template = trackTemplate(f)
   if (axis === 'row') grid.style.gridTemplateColumns = template
   else grid.style.gridTemplateRows = template
 }
 
+/** The two members divider `k` separates, and how much of the chain they own between them. */
+export function pairOf(f: number[], k: number): { p: number; lo: number; hi: number } {
+  const p = (f[k] ?? 0) + (f[k + 1] ?? 0)
+  const lo = MIN_TILE / p
+  // On a legacy chain a pair can be narrower than two tiles, and the two ends cross over.
+  // Halving is the one answer legal from both directions — the same rule `cide-core` uses.
+  return lo <= 1 - lo ? { p, lo, hi: 1 - lo } : { p, lo: 0.5, hi: 0.5 }
+}
+
+export function clampPair(f: number[], k: number, t: number): number {
+  const { lo, hi } = pairOf(f, k)
+  return Math.min(hi, Math.max(lo, t))
+}
+
+/**
+ * The chain's fractions with divider `k` moved to pair share `t`.
+ *
+ * The pair's own budget `p` is preserved, so every other member is *copied*, never
+ * recomputed — which is why the invariance is exact rather than within a pixel.
+ */
+export function applyDrag(f: number[], k: number, t: number): number[] {
+  const { p } = pairOf(f, k)
+  const next = f.slice()
+  next[k] = p * t
+  next[k + 1] = p * (1 - t)
+  return next
+}
+
 export interface SplitterProps {
   split: SplitId
-  /** The split's axis: `row` children sit left/right, so the divider is vertical. */
+  /** The chain's axis: `row` members sit left/right, so the divider is vertical. */
   axis: Axis
-  ratio: number
-  /** The grid being divided. The ratio is read off *its* box, never the splitter's. */
+  /** Every member's share of the chain, in order. */
+  fractions: number[]
+  /** This divider's in-order index: it separates members `index` and `index + 1`. */
+  index: number
+  /** The grid being divided. Sizes are read off *its* box, never the splitter's. */
   gridRef: RefObject<HTMLDivElement | null>
   /** Hidden rather than unmounted while a sibling is maximized. */
   hidden?: boolean | undefined
@@ -80,21 +124,34 @@ export interface SplitterProps {
 export function Splitter({
   split,
   axis,
-  ratio,
+  fractions,
+  index,
   gridRef,
   hidden = false,
   onDragActive,
   onCommit,
 }: SplitterProps) {
   const vertical = axis === 'row'
+  const { p, lo, hi } = pairOf(fractions, index)
+  const share = p > 0 ? (fractions[index] ?? 0) / p : 0.5
+
   const [active, setActive] = useState(false)
   const dragging = useRef(false)
-  // The ratio the DOM is currently showing. Diverges from the prop during a drag, and
+  // The pair share the DOM is currently showing. Diverges from the prop during a drag, and
   // between a keyboard nudge and the snapshot that answers it — without it, key repeat
   // would compute every step from the same stale prop and the divider would move once.
-  const live = useRef(ratio)
+  const live = useRef(share)
   /** The separator element, for imperative `aria-valuenow` during a gesture. */
   const selfRef = useRef<HTMLDivElement>(null)
+  /**
+   * The splitter track's own width, measured once at `pointerdown`.
+   *
+   * Measured rather than parsed out of `getComputedStyle(--w-splitter)`, and rather than
+   * derived from the neighbours' rects: computing everything from `fractions` plus this one
+   * number keeps the handler self-contained and immune to a hidden neighbour reporting a
+   * zero-sized rect while a pane is maximized.
+   */
+  const gutter = useRef(0)
   /** Pending keyboard commit, so a held arrow key does not commit per repeat. */
   const commitTimer = useRef<number | null>(null)
   useEffect(
@@ -105,8 +162,8 @@ export function Splitter({
   )
 
   useEffect(() => {
-    if (!dragging.current) live.current = ratio
-  }, [ratio])
+    if (!dragging.current) live.current = share
+  }, [share])
 
   const stop = useCallback(
     (commit: boolean) => {
@@ -138,8 +195,10 @@ export function Splitter({
     // Stops the gesture from starting a text selection in the pane it began over.
     e.preventDefault()
     e.currentTarget.setPointerCapture(e.pointerId)
+    const self = e.currentTarget.getBoundingClientRect()
+    gutter.current = vertical ? self.width : self.height
     dragging.current = true
-    live.current = ratio
+    live.current = share
     setActive(true)
     onDragActive?.(true)
     // On the body, not the splitter: the pointer spends the whole drag over the panes, and
@@ -152,9 +211,17 @@ export function Splitter({
     const grid = gridRef.current
     if (!dragging.current || !grid) return
     const box = grid.getBoundingClientRect()
-    const raw = vertical ? (e.clientX - box.left) / box.width : (e.clientY - box.top) / box.height
-    live.current = clampRatio(raw)
-    applyTemplate(grid, axis, live.current)
+    const extent = vertical ? box.width : box.height
+    // The gutters are fixed tracks, so the `fr` shares divide only what is left of the box.
+    const usable = extent - (fractions.length - 1) * gutter.current
+    if (usable <= 0 || p <= 0) return
+    // Where this pair starts inside the grid: every earlier member's share of the usable
+    // space, plus the fixed gutters already crossed.
+    const start = fractions.slice(0, index).reduce((s, w) => s + w, 0) * usable
+      + index * gutter.current
+    const at = (vertical ? e.clientX - box.left : e.clientY - box.top) - start
+    live.current = clampPair(fractions, index, at / (p * usable))
+    applyTracks(grid, axis, applyDrag(fractions, index, live.current))
   }
 
   /**
@@ -173,8 +240,8 @@ export function Splitter({
    */
   const moveTo = (next: number) => {
     const grid = gridRef.current
-    live.current = clampRatio(next)
-    if (grid) applyTemplate(grid, axis, live.current)
+    live.current = clampPair(fractions, index, next)
+    if (grid) applyTracks(grid, axis, applyDrag(fractions, index, live.current))
     selfRef.current?.setAttribute('aria-valuenow', String(Math.round(live.current * 100)))
 
     if (commitTimer.current !== null) window.clearTimeout(commitTimer.current)
@@ -197,17 +264,18 @@ export function Splitter({
     const forward = vertical ? 'ArrowRight' : 'ArrowDown'
     if (e.key === back) moveTo(live.current - KEY_STEP)
     else if (e.key === forward) moveTo(live.current + KEY_STEP)
-    else if (e.key === 'Home') moveTo(MIN_RATIO)
-    else if (e.key === 'End') moveTo(MAX_RATIO)
+    else if (e.key === 'Home') moveTo(lo)
+    else if (e.key === 'End') moveTo(hi)
     else return
     e.preventDefault()
   }
 
-  // The middle track, stated rather than auto-placed: see `place` in SplitTree.tsx for what
-  // auto-placement does to this element once a sibling branch spans the whole grid.
+  // The divider's own track, stated rather than auto-placed: see `place` in SplitTree.tsx
+  // for what auto-placement does to this element once a member spans the whole grid.
+  const track = String(2 * index + 2)
   const placement: CSSProperties = vertical
-    ? { gridColumn: '2', gridRow: '1' }
-    : { gridRow: '2', gridColumn: '1' }
+    ? { gridColumn: track, gridRow: '1' }
+    : { gridRow: track, gridColumn: '1' }
 
   const className = [
     styles.splitter,
@@ -222,9 +290,9 @@ export function Splitter({
       role="separator"
       aria-orientation={vertical ? 'vertical' : 'horizontal'}
       aria-label={vertical ? 'Resize panes horizontally' : 'Resize panes vertically'}
-      aria-valuenow={Math.round(ratio * 100)}
-      aria-valuemin={MIN_RATIO * 100}
-      aria-valuemax={MAX_RATIO * 100}
+      aria-valuenow={Math.round(share * 100)}
+      aria-valuemin={Math.round(lo * 100)}
+      aria-valuemax={Math.round(hi * 100)}
       tabIndex={0}
       ref={selfRef}
       onKeyUp={flushCommit}

@@ -231,6 +231,7 @@ pub fn run() {
             cmd::file::tab_set_dirty,
             cmd::lifecycle::app_restore_plan,
             cmd::pane::pane_split,
+            cmd::pane::pane_add_row,
             cmd::pane::pane_close,
             cmd::pane::pane_focus,
             cmd::pane::pane_maximize,

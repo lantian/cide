@@ -1,18 +1,32 @@
 /*
  * The Claude tab's pane tree.
  *
- * A split is a nested `display: grid` with an `Nfr var(--w-splitter) Mfr` template, which
- * is why the splitter is a real grid track rather than an absolutely positioned overlay:
- * the track *is* the 6px gap, so the panes either side need no compensating margin and
- * nothing overlaps a terminal's hit area.
+ * A whole chain of same-axis splits is one `display: grid` with `2n - 1` tracks —
+ * `f0 fr var(--w-splitter) f1 fr …` — which is why a splitter is a real grid track rather
+ * than an absolutely positioned overlay: the track *is* the 6px gap, so the panes either
+ * side need no compensating margin and nothing overlaps a terminal's hit area. It is also
+ * why a vertical divider is exactly as tall as its own row: it is a track of that row's
+ * grid, and that grid's box is one row tall.
  */
 .tree {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  /* One stretched cell, so the root node fills the tab whether it is a leaf or a split. */
-  display: grid;
+  /* A column, so the `+ row` strip sits under the tree rather than inside any chain grid. */
+  display: flex;
+  flex-direction: column;
   background: var(--panel-2);
+}
+
+/*
+ * The tree itself. One stretched cell, so the root node fills whatever is left over the
+ * strip whether it is a leaf or a chain.
+ */
+.canvas {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
 }
 
 /*
@@ -24,6 +38,48 @@
   display: grid;
   min-width: 0;
   min-height: 0;
+}
+
+/*
+ * "Add a row" — the gesture the user could not find, because until now the only split
+ * affordance in the whole app was the header's ⊞.
+ *
+ * A slim strip under the tree rather than a floating overlay: an overlay would need its own
+ * layer hit-testing over live terminals, and this is the only control in the tab that acts
+ * on the *tab* rather than on a pane. Sized off `--w-splitter` so it reads as part of the
+ * gutter system, and coloured only from tokens, so both themes are covered by construction.
+ */
+.addRow {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  align-items: stretch;
+  gap: 1px;
+  min-height: calc(var(--w-splitter) * 2);
+  background: var(--panel-2);
+  border-top: 1px solid var(--border-soft);
+}
+
+.addRowButton {
+  appearance: none;
+  border: 0;
+  background: var(--chrome);
+  color: var(--dim);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.addRowButton:hover {
+  background: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.addRowButton:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 /*

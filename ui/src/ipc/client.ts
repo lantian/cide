@@ -235,7 +235,12 @@ export const pane = {
   maximize: (projectId: ProjectId, tabId: TabId, paneId: PaneId | null) =>
     invoke<{ rev: number }>('pane_maximize', { project: projectId, tab: tabId, pane: paneId }),
 
-  /** Returns the value actually stored, which may be clamped to [0.1, 0.9]. */
+  /**
+   * Move a divider. `ratio` is the **pair share** — the first of the two tiles this divider
+   * separates within its row, not the split node's `a`-share. The two are the same number
+   * for every two-pane tab and for the shipped console, which is why this signature did not
+   * move. Returns the value actually stored, which may be clamped to [0.1, 0.9].
+   */
   setRatio: (projectId: ProjectId, tabId: TabId, split: SplitId, ratio: number) =>
     invoke<number>('pane_set_ratio', { project: projectId, tab: tabId, split, ratio }),
 
@@ -258,6 +263,28 @@ export const pane = {
       tab: tabId,
       pane: paneId,
       session,
+    }),
+
+  /**
+   * A new full-width row holding one pane.
+   *
+   * `after: null` appends at the bottom; otherwise the row lands on `side` of the row that
+   * currently holds `after`. `intent: null` asks for the tab's default — the same one
+   * splitting downwards has always used, a new Claude session in the console.
+   */
+  addRow: (
+    projectId: ProjectId,
+    tabId: TabId,
+    after: PaneId | null = null,
+    side: Side = 'after',
+    intent: SplitIntent | null = null,
+  ) =>
+    invoke<SplitOutcome>('pane_add_row', {
+      project: projectId,
+      tab: tabId,
+      after,
+      side,
+      intent,
     }),
 }
 

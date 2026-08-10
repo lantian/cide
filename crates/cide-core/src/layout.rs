@@ -43,6 +43,53 @@
 //!
 //! Maximizing is the one operation that is *not* tree surgery: it sets a flag the renderer
 //! honours, which keeps restore exact and costs no terminal reflow.
+//!
+//! # Chains: rows of tiles on top of a binary tree
+//!
+//! The tree stays binary — nothing above changes — but the *gestures* now speak in rows.
+//! A **chain** is a maximal same-axis subtree; its **members** are the in-order leaves and
+//! cross-axis subtrees hanging off it. A chain of `n` members has exactly `n - 1` interior
+//! splits, and in-order traversal yields `member, split, member, …, member`, so **divider
+//! `k` is the `k`-th interior split in in-order** and separates members `k` and `k + 1`.
+//! No new id space is needed for that.
+//!
+//! The canonical shape the gesture surface builds is *a `Col` spine of rows, each row a
+//! `Row` chain of tiles*. That is a convention held by [`add_row`] and [`add_tile`], not a
+//! rule in [`validate`]: an ordinary file or diff tab legitimately holds any tree, and a
+//! `validate` rule would reject files already on disk.
+//!
+//! [`weights`] turns a chain into each member's share (the product of the ratios on its
+//! path), and [`write_weights`] is its exact inverse, writing every ratio bottom-up from a
+//! share vector. That pair is what makes a divider edit local: change two adjacent shares
+//! while preserving their sum and *every other member keeps its share bit for bit*,
+//! whatever the tree shape underneath.
+//!
+//! ## Why `MIN_TILE == MIN_RATIO`, and why `validate` did not have to change
+//!
+//! The obvious objection to deriving ratios from shares is that a flattened chain seems to
+//! need a looser clamp than the stored `[MIN_RATIO, MAX_RATIO]` band. It does not. For
+//! every node of a chain, `ratio = W(a) / (W(a) + W(b))`. Given `W(a), W(b) >= MIN_TILE`
+//! and `W(a) + W(b) <= 1`:
+//!
+//! ```text
+//! ratio >= MIN_TILE / (W(a) + W(b)) >= MIN_TILE
+//! ratio  = 1 - W(b) / (W(a) + W(b)) <= 1 - MIN_TILE
+//! ```
+//!
+//! so every derived ratio lands inside `[MIN_TILE, 1 - MIN_TILE]`. Setting
+//! `MIN_TILE = MIN_RATIO` therefore makes the derived band *exactly* today's band, for any
+//! shape and any arity — [`validate`] is untouched, no persisted guarantee weakens, and the
+//! frontend keeps mirroring two literals rather than recomputing a function of the arity.
+//! Relaxing `MIN_RATIO` to 0.01 was the alternative and it loses: it weakens a documented
+//! guarantee on a persisted field to buy nothing.
+//!
+//! The one cost is a hard cap of [`MAX_MEMBERS`] members per chain, since `n * MIN_TILE`
+//! must fit in 1. [`add_tile`] and [`add_row`] refuse the eleventh explicitly rather than
+//! producing a silently uneven layout.
+//!
+//! The clamp inside [`write_weights`] is retained only as a backstop for *legacy* chains
+//! whose members are already below the floor — reachable today, because three nested splits
+//! at 0.1 give a 0.1% leaf while every stored ratio is legal.
 
 use std::collections::HashSet;
 
@@ -232,32 +279,219 @@ pub fn take_pane(tree: &mut PaneTree, pane: PaneId) -> Result<Pane> {
     Ok(removed)
 }
 
-/// Move a divider, clamped to `[MIN_RATIO, MAX_RATIO]`.
+/// A member's minimum share of its chain.
+///
+/// Equal to [`MIN_RATIO`] on purpose — see the module docs for the proof that this is what
+/// keeps every derived ratio inside the band [`validate`] already enforced.
+pub const MIN_TILE: f32 = MIN_RATIO;
+
+/// `1 / MIN_TILE`: a chain cannot hold more members than this and still give each one a
+/// legal share.
+pub const MAX_MEMBERS: usize = 10;
+
+/// Move a divider.
+///
+/// `share` is the first member's share of the **pair** this divider separates within its
+/// chain — not the split's `a`-share. The two coincide whenever the split is the only one
+/// in its chain, which covers every two-pane tab and the shipped console, so no existing
+/// caller changes.
+///
+/// Only the two members either side of the divider move: their shares are rewritten with
+/// their sum preserved, so every other member of the chain — and every member of every
+/// other chain — keeps its share bit for bit. That is a theorem about [`weights`] and
+/// [`write_weights`] rather than an emergent property of tree shape, which is what lets a
+/// vertical divider in one row leave the row below it alone.
 ///
 /// Returns the value that was stored rather than `()`, so a caller dragging past the end
 /// stop learns where the divider actually went instead of having to re-derive the clamp.
-pub fn set_ratio(tree: &mut PaneTree, split: SplitId, ratio: f32) -> Result<f32> {
+pub fn set_ratio(tree: &mut PaneTree, split: SplitId, share: f32) -> Result<f32> {
     // Existence first. A stale divider id is the caller's mistake and it says so plainly;
     // reporting `Invariant` because the value was also bad would send whoever is debugging
     // a dropped drag event looking at the wrong thing.
-    let mut splits = Vec::new();
-    collect_splits(&tree.root, &mut splits);
-    if !splits.iter().any(|(id, _)| *id == split) {
+    let mut path = Vec::new();
+    let Some((k, axis)) = locate_chain(&tree.root, split, &mut path) else {
         return Err(CoreError::NoSuchSplit(split));
-    }
+    };
 
     // `f32::clamp` propagates NaN, so a non-finite ratio would sail through and poison the
     // layout for the rest of the session.
-    if !ratio.is_finite() {
+    if !share.is_finite() {
         return Err(CoreError::Invariant(format!(
             "ratio for split {split} is not finite"
         )));
     }
-    let clamped = ratio.clamp(MIN_RATIO, MAX_RATIO);
-    if !write_ratio(&mut tree.root, split, clamped) {
-        return Err(CoreError::NoSuchSplit(split));
+
+    let chain = node_at_mut(&mut tree.root, &path);
+    let mut f = weights(chain, axis);
+    let p = f[k] + f[k + 1];
+    // `MIN_TILE / p` is the pair-relative floor. On a legacy chain whose pair is already
+    // smaller than two tiles the two ends cross over, and `f32::clamp` panics on an
+    // inverted range — halving the pair is the one answer that is legal from both ends.
+    let lo = MIN_TILE / p;
+    let t = if lo <= 1.0 - lo {
+        share.clamp(lo, 1.0 - lo)
+    } else {
+        0.5
+    };
+    f[k] = p * t;
+    f[k + 1] = p * (1.0 - t);
+    write_weights(chain, axis, &f);
+
+    // Re-read rather than reporting `t`: on a legacy chain the backstop clamp inside
+    // `write_weights` can store a slightly different geometry, and a caller that was
+    // clamped has to learn the truth. The final clamp is a no-op on every chain whose
+    // members meet the floor, and it stops a pathological legacy chain from reporting a
+    // share outside the band the wire promises.
+    let g = weights(node_at(&tree.root, &path), axis);
+    let stored = g[k] / (g[k] + g[k + 1]);
+    Ok(if stored.is_finite() {
+        stored.clamp(MIN_RATIO, MAX_RATIO)
+    } else {
+        t
+    })
+}
+
+/// Add a tile beside `target`, in `target`'s row.
+///
+/// The new tile takes `1 / (n + 1)` of the row and every existing tile is scaled by
+/// `n / (n + 1)`, so relative widths survive and four clicks from one pane give four equal
+/// tiles. Equalising the row instead was the alternative and it loses: it discards a
+/// hand-tuned row on every insert, and it gives the same answer in the case anyone actually
+/// complained about.
+///
+/// Refused once the row holds [`MAX_MEMBERS`] tiles — an explicit refusal, not a silently
+/// uneven row.
+pub fn add_tile(tree: &mut PaneTree, target: PaneId, side: Side, pane: Pane) -> Result<PaneId> {
+    if !tree.panes.contains_key(&target) {
+        return Err(CoreError::NoSuchPane(target));
     }
-    Ok(clamped)
+    if tree.panes.contains_key(&pane.id) {
+        return Err(CoreError::Invariant(format!(
+            "pane {} is already in this tree",
+            pane.id
+        )));
+    }
+
+    // Read from the *old* chain: the split `graft` mints carries a placeholder 0.5 that
+    // means nothing, and reading it back would bake the placeholder into the row.
+    let mut path = Vec::new();
+    let (f, m) = match locate_member(&tree.root, target, Axis::Row, &mut path) {
+        Some(m) => (weights(node_at(&tree.root, &path), Axis::Row), m),
+        // The target has no row above it — a lone pane, or one stacked inside a column. The
+        // graft below mints the row.
+        None => (vec![1.0], 0),
+    };
+    let n = f.len();
+    if n >= MAX_MEMBERS {
+        return Err(CoreError::Invariant(format!(
+            "a row already holds {MAX_MEMBERS} panes; add a row instead"
+        )));
+    }
+
+    let mut next = reweight_for_insert(
+        &f,
+        match side {
+            Side::Before => m,
+            Side::After => m + 1,
+        },
+    );
+    legalise(&mut next);
+
+    let id = pane.id;
+    if !graft(&mut tree.root, target, Axis::Row, side, id) {
+        return Err(CoreError::NoSuchPane(target));
+    }
+    tree.panes.insert(id, pane);
+    // The same coupling `attach` enforces and `validate` checks: the pane the user just
+    // made takes focus, and a maximized flag left set would hide it.
+    tree.focused = id;
+    tree.maximized = None;
+
+    // Located again rather than reused: when the target had no row above it, the chain root
+    // is the split that has just been minted.
+    let mut after = Vec::new();
+    if locate_member(&tree.root, id, Axis::Row, &mut after).is_some() {
+        write_weights(node_at_mut(&mut tree.root, &after), Axis::Row, &next);
+    }
+    Ok(id)
+}
+
+/// Add a full-width row holding exactly one pane.
+///
+/// `after: None` wraps the whole root, which is the only way to reach a *row*: [`split`]
+/// only ever replaces a leaf, so splitting downwards stacks a tile inside one cell and
+/// never spans the tab. `after: Some(p)` wraps the spine member whose subtree holds `p`, so
+/// "split down" from row 1 of a three-row tab inserts between rows 1 and 2 rather than at
+/// the bottom.
+///
+/// The new row takes `1 / (n + 1)` of the tab and the existing rows are scaled by
+/// `n / (n + 1)`, exactly as [`add_tile`] does within a row — so one row plus one row is
+/// 50/50, which is the case the user asked for by name.
+pub fn add_row(
+    tree: &mut PaneTree,
+    after: Option<PaneId>,
+    side: Side,
+    pane: Pane,
+) -> Result<PaneId> {
+    if tree.panes.contains_key(&pane.id) {
+        return Err(CoreError::Invariant(format!(
+            "pane {} is already in this tree",
+            pane.id
+        )));
+    }
+    if let Some(p) = after
+        && !tree.panes.contains_key(&p)
+    {
+        return Err(CoreError::NoSuchPane(p));
+    }
+
+    let f = weights(&tree.root, Axis::Col);
+    let n = f.len();
+    if n >= MAX_MEMBERS {
+        return Err(CoreError::Invariant(format!(
+            "a tab already holds {MAX_MEMBERS} rows"
+        )));
+    }
+
+    // Which spine member gets wrapped, and where the new row lands among the members.
+    let (member, at) = match after {
+        None => (
+            None,
+            match side {
+                Side::Before => 0,
+                Side::After => n,
+            },
+        ),
+        Some(p) => {
+            let m = member_index_of(&tree.root, Axis::Col, p).ok_or(CoreError::NoSuchPane(p))?;
+            (
+                Some(m),
+                match side {
+                    Side::Before => m,
+                    Side::After => m + 1,
+                },
+            )
+        }
+    };
+
+    let mut next = reweight_for_insert(&f, at);
+    legalise(&mut next);
+
+    let id = pane.id;
+    let mut path = Vec::new();
+    if let Some(m) = member {
+        member_path(&tree.root, Axis::Col, m, &mut path);
+    }
+    wrap_node(node_at_mut(&mut tree.root, &path), Axis::Col, side, id);
+
+    tree.panes.insert(id, pane);
+    tree.focused = id;
+    tree.maximized = None;
+
+    // The root is a `Col` split by construction now, whichever branch ran, so the whole
+    // spine is one chain.
+    write_weights(&mut tree.root, Axis::Col, &next);
+    Ok(id)
 }
 
 /// Focus a pane. Fails rather than focusing something that is not in the tree.
@@ -280,13 +514,16 @@ pub fn focus(tree: &mut PaneTree, pane: PaneId) -> Result<()> {
 /// The pane the keyboard should move to, or `None` at the edge of the tree.
 ///
 /// Walks up to the nearest ancestor split on `dir`'s axis where `from` sits on the side
-/// being moved away from, then descends the other subtree taking the child nearest the
-/// shared boundary.
+/// being moved away from, then descends the other subtree taking the pane that lies under
+/// the source's own position on the perpendicular axis.
 ///
-/// Where that descent crosses a split on the *other* axis both children touch the boundary
-/// equally, and with no pane rectangles to consult the first child is chosen. Making that
-/// choice geometric — or last-focus based, as tmux does — needs measured layout the core
-/// does not have; the rule here is at least stable, so repeated moves do not wander.
+/// That last part used to be a fudge — "with no pane rectangles to consult, take the first
+/// child" — and it is visibly wrong in the layout this module now builds: `Down` from the
+/// fourth tile of a row landed on the *first* tile of the row below. [`weights`] is the
+/// measured layout the core was said not to have, up to a constant factor per axis, so the
+/// source's interval on the perpendicular axis is accumulated on the way up and its midpoint
+/// picks the child on the way down. Ties go to the first child, which is what keeps every
+/// answer this rule shares with the old one identical.
 pub fn navigate(tree: &PaneTree, from: PaneId, dir: Direction) -> Option<PaneId> {
     let mut path = Vec::new();
     if !path_to(&tree.root, from, &mut path) {
@@ -295,7 +532,7 @@ pub fn navigate(tree: &PaneTree, from: PaneId, dir: Direction) -> Option<PaneId>
 
     let axis = dir.axis();
     let forward = dir.is_forward();
-    for (node, took_b) in path.iter().rev() {
+    for (i, (node, took_b)) in path.iter().enumerate().rev() {
         let LayoutNode::Split {
             axis: split_axis,
             a,
@@ -310,8 +547,12 @@ pub fn navigate(tree: &PaneTree, from: PaneId, dir: Direction) -> Option<PaneId>
         if *split_axis != axis || *took_b == forward {
             continue;
         }
+        // The ancestor splits along the axis of travel, so the subtree across the divider
+        // has exactly the ancestor's extent on the perpendicular axis — which is what makes
+        // an interval measured against the ancestor directly usable over there.
+        let (lo, hi) = perpendicular_span(&path[i + 1..], axis);
         let across = if forward { b } else { a };
-        return Some(boundary_leaf(across, axis, forward));
+        return Some(boundary_leaf(across, axis, forward, (lo + hi) / 2.0));
     }
     None
 }
@@ -714,23 +955,301 @@ fn prune(node: &mut LayoutNode, target: PaneId) -> Prune {
     }
 }
 
-/// Store a ratio on the split with this id, reporting whether it was found.
+// --- chain algebra -----------------------------------------------------------------
+//
+// A chain is addressed by the path from the root to its root node — a `Vec<bool>` of "took
+// `b`" steps. A path rather than a `&mut` because every one of these operations reads the
+// chain, decides, and then writes it: holding a mutable borrow across the decision would
+// mean cloning the subtree to look at it.
+
+/// Each member's share of the chain `node` roots, treated as a chain of `axis`.
 ///
-/// Returns a bool rather than the `&mut f32` it found so that the borrow of `node` ends
-/// with the call: [`set_ratio`] has nothing further to do with the slot, and handing one
-/// out would let a future caller hold a live pointer into the tree across a mutation.
-fn write_ratio(node: &mut LayoutNode, target: SplitId, value: f32) -> bool {
-    let LayoutNode::Split {
-        id, a, b, ratio, ..
-    } = node
-    else {
-        return false;
-    };
-    if *id == target {
-        *ratio = value;
-        return true;
+/// The share is the product of the ratios on the member's path (`ratio` descending into
+/// `a`, `1 - ratio` into `b`), so the vector sums to 1 by construction. A node that is not
+/// an `axis` split is a chain of one.
+fn weights(node: &LayoutNode, axis: Axis) -> Vec<f32> {
+    let mut out = Vec::new();
+    collect_weights(node, axis, 1.0, &mut out);
+    out
+}
+
+fn collect_weights(node: &LayoutNode, axis: Axis, factor: f32, out: &mut Vec<f32>) {
+    match node {
+        LayoutNode::Split {
+            axis: ax,
+            a,
+            b,
+            ratio,
+            ..
+        } if *ax == axis => {
+            collect_weights(a, axis, factor * *ratio, out);
+            collect_weights(b, axis, factor * (1.0 - *ratio), out);
+        }
+        // A leaf, or a split on the other axis: one member, whatever it holds inside.
+        _ => out.push(factor),
     }
-    write_ratio(a, target, value) || write_ratio(b, target, value)
+}
+
+/// The exact inverse of [`weights`]: write every ratio of the chain from a share vector.
+///
+/// Bottom-up, because a node's ratio is the ratio of its two subtrees' *totals* and those
+/// are only known once the children have been visited. Returns the subtree's total so the
+/// parent can use it.
+///
+/// The clamp is a backstop, not the design: on any chain whose members meet `MIN_TILE` it
+/// provably never fires (see the module docs). It is here for a legacy chain that already
+/// holds a sub-floor member, where letting an out-of-band ratio through would make the very
+/// next [`validate`] reject the whole workspace as corrupt.
+fn write_weights(node: &mut LayoutNode, axis: Axis, f: &[f32]) -> f32 {
+    let mut i = 0;
+    write_axis(node, axis, f, &mut i)
+}
+
+fn write_axis(node: &mut LayoutNode, axis: Axis, f: &[f32], i: &mut usize) -> f32 {
+    match node {
+        LayoutNode::Split {
+            axis: ax,
+            a,
+            b,
+            ratio,
+            ..
+        } if *ax == axis => {
+            let wa = write_axis(a, axis, f, i);
+            let wb = write_axis(b, axis, f, i);
+            let total = wa + wb;
+            // A zero or non-finite total can only come from a caller's vector, never from
+            // `weights`; halving keeps the tree renderable rather than writing a NaN that
+            // `validate` would then reject.
+            let want = if total.is_finite() && total > 0.0 {
+                wa / total
+            } else {
+                0.5
+            };
+            *ratio = want.clamp(MIN_RATIO, MAX_RATIO);
+            total
+        }
+        _ => {
+            let w = f.get(*i).copied().unwrap_or(0.0);
+            *i += 1;
+            w
+        }
+    }
+}
+
+/// Raise every sub-floor share to [`MIN_TILE`] and scale the surplus of the rest down to
+/// pay for it.
+///
+/// One pass is exact: the surplus above the floor sums to `1 - n * MIN_TILE`, which is
+/// exactly what is left after every member is given its floor, so scaling the surplus by
+/// `(1 - n * MIN_TILE) / free` lands the vector back on 1 and can never push a member back
+/// below the floor. A no-op — deliberately, down to the last bit — on a healthy vector, so
+/// "a divider edit moves only its two members" survives it.
+fn legalise(f: &mut [f32]) {
+    let n = f.len();
+    if n == 0 || f.iter().all(|w| w.is_finite() && *w >= MIN_TILE) {
+        return;
+    }
+    // More members than the floor can pay for. Only reachable on a legacy chain, since both
+    // gestures refuse past `MAX_MEMBERS`; equal shares is the least surprising answer.
+    let floor_total = n as f32 * MIN_TILE;
+    let total: f32 = f.iter().sum();
+    if floor_total > 1.0 || !total.is_finite() || total <= 0.0 {
+        f.fill(1.0 / n as f32);
+        return;
+    }
+    for w in f.iter_mut() {
+        *w /= total;
+    }
+    let free: f32 = f
+        .iter()
+        .filter(|w| **w > MIN_TILE)
+        .map(|w| *w - MIN_TILE)
+        .sum();
+    if free <= 0.0 {
+        f.fill(1.0 / n as f32);
+        return;
+    }
+    let scale = (1.0 - floor_total) / free;
+    for w in f.iter_mut() {
+        *w = MIN_TILE + (*w - MIN_TILE).max(0.0) * scale;
+    }
+}
+
+/// The share vector for a chain that is about to gain a member at `at`.
+///
+/// The newcomer takes `1 / (n + 1)` and everyone else is scaled by `n / (n + 1)`, so the
+/// sum stays 1 and the existing members keep their *relative* sizes.
+fn reweight_for_insert(f: &[f32], at: usize) -> Vec<f32> {
+    let n = f.len();
+    let share = 1.0 / (n + 1) as f32;
+    let keep = n as f32 * share;
+    let mut next: Vec<f32> = f.iter().map(|w| w * keep).collect();
+    next.insert(at.min(n), share);
+    next
+}
+
+/// The interior splits of the chain `node` roots, in in-order — so index `k` is the divider
+/// between members `k` and `k + 1`.
+fn chain_splits(node: &LayoutNode, axis: Axis, out: &mut Vec<SplitId>) {
+    if let LayoutNode::Split {
+        id, axis: ax, a, b, ..
+    } = node
+        && *ax == axis
+    {
+        chain_splits(a, axis, out);
+        out.push(*id);
+        chain_splits(b, axis, out);
+    }
+}
+
+/// The maximal same-axis chain containing `split`: the path to its root node, the divider
+/// index of `split` within it, and the chain's axis.
+///
+/// Descending from the tree root finds the *outermost* node whose chain holds the split,
+/// which is the chain root by definition: had an ancestor's chain held it, that ancestor
+/// would have answered first.
+fn locate_chain(node: &LayoutNode, split: SplitId, path: &mut Vec<bool>) -> Option<(usize, Axis)> {
+    let LayoutNode::Split { axis, a, b, .. } = node else {
+        return None;
+    };
+    let mut dividers = Vec::new();
+    chain_splits(node, *axis, &mut dividers);
+    if let Some(k) = dividers.iter().position(|id| *id == split) {
+        return Some((k, *axis));
+    }
+    path.push(false);
+    if let Some(found) = locate_chain(a, split, path) {
+        return Some(found);
+    }
+    path.pop();
+    path.push(true);
+    if let Some(found) = locate_chain(b, split, path) {
+        return Some(found);
+    }
+    path.pop();
+    None
+}
+
+/// The chain of `axis` in which `pane` is a member in its own right: the path to the chain
+/// root and the pane's member index.
+///
+/// `None` when the pane's parent is not an `axis` split — it is then a chain of one, and the
+/// caller mints the chain.
+fn locate_member(
+    node: &LayoutNode,
+    pane: PaneId,
+    axis: Axis,
+    path: &mut Vec<bool>,
+) -> Option<usize> {
+    let LayoutNode::Split { axis: ax, a, b, .. } = node else {
+        return None;
+    };
+    if *ax == axis
+        && let Some(i) = member_index_of(node, axis, pane)
+        && matches!(chain_member(node, axis, i), Some(LayoutNode::Leaf { .. }))
+    {
+        return Some(i);
+    }
+    path.push(false);
+    if let Some(i) = locate_member(a, pane, axis, path) {
+        return Some(i);
+    }
+    path.pop();
+    path.push(true);
+    if let Some(i) = locate_member(b, pane, axis, path) {
+        return Some(i);
+    }
+    path.pop();
+    None
+}
+
+/// Every member of the chain `node` roots, in order.
+fn chain_members<'a>(node: &'a LayoutNode, axis: Axis, out: &mut Vec<&'a LayoutNode>) {
+    match node {
+        LayoutNode::Split { axis: ax, a, b, .. } if *ax == axis => {
+            chain_members(a, axis, out);
+            chain_members(b, axis, out);
+        }
+        _ => out.push(node),
+    }
+}
+
+fn chain_member(node: &LayoutNode, axis: Axis, index: usize) -> Option<&LayoutNode> {
+    let mut members = Vec::new();
+    chain_members(node, axis, &mut members);
+    members.get(index).copied()
+}
+
+/// Which member of the chain `node` roots holds `pane`, anywhere inside it.
+fn member_index_of(node: &LayoutNode, axis: Axis, pane: PaneId) -> Option<usize> {
+    let mut members = Vec::new();
+    chain_members(node, axis, &mut members);
+    members.iter().position(|m| contains_leaf(m, pane))
+}
+
+/// The path from the chain root down to its `index`-th member.
+fn member_path(node: &LayoutNode, axis: Axis, index: usize, path: &mut Vec<bool>) {
+    let LayoutNode::Split { axis: ax, a, b, .. } = node else {
+        return;
+    };
+    if *ax != axis {
+        return;
+    }
+    let mut left = Vec::new();
+    chain_members(a, axis, &mut left);
+    if index < left.len() {
+        path.push(false);
+        member_path(a, axis, index, path);
+    } else {
+        path.push(true);
+        member_path(b, axis, index - left.len(), path);
+    }
+}
+
+/// Wrap a whole node — a leaf or a subtree — in a fresh split holding it and a new pane.
+///
+/// The generalisation of [`graft_at`], which can only wrap an anchor's sibling. Wrapping a
+/// *subtree* is what makes a new row span the tab rather than land inside one cell.
+fn wrap_node(node: &mut LayoutNode, axis: Axis, side: Side, new_pane: PaneId) {
+    // The placeholder is dropped on the next line; it exists only so the old node — which
+    // may be the whole tree — can be moved into the new split rather than cloned.
+    let old = std::mem::replace(node, LayoutNode::Leaf { pane: new_pane });
+    let new = LayoutNode::Leaf { pane: new_pane };
+    let (a, b) = match side {
+        Side::Before => (new, old),
+        Side::After => (old, new),
+    };
+    *node = LayoutNode::Split {
+        id: SplitId::new(),
+        axis,
+        a: Box::new(a),
+        b: Box::new(b),
+        // Overwritten by the caller's `write_weights`; a fresh split has no ratio of its own
+        // to contribute, and reading this back would bake the placeholder into the layout.
+        ratio: 0.5,
+    };
+}
+
+fn node_at<'a>(root: &'a LayoutNode, path: &[bool]) -> &'a LayoutNode {
+    let mut cursor = root;
+    for &took_b in path {
+        let LayoutNode::Split { a, b, .. } = cursor else {
+            return cursor;
+        };
+        cursor = if took_b { b } else { a };
+    }
+    cursor
+}
+
+fn node_at_mut<'a>(root: &'a mut LayoutNode, path: &[bool]) -> &'a mut LayoutNode {
+    let mut cursor = root;
+    for &took_b in path {
+        let LayoutNode::Split { a, b, .. } = cursor else {
+            return cursor;
+        };
+        cursor = if took_b { b } else { a };
+    }
+    cursor
 }
 
 /// The ancestor chain of `target`, outermost first, each paired with whether the walk
@@ -759,9 +1278,40 @@ fn path_to<'a>(
     }
 }
 
-/// Descend to the leaf lying against the divider we have just crossed.
-fn boundary_leaf(node: &LayoutNode, axis: Axis, forward: bool) -> PaneId {
+/// The source's interval on the axis perpendicular to `axis`, as a fraction of the crossing
+/// ancestor's extent.
+///
+/// `descent` is the ancestor's own sub-path down to the source leaf; splits along the axis
+/// of travel narrow nothing, because the perpendicular extent is the same on both sides.
+fn perpendicular_span(descent: &[(&LayoutNode, bool)], axis: Axis) -> (f32, f32) {
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for (node, took_b) in descent {
+        if let LayoutNode::Split {
+            axis: split_axis,
+            ratio,
+            ..
+        } = node
+            && *split_axis != axis
+        {
+            let mid = lo + (hi - lo) * *ratio;
+            if *took_b {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// Descend to the leaf lying against the divider we have just crossed, at position `at` on
+/// the perpendicular axis.
+///
+/// `at` is rescaled into whichever child it lands in, so the descent tracks one point
+/// through however many levels the subtree has.
+fn boundary_leaf(node: &LayoutNode, axis: Axis, forward: bool, at: f32) -> PaneId {
     let mut cursor = node;
+    let mut at = at;
     loop {
         match cursor {
             LayoutNode::Leaf { pane } => return *pane,
@@ -769,15 +1319,28 @@ fn boundary_leaf(node: &LayoutNode, axis: Axis, forward: bool) -> PaneId {
                 axis: split_axis,
                 a,
                 b,
+                ratio,
                 ..
             } => {
-                // Along the axis of travel one child touches the divider we crossed;
-                // across it both do, so take the first and stay predictable.
-                cursor = if *split_axis == axis && !forward {
-                    b
+                if *split_axis == axis {
+                    // Along the axis of travel exactly one child touches the divider we
+                    // crossed; the position carries through it unchanged.
+                    cursor = if forward { a } else { b };
+                } else if at <= *ratio {
+                    // `<=`, so a position exactly on a divider takes the first child. That
+                    // is the old rule's answer, which is why every case the two agree on
+                    // still reads the same.
+                    cursor = a;
+                    at = if *ratio > 0.0 { at / *ratio } else { 0.5 };
                 } else {
-                    a
-                };
+                    cursor = b;
+                    let rest = 1.0 - *ratio;
+                    at = if rest > 0.0 {
+                        (at - *ratio) / rest
+                    } else {
+                        0.5
+                    };
+                }
             }
         }
     }
@@ -1239,6 +1802,487 @@ mod tests {
         }
     }
 
+    // --- chain algebra -----------------------------------------------------------------
+
+    /// A chain of `axis` with `n` members and the shape the seed picks, so the properties
+    /// below are asserted over combs, balanced trees and everything between.
+    fn chain_of(rng: &mut Lcg, axis: Axis, n: usize) -> PaneTree {
+        let first = aux();
+        let mut tree = new_tree(first);
+        for _ in 1..n {
+            let ids = leaves(&tree.root);
+            let at = ids[rng.next(ids.len())];
+            let side = if rng.next(2) == 0 {
+                Side::Before
+            } else {
+                Side::After
+            };
+            split(&mut tree, at, axis, side, aux()).expect("split of a live leaf");
+        }
+        tree
+    }
+
+    /// Overwrite every ratio in a tree, so a test can build the sub-floor shapes that only a
+    /// file written by an older build can reach.
+    fn force_ratios(node: &mut LayoutNode, value: f32) {
+        if let LayoutNode::Split { a, b, ratio, .. } = node {
+            *ratio = value;
+            force_ratios(a, value);
+            force_ratios(b, value);
+        }
+    }
+
+    /// Give a chain shares that are legal by construction: every member at or above the
+    /// floor, summing to one.
+    fn healthy_shares(rng: &mut Lcg, n: usize) -> Vec<f32> {
+        let mut f: Vec<f32> = (0..n).map(|_| 1.0 + rng.next(100) as f32).collect();
+        let total: f32 = f.iter().sum();
+        for w in &mut f {
+            *w /= total;
+        }
+        legalise(&mut f);
+        f
+    }
+
+    #[test]
+    fn write_weights_is_the_exact_inverse_of_weights() {
+        for seed in 0..200u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+            let n = 2 + rng.next(7);
+            let mut tree = chain_of(&mut rng, Axis::Row, n);
+            let want = healthy_shares(&mut rng, n);
+
+            write_weights(&mut tree.root, Axis::Row, &want);
+            let got = weights(&tree.root, Axis::Row);
+
+            assert_eq!(got.len(), want.len(), "seed {seed}");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-6,
+                    "seed {seed} member {i}: {g} != {w} (shape held {n} members)"
+                );
+            }
+            validate(&tree).expect("a written chain is still a legal tree");
+        }
+    }
+
+    #[test]
+    fn every_ratio_write_weights_derives_is_inside_the_clamp_band() {
+        // The theorem the whole design rests on: shares at or above `MIN_TILE` can only
+        // produce ratios inside the band `validate` already enforced. This is what lets
+        // `MIN_RATIO` stay at 0.1 and `validate` stay untouched.
+        for seed in 0..300u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 3);
+            let n = 2 + rng.next(MAX_MEMBERS - 1);
+            let axis = if rng.next(2) == 0 {
+                Axis::Row
+            } else {
+                Axis::Col
+            };
+            let mut tree = chain_of(&mut rng, axis, n);
+            let want = healthy_shares(&mut rng, n);
+            assert!(want.iter().all(|w| *w >= MIN_TILE), "seed {seed}: fixture");
+
+            write_weights(&mut tree.root, axis, &want);
+
+            let mut splits = Vec::new();
+            collect_splits(&tree.root, &mut splits);
+            for (id, ratio) in splits {
+                assert!(
+                    (MIN_RATIO..=MAX_RATIO).contains(&ratio),
+                    "seed {seed}: split {id} landed on {ratio}, outside the band"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_divider_edit_moves_only_its_two_members() {
+        for seed in 0..300u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+            let n = 3 + rng.next(MAX_MEMBERS - 2);
+            let mut tree = chain_of(&mut rng, Axis::Row, n);
+            write_weights(&mut tree.root, Axis::Row, &healthy_shares(&mut rng, n));
+
+            let before = weights(&tree.root, Axis::Row);
+            let mut dividers = Vec::new();
+            chain_splits(&tree.root, Axis::Row, &mut dividers);
+            let k = rng.next(dividers.len());
+            let asked = (rng.next(300) as f32) / 100.0 - 1.0;
+
+            set_ratio(&mut tree, dividers[k], asked).expect("a live divider moves");
+
+            let after = weights(&tree.root, Axis::Row);
+            for i in 0..n {
+                if i == k || i == k + 1 {
+                    continue;
+                }
+                // Exact in ℝ — the pair's sum is preserved, so no ancestor's *total* moves —
+                // and within a couple of ulp in f32, because the ancestors' ratios really are
+                // recomputed and a share is a product of them. A pixel is 1e-3 of a tab, so
+                // 1e-6 is three orders of magnitude tighter than anything visible.
+                assert!(
+                    (after[i] - before[i]).abs() < 1e-6,
+                    "seed {seed}: member {i} moved when divider {k} did: {} -> {}",
+                    before[i],
+                    after[i]
+                );
+            }
+            // And the pair kept its own budget, so nothing outside it had to give.
+            assert!(
+                ((after[k] + after[k + 1]) - (before[k] + before[k + 1])).abs() < 1e-6,
+                "seed {seed}: the pair's own share changed"
+            );
+            validate(&tree).expect("valid");
+        }
+    }
+
+    #[test]
+    fn set_ratio_on_a_two_leaf_split_behaves_exactly_as_it_did() {
+        // The shipped console's shape. A pair that is the whole chain has `pair share` and
+        // `a`'s share meaning the same number, which is why no existing caller changed.
+        let first = primary();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        split_at(&mut tree, a, Axis::Row, Side::After);
+        let mut splits = Vec::new();
+        collect_splits(&tree.root, &mut splits);
+        let id = splits[0].0;
+
+        for asked in [0.2_f32, 0.35, 0.5, 0.75, 0.9] {
+            assert_eq!(set_ratio(&mut tree, id, asked).unwrap(), asked);
+            let mut after = Vec::new();
+            collect_splits(&tree.root, &mut after);
+            assert_eq!(after[0].1, asked, "the stored ratio is the share asked for");
+        }
+    }
+
+    #[test]
+    fn set_ratio_on_a_legacy_chain_with_sub_floor_members_still_leaves_a_valid_tree() {
+        // Three nested splits at the floor give a 1% leaf while every stored ratio is legal
+        // — reachable on a file written by the current build, which is why the backstop
+        // clamp inside `write_weights` exists at all.
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = split_at(&mut tree, a, Axis::Row, Side::After);
+        let c = split_at(&mut tree, b, Axis::Row, Side::After);
+        split_at(&mut tree, c, Axis::Row, Side::After);
+        // Written straight onto the nodes: every ratio here is legal, and no gesture can
+        // produce the shares they multiply out to, which is the whole point.
+        force_ratios(&mut tree.root, MIN_RATIO);
+        validate(&tree).expect("the fixture is a tree the current build could have written");
+        let shares = weights(&tree.root, Axis::Row);
+        assert!(
+            shares.iter().any(|w| *w < MIN_TILE),
+            "the fixture must really hold a sub-floor member, got {shares:?}"
+        );
+
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        let stored = set_ratio(&mut tree, dividers[1], 0.5).expect("moves");
+
+        let after = weights(&tree.root, Axis::Row);
+        let actual = after[1] / (after[1] + after[2]);
+        assert!(
+            (stored - actual).abs() < 1e-6,
+            "the reported share {stored} is not the one stored, {actual}"
+        );
+        assert!(
+            (MIN_RATIO..=MAX_RATIO).contains(&stored),
+            "and it is still a number the wire promises: {stored}"
+        );
+        validate(&tree).expect("the backstop kept every ratio inside the band");
+    }
+
+    // --- rows and tiles ----------------------------------------------------------------
+
+    /// The shares of the tab's rows, and of the tiles within each row.
+    fn shape(tree: &PaneTree) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let spine = weights(&tree.root, Axis::Col);
+        let mut rows = Vec::new();
+        chain_members(&tree.root, Axis::Col, &mut rows);
+        let tiles = rows.iter().map(|r| weights(r, Axis::Row)).collect();
+        (spine, tiles)
+    }
+
+    fn close_to(got: &[f32], want: &[f32]) -> bool {
+        got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-5)
+    }
+
+    #[test]
+    fn add_tile_four_times_gives_four_equal_tiles() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let mut last = a;
+        for _ in 0..3 {
+            last = add_tile(&mut tree, last, Side::After, aux()).expect("a tile joins the row");
+        }
+
+        let (spine, tiles) = shape(&tree);
+        assert!(close_to(&spine, &[1.0]), "one row: {spine:?}");
+        assert!(
+            close_to(&tiles[0], &[0.25; 4]),
+            "four equal tiles: {tiles:?}"
+        );
+        assert_eq!(tree.focused, last);
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn add_tile_preserves_the_relative_widths_of_a_hand_tuned_row() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        set_ratio(&mut tree, dividers[0], 0.75).expect("moves");
+
+        add_tile(&mut tree, b, Side::After, aux()).expect("joins");
+
+        let (_, tiles) = shape(&tree);
+        // 75/25 scaled by 2/3, plus a third of the row for the newcomer. Equalising instead
+        // would have thrown the tuning away.
+        assert!(
+            close_to(&tiles[0], &[0.5, 1.0 / 6.0, 1.0 / 3.0]),
+            "{tiles:?}"
+        );
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn add_row_on_a_one_row_tab_gives_fifty_fifty() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+
+        let new = add_row(&mut tree, Some(a), Side::After, aux()).expect("a row is added");
+
+        let (spine, tiles) = shape(&tree);
+        assert!(close_to(&spine, &[0.5, 0.5]), "50/50: {spine:?}");
+        assert!(close_to(&tiles[1], &[1.0]), "the new row holds one tile");
+        assert_eq!(tree.focused, new);
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn the_users_layout_is_four_tiles_then_two_at_fifty_fifty() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let mut last = a;
+        for _ in 0..3 {
+            last = add_tile(&mut tree, last, Side::After, aux()).expect("joins");
+        }
+        let second = add_row(&mut tree, Some(last), Side::After, aux()).expect("a row is added");
+        add_tile(&mut tree, second, Side::After, aux()).expect("joins the new row");
+
+        let (spine, tiles) = shape(&tree);
+        assert!(close_to(&spine, &[0.5, 0.5]), "two rows, 50/50: {spine:?}");
+        assert!(close_to(&tiles[0], &[0.25; 4]), "row 1 holds four tiles");
+        assert!(close_to(&tiles[1], &[0.5, 0.5]), "row 2 holds two");
+        assert_eq!(leaves(&tree.root).len(), 6);
+        validate(&tree).expect("valid");
+
+        // The claim the user actually made: a divider in row 1 must not move row 2.
+        let mut rows = Vec::new();
+        chain_members(&tree.root, Axis::Col, &mut rows);
+        let mut row_one = Vec::new();
+        chain_splits(rows[0], Axis::Row, &mut row_one);
+        let before = shape(&tree);
+        set_ratio(&mut tree, row_one[0], 0.8).expect("moves");
+        let after = shape(&tree);
+
+        assert_eq!(after.0, before.0, "the rows' own heights must not move");
+        assert_eq!(after.1[1], before.1[1], "row 2's tiles must not move");
+        assert!(
+            close_to(&after.1[0], &[0.4, 0.1, 0.25, 0.25]),
+            "{:?}",
+            after.1[0]
+        );
+    }
+
+    #[test]
+    fn add_row_inserts_below_the_named_panes_row_not_at_the_bottom() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let second = add_row(&mut tree, Some(a), Side::After, aux()).expect("row 2");
+        let third = add_row(&mut tree, Some(second), Side::After, aux()).expect("row 3");
+
+        let inserted = add_row(&mut tree, Some(a), Side::After, aux()).expect("between 1 and 2");
+
+        let mut rows = Vec::new();
+        chain_members(&tree.root, Axis::Col, &mut rows);
+        let order: Vec<PaneId> = rows.iter().map(|r| leaves(r)[0]).collect();
+        assert_eq!(order, vec![a, inserted, second, third]);
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn add_tile_refuses_an_eleventh_pane_in_a_row() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let mut last = a;
+        for _ in 1..MAX_MEMBERS {
+            last = add_tile(&mut tree, last, Side::After, aux()).expect("joins");
+        }
+        assert_eq!(weights(&tree.root, Axis::Row).len(), MAX_MEMBERS);
+
+        let Err(CoreError::Invariant(msg)) = add_tile(&mut tree, last, Side::After, aux()) else {
+            panic!("an eleventh tile must be refused");
+        };
+        assert_eq!(msg, "a row already holds 10 panes; add a row instead");
+        validate(&tree).expect("the refusal left the tree alone");
+    }
+
+    #[test]
+    fn add_row_refuses_an_eleventh_row() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let mut last = a;
+        for _ in 1..MAX_MEMBERS {
+            last = add_row(&mut tree, Some(last), Side::After, aux()).expect("a row is added");
+        }
+        assert_eq!(weights(&tree.root, Axis::Col).len(), MAX_MEMBERS);
+
+        let Err(CoreError::Invariant(msg)) = add_row(&mut tree, Some(last), Side::After, aux())
+        else {
+            panic!("an eleventh row must be refused");
+        };
+        assert_eq!(msg, "a tab already holds 10 rows");
+        validate(&tree).expect("the refusal left the tree alone");
+    }
+
+    #[test]
+    fn add_row_mints_one_split_and_leaves_every_existing_split_id_live() {
+        let (mut tree, [p1, ..]) = asymmetric();
+        let before: Vec<SplitId> = {
+            let mut out = Vec::new();
+            collect_splits(&tree.root, &mut out);
+            out.into_iter().map(|(id, _)| id).collect()
+        };
+
+        add_row(&mut tree, Some(p1), Side::After, aux()).expect("a row is added");
+
+        let after: Vec<SplitId> = {
+            let mut out = Vec::new();
+            collect_splits(&tree.root, &mut out);
+            out.into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(after.len(), before.len() + 1, "exactly one new divider");
+        for id in &before {
+            assert!(after.contains(id), "divider {id} went away");
+        }
+    }
+
+    #[test]
+    fn a_dock_anchor_taken_before_add_row_still_restores_exactly() {
+        // The reason `add_row` mints ids rather than re-minting them: a persisted anchor
+        // must stay exactly as valid as it was, or a detached pane comes home to a guess.
+        let (mut tree, [_p1, _p2, p3, p4, _p5]) = asymmetric();
+        let anchor = anchor_of(&tree, p4).expect("has a parent");
+        let taken = take_pane(&mut tree, p4).expect("leaves");
+
+        add_row(&mut tree, Some(p3), Side::After, aux()).expect("a row is added while it is out");
+
+        assert!(
+            can_restore(&tree, &anchor),
+            "the anchor survived the new row"
+        );
+        insert_pane_at(&mut tree, &anchor, taken).expect("restores");
+        let mut splits = Vec::new();
+        collect_splits(&tree.root, &mut splits);
+        let (_, ratio) = splits
+            .iter()
+            .find(|(id, _)| *id == anchor.split)
+            .expect("the recorded divider is back, under its own id");
+        assert_eq!(*ratio, anchor.ratio);
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn add_row_clears_maximized_and_takes_focus() {
+        let (mut tree, [p1, p2, ..]) = asymmetric();
+        maximize(&mut tree, Some(p2)).expect("maximizes");
+
+        let new = add_row(&mut tree, Some(p1), Side::After, aux()).expect("a row is added");
+
+        assert_eq!(tree.focused, new);
+        assert_eq!(tree.maximized, None, "a hidden new row is no use to anyone");
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn add_row_on_the_console_keeps_validate_console_passing() {
+        let first = primary();
+        let a = first.id;
+        let mut tree = new_tree(first);
+
+        add_row(&mut tree, Some(a), Side::After, aux()).expect("a row is added");
+        add_tile(&mut tree, a, Side::After, aux()).expect("a tile joins the primary's row");
+
+        validate_console(&tree).expect("the console still holds its conversation");
+        assert_eq!(primary_of(&tree), Some(a));
+    }
+
+    #[test]
+    fn add_row_and_add_tile_on_a_file_tab_produce_a_valid_tree() {
+        // A file tab's editor pane is `Auxiliary` and holds no session; neither gesture may
+        // move it or change what it is.
+        let editor = Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Editor,
+            role: PaneRole::Auxiliary,
+            session: None,
+            title: "workspace.rs".into(),
+        };
+        let e = editor.id;
+        let mut tree = new_tree(editor);
+
+        add_tile(&mut tree, e, Side::After, aux()).expect("a tile joins");
+        add_row(&mut tree, Some(e), Side::After, aux()).expect("a row is added");
+
+        assert_eq!(leaves(&tree.root)[0], e, "the editor keeps its position");
+        assert_eq!(tree.panes[&e].kind, PaneKind::Editor);
+        assert_eq!(tree.panes[&e].role, PaneRole::Auxiliary);
+        assert!(tree.panes[&e].session.is_none());
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn add_tile_and_add_row_refuse_a_pane_that_is_not_there() {
+        let (mut tree, _) = asymmetric();
+        let ghost = PaneId::new();
+        assert_eq!(
+            add_tile(&mut tree, ghost, Side::After, aux()),
+            Err(CoreError::NoSuchPane(ghost))
+        );
+        assert_eq!(
+            add_row(&mut tree, Some(ghost), Side::After, aux()),
+            Err(CoreError::NoSuchPane(ghost))
+        );
+    }
+
+    #[test]
+    fn add_row_with_no_anchor_wraps_the_whole_tab() {
+        let (mut tree, _) = asymmetric();
+        let top = add_row(&mut tree, None, Side::Before, aux()).expect("a row is added");
+        let bottom = add_row(&mut tree, None, Side::After, aux()).expect("another");
+
+        let mut rows = Vec::new();
+        chain_members(&tree.root, Axis::Col, &mut rows);
+        assert_eq!(rows.len(), 3, "the old tree became the middle row");
+        assert_eq!(leaves(rows[0]), vec![top]);
+        assert_eq!(leaves(rows[2]), vec![bottom]);
+        validate(&tree).expect("valid");
+    }
+
     #[test]
     fn focus_refuses_a_pane_that_is_not_in_the_tree() {
         let (mut tree, [p1, ..]) = asymmetric();
@@ -1283,12 +2327,47 @@ mod tests {
     }
 
     #[test]
-    fn navigate_across_a_perpendicular_split_takes_the_first_child() {
-        // p5 is bottom left; the subtree to its right is split top/bottom, and with no pane
-        // geometry the top child wins. Pinned here so a later geometry-aware rule is a
-        // deliberate change rather than an accident.
-        let (tree, [_p1, p2, _p3, _p4, p5]) = asymmetric();
-        assert_eq!(navigate(&tree, p5, Direction::Right), Some(p2));
+    fn navigate_across_a_perpendicular_split_takes_the_tile_under_the_cursor() {
+        // p5 is bottom left; the subtree to its right is split top/bottom, and the old rule
+        // took the top child because the core had no geometry to consult. It does now —
+        // `weights` is that geometry — so `Right` from the bottom-left pane lands on the
+        // bottom-middle one. The old expectation was pinned so that this change would be a
+        // deliberate one rather than an accident; this is that change.
+        let (tree, [_p1, _p2, p3, _p4, p5]) = asymmetric();
+        assert_eq!(navigate(&tree, p5, Direction::Right), Some(p3));
+    }
+
+    #[test]
+    fn navigate_down_from_the_third_tile_of_a_row_lands_under_it() {
+        // The layout the user asked for: four tiles over two. `Down` from tile 3 has to
+        // reach the tile it is sitting on, which under the old first-child rule was always
+        // the leftmost one whatever the source's position.
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).unwrap();
+        let c = add_tile(&mut tree, b, Side::After, aux()).unwrap();
+        let d = add_tile(&mut tree, c, Side::After, aux()).unwrap();
+        let e = add_row(&mut tree, Some(a), Side::After, aux()).unwrap();
+        let f = add_tile(&mut tree, e, Side::After, aux()).unwrap();
+
+        // Row two is 25/75, so no tile's midpoint lands on a divider in the row above and
+        // every answer below is the one a ruler gives. (Exact ties do happen — two tiles
+        // over four is nothing but ties — and go to the first child by the rule in
+        // `boundary_leaf`; pinning one here would be pinning f32 rounding.)
+        let mut row_two = Vec::new();
+        chain_splits(node_at(&tree.root, &[true]), Axis::Row, &mut row_two);
+        set_ratio(&mut tree, row_two[0], 0.25).expect("moves");
+
+        // Tile 1 spans [0, .25) and sits over `e`; tiles 2, 3 and 4 span the rest, over `f`.
+        assert_eq!(navigate(&tree, a, Direction::Down), Some(e));
+        assert_eq!(navigate(&tree, b, Direction::Down), Some(f));
+        assert_eq!(navigate(&tree, c, Direction::Down), Some(f));
+        assert_eq!(navigate(&tree, d, Direction::Down), Some(f));
+        // And back up, into the tile whose span holds the source's midpoint. `f`'s midpoint
+        // is 0.625, which is inside tile 3 — the old first-child rule always answered tile 1.
+        assert_eq!(navigate(&tree, e, Direction::Up), Some(a));
+        assert_eq!(navigate(&tree, f, Direction::Up), Some(c));
     }
 
     #[test]
@@ -1592,6 +2671,10 @@ mod tests {
         Nav(Direction),
         Maximize(Option<usize>),
         Swap(usize, usize),
+        /// Add a tile beside the pane at this position, in its row.
+        AddTile(usize, Side),
+        /// Add a full-width row below or above the row holding this pane.
+        AddRow(usize, Side),
     }
 
     #[test]
@@ -1629,6 +2712,19 @@ mod tests {
             Nav(Down),
             Close(2),
             Close(1),
+            // The rows model, interleaved with the old gestures on purpose: the two build
+            // the same kind of tree and must not be able to leave each other a broken one.
+            AddTile(1, After),
+            AddTile(2, After),
+            AddRow(1, After),
+            AddTile(3, Before),
+            Ratio(1, 0.8),
+            AddRow(2, Before),
+            Nav(Down),
+            Close(2),
+            AddTile(1, After),
+            Maximize(Some(1)),
+            AddRow(1, After),
         ];
 
         let first = primary();
@@ -1678,6 +2774,14 @@ mod tests {
                     .unwrap_or_else(|e| panic!("step {n}: maximize failed: {e}")),
                 Swap(x, y) => swap(&mut tree, at(x), at(y))
                     .unwrap_or_else(|e| panic!("step {n}: swap failed: {e}")),
+                AddTile(i, side) => {
+                    add_tile(&mut tree, at(i), side, aux())
+                        .unwrap_or_else(|e| panic!("step {n}: add_tile failed: {e}"));
+                }
+                AddRow(i, side) => {
+                    add_row(&mut tree, Some(at(i)), side, aux())
+                        .unwrap_or_else(|e| panic!("step {n}: add_row failed: {e}"));
+                }
             }
             validate(&tree).unwrap_or_else(|e| panic!("step {n} left the tree broken: {e}"));
         }
@@ -1729,11 +2833,23 @@ mod tests {
                 };
                 let where_ = format!("seed {seed} step {step}");
 
-                match rng.next(9) {
+                match rng.next(11) {
                     0..=2 => {
                         split(&mut tree, pick, axis, side, aux())
                             .unwrap_or_else(|e| panic!("{where_}: split of a live leaf: {e}"));
                     }
+                    // The two rows gestures. Both refuse an over-full chain, which is a legal
+                    // answer rather than a failure — the same shape as `close` on a sole pane.
+                    9 => match add_tile(&mut tree, pick, side, aux()) {
+                        Ok(_) => {}
+                        Err(CoreError::Invariant(msg)) if msg.contains("already holds") => {}
+                        Err(e) => panic!("{where_}: add_tile: {e}"),
+                    },
+                    10 => match add_row(&mut tree, Some(pick), side, aux()) {
+                        Ok(_) => {}
+                        Err(CoreError::Invariant(msg)) if msg.contains("already holds") => {}
+                        Err(e) => panic!("{where_}: add_row: {e}"),
+                    },
                     // Refused on the sole pane, which is a legal answer rather than a failure.
                     3 => drop(close(&mut tree, pick)),
                     4 => {

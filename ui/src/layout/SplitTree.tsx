@@ -1,19 +1,36 @@
 /**
  * The recursive renderer for a tab's `PaneTree`.
  *
- * A split is a two-child `display: grid` with an `Nfr var(--w-splitter) Mfr` template, so
- * the divider is a real grid track rather than an absolutely positioned overlay. Nesting
- * splits nests grids; the mock's 2x2 is a `row` split whose two children are `col` splits.
+ * A *chain* — a maximal run of same-axis splits — is drawn as **one** `display: grid` with
+ * `2n - 1` tracks: `f0 fr, var(--w-splitter), f1 fr, …`. The dividers are real grid tracks
+ * rather than absolutely positioned overlays, and because a row is one grid, **a vertical
+ * divider physically cannot be taller than its row**. That is the user's complaint answered
+ * structurally: there is no clamp and no `if (axis === 'row')` anywhere below.
+ *
+ * The flatten is deliberately general — any shape, any depth, any arity — so a tree written
+ * by an older build renders correctly the moment this ships and no migration stands behind
+ * it. The one honest cost: a user who already built a 2x2 the old way has a genuine
+ * `Row(Col(a,b), Col(c,d))` on disk and keeps its full-height centre divider, because that
+ * really is two columns. It is not broken and `add_row` works on it; rebuilding is a few
+ * clicks.
  *
  * This file knows nothing about terminals and nothing about IPC. Panes arrive through
  * `renderPane` and mutations leave through callbacks, which is what lets the whole grid be
  * rendered from a fixture with no Rust behind it.
  */
-import { useLayoutEffect, useRef } from 'react'
+import { Fragment, useLayoutEffect, useRef } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 // Types only, erased at build time — see the note in Splitter.tsx.
-import type { Axis, LayoutNode, Pane, PaneId, PaneTree, SplitId } from '@/ipc/generated'
-import { applyTemplate, Splitter, splitTemplate } from './Splitter'
+import type {
+  Axis,
+  LayoutNode,
+  Pane,
+  PaneId,
+  PaneTree,
+  SplitId,
+  SplitIntent,
+} from '@/ipc/generated'
+import { applyTracks, Splitter, trackTemplate } from './Splitter'
 import styles from './SplitTree.module.css'
 
 export interface SplitTreeProps {
@@ -22,16 +39,21 @@ export interface SplitTreeProps {
   renderPane: (pane: Pane, index: number) => ReactNode
   onFocus?: ((pane: PaneId) => void) | undefined
   onRatioCommit?: ((split: SplitId, ratio: number) => void) | undefined
+  /**
+   * Add a full-width row holding one pane. Absent hides the strip entirely, so the tab still
+   * renders — and still resizes — in a window that has no such gesture to offer.
+   */
+  onAddRow?: ((intent: SplitIntent | null) => void) | undefined
 }
 
 /**
  * Maximize is a flag, not tree surgery.
  *
- * The branch holding the maximized pane is spanned across its parent's whole grid area, and
- * its sibling — plus the divider — is hidden. Applied at every split on the path, the
- * maximized leaf ends up covering the tab. Outside that path no track changes, so those
+ * The member holding the maximized pane is spanned across its chain's whole grid area, and
+ * every other member — plus every divider — is hidden. Applied at every chain on the path,
+ * the maximized leaf ends up covering the tab. Outside that path no track changes, so those
  * panes' terminals keep their exact pixel size and come back with no reflow. The one
- * exception is a hidden pane *inside* the maximized branch: the branch itself grows to fill
+ * exception is a hidden pane *inside* the maximized member: the member itself grows to fill
  * the tab, so its own children grow with it and that pane is resized once each way.
  *
  * `visibility: hidden`, never `display: none`: a display-none terminal measures zero in
@@ -43,17 +65,18 @@ const FILL: CSSProperties = { gridArea: '1 / 1 / -1 / -1' }
 const HIDDEN: CSSProperties = { visibility: 'hidden' }
 
 /**
- * Where a child sits among its split's three tracks: `a`, the divider, `b`.
+ * Where a child sits among its chain's `2n - 1` tracks: members on the odd lines, dividers
+ * on the even ones.
  *
- * Stated rather than left to auto-placement, and only maximize shows why. A spanned branch
+ * Stated rather than left to auto-placement, and only maximize shows why. A spanned member
  * occupies every cell of its grid, so an auto-placed sibling finds no free cell and lands in
  * a fresh *implicit* track instead — and `-1` in `FILL` means the last explicit line, so the
- * spanned branch does not cover it. Measured in Chrome on the mock's 2x2 at 1000x600: the
+ * spanned member does not cover it. Measured in Chrome on the mock's 2x2 at 1000x600: the
  * maximized pane came out 62px short of the tab, and the hidden panes, far from holding
  * still, were squeezed into 6px-wide strips, which is a live xterm reflowing to a couple of
  * columns and back again.
  */
-function place(track: 1 | 2 | 3, axis: Axis): CSSProperties {
+function place(track: number, axis: Axis): CSSProperties {
   const line = String(track)
   return axis === 'row' ? { gridColumn: line, gridRow: '1' } : { gridRow: line, gridColumn: '1' }
 }
@@ -63,67 +86,123 @@ function contains(node: LayoutNode, pane: PaneId): boolean {
   return contains(node.a, pane) || contains(node.b, pane)
 }
 
-interface SplitNodeProps {
-  split: SplitId
+type SplitNode = Extract<LayoutNode, { kind: 'split' }>
+
+export interface Chain {
   axis: Axis
-  ratio: number
-  a: ReactNode
-  b: ReactNode
-  splitterHidden: boolean
+  /** In order. Each is a leaf or a split on the *other* axis, never a same-axis split. */
+  members: LayoutNode[]
+  /** In in-order, so `dividers[k]` separates `members[k]` and `members[k + 1]`. */
+  dividers: SplitId[]
+  /** Each member's share, the product of the ratios on its path. Sums to 1. */
+  fractions: number[]
+}
+
+/**
+ * Flatten the maximal same-axis chain rooted at `node`.
+ *
+ * In-order, because that is what makes `dividers[k]` the divider between members `k` and
+ * `k + 1` with no new id space: a binary chain visited in-order yields
+ * `member, split, member, …, member`. The mirror of `cide-core`'s `weights` / `chain_splits`,
+ * and the two must agree — a divider commit sends `dividers[k]`'s id and a pair share, which
+ * Rust resolves through exactly this indexing.
+ */
+export function flattenChain(node: SplitNode): Chain {
+  const members: LayoutNode[] = []
+  const dividers: SplitId[] = []
+  const fractions: number[] = []
+
+  const visit = (n: LayoutNode, factor: number) => {
+    if (n.kind === 'split' && n.axis === node.axis) {
+      visit(n.a, factor * n.ratio)
+      dividers.push(n.id)
+      visit(n.b, factor * (1 - n.ratio))
+      return
+    }
+    members.push(n)
+    fractions.push(factor)
+  }
+  visit(node, 1)
+
+  return { axis: node.axis, members, dividers, fractions }
+}
+
+interface ChainNodeProps {
+  chain: Chain
+  /** One per member, already walked, in order. */
+  rendered: ReactNode[]
+  /** Which member is spanned across the whole grid, or `-1` for none. */
+  maximizedMember: number
   style: CSSProperties | undefined
   onRatioCommit?: ((split: SplitId, ratio: number) => void) | undefined
 }
 
-function SplitNode({
-  split,
-  axis,
-  ratio,
-  a,
-  b,
-  splitterHidden,
+function ChainNode({
+  chain,
+  rendered,
+  maximizedMember,
   style,
   onRatioCommit,
-}: SplitNodeProps) {
+}: ChainNodeProps) {
   const gridRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
+  const { axis, fractions, dividers } = chain
 
   // Deliberately runs on every render, with no dependency array.
   //
   // A drag mutates this element's style behind React's back, so React's own style diff is
   // no longer a reliable description of the DOM: when a commit is clamped or rejected and
-  // the ratio comes back unchanged, the diff finds nothing to write and the divider stays
+  // the shares come back unchanged, the diff finds nothing to write and the divider stays
   // where the pointer left it, disagreeing with the model for good. Re-asserting from props
-  // costs one string assignment per split per render and makes the model authoritative
+  // costs one string assignment per chain per render and makes the model authoritative
   // again the moment a snapshot lands.
   useLayoutEffect(() => {
     const grid = gridRef.current
     if (!grid || dragging.current) return
-    applyTemplate(grid, axis, ratio)
+    applyTracks(grid, axis, fractions)
   })
 
-  const template = splitTemplate(ratio)
-  // The cross axis is one explicit track. Without it the three children auto-place into an
-  // implicit grid — a `col` split would lay its two panes out side by side.
+  const template = trackTemplate(fractions)
+  // The cross axis is one explicit track. Without it the children auto-place into an
+  // implicit grid — a `col` chain would lay its panes out side by side.
   const layout: CSSProperties =
     axis === 'row'
       ? { gridTemplateColumns: template, gridTemplateRows: 'minmax(0, 1fr)' }
       : { gridTemplateRows: template, gridTemplateColumns: 'minmax(0, 1fr)' }
 
+  const hideDividers = maximizedMember >= 0
+
   return (
-    <div ref={gridRef} className={styles.split} style={{ ...style, ...layout }}>
-      {a}
-      <Splitter
-        split={split}
-        axis={axis}
-        ratio={ratio}
-        gridRef={gridRef}
-        hidden={splitterHidden}
-        onDragActive={(active) => {
-          dragging.current = active
-        }}
-        onCommit={onRatioCommit}
-      />
-      {b}
+    <div
+      ref={gridRef}
+      className={styles.split}
+      data-audit="chain"
+      data-axis={axis}
+      style={{ ...style, ...layout }}
+    >
+      {rendered.map((member, i) => (
+        // A `Fragment`, not a wrapper element: two children per member — the member and the
+        // divider after it — and anything real between them and the grid would break the
+        // explicit track placement below. Keyed by the divider's own id rather than by array
+        // index, so React reuses the right subtree when a tile is inserted mid-row.
+        <Fragment key={dividers[i] ?? 'end'}>
+          {member}
+          {i < dividers.length && (
+            <Splitter
+              split={dividers[i] as SplitId}
+              axis={axis}
+              fractions={fractions}
+              index={i}
+              gridRef={gridRef}
+              hidden={hideDividers}
+              onDragActive={(active) => {
+                dragging.current = active
+              }}
+              onCommit={onRatioCommit}
+            />
+          )}
+        </Fragment>
+      ))}
     </div>
   )
 }
@@ -169,48 +248,44 @@ function walk(node: LayoutNode, ctx: WalkContext, style: CSSProperties | undefin
     )
   }
 
+  const chain = flattenChain(node)
   const maximized = ctx.tree.maximized
-  let aStyle: CSSProperties = place(1, node.axis)
-  let bStyle: CSSProperties = place(3, node.axis)
-  let splitterHidden = false
-  if (maximized !== null) {
-    if (contains(node.a, maximized)) {
-      aStyle = FILL
-      bStyle = { ...bStyle, ...HIDDEN }
-      splitterHidden = true
-    } else if (contains(node.b, maximized)) {
-      aStyle = { ...aStyle, ...HIDDEN }
-      bStyle = FILL
-      splitterHidden = true
-    }
-    // Neither branch holds it: this split is already inside a hidden subtree, and
-    // `visibility` inherits, so there is nothing left to do here.
-  }
+  const holder =
+    maximized === null ? -1 : chain.members.findIndex((m) => contains(m, maximized))
 
-  // Ordered, not inlined into the JSX below: `a` must draw its pane numbers before `b`.
-  const a = walk(node.a, ctx, aStyle)
-  const b = walk(node.b, ctx, bStyle)
+  // Ordered, not built inside the JSX: member `i` must draw its pane numbers before `i + 1`.
+  const rendered = chain.members.map((member, i) => {
+    let style: CSSProperties = place(2 * i + 1, chain.axis)
+    if (holder >= 0) style = i === holder ? FILL : { ...style, ...HIDDEN }
+    // Neither this member nor any other holds it: the chain is already inside a hidden
+    // subtree, and `visibility` inherits, so there is nothing left to do here.
+    return walk(member, ctx, style)
+  })
 
   return (
-    <SplitNode
-      key={node.id}
-      split={node.id}
-      axis={node.axis}
-      ratio={node.ratio}
-      a={a}
-      b={b}
-      splitterHidden={splitterHidden}
+    <ChainNode
+      key={chain.dividers[0]}
+      chain={chain}
+      rendered={rendered}
+      maximizedMember={holder}
       style={style}
       onRatioCommit={ctx.onRatioCommit}
     />
   )
 }
 
+/** What the two `+ row` buttons ask for. Named here so the audit can assert on them. */
+const ROW_INTENTS: ReadonlyArray<{ label: string; name: string; intent: SplitIntent }> = [
+  { label: '⊞ bash row', name: 'Add a row with a shell', intent: { kind: 'shell' } },
+  { label: '⊞ claude row', name: 'Add a row with a Claude session', intent: { kind: 'newClaude' } },
+]
+
 export function SplitTree({
   tree,
   renderPane,
   onFocus,
   onRatioCommit,
+  onAddRow,
 }: SplitTreeProps): ReactNode {
   // Pane numbers are the depth-first position, computed during this walk rather than
   // stored: they are presentation — the thing "focus pane 3" refers to — and storing them
@@ -226,7 +301,29 @@ export function SplitTree({
 
   return (
     <div className={styles.tree} data-audit="paneTree">
-      {walk(tree.root, ctx, undefined)}
+      <div className={styles.canvas}>{walk(tree.root, ctx, undefined)}</div>
+      {/*
+        * A flex sibling of the tree, outside every grid, so the divider arithmetic stays
+        * pure — an extra track inside the chain would have to be subtracted from `usable` in
+        * every drag computation. Withheld while a pane is maximized: the gesture would
+        * un-maximize the tab out from under the user to show a row they cannot see yet.
+        */}
+      {onAddRow && tree.maximized === null && (
+        <div className={styles.addRow} data-audit="addRow">
+          {ROW_INTENTS.map(({ label, name, intent }) => (
+            <button
+              key={label}
+              type="button"
+              className={styles.addRowButton}
+              title={name}
+              aria-label={name}
+              onClick={() => onAddRow(intent)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

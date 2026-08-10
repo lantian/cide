@@ -216,8 +216,8 @@ const VIEW: &str = "View";
 fn build() -> Vec<Command> {
     vec![
         // Window.
-        Command::new("pane.split.right", "Split pane right", WINDOW),
-        Command::new("pane.split.down", "Split pane down", WINDOW),
+        Command::new("pane.split.right", "Split pane right (adds a tile)", WINDOW),
+        Command::new("pane.split.down", "Split pane down (adds a row)", WINDOW),
         Command::new("pane.promoteToTab", "Promote pane to full tab", WINDOW),
         Command::new("pane.detachToWindow", "Detach pane into window", WINDOW),
         Command::new("pane.close", "Close pane", WINDOW),
@@ -380,8 +380,8 @@ mod tests {
     #[test]
     fn titles_match_the_palette_mock_exactly() {
         for (id, title) in [
-            ("pane.split.right", "Split pane right"),
-            ("pane.split.down", "Split pane down"),
+            ("pane.split.right", "Split pane right (adds a tile)"),
+            ("pane.split.down", "Split pane down (adds a row)"),
             ("claude.split.newSession", "Split: new Claude session"),
             ("pane.promoteToTab", "Promote pane to full tab"),
             ("pane.detachToWindow", "Detach pane into window"),

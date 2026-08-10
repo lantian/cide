@@ -593,6 +593,243 @@ mod tests {
         assert_eq!(loaded, as_loaded(&workspace));
     }
 
+    /// A `workspace.json` as the build *before* the rows change wrote it: a nested 2x2 tree
+    /// — `Row(Col(a, b), Col(c, d))`, columns of stacked tiles — a populated `dockAnchors`,
+    /// a live detached pane and a second tab. Captured from `serde_json::to_string_pretty`
+    /// on a real `Workspace`, then edited only to give it that shape.
+    ///
+    /// Checked in as text rather than rebuilt from the constructors, which is the whole
+    /// point: a constructor moves with the code, so a test built from one cannot notice the
+    /// day the format stops matching what is on somebody's disk.
+    const LEGACY_WORKSPACE: &str = r#"{
+  "schemaVersion": 1,
+  "rev": 41,
+  "settings": {
+    "windowMode": "stacked",
+    "theme": "light",
+    "eachProjectKeepsClaudeTab": true,
+    "reopenLastProject": true,
+    "keepSessionsOnWindowClose": true,
+    "confirmCloseWithLiveSession": false,
+    "editor": {
+      "fontSize": 13,
+      "tabSize": 4,
+      "insertSpaces": true,
+      "showMinimap": true,
+      "wordWrap": false,
+      "trimTrailingWhitespaceOnSave": false
+    },
+    "terminal": { "fontSize": 12, "scrollback": 5000, "renderer": "auto" },
+    "graphics": {
+      "disableDmabufRenderer": null,
+      "disableCompositingMode": null,
+      "disableNvidiaExplicitSync": null
+    },
+    "claude": {
+      "disableMouse": false,
+      "altScreenFullRepaint": false,
+      "disableAlternateScreen": false
+    }
+  },
+  "projects": {
+    "95a107d5-944e-497c-b75a-dca593009bf9": {
+      "id": "95a107d5-944e-497c-b75a-dca593009bf9",
+      "name": "cide",
+      "displayPath": "~/work/cide",
+      "dot": "var(--accent)",
+      "roots": [{ "path": "~/work/cide", "repo": null, "label": "cide" }],
+      "tabs": [
+        {
+          "id": "8e5ed863-412d-487f-a6c4-ad5b4ba0b5d1",
+          "kind": { "kind": "claudeHome" },
+          "tree": {
+            "root": {
+              "kind": "split",
+              "id": "98ce54f1-72d5-4938-b5f3-1e6a6c488704",
+              "axis": "row",
+              "a": {
+                "kind": "split",
+                "id": "1c0d4e51-6f0a-4a2b-9b64-2a7ad2c1f001",
+                "axis": "col",
+                "a": { "kind": "leaf", "pane": "2f130069-a1a3-4788-aff1-eeecd3e9118c" },
+                "b": { "kind": "leaf", "pane": "5f4274c3-fbc4-4891-8a54-7ce69e5439f8" },
+                "ratio": 0.7
+              },
+              "b": {
+                "kind": "split",
+                "id": "1c0d4e51-6f0a-4a2b-9b64-2a7ad2c1f002",
+                "axis": "col",
+                "a": { "kind": "leaf", "pane": "3a9b1f22-0c71-4d1e-8a55-11aa22bb33cc" },
+                "b": { "kind": "leaf", "pane": "44445555-6666-4777-8888-999900001111" },
+                "ratio": 0.35
+              },
+              "ratio": 0.62
+            },
+            "focused": "3a9b1f22-0c71-4d1e-8a55-11aa22bb33cc",
+            "maximized": null,
+            "panes": {
+              "2f130069-a1a3-4788-aff1-eeecd3e9118c": {
+                "id": "2f130069-a1a3-4788-aff1-eeecd3e9118c",
+                "kind": "claude",
+                "role": "primary",
+                "session": "b7bd5681-36fd-4436-a71b-c4a34dcd580e",
+                "title": "cide : claude"
+              },
+              "5f4274c3-fbc4-4891-8a54-7ce69e5439f8": {
+                "id": "5f4274c3-fbc4-4891-8a54-7ce69e5439f8",
+                "kind": "shell",
+                "role": "auxiliary",
+                "session": "e0d851bd-6139-412d-a390-4456ea3b9bdf",
+                "title": "cide : bash"
+              },
+              "3a9b1f22-0c71-4d1e-8a55-11aa22bb33cc": {
+                "id": "3a9b1f22-0c71-4d1e-8a55-11aa22bb33cc",
+                "kind": "claude",
+                "role": "auxiliary",
+                "session": "aaaabbbb-cccc-4ddd-8eee-ffff00001111",
+                "title": "cide : claude — tests"
+              },
+              "44445555-6666-4777-8888-999900001111": {
+                "id": "44445555-6666-4777-8888-999900001111",
+                "kind": "diff",
+                "role": "auxiliary",
+                "session": null,
+                "title": "cide : claude — diff"
+              }
+            }
+          }
+        },
+        {
+          "id": "e103d9b3-d11b-4cb7-84fa-2133f79765f0",
+          "kind": { "kind": "settings", "section": "keymap" },
+          "tree": {
+            "root": { "kind": "leaf", "pane": "c7386d65-f163-42bc-9a2c-9bfa6e818815" },
+            "focused": "c7386d65-f163-42bc-9a2c-9bfa6e818815",
+            "maximized": null,
+            "panes": {
+              "c7386d65-f163-42bc-9a2c-9bfa6e818815": {
+                "id": "c7386d65-f163-42bc-9a2c-9bfa6e818815",
+                "kind": "editor",
+                "role": "auxiliary",
+                "session": null,
+                "title": "settings"
+              }
+            }
+          }
+        }
+      ],
+      "activeTab": "8e5ed863-412d-487f-a6c4-ad5b4ba0b5d1",
+      "detached": {
+        "deadbeef-0000-4111-8222-333344445555": {
+          "id": "deadbeef-0000-4111-8222-333344445555",
+          "kind": "shell",
+          "role": "auxiliary",
+          "session": "12121212-3434-4545-8656-767878789090",
+          "title": "cide : bash"
+        }
+      },
+      "dockAnchors": {
+        "deadbeef-0000-4111-8222-333344445555": {
+          "sibling": { "kind": "split", "split": "1c0d4e51-6f0a-4a2b-9b64-2a7ad2c1f002" },
+          "split": "1c0d4e51-6f0a-4a2b-9b64-2a7ad2c1f003",
+          "axis": "row",
+          "side": "after",
+          "ratio": 0.73
+        }
+      },
+      "primarySession": "b7bd5681-36fd-4436-a71b-c4a34dcd580e"
+    }
+  },
+  "windows": {
+    "shell:0e9a1b2c-3d4e-4f50-8a1b-2c3d4e5f6071": {
+      "kind": "shell",
+      "projects": ["95a107d5-944e-497c-b75a-dca593009bf9"],
+      "active": "95a107d5-944e-497c-b75a-dca593009bf9"
+    },
+    "pane:0e9a1b2c-3d4e-4f50-8a1b-2c3d4e5f6072": {
+      "kind": "detachedPane",
+      "project": "95a107d5-944e-497c-b75a-dca593009bf9",
+      "tab": "8e5ed863-412d-487f-a6c4-ad5b4ba0b5d1",
+      "pane": "deadbeef-0000-4111-8222-333344445555"
+    }
+  }
+}"#;
+
+    /// Criterion 2 of the rows change: nothing on anybody's disk had to move.
+    ///
+    /// `CURRENT_SCHEMA` is still 1, so this document takes the fast path in `read_workspace`
+    /// and is never routed through `serde_json::Value` — which would re-sort the header tab
+    /// order. No migration arm runs, no file is rewritten, no quarantine copy appears, and
+    /// every anchor comes back naming the same split it named before.
+    #[test]
+    fn a_workspace_written_before_this_change_loads_at_schema_1_untouched() {
+        let dir = TempDir::new("legacy");
+        let path = dir.join("workspace.json");
+        fs::write(&path, LEGACY_WORKSPACE).expect("write the captured document");
+
+        let ws = load(&path);
+
+        assert_eq!(Workspace::CURRENT_SCHEMA, 1, "no schema bump was needed");
+        assert_eq!(ws.schema_version, 1);
+        assert_eq!(
+            dir.entries(),
+            vec!["workspace.json".to_string()],
+            "nothing was quarantined and nothing was written beside it"
+        );
+
+        let project = ws.projects.values().next().expect("the project loaded");
+        assert_eq!(project.tabs.len(), 2);
+        let tree = &project.tabs[0].tree;
+
+        // The tree is the shape it was on disk: two *columns* of stacked tiles, ratios and
+        // split ids intact. The flattening renderer draws it correctly as it stands, which is
+        // why no migration was needed to make it right.
+        let LayoutNode::Split {
+            id,
+            axis,
+            a,
+            b,
+            ratio,
+        } = &tree.root
+        else {
+            panic!("the root is still a split");
+        };
+        assert_eq!(id.to_string(), "98ce54f1-72d5-4938-b5f3-1e6a6c488704");
+        assert_eq!(*axis, Axis::Row);
+        assert!((ratio - 0.62).abs() < 1e-6);
+        for (side, want) in [(a, Axis::Col), (b, Axis::Col)] {
+            let LayoutNode::Split { axis, .. } = side.as_ref() else {
+                panic!("a column survived as a column");
+            };
+            assert_eq!(*axis, want);
+        }
+
+        // Every pane, every session binding, and both flags.
+        assert_eq!(tree.panes.len(), 4);
+        assert_eq!(crate::layout::leaves(&tree.root).len(), 4);
+        assert_eq!(
+            tree.focused.to_string(),
+            "3a9b1f22-0c71-4d1e-8a55-11aa22bb33cc"
+        );
+        assert_eq!(tree.maximized, None);
+        assert!(
+            tree.panes.values().filter(|p| p.session.is_some()).count() == 3,
+            "the three panes with a live conversation kept their binding"
+        );
+
+        // And the detached pane's anchor still names a split that is really there, so it
+        // re-docks exactly rather than falling back to a guess.
+        assert_eq!(project.detached.len(), 1);
+        let (pane, anchor) = project.dock_anchors.iter().next().expect("one anchor");
+        assert!(project.detached.contains_key(pane));
+        assert!(
+            crate::layout::can_restore(tree, anchor),
+            "the anchor survived the upgrade"
+        );
+
+        crate::workspace::validate(&ws).expect("no invariant was tightened under it");
+    }
+
     /// `Project::detached` is `#[serde(default)]`, so a field lost to a rename or a typo
     /// deserialises as an empty map instead of failing loudly — and a torn-out pane holds a
     /// live `SessionId`, so losing it silently orphans a running conversation.

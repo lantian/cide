@@ -225,6 +225,20 @@ interface WorkspaceStore {
     side: Side,
     intent?: SplitIntent | null,
   ) => Promise<SplitOutcome>
+  /**
+   * Add a full-width row holding one pane.
+   *
+   * `after: null` appends at the bottom; otherwise the row lands on `side` of the row that
+   * holds `after`. Independent of how many tiles any other row has — that is the whole point
+   * of a row being a row.
+   */
+  addRow: (
+    project: ProjectId,
+    tab: TabId,
+    after?: PaneId | null,
+    side?: Side,
+    intent?: SplitIntent | null,
+  ) => Promise<SplitOutcome>
   closePane: (project: ProjectId, tab: TabId, pane: PaneId, force?: boolean) => Promise<void>
   focusPane: (project: ProjectId, tab: TabId, pane: PaneId) => Promise<void>
   maximizePane: (project: ProjectId, tab: TabId, pane: PaneId | null) => Promise<void>
@@ -374,6 +388,17 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // Recorded before the hydrate that makes the pane renderable, so the spawn plan is
     // already in place by the time `TerminalPane` mounts and asks for one. The other order
     // races: the pane appears, spawns a fresh session, and the fork is lost.
+    if (created.intent.kind === 'forkPrimary' || created.intent.kind === 'mirror') {
+      rememberSpawnPlan(created.pane, created.intent)
+    }
+    await get().hydrate()
+    return created
+  },
+  addRow: async (project, tab, after = null, side = 'after', intent = null) => {
+    const created = await paneApi.addRow(project, tab, after, side, intent)
+    // Same ordering as `splitPane`, and for the same reason: the plan has to be in place
+    // before the hydrate that makes the pane renderable, or `TerminalPane` mounts, finds no
+    // plan and spawns a fresh session where the user asked to branch one.
     if (created.intent.kind === 'forkPrimary' || created.intent.kind === 'mirror') {
       rememberSpawnPlan(created.pane, created.intent)
     }

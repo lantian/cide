@@ -24,6 +24,8 @@ export interface PaneFrameProps {
   maximized: boolean
   children: ReactNode
   onFocus?: (() => void) | undefined
+  /** Add a tile beside this pane, in its row. Absent hides the button. */
+  onAddTile?: (() => void) | undefined
   onMaximize?: (() => void) | undefined
   onDetach?: (() => void) | undefined
   onClose?: (() => void) | undefined
@@ -36,6 +38,7 @@ export function PaneFrame({
   maximized,
   children,
   onFocus,
+  onAddTile,
   onMaximize,
   onDetach,
   onClose,
@@ -72,6 +75,7 @@ export function PaneFrame({
         // in the frame that is guaranteed to fail — and it fails into an error toast, which
         // reads as a bug rather than as a rule.
         detachable={pane.role !== 'primary'}
+        onAddTile={onAddTile}
         onMaximize={onMaximize}
         onDetach={onDetach}
         onClose={onClose}
@@ -96,6 +100,15 @@ export interface PaneTitleBarProps {
    * through the same `take_pane` refusal, so the button would never once succeed.
    */
   detachable?: boolean | undefined
+  /**
+   * Add a tile beside this pane, in its row. Absent hides the button — a detached-pane
+   * window has no row to add to.
+   *
+   * This bar had no split affordance at all until M11, which is a large part of why the
+   * gesture was unfindable: the only one in the app was the header's ⊞, six inches away from
+   * the pane it acts on.
+   */
+  onAddTile?: (() => void) | undefined
   onMaximize?: (() => void) | undefined
   onDetach?: (() => void) | undefined
   onClose?: (() => void) | undefined
@@ -108,6 +121,7 @@ export function PaneTitleBar({
   maximized = false,
   closable = true,
   detachable = true,
+  onAddTile,
   onMaximize,
   onDetach,
   onClose,
@@ -119,6 +133,17 @@ export function PaneTitleBar({
         {title}
       </span>
       <span className={styles.actions}>
+        {onAddTile && (
+          <button
+            type="button"
+            className={styles.action}
+            title="Add a pane to this row"
+            aria-label="Add pane to this row"
+            onClick={onAddTile}
+          >
+            ⊞
+          </button>
+        )}
         <button
           type="button"
           className={maximized ? `${styles.action} ${styles.actionOn}` : styles.action}
