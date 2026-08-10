@@ -239,3 +239,34 @@ pub fn close_blocked(
         tracing::debug!(%error, "close-blocked reached no window");
     }
 }
+
+// --- diagnostics ------------------------------------------------------------------------
+
+/// The IPC transport is on the slow path.
+///
+/// Promised by `cmd/diag.rs` since M0 and never actually sent, which meant the one failure
+/// mode the M0 instrumentation exists to catch was the one nothing could report. It matters
+/// because the degradation is *silent and permanent*: `ipc-protocol.js` catches a rejection
+/// from the custom-protocol fetch, sets `customProtocolIpcFailed = true` for the life of the
+/// page, and from then on every payload is JSON-encoded and `eval`'d. Nothing crashes. The app
+/// simply becomes slow, which is precisely the report a user files as "typing is laggy" —
+/// with no way for anyone to tell that from a renderer problem or a PTY problem.
+///
+/// Broadcast to every window rather than answered to the caller: the probe runs in one window
+/// and the transport is the process's.
+pub const IPC_DEGRADED: &str = "cide://ipc-degraded";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IpcDegraded {
+    health: cide_ipc::IpcHealth,
+}
+
+pub fn ipc_degraded(app: &AppHandle, health: &cide_ipc::IpcHealth) {
+    let payload = IpcDegraded {
+        health: health.clone(),
+    };
+    if let Err(error) = app.emit(IPC_DEGRADED, payload) {
+        tracing::debug!(%error, "ipc-degraded reached no window");
+    }
+}

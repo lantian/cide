@@ -12,6 +12,7 @@
     "check:exit": "node scripts/check-exit-marker.mjs",
     "check:format": "node scripts/check-status-format.mjs",
     "check:git": "node scripts/check-git-tree.mjs",
+    "check:input": "node scripts/check-input-emitters.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:picker": "node scripts/check-picker.mjs",
     "check:problems": "node scripts/check-problems.mjs",

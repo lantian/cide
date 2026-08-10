@@ -24,6 +24,7 @@
 #   ./run.sh --audit-chrome       # chrome vs the design mock (M3), prints and exits
 #   ./run.sh --audit-panes        # pane host registry under churn (M4)
 #   ./run.sh --audit-windows      # detach/re-dock and window modes (M5)
+#   ./run.sh --input-probe        # trace every keyboard emitter into the log (see below)
 #   ./run.sh --fresh              # start from an empty workspace
 #   ./run.sh --on-top             # keep the window above others, for screenshots
 #
@@ -46,6 +47,10 @@ for arg in "$@"; do
     --audit-chrome)   env_flags+=(CIDE_AUDIT=1) ;;
     --audit-panes)    env_flags+=(CIDE_AUDIT_PANES=1) ;;
     --audit-windows)  env_flags+=(CIDE_AUDIT_WINDOWS=1) ;;
+    # Answers "which of xterm's two input emitters is the input method firing" — the only
+    # thing that can, short of a debugger. Off by default because it logs four synchronous
+    # IPC round trips per character; see `ui/src/terminal/inputHost.ts`.
+    --input-probe)    env_flags+=(CIDE_INPUT_PROBE=1) ;;
     --on-top)         env_flags+=(CIDE_ON_TOP=1) ;;
     --fresh)          fresh=1 ;;
     *) echo "unknown option: $arg" >&2; sed -n '20,29p' "$0" >&2; exit 2 ;;
@@ -122,6 +127,47 @@ if [ ! -x "$BIN" ]; then
     echo "[run] $BIN is missing; run: pnpm --dir ui build && cargo build --release -p cide-app" >&2
   else
     echo "[run] $BIN is missing; run: cargo build -p cide-app" >&2
+  fi
+  exit 1
+fi
+
+# --- refuse a binary older than the Rust it is supposed to be ---------------------------
+#
+# This script starts Vite, which hot-reloads the frontend the instant a file changes, and then
+# launches a binary it never rebuilds. So an ordinary edit-and-relaunch loop leaves the two
+# halves of the app at different commits, silently, and the failure is invisible from both
+# sides: Tauri deserialises each command argument *by name* (`tauri/src/ipc/command.rs`, and
+# there is no whole-payload struct and no `deny_unknown_fields`), so a stale binary does not
+# reject a new payload — it ignores the fields it has not heard of and carries on. The symptom
+# is a feature that is simply absent, or a pane that comes up blank, with no error anywhere.
+#
+# Hours were spent on a reported bug asking whether this had happened. Refusing here is cheaper
+# than any handshake: the check is one `find`, and the answer is available before a window
+# exists rather than after.
+#
+# **Only `*.rs` and the manifests, and only under `crates/`.** A guard that refuses when
+# nothing is wrong gets bypassed and then deleted, so its false-positive rate is the whole
+# design. Two things would have given it one:
+#
+#   * `crates/*/bindings/*.ts` — ts-rs rewrites every one of them on every `cargo test`, so a
+#     plain `find crates` refuses after any test run, with the binary perfectly current.
+#     Verified, not assumed: their mtime moves on a bare `cargo test -p cide-ipc`.
+#   * `xtask/` — not linked into `cide` at all. Editing the build tool says nothing about
+#     whether the binary is stale.
+newer=$(find crates -name '*.rs' -newer "$BIN" -type f 2>/dev/null; \
+        find crates -name Cargo.toml -newer "$BIN" -type f 2>/dev/null; \
+        find Cargo.toml Cargo.lock -newer "$BIN" -type f 2>/dev/null)
+newer=$(printf '%s\n' "$newer" | grep -v '^$' | head -n 3)
+if [ -n "$newer" ]; then
+  echo "[run] REFUSING: $BIN is older than the Rust sources it was built from."
+  echo "[run] Newer than the binary, among others:"
+  echo "$newer" | sed 's/^/[run]   /'
+  echo "[run] This script rebuilds the frontend but never the binary, so launching now would"
+  echo "[run] run a new UI against an old backend — which fails silently, not loudly."
+  if [ "$release" = 1 ]; then
+    echo "[run] Fix:  pnpm --dir ui build && cargo build --release -p cide-app"
+  else
+    echo "[run] Fix:  cargo build -p cide-app"
   fi
   exit 1
 fi

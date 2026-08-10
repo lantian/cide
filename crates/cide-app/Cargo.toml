@@ -36,6 +36,8 @@ tauri-plugin-store = { workspace = true }
 tauri-plugin-window-state = { workspace = true }
 
 dashmap = { workspace = true }
+# Only for `tauri_plugin_log::Builder::level_for`. This crate's own logging is `tracing`.
+log = { workspace = true }
 # The IDE server is async; `ide.rs` owns a runtime for it rather than making the app async.
 tokio = { workspace = true }
 parking_lot = { workspace = true }

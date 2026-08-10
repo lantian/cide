@@ -110,6 +110,31 @@ fn state_path_hint() -> String {
     cide_core::persist::workspace_path().display().to_string()
 }
 
+/// The log destination, configured so that it can still hold anything worth reading.
+///
+/// **`Builder::default()` was making the log eat itself.** Its defaults are level `Trace`,
+/// `max_file_size` 40 000 bytes and `RotationStrategy::KeepOne`, and the `notify` inotify
+/// backend emits a TRACE line per watch descriptor — roughly 27 KB during start-up alone on a
+/// project of any size. Everything written before that point was rotated out within a second
+/// of launch, so by the time anyone opened the file the only thing in it was inotify
+/// bookkeeping. That is why `app_open_log_dir` exists and why it has never been useful, and it
+/// is what has to be fixed before any diagnostic added here is worth adding.
+///
+/// The two noisy targets are pinned to `Info` rather than raising the global floor: a
+/// `tracing::debug!` from this workspace is exactly the thing a user is asked to send back.
+fn log_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri_plugin_log::Builder::default()
+        .level_for("notify", log::LevelFilter::Info)
+        .level_for("notify_debouncer_full", log::LevelFilter::Info)
+        // Two megabytes, three files. A session's worth of diagnostics is a few hundred
+        // kilobytes; the old 40 KB could not hold one project's start-up. `KeepSome` rather
+        // than `KeepAll` because a log directory that grows for ever is the other way to
+        // make a log useless.
+        .max_file_size(2 * 1024 * 1024)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+        .build()
+}
+
 /// `deny(unused_variables)` is scoped to this function on purpose.
 ///
 /// `run` is where every subsystem is built and handed to the app, so an unused binding here
@@ -133,7 +158,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_log::Builder::default().build());
+        .plugin(log_plugin());
 
     if restore_geometry {
         builder = builder.plugin(

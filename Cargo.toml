@@ -113,10 +113,25 @@ libc = "0.2.189"
 getrandom = "0.4.3"
 
 # --- diagnostics ---
+# Named directly only so `tauri-plugin-log`'s `level_for` can be given a `LevelFilter`. It is
+# already in the graph via the plugin; this workspace logs through `tracing`, which now
+# bridges into it (see below).
+log = "0.4.33"
 thiserror = "2.0.19"
 anyhow = "1.0.104"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# The `log` feature is what makes the 60-odd `tracing::` call sites in this workspace do
+# anything at all. There is no `tracing-subscriber` installed anywhere — checked, not assumed:
+# no crate calls `set_global_default`, and until this line `tracing`'s dependency list held
+# only `pin-project-lite`, `tracing-attributes` and `tracing-core`, i.e. no `log` bridge. Every
+# `tracing::warn!` in the app compiled, ran, and went nowhere. With `log` enabled they emit
+# `log` records, which `tauri-plugin-log` — already installed in `lib.rs` — writes to the log
+# file, the terminal and the webview console.
+#
+# The alternative that lost was installing `tracing-subscriber` and its own file appender. It
+# is the more capable option, and it would have meant two independent logging stacks writing
+# two files, with `tauri-plugin-log` still owning the one that `app_open_log_dir` points a user
+# at. One destination is worth more here than span support nothing currently emits.
+tracing = { version = "0.1.44", features = ["log"] }
 
 [profile.dev]
 # The webview + libgit2 + tree-sitter make a fully-unoptimised dev build painful to use.

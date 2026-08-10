@@ -20,6 +20,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { terminalKeyGate } from '@/keys/gate'
 import { terminalKeyBytes } from './keys'
+import { imeFiltered, InputRouter } from './inputRouting'
 import { paletteSignature, terminalPalette, unresolvedSlots } from '@/settings/theme'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
@@ -30,6 +31,14 @@ export const MAX_WEBGL = 5
 export interface TerminalHandle {
   term: Terminal
   fit: FitAddon
+  /**
+   * Who has already emitted for the keystroke in flight.
+   *
+   * Read by the capture-phase `input` listener `openTerminal` installs, written by the key
+   * handler below. See `inputRouting.ts` — this is the state that keeps xterm's two
+   * emitters from both firing under an input method.
+   */
+  input: InputRouter
   /** Cell metrics, needed so the PTY gets real pixel dimensions rather than zeroes. */
   cellSize(): { width: number; height: number }
   dispose(): void
@@ -110,7 +119,33 @@ export function createTerminal(): TerminalHandle {
    * Doing it the other way round would make a `shift+enter` binding in `keymap.json`
    * unreachable inside terminals with nothing on screen to say why.
    */
+  const input = new InputRouter()
+
   term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type === 'keydown') {
+      /*
+       * An input method has taken this key: it has *not* been handled here, and the `input`
+       * event that follows is the only delivery there will be.
+       *
+       * Returning false stops `_keyDown` before `this._compositionHelper.keydown(event)`,
+       * which disarms the second, quieter duplication path: `_handleAnyTextareaChanges`
+       * snapshots `textarea.value`, waits a `setTimeout(0)`, and emits
+       * `newValue.replace(oldValue, '')` — a diff that is wrong whenever anything else
+       * cleared the textarea in between, and which emits a bare `C0.DEL` when
+       * `_handleTextAreaBlur` does exactly that.
+       *
+       * Deliberately WITHOUT `preventDefault`, which is the opposite of every other false
+       * return in this file: the textarea has to keep receiving the commit, because the
+       * capture-phase listener in `openTerminal` is what turns it into one byte sequence.
+       * Cancelling here would make the character vanish instead of doubling.
+       */
+      if (imeFiltered(ev)) return false
+      // Claimed whichever way the rest of this handler goes — a key the gate swallows was
+      // still consumed by this app, and letting the IM re-deliver it would push a byte the
+      // user's binding said not to send.
+      input.keydown(ev, performance.now())
+    }
+
     if (!terminalKeyGate(ev)) return false
 
     const bytes = terminalKeyBytes(ev)
@@ -128,6 +163,7 @@ export function createTerminal(): TerminalHandle {
   const handle: TerminalHandle = {
     term,
     fit,
+    input,
     cellSize() {
       // xterm does not expose cell metrics publicly; derive them from the rendered
       // dimensions, which is stable once the terminal has opened and fitted.

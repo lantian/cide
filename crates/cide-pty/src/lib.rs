@@ -57,6 +57,13 @@ pub const MAX_FRAME: usize = 64 * 1024;
 /// Depth of the reader→coalescer channel. Small on purpose: this is the backpressure.
 const READ_QUEUE_DEPTH: usize = 16;
 
+/// How long [`PtySession::attach_with_snapshot`] waits for the coalescer to cut the stream.
+///
+/// Generous, because the only thing that can delay the answer is a flush already in progress —
+/// bounded by one `state_formatted()` over the scrollback — and finite because this runs on the
+/// thread that receives IPC messages. Expiring costs the attach its atomicity, not the attach.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How much a sink may owe before it stops being sent raw output, and how it recovers.
 ///
 /// # Why credit is per-sink and not per-session
@@ -313,6 +320,20 @@ struct Registered {
     last_ack: Mutex<Instant>,
 }
 
+/// Work handed to the coalescer thread that is not output.
+///
+/// Exists for exactly one reason: an attachment has to happen at a point in the stream where
+/// the mirror and the sinks agree, and the coalescer thread is the only place such a point
+/// exists. See [`PtySession::attach_with_snapshot`].
+enum Control {
+    Attach {
+        id: SinkId,
+        sink: Arc<dyn Sink>,
+        /// The screen as of the cut point. The caller sends this to the sink itself.
+        reply: Sender<Vec<u8>>,
+    },
+}
+
 /// What the coalescer sends to sinks.
 enum Frame {
     Bytes(Vec<u8>),
@@ -333,6 +354,11 @@ enum Frame {
 pub struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer_tx: Sender<Vec<u8>>,
+    /// Attach requests, serviced on the coalescer thread. A channel of its own rather than a
+    /// variant on the reader→coalescer channel: that one reaching `Disconnected` is how EOF is
+    /// detected, and holding a second sender for it here would mean the coalescer never sees
+    /// the child go away.
+    control_tx: Sender<Control>,
     vt: Arc<Mutex<vt100::Parser>>,
     sinks: Arc<Mutex<Vec<Registered>>>,
     next_sink_id: AtomicU32,
@@ -402,10 +428,12 @@ impl PtySession {
 
         let (raw_tx, raw_rx) = bounded::<Vec<u8>>(READ_QUEUE_DEPTH);
         let (writer_tx, writer_rx) = unbounded::<Vec<u8>>();
+        let (control_tx, control_rx) = unbounded::<Control>();
 
         spawn_reader(reader, raw_tx);
         spawn_coalescer(
             raw_rx,
+            control_rx,
             Arc::clone(&vt),
             Arc::clone(&sinks),
             Arc::clone(&exited),
@@ -420,6 +448,7 @@ impl PtySession {
         Ok(Arc::new(Self {
             master: Mutex::new(pair.master),
             writer_tx,
+            control_tx,
             vt,
             sinks,
             next_sink_id: AtomicU32::new(1),
@@ -511,16 +540,68 @@ impl PtySession {
     /// The caller is responsible for first delivering [`Self::screen_state`] so the new
     /// consumer starts from the current screen rather than mid-stream.
     pub fn attach(&self, sink: Arc<dyn Sink>) -> SinkId {
-        let id = SinkId(self.next_sink_id.fetch_add(1, Ordering::Relaxed) as u64);
-        self.sinks.lock().push(Registered {
-            id,
-            sink,
-            outstanding: AtomicUsize::new(0),
-            choked: AtomicBool::new(false),
-            missed: AtomicBool::new(false),
-            last_ack: Mutex::new(Instant::now()),
-        });
+        let id = self.mint_sink_id();
+        self.sinks.lock().push(registered(id, sink));
         id
+    }
+
+    /// Attach a consumer **and** take the screen it should start from, at one cut point.
+    ///
+    /// # The bug this replaces
+    ///
+    /// `screen_state()` then `attach()` is two operations, and there is a window between them
+    /// in which bytes are counted twice. The mirror is fed per *chunk*, the moment the
+    /// coalescer receives it; sinks are fed per *flush*, up to [`FLUSH_INTERVAL`] later. So a
+    /// byte that arrived during that window is already painted into the snapshot and is still
+    /// sitting in the coalescer's `pending` buffer, which the new sink is then sent in full.
+    /// The pane shows the tail of its own scrollback twice. For a fullscreen TUI, whose repaint
+    /// the frontend nudges immediately afterwards, it is invisible; for a shell pane it is a
+    /// duplicated prompt and a duplicated last command, on every re-dock and every rehydration.
+    ///
+    /// # Why it goes to the coalescer thread
+    ///
+    /// Because that thread is the only place where "the mirror and the sinks are in step" is
+    /// ever true. It flushes `pending` first — so the existing sinks receive those bytes
+    /// exactly once, as ordinary output — then registers the new sink, then renders the
+    /// mirror. Nothing runs between the three, because they are three statements on the one
+    /// thread that broadcasts.
+    ///
+    /// The alternative that lost was moving `vt.process` from the receive arm into `broadcast`,
+    /// so the mirror only ever advances when the sinks do. It removes the window too, but it
+    /// makes the mirror lag the child by up to a flush interval — and `session_scrollback` on a
+    /// *quiet* session would then answer with a screen missing the bytes that arrived since
+    /// the last flush. That converts a visible duplication into a silent loss, which is worse.
+    ///
+    /// Falls back to the unsynchronised pair if the coalescer is gone, which is the case for a
+    /// child that has already exited: there is no more output, so there is no window to be
+    /// wrong about.
+    pub fn attach_with_snapshot(&self, sink: Arc<dyn Sink>) -> (SinkId, Vec<u8>) {
+        let id = self.mint_sink_id();
+
+        if !self.exited.load(Ordering::Acquire) {
+            let (reply_tx, reply_rx) = bounded::<Vec<u8>>(1);
+            let request = Control::Attach {
+                id,
+                sink: Arc::clone(&sink),
+                reply: reply_tx,
+            };
+            if self.control_tx.send(request).is_ok()
+                // Bounded rather than `recv()`: this runs on the thread that receives IPC
+                // messages, and a coalescer that has exited between the check above and the
+                // send would otherwise wedge the whole webview. A timeout that expires means
+                // the fallback below, not a lost attachment.
+                && let Ok(screen) = reply_rx.recv_timeout(ATTACH_TIMEOUT)
+            {
+                return (id, screen);
+            }
+        }
+
+        self.sinks.lock().push(registered(id, sink));
+        (id, self.screen_state())
+    }
+
+    fn mint_sink_id(&self) -> SinkId {
+        SinkId(self.next_sink_id.fetch_add(1, Ordering::Relaxed) as u64)
     }
 
     /// Detaching drops the sink's credit with it, rather than stranding it.
@@ -643,8 +724,71 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, tx: Sender<Vec<u8>>) {
         .expect("spawn pty reader thread");
 }
 
+/// One turn of the coalescer's loop, so the `select!` has a single value to match on.
+enum Event {
+    Output(Vec<u8>),
+    Control(Control),
+    /// Nothing arrived within the flush deadline: flush and service credit.
+    Idle,
+    /// Either channel closed. The child is gone.
+    Eof,
+}
+
+/// A fresh registration, owing nothing.
+///
+/// A function rather than a `Registered::new`, because the struct is private and this is the
+/// only shape it is ever built in — the two call sites (`attach` and the coalescer's control
+/// arm) differing would be a credit bug that shows up as one pane choking and not the other.
+fn registered(id: SinkId, sink: Arc<dyn Sink>) -> Registered {
+    Registered {
+        id,
+        sink,
+        outstanding: AtomicUsize::new(0),
+        choked: AtomicBool::new(false),
+        missed: AtomicBool::new(false),
+        last_ack: Mutex::new(Instant::now()),
+    }
+}
+
+/// Handle one control request, on the coalescer thread.
+///
+/// The order is the whole point and it is not interchangeable:
+///
+/// 1. **Flush** what is pending, to the sinks that already exist. Those bytes are in the
+///    mirror already, so leaving them queued would send them to the new sink as live output
+///    *after* it had received them inside the snapshot.
+/// 2. **Register** the new sink, which from here on receives only future frames.
+/// 3. **Render** the mirror, which now contains exactly what step 1 delivered and nothing
+///    more.
+///
+/// Nothing can run between them: this thread is the only one that broadcasts, and the mirror
+/// only advances from this thread's output arm.
+fn serve_control(
+    request: Control,
+    sinks: &Arc<Mutex<Vec<Registered>>>,
+    vt: &Arc<Mutex<vt100::Parser>>,
+    policy: &CreditPolicy,
+    pending: &mut Vec<u8>,
+    first_byte_at: &mut Option<Instant>,
+) {
+    match request {
+        Control::Attach { id, sink, reply } => {
+            if !pending.is_empty() {
+                broadcast(sinks, vt, policy, Frame::Bytes(std::mem::take(pending)));
+                *first_byte_at = None;
+            }
+            sinks.lock().push(registered(id, sink));
+            // A caller that has given up (see `ATTACH_TIMEOUT`) leaves nobody on the other
+            // end. The sink stays attached regardless — it is registered and will receive
+            // output; only the atomicity of its first frame was lost.
+            let _ = reply.send(vt.lock().screen().state_formatted());
+        }
+    }
+}
+
 fn spawn_coalescer(
     rx: Receiver<Vec<u8>>,
+    control_rx: Receiver<Control>,
     vt: Arc<Mutex<vt100::Parser>>,
     sinks: Arc<Mutex<Vec<Registered>>>,
     exited: Arc<AtomicBool>,
@@ -664,8 +808,38 @@ fn spawn_coalescer(
                     Some(t) => FLUSH_INTERVAL.saturating_sub(t.elapsed()),
                 };
 
-                match rx.recv_timeout(timeout) {
-                    Ok(chunk) => {
+                // Selected on rather than polled between reads: an idle session waits 250 ms
+                // per iteration, and an attach that queued behind that wait would put a
+                // quarter-second stall in front of every pane opening onto a quiet shell.
+                //
+                // `control_rx` cannot disconnect while this thread lives — the session holds
+                // the sender, and if it did not, `Err` on this arm would spin the loop. That
+                // is asserted by construction rather than handled: a disconnected control arm
+                // ends the thread, exactly as a disconnected output arm does.
+                let event = crossbeam_channel::select! {
+                    recv(control_rx) -> request => match request {
+                        Ok(request) => Event::Control(request),
+                        Err(_) => Event::Eof,
+                    },
+                    recv(rx) -> chunk => match chunk {
+                        Ok(chunk) => Event::Output(chunk),
+                        Err(_) => Event::Eof,
+                    },
+                    default(timeout) => Event::Idle,
+                };
+
+                match event {
+                    Event::Control(request) => {
+                        serve_control(
+                            request,
+                            &sinks,
+                            &vt,
+                            &policy,
+                            &mut pending,
+                            &mut first_byte_at,
+                        );
+                    }
+                    Event::Output(chunk) => {
                         // The mirror is fed unconditionally, attached or not — that is what
                         // makes a reattaching pane able to paint the current screen.
                         vt.lock().process(&chunk);
@@ -693,7 +867,7 @@ fn spawn_coalescer(
                             first_byte_at = None;
                         }
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    Event::Idle => {
                         if !pending.is_empty() {
                             broadcast(
                                 &sinks,
@@ -707,7 +881,7 @@ fn spawn_coalescer(
                         // during a burst still recovers once the burst ends.
                         broadcast(&sinks, &vt, &policy, Frame::Tick);
                     }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    Event::Eof => {
                         if !pending.is_empty() {
                             broadcast(
                                 &sinks,

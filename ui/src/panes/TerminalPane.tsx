@@ -14,6 +14,7 @@ import { getHost, openTerminal } from '@/layout/paneHosts'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
 import { exitMarkerBytes, markFor } from './exitMarker'
 import {
+  diag,
   events,
   paneSession,
   session as sessionApi,
@@ -151,12 +152,53 @@ function syncSize(paneId: string): void {
   if (!host.sessionId) return
 
   const cell = handle.cellSize()
-  void sessionApi.resize(host.sessionId, {
+  const geo = {
     cols: handle.term.cols,
     rows: handle.term.rows,
     cellWidth: cell.width,
     cellHeight: cell.height,
+  }
+  // A `ResizeObserver` fires per frame of a drag, and most of those frames are the same cell
+  // geometry — a pixel change under one cell is not a resize. `session_resize` is synchronous
+  // and reflows the whole scrollback under a lock (see `cmd/session.rs`), so re-sending an
+  // unchanged size put one full reflow per frame per pane in front of the user's keystrokes
+  // on the same thread. See `PaneHost.lastGeometry`.
+  const last = host.lastGeometry
+  if (
+    last &&
+    last.cols === geo.cols &&
+    last.rows === geo.rows &&
+    last.cellWidth === geo.cellWidth &&
+    last.cellHeight === geo.cellHeight
+  ) {
+    return
+  }
+  host.lastGeometry = geo
+
+  void sessionApi.resize(host.sessionId, geo).catch((e) => {
+    // Cleared so the next callback retries: a dropped resize leaves the child at a size the
+    // pane is not, and silently remembering the size we failed to send would make that
+    // permanent.
+    host.lastGeometry = undefined
+    console.error('[cide] terminal resize failed', e)
   })
+}
+
+/** Panes that have already reported a failed write, so the log cannot become the outage. */
+const writeFailures = new Set<string>()
+
+/**
+ * Say something when a keystroke does not reach the child.
+ *
+ * Goes to the Rust log as well as the console because the console is not reachable from a
+ * shell on Wayland — see `cmd/diag.rs`, which is where that limitation is written down.
+ */
+function reportWriteFailure(paneId: string, error: unknown): void {
+  if (writeFailures.has(paneId)) return
+  writeFailures.add(paneId)
+  const line = `pane ${paneId}: session write failed — keystrokes are being dropped: ${String(error)}`
+  console.error(`[cide] ${line}`)
+  void diag.log(line).catch(() => {})
 }
 
 /**
@@ -366,19 +408,50 @@ export function TerminalPane({
         boundCb.current?.(id)
       }
 
-      // The screen mirror, so a pane opening onto an already-running session paints
-      // immediately instead of waiting for the child's next byte.
+      const host = getHost(paneId)
+      const alt = await sessionApi.inAlternateScreen(id)
+      if (disposed) return
+
+      // The ack goes in `term.write`'s completion callback, not here. Reaching this line
+      // only means the bytes arrived; the callback fires once xterm has actually parsed
+      // them, which is the rate the session should be pacing itself against. Acking on
+      // arrival would report a speed this renderer cannot sustain and would turn credit
+      // control back into no control at all.
+      const deliver = (bytes: Uint8Array) => {
+        term.write(bytes, () => paneSession.ack(paneId, id, bytes.byteLength))
+      }
+
+      // Live frames that arrive before the snapshot has been written.
       //
+      // They can, and the ordering matters: the sink is registered on the Rust side the
+      // moment `session_attach` runs, so the channel can deliver its first frame while the
+      // command's own reply — the screen those frames continue from — is still in flight.
+      // Writing them in arrival order would paint the continuation and then paint the screen
+      // it continues from on top of it. Queued rather than dropped, because they are already
+      // charged against this sink's credit and only `deliver` pays that back.
+      let painted = false
+      const queued: Uint8Array[] = []
+
+      // Attaching *by pane*, not by window. Two panes mirroring one session in one window
+      // used to be one attachment on the Rust side, so opening a mirror detached the pane
+      // being mirrored — see `paneSession` in the IPC client.
+      //
+      // The screen comes back from `attach` itself, taken at the instant this sink was
+      // registered. It used to be a separate `session.scrollback` beforehand, and the gap
+      // between the two calls is a window in which the Rust mirror runs ahead of the sinks:
+      // bytes landing there were painted from the snapshot and then delivered again as live
+      // output. See `cide_pty::PtySession::attach_with_snapshot`.
+      const screen = await paneSession.attach(paneId, id, geo, (data) => {
+        const bytes = new Uint8Array(data)
+        if (painted) deliver(bytes)
+        else queued.push(bytes)
+      })
+      if (disposed) return
+
       // Exactly once per host. A split or a close remounts the surviving leaf — React swaps
       // a leaf node for a split node at that position — and this terminal already holds
       // those bytes; writing them again appends a second copy of the whole transcript. The
       // host survives the remount, so the flag on it is what makes "once" mean once.
-      const host = getHost(paneId)
-      const [state, alt] = await Promise.all([
-        host.hydrated ? Promise.resolve(new ArrayBuffer(0)) : sessionApi.scrollback(id),
-        sessionApi.inAlternateScreen(id),
-      ])
-      if (disposed) return
       if (!host.hydrated) {
         // A host that was released and is coming back still holds its pre-detach screen.
         // The mirror replaces that rather than following it.
@@ -386,24 +459,14 @@ export function TerminalPane({
           term.reset()
           host.needsReset = false
         }
-        const prior = new Uint8Array(state)
+        const prior = new Uint8Array(screen)
         if (prior.byteLength > 0) term.write(prior)
         host.hydrated = true
       }
 
-      // The ack goes in `term.write`'s completion callback, not here. Reaching this line
-      // only means the bytes arrived; the callback fires once xterm has actually parsed
-      // them, which is the rate the session should be pacing itself against. Acking on
-      // arrival would report a speed this renderer cannot sustain and would turn credit
-      // control back into no control at all.
-      //
-      // Attaching *by pane*, not by window. Two panes mirroring one session in one window
-      // used to be one attachment on the Rust side, so opening a mirror detached the pane
-      // being mirrored — see `paneSession` in the IPC client.
-      await paneSession.attach(paneId, id, geo, (data) => {
-        const bytes = new Uint8Array(data)
-        term.write(bytes, () => paneSession.ack(paneId, id, bytes.byteLength))
-      })
+      painted = true
+      for (const bytes of queued) deliver(bytes)
+      queued.length = 0
 
       if (alt) {
         // A fullscreen TUI's own model is authoritative for everything the screen mirror
@@ -431,7 +494,12 @@ export function TerminalPane({
 
     const onData = term.onData((data) => {
       const id = getHost(paneId).sessionId
-      if (id) void sessionApi.write(id, data)
+      if (!id) return
+      // `void` with no `catch` was swallowing the one failure a user cannot diagnose: a
+      // keystroke that never reached the child looks exactly like a keystroke the child
+      // ignored. Once per pane, because if writes are failing they are failing on every
+      // character and a per-keystroke log is its own outage.
+      sessionApi.write(id, data).catch((e) => reportWriteFailure(paneId, e))
     })
 
     // Exit arrives as an event now. It used to be a `session.hasExited` round trip per pane

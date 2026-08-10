@@ -350,15 +350,24 @@ fn to_outcome(a: cide_ipc::DiffAnswer) -> cide_ide_mcp::DiffOutcome {
     }
 }
 
-/// Attach a webview sink to a session.
+/// Attach a webview sink to a session, and answer with the screen it should start from.
 ///
-/// The caller receives the current screen first (see [`session_scrollback`]) so a pane
-/// that opens onto an already-running session paints immediately instead of waiting for
-/// the child's next output.
+/// **The screen comes back from here rather than from [`session_scrollback`], and that is a
+/// correctness change, not a round-trip saving.** Asking for the screen and then attaching are
+/// two moments, and the mirror and the sinks are not in step between them: `cide-pty` feeds
+/// the mirror the instant a chunk arrives but feeds sinks only on a flush, up to
+/// `FLUSH_INTERVAL` later. Bytes that landed in that window are painted into the snapshot
+/// *and* are still queued for the next flush, so the attaching pane was shown them twice —
+/// a duplicated prompt on every re-dock and every rehydration.
+/// [`cide_pty::PtySession::attach_with_snapshot`] does both on the coalescer thread, where a
+/// point at which the two agree actually exists.
 ///
 /// `pane` names *which* pane is attaching, and leaving it out is what broke mirroring: see
 /// [`AttachmentKey`]. It is optional so a caller that does not name a pane still attaches,
 /// on the old window-wide slot.
+///
+/// `Response` — raw bytes, no JSON, no base64 — for the same reason [`session_scrollback`]
+/// uses it: a full screen of scrollback is not something to send through `serde_json`.
 ///
 /// Synchronous, and the resize deliberately not on the blocking pool: see [`session_resize`].
 #[tauri::command(rename_all = "camelCase")]
@@ -369,14 +378,14 @@ pub fn session_attach(
     pane: Option<PaneId>,
     sink: Channel<InvokeResponseBody>,
     geometry: Geometry,
-) -> Result<(), SessionError> {
+) -> Result<Response, SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
     s.resize(pty_geometry(geometry))
         .map_err(|e| SessionError::Pty(e.to_string()))?;
 
     let sink: Arc<dyn Sink> =
         Arc::new(move |bytes: &[u8]| sink.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok());
-    let id = s.attach(sink);
+    let (id, screen) = s.attach_with_snapshot(sink);
 
     registry.record_attachment(
         AttachmentKey {
@@ -386,7 +395,7 @@ pub fn session_attach(
         },
         id,
     );
-    Ok(())
+    Ok(Response::new(screen))
 }
 
 /// Report that this pane has finished processing `bytes` of the session's output.
@@ -448,10 +457,10 @@ pub fn session_detach(
 
 /// The byte sequence that reconstructs the current screen on a fresh terminal.
 ///
-/// Sent as the first frame after attaching. For a fullscreen TUI the frontend follows it
-/// with a one-frame `cols-1 → cols` resize nudge, so the application repaints from its own
-/// model — covering sequences the screen mirror does not track (OSC 8 hyperlinks, OSC 52
-/// clipboard traffic, DEC 2026 synchronized-output framing).
+/// **No longer on the pane-open path** — [`session_attach`] answers with this itself, at a cut
+/// point where the mirror and the sinks agree, which is the only way to get it without
+/// double-painting the window between the two calls. This remains for callers that want the
+/// screen and are not attaching: `cide-headless`, and anything scripting the app.
 ///
 /// `async` because serialising the mirror is not cheap: `state_formatted` walks every cell
 /// of a screen that may hold ten thousand lines of scrollback, and every pane in a restored
@@ -475,13 +484,38 @@ pub fn session_in_alternate_screen(
     Ok(s.in_alternate_screen())
 }
 
+/// Send bytes to the child.
+///
+/// `seq` is a strictly increasing number minted by the caller, and it is what makes a
+/// keystroke arrive exactly once over a transport that guarantees at-least-once — see
+/// [`SessionRegistry::accept_write`] for the retry it defends against. It is optional so the
+/// old wire shape still works; a write that names no `seq` is applied unconditionally, as it
+/// always was.
+///
+/// **`window` is not decoration: the counter is minted per webview.** Every window runs its
+/// own copy of `ui/src/ipc/client.ts` and starts counting at 1, and two windows share a
+/// session whenever a pane is mirrored or torn out — `session.attach` attaches the new
+/// window's sink before the old one detaches, on purpose. Deduplicating by session alone
+/// would therefore have discarded the new window's first *n* keystrokes as replays, where
+/// *n* is however much had been typed in the old one. Injected by Tauri, so it costs the wire
+/// nothing.
+///
+/// A duplicate is `Ok(())`, not an error. The caller has no repair to make — the bytes *are*
+/// in the child, delivered by the attempt this one is a replay of — and reporting a failure
+/// would put a red line in the log for the mechanism working.
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_write(
     registry: State<'_, SessionRegistry>,
+    window: tauri::Window,
     session: SessionId,
     data: String,
+    seq: Option<u64>,
 ) -> Result<(), SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
+    if !registry.accept_write(session, window.label(), seq) {
+        tracing::debug!(%session, ?seq, window = window.label(), "session write: dropped a replayed frame");
+        return Ok(());
+    }
     s.write(data.into_bytes());
     Ok(())
 }

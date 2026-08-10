@@ -27,6 +27,8 @@
  *    throws away the view of a live turn and the id it would have re-attached with.
  */
 import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from '@/terminal/xterm'
+import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
+import { diag } from '@/ipc/client'
 
 export interface PaneHost {
   readonly paneId: string
@@ -73,6 +75,20 @@ export interface PaneHost {
   busy: boolean
   /** True once the pane left this window's tree while its session stayed alive. */
   released: boolean
+  /**
+   * The geometry last pushed at this pane's child.
+   *
+   * `syncSize` runs from a `ResizeObserver`, which fires on every frame of a window drag, and
+   * `session_resize` is deliberately synchronous — `vt100::Screen::set_size` reflows the whole
+   * scrollback under a lock on the thread that receives IPC messages, so a drag was queueing
+   * one full reflow per frame per pane behind the keystrokes. Most of those callbacks report
+   * the *same* cell size, because a pixel change smaller than one cell is not a resize at all.
+   * Comparing here is what turns a drag into one call per actual size change.
+   *
+   * On the host rather than in the component: the host is what survives a remount, and a
+   * re-mounted pane whose size has not changed must not re-send either.
+   */
+  lastGeometry?: { cols: number; rows: number; cellWidth: number; cellHeight: number } | undefined
 }
 
 /**
@@ -215,6 +231,20 @@ export function openTerminal(paneId: string): TerminalHandle {
   handle.term.open(host.el)
   host.opened = true
   record(paneId).opens += 1
+
+  // After `open()`, because both of these need the textarea xterm creates there. Registered
+  // in `cleanup` so `teardown` takes them down — a listener left on an evicted host's element
+  // would keep the whole terminal reachable.
+  //
+  // The probe goes first, and that ordering is load-bearing: both listen for `input` on this
+  // element in the capture phase, listeners on one element fire in registration order, and the
+  // router calls `stopPropagation()`. Registered the other way round, the probe would only ever
+  // see the events the router chose to pass on.
+  host.cleanup.push(
+    attachInputProbe(handle, host.el, paneId, (line) => void diag.log(line).catch(() => {})),
+  )
+  host.cleanup.push(attachInputRouting(handle, host.el))
+
   promoteWebgl(handle)
   return handle
 }
@@ -236,13 +266,43 @@ export function mountHost(paneId: string, slot: HTMLElement): void {
   if (redocked && host.terminal) promoteWebgl(host.terminal)
 }
 
+/**
+ * Settle a host's input state before its element is re-parented.
+ *
+ * Re-parenting a focused textarea blurs it implicitly, and an implicit blur is the one path
+ * that leaves xterm's `CompositionHelper._isComposing` set: it is cleared only from
+ * `_finalizeComposition`, which is reachable from `compositionend` and from a non-229 keydown
+ * while composing, and neither happens to an element being moved. A composition that is
+ * never finalised keeps `onRender` calling `getBoundingClientRect()` on the composition view
+ * every frame — a forced synchronous layout in the render path, on every pane, for the rest
+ * of the session — and leaves `_handleAnyTextareaChanges`' `setTimeout(0)` diff armed against
+ * a textarea `_handleTextAreaBlur` is about to empty, which emits a bare `C0.DEL` at the
+ * child.
+ *
+ * Blurring *first* gives the browser somewhere to fire `compositionend`. The standing
+ * keystroke claims go too: they are about a keystroke in flight, and a pane the user has
+ * navigated away from has none.
+ */
+function quiesce(host: PaneHost): void {
+  if (!host.terminal) return
+  host.terminal.input.clear()
+  try {
+    host.terminal.term.blur()
+  } catch {
+    // A terminal that was never opened has no textarea to blur; nothing to settle either.
+  }
+}
+
 /** Return a host to parking. Never destroys it. */
 export function parkHost(paneId: string): void {
   const host = hosts.get(paneId)
   if (!host) return
   host.mounted = false
   host.lastUsed = now()
-  if (host.el.parentElement !== parking) parking.appendChild(host.el)
+  if (host.el.parentElement !== parking) {
+    quiesce(host)
+    parking.appendChild(host.el)
+  }
 }
 
 /**
@@ -271,8 +331,14 @@ export function releaseHost(paneId: string): void {
   // terminal holds rather than append to it. Without the reset the pane comes back showing
   // its pre-detach transcript followed by a second copy of the current screen.
   host.needsReset = true
+  // Another window has been resizing this session in the meantime, so what this host last
+  // sent says nothing about what the child currently thinks its size is.
+  host.lastGeometry = undefined
   if (host.terminal) releaseWebgl(host.terminal)
-  if (host.el.parentElement !== parking) parking.appendChild(host.el)
+  if (host.el.parentElement !== parking) {
+    quiesce(host)
+    parking.appendChild(host.el)
+  }
 }
 
 /**

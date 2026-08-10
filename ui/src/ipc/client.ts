@@ -601,7 +601,7 @@ export const session = {
   attach: (id: SessionId, geo: Geometry, onData: (data: ArrayBuffer) => void) => {
     const sink = new Channel<ArrayBuffer>()
     sink.onmessage = onData
-    return invoke<void>('session_attach', { session: id, sink, geometry: geo })
+    return invoke<ArrayBuffer>('session_attach', { session: id, sink, geometry: geo })
   },
 
   detach: (id: SessionId) => invoke<void>('session_detach', { session: id }),
@@ -619,7 +619,7 @@ export const session = {
    * path.
    */
   ack: (id: SessionId, bytes: number) => {
-    void invoke<void>('session_ack', { session: id, bytes }).catch(() => {})
+    void invoke<void>('session_ack', { session: id, bytes }).catch(ackFailed)
   },
 
   /** The byte sequence that reconstructs the current screen. Send this before live bytes. */
@@ -628,7 +628,20 @@ export const session = {
   inAlternateScreen: (id: SessionId) =>
     invoke<boolean>('session_in_alternate_screen', { session: id }),
 
-  write: (id: SessionId, data: string) => invoke<void>('session_write', { session: id, data }),
+  /**
+   * Send bytes to the child.
+   *
+   * `seq` is not bookkeeping — it is what makes a keystroke arrive **once**. Tauri's
+   * `ipc-protocol.js` attaches its rejection handler as the second argument of the second
+   * `.then`, so it also catches a failure of `response.json()`/`arrayBuffer()` — a rejection
+   * that happens *after* the Rust command has already run. It then flips
+   * `customProtocolIpcFailed` permanently and re-sends the identical message over
+   * `postMessage`. At-least-once delivery for a command whose whole effect is a side effect.
+   * The retry carries the same `seq`, and `session_write` drops anything it has already
+   * applied, which is the only way to be sure that path cannot double a character.
+   */
+  write: (id: SessionId, data: string) =>
+    invoke<void>('session_write', { session: id, data, seq: nextWriteSeq(id) }),
 
   resize: (id: SessionId, geo: Geometry) =>
     invoke<void>('session_resize', { session: id, geometry: geo }),
@@ -1001,11 +1014,22 @@ export function isDegraded(name: string): boolean {
  * a caller outside a pane is not broken by this. New pane callers use these.
  */
 export const paneSession = {
-  /** Attach this pane's sink. See `session.attach`; the pane is what keeps mirrors apart. */
+  /**
+   * Attach this pane's sink, and receive the screen it should start from.
+   *
+   * The returned bytes are the screen **as of the moment this sink was registered**, taken on
+   * the coalescer thread so the two cannot disagree. Asking `session.scrollback` first and
+   * attaching second is the shape this replaces: the mirror runs ahead of the sinks by up to
+   * a flush interval, so anything that arrived in between was painted from the snapshot and
+   * then delivered again as live output.
+   *
+   * The caller must write these bytes before any bytes the channel delivers. See
+   * `TerminalPane`, which queues channel frames until it has.
+   */
   attach: (pane: PaneId, id: SessionId, geo: Geometry, onData: (data: ArrayBuffer) => void) => {
     const sink = new Channel<ArrayBuffer>()
     sink.onmessage = onData
-    return invoke<void>('session_attach', { session: id, pane, sink, geometry: geo })
+    return invoke<ArrayBuffer>('session_attach', { session: id, pane, sink, geometry: geo })
   },
 
   /**
@@ -1013,7 +1037,7 @@ export const paneSession = {
    * `session.ack` is: it runs in `term.write`'s completion callback, once per frame.
    */
   ack: (pane: PaneId, id: SessionId, bytes: number) => {
-    void invoke<void>('session_ack', { session: id, pane, bytes }).catch(() => {})
+    void invoke<void>('session_ack', { session: id, pane, bytes }).catch(ackFailed)
   },
 
   /** Drop this pane's sink. The child keeps running; only this view of it ends. */
@@ -1183,4 +1207,70 @@ export const gitDiff = {
     side: DiffSide,
     oldPath: string | null = null,
   ) => invoke<TabId>('tab_open_diff', { project, repo, path, side, oldPath }),
+}
+
+/* --------------------------------------------------------------------------------------
+ * Input-path integrity. Appended as one block, per the house rule about this file.
+ *
+ * Two things that were previously invisible: a write that may be delivered twice, and an ack
+ * that failed and told nobody.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * The IPC transport has degraded to `postMessage`. (M11)
+ *
+ * Not on the `events` object above only because of the house rule about this file; it is an
+ * ordinary event listener and behaves like the ones there.
+ *
+ * Fires whenever `diag.reportIpc` is told the custom protocol is not in use — at boot, and
+ * again from `watchTransport`'s re-probe if it fails later. It is the one thing that turns "the
+ * app feels slow" into a fact, so it belongs in front of the user and not only in the log.
+ */
+export const onIpcDegraded = (handler: (health: IpcHealth) => void) =>
+  listen<{ health: IpcHealth }>('cide://ipc-degraded', (e) => handler(e.payload.health))
+
+/** The last sequence number handed to `session.write`, per session. */
+const writeSeq = new Map<SessionId, number>()
+
+/**
+ * The next write sequence number for this session.
+ *
+ * Monotonic per session and never reset while the window lives. Keyed on the *session*
+ * because that is what the Rust side dedupes against: two mirrored panes write into one
+ * child, and a per-pane counter would give them colliding numbers, so the second pane's
+ * first keystroke would be dropped as an already-applied retry.
+ *
+ * A finished session leaves its entry behind. That is one number per session ever typed
+ * into, which is not a size worth managing, and clearing it would be worse: a late retry of
+ * the last write from a session being torn down would find the counter gone and start again
+ * from 1, which is the duplicate this exists to prevent.
+ */
+function nextWriteSeq(id: SessionId): number {
+  const next = (writeSeq.get(id) ?? 0) + 1
+  writeSeq.set(id, next)
+  return next
+}
+
+/** Whether a failed ack has already been reported, so the render path cannot flood the log. */
+let ackFailureReported = false
+
+/**
+ * Report an ack that did not land.
+ *
+ * This used to be `.catch(() => {})` on the one call that keeps credit flowing. An ack that
+ * never arrives leaves its bytes outstanding for ever; once they pass `CreditPolicy.high` the
+ * sink is choked and the pane stops receiving raw output until the watchdog forgives it,
+ * over and over. The symptom is a terminal that feels slow with nothing anywhere saying why —
+ * which is exactly the kind of report this block was written for.
+ *
+ * Still fire-and-forget, and still tolerant: an ack racing a pane close is ordinary. Once per
+ * window, because it runs in `term.write`'s completion callback and a per-frame log line
+ * would be its own slowdown.
+ */
+function ackFailed(error: unknown): void {
+  if (ackFailureReported) return
+  ackFailureReported = true
+  const line = `session ack failed — this pane's flow control is now one-sided: ${String(error)}`
+  console.error(`[cide] ${line}`)
+  void diag.log(line).catch(() => {})
 }

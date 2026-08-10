@@ -73,13 +73,23 @@ pub fn diag_bench_report(app: tauri::AppHandle, report: String) {
     }
 }
 
-/// Record what the frontend measured at boot.
+/// Record what the frontend measured, and raise the alarm if the transport has degraded.
 ///
-/// Logged rather than stored for M0; M11 surfaces it in Settings and emits
-/// `cide://ipc-degraded` so a user on the slow path finds out from the UI instead of from
-/// the app feeling inexplicably sluggish.
+/// The `cide://ipc-degraded` broadcast is the part that took until now to exist, and its
+/// absence was the whole problem: the doc comment above promised it from M0, `contract/events.json`
+/// never had it, and so the one failure this instrumentation was built to catch was the one
+/// failure nothing could report. A degraded transport does not crash — it makes every payload
+/// JSON-encoded and `eval`'d, permanently, and the app just feels slow.
+///
+/// **Called on every probe, not only at boot.** `customProtocolIpcFailed` flips at any later
+/// moment (`tauri-2.11.5/scripts/ipc-protocol.js`, in the rejection handler that also catches a
+/// body-decode failure *after* a command has run), so a boot-only report answers the one state
+/// that was never in doubt.
 #[tauri::command]
-pub fn diag_report_ipc(health: IpcHealth) {
+pub fn diag_report_ipc(app: tauri::AppHandle, health: IpcHealth) {
+    if !health.custom_protocol {
+        crate::emit::ipc_degraded(&app, &health);
+    }
     if health.custom_protocol {
         tracing::info!(
             webkit = %health.webkit_version,

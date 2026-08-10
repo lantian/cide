@@ -106,6 +106,21 @@ pub fn create(
     } else {
         ""
     };
+    // `CIDE_INPUT_PROBE=1` traces every keyboard emitter into the log — see
+    // `ui/src/terminal/inputHost.ts`, which is the only way to tell which of xterm's two
+    // input emitters an input method is firing.
+    //
+    // **Opt-in rather than on for every dev build, and that is a performance decision.** The
+    // probe writes one `diag_log` per keydown, keyup, `input` and `onData`; `diag_log` is a
+    // synchronous command, so each line is a main-thread IPC round trip and a file append.
+    // Four of those per character, on the thread that receives the keystrokes, in exactly the
+    // configuration `run.sh` launches — a diagnostic for a lag report that would itself be a
+    // cause of lag. It is worth having and it is not worth having by default.
+    let input_probe = if std::env::var_os("CIDE_INPUT_PROBE").is_some() {
+        "&inputprobe=1"
+    } else {
+        ""
+    };
     // `CIDE_AUDIT_WINDOWS=1` runs M5's acceptance check: detach and re-dock round trips and
     // window-mode flips, asserting no session is lost to any of them.
     let wins = if std::env::var_os("CIDE_AUDIT_WINDOWS").is_some() {
@@ -124,7 +139,7 @@ pub fn create(
     };
     let url = WebviewUrl::App(
         format!(
-            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}",
+            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}{input_probe}",
             label.as_str()
         )
         .into(),
