@@ -110,6 +110,16 @@ fn state_path_hint() -> String {
     cide_core::persist::workspace_path().display().to_string()
 }
 
+/// `deny(unused_variables)` is scoped to this function on purpose.
+///
+/// `run` is where every subsystem is built and handed to the app, so an unused binding here
+/// means precisely one thing: something was constructed and then never wired up. That is not a
+/// style problem, it is the shape of the bug this function keeps producing — `IdeServers` built
+/// at launch and never offered the restored workspace, so every project came up with no
+/// lockfile and no `CLAUDE_CODE_SSE_PORT` and nothing failed. Deleting the `install` call
+/// leaves `ide` unused, and a warning in a build that emits none is still a thing a person has
+/// to notice. This makes it stop the build instead.
+#[deny(unused_variables)]
 pub fn run() {
     // The audit compares against a mock stated at 1440x900, and this plugin restores
     // whatever size the window was last left at — quietly measuring some other viewport and
@@ -148,7 +158,7 @@ pub fn run() {
     // terminal still works, and Claude prints its diffs as text in the pane the way it does
     // in any other terminal. Refusing to launch over it would trade a degraded feature for
     // no editor at all.
-    let ide = match ide::IdeServers::new() {
+    let ide = match ide::PendingIdeServers::new() {
         Ok(servers) => Some(servers),
         Err(error) => {
             tracing::error!(%error, "could not start the IDE subsystem; panes will run without it");
@@ -165,9 +175,10 @@ pub fn run() {
     // so that `search.query` resolves its state and answers `NoIndex` rather than failing to
     // resolve at all.
     builder = builder.manage(cmd::search::SearchRegistry::default());
-    if let Some(ide) = ide {
-        builder = builder.manage(ide);
-    }
+    // `ide` is deliberately *not* managed here. It is a `PendingIdeServers`, whose one method
+    // ensures every restored project's server and registers the state together — so it has to
+    // wait for `setup`, where the restored workspace exists to be offered. Registering it here
+    // is what used to let the two steps drift apart. See `ide::PendingIdeServers`.
 
     builder
         // Loaded before the first window exists, so `app.get_bootstrap` can answer from a
@@ -295,7 +306,7 @@ pub fn run() {
                 api.prevent_close();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             // Before any window exists, so the first mutation can already broadcast.
             app.state::<WorkspaceState>()
                 .attach_app(app.handle().clone());
@@ -335,12 +346,14 @@ pub fn run() {
             // `ensure` is otherwise called only from `project_open`, which a restoring launch
             // never reaches — the projects arrive from `workspace.json` — so without this the
             // headline feature was missing on every launch but the first.
-            if let Some(servers) = app.try_state::<ide::IdeServers>() {
+            if let Some(pending) = ide {
                 // The snapshot is taken and dropped before any server starts: `ensure` blocks
                 // on a runtime, and holding the workspace lock across that would stall every
                 // command behind a port bind.
                 let ws = app.state::<WorkspaceState>().snapshot();
-                servers.ensure_all(app.handle(), &ws);
+                // Ensuring and managing are one call because they were two, and the bug was
+                // that they could disagree. See `ide::PendingIdeServers`.
+                pending.install(app.handle(), &ws);
             }
 
             restore_windows(app.handle())?;

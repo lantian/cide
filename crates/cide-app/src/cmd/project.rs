@@ -123,7 +123,7 @@ pub fn project_activate(
 
     // After the mutation, and reading the roots in a separate borrow: `ensure` blocks on a
     // runtime to bind a port, and holding the workspace lock across that would stall every
-    // other command behind it — the same reason `setup` snapshots before `ensure_all`.
+    // other command behind it — the same reason `setup` snapshots before `PendingIdeServers::install`.
     if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
         let roots = state.with(|ws| {
             workspace::project(ws, project)

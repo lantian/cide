@@ -58,7 +58,54 @@ pub struct IdeServers {
     servers: DashMap<ProjectId, Entry>,
 }
 
-impl IdeServers {
+/// An [`IdeServers`] that has not yet been shown the restored workspace.
+///
+/// # Why this type exists
+///
+/// Two independent reviewers found the same hole and neither could close it: deleting the
+/// `ensure_all` call from `lib.rs`'s `setup` left the entire suite green, with no dead-code
+/// warning either. That is precisely the regression the call was added to fix — `ensure` had
+/// been reachable only from `project_open`, so every launch that *restored* a workspace rather
+/// than opening one gave its projects no server, no lockfile and no `CLAUDE_CODE_SSE_PORT`:
+/// the headline feature absent on every launch after the first, silently, because a project
+/// with no server is indistinguishable from Claude simply having no IDE.
+///
+/// The obvious guard is a test, and it is not available. Reaching the `setup` closure needs a
+/// running Tauri app; `tauri`'s mock runtime is a different `Runtime` type, so using it would
+/// mean making every `AppHandle` in this file generic over `R` — a large refactor of a crate
+/// that is thin glue by policy, to guard one line.
+///
+/// So the two steps are welded together instead. [`new`](Self::new) hands back one of these,
+/// and the only thing you can do with it is [`install`](Self::install), which ensures every
+/// project's server **and** registers the state, in that order, in one call nobody can half-do.
+///
+/// What that does and does not buy, stated honestly, because the first attempt at this claimed
+/// more than it delivered:
+///
+/// * The demonstrated regression — servers registered but never ensured — is now inexpressible.
+///   It was two statements that had to agree, one before the app existed and one inside
+///   `setup`; drift between them was the bug, and there is no longer a gap to drift in.
+/// * Deleting the `install` call outright is a **compile error**, which is the case the
+///   reviewers actually demonstrated. Nothing makes absent code a type error directly, so it
+///   is caught one step downstream: `run` builds this and binds it, so removing its only use
+///   leaves an unused binding, and `run` carries a scoped `deny(unused_variables)` for exactly
+///   this reason. Verified by deleting the block and watching the build fail.
+///
+/// A first attempt returned `IdeServers` for the caller to `manage`, on the theory that only
+/// this conversion could produce the managed type. That was wrong, and worth recording:
+/// `Manager::manage` is generic over any `Send + Sync + 'static`, so `app.manage(pending)`
+/// compiled happily, registered the wrong type, and left every `try_state::<IdeServers>()`
+/// answering `None` — the identical silent failure, reached by a different route. Checked by
+/// mutation, not by reading.
+///
+/// Ordering comes out of the same construction. The workspace has to be read before the state
+/// can be registered at all, which puts every server up before `restore_windows` creates the
+/// first webview — and therefore before any pane can spawn a child that reads
+/// `CLAUDE_CODE_SSE_PORT` out of its environment at exec.
+#[must_use = "an IDE subsystem that is never installed serves no project"]
+pub struct PendingIdeServers(IdeServers);
+
+impl PendingIdeServers {
     /// Build the runtime and clear our own abandoned lockfiles.
     ///
     /// The sweep runs once, at boot, before any server publishes. A lockfile left by a
@@ -66,21 +113,37 @@ impl IdeServers {
     /// which the CLI reports as a broken IDE rather than as no IDE — worse than never having
     /// advertised. [`sweep_stale`] only ever removes files whose `ideName` is ours, so a
     /// user's VS Code or JetBrains lockfile in the same directory is never at risk.
+    ///
+    /// On this type rather than on [`IdeServers`] because that is what it returns: an
+    /// `IdeServers` exists only on the far side of [`install`](Self::install).
     pub fn new() -> std::io::Result<Self> {
         let swept = sweep_stale();
         if swept > 0 {
             tracing::info!(swept, "removed stale cide lockfiles from a previous run");
         }
 
-        Ok(Self {
+        Ok(Self(IdeServers {
             rt: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("cide-ide")
                 .build()?,
             servers: DashMap::new(),
-        })
+        }))
     }
 
+    /// Start a server for every project the restored workspace holds, then manage the state.
+    ///
+    /// Failures are swallowed by [`IdeServers::ensure`] one project at a time, which is what
+    /// we want here too: one project that cannot bind a port must not cost the others theirs.
+    pub fn install(self, app: &AppHandle, ws: &Workspace) {
+        for (project, roots) in servable_projects(ws) {
+            self.0.ensure(app, project, roots);
+        }
+        app.manage(self.0);
+    }
+}
+
+impl IdeServers {
     /// Start a server for a project, or return the port of the one already running.
     ///
     /// Failure is logged and returns `None` rather than propagating: not being able to bind a
@@ -119,21 +182,6 @@ impl IdeServers {
         );
         tracing::info!(%project, port, "IDE server listening");
         Some(port)
-    }
-
-    /// Start a server for every project a restored workspace already holds.
-    ///
-    /// [`ensure`](Self::ensure) is otherwise reached only from `project_open`, and a launch
-    /// that *restores* never calls it: the projects come straight out of `workspace.json`.
-    /// Without this, every project on every launch after the first had no lockfile and no
-    /// `CLAUDE_CODE_SSE_PORT` for its panes — no `openDiff`, no selection, no `@`-mentions.
-    ///
-    /// Failures are already swallowed by `ensure`, one project at a time, which is what we
-    /// want here too: one project that cannot bind a port must not cost the others theirs.
-    pub fn ensure_all(&self, app: &AppHandle, ws: &Workspace) {
-        for (project, roots) in servable_projects(ws) {
-            self.ensure(app, project, roots);
-        }
     }
 
     /// The port to put in a child's `CLAUDE_CODE_SSE_PORT`.
@@ -198,7 +246,7 @@ impl IdeServers {
 
 /// Every project that wants a server, with the roots its lockfile should advertise.
 ///
-/// A separate function from [`IdeServers::ensure_all`] because this is the half that can be
+/// A separate function from [`PendingIdeServers::install`] because this is the half that can be
 /// tested: `ensure` binds a loopback port and writes into the user's real `~/.claude/ide`,
 /// which is shared with whatever editors they are actually running and is no place for a
 /// test suite to leave files — the same reason `cide-ide-mcp` tests against `attach` rather
@@ -478,17 +526,19 @@ pub fn pending_request_ids(state: &WorkspaceState, project: ProjectId) -> Vec<St
 mod tests {
     use super::*;
 
-    /// Every restored project appears in the list `ensure_all` walks.
+    /// Every restored project appears in the list `install` walks.
     ///
-    /// **What this does not cover, deliberately and unhappily:** that `setup` calls
-    /// `ensure_all` at all. Deleting that call leaves this file's four tests green — the
-    /// wiring is one line in `crate::run`'s `setup` closure, `ensure` binds a port and
-    /// writes into the user's real `~/.claude/ide`, and `tauri`'s mock app is behind a
-    /// feature this build does not enable, so there is no seam between the two that a test
-    /// can hold. This is the same limitation `hooks::live_in` documents, handled the same
-    /// way: everything that can be *wrong* was pushed down into `servable_projects`, which
-    /// is what these tests hold, and the call site above it is a single unconditional line
-    /// with nothing to get subtly wrong.
+    /// **What this covers and what the compiler covers.** These tests hold the half that can
+    /// be wrong — which projects are chosen, in what order, under the cap. They cannot reach
+    /// the call site: `ensure` binds a port and writes into the user's real `~/.claude/ide`,
+    /// and `tauri`'s mock app is behind a feature this build does not enable, the same
+    /// limitation `hooks::live_in` documents.
+    ///
+    /// That gap used to be open, and two reviewers demonstrated it by deleting the call with
+    /// every test still green. It is now closed by construction rather than by coverage: see
+    /// [`PendingIdeServers`], which welds ensuring to managing so they cannot disagree, and
+    /// `crate::run`'s scoped `deny(unused_variables)`, which makes deleting the call a build
+    /// error. Verified by mutation both ways.
     ///
     /// Servers used to start only from `project_open`, so a launch that loaded
     /// `workspace.json` gave every project panes with no `CLAUDE_CODE_SSE_PORT`. The
