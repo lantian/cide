@@ -261,7 +261,14 @@ interface WorkspaceStore {
 
 export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   boot: null,
-  theme: 'dark',
+  // Read back from the attribute `public/theme-boot.js` already wrote in <head>, rather
+  // than named literally here. This value is live for the whole window-open — `hydrate` is
+  // an IPC round trip — and `App.tsx` writes it straight to `documentElement.dataset.theme`
+  // on mount. A literal here therefore *overwrites* what theme-boot resolved from `?theme=`
+  // and repaints the window in the wrong palette until the bootstrap lands, which is the
+  // exact flash theme-boot exists to remove. Hardcoding `'light'` instead would fix the
+  // default case and leave dark-theme users flashing; only the attribute knows.
+  theme: globalThis.document?.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
 
   hydrate: async () => {
     const boot = await appApi.getBootstrap()

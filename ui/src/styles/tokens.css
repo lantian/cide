@@ -134,7 +134,7 @@
   --accent: #d97757;
   --accent-hi: #e89476;
   --accent-dim: #7a4432;
-  /* Dark ink, not white: the dark theme's accent is light enough that white on it is 2.0:1. */
+  /* Dark ink, not white: white on this accent is 3.12:1, under AA for anything but 24px+. */
   --on-accent: #1a0f08;
   --blue: #7aa2f7;
   --green: #8fbf7a;

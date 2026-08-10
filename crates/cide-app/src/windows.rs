@@ -249,3 +249,42 @@ pub fn reveal(app: &AppHandle, label: &str) {
         let _ = w.set_focus();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{BG_DARK, BG_LIGHT};
+    use tauri::window::Color;
+
+    /// The one place a token value is copied out of CSS into Rust, so it is the one place
+    /// that can silently drift. It costs a frame of the wrong colour at launch — the exact
+    /// bug `background_color` was added to fix — and nothing else in the tree notices,
+    /// because Rust never reads the stylesheet and the stylesheet never reads Rust.
+    ///
+    /// Parsed from the file rather than restated here: a second copy of the literal would
+    /// only pin this test to itself.
+    #[test]
+    fn the_native_window_fill_matches_the_bg_token_of_each_theme() {
+        let css = include_str!("../../../ui/src/styles/tokens.css");
+
+        // `--bg` appears once per theme block and the light block is first, matching the
+        // order the file is written in (`:root, [data-theme='light']` then dark).
+        let mut found = css
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("--bg:"))
+            .map(|v| v.trim().trim_end_matches(';'));
+        let light = found.next().expect("tokens.css declares no --bg");
+        let dark = found.next().expect("tokens.css declares only one --bg");
+        assert_eq!(
+            found.next(),
+            None,
+            "a third --bg appeared; this test picks by order"
+        );
+
+        assert_eq!(hex(BG_LIGHT), light, "BG_LIGHT drifted from the light --bg");
+        assert_eq!(hex(BG_DARK), dark, "BG_DARK drifted from the dark --bg");
+    }
+
+    fn hex(c: Color) -> String {
+        format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+    }
+}

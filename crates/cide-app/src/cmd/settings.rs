@@ -27,8 +27,9 @@ use cide_ipc::{
     KeymapConflict, KeymapProblem, KeymapReport, Pane, PaneId, PaneKind, PaneRole, ProjectId,
     RepoId, Settings, SettingsPatch, SettingsSection, TabId, TabKind,
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 
+use crate::windows;
 use crate::workspace_state::WorkspaceState;
 
 // --- stored settings ---------------------------------------------------------------------
@@ -49,8 +50,12 @@ pub fn settings_get(state: State<'_, WorkspaceState>) -> Settings {
 #[tauri::command(rename_all = "camelCase")]
 pub fn settings_set(
     state: State<'_, WorkspaceState>,
+    app: AppHandle,
     patch: SettingsPatch,
 ) -> Result<Settings, CoreError> {
+    // Read before the patch, so the comparison below is against what the windows are
+    // actually wearing rather than against the value we just wrote.
+    let was = state.with(|ws| ws.settings.theme);
     state.update(|ws| {
         apply_patch(&mut ws.settings, patch);
         // Settings are not part of any structural invariant, but they are part of the tree,
@@ -60,7 +65,15 @@ pub fn settings_set(
         workspace::bump(ws);
         Ok(())
     })?;
-    Ok(state.with(|ws| ws.settings.clone()))
+    let settings = state.with(|ws| ws.settings.clone());
+    // The webview repaints itself from `data-theme`; the *native* fill behind and around it
+    // does not, and it is what shows through while a window is being dragged or resized.
+    // Outside the `update` closure deliberately: `windows::apply_theme` walks the window
+    // list, and the workspace lock is `parking_lot` and not reentrant.
+    if settings.theme != was {
+        windows::apply_theme(&app, settings.theme);
+    }
+    Ok(settings)
 }
 
 /// Fold a patch into stored settings. `None` leaves a field alone.
@@ -739,15 +752,24 @@ mod tests {
         let mut settings = Settings::default();
         settings.terminal.font_size = 17;
 
+        // Dark, because Light is now `Theme::default()`: patching a field to the value it
+        // already holds asserts nothing, and this half of the test would pass against an
+        // `apply_patch` that ignored `theme` entirely. Pinned rather than left implicit —
+        // the default has moved once already.
+        assert_ne!(
+            Theme::Dark,
+            Settings::default().theme,
+            "patch the non-default theme, or this assertion is vacuous"
+        );
         apply_patch(
             &mut settings,
             SettingsPatch {
-                theme: Some(Theme::Light),
+                theme: Some(Theme::Dark),
                 ..SettingsPatch::default()
             },
         );
 
-        assert_eq!(settings.theme, Theme::Light);
+        assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.terminal.font_size, 17, "an untouched group moved");
         assert!(settings.reopen_last_project, "an untouched toggle moved");
     }
