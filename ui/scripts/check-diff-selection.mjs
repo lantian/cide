@@ -63,6 +63,7 @@ try {
         join(UI, 'src', 'sidebar', 'GitPanel', 'diffSelection.ts'),
         join(UI, 'src', 'sidebar', 'GitPanel', 'partialStore.ts'),
         join(UI, 'src', 'sidebar', 'GitPanel', 'repoRoots.ts'),
+        join(UI, 'src', 'panes', 'diffTabs.ts'),
       ],
     }),
   )
@@ -74,6 +75,7 @@ try {
   const s = await import(`file://${join(out, 'sidebar', 'GitPanel', 'diffSelection.js')}`)
   const store = await import(`file://${join(out, 'sidebar', 'GitPanel', 'partialStore.js')}`)
   const roots = await import(`file://${join(out, 'sidebar', 'GitPanel', 'repoRoots.js')}`)
+  const tabs = await import(`file://${join(out, 'panes', 'diffTabs.js')}`)
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -492,6 +494,86 @@ try {
     touches([`${ROOT}/vendor/sub/src/main.rs`], roots.repoRoot('r1'), 'src/main.rs'),
     false,
     'and the parent repo does not claim it',
+  )
+
+  /* --- and when it is allowed to act on them ----------------------------------------------
+   *
+   * The filter above says *which* events are this tab's; this says *when* it spends one. Both
+   * halves have to work off something the pane can get for itself: the shell renders
+   * `<GitDiffPane project spec />` with no visibility flag, so a deferral that only reads a
+   * prop is a deferral that never runs, and a hidden diff tab goes on refetching exactly as it
+   * did before the change. `diffTabOnScreen` is that fact, derived from the workspace mirror.
+   */
+  const spec = (repo, path, side = 'unstaged') => ({
+    kind: 'diff',
+    spec: {
+      title: `${path} — diff`,
+      oldPath: path,
+      newPath: path,
+      origin: { kind: 'git', repo, path, side },
+    },
+  })
+  const project = {
+    activeTab: 't-main',
+    tabs: [
+      { id: 't-home', kind: { kind: 'claudeHome' } },
+      { id: 't-main', kind: spec('r1', 'src/main.rs') },
+      { id: 't-lib', kind: spec('r1', 'src/lib.rs') },
+      { id: 't-sub', kind: spec('r2', 'src/main.rs') },
+      { id: 't-file', kind: { kind: 'file', path: 'README.md', dirty: false } },
+    ],
+  }
+
+  ok(tabs.diffTabOnScreen(project, 'r1', 'src/main.rs'), 'the active diff tab is on screen')
+  eq(
+    tabs.diffTabOnScreen(project, 'r1', 'src/lib.rs'),
+    false,
+    'a diff tab behind the active one is not, which is the whole point of deferring',
+  )
+  eq(
+    tabs.diffTabOnScreen(project, 'r2', 'src/main.rs'),
+    false,
+    'and the same relative path in a submodule is its own tab, not this one',
+  )
+  ok(
+    tabs.diffTabOnScreen(project, 'r1', 'src/gone.rs'),
+    'a file with no tab of its own answers “on screen”: not knowing must never defer forever',
+  )
+  ok(
+    tabs.diffTabOnScreen(undefined, 'r1', 'src/main.rs'),
+    'nor must a window that has not received a snapshot yet',
+  )
+  eq(
+    tabs.showsGitDiff({ kind: 'file', path: 'src/main.rs', dirty: false }, 'r1', 'src/main.rs'),
+    false,
+    'an *editor* on the same file is a different tab — the pair alone does not identify one',
+  )
+  // A tab opened on `unstaged` and switched to `staged` is still the tab for this file — the
+  // pane switches sides in place and `shows_git_diff` leaves the side out for that reason. A
+  // match that included it would report the tab in front as hidden and defer its fetches
+  // forever, which is the failure mode worth an assertion.
+  ok(
+    tabs.diffTabOnScreen(
+      { activeTab: 't-main', tabs: [{ id: 't-main', kind: spec('r1', 'src/main.rs', 'staged') }] },
+      'r1',
+      'src/main.rs',
+    ),
+    'the side a tab was opened on is not part of the match',
+  )
+  ok(
+    tabs.diffTabOnScreen(
+      {
+        activeTab: 't-second',
+        tabs: [
+          { id: 't-first', kind: spec('r1', 'src/main.rs') },
+          { id: 't-second', kind: spec('r1', 'src/main.rs') },
+        ],
+      },
+      'r1',
+      'src/main.rs',
+    ),
+    'two tabs over one file cannot be opened, but if a workspace.json held them the one in ' +
+      'front still answers — a `find` on the first would defer the visible tab forever',
   )
 
   if (failed > 0) {

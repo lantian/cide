@@ -82,6 +82,7 @@ import {
 } from '@/ipc/client'
 import { markDiffPaneAvailable } from '@/sidebar/GitPanel/diffHost'
 import { noteRepoRoots, repoRoot, touchesFile } from '@/sidebar/GitPanel/repoRoots'
+import { diffTabOnScreen } from './diffTabs'
 import styles from './GitDiffPane.module.css'
 
 /*
@@ -413,18 +414,17 @@ export interface GitDiffPaneProps {
   /** The tab's spec. Only a `git` origin renders here; a Claude one belongs to `DiffPane`. */
   spec: DiffSpec
   /**
-   * Whether this tab is the one on screen.
+   * Whether this tab is the one on screen — the flag `TabContent` hands `renderTree`.
    *
-   * `TabContent` keeps every tab of the project mounted and hides all but one with
-   * `visibility: hidden`, so the DOM alone cannot answer this — it is the same flag its
-   * `renderTree` already hands the WebGL pool and the focus restorer. Omitting it is safe and
-   * means "assume visible": the pane then refetches the moment its file changes, which is
-   * what it did before this argument existed.
+   * Optional, and **not** the pane's only source for it. Omitted, the pane works the same
+   * answer out of the workspace mirror; see `diffTabs.diffTabOnScreen` for why it does not
+   * simply assume "visible" instead. Passed, the host wins: a host that renders this pane
+   * outside the tab stack knows something the mirror does not.
    */
   visible?: boolean
 }
 
-export function GitDiffPane({ project, spec, visible = true }: GitDiffPaneProps): ReactNode {
+export function GitDiffPane({ project, spec, visible }: GitDiffPaneProps): ReactNode {
   if (spec.origin.kind !== 'git') {
     // Not reachable through `tab_open_diff`, which only ever writes a git origin. Said out
     // loud rather than rendered blank so a mis-wired host sees why nothing is here.
@@ -451,10 +451,27 @@ interface GitDiffProps {
   path: string
   /** The side the tab was opened on. The pane owns it from here. */
   from: DiffSide
-  visible: boolean
+  /** The host's answer, when it has one. `undefined` means "work it out". */
+  visible: boolean | undefined
 }
 
-function GitDiff({ project, repo, path, from, visible }: GitDiffProps): ReactNode {
+function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): ReactNode {
+  /**
+   * Whether the tab drawing this diff is the one in front, worked out rather than told.
+   *
+   * `told` wins when a host passes it — it knows things the workspace does not, such as
+   * rendering this pane outside the tab stack — but it is not the only source, because a
+   * deferral that has to be switched on is a deferral that is off: the shell renders
+   * `<GitDiffPane project spec />` with no flag, and every tab claiming to be visible makes
+   * the whole hidden-tab path below dead code that reads as if it were working.
+   *
+   * Starts `true` and is corrected by the first `cide://workspace-changed`. That direction is
+   * the safe one — a tab wrongly believed visible costs a redundant `git_diff_file`, one
+   * wrongly believed hidden stops following its file — and activating a tab *is* a workspace
+   * mutation, so the first tab switch in the window settles it for every diff tab at once.
+   */
+  const [onScreen, setOnScreen] = useState(true)
+  const visible = told ?? onScreen
   const [side, setSide] = useState<DiffSide>(from)
   const [diff, setDiff] = useState<FileDiff | null>(null)
   const [reason, setReason] = useState<string | null>(null)
@@ -561,9 +578,20 @@ function GitDiff({ project, repo, path, from, visible }: GitDiffProps): ReactNod
    * on a gesture people make constantly. So the cost is paid exactly when the file it is
    * showing actually moved, and a tab nobody touched draws from the state it already has.
    *
+   * "Hidden" is `onScreen` above, which follows `cide://workspace-changed` rather than waiting
+   * to be told. That is not tidiness: with the answer coming only from a prop, a host that
+   * renders `<GitDiffPane project spec />` — which is what the shell does today — leaves every
+   * tab claiming to be visible, so this whole section is dead and the only filter that ever
+   * fired was the path one above. A deferral that has to be switched on is a deferral that is
+   * off.
+   *
    * The one thing this gives up is a hidden tab that is *watched* rather than looked at —
-   * split off into its own window, say. That case is not reachable today: a detached window
-   * hosts a pane, not a tab, and its tab is by definition the visible one in its own shell.
+   * split off into its own window, say. Not reachable today, and it is worth being exact
+   * about why, because `onScreen` reads the project's `activeTab` and a second window has an
+   * active tab of its own that the workspace does not record: a `pane:` window renders
+   * `DetachedPaneWindow`, never a tab, and `App` draws diff tabs only from the shell's
+   * `TabContent`. A host that does put this pane in a second window has to pass `visible`,
+   * which is the case that prop is kept for.
    */
   useEffect(() => {
     let gone = false
@@ -600,6 +628,16 @@ function GitDiff({ project, repo, path, from, visible }: GitDiffProps): ReactNod
     track(
       events.onSessionTool((_session, paths) => {
         if (touchesFile(paths, repoRoot(repo), path)) bump()
+      }),
+    )
+    // Which tab is in front is workspace state, so it arrives here the way every other piece
+    // of workspace state does. Subscribed beside the other two rather than through the store
+    // hook that already follows this event: `store/workspace` reaches xterm through
+    // `paneHosts`, and importing it here would put a terminal in the SSR bundle
+    // `check-diff-render.mjs` renders this pane's view from.
+    track(
+      events.onWorkspaceChanged((ws) => {
+        setOnScreen(diffTabOnScreen(ws.projects[project], repo, path))
       }),
     )
     return () => {
