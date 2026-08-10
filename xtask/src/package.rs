@@ -28,13 +28,35 @@
 //! fast buffer reload, and a close confirm that cannot tell busy from idle. Nothing errors;
 //! the features are simply absent.
 //!
-//! So the hook rides along as a Tauri *sidecar*: `bundle.externalBin` in `tauri.conf.json`
-//! names `../../target/release/cide-hook`, the bundler looks for that path with the target
-//! triple appended, and `Settings::copy_binaries` strips the triple back off when it copies
-//! it into `usr/bin/` — beside `cide`, which is exactly where `cmd::session::hook_settings`
-//! looks (`current_exe().parent().join("cide-hook")`). Two steps in the plan produce that
-//! suffixed copy. The alternative — `bundle.linux.appimage.files` — was rejected because it
-//! is AppImage-only, so the `.deb` would have silently kept shipping without the hook.
+//! So the hook rides along as a Tauri *sidecar*: `bundle.externalBin` names
+//! `../../target/release/cide-hook`, the bundler looks for that path with the target triple
+//! appended, and `Settings::copy_binaries` strips the triple back off when it copies it into
+//! `usr/bin/` — beside `cide`, which is exactly where `cmd::session::hook_settings` looks
+//! (`current_exe().parent().join("cide-hook")`). Two steps in the plan produce that suffixed
+//! copy. The alternative — `bundle.linux.appimage.files` — was rejected because it is
+//! AppImage-only, so the `.deb` would have silently kept shipping without the hook.
+//!
+//! # …but that key may not live in `tauri.conf.json`, or nothing in this repository builds
+//!
+//! `bundle.externalBin` is read by `tauri-build`, not only by the bundler: the `cide-app`
+//! build script copies every named sidecar into the target directory on **every** cargo
+//! invocation, and errors with `resource path ... doesn't exist` when one is missing. Putting
+//! the key in `crates/cide-app/tauri.conf.json` therefore makes a plain `cargo build`,
+//! `cargo test --workspace` and `cargo clippy --workspace` fail on any tree that has not
+//! already produced a *release* `target/release/cide-hook-<triple>` — a fresh clone, and every
+//! CI run, because `.github/workflows/ci.yml` builds the workspace before anything packages
+//! anything. The failure looks like a broken checkout, not like a packaging decision.
+//!
+//! So the key lives in `crates/cide-app/tauri.bundle.conf.json`, which nothing reads unless
+//! it is asked to, and the plan asks: `cargo tauri build --config tauri.bundle.conf.json`.
+//! `tauri-cli` merges that patch over `tauri.conf.json` for its own bundling *and* exports the
+//! merged patch as `TAURI_CONFIG`, which `tauri-build` picks up — so the sidecar reaches both
+//! halves of the build, and only during a packaging run. `preflight` fails if the key ever
+//! comes back to the base config; `the_base_config_must_not_carry_the_sidecar` is the test.
+//!
+//! Rejected: `tauri.linux.conf.json`, the platform-overlay file. `tauri-build` reads that one
+//! too (`tauri_utils::config::parse::read_platform`), so it breaks the workspace build in
+//! exactly the same way on the only platform this file targets.
 //!
 //! # The Flatpak manifest is generated, not hand-maintained
 //!
@@ -52,6 +74,25 @@ use anyhow::{Context, Result, bail};
 
 /// The Tauri configuration, which is where the identifier, version and bundle targets live.
 const TAURI_CONF: &str = "crates/cide-app/tauri.conf.json";
+
+/// The bundle-only overlay, merged over `TAURI_CONF` by `cargo tauri build --config`.
+///
+/// Everything here is a key that would break a plain `cargo build` if it sat in the base
+/// config — today that is `bundle.externalBin`. See the module docs.
+const TAURI_BUNDLE_CONF: &str = "crates/cide-app/tauri.bundle.conf.json";
+
+/// The same file as `TAURI_BUNDLE_CONF`, spelled the way `cargo tauri build` will see it.
+///
+/// `--config` resolves a path against the *process* working directory, and the bundler step
+/// runs in `APP_CRATE`. Deriving it rather than writing it twice, so a move of the file
+/// cannot leave the flag pointing at the old name.
+fn bundle_conf_arg() -> String {
+    Path::new(TAURI_BUNDLE_CONF)
+        .strip_prefix(APP_CRATE)
+        .unwrap_or(Path::new(TAURI_BUNDLE_CONF))
+        .display()
+        .to_string()
+}
 
 /// Where the generated Flatpak files are checked in.
 const FLATPAK_DIR: &str = "packaging/flatpak";
@@ -165,8 +206,12 @@ pub struct AppInfo {
     pub bundle_targets: Vec<String>,
     pub icons: Vec<String>,
     pub has_updater: bool,
-    /// `bundle.externalBin` — the sidecars the bundler copies beside the main binary.
+    /// `bundle.externalBin` from `TAURI_BUNDLE_CONF` — the sidecars the bundler copies beside
+    /// the main binary.
     pub external_bin: Vec<String>,
+    /// `bundle.externalBin` from `TAURI_CONF`. Must stay empty: `tauri-build` acts on it on
+    /// every cargo invocation, so anything here breaks `cargo build --workspace`.
+    pub base_external_bin: Vec<String>,
 }
 
 impl AppInfo {
@@ -344,7 +389,16 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
         // not a separate step here — adding one would build it twice.
         steps.push(Step {
             program: "cargo".into(),
-            args: vec!["tauri".into(), "build".into(), "--bundles".into(), bundles],
+            args: vec![
+                "tauri".into(),
+                "build".into(),
+                // The sidecar lives here and not in tauri.conf.json; see the module docs.
+                // Without this flag the bundle comes out with no `cide-hook` and no error.
+                "--config".into(),
+                bundle_conf_arg(),
+                "--bundles".into(),
+                bundles,
+            ],
             cwd: APP_CRATE.into(),
             env,
         });
@@ -501,17 +555,30 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets) -> Vec<Verdict> 
         out.push(tauri_cli_check());
         out.push(if info.bundles_the_hook() {
             Verdict::Ok(format!(
-                "{TAURI_CONF} ships {HOOK_BIN} as a sidecar (bundle.externalBin)"
+                "{TAURI_BUNDLE_CONF} ships {HOOK_BIN} as a sidecar (bundle.externalBin)"
             ))
         } else {
             // A failure, not a warning. The bundle would be produced, would install, would
             // launch, and every session in it would run with no hooks — see the module docs.
             Verdict::Fail(format!(
-                "{TAURI_CONF} has no `{HOOK_BIN}` in bundle.externalBin, so the package would \
-                 ship without it: `cargo tauri build` bundles only the app crate's own \
+                "{TAURI_BUNDLE_CONF} has no `{HOOK_BIN}` in bundle.externalBin, so the package \
+                 would ship without it: `cargo tauri build` bundles only the app crate's own \
                  binaries. Sessions would run with no hooks and nothing would report an error"
             ))
         });
+        // The mirror image, and the more expensive mistake of the two: `tauri-build` acts on
+        // `bundle.externalBin` on every cargo invocation, so the same key in the *base* config
+        // fails `cargo build --workspace` on any tree that has not already produced a release
+        // sidecar. That is a broken checkout and a red CI, not a broken package.
+        if !info.base_external_bin.is_empty() {
+            out.push(Verdict::Fail(format!(
+                "{TAURI_CONF} carries bundle.externalBin ({:?}). `tauri-build` copies those on \
+                 every `cargo build`, so the whole workspace stops compiling until a release \
+                 {HOOK_BIN} exists. Move it to {TAURI_BUNDLE_CONF}, which only the bundler step \
+                 reads (`--config`)",
+                info.base_external_bin
+            )));
+        }
         // The `externalBin` path is written relative to the app crate and hardcodes
         // `target/release`. Cargo honours CARGO_TARGET_DIR, the config cannot, and the
         // mismatch surfaces as a missing-sidecar error naming a path that does exist.
@@ -1015,6 +1082,15 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
             .unwrap_or_default()
     };
 
+    // Absent rather than malformed is not an error here: the preflight reports it, with the
+    // sentence that says what the missing file costs. A hard error out of `read_app_info`
+    // would also take out `--check` and `--write`, which do not need the overlay at all.
+    let overlay_path = root.join(TAURI_BUNDLE_CONF);
+    let overlay: serde_json::Value = fs::read_to_string(&overlay_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+
     Ok(AppInfo {
         identifier: string(conf.get("identifier"), "identifier")?,
         version: string(conf.get("version"), "version")?,
@@ -1022,7 +1098,8 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         bundle_targets: list(conf.pointer("/bundle/targets")),
         icons: list(conf.pointer("/bundle/icon")),
         has_updater: conf.pointer("/plugins/updater").is_some(),
-        external_bin: list(conf.pointer("/bundle/externalBin")),
+        external_bin: list(overlay.pointer("/bundle/externalBin")),
+        base_external_bin: list(conf.pointer("/bundle/externalBin")),
     })
 }
 
@@ -1039,7 +1116,27 @@ mod tests {
             icons: vec!["icons/32x32.png".into()],
             has_updater: false,
             external_bin: vec!["../../target/release/cide-hook".into()],
+            base_external_bin: Vec::new(),
         }
+    }
+
+    /// Resolve `..` and `.` textually, the way `Path::join` does not.
+    ///
+    /// Used to answer "which file will the bundler open", which is the only question the
+    /// sidecar path test is asking. `canonicalize` cannot: the sidecar does not exist until
+    /// the plan has run, and the test has to hold before that.
+    fn normalize(path: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other),
+            }
+        }
+        out
     }
 
     #[test]
@@ -1069,32 +1166,95 @@ mod tests {
 
     #[test]
     fn the_sidecar_path_matches_the_checked_in_config() {
-        // `externalBin` is resolved relative to the crate holding tauri.conf.json; the plan
-        // writes its copy relative to the workspace root. The two spellings of one path must
-        // meet, and they only do if the config's entry is `../../` plus ours.
+        // `externalBin` is resolved relative to the crate holding tauri.conf.json and the
+        // triple is appended; the plan writes its copy relative to the workspace root. The two
+        // spellings have to name one file.
+        //
+        // The predecessor of this test asserted `resolved.ends_with("target/release/cide-hook")`
+        // — which a config entry of plain `target/release/cide-hook`, missing the `../../` and
+        // therefore pointing at a `crates/cide-app/target/` that never exists, satisfies. It
+        // was green for the exact drift it was written to catch. Compare whole paths.
         let root = crate::workspace_root().expect("a workspace root");
         let info = read_app_info(&root).expect("tauri.conf.json parses");
+        let triple = "x86_64-unknown-linux-gnu";
         let entry = info
             .external_bin
             .iter()
             .find(|p| p.ends_with(HOOK_BIN))
             .expect("an externalBin entry for the hook");
-        let from_root = root
-            .join(APP_CRATE)
-            .join(entry)
-            .canonicalize()
-            .or_else(|_| {
-                // The sidecar need not exist yet — the plan builds it — so fall back to
-                // comparing the lexical path against the app crate's parent.
-                Ok::<_, std::io::Error>(root.join(APP_CRATE).join(entry))
-            })
-            .unwrap();
-        let ours = root.join(format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"));
+
+        let bundler_opens = normalize(&root.join(APP_CRATE).join(format!("{entry}-{triple}")));
+        let plan_writes = root.join(sidecar_path(triple));
+        assert_eq!(
+            bundler_opens,
+            plan_writes,
+            "the bundler will open {}, but the plan writes {}",
+            bundler_opens.display(),
+            plan_writes.display()
+        );
+    }
+
+    #[test]
+    fn the_base_config_must_not_carry_the_sidecar() {
+        // `bundle.externalBin` is not bundler-only: `tauri-build` copies every entry on every
+        // cargo invocation and errors when one is missing. In tauri.conf.json it therefore
+        // stops `cargo build --workspace`, `cargo test --workspace` and CI dead on any tree
+        // without a prebuilt release cide-hook — which is every fresh clone. It belongs in the
+        // overlay that only `cargo tauri build --config` reads.
+        let root = crate::workspace_root().expect("a workspace root");
+        let info = read_app_info(&root).expect("tauri.conf.json parses");
         assert!(
-            from_root.ends_with(format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"))
-                || from_root == ours.canonicalize().unwrap_or(ours),
-            "externalBin resolves to {}, but the plan writes {HOOK_SIDECAR_DIR}/{HOOK_BIN}",
-            from_root.display()
+            info.base_external_bin.is_empty(),
+            "{TAURI_CONF} must not carry bundle.externalBin (found {:?}); \
+             it belongs in {TAURI_BUNDLE_CONF}",
+            info.base_external_bin
+        );
+    }
+
+    #[test]
+    fn a_sidecar_in_the_base_config_is_a_preflight_failure() {
+        let mut info = info();
+        info.base_external_bin = vec!["../../target/release/cide-hook".into()];
+        let checks = preflight(Path::new("/nonexistent"), &info, Targets::ALL);
+        assert!(
+            checks
+                .iter()
+                .any(|c| matches!(c, Verdict::Fail(d) if d.contains("every `cargo build`"))),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn the_bundler_step_reads_the_overlay_that_holds_the_sidecar() {
+        // Without `--config`, tauri-cli sees only tauri.conf.json — which no longer names the
+        // hook — and produces a bundle with no cide-hook and no error. This flag is the only
+        // thing connecting the overlay to the build.
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            Targets::ALL,
+            "x86_64-unknown-linux-gnu",
+        );
+        let bundle = steps
+            .iter()
+            .find(|s| s.args.first().map(String::as_str) == Some("tauri"))
+            .expect("the bundler step");
+        let config = bundle
+            .args
+            .iter()
+            .position(|a| a == "--config")
+            .and_then(|i| bundle.args.get(i + 1))
+            .expect("a --config flag naming the overlay");
+        // The step runs in APP_CRATE and `--config` resolves against the process cwd, so the
+        // flag's value joined onto the cwd has to be the checked-in file.
+        assert_eq!(
+            Path::new(APP_CRATE).join(config),
+            Path::new(TAURI_BUNDLE_CONF)
+        );
+        let root = crate::workspace_root().expect("a workspace root");
+        assert!(
+            root.join(TAURI_BUNDLE_CONF).exists(),
+            "{TAURI_BUNDLE_CONF} is named by the plan but is not checked in"
         );
     }
 
@@ -1252,10 +1412,13 @@ mod tests {
             matches!(verdict, Verdict::Ok(_) | Verdict::Warn(_)),
             "never a hard failure: {verdict:?}"
         );
-        let ok = WEBKIT_SEARCH_DIRS.iter().any(|d| {
-            Path::new(d)
-                .join("webkit2gtk-4.1/WebKitWebProcess")
-                .exists()
+        // Both helpers, not just one: tauri-bundler's loop is per-file over every search dir,
+        // so a machine holding one of the two gets a Warn, and a test that only looked for
+        // WebKitWebProcess would call that a bug in the check.
+        let ok = WEBKIT_HELPERS.iter().all(|helper| {
+            WEBKIT_SEARCH_DIRS
+                .iter()
+                .any(|d| Path::new(d).join("webkit2gtk-4.1").join(helper).exists())
         });
         assert_eq!(matches!(verdict, Verdict::Ok(_)), ok, "{verdict:?}");
         if let Verdict::Warn(detail) = &verdict {

@@ -50,12 +50,11 @@ hooks: no token figures, no fast buffer reload, and a close confirm that cannot 
 idle. `cmd::session::hook_settings` returns `None`, logs one `warn`, and the session proceeds.
 Nothing fails.
 
-So `bundle.externalBin` in `tauri.conf.json` names `../../target/release/cide-hook`. The
-bundler resolves an `externalBin` entry by appending the target triple, and
-`Settings::copy_binaries` strips the triple back off when it copies the file into the package's
-`usr/bin/` — beside `cide`, which is exactly where `hook_settings` looks
-(`current_exe().parent().join("cide-hook")`). Inside a mounted AppImage `current_exe()` is
-`$APPDIR/usr/bin/cide`, so the two agree.
+So `bundle.externalBin` names `../../target/release/cide-hook`. The bundler resolves an
+`externalBin` entry by appending the target triple, and `Settings::copy_binaries` strips the
+triple back off when it copies the file into the package's `usr/bin/` — beside `cide`, which is
+exactly where `hook_settings` looks (`current_exe().parent().join("cide-hook")`). Inside a
+mounted AppImage `current_exe()` is `$APPDIR/usr/bin/cide`, so the two agree.
 
 Producing the triple-suffixed copy is two steps in `cargo xtask package`'s plan, ahead of the
 bundler:
@@ -68,9 +67,45 @@ install -m755 target/release/cide-hook target/release/cide-hook-x86_64-unknown-l
 The rejected alternative was `bundle.linux.appimage.files`, which takes a plain dest→src map
 and needs no triple dance. It is AppImage-only: the `.deb` would have gone on shipping without
 the hook, and the failure is invisible, so a mechanism that covers only one of the two formats
-is the wrong one. Three tests guard this — that the checked-in config still names the hook,
-that a config without it is a preflight *failure* rather than a warning, and that the plan
-builds and suffixes the binary before the bundler runs.
+is the wrong one.
+
+#### …but the key may not live in `tauri.conf.json`
+
+`bundle.externalBin` is not read only by the bundler. `tauri-build` — `cide-app`'s build script
+— copies every named sidecar into the target directory on **every** cargo invocation, and
+fails with `resource path ... doesn't exist` when one is missing. The first version of this
+change put the key in `crates/cide-app/tauri.conf.json`, and the result was that `cargo build`,
+`cargo test --workspace` and `cargo clippy --workspace` all failed on any tree that had not
+already produced a *release* `target/release/cide-hook-<triple>`. That is every fresh clone,
+and it is `.github/workflows/ci.yml`'s `cargo build --locked --workspace` step, which runs long
+before anything packages anything. The symptom reads as a broken checkout rather than as a
+packaging decision, and the machine it was developed on could not see it: the packaging run had
+already left the sidecar in place.
+
+The key therefore lives in `crates/cide-app/tauri.bundle.conf.json`, a merge patch nothing
+reads unless it is asked to, and the plan asks:
+
+```sh
+cd crates/cide-app && cargo tauri build --config tauri.bundle.conf.json --bundles appimage,deb
+```
+
+`tauri-cli` merges that patch over `tauri.conf.json` for its own bundling **and** exports the
+merged patch as `TAURI_CONFIG` (`src/helpers/config.rs`), which `tauri-build` reads — so the
+sidecar reaches both halves of the build, and only during a packaging run. `--config` resolves
+its path against the process working directory, which is why the flag's value is the bare file
+name and the step's `cwd` is the app crate.
+
+`tauri.linux.conf.json`, the platform-overlay file, was the other candidate and loses for the
+same reason as the base config: `tauri_utils::config::parse::read_platform` is called by
+`tauri-build` too, so it breaks the workspace build identically on the only platform this file
+targets.
+
+Six tests guard the pair: that the overlay still names the hook, that a config without it is a
+preflight *failure* rather than a warning, that the plan builds and suffixes the binary before
+the bundler runs, that the bundler step passes `--config`, that the base config carries no
+`externalBin` at all, and that the path the bundler will open is byte-for-byte the path the plan
+writes. That last one replaces an `ends_with("target/release/cide-hook")` assertion that a
+config entry missing its `../../` also satisfied — green for precisely the drift it named.
 
 ### .deb — a convenience
 
@@ -146,8 +181,10 @@ effect of a command somebody typed to see what it would do is hostile.
 ```sh
 cargo build --release --locked -p cide-hook
 install -m755 target/release/cide-hook target/release/cide-hook-<host triple>
-cd crates/cide-app && cargo tauri build --bundles appimage,deb
+cd crates/cide-app && cargo tauri build --config tauri.bundle.conf.json --bundles appimage,deb
 ```
+
+(plus a `curl` for the AppImage runtime, below, when `target/appimage-runtime/` is empty.)
 
 The last from the app crate, because `cargo tauri build` finds `tauri.conf.json` by walking up
 from the working directory and this workspace has no `src-tauri`. That config's
@@ -199,7 +236,14 @@ Its squashfs payload carries `usr/bin/cide` and `usr/bin/cide-hook` side by side
 libsoup 3, GStreamer, and the pixbuf and immodule loaders. Verified with
 `unsquashfs -o 944632 -l`, not by running it.
 
-`cide` links fifteen libraries. Twelve are inside the bundle: `libgtk-3.so.0`,
+That run predates the move of `externalBin` out of the base config, so it was built without
+`--config`. The artefact is unaffected: `tauri-cli` merges the patch into the same configuration
+it would otherwise have read, and the merged value is identical. What has *not* been re-run
+end-to-end since the move is `cargo xtask package --appimage --run` itself; the mechanism was
+verified one layer down, by putting the same patch in `TAURI_CONFIG` — which is exactly what
+`--config` sets — and watching `cargo check -p cide-app` demand the sidecar and then accept it.
+
+`cide` links fifteen libraries. Eleven are inside the bundle: `libgtk-3.so.0`,
 `libgdk-3.so.0`, `libgdk_pixbuf-2.0.so.0`, `libcairo.so.2`, `libglib-2.0.so.0`,
 `libgobject-2.0.so.0`, `libgio-2.0.so.0`, `libdbus-1.so.3`, `libsoup-3.0.so.0`,
 `libwebkit2gtk-4.1.so.0`, `libjavascriptcoregtk-4.1.so.0`. Four come from the host:
