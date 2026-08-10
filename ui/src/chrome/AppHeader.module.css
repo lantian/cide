@@ -27,7 +27,8 @@
 }
 
 /*
- * The only literal colours left in the app, and deliberately so: these are a fixed motif,
+ * The only literal colours left in the stylesheets, and deliberately so (`minimap.ts` keeps
+ * one more, an unreachable `#888` for a token that failed to resolve): these are a fixed motif,
  * like a logo, not palette. A user who sees amber-then-green anywhere else reads these three
  * as the same control, and tokenising them would repaint the close button `--red` — which
  * moves with the theme and, in a white light theme, stops matching every other OS's lights.

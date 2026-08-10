@@ -249,20 +249,31 @@
  * `var()` follows `data-theme` for free. `&light X` finishes as two classes, so the three
  * and four here win outright rather than on source order.
  *
- * The accent pair rather than `--yellow`: a hit is the app's own emphasis, not a warning,
- * and the dim/solid split is what separates "a match" from "the match you are standing on".
+ * The accent family rather than `--yellow`: a hit is the app's own emphasis, not a warning.
  * Sharing `--accent-dim` with `.cm-selectionMatch` above is deliberate — both mean "another
- * occurrence of this" — and only the current hit needs to break away from them.
+ * occurrence of this".
+ *
+ * The current hit is the same fill plus a ring, NOT a solid `--accent`. Solid was tried and
+ * is unusable, because this rule cannot choose the ink on top of it: `syntaxHighlighting` is
+ * registered `Prec.high` (`@codemirror/language`), the decoration facet is ordered by
+ * precedence, and `ensureMarks` nests the lowest-ranked mark *deepest* (`@codemirror/view`),
+ * so the `.cide-tk-*` span is always inside the `.cm-searchMatch` one and its own `color`
+ * wins whatever this rule says. A `color` here reaches only the uncoloured runs, so a solid
+ * accent field ends up carrying purple keywords and cyan types at about 1.1:1 in both
+ * palettes — worse than the base theme's 33%-alpha wash it replaced. The ring says "this
+ * one" without touching contrast; `.cm-matchingBracket` above already uses that idiom.
+ *
+ * `outline-offset: -1px` so a match that wraps across lines does not have consecutive
+ * rings touching.
  */
 .body :global(.cm-editor .cm-searchMatch) {
   background: var(--accent-dim);
 }
 
 .body :global(.cm-editor .cm-searchMatch.cm-searchMatch-selected) {
-  background: var(--accent);
-  /* `--bg`, not a literal white: the accent is a light orange on the dark palette and a
-     darker one on the light palette, and the app's own ground inverts to match both. */
-  color: var(--bg);
+  background: var(--accent-dim);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 /* --- minimap --------------------------------------------------------------------------- */

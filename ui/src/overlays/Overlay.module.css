@@ -18,12 +18,16 @@
    * necessarily theme-independent. That was half right. A scrim must be built from a *dark*
    * colour in both themes — a light-theme scrim made of a light token recedes nothing — but
    * one alpha cannot serve both. Over `--bg` at #111113 the wash is barely visible; over the
-   * white light ground the user asked for, 42% black lands on #949494, which is most of why
-   * the light theme reads as grey rather than white.
+   * white light ground the user asked for, 42% black lands on #949494 — a heavy grey over
+   * the whole window for as long as an overlay is open. (Only for that long: the beige
+   * `--bg`/`--chrome` were why the light theme read as grey at rest, and those are
+   * `tokens.css`'s to fix, not this rule's.)
    *
-   * So the value moves behind `--scrim`, which `tokens.css` sets per theme. The literal here
-   * is the fallback, not the intent: it keeps the dark theme exactly as the mock draws it if
-   * the token is ever missing. Do not fold it back into the mock's single value.
+   * So the value moves behind `--scrim`. **`tokens.css` does not define it yet** — until it
+   * does, both themes resolve to the fallback and the light scrim is unchanged. The literal
+   * is the fallback, not the intent: it keeps the dark theme exactly as the mock draws it.
+   * Do not fold it back into the mock's single value; add the token instead, dark
+   * `rgba(0,0,0,.42)` and light something near `rgba(0,0,0,.18)`.
    */
   background: var(--scrim, rgba(0, 0, 0, 0.42));
   display: flex;
