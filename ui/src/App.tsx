@@ -35,6 +35,7 @@ import { SearchPanel } from '@/sidebar/SearchPanel'
 import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
+import { Failures } from '@/chrome/Failures'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
@@ -785,6 +786,15 @@ export function App() {
             }}
           />
         )}
+
+        {/*
+          * Last in the shell, so it paints over everything. A failed command used to be
+          * indistinguishable from a control wired to nothing — which is precisely how the
+          * `+ row` buttons presented when the running binary predated their command. See
+          * `Failures.tsx`; it needs no props because it listens for the rejections the
+          * `void` call sites above it discard.
+          */}
+        <Failures />
 
         {pendingClose && (
           <CloseConfirm

@@ -1,0 +1,86 @@
+/*
+ * Toasts for failed commands. See `Failures.tsx` for why they exist at all.
+ *
+ * Bottom-right and above the status bar, which is the one strip of chrome that never holds
+ * content the user is reading. Deliberately *not* centred over the workspace: a failure here
+ * is informational, and a modal treatment would interrupt a turn the user is watching.
+ *
+ * Every colour is a token, so both themes work. `--red` is the semantic error colour in both
+ * palettes and is checked against `--panel` by `check:theme`.
+ */
+
+.stack {
+  position: absolute;
+  right: 12px;
+  /* Clear of the status bar rather than a magic number: the token is the bar's own height. */
+  bottom: calc(var(--h-status) + 12px);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* The stack is a positioned overlay across the workspace; only the toasts take clicks. */
+  pointer-events: none;
+  max-width: min(420px, calc(100% - 24px));
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 10px 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  /* The one saturated edge, so a failure reads as a failure at a glance without the whole
+     card being alarming. */
+  border-left: 3px solid var(--red);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.text {
+  margin: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+  /* A message from Rust can carry a path with no spaces in it. */
+  overflow-wrap: anywhere;
+}
+
+.hint {
+  margin: 0;
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.dismiss {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--faint);
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+
+.dismiss:hover {
+  color: var(--text-hi);
+  background: var(--chrome-hi);
+}
+
+.dismiss:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
