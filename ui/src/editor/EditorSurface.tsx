@@ -46,7 +46,8 @@ import { cideHighlightStyle } from './highlight'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
 import { languageName, loadLanguage } from './languages'
-import { detectLineEnding, restoreLineEndings, type LineEnding } from './lineEndings'
+import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
+import { exceedsBytes } from './byteSize'
 import styles from './EditorSurface.module.css'
 
 /**
@@ -62,6 +63,10 @@ import styles from './EditorSurface.module.css'
  *
  * One megabyte is comfortably above every hand-written source file in this repository (the
  * largest is 60 KB) and comfortably below the 5 MB the milestone tests with.
+ *
+ * Bytes, and measured as bytes — see `byteSize.ts`. Compared against `source.length` this
+ * would be UTF-16 code units, and a file of non-Latin prose would be measured at up to a
+ * third of its real size.
  */
 export const HIGHLIGHT_LIMIT_BYTES = 1024 * 1024
 
@@ -171,11 +176,11 @@ export function EditorSurface({
 
   const segments = useMemo(() => breadcrumbSegments(path, root), [path, root])
   const language = useMemo(() => languageName(path), [path])
-  const lineEnding = useMemo(() => detectLineEnding(doc), [doc])
+  const endings = useMemo(() => captureLineEndings(doc), [doc])
 
   // Captured per load, because after `EditorState.create` the buffer's endings are all `\n`
   // and the question can no longer be asked. See `lineEndings.ts`.
-  const endingRef = useRef<LineEnding>('LF')
+  const endingRef = useRef<DocumentEndings>(endings)
   const dirtyRef = useRef(false)
 
   useEffect(() => {
@@ -183,11 +188,11 @@ export function EditorSurface({
     if (host === null) return
 
     const source = doc
-    const oversize = source.length > HIGHLIGHT_LIMIT_BYTES
-    // `lineEnding` is memoized on the same `doc` this effect captured, so reusing it here is
+    const oversize = exceedsBytes(source, HIGHLIGHT_LIMIT_BYTES)
+    // `endings` is memoized on the same `doc` this effect captured, so reusing it here is
     // the same answer for one scan instead of two — and it keeps the readout and the bytes
     // that get written from ever disagreeing about what the file was.
-    endingRef.current = lineEnding
+    endingRef.current = endings
     dirtyRef.current = false
 
     const languageSlot = new Compartment()
@@ -276,7 +281,7 @@ export function EditorSurface({
         if (update.selectionSet || update.docChanged) {
           const el = readoutRef.current
           if (el !== null) {
-            el.textContent = `${language} · UTF-8 · ${lineEnding} · ${cursorLabel(update.state)}`
+            el.textContent = `${language} · UTF-8 · ${endings.ending} · ${cursorLabel(update.state)}`
           }
           // Read from `update.state`, not from a captured view: this listener outlives
           // several states and the one that changed is the one to report.
@@ -328,7 +333,7 @@ export function EditorSurface({
 
     const el = readoutRef.current
     if (el !== null) {
-      el.textContent = `${language} · UTF-8 · ${lineEnding} · ${cursorLabel(view.state)}`
+      el.textContent = `${language} · UTF-8 · ${endings.ending} · ${cursorLabel(view.state)}`
     }
 
     // Fire-and-forget, and guarded on the view still being the live one: a tab closed while
@@ -364,7 +369,7 @@ export function EditorSurface({
           ))}
         </div>
         <div className={styles.readout} ref={readoutRef} data-audit="editorReadout">
-          {`${language} · UTF-8 · ${lineEnding} · Ln 1, Col 1`}
+          {`${language} · UTF-8 · ${endings.ending} · Ln 1, Col 1`}
         </div>
       </div>
 

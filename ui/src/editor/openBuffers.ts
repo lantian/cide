@@ -40,6 +40,32 @@ export function canSaveAll(tabs: readonly string[]): boolean {
 }
 
 /**
+ * Save one tab's buffer, or answer `null` when nothing here can.
+ *
+ * `null` rather than a rejected promise or a silent no-op. The caller is the `file.save`
+ * command — reached from Ctrl+S and from the palette — and "there is no editor for that tab"
+ * is not a failure to report to the user; it is a reason for the command to say it did not
+ * run. A rejected promise would make an ordinary Ctrl+S in a terminal look like a failed
+ * write, and a resolved one would make it look like a successful one. See `keys/dispatch.ts`.
+ *
+ * `tab` is nullable so a caller that has no focused tab at all can ask without a branch.
+ */
+export function saveTab(tab: string | null): Promise<void> | null {
+  if (tab === null) return null
+  const save = savers.get(tab)
+  if (save === undefined) return null
+  try {
+    return save()
+  } catch (error) {
+    // A saver that throws synchronously would otherwise escape into the key gate's keydown
+    // handler, where an exception stops the rest of that listener — including the
+    // `preventDefault` that keeps `^S` away from a PTY. Turned into a rejection so the one
+    // caller that cares handles it the same way it handles a failed write.
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)))
+  }
+}
+
+/**
  * Save the given tabs, and report the ones that failed.
  *
  * Sequential rather than concurrent. These are writes to the user's files: a failure part-way

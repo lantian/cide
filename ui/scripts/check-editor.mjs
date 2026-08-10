@@ -9,10 +9,13 @@
  *
  * Same shape as `check-status-format.mjs` and `check-picker.mjs`: no JS test runner in this
  * project, so the TypeScript already in `node_modules` compiles the modules and this file
- * imports the output. Five things are pinned, in the order they appear below.
+ * imports the output. Seven things are pinned, in the order they appear below.
  *
- *  1. **Line endings.** A round trip — detect, hand the text to CodeMirror, restore — is
- *     byte-identical for LF, CRLF and bare CR. This is the regression that already bit.
+ *  1. **Line endings.** A round trip — capture, hand the text to CodeMirror, restore — is
+ *     byte-identical for LF, CRLF, bare CR *and* mixed. This is the regression that already
+ *     bit, and the mixed case is the one that was still open until the per-line record
+ *     landed: `Mixed` restored nothing, so the first save of such a file rewrote every break
+ *     that was not already `\n`.
  *  2. **The language table.** Extension and whole-name lookup, and that an extension nobody
  *     has heard of degrades to `Plain Text` and a null extension rather than throwing.
  *  3. **The highlight table.** Every tag name the grammars actually emit resolves to a token
@@ -25,6 +28,12 @@
  *  5. **The stream grammars.** Every `token()` call advances the stream, over a corpus of
  *     each language crossed with every *other* language's source; and tokenizing a line
  *     scales with its length rather than its square.
+ *  6. **The size gate's unit.** `byteSize.ts` gives the same answer as `TextEncoder` without
+ *     allocating the encoding — the gate is spelled in bytes and was being compared against
+ *     UTF-16 code units, which measures a CJK file at a third of its size.
+ *  7. **The open-buffer registry.** What `file.save` and *Save and close* both go through:
+ *     which tabs can be saved, what happens when one cannot, and that "no editor here" is
+ *     distinguishable from "the write failed".
  *
  * The fifth found two more quadratics on its first run — the markdown link matcher and the
  * shell `${…}` matcher, both the same unbounded-scan-then-backtrack shape as the YAML key
@@ -88,6 +97,8 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/editor/lineEndings.ts',
+      'src/editor/byteSize.ts',
+      'src/editor/openBuffers.ts',
       'src/editor/languages.ts',
       'src/editor/highlight.ts',
       'src/editor/minimapGeometry.ts',
@@ -123,7 +134,10 @@ try {
   const require = createRequire(import.meta.url)
   const load = (name) => require(join(out, 'editor', name))
 
-  const { countLines, detectLineEnding, restoreLineEndings } = load('lineEndings.js')
+  const { captureLineEndings, countLines, detectLineEnding, restoreLineEndings } =
+    load('lineEndings.js')
+  const { exceedsBytes, utf8ByteLength } = load('byteSize.js')
+  const buffers = load('openBuffers.js')
   const { basename, languageName, loadLanguage } = load('languages.js')
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
@@ -170,17 +184,29 @@ try {
     eq(detectLineEnding(text), ending, `detectLineEnding: ${what}`)
     eq(countLines(text), lines, `countLines: ${what}`)
 
-    const restored = restoreLineEndings(throughCodeMirror(text), detectLineEnding(text))
+    /*
+     * The whole claim, for every shape including `Mixed`: load it, hand it to CodeMirror,
+     * hand it back, and get the same bytes.
+     *
+     * `Mixed` used to be exempt from this — `restoreLineEndings` returned the buffer
+     * unchanged and every break that was not already `\n` was rewritten on the first save,
+     * which is precisely the whole-file rewrite the module exists to prevent. It is no
+     * longer exempt, and the exemption must not come back.
+     */
+    const captured = captureLineEndings(text)
+    eq(captured.ending, ending, `captureLineEndings agrees on the classification: ${what}`)
+    eq(
+      restoreLineEndings(throughCodeMirror(text), captured),
+      text,
+      `round trip is byte-identical: ${what}`,
+    )
+
+    // A uniform document must not allocate a break per line; a mixed one must record one
+    // per break, or the restore above is passing on an array that happens to be long enough.
     if (ending === 'Mixed') {
-      // The honest statement of a known loss, asserted so it cannot change unnoticed: a
-      // file with more than one ending shape comes back LF throughout, because by save time
-      // the buffer has only `\n` left and there is no single answer to put back. Every line
-      // that was not already LF is rewritten. Preserving them needs the *sequence* of breaks
-      // carried alongside the document, which is a design decision, not a fix.
-      eq(restored, throughCodeMirror(text), `mixed endings come back LF-only: ${what}`)
-      ok(restored !== text || !/\r/.test(text), `mixed endings are not preserved: ${what}`)
+      eq(captured.breaks?.length, lines - 1, `the record has one break per line: ${what}`)
     } else {
-      eq(restored, text, `round trip is byte-identical: ${what}`)
+      eq(captured.breaks, null, `a uniform document stores no per-line record: ${what}`)
     }
   }
 
@@ -189,12 +215,88 @@ try {
   const big = 'const x = 1;\r\n'.repeat(5000)
   eq(detectLineEnding(big), 'CRLF', 'a large CRLF file')
   eq(countLines(big), 5001, 'a large CRLF file counts its lines')
-  eq(restoreLineEndings(throughCodeMirror(big), 'CRLF'), big, 'a large CRLF file round-trips')
+  eq(
+    restoreLineEndings(throughCodeMirror(big), captureLineEndings(big)),
+    big,
+    'a large CRLF file round-trips',
+  )
 
-  eq(restoreLineEndings('a\nb', 'LF'), 'a\nb', 'restoring LF is the identity')
-  eq(restoreLineEndings('a\nb', 'Mixed'), 'a\nb', 'restoring Mixed is the identity')
-  eq(restoreLineEndings('a\nb', 'CR'), 'a\rb', 'restoring CR')
-  eq(restoreLineEndings('a\nb', 'CRLF'), 'a\r\nb', 'restoring CRLF')
+  // The same file with one stray LF in it: the mixed case as it actually occurs, and the
+  // size at which "a mixed file is rewritten whole" stops being a footnote.
+  {
+    const strays = `first\n${'const x = 1;\r\n'.repeat(5000)}`
+    const captured = captureLineEndings(strays)
+    eq(captured.ending, 'Mixed', 'a large mostly-CRLF file with one LF is mixed')
+    eq(captured.fill, '\r\n', 'and a new line in it gets the shape the file mostly uses')
+    eq(restoreLineEndings(throughCodeMirror(strays), captured), strays, 'and it round-trips')
+  }
+
+  /*
+   * Recording the sequence has to cost one pass, not one pass per break.
+   *
+   * The shape that catches it is a stray `\r` near the *top* of an otherwise LF file: an
+   * implementation that asks `indexOf('\r', i)` again after each break scans the whole
+   * remaining document every time, once there is no `\r` left to find.
+   *
+   * Measured on this box: 7 ms for the one-pass version, 1,336 ms for the naive one, on the
+   * same input. The ceiling is 250 ms — well clear of a box thirty times slower than this
+   * one, and five times below the failure. Half a million lines rather than fifty thousand because
+   * `indexOf` is vectorised: at 50,000 the naive shape still finishes in 20 ms and the
+   * assertion would have no teeth at all.
+   */
+  {
+    const strayAtTop = `a\rb\n${'x\n'.repeat(500_000)}`
+    const started = Date.now()
+    const captured = captureLineEndings(strayAtTop)
+    const elapsed = Date.now() - started
+    eq(captured.ending, 'Mixed', 'one bare CR at the top of an LF file is mixed')
+    eq(captured.breaks?.length, 500_002, 'every break is recorded')
+    eq(captured.fill, '\n', 'and the file is overwhelmingly LF')
+    ok(elapsed < 250, `recording 500,000 breaks is one pass (took ${elapsed}ms)`)
+    eq(restoreLineEndings(throughCodeMirror(strayAtTop), captured), strayAtTop, 'and it round-trips')
+  }
+
+  /*
+   * What happens to a mixed file that is actually *edited*, which is the only reason any of
+   * this exists. Endings are reapplied by index, so an edit that keeps the line count keeps
+   * every ending; one that changes it shifts the tail, and lines past the end of the record
+   * get `fill`.
+   */
+  {
+    const original = 'a\r\nb\nc\r\n'
+    const captured = captureLineEndings(original)
+    eq(captured.ending, 'Mixed', 'the worked example is mixed')
+    eq(captured.fill, '\r\n', 'CRLF is what it mostly uses')
+
+    const buffer = throughCodeMirror(original)
+    eq(buffer, 'a\nb\nc\n', 'CodeMirror flattens it to LF')
+    eq(
+      restoreLineEndings('aX\nb\nc\n', captured),
+      'aX\r\nb\nc\r\n',
+      'a typed character rewrites one line and no others',
+    )
+    eq(
+      restoreLineEndings('a\nb\nc\nd\n', captured),
+      'a\r\nb\nc\r\nd\r\n',
+      'an appended line gets the fill, and the lines above it keep their own',
+    )
+    eq(
+      restoreLineEndings('a\nb\n', captured),
+      'a\r\nb\n',
+      'a deleted last line takes its break with it',
+    )
+  }
+
+  // `fill` is the file's own answer, and the tiebreak has to be the file's too — otherwise
+  // the ending of a newly typed line depends on the order this implementation tests three
+  // shapes in.
+  eq(captureLineEndings('a\r\nb\nc').fill, '\r\n', 'a tie goes to the shape that appears first')
+  eq(captureLineEndings('a\nb\r\nc').fill, '\n', 'and the other way round')
+  eq(captureLineEndings('a\rb\nc\nd').fill, '\n', 'otherwise the most common shape wins')
+
+  eq(restoreLineEndings('a\nb', captureLineEndings('x\ny')), 'a\nb', 'restoring LF is the identity')
+  eq(restoreLineEndings('a\nb', captureLineEndings('x\ry')), 'a\rb', 'restoring CR')
+  eq(restoreLineEndings('a\nb', captureLineEndings('x\r\ny')), 'a\r\nb', 'restoring CRLF')
 
   // ---------------------------------------------------------------------------------------
   // 2. The language table
@@ -993,6 +1095,140 @@ try {
         break
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 6. The size gate's unit
+  // ---------------------------------------------------------------------------------------
+
+  {
+    /*
+     * `TextEncoder` is the authority here, deliberately: `byteSize.ts` exists to give the
+     * same answer without allocating the encoding, so the assertion worth making is that it
+     * does, on every shape where the two could differ.
+     */
+    const encoder = new TextEncoder()
+    const samples = {
+      empty: '',
+      ascii: 'const x = 1;\n',
+      'two-byte': 'héllo wörld',
+      'three-byte': '漢字とかな',
+      'four-byte, a surrogate pair': '😀🎉',
+      'a lone high surrogate': '\ud800',
+      'a lone low surrogate': '\udc00',
+      'a surrogate that is not a pair': 'a\ud800b',
+      'a pair split by a stray': '\ud83d😀',
+      mixed: 'a é 漢 😀 z',
+      // The boundary between the two-byte and three-byte forms, from both sides.
+      'U+07FF': '߿',
+      'U+0800': 'ࠀ',
+    }
+    for (const [what, text] of Object.entries(samples)) {
+      eq(utf8ByteLength(text), encoder.encode(text).length, `utf8ByteLength: ${what}`)
+      // And the shortcut agrees with the count it is a shortcut for, at limits either side
+      // of the answer and at the answer itself.
+      const bytes = encoder.encode(text).length
+      for (const limit of [0, 1, bytes - 1, bytes, bytes + 1, 1024]) {
+        if (limit < 0) continue
+        eq(exceedsBytes(text, limit), bytes > limit, `exceedsBytes(${what}, ${limit})`)
+      }
+    }
+
+    /*
+     * The bug this module was written for. 400,000 CJK characters are 400,000 UTF-16 code
+     * units and 1.2 MB of file, so `source.length > HIGHLIGHT_LIMIT_BYTES` says "small
+     * enough to highlight" about a document a third larger than the limit — and the file
+     * whose stream parse is slowest is exactly the one that gets a stream parser.
+     */
+    const HIGHLIGHT_LIMIT = 1024 * 1024
+    const cjk = '漢'.repeat(400_000)
+    eq(cjk.length > HIGHLIGHT_LIMIT, false, 'the old test called a 1.2 MB file small')
+    eq(exceedsBytes(cjk, HIGHLIGHT_LIMIT), true, 'and the byte test does not')
+    // The two shortcuts, on documents big enough that taking the count instead would show.
+    eq(exceedsBytes('a'.repeat(2 * HIGHLIGHT_LIMIT), HIGHLIGHT_LIMIT), true, 'long is over')
+    eq(exceedsBytes('a'.repeat(1000), HIGHLIGHT_LIMIT), false, 'short is under')
+    eq(exceedsBytes('漢'.repeat(300_000), HIGHLIGHT_LIMIT), false, '900 KB of CJK is under')
+
+    // 5 MB of ASCII must not cost a walk of five million code units to reject.
+    {
+      const huge = 'const x = 1;\n'.repeat(400_000)
+      const started = Date.now()
+      eq(exceedsBytes(huge, HIGHLIGHT_LIMIT), true, 'a 5 MB file is over the limit')
+      const elapsed = Date.now() - started
+      ok(elapsed < 10, `the length shortcut answers without a scan (took ${elapsed}ms)`)
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 7. The open-buffer registry
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * `saveTab` is what `keys/dispatch.ts` calls for `file.save`, so its three answers are the
+   * three things Ctrl+S can mean: this tab was written, this tab could not be written, and
+   * there is no editor here at all. The last one has to be distinguishable from the other
+   * two — a Ctrl+S with a terminal focused is not a failed save — which is why it is `null`
+   * and not a rejected promise.
+   */
+  {
+    const saved = []
+    const ok_ = (tab) => () => {
+      saved.push(tab)
+      return Promise.resolve()
+    }
+
+    buffers.registerBuffer('tab-a', ok_('tab-a'))
+    buffers.registerBuffer('tab-b', ok_('tab-b'))
+    buffers.registerBuffer('tab-slow', () => new Promise((resolve) => setTimeout(resolve, 1)))
+    buffers.registerBuffer('tab-rejects', () => Promise.reject(new Error('disk full')))
+    buffers.registerBuffer('tab-throws', () => {
+      throw new Error('synchronous')
+    })
+
+    eq(
+      buffers.registeredBuffers().sort(),
+      ['tab-a', 'tab-b', 'tab-rejects', 'tab-slow', 'tab-throws'],
+      'every registered tab is listed',
+    )
+
+    eq(buffers.canSaveAll(['tab-a', 'tab-b']), true, 'canSaveAll: both are live')
+    eq(buffers.canSaveAll(['tab-a', 'nope']), false, 'canSaveAll: one is not')
+    eq(buffers.canSaveAll([]), false, 'canSaveAll: nothing to save is not "yes"')
+
+    eq(buffers.saveTab(null), null, 'saveTab: no focused tab saves nothing')
+    eq(buffers.saveTab('nope'), null, 'saveTab: a tab with no editor saves nothing')
+
+    const saving = buffers.saveTab('tab-a')
+    ok(saving !== null, 'saveTab: a registered tab returns a promise')
+    await saving
+    eq(saved, ['tab-a'], 'saveTab: and ran that tab’s saver, and only that one')
+
+    // A saver that throws where it should have rejected must not throw out of `saveTab` —
+    // that call happens inside a keydown handler, and an exception there skips the
+    // `preventDefault` that keeps `^S` away from a PTY.
+    let threw = false
+    let rejected = false
+    try {
+      await buffers.saveTab('tab-throws')?.catch(() => {
+        rejected = true
+      })
+    } catch {
+      threw = true
+    }
+    eq(threw, false, 'saveTab: a synchronous throw does not escape')
+    eq(rejected, true, 'saveTab: it arrives as a rejection instead')
+
+    saved.length = 0
+    const result = await buffers.saveAll(['tab-b', 'tab-rejects', 'nope', 'tab-a'])
+    eq(result.failed, ['tab-rejects', 'nope'], 'saveAll: reports what it could not write')
+    eq(saved, ['tab-b', 'tab-a'], 'saveAll: and wrote the rest, in the order it was given')
+
+    buffers.unregisterBuffer('tab-a')
+    eq(buffers.saveTab('tab-a'), null, 'unregisterBuffer: the tab is gone')
+    eq(buffers.canSaveAll(['tab-a']), false, 'unregisterBuffer: and cannot be saved')
+
+    for (const tab of buffers.registeredBuffers()) buffers.unregisterBuffer(tab)
+    eq(buffers.registeredBuffers(), [], 'the registry is a module singleton and is left empty')
   }
 
   if (failed > 0) {

@@ -446,6 +446,69 @@ try {
     eq(chipFor('palette.commands'), '⌃⇧P', 'chipFor works detached from its object')
   }
 
+  /* -------------------------------------------------- every bound key reaches a dispatcher */
+
+  /*
+   * A binding whose command nothing dispatches is worse than no binding at all.
+   *
+   * `ctrl+s` was bound to `file.save` in `cide_core::keymap::defaults()` from the day the
+   * table was written, and nothing in the frontend had a case for it. The gate did exactly
+   * what it is supposed to do — resolved the chord, swallowed the keystroke, called the
+   * dispatcher — and the dispatcher logged a line and returned. The effect was that Ctrl+S
+   * did nothing *and* that CodeMirror's own `Mod-s`, which would have saved the file, never
+   * saw the event. Every assertion above passed throughout: they check that a chord resolves
+   * and dispatches, not that anything is listening.
+   *
+   * So this reads the two files that dispatch — `keys/dispatch.ts` and the app's fallback in
+   * `App.tsx` — and asserts that every command in the shipped table reaches one of them.
+   * Source text rather than an import because `App.tsx` cannot be compiled here (it is the
+   * whole application) and because the question is genuinely "is this string written down as
+   * a case", which is what a `switch` is.
+   */
+  {
+    const readSource = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8')
+    const dispatchers = readSource('../src/keys/dispatch.ts') + readSource('../src/App.tsx')
+    const dispatched = new Set()
+    for (const [, id] of dispatchers.matchAll(/case '([a-zA-Z][\w.]*)':/g)) dispatched.add(id)
+    for (const [, id] of dispatchers.matchAll(/command === '([a-zA-Z][\w.]*)'/g)) dispatched.add(id)
+    ok(dispatched.size >= 10, `found ${dispatched.size} dispatched commands — the scan still works`)
+
+    /*
+     * The bindings that are still dead, each with the reason, so that a *new* one cannot be
+     * added without either wiring it or arguing for a line here.
+     *
+     * None of these is in this file's gift: they need the workspace store and `App.tsx`,
+     * which belongs to whoever is merging. They are listed rather than quietly excluded
+     * because the whole point of the assertion is that a dead key is a fact somebody has to
+     * look at.
+     */
+    const KNOWN_DEAD = {
+      'tab.close': 'needs the focused tab and `tab_close`; the × button is the only way today',
+      'theme.toggle': 'the app header has the toggle; no command reaches it',
+      'settings.open': 'the activity rail’s ⚙ is the only gesture that opens Settings',
+      'pane.promoteToTab': 'no dispatcher; `pane_promote` is wired to nothing',
+      'pane.detachToWindow': 'no dispatcher; the pane menu is the only route',
+      'pane.navigate.left': 'no dispatcher for the `pane_navigate` family',
+      'pane.navigate.right': 'no dispatcher for the `pane_navigate` family',
+      'pane.navigate.up': 'no dispatcher for the `pane_navigate` family',
+      'pane.navigate.down': 'no dispatcher for the `pane_navigate` family',
+    }
+
+    for (const { key, command } of rustDefaults()) {
+      if (Object.hasOwn(KNOWN_DEAD, command)) continue
+      ok(
+        dispatched.has(command),
+        `${key} is bound to ${command} and something dispatches it ` +
+          '(a bound key whose command nobody handles swallows the keystroke and does nothing)',
+      )
+    }
+    // And the list cannot rot: wiring one of them without deleting its line here would leave
+    // a note claiming a gap that no longer exists.
+    for (const command of Object.keys(KNOWN_DEAD)) {
+      ok(!dispatched.has(command), `${command} is still undispatched — remove it from KNOWN_DEAD`)
+    }
+  }
+
   if (failed > 0) {
     console.error(`\ncheck-key-gate: ${failed} failure(s)`)
     process.exit(1)
