@@ -49,6 +49,7 @@ export {
   countBySeverity,
   groupByFile,
   headline,
+  isSeverity,
   metaFigure,
   severityRank,
   statusBarCounts,

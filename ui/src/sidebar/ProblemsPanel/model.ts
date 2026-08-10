@@ -32,6 +32,29 @@
  */
 export type Severity = 'error' | 'warning' | 'info' | 'hint'
 
+/**
+ * The four severities, as data, so membership is a lookup rather than a type assertion.
+ *
+ * `Array.includes` and not `value in SOME_OBJECT`: `in` walks the prototype chain, so
+ * `'constructor' in {error: 0, …}` is `true` and every object-keyed lookup below would hand
+ * back `Object.prototype.constructor` — a function — where a number or a glyph was expected.
+ * That is not hypothetical robustness: severities arrive from a process we do not control, and
+ * a function reaching the comparator makes it return `NaN` (which in V8 leaves the whole list
+ * unsorted) while a function reaching JSX is not a valid React child.
+ */
+const SEVERITIES: readonly string[] = ['error', 'warning', 'info', 'hint']
+
+/**
+ * Is this one of the four severities we know how to render?
+ *
+ * Takes `string` rather than `Severity` on purpose: every caller has a value *annotated*
+ * `Severity` by a wire type, and the whole point of this guard is that the annotation is a
+ * promise from another process rather than a fact.
+ */
+export function isSeverity(value: string): value is Severity {
+  return SEVERITIES.includes(value)
+}
+
 export interface Diagnostic {
   /** Workspace-relative, forward slashes — the form the tree and the tab strip already use. */
   path: string
@@ -88,12 +111,12 @@ export const NO_SOURCE: DiagnosticsSnapshot = {
 /*
  * Sort weight: worst first within a file, so the first row of a group is the worst news.
  *
- * Typed `Record<string, number | undefined>` rather than `Record<Severity, number>` on
- * purpose. The precise type would make the lookup non-nullable and the fallback in
- * `severityRank` a compile error — TS would be telling us a value from another process cannot
- * surprise us, which is exactly the thing it does not know.
+ * Precisely typed `Record<Severity, number>`, which is safe only because every read goes
+ * through `isSeverity` first. The looser `Record<string, number | undefined>` was the
+ * alternative and it is a trap: an `undefined` check does not catch `'constructor'`, whose
+ * lookup returns a function rather than `undefined`.
  */
-const SEVERITY_RANK: Record<string, number | undefined> = {
+const SEVERITY_RANK: Record<Severity, number> = {
   error: 0,
   warning: 1,
   info: 2,
@@ -108,11 +131,10 @@ const SEVERITY_RANK: Record<string, number | undefined> = {
  * has somewhere to be commented.
  */
 export function severityRank(severity: Severity): number {
-  const rank = SEVERITY_RANK[severity]
   // The `Severity` annotation is a promise from a process we do not control, not a guarantee.
-  // An unrecognised value sorts after every known one instead of coming back `NaN` and
-  // turning the comparator non-transitive, which in V8 leaves the whole list unsorted.
-  return rank === undefined ? UNKNOWN_SEVERITY_RANK : rank
+  // An unrecognised value sorts after every known one instead of returning a non-number and
+  // turning the comparator into `NaN`, which in V8 leaves the whole list unsorted.
+  return isSeverity(severity) ? SEVERITY_RANK[severity] : UNKNOWN_SEVERITY_RANK
 }
 
 const UNKNOWN_SEVERITY_RANK = 4
@@ -122,14 +144,35 @@ export interface SeverityCounts {
   warning: number
   info: number
   hint: number
+  /**
+   * Diagnostics whose severity is none of the four above.
+   *
+   * A fifth bucket rather than a drop, and this is the panel's central invariant: the counts
+   * must total the number of items. Dropping an unrecognised severity made `countBySeverity`
+   * return all zeroes for a non-empty list, and `summaryLine` then printed **“No problems
+   * found”** as the headline and as the group's own count, directly above the rows it had
+   * just refused to count — the exact confident-clean-bill-of-health failure the whole
+   * three-state snapshot exists to prevent, one layer further in.
+   *
+   * Not folded into `error`: an unknown severity is not known to be an error, and the status
+   * bar's ✗ must stay a count of things we actually recognise as errors.
+   */
+  other: number
 }
 
+/**
+ * Count by severity, losing nothing.
+ *
+ * `counts.error + … + counts.other === items.length` for every input, which is what lets
+ * `summaryLine` promise that a non-empty list never renders as "No problems found".
+ */
 export function countBySeverity(items: readonly Diagnostic[]): SeverityCounts {
-  const counts: SeverityCounts = { error: 0, warning: 0, info: 0, hint: 0 }
+  const counts: SeverityCounts = { error: 0, warning: 0, info: 0, hint: 0, other: 0 }
   for (const item of items) {
-    // Guarded because `items` crosses a process boundary: an unknown severity is dropped from
-    // the counters rather than creating an `undefined` key that renders as `NaN`.
-    if (item.severity in counts) counts[item.severity] += 1
+    // Guarded because `items` crosses a process boundary. The unrecognised ones land in
+    // `other` rather than being dropped: see the field's comment for what dropping cost.
+    if (isSeverity(item.severity)) counts[item.severity] += 1
+    else counts.other += 1
   }
   return counts
 }
@@ -257,8 +300,12 @@ export function summaryLine(counts: SeverityCounts): string {
   push(counts.warning, 'warning', 'warnings')
   push(counts.info, 'info', 'infos')
   push(counts.hint, 'hint', 'hints')
-  // Only reachable if every severity is zero, which `headline` handles before calling here;
-  // kept total anyway so the function is safe to reuse for a group's own summary.
+  // Same word either way: "1 other" / "3 other" reads as a residual bucket, where "3 others"
+  // reads as a noun the panel never defined. Short matters at 252px.
+  push(counts.other, 'other', 'other')
+  // Reachable only when every bucket is zero, which — because `other` catches everything
+  // `isSeverity` rejects — happens only for a genuinely empty list. That is what makes this
+  // fallback a true statement rather than a headline printed over visible rows.
   return parts.length === 0 ? 'No problems found' : parts.join(', ')
 }
 

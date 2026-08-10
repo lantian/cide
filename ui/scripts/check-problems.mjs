@@ -14,6 +14,15 @@
  * them apart — including `statusBarCounts`, which is what stops the panel and the status bar
  * from ever disagreeing about whether the workspace is clean.
  *
+ * # Three layers, because the first two cannot see the third
+ *
+ * The model is compiled alone and driven under node; the component is then rendered for real
+ * through `react-dom/server` (see `ProblemsPanel/smokeEntry.tsx`), because a panel can pass
+ * every pure-function check while painting nothing — this repo has shipped that twice. The
+ * render layer is also the only one that can see a `styles.x` referencing a rule the
+ * stylesheet does not define: that type-checks, evaluates to `undefined`, and React drops the
+ * attribute in silence.
+ *
  * The three source pins at the end are there because each one is a fix that a later,
  * well-meaning edit would silently undo:
  *   - `StatusBar.tsx` re-growing its own copy of the "no language server" sentence,
@@ -23,7 +32,7 @@
  * Run: `pnpm --dir ui run check:problems`   (or `node ui/scripts/check-problems.mjs`)
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -158,19 +167,63 @@ try {
 
   deep(
     countBySeverity(mixed),
-    { error: 2, warning: 1, info: 1, hint: 1 },
+    { error: 2, warning: 1, info: 1, hint: 1, other: 0 },
     'every severity is counted, including the two the status bar does not show',
   )
-  deep(countBySeverity([]), { error: 0, warning: 0, info: 0, hint: 0 }, 'nothing counts as zeroes')
   deep(
-    // The severity annotation is a promise from an external process, not a guarantee.
-    countBySeverity([at('a.rs', 1, 1, 'catastrophe', 'from the future')]),
-    { error: 0, warning: 0, info: 0, hint: 0 },
-    'an unrecognised severity is dropped from the counters rather than creating a NaN column',
+    countBySeverity([]),
+    { error: 0, warning: 0, info: 0, hint: 0, other: 0 },
+    'nothing counts as zeroes',
   )
+
+  /*
+   * The bug this block exists for, and it shipped: an unrecognised severity used to be
+   * *dropped*, so a non-empty list counted as all zeroes and `summaryLine` printed
+   * "No problems found" — as the headline and as the group's own count — directly above rows
+   * the user could see. A panel whose entire premise is "never claim clean without checking"
+   * cannot lose an item on the way to its own counter, so unknowns land in `other`.
+   */
+  const rogue = [
+    // The severity annotation is a promise from an external process, not a guarantee.
+    at('a.rs', 1, 1, 'catastrophe', 'from the future'),
+    // A prototype key, which is the case an `undefined` check silently lets through:
+    // `SEVERITY_RANK['constructor']` is a function, not `undefined`.
+    at('a.rs', 2, 1, 'constructor', 'from the prototype chain'),
+  ]
+  deep(
+    countBySeverity(rogue),
+    { error: 0, warning: 0, info: 0, hint: 0, other: 2 },
+    'an unrecognised severity is bucketed as `other`, never dropped',
+  )
+  for (const items of [mixed, rogue, [...mixed, ...rogue]]) {
+    const c = countBySeverity(items)
+    eq(
+      c.error + c.warning + c.info + c.hint + c.other,
+      items.length,
+      'the counters total the items — the invariant that makes an empty summary a true statement',
+    )
+    ok(
+      headline(ready(items)).text !== 'No problems found',
+      'and so a non-empty list can never headline as a clean bill of health',
+    )
+  }
   ok(
     severityRank('catastrophe') > severityRank('hint'),
-    'and sorts after every known severity rather than making the comparator non-transitive',
+    'an unknown severity sorts after every known one rather than making the comparator non-transitive',
+  )
+  eq(
+    typeof severityRank('constructor'),
+    'number',
+    'including a prototype key, whose rank was a *function* while the lookup only checked for undefined',
+  )
+  ok(
+    Number.isFinite(severityRank('error') - severityRank('constructor')),
+    'so the comparator subtracts two numbers and never yields NaN, which in V8 leaves the list unsorted',
+  )
+  deep(
+    groupByFile(rogue)[0].items.map((d) => d.message),
+    ['from the future', 'from the prototype chain'],
+    'and a list of unknown severities still comes back sorted rather than in arrival order',
   )
 
   deep(
@@ -179,12 +232,25 @@ try {
     'the status bar sees errors and warnings only',
   )
 
-  eq(summaryLine({ error: 2, warning: 1, info: 0, hint: 0 }), '2 errors, 1 warning', 'plurals')
-  eq(summaryLine({ error: 1, warning: 0, info: 0, hint: 0 }), '1 error', 'a lone error is singular')
   eq(
-    summaryLine({ error: 0, warning: 0, info: 3, hint: 1 }),
+    summaryLine({ error: 2, warning: 1, info: 0, hint: 0, other: 0 }),
+    '2 errors, 1 warning',
+    'plurals',
+  )
+  eq(
+    summaryLine({ error: 1, warning: 0, info: 0, hint: 0, other: 0 }),
+    '1 error',
+    'a lone error is singular',
+  )
+  eq(
+    summaryLine({ error: 0, warning: 0, info: 3, hint: 1, other: 0 }),
     '3 infos, 1 hint',
     'severities with none are omitted rather than printed as `0 errors`',
+  )
+  eq(
+    summaryLine({ error: 0, warning: 0, info: 0, hint: 0, other: 2 }),
+    '2 other',
+    'and rows we could not classify are still reported as rows',
   )
   eq(headline(ready(mixed)).text, '2 errors, 1 warning, 1 info, 1 hint', 'the headline is the summary')
   eq(headline(ready(mixed)).tone, 'counts', 'and is toned as counts')
@@ -200,7 +266,7 @@ try {
   )
   deep(
     groups[0].counts,
-    { error: 2, warning: 0, info: 1, hint: 1 },
+    { error: 2, warning: 0, info: 1, hint: 1, other: 0 },
     'each group carries its own counts, so a collapsed group can still be summarised',
   )
   deep(groupByFile([]), [], 'nothing groups into nothing, not into an empty file')
@@ -258,6 +324,113 @@ try {
     appCss.includes('.benchButton.benchButtonArmed'),
     'and there is a class for the CIDE_BENCH-guarded version to put it back',
   )
+
+  // --- And whether the thing actually paints. ---------------------------------------------
+
+  /*
+   * Everything above tests the pure core, which a panel can pass while rendering nothing at
+   * all — this repo has shipped exactly that, twice, and `check-git-render.mjs` was written
+   * the last time it happened. So the component goes through `react-dom/server` for real,
+   * with a `ready` snapshot the model has never seen rendered.
+   *
+   * Built under `node_modules/.cache` rather than the temp dir this script uses for the model
+   * compile: the SSR bundle keeps `react-dom/server` external, so node resolves it relative to
+   * the output, and under /tmp there is no `node_modules` above it.
+   */
+  mkdirSync(join(UI, 'node_modules/.cache'), { recursive: true })
+  const renderOut = mkdtempSync(join(UI, 'node_modules/.cache', 'cide-problems-render-'))
+  let digests
+  try {
+    execFileSync(
+      'node',
+      [
+        'node_modules/vite/bin/vite.js',
+        'build',
+        '--ssr', 'src/sidebar/ProblemsPanel/smokeEntry.tsx',
+        '--outDir', renderOut,
+        '--logLevel', 'error',
+      ],
+      { cwd: UI, stdio: 'inherit' },
+    )
+    const printed = []
+    const log = console.log
+    console.log = (line) => printed.push(line)
+    await import(`file://${join(renderOut, 'smokeEntry.js')}`)
+    console.log = log
+    digests = Object.fromEntries(JSON.parse(printed.at(-1)).map((d) => [d.story, d]))
+  } finally {
+    rmSync(renderOut, { recursive: true, force: true })
+  }
+
+  const story = (name) => digests[name] ?? {}
+
+  eq(story('no-source').meta, '—', 'the rendered header withholds the digit when nothing looked')
+  eq(
+    story('no-source').claim,
+    'No diagnostics source is running',
+    'and the rendered claim is the model’s, not a second copy in the JSX',
+  )
+  eq(story('no-source').explainer, true, 'the surprising state carries its explainer')
+  eq(story('scanning').explainer, false, 'a state that is merely pending does not')
+  eq(story('no-project').claim, null, 'with no project open the analyser is not the reason')
+  eq(story('clean').meta, '0', 'a checked, empty workspace renders a real zero')
+
+  const ready4 = story('ready')
+  eq(ready4.meta, '4', 'a ready snapshot renders its count')
+  eq(ready4.claim, '2 errors, 1 warning, 1 hint', 'and its summary')
+  deep(
+    ready4.rows,
+    [
+      'error|cannot find value',
+      'error|mismatched types',
+      'hint|consider borrowing',
+      'warning|unused variable',
+    ],
+    'every diagnostic reaches the DOM, worst first, in the order the model sorted them',
+  )
+  deep(
+    ready4.groups,
+    ['src/a.rs :: 2 errors, 1 hint', 'src/b.rs :: 1 warning'],
+    'grouped by file, each group carrying its own count line',
+  )
+  deep(
+    ready4.glyphClasses,
+    [2, 2, 2, 2],
+    'each glyph carries its severity colour on top of `.glyph` — the only thing that tells an ' +
+      'error from a hint at a glance',
+  )
+  eq(ready4.rowTag, 'div', 'with no `onOpenLocation`, a row is static text and not a dead button')
+  eq(story('ready-wired').rowTag, 'button', 'and a real button once a host can act on the click')
+
+  /*
+   * The regression this whole review turned on. Before the `other` bucket, this story rendered
+   * `claim: "No problems found"` and `groups: ["src/a.rs :: No problems found"]` above two
+   * visible rows, with the header counter reading 2.
+   */
+  const rogue2 = story('rogue')
+  eq(rogue2.meta, '2', 'an unknown severity still counts toward the header figure')
+  eq(rogue2.claim, '2 other', 'and is reported rather than silently uncounted')
+  deep(rogue2.groups, ['src/a.rs :: 2 other'], 'in the group line too')
+  eq(rogue2.rows.length, 2, 'and both rows are on screen to be counted')
+  deep(
+    rogue2.glyphClasses,
+    [2, 2],
+    'an unrenderable severity still gets a glyph class rather than a stringified function',
+  )
+  deep(
+    rogue2.glyphs,
+    ['·', '·'],
+    'and a real glyph — including for the prototype key, whose table lookup is a function that ' +
+      '`??` passes through, blanking the cell and poisoning the class string',
+  )
+  ok(
+    rogue2.claim !== 'No problems found',
+    'a panel that renders problems must never headline that there are none',
+  )
+
+  for (const [name, d] of Object.entries(digests)) {
+    eq(d.unclassed, 0, `${name}: every audit-hooked element carries a class from the stylesheet`)
+  }
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

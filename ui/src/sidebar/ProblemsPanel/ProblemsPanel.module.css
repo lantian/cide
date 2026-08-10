@@ -139,6 +139,19 @@
   gap: 10px;
 }
 
+/*
+ * One file's head plus its rows. Was referenced by `ProblemsPanel.tsx` as `styles.group` but
+ * never defined here, so the class resolved to `undefined` and React dropped the attribute
+ * entirely — the wrapper shipped unstyled. Defined rather than deleted from the component:
+ * the rows need to sit tighter to each other than the 10px `.groups` gap that separates one
+ * file from the next, which is the distinction that makes the grouping readable at all.
+ */
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
 .groupHead {
   display: flex;
   align-items: baseline;

@@ -32,6 +32,7 @@ import {
   checked,
   groupByFile,
   headline,
+  isSeverity,
   metaFigure,
   summaryLine,
   type DiagnosticsSnapshot,
@@ -58,6 +59,22 @@ const SEVERITY_CLASS: Record<Severity, string | undefined> = {
   warning: styles.warning,
   info: styles.info,
   hint: styles.hint,
+}
+
+/**
+ * The glyph and colour class for a severity that may not be one.
+ *
+ * Both tables are keyed by `Severity`, and `item.severity` only claims to be one — it comes
+ * from another process. A bare `TABLE[item.severity] ?? fallback` does not close that gap:
+ * for a prototype key such as `'constructor'` the lookup returns a *function*, `??` passes it
+ * through, and React refuses a function as a child while `className` stringifies it into
+ * garbage. So membership is checked first, and everything else renders as a hint — dim, with
+ * the raw severity still visible in the row's title, which is the honest way to show a row we
+ * do not know how to categorise.
+ */
+function severityLook(severity: Severity): { glyph: string; className: string | undefined } {
+  if (!isSeverity(severity)) return { glyph: '·', className: styles.hint }
+  return { glyph: SEVERITY_GLYPH[severity], className: SEVERITY_CLASS[severity] }
 }
 
 export interface ProblemsPanelProps {
@@ -160,7 +177,7 @@ export function ProblemsPanel({
           {groups.length > 0 && (
             <div className={styles.groups} data-audit="problemsGroups">
               {groups.map((group) => (
-                <div key={group.path} className={styles.group}>
+                <div key={group.path} className={styles.group} data-audit="problemsGroup">
                   <div className={styles.groupHead} title={group.path}>
                     <span className={styles.groupPath}>{group.path}</span>
                     <span className={styles.groupCount}>{summaryLine(group.counts)}</span>
@@ -168,13 +185,11 @@ export function ProblemsPanel({
                   {group.items.map((item, i) => {
                     const where = `${item.line}:${item.column}`
                     const label = `${item.severity} at ${group.path} ${where}: ${item.message}`
+                    const look = severityLook(item.severity)
                     const body = (
                       <>
-                        <span
-                          className={`${styles.glyph} ${SEVERITY_CLASS[item.severity] ?? styles.hint}`}
-                          aria-hidden="true"
-                        >
-                          {SEVERITY_GLYPH[item.severity] ?? '·'}
+                        <span className={`${styles.glyph} ${look.className}`} aria-hidden="true">
+                          {look.glyph}
                         </span>
                         <span className={styles.message}>{item.message}</span>
                         {item.code !== undefined && (
@@ -186,7 +201,13 @@ export function ProblemsPanel({
                     return onOpenLocation === undefined ? (
                       // Static, not a disabled button: there is nowhere to go, and a row that
                       // looks clickable and is not is the bug this whole task is about.
-                      <div key={`${where}-${i}`} className={styles.row} title={label}>
+                      <div
+                        key={`${where}-${i}`}
+                        className={styles.row}
+                        data-audit="problemsRow"
+                        data-severity={item.severity}
+                        title={label}
+                      >
                         {body}
                       </div>
                     ) : (
@@ -194,6 +215,8 @@ export function ProblemsPanel({
                         key={`${where}-${i}`}
                         type="button"
                         className={`${styles.row} ${styles.rowButton}`}
+                        data-audit="problemsRow"
+                        data-severity={item.severity}
                         title={label}
                         onClick={() => onOpenLocation(group.path, item.line, item.column)}
                       >
