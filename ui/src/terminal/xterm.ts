@@ -20,6 +20,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { terminalKeyGate } from '@/keys/gate'
 import { terminalKeyBytes } from './keys'
+import { paletteSignature, terminalPalette, unresolvedSlots } from '@/settings/theme'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
 
@@ -37,36 +38,30 @@ export interface TerminalHandle {
 const webglOrder: TerminalHandle[] = []
 const webglAddons = new WeakMap<Terminal, WebglAddon>()
 
-function readTheme(): Record<string, string> {
-  const s = getComputedStyle(document.documentElement)
-  const v = (name: string) => s.getPropertyValue(name).trim()
-  return {
-    background: v('--panel'),
-    foreground: v('--text'),
-    cursor: v('--accent'),
-    cursorAccent: v('--panel'),
-    selectionBackground: v('--sel'),
-    black: v('--panel-2'),
-    red: v('--red'),
-    green: v('--green'),
-    yellow: v('--yellow'),
-    blue: v('--blue'),
-    magenta: v('--purple'),
-    cyan: v('--cyan'),
-    white: v('--text'),
-    brightBlack: v('--faint'),
-    brightRed: v('--red'),
-    brightGreen: v('--green'),
-    brightYellow: v('--yellow'),
-    brightBlue: v('--blue'),
-    brightMagenta: v('--purple'),
-    brightCyan: v('--cyan'),
-    brightWhite: v('--text-hi'),
-  }
+/**
+ * The colours each terminal is currently wearing, as a [`paletteSignature`].
+ *
+ * On the terminal rather than a single module-level "current theme", because the two are
+ * not the same claim. A terminal built before the first `data-theme` write, or one whose
+ * host was evicted and rebuilt, has whatever the palette was when it was constructed — and
+ * that is the terminal a switch most needs to reach. A `WeakMap` so a disposed terminal
+ * takes its entry with it; `TerminalHandle` is not a stable key across an eviction.
+ */
+const appliedPalette = new WeakMap<Terminal, string>()
+
+/**
+ * The token values a terminal paints with, resolved against a live computed style.
+ *
+ * The style is passed in rather than read here so a caller that needs other tokens from the
+ * same element — `createTerminal` also wants `--font-mono` — pays for one lookup.
+ */
+function readTheme(style: CSSStyleDeclaration): Record<string, string> {
+  return terminalPalette((name) => style.getPropertyValue(name).trim())
 }
 
 export function createTerminal(): TerminalHandle {
   const style = getComputedStyle(document.documentElement)
+  const theme = readTheme(style)
 
   const term = new Terminal({
     // Required by the unicode addon's provider registration.
@@ -80,8 +75,12 @@ export function createTerminal(): TerminalHandle {
     // The Rust core holds the authoritative screen mirror, so xterm's own scrollback is a
     // convenience rather than the source of truth for reattach.
     convertEol: false,
-    theme: readTheme(),
+    theme,
   })
+  // Recorded so `retheme` can tell a terminal that already has these colours from one built
+  // under a different palette. A terminal created *after* a switch reads the tokens here and
+  // needs no repaint; one created before does, and only the values distinguish them.
+  appliedPalette.set(term, paletteSignature(theme))
 
   const fit = new FitAddon()
   term.loadAddon(fit)
@@ -198,8 +197,79 @@ export function releaseWebgl(handle: TerminalHandle): void {
   }
 }
 
-/** Repaint every live terminal with the current token values, after a theme switch. */
+/**
+ * Repaint every live terminal with the current token values, after a theme switch.
+ *
+ * # Why one assignment is enough, including for WebGL
+ *
+ * Read out of the xterm 6 and `addon-webgl` 0.19 sources in `node_modules` rather than
+ * assumed, because the WebGL renderer keeps a glyph texture atlas keyed by colour and a
+ * stale atlas is precisely the "some terminals did not switch" symptom:
+ *
+ * `term.options.theme = …` hits the `OptionsService` setter, which fires `onOptionChange`
+ * on reference inequality — `readTheme` returns a fresh object every call, so it always
+ * fires. `ThemeService` listens for that key, recomputes the colour set, clears its
+ * contrast caches and fires `onChangeColors`. `WebglRenderer._handleColorChange` then calls
+ * `_refreshCharAtlas`, and `acquireTextureAtlas` keys its cache on the resolved foreground,
+ * background and all 256 ansi colours (`CharAtlasUtils.configEquals`) — so a changed
+ * palette releases the old atlas and builds a new one — and clears the render model.
+ * `RenderService` separately schedules a full refresh off the same event.
+ *
+ * So the atlas needs no manual `clearTextureAtlas`, and the addon must *not* be disposed
+ * and re-created: that would hand back and re-take one of the `MAX_WEBGL` contexts this
+ * pool exists to budget, on every theme switch, for no change in what is drawn.
+ *
+ * # Parked hosts
+ *
+ * `liveHosts()` yields hosts sitting in the parking div as well as mounted ones, and they
+ * are repainted here rather than on the way back in. xterm carries it: while its
+ * IntersectionObserver says the screen is hidden, `RenderService._fullRefresh` records
+ * `_needsFullRefresh` instead of drawing, and `_handleIntersectionChange` flushes it when the
+ * element becomes visible again. A parked host with no measurable size also leaves
+ * `WebglRenderer._isAttached` false, and `renderRows` re-acquires the atlas on the first
+ * frame after it is connected and measurable. A host that skipped this would re-dock wearing
+ * the old palette.
+ *
+ * A host that was *evicted* has no terminal at all; the one rebuilt in its place reads the
+ * tokens in `createTerminal` and is correct without going through here.
+ */
 export function retheme(handles: Iterable<TerminalHandle>): void {
-  const theme = readTheme()
-  for (const h of handles) h.term.options.theme = theme
+  // Read once for the whole pass, and read *now*: the caller has just written `data-theme`,
+  // and touching a computed style flushes the pending recalculation, so this observes the
+  // palette that was switched to rather than the one a frame ago.
+  const theme = readTheme(getComputedStyle(document.documentElement))
+  const signature = paletteSignature(theme)
+  warnUnresolved(theme, signature)
+
+  for (const h of handles) {
+    // Skipped only when this terminal already holds these exact colours. The switch is
+    // cheap but not free — a full model clear and an atlas rebuild each — and `retheme` is
+    // reachable twice for one change while `App`'s effect and the store subscription
+    // overlap.
+    if (appliedPalette.get(h.term) === signature) continue
+    appliedPalette.set(h.term, signature)
+    h.term.options.theme = theme
+  }
+}
+
+/** Signature already reported, so a repaint per snapshot cannot become a log flood. */
+let warnedPalette = ''
+
+/**
+ * Say something when a token is missing, because nothing else will.
+ *
+ * xterm's `parseColor` swallows an unparseable value and substitutes its own default, so a
+ * palette that forgot `--panel` gives that terminal a stock black background under a white
+ * theme with no error anywhere. `check-theme.mjs` catches this before it ships; this is for
+ * the case that gets past it.
+ */
+function warnUnresolved(theme: Record<string, string>, signature: string): void {
+  if (warnedPalette === signature) return
+  warnedPalette = signature
+  const missing = unresolvedSlots(theme)
+  if (missing.length > 0) {
+    console.warn(
+      `[cide] terminal palette unresolved: ${missing.join(', ')} — xterm will substitute its own colours`,
+    )
+  }
 }
