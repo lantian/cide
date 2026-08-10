@@ -266,6 +266,68 @@ fn live_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises every test in this binary that touches the process environment.
+    ///
+    /// Not a tidiness measure. `std::env::set_var` mutates a process-global that glibc may
+    /// reallocate, and *any* concurrent environment access — including the environ walk
+    /// `Command::spawn` does — can read through the freed array. That is undefined
+    /// behaviour, which is why edition 2024 made `set_var` unsafe, and it is why this is a
+    /// lock rather than two tests being careful. Reviewers of two separate agents watched
+    /// these two flake against each other before it existed.
+    ///
+    /// `crates/cide-ide-mcp/src/lockfile.rs` carries the same lock for `HOME`, and for the
+    /// same reason. A lock per binary is the most that can be had: a *different* test binary
+    /// runs in a different process and shares nothing, so no test may ever assume the
+    /// environment is its own beyond this guard.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A temporary `XDG_CONFIG_HOME`, restored when this drops.
+    ///
+    /// RAII rather than a restore at the end of the test, because a failing assertion
+    /// unwinds — and leaving the variable pointing at a deleted temp directory would make
+    /// every later test in this binary read a config that is not there.
+    struct TempConfig {
+        dir: std::path::PathBuf,
+        previous: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TempConfig {
+        fn new(tag: &str) -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!("cide-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            // `persist::config_dir` appends `cide` to `XDG_CONFIG_HOME`, so the file this
+            // writes lives one level below the directory handed over.
+            std::fs::create_dir_all(dir.join("cide")).expect("temp config dir");
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: `ENV_LOCK` is held for the lifetime of this guard, and it is the only
+            // thing in this binary that writes the environment.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+            Self {
+                dir,
+                previous,
+                _guard: guard,
+            }
+        }
+
+        fn write_keymap(&self, contents: &str) {
+            std::fs::write(self.dir.join("cide").join("keymap.json"), contents).expect("write");
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            // SAFETY: as above — the lock is still held until this struct is fully dropped.
+            match self.previous.take() {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 
     /// The regression guard for the bug this function was written to fix.
     ///
@@ -277,31 +339,11 @@ mod tests {
     /// This asserts the file is *read*: the narrow fact that no other test could see.
     #[test]
     fn a_user_binding_in_keymap_json_reaches_the_resolved_keymap() {
-        // `XDG_CONFIG_HOME` is what `persist::config_dir` consults, so pointing it at a temp
-        // directory is enough to isolate this from the developer's own keymap.
-        let dir = std::env::temp_dir().join(format!("cide-keymap-{}", std::process::id()));
-        // `persist::config_dir` appends `cide` to `XDG_CONFIG_HOME`, so the file lives one
-        // level below the directory this test hands it.
-        std::fs::create_dir_all(dir.join("cide")).expect("temp config dir");
-        std::fs::write(
-            dir.join("cide").join("keymap.json"),
-            r#"[{"key":"ctrl+alt+z","command":"workbench.showFilePicker"}]"#,
-        )
-        .expect("write keymap.json");
-
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: this test is the only one in this binary that touches the environment, and
-        // it restores the previous value before returning. Rust 2024 requires the block.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let config = TempConfig::new("keymap");
+        config.write_keymap(r#"[{"key":"ctrl+alt+z","command":"workbench.showFilePicker"}]"#);
 
         let user = user_keymap();
         let resolved = keymap::resolve(&user);
-
-        match previous {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(user.len(), 1, "keymap.json was not read at all");
         assert!(
@@ -317,20 +359,10 @@ mod tests {
     fn a_broken_keymap_json_costs_the_overrides_and_not_the_app() {
         // A user who has broken their JSON needs a working editor to fix it in. Failing the
         // bootstrap would mean an app that will not start because of a trailing comma.
-        let dir = std::env::temp_dir().join(format!("cide-keymap-bad-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("cide")).expect("temp config dir");
-        std::fs::write(dir.join("cide").join("keymap.json"), "{ not json").expect("write");
+        let config = TempConfig::new("keymap-bad");
+        config.write_keymap("{ not json");
 
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: as above.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         let user = user_keymap();
-        match previous {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-
         assert!(
             user.is_empty(),
             "a malformed file must degrade, not propagate"
