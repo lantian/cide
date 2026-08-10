@@ -83,7 +83,8 @@ impl SearchRegistry {
         }
     }
 
-    /// Drop every search. The quit path, and [`crate::cmd::fs::close_all`].
+    /// Drop every search. [`crate::lifecycle::shutdown`] — the quit path — and
+    /// [`crate::cmd::fs::close_all`], which currently has no caller of its own.
     pub fn cancel_all(&self) {
         self.jobs.retain(|_, job| {
             job.cancel();

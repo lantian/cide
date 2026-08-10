@@ -263,10 +263,14 @@ impl Search<'_> {
             };
             scope.spawn(move || walker.visit(&mut factory));
 
-            // The receiver is where the caps are enforced exactly. The visitors also stop
-            // themselves once the total is reached, but they do it from a racing count on N
-            // threads and can overshoot by a file each; trimming here is what makes
-            // `max_hits` a number rather than an approximation.
+            // The receiver is the *only* place the total cap is enforced. The visitors count
+            // nothing across files — they apply `max_hits_per_file` and consult `cancel`, and
+            // that is all — so a walker only learns the budget is spent when this loop sets
+            // the flag below. That is deliberate: a shared running total would be an atomic
+            // per hit on N threads that could still overshoot by a file each between the load
+            // and the send, and it would leave the trim here anyway. Enforcing it once, on the
+            // single-threaded side of the channel, is what makes `max_hits` an exact number
+            // rather than an approximation.
             for batch in rx {
                 let room = self.limits.max_hits - outcome.hits as usize;
                 // `>` and not `>=`: a batch that exactly fills the remaining room has nothing

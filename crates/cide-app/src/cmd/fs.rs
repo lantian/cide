@@ -342,7 +342,13 @@ pub async fn fs_delete(
     .await?
 }
 
-/// Stop watching everything, and stop every search. The quit path.
+/// Stop watching everything, and stop every search.
+///
+/// **No caller today.** It reads like the quit path and is not: `lifecycle::shutdown` is,
+/// and it cancels the searches itself rather than coming through here, because dropping every
+/// project's index on the main thread is the teardown `fs_close` hands to a blocking worker
+/// for being too slow. Kept for the whole-registry teardown a second window mode would want;
+/// if that never arrives, this should go rather than keep implying something calls it.
 pub fn close_all(app: &tauri::AppHandle) {
     // Searches first: a walker thread that outlives the registry entry it is searching is what
     // makes a quit hang, and the flag is what stops it. Same order as `close_project`.
