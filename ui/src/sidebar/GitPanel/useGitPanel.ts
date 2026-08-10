@@ -39,6 +39,7 @@ import {
   events,
   git as gitApi,
   gitDiff as gitDiffApi,
+  type ChangesTree,
   type DiffSide,
   type FileDiff,
   type PathSelection,
@@ -56,6 +57,7 @@ import {
   subscribe as subscribePartials,
   type PartialEntry,
 } from './partialStore'
+import { noteRepoRoots } from './repoRoots'
 import {
   allFiles,
   allGroups,
@@ -380,6 +382,24 @@ export function useGitPanel(
     })
   }, [])
 
+  /**
+   * `viewOf`, plus the one fact in a tree that outlives the panel.
+   *
+   * Every `ChangesTree` names the absolute work tree of every repo in it, and the diff pane
+   * needs exactly that to tell a tool call that touched *its* file from one that touched a
+   * file at the same relative path in another project. The panel is where trees arrive first
+   * — usually well before any diff tab exists, since a tab is opened by double-clicking a row
+   * here — so noting it in passing costs nothing and saves the pane a `git_status` of its own.
+   * See `repoRoots.ts`.
+   *
+   * Not folded into `viewOf`: `model.ts` is compiled on its own by `check-git-tree.mjs`, and a
+   * side effect in a pure mapping is not the sort of thing that stays in one place.
+   */
+  const absorb = useCallback((tree: ChangesTree): StatusView => {
+    noteRepoRoots(tree)
+    return viewOf(tree)
+  }, [])
+
   const refresh = useCallback(async () => {
     if (story) return
     if (project === null) {
@@ -395,8 +415,8 @@ export function useGitPanel(
     // Keeping the previous tree after a failure would show changes that may no longer
     // exist, so a failure empties the panel.
     if (raw === undefined) adopt(EMPTY, false)
-    else adopt(viewOf(raw))
-  }, [project, story, guarded, adopt])
+    else adopt(absorb(raw))
+  }, [project, story, guarded, adopt, absorb])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
   const pending = useRef<number | null>(null)
@@ -451,7 +471,7 @@ export function useGitPanel(
     // showing files that were just committed away.
     track(
       events.onGitStatus((forProject, tree) => {
-        if (project !== null && forProject === project) adopt(viewOf(tree))
+        if (project !== null && forProject === project) adopt(absorb(tree))
       }),
       'git-status',
     )
@@ -459,7 +479,7 @@ export function useGitPanel(
       gone = true
       for (const fn of unlisten) fn()
     }
-  }, [schedule, story, project, adopt])
+  }, [schedule, story, project, adopt, absorb])
 
   const toggleCheck = useCallback((row: Row) => setSelected((prev) => toggleRow(row, prev)), [])
 
@@ -677,10 +697,10 @@ export function useGitPanel(
         // refresh alone — what this used to do — left the bar up forever.
         const tree = await guarded('git reload index', () => gitApi.adoptIndex(project, repo))
         if (tree === undefined) await refresh()
-        else adopt(viewOf(tree))
+        else adopt(absorb(tree))
       })()
     },
-    [project, guarded, refresh, adopt],
+    [project, guarded, refresh, adopt, absorb],
   )
 
   const overwriteIndex = useCallback((repo: RepoId) => {

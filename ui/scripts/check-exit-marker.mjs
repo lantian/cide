@@ -53,7 +53,7 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { exitMarkerText, exitMarkerBytes, showsCode } = await import(
+  const { exitMarkerText, exitMarkerBytes, showsCode, markFor } = await import(
     `file://${join(out, 'exitMarker.js')}`
   )
 
@@ -100,6 +100,41 @@ try {
   ok(bytes.startsWith(`\r\n${ESC}[2m`), 'the marker starts a fresh line and opens dim')
   ok(bytes.endsWith(`${ESC}[0m\r\n`), 'the marker closes SGR so later output is not left dim')
   ok(bytes.includes('— exited (137) —'), 'the framing wraps the text rather than replacing it')
+
+  // --- the second path in, the one that used to lose the number -------------------------
+  //
+  // Exit reaches a pane from two directions: the `cide://session-state` event, which carries
+  // `code`, and a one-shot question asked at attach time for a child that died before this
+  // pane existed. The question was `session_has_exited`, which answers a boolean, so the
+  // rehydration path printed a bare `— exited —` over a status the registry was still
+  // holding. `markFor` is the decision that path should be making instead.
+  eq(markFor({ kind: 'running' }), null, 'a live child is not marked')
+  eq(
+    markFor({ kind: 'exited', code: 137 }),
+    { code: 137 },
+    'a reaped child hands over the status it really ended with',
+  )
+  eq(
+    markFor({ kind: 'unknown' }),
+    {},
+    'a session the registry never held has no code, and that is the only bare marker',
+  )
+  eq(
+    markFor({ kind: 'reaping' }),
+    null,
+    'gone but not yet reaped declines: `markExited` is one-shot, so marking now would beat ' +
+      'the event that carries the number and print the codeless line instead',
+  )
+  eq(
+    exitMarkerText(markFor({ kind: 'exited', code: 143 })?.code),
+    '— exited (143) —',
+    'the answer feeds the marker unchanged — no second place for a code to be dropped',
+  )
+  eq(
+    exitMarkerText(markFor({ kind: 'unknown' })?.code),
+    '— exited —',
+    'and the case with no code still does not invent one',
+  )
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
