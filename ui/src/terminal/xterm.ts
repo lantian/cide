@@ -20,7 +20,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { terminalKeyGate } from '@/keys/gate'
 import { terminalKeyBytes } from './keys'
-import { imeFiltered, InputRouter } from './inputRouting'
+import { imeFiltered, InputGuard } from './inputRouting'
 import { paletteSignature, terminalPalette, unresolvedSlots } from '@/settings/theme'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
@@ -32,13 +32,13 @@ export interface TerminalHandle {
   term: Terminal
   fit: FitAddon
   /**
-   * Who has already emitted for the keystroke in flight.
+   * Whether a composition is open, and whether a commit is being read out of the textarea.
    *
-   * Read by the capture-phase `input` listener `openTerminal` installs, written by the key
-   * handler below. See `inputRouting.ts` — this is the state that keeps xterm's two
-   * emitters from both firing under an input method.
+   * Driven entirely by the listeners `openTerminal` installs (`inputHost.ts`). See
+   * `inputRouting.ts` — this is the state that keeps xterm's four emitters from writing
+   * anything but the character that was typed, exactly once.
    */
-  input: InputRouter
+  input: InputGuard
   /** Cell metrics, needed so the PTY gets real pixel dimensions rather than zeroes. */
   cellSize(): { width: number; height: number }
   dispose(): void
@@ -119,32 +119,50 @@ export function createTerminal(): TerminalHandle {
    * Doing it the other way round would make a `shift+enter` binding in `keymap.json`
    * unreachable inside terminals with nothing on screen to say why.
    */
-  const input = new InputRouter()
+  const input = new InputGuard()
 
   term.attachCustomKeyEventHandler((ev) => {
     if (ev.type === 'keydown') {
       /*
-       * An input method has taken this key: it has *not* been handled here, and the `input`
-       * event that follows is the only delivery there will be.
+       * An input method has taken this key: it has *not* been handled here, and something on
+       * the textarea path is the only delivery there will be.
        *
-       * Returning false stops `_keyDown` before `this._compositionHelper.keydown(event)`,
-       * which disarms the second, quieter duplication path: `_handleAnyTextareaChanges`
-       * snapshots `textarea.value`, waits a `setTimeout(0)`, and emits
-       * `newValue.replace(oldValue, '')` — a diff that is wrong whenever anything else
-       * cleared the textarea in between, and which emits a bare `C0.DEL` when
-       * `_handleTextAreaBlur` does exactly that.
+       * Returning false stops `_keyDown` at line 1026, before
+       * `this._compositionHelper.keydown(event)` at line 1032 — and so before the
+       * `keyCode === 229` branch (`CompositionHelper.keydown`, line 110) that arms
+       * `_handleAnyTextareaChanges`. That still matters now that the textarea is kept empty:
+       * against an empty base that diff would emit the *correct* character, but it would be a
+       * second emitter for a keystroke `inputHost.ts` is already delivering.
        *
        * Deliberately WITHOUT `preventDefault`, which is the opposite of every other false
        * return in this file: the textarea has to keep receiving the commit, because the
-       * capture-phase listener in `openTerminal` is what turns it into one byte sequence.
+       * capture-phase listeners in `openTerminal` are what turn it into one byte sequence.
        * Cancelling here would make the character vanish instead of doubling.
        */
       if (imeFiltered(ev)) return false
-      // Claimed whichever way the rest of this handler goes — a key the gate swallows was
-      // still consumed by this app, and letting the IM re-deliver it would push a byte the
-      // user's binding said not to send.
-      input.keydown(ev, performance.now())
     }
+
+    /*
+     * `_keyPress` is a fifth emitter, and it is the one that breaks the invariant everything
+     * else here rests on: *either* `_keyDown` writes the key and cancels the event, *or* the
+     * event is left alone and the textarea path delivers it. Read out of the shipped bundle,
+     * `_keyDown` has an early `return true` for `ev.key.length === 1 && charCode 65..90` with
+     * no modifiers — every capital letter — that neither writes nor cancels. `_keyPress` then
+     * writes it (`triggerDataEvent(String.fromCharCode(charCode))`) and calls `cancel(event)`
+     * *without* force, which is a no-op because `cancelEvents` defaults to false. So the
+     * browser also inserts the character into the textarea, an `input` event follows, and
+     * `InputGuard.input` writes it a second time: one Shift+P, `PP` at the child.
+     *
+     * Returning false stops `_keyPress` at its own guard, before the write, and leaves the
+     * default action intact so the character still lands in the textarea. `preventDefault`
+     * would be the obvious-looking alternative and it is the wrong one: it suppresses the
+     * insertion, and then nothing delivers the character at all.
+     *
+     * Above the gate rather than below it because the gate already returns pass-through for
+     * every non-keydown (`decide`, `ev.type !== 'keydown'`) and `terminalKeyBytes` resolves
+     * only keydowns — so no chord resolution is skipped by short-circuiting here.
+     */
+    if (ev.type === 'keypress') return false
 
     if (!terminalKeyGate(ev)) return false
 

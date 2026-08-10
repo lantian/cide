@@ -1,55 +1,100 @@
 /// <reference types="vite/client" />
 /**
- * The DOM half of `inputRouting.ts`: one capture-phase `input` listener per pane.
+ * The DOM half of `inputRouting.ts`: four listeners per pane, and the code that empties the
+ * textarea.
  *
- * # Why the listener goes on the host element, not the textarea
+ * # Why the listeners go on the host element, not the textarea
  *
- * xterm registers its own `input` handler on `term.textarea` in `_initGlobal`, i.e. on the
- * *target*. A capture listener on any ancestor runs before the target's own listeners, and
- * `host.el` is the element `term.open()` was given — so it is an ancestor of the textarea by
- * construction. That ordering is what makes `stopPropagation()` here deterministically
- * disarm `_inputEvent`; a listener on the textarea itself would be racing registration
- * order, and xterm's was registered first.
+ * xterm registers its own handlers on `term.textarea` in `_initGlobal` (lines 378-384), i.e.
+ * on the *target*. A capture listener on any ancestor runs before every listener on the
+ * target, whatever order they were registered in, and `host.el` is the element `term.open()`
+ * was given — so it is an ancestor of the textarea by construction. That ordering is the
+ * whole mechanism:
  *
- * # Why the textarea is cleared
+ * * `keydown` in **capture** runs before `_keyDown`, so the textarea is empty before
+ *   `CompositionHelper` snapshots `oldValue` (line 187) and before a `compositionstart`
+ *   records `_compositionPosition.start` (line 63). Every base is taken against `''`.
+ * * `input` in **capture** lets `stopPropagation()` deterministically disarm `_inputEvent`.
+ * * `compositionend` in **bubble**, uniquely, because it must run *after* xterm's listener:
+ *   `_finalizeComposition` queues a `setTimeout(0)` that reads the composed text out of the
+ *   textarea, and the clear that follows has to be queued behind that read, not in front of
+ *   it. A capture listener here would empty the textarea before the commit was taken out of
+ *   it and CJK input would silently vanish.
  *
- * `CompositionHelper._handleAnyTextareaChanges` snapshots `textarea.value`, waits a
- * `setTimeout(0)`, and emits `newValue.replace(oldValue, '')`. Leaving a committed character
- * sitting in the textarea leaves that diff armed with content, so a later unrelated change
- * emits the accumulated remainder. Clearing after every routed insertion keeps the snapshot
- * base empty, which is the only value for which the diff is harmless.
+ * # Why clearing the textarea is safe at all
+ *
+ * Nothing in xterm 6 reads the textarea for display or for accessibility: `_syncTextArea`
+ * (line 301) only moves and resizes it, and the value is written only by the browser's own
+ * editing, by `paste`, and by `onLinuxMouseSelection`. It is an input scratchpad, and the
+ * only code that treats it as a buffer is the code with the bug.
  */
+import type { Reaction } from './inputRouting'
 import type { TerminalHandle } from './xterm'
 
 /**
- * Route this pane's `input` events through the terminal's router.
+ * Attach this pane's textarea discipline.
  *
  * Returns the removal function; the caller puts it in `host.cleanup` so `teardown` takes it
  * down with everything else.
  */
 export function attachInputRouting(handle: TerminalHandle, el: HTMLElement): () => void {
-  const listener = (raw: Event) => {
-    const ev = raw as InputEvent
-    const decision = handle.input.input(
-      { inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing },
-      performance.now(),
-    )
-    if (decision === 'defer') return
+  const guard = handle.input
 
-    // Both remaining outcomes stop the event: `_inputEvent` must not be the one that decides.
-    ev.stopPropagation()
-    if (decision === 'emit' && ev.data !== null) {
+  const apply = (r: Reaction, ev: Event | null): void => {
+    if (r.stop) ev?.stopPropagation()
+    // Cleared before the write, so anything the write reaches synchronously — `onUserInput`
+    // clearing the selection, the scroll-to-bottom — already sees a settled textarea.
+    if (r.clear) {
+      const textarea = handle.term.textarea
+      if (textarea) textarea.value = ''
+    }
+    if (r.emit !== null) {
       // xterm's own "as if typed" path, the same one the Shift+Enter re-encoding uses, so
       // the bytes leave through the `onData` the pane already listens on and typing's side
       // effects (scroll to bottom, clear selection) still happen.
-      handle.term.input(ev.data, true)
+      handle.term.input(r.emit, true)
     }
-    const textarea = handle.term.textarea
-    if (textarea) textarea.value = ''
+    if (r.defer) setTimeout(() => apply(guard.commitSettled(), null), 0)
   }
 
-  el.addEventListener('input', listener, true)
-  return () => el.removeEventListener('input', listener, true)
+  const onKeydown = (raw: Event): void => {
+    const ev = raw as KeyboardEvent
+    apply(
+      guard.keydown({
+        key: ev.key,
+        keyCode: ev.keyCode,
+        ctrlKey: ev.ctrlKey,
+        altKey: ev.altKey,
+        metaKey: ev.metaKey,
+        isComposing: ev.isComposing,
+      }),
+      ev,
+    )
+  }
+
+  const onInput = (raw: Event): void => {
+    const ev = raw as InputEvent
+    apply(
+      guard.input({ inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing }),
+      ev,
+    )
+  }
+
+  const onCompositionStart = (ev: Event): void => apply(guard.compositionstart(), ev)
+  const onCompositionEnd = (ev: Event): void => apply(guard.compositionend(), ev)
+
+  el.addEventListener('keydown', onKeydown, true)
+  el.addEventListener('input', onInput, true)
+  el.addEventListener('compositionstart', onCompositionStart, true)
+  // Bubble. Not a slip — see the module comment; this one has to follow xterm's.
+  el.addEventListener('compositionend', onCompositionEnd, false)
+
+  return () => {
+    el.removeEventListener('keydown', onKeydown, true)
+    el.removeEventListener('input', onInput, true)
+    el.removeEventListener('compositionstart', onCompositionStart, true)
+    el.removeEventListener('compositionend', onCompositionEnd, false)
+  }
 }
 
 /**
@@ -72,8 +117,9 @@ function probeRequested(): boolean {
 }
 
 /**
- * A keystroke-level trace of every emitter, for the one question no reading of the source
- * can settle: whether this machine's input method re-delivers ordinary ASCII at all.
+ * A keystroke-level trace of every emitter, for the questions no reading of the source can
+ * settle: what this machine's input method actually sends, and what is in the textarea when
+ * it sends it.
  *
  * Development builds, and **only when asked for**: `./run.sh --input-probe`, which sets
  * `CIDE_INPUT_PROBE=1`, which puts `inputprobe=1` on the window URL. On by default it would
@@ -84,18 +130,19 @@ function probeRequested(): boolean {
  *
  * It does **not** use `console.log`: `cmd/diag.rs` already documents that the webview console
  * is unreachable from a shell on Wayland, which is the environment this is for. It goes to the
- * Rust log, one line per event, timestamped from `performance.now()` so the keyup/commit race
+ * Rust log, one line per event, timestamped from `performance.now()` so the commit/keyup race
  * is legible in the ordering.
  *
- * Reading it:
+ * Reading it — `ta=` is the field that matters, because the whole defect was textarea
+ * residue:
  *
- * * a real `keyCode` plus a `data` line arriving *after* that key's `keyup` — the async
- *   IM-commit path this whole module exists for; the `swallow` decision on the same line is
- *   the fix working.
- * * `keyCode 229` on keydown — the `CompositionHelper` snapshot-diff path; the keydown is
- *   returned false in `xterm.ts` and the `emit` here is the only delivery.
- * * one `data` line per keystroke and no `input` lines at all — no IM involvement; the
- *   duplication, if any, is not here.
+ * * `ta=` non-zero on a keydown — the invariant is broken; something is writing to the
+ *   textarea that this module does not know about, and every base-relative emitter in xterm
+ *   is about to be wrong by exactly that much.
+ * * `onData` longer than the character typed — one of the textarea emitters swept residue
+ *   into its payload. Compare it against the preceding `ta=`.
+ * * two `onData` lines for one keystroke — two emitters fired; the `composing=`/`commit=`
+ *   fields say which window the second one came from.
  */
 export function attachInputProbe(
   handle: TerminalHandle,
@@ -111,6 +158,10 @@ export function attachInputProbe(
   const tag = paneId.slice(0, 8)
   const at = () => performance.now().toFixed(1)
   const removers: Array<() => void> = []
+  const guardState = () => {
+    const s = handle.input.state()
+    return `ta=${JSON.stringify(textarea.value)} composing=${s.composing} commit=${s.commitPending}`
+  }
 
   const on = <K extends keyof HTMLElementEventMap>(
     type: K,
@@ -123,31 +174,31 @@ export function attachInputProbe(
     removers.push(() => target.removeEventListener(type, wrapped, true))
   }
 
+  // On the host element, not the textarea, and registered before `attachInputRouting` — those
+  // listeners are on the same element in the same phase, they empty the textarea and they call
+  // `stopPropagation()`. Registered the other way round the probe would report a textarea that
+  // had just been cleared and would never see a swallowed event at all, which is the one
+  // answer this probe must never be able to give.
   on('keydown', (ev) => {
     log(
       `input ${tag} ${at()} keydown key=${JSON.stringify(ev.key)} code=${ev.code} ` +
-        `keyCode=${ev.keyCode} composing=${ev.isComposing} claims=${handle.input.pending()}`,
+        `keyCode=${ev.keyCode} composing=${ev.isComposing} ${guardState()}`,
     )
-  })
-  on('keyup', (ev) => log(`input ${tag} ${at()} keyup key=${JSON.stringify(ev.key)}`))
-  // On the host element, not the textarea, and registered before `attachInputRouting` — that
-  // listener calls `stopPropagation()` on the same element in the same phase, and an event it
-  // swallows never reaches the textarea at all. A probe that traced only the events the fix
-  // let through would show one emitter per keystroke however broken the routing was, which is
-  // the one answer this probe must never be able to give.
+  }, el)
+  on('keyup', (ev) => log(`input ${tag} ${at()} keyup key=${JSON.stringify(ev.key)}`), el)
   on(
     'input',
     (raw) => {
       const ev = raw as InputEvent
       log(
         `input ${tag} ${at()} input type=${ev.inputType} data=${JSON.stringify(ev.data)} ` +
-          `composed=${ev.composed} claims=${handle.input.pending()}`,
+          `composed=${ev.composed} ${guardState()}`,
       )
     },
     el,
   )
   for (const type of ['compositionstart', 'compositionupdate', 'compositionend'] as const) {
-    on(type, (ev) => log(`input ${tag} ${at()} ${type} data=${JSON.stringify(ev.data)}`))
+    on(type, (ev) => log(`input ${tag} ${at()} ${type} data=${JSON.stringify(ev.data)} ${guardState()}`), el)
   }
 
   const onData = handle.term.onData((data) => log(`input ${tag} ${at()} onData ${JSON.stringify(data)}`))

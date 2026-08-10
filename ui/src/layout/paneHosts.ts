@@ -236,10 +236,10 @@ export function openTerminal(paneId: string): TerminalHandle {
   // in `cleanup` so `teardown` takes them down — a listener left on an evicted host's element
   // would keep the whole terminal reachable.
   //
-  // The probe goes first, and that ordering is load-bearing: both listen for `input` on this
-  // element in the capture phase, listeners on one element fire in registration order, and the
-  // router calls `stopPropagation()`. Registered the other way round, the probe would only ever
-  // see the events the router chose to pass on.
+  // The probe goes first, and that ordering is load-bearing: both listen on this element in
+  // the capture phase, listeners on one element fire in registration order, and the guard
+  // empties the textarea and calls `stopPropagation()`. Registered the other way round, the
+  // probe would report an already-cleared textarea and would never see a swallowed event.
   host.cleanup.push(
     attachInputProbe(handle, host.el, paneId, (line) => void diag.log(line).catch(() => {})),
   )
@@ -275,17 +275,16 @@ export function mountHost(paneId: string, slot: HTMLElement): void {
  * while composing, and neither happens to an element being moved. A composition that is
  * never finalised keeps `onRender` calling `getBoundingClientRect()` on the composition view
  * every frame — a forced synchronous layout in the render path, on every pane, for the rest
- * of the session — and leaves `_handleAnyTextareaChanges`' `setTimeout(0)` diff armed against
- * a textarea `_handleTextAreaBlur` is about to empty, which emits a bare `C0.DEL` at the
- * child.
+ * of the session.
  *
- * Blurring *first* gives the browser somewhere to fire `compositionend`. The standing
- * keystroke claims go too: they are about a keystroke in flight, and a pane the user has
- * navigated away from has none.
+ * Blurring *first* gives the browser somewhere to fire `compositionend`, and
+ * `_handleTextAreaBlur` empties the textarea on the way through, which is the invariant
+ * `inputRouting.ts` maintains anyway. The guard's own two bits are reset with it: they
+ * describe a keystroke in flight, and a pane the user has navigated away from has none.
  */
 function quiesce(host: PaneHost): void {
   if (!host.terminal) return
-  host.terminal.input.clear()
+  host.terminal.input.reset()
   try {
     host.terminal.term.blur()
   } catch {
