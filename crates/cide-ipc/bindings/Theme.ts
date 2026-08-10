@@ -2,5 +2,15 @@
 
 /**
  * Which theme the webview should paint.
+ *
+ * **Light is the default, by explicit user instruction** — it used to be `Dark`. The
+ * default is read in more places than the settings screen: `Settings` is `#[serde(default)]`
+ * throughout, so it is also what a `workspace.json` with no `theme` key deserializes to,
+ * and it is what `windows.rs` bakes into `?theme=` before a webview exists. Flipping it
+ * here is what makes a fresh install open white.
+ *
+ * The variant order is the mock's Appearance segmented control, and it stays Dark-first
+ * even though Dark is no longer the default: ts-rs emits the union in declaration order,
+ * and reordering would rewrite `generated.ts` for a cosmetic reason.
  */
 export type Theme = "dark" | "light";

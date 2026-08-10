@@ -4,6 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>cide</title>
+    <!--
+      Blocking, in <head>, and deliberately before anything else: it writes `data-theme`
+      from the `?theme=` parameter so the first frame is already the right colour. Moving it
+      to the bottom of <body>, making it `defer`/`type=module`, or folding it into
+      `main.tsx` all reintroduce the flash. See `public/theme-boot.js`.
+    -->
+    <script src="/theme-boot.js"></script>
   </head>
   <body>
     <!--

@@ -1,18 +1,125 @@
 /*
- * Design tokens, transcribed verbatim from the design mock.
+ * Design tokens. The names are the mock's names.
  *
- * The names are the mock's names. Nothing here is renamed to suit a utility framework —
- * that is precisely why this project uses plain custom properties plus CSS Modules rather
- * than Tailwind, whose `@theme` only generates utilities for namespaced token names and
- * would need a hand-maintained 24-token bridge that silently drifts.
+ * Nothing here is renamed to suit a utility framework — that is precisely why this project
+ * uses plain custom properties plus CSS Modules rather than Tailwind, whose `@theme` only
+ * generates utilities for namespaced token names and would need a hand-maintained 24-token
+ * bridge that silently drifts.
  *
  * Theme is an explicit app setting, so `data-theme` on <html> is authoritative. There is
  * no `prefers-color-scheme` block: this is a desktop app with its own Appearance section,
  * not a page that should follow the browser.
+ *
+ * **Light is the bare `:root` block, and that is load-bearing.** `:root` is what paints
+ * before any JS has run, so whichever theme lives there is the one every window flashes on
+ * the way up. Light is the default (`Theme::default()` in `cide-ipc`), so light is `:root`
+ * and dark is the override. A window whose setting *is* dark gets `data-theme` written by
+ * `public/theme-boot.js` — a classic script in <head>, so it runs before the first frame,
+ * off the `?theme=` parameter `windows.rs` bakes into the URL. Neither direction flashes.
+ *
+ * **The light values are the user's, not the mock's.** `Grount IDE.dc.html` specifies a
+ * warm beige light theme (`--bg: #f5f3f0`, `--chrome: #e8e4de`); the user looked at that
+ * and asked for white instead — "light theme should be white (currently is not fully
+ * white) with red/orange gradients (main color is white)". This is a deliberate override,
+ * not drift: do not "restore" the beige. The mock still governs the dark theme, which is
+ * unchanged below, and it still governs every dimension in this file.
  */
 
 :root,
+[data-theme='light'] {
+  /* Makes UA-drawn bits — form controls, focus rings, the canvas before CSS lands — light. */
+  color-scheme: light;
+
+  /*
+   * White is the surface the user reads on: `--panel` (editor, terminal, sidebars) is pure
+   * white and `--bg` is a hair off it, keeping the mock's relationship where a panel sits
+   * *above* the app background. The greys are neutral rather than warm — a warm grey next
+   * to a red/orange accent reads as the beige we were asked to leave behind.
+   */
+  --bg: #fbfbfc;
+  --chrome: #f2f2f5;
+  --chrome-hi: #e6e6eb;
+  --panel: #ffffff;
+  --panel-2: #f6f6f9;
+  --border: #d8d8de;
+  --border-soft: #e9e9ee;
+  --text: #1b1b1f;
+  --text-hi: #0a0a0c;
+  /*
+   * Darker than the beige theme's greys by design. Beige hid low-contrast text; white does
+   * not, and these two are the tokens a reviewer checks. On `--panel` `--dim` is 7.26:1 and
+   * `--faint` 5.19:1 — both AA for body text, which the beige `--faint` (#9a938a, 2.9:1 on
+   * its panel) was nowhere near.
+   */
+  --dim: #56565f;
+  --faint: #6c6c77;
+  /*
+   * `#d97757` is Claude's orange and the family everything here is built from; on white it
+   * is only 3.1:1, so the light accent is the same hue pushed toward red until white text
+   * on it clears AA (4.96:1). `--accent-hi` is *darker* here and lighter in dark — "hi"
+   * means more prominent, not brighter.
+   */
+  --accent: #c4452a;
+  --accent-hi: #9e3319;
+  --accent-dim: #f6d0bf;
+  /* What to put ON `--accent` or any `--grad-accent-ink` fill. */
+  --on-accent: #ffffff;
+  /*
+   * Read by the editor's highlight table AND by the terminal's ANSI palette, so these are
+   * text colours on white and are pitched darker than the dark theme's accordingly — each
+   * is at least 4.7:1 on `--panel` and on `--bg`.
+   */
+  --blue: #1f5fbf;
+  --green: #2f7a3d;
+  --purple: #7a3fa8;
+  --yellow: #8a5a00;
+  --red: #c0332b;
+  --cyan: #0f6c7c;
+  /*
+   * Selection is in the accent family rather than the mock's blue: it is the one large
+   * tinted surface in a white theme and a blue one would fight the red/orange. Kept pale so
+   * that syntax-coloured text stays readable *on* it — the worst case is `--green` at
+   * 4.45:1, better than a saturated selection would allow.
+   */
+  --sel: #ffe7d9;
+  /*
+   * Two layers, both far softer than the beige theme's single 0.18 drop. On white a heavy
+   * shadow reads as the surface peeling; the hairline does the "this is above you" work and
+   * the wide one only grounds it.
+   */
+  --shadow:
+    0 1px 2px rgba(24, 16, 12, 0.06), 0 18px 44px rgba(24, 16, 12, 0.12);
+
+  /*
+   * The red→orange gradient the user asked for. Stops are exposed separately so a module
+   * can build its own angle without hardcoding hexes.
+   *
+   * `--grad-accent` is vivid and therefore DECORATIVE: white on its orange end is 2.4:1,
+   * which fails even AA-large. Fills, rails, indicator bars, icon washes, oversized
+   * display type — not body text. Anything carrying text uses `--grad-accent-ink`, whose
+   * stops are both ≥4.5:1 against `--on-accent` (5.42:1 and 4.80:1), so a button label is
+   * AA anywhere along the sweep.
+   */
+  --grad-from: #dc3f28;
+  --grad-to: #f2903a;
+  --grad-accent: linear-gradient(135deg, var(--grad-from) 0%, var(--grad-to) 100%);
+  --grad-accent-h: linear-gradient(90deg, var(--grad-from) 0%, var(--grad-to) 100%);
+  --grad-accent-ink: linear-gradient(135deg, #c4342b 0%, #b8560d 100%);
+  --grad-accent-soft: linear-gradient(
+    135deg,
+    rgba(220, 63, 40, 0.1) 0%,
+    rgba(242, 144, 58, 0.08) 100%
+  );
+
+  /* Diff row backgrounds. Denser than the dark theme's: a 10% tint washes out on white. */
+  --diff-add-bg: rgba(47, 122, 61, 0.12);
+  --diff-del-bg: rgba(192, 51, 43, 0.1);
+}
+
+/* Transcribed verbatim from the design mock, and unchanged by the move to a light default. */
 [data-theme='dark'] {
+  color-scheme: dark;
+
   --bg: #111113;
   --chrome: #1a1a1e;
   --chrome-hi: #232329;
@@ -27,6 +134,8 @@
   --accent: #d97757;
   --accent-hi: #e89476;
   --accent-dim: #7a4432;
+  /* Dark ink, not white: the dark theme's accent is light enough that white on it is 2.0:1. */
+  --on-accent: #1a0f08;
   --blue: #7aa2f7;
   --green: #8fbf7a;
   --purple: #b48ead;
@@ -36,37 +145,25 @@
   --sel: #2b3a55;
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
 
+  /*
+   * The same six gradient tokens, so a CSS module that uses one is not writing a
+   * light-only rule. Stops run brighter here because they sit on #111113, and
+   * `--grad-accent-ink` is measured against the dark `--on-accent` (4.83:1 and 7.10:1).
+   */
+  --grad-from: #d9573f;
+  --grad-to: #f0a06a;
+  --grad-accent: linear-gradient(135deg, var(--grad-from) 0%, var(--grad-to) 100%);
+  --grad-accent-h: linear-gradient(90deg, var(--grad-from) 0%, var(--grad-to) 100%);
+  --grad-accent-ink: linear-gradient(135deg, #d9573f 0%, #e08a52 100%);
+  --grad-accent-soft: linear-gradient(
+    135deg,
+    rgba(217, 87, 63, 0.18) 0%,
+    rgba(240, 160, 106, 0.1) 100%
+  );
+
   /* Diff row backgrounds, from the mock's inline rgba() values. */
   --diff-add-bg: rgba(143, 191, 122, 0.1);
   --diff-del-bg: rgba(224, 108, 117, 0.1);
-}
-
-[data-theme='light'] {
-  --bg: #f5f3f0;
-  --chrome: #e8e4de;
-  --chrome-hi: #dcd7cf;
-  --panel: #fbfaf8;
-  --panel-2: #efece7;
-  --border: #d8d2c9;
-  --border-soft: #e3ded6;
-  --text: #2c2926;
-  --text-hi: #14120f;
-  --dim: #726c64;
-  --faint: #9a938a;
-  --accent: #c25f3d;
-  --accent-hi: #a94d2d;
-  --accent-dim: #e8c7b8;
-  --blue: #3b62b8;
-  --green: #4d7c3f;
-  --purple: #8250a0;
-  --yellow: #a3730f;
-  --red: #b3352f;
-  --cyan: #2f7481;
-  --sel: #cfdcf2;
-  --shadow: 0 24px 60px rgba(60, 45, 30, 0.18);
-
-  --diff-add-bg: rgba(77, 124, 63, 0.12);
-  --diff-del-bg: rgba(179, 53, 47, 0.1);
 }
 
 :root {

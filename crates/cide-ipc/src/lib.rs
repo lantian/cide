@@ -308,13 +308,37 @@ pub enum WindowMode {
 }
 
 /// Which theme the webview should paint.
+///
+/// **Light is the default, by explicit user instruction** — it used to be `Dark`. The
+/// default is read in more places than the settings screen: `Settings` is `#[serde(default)]`
+/// throughout, so it is also what a `workspace.json` with no `theme` key deserializes to,
+/// and it is what `windows.rs` bakes into `?theme=` before a webview exists. Flipping it
+/// here is what makes a fresh install open white.
+///
+/// The variant order is the mock's Appearance segmented control, and it stays Dark-first
+/// even though Dark is no longer the default: ts-rs emits the union in declaration order,
+/// and reordering would rewrite `generated.ts` for a cosmetic reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum Theme {
-    #[default]
     Dark,
+    #[default]
     Light,
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::Theme;
+
+    /// Pins the default, because it is a user decision and nothing else in the tree fails
+    /// when it changes: `Settings` is `#[serde(default)]`, so a flip back to `Dark` would
+    /// silently change what a fresh install paints and what `windows.rs` writes into
+    /// `?theme=`, with every existing test still green.
+    #[test]
+    fn the_default_theme_is_light() {
+        assert_eq!(Theme::default(), Theme::Light);
+    }
 }
 
 /// A session that would be interrupted by closing something.

@@ -7,8 +7,38 @@
 //! Every window loads the same `index.html` and reads its role from `?window=<label>`.
 //! There is exactly one webview per OS window — see `docs/adr/0001-no-multiwebview.md`.
 
-use cide_ipc::WindowLabel;
+use cide_ipc::{Theme, WindowLabel};
+use tauri::window::Color;
 use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+use crate::workspace_state::WorkspaceState;
+
+/// `--bg` for each theme, as `tokens.css` defines it.
+///
+/// Duplicated from CSS on purpose, and the only duplication of a token value in Rust: the
+/// native window is painted by the toolkit *before* the webview has parsed a stylesheet, so
+/// this colour cannot be read from the place that owns it. Wrong values here cost one frame
+/// of the wrong colour at launch, which is precisely the bug this is here to fix — keep
+/// them in step with the `--bg` of each theme block.
+const BG_LIGHT: Color = Color(0xfb, 0xfb, 0xfc, 0xff);
+const BG_DARK: Color = Color(0x11, 0x11, 0x13, 0xff);
+
+/// The theme the next window should open in.
+///
+/// Read from the saved workspace rather than passed in, because every caller — startup,
+/// restore, a detach, a window-mode flip — wants the same answer and none of them has a
+/// reason to hold it. `try_state` because `create` is reachable from `setup` before the
+/// managed state is registered in some orders; the default is what a fresh install gets.
+///
+/// It takes the workspace lock, which is `parking_lot` and therefore not reentrant, so
+/// [`create`] must not be called from inside a `WorkspaceState::update`/`with` closure.
+/// Today's callers all commit the mutation first and open the window after — `detach_pane`
+/// deliberately so, since it rolls the workspace back if the window fails.
+fn theme(app: &AppHandle) -> Theme {
+    app.try_state::<WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.theme))
+        .unwrap_or_default()
+}
 
 /// Logical size of the design mock. Used as the first-run default so the app opens at the
 /// geometry the screenshot comparison in M3 is specified against.
@@ -83,9 +113,18 @@ pub fn create(
     } else {
         ""
     };
+    // The saved theme, on the URL, because a webview cannot ask Rust anything before its
+    // first frame — `app_get_bootstrap` is a round trip and the flash happens long before it
+    // answers. `public/theme-boot.js` reads this parameter in <head> and writes `data-theme`
+    // while the parser is still above <body>.
+    let theme = theme(app);
+    let theme_param = match theme {
+        Theme::Dark => "&theme=dark",
+        Theme::Light => "&theme=light",
+    };
     let url = WebviewUrl::App(
         format!(
-            "index.html?window={}{bench}{audit}{panes}{wins}",
+            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}",
             label.as_str()
         )
         .into(),
@@ -117,19 +156,35 @@ pub fn create(
         .inner_size(initial_width, initial_height)
         .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
         // Not transparent: on Linux `transparent(true)` needs a running compositor and
-        // renders opaque black or garbage without one. The frontend paints --bg #111113.
+        // renders opaque black or garbage without one. The frontend paints --bg.
         .transparent(false)
+        // The toolkit's own fill, for the frames between the window being mapped and the
+        // webview having any content — before this it was the toolkit default, which is
+        // white on GTK and was the last visible white frame a dark-theme user saw.
+        //
+        // Set from the saved theme rather than from `tauri.conf.json`, which has nowhere to
+        // put it: `app.windows` is empty by design (see the module comment), and a config
+        // value could only name one theme anyway.
+        .background_color(match theme {
+            Theme::Dark => BG_DARK,
+            Theme::Light => BG_LIGHT,
+        })
         // Mapped immediately rather than hidden-then-shown on first paint.
         //
-        // The hidden-then-reveal trick avoids a white flash before the dark theme lands,
+        // The hidden-then-reveal trick is the usual way to hide a mismatched first frame,
         // and it is the right pattern on Windows and macOS. On Wayland it is actively
         // broken: a surface that is never mapped is never *configured*, so it has no size
         // — the window reported `visible=false outer=0x0` indefinitely, and because JS
         // still runs in an unmapped webview the app looked alive while every PTY sat at
         // the fallback 80x24 with no layout to measure.
         //
-        // The flash is instead avoided by painting `--bg` from the very first frame; the
-        // background is set on `html`/`body` in tokens.css, not by a React render.
+        // So there is nothing to hide behind and every frame has to be correct on its own.
+        // Three things make that true, in the order they paint: `background_color` above
+        // covers the pre-webview frames; `:root` in tokens.css is the LIGHT palette, which
+        // is the default, so a webview with no attribute yet is already right for most
+        // users; and `public/theme-boot.js` writes `data-theme=dark` from `?theme=` in
+        // <head>, before the first frame, for the users for whom it is not. No step waits
+        // on React.
         .visible(true)
         // `CIDE_ON_TOP=1` keeps the window above others so a screenshot tool can see it.
         // Not a debugging hack: M3's acceptance test is a screenshot diff against the
@@ -164,6 +219,26 @@ pub fn destroy(app: &AppHandle, label: &WindowLabel) {
     };
     if let Err(error) = window.destroy() {
         tracing::error!(%label, %error, "could not destroy a window");
+    }
+}
+
+/// Repaint every window's *native* fill after a theme switch.
+///
+/// The webview repaints itself — `data-theme` on `<html>` re-resolves every token — and
+/// this is the half of the window the webview does not own: the toolkit's fill, which shows
+/// through during a resize and behind the webview on any frame it has not drawn. Without
+/// this a window switched from dark to light keeps flashing #111113 at its edges while
+/// being dragged.
+///
+/// Call it from wherever the theme setting is committed, after the workspace has the new
+/// value; new windows need nothing, since [`create`] reads the same setting.
+pub fn apply_theme(app: &AppHandle, theme: Theme) {
+    let color = match theme {
+        Theme::Dark => BG_DARK,
+        Theme::Light => BG_LIGHT,
+    };
+    for window in app.webview_windows().values() {
+        let _ = window.set_background_color(Some(color));
     }
 }
 
