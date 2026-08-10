@@ -32,6 +32,7 @@ import type {
   QuitDecision,
   SearchFrame,
   SearchQuery,
+  SessionExit,
   SessionState,
   Settings as SettingsDto,
   SettingsPatch,
@@ -606,6 +607,20 @@ export const session = {
     invoke<void>('session_resize', { session: id, geometry: geo }),
 
   hasExited: (id: SessionId) => invoke<boolean>('session_has_exited', { session: id }),
+
+  /**
+   * The same question as `hasExited`, answered with the exit code instead of a boolean.
+   *
+   * Used by the rehydration path in `TerminalPane` — a pane host evicted and re-created after
+   * its child had already gone, so the `cide://session-state` event carrying the code fired
+   * before anything was listening. `hasExited` stays for the window audit, which genuinely
+   * wants a predicate; this one is for the caller that is about to print the number.
+   *
+   * Never rejects for an unknown session: that is `{ kind: 'unknown' }`, the one case where no
+   * code exists anywhere, and it is a routine answer after a workspace restore rather than a
+   * failure. See `SessionExit` in the generated bindings.
+   */
+  exit: (id: SessionId) => invoke<SessionExit>('session_exit', { session: id }),
 
   kill: (id: SessionId) => invoke<void>('session_kill', { session: id }),
 

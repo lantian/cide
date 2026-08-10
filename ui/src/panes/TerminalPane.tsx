@@ -12,7 +12,7 @@ import { useEffect, useRef } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
-import { exitMarkerBytes } from './exitMarker'
+import { exitMarkerBytes, markFor } from './exitMarker'
 import {
   events,
   paneSession,
@@ -193,16 +193,46 @@ function markExited(paneId: string, code?: number): boolean {
 }
 
 /**
- * Whether the Rust registry still holds a running child for this session.
+ * What the registry can still say about a session this pane was not there to hear die.
  *
- * `hasExited` rejects with `noSuchSession` for an id the registry has never heard of, which
- * is exactly what a `SessionId` restored from `workspace.json` is — the process that owned
- * it is gone. Both answers mean the same thing here, so the rejection is a `false` rather
- * than an error: this is a question, not an operation.
+ * Returns the argument for `markExited`, or `null` for "do not mark" — see `markFor`, which
+ * owns that decision and is the part a check script can run.
+ *
+ * The `SessionExit` the command returns is handed straight to `markFor`, whose parameter is
+ * `exitMarker.ts`'s own `ExitAnswer`. That assignment is the equivalence check between the two:
+ * `exitMarker.ts` cannot import the generated bindings, because it is deliberately a pure
+ * module that `check-exit-marker.mjs` compiles standalone, so if the Rust enum ever gains a
+ * variant or renames a field, this line stops typechecking rather than silently falling through
+ * `markFor`'s switch.
+ *
+ * A rejection is `null`: a question that could not be asked is not evidence the child is gone,
+ * and marking a live pane `— exited —` is the worse of the two mistakes.
+ */
+async function exitMark(session: string): Promise<{ code?: number } | null> {
+  return sessionApi.exit(session).then(markFor, (e) => {
+    console.error('[cide] could not ask about session exit', e)
+    return null
+  })
+}
+
+/**
+ * Whether the registry still holds a *running* child for this session.
+ *
+ * Asked before adopting a session id the domain already has, so the answer decides whether
+ * this pane attaches to an existing conversation or spawns its own.
+ *
+ * `running` is the only yes, and `reaping` deliberately is not: that child is already dead and
+ * merely not yet reaped, so adopting it would attach a pane to a corpse and leave it blank.
+ * `unknown` — the ordinary shape of a `SessionId` restored from `workspace.json`, whose process
+ * died with the previous run — is a no for the same reason.
+ *
+ * Over `session.exit` rather than `session.hasExited` so this file asks the registry one
+ * question in one shape. The predicate command still exists for the window audit, which wants
+ * a bool and has no use for the code.
  */
 async function sessionIsLive(session: string): Promise<boolean> {
-  return sessionApi.hasExited(session).then(
-    (exited) => !exited,
+  return sessionApi.exit(session).then(
+    (answer) => answer.kind === 'running',
     () => false,
   )
 }
@@ -391,7 +421,12 @@ export function TerminalPane({
       // — the watcher fired before anyone was listening. One check, not a poll: this is the
       // rehydration case (a host evicted and re-created after its child had gone), and it is
       // answered once at attach time rather than every second for the life of the pane.
-      if (!(await sessionIsLive(id)) && markExited(paneId)) exitCb.current?.()
+      //
+      // The answer carries the code now. It used to be a bool, so this path printed a bare
+      // `— exited —` over a status the registry was still holding — the same pane, the same
+      // dead child, a different sentence depending only on whether it happened to be mounted.
+      const mark = await exitMark(id)
+      if (mark && markExited(paneId, mark.code)) exitCb.current?.()
     })().catch((e) => console.error('[cide] terminal pane failed to start', e))
 
     const onData = term.onData((data) => {

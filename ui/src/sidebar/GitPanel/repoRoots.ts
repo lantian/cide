@@ -29,7 +29,7 @@
  * common React ancestor is the shell. A root is a fact about the filesystem, so a second
  * window learning it independently costs nothing and cannot disagree.
  */
-import type { ChangesTree, RepoId } from '@/ipc/generated'
+import type { ChangesTree, RepoId } from '@/ipc/client'
 
 const roots = new Map<RepoId, string>()
 

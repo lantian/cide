@@ -23,7 +23,7 @@
  *   answers a boolean" — a code that existed and was never requested. {@link markFor} narrows
  *   it to the one case where no number exists anywhere: a session the registry has never
  *   heard of, restored from `workspace.json` after the process that owned it died with the
- *   app.
+ *   app. Every other rehydration now arrives through `session_exit` with its status intact.
  * * `0` — it finished, and it worked. `— exited (0) —` is noise on the ordinary case, and
  *   noise on the ordinary case is how a marker stops being read at all.
  * * negative — `cide_pty::UNKNOWN_EXIT_CODE`, meaning `wait()` itself failed and this build
@@ -59,11 +59,19 @@ export function exitMarkerBytes(code?: number): string {
  * What the registry can still say about a session whose pane was not there to hear it die.
  *
  * The rehydration path — a host evicted and re-created after its child had already gone —
- * asks a question rather than listening for an event, and the question it asks today is
+ * asks a question rather than listening for an event, and the question it used to ask was
  * `session_has_exited`, which answers a boolean. That is why the marker on that path never
- * carries a number: the number exists, it is just not on the wire. See the note on
- * `showsCode` above, and the report accompanying this change for the command that would
- * carry it.
+ * carried a number: the number existed in the registry the whole time and was simply not on
+ * the wire. `session_exit` now carries it, and `TerminalPane` hands its answer straight to
+ * {@link markFor}.
+ *
+ * **This type is declared here rather than imported from the generated bindings**, which is a
+ * deliberate cost. `check-exit-marker.mjs` compiles this module standalone with `tsc`, with no
+ * path aliases and no bundler, because it is the only place the exit code becomes something a
+ * user reads and that decision deserves a test that does not need a DOM. So the equivalence
+ * with Rust's `SessionExit` is enforced at the call site instead: `TerminalPane` passes the
+ * generated type into {@link markFor}, and structural typing fails the build if the two ever
+ * diverge. A variant added in Rust and missed here is a type error, not a silent fallthrough.
  *
  * Four answers, because `cide-pty` genuinely has four states to report and collapsing any two
  * of them loses the code again:
@@ -79,10 +87,7 @@ export function exitMarkerBytes(code?: number): string {
  *   after a restart is exactly this: the process that owned it is gone and no code survives
  *   anywhere. This is the only answer for which a bare `— exited —` is the truth.
  *
- * Mirrors the shape a `session_exit` command would return. Declared here rather than waited
- * for because this module is where the decision belongs and where a check script can reach
- * it; when the command lands, this type is replaced by the generated one and nothing else
- * moves.
+ * Mirrors `SessionExit` in `cide-ipc`, which is the command's return type.
  */
 export type ExitAnswer =
   | { kind: 'running' }

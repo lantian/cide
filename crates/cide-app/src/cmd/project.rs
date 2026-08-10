@@ -98,18 +98,41 @@ pub fn project_close(
 ///
 /// Idempotent, and cheap: activating the project that is already active still bumps `rev`
 /// through `update`, which is what makes a second window follow along.
+///
+/// It also **ensures the project's IDE server**, which is the other half of the cap that
+/// `ide::servable_projects` applies at launch. That cap binds at most 32 ports, ordered so a
+/// project some window is showing always makes the cut — but a workspace larger than the cap
+/// still has projects with no server, and switching to one is exactly how a user reaches it.
+/// Without this, such a project's panes spawn with no `CLAUDE_CODE_SSE_PORT`: no `openDiff`,
+/// no selection, no `@`-mentions, and no error anywhere, because a `claude` with no IDE looks
+/// identical to a `claude` whose IDE never started. `ensure` is idempotent, so for the
+/// overwhelmingly common under-the-cap case this is a `DashMap` hit and nothing else.
 #[tauri::command(rename_all = "camelCase")]
 pub fn project_activate(
+    app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
 ) -> Result<Mutated, CoreError> {
-    state.update(|ws| {
+    let out = state.update(|ws| {
         // Resolved first so an unknown id is an error rather than a silent no-op — the
         // frontend passes an id it read from the tree, so a miss means they have diverged.
         workspace::project(ws, project)?;
         workspace::activate_project(ws, project);
         Ok(Mutated { rev: ws.rev })
-    })
+    })?;
+
+    // After the mutation, and reading the roots in a separate borrow: `ensure` blocks on a
+    // runtime to bind a port, and holding the workspace lock across that would stall every
+    // other command behind it — the same reason `setup` snapshots before `ensure_all`.
+    if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
+        let roots = state.with(|ws| {
+            workspace::project(ws, project)
+                .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        servers.ensure(&app, project, roots);
+    }
+    Ok(out)
 }
 
 #[tauri::command(rename_all = "camelCase")]

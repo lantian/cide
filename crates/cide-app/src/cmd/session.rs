@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cide_ipc::{Geometry, PaneId, SessionId};
+use cide_ipc::{Geometry, PaneId, SessionExit, SessionId};
 use cide_pty::{Geometry as PtyGeometry, PtySession, Sink, SpawnSpec};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{Manager, State};
@@ -527,6 +527,51 @@ pub fn session_has_exited(
     Ok(s.has_exited())
 }
 
+/// The same question as [`session_has_exited`], answered with the code instead of a `bool`.
+///
+/// Both exist because they are asked by different callers for different reasons, and the
+/// difference is not stylistic. `session_has_exited` is a liveness predicate — the window
+/// audit uses it to decide whether a pane still has a child — and a predicate is the right
+/// shape for that. This one is asked by a pane that is *about to print a line to the user*,
+/// where a `bool` throws away the only part anybody reads.
+///
+/// That loss was the whole defect: `cide-pty` maps a signalled child to the shell's
+/// `128 + signum` specifically so an OOM kill (137), the SIGTERM this app sends on quit (143)
+/// and an ordinary failure (1) can be told apart — and then the rehydration path asked a
+/// question whose answer could not carry any of them. A pane that happened to be mounted when
+/// its child died showed `— exited (137) —`; the identical pane rehydrated a moment later
+/// showed `— exited —`. Same session, same corpse, different sentence.
+///
+/// **An unknown session is [`SessionExit::Unknown`], not an error.** Restoring a workspace from
+/// `workspace.json` produces `SessionId`s whose processes died with the previous run, so that
+/// is a routine answer with a correct rendering — and returning `NoSuchSession` here would put
+/// the one case that legitimately has no code down the same path as a genuinely failed call.
+#[tauri::command(rename_all = "camelCase")]
+pub fn session_exit(registry: State<'_, SessionRegistry>, session: SessionId) -> SessionExit {
+    exit_answer(&registry, session)
+}
+
+/// The body of [`session_exit`], as a free function over the registry.
+///
+/// Split out purely so it is testable: a `State<'_, T>` can only be built by a running Tauri
+/// app, and this crate's tests have no app — the same wall `hooks::live_in` and
+/// `ide::servable_projects` document. Everything that can be *wrong* here is in this function,
+/// and the command is the one line that cannot be.
+fn exit_answer(registry: &SessionRegistry, session: SessionId) -> SessionExit {
+    let Some(s) = registry.get(session) else {
+        return SessionExit::Unknown;
+    };
+    match (s.has_exited(), s.exit_status()) {
+        // The status is read second but matched first, so it wins if the reaper lands between
+        // the two reads. A code we have is never worth discarding for a flag that is merely
+        // about to agree with it — and that ordering is what makes `Reaping` genuinely mean
+        // "no status yet" rather than "we looked too early".
+        (_, Some(exit)) => SessionExit::Exited { code: exit.code },
+        (true, None) => SessionExit::Reaping,
+        (false, None) => SessionExit::Running,
+    }
+}
+
 /// Every session the registry currently holds a child for.
 ///
 /// The registry, not the workspace tree. That distinction is the whole claim M5 makes: a
@@ -547,6 +592,83 @@ pub fn session_kill(registry: State<'_, SessionRegistry>, session: SessionId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn a shell that ends with `code`, and wait until the reaper has the status.
+    ///
+    /// Waits on `exit_status()` rather than `has_exited()`, which is the same trap a test in
+    /// `cide-pty` already fell into: `has_exited` flips on EOF, and EOF is a *different event
+    /// on a different thread* from `wait()` returning. Polling the flag and then asserting on
+    /// the status is a race that passes on an idle machine and fails under load.
+    fn reaped_with(code: i32) -> Arc<PtySession> {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg(format!("exit {code}"));
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while session.exit_status().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(session.exit_status().is_some(), "child was never reaped");
+        session
+    }
+
+    /// A session the registry has never held answers `Unknown` — **not an error**.
+    ///
+    /// This is the case the change exists for. Restoring a workspace produces `SessionId`s
+    /// whose processes died with the previous run, so this is the routine answer on every
+    /// launch, and it is the only one for which a bare `— exited —` is the truth. The command
+    /// this replaced returned `NoSuchSession` here, which the frontend could only interpret as
+    /// a failed call.
+    #[test]
+    fn a_session_the_registry_never_held_is_unknown() {
+        let registry = SessionRegistry::default();
+        assert_eq!(
+            exit_answer(&registry, SessionId::new()),
+            SessionExit::Unknown
+        );
+    }
+
+    /// The code survives the round trip, which is the entire point of the command.
+    ///
+    /// `42` rather than `1`: a status the shell would never invent on its own, so a bug that
+    /// substitutes a generic failure code cannot pass this. The predicate command it replaced
+    /// answered `true` here and lost the number.
+    #[test]
+    fn a_reaped_session_reports_its_code() {
+        let registry = SessionRegistry::default();
+        let id = SessionId::new();
+        registry.insert(id, reaped_with(42));
+        assert_eq!(exit_answer(&registry, id), SessionExit::Exited { code: 42 });
+    }
+
+    /// Zero is a code like any other on the wire.
+    ///
+    /// Suppressing `(0)` is a *rendering* decision and it lives in `exitMarker.ts`, where
+    /// `showsCode` owns it and a check script covers it. Deciding it here as well would put
+    /// the same judgement in two places and make the wire unable to distinguish "finished
+    /// cleanly" from "nothing can say" — the exact collapse this whole path exists to undo.
+    #[test]
+    fn a_clean_exit_still_carries_its_zero() {
+        let registry = SessionRegistry::default();
+        let id = SessionId::new();
+        registry.insert(id, reaped_with(0));
+        assert_eq!(exit_answer(&registry, id), SessionExit::Exited { code: 0 });
+    }
+
+    /// A live child is `Running`, so a rehydrating pane adopts it instead of marking it dead.
+    #[test]
+    fn a_live_session_is_running() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 30");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        let registry = SessionRegistry::default();
+        let id = SessionId::new();
+        registry.insert(id, Arc::clone(&session));
+
+        assert_eq!(exit_answer(&registry, id), SessionExit::Running);
+        session.kill();
+    }
 
     #[test]
     fn a_plain_session_only_names_itself() {

@@ -244,6 +244,7 @@ pub fn run() {
             cmd::session::session_in_alternate_screen,
             cmd::session::session_write,
             cmd::session::session_resize,
+            cmd::session::session_exit,
             cmd::session::session_has_exited,
             cmd::session::session_list,
             cmd::session::session_kill,

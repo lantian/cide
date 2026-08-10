@@ -80,6 +80,7 @@
   "session_ack",
   "session_attach",
   "session_detach",
+  "session_exit",
   "session_has_exited",
   "session_in_alternate_screen",
   "session_kill",
