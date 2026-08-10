@@ -12,6 +12,7 @@
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:picker": "node scripts/check-picker.mjs",
     "check:render": "node scripts/check-git-render.mjs",
+    "check:search": "node scripts/check-search.mjs",
     "check:tree-status": "node scripts/check-tree-status.mjs",
     "dev": "vite",
     "preview": "vite preview",

@@ -739,9 +739,13 @@ dependencies = [
 name = "cide-search"
 version = "0.1.0"
 dependencies = [
+ "cide-fs",
  "cide-ipc",
+ "ignore",
  "nucleo",
  "parking_lot",
+ "regex",
+ "tracing",
 ]
 
 [[package]]

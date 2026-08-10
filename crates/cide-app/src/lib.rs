@@ -161,6 +161,10 @@ pub fn run() {
     // command arriving before any `fs.index` answers `NoIndex` rather than failing to
     // resolve its state.
     builder = builder.manage(files::FsRegistry::default());
+    // Likewise: empty until the search panel asks for something, and managed from the start
+    // so that `search.query` resolves its state and answers `NoIndex` rather than failing to
+    // resolve at all.
+    builder = builder.manage(cmd::search::SearchRegistry::default());
     if let Some(ide) = ide {
         builder = builder.manage(ide);
     }
@@ -271,6 +275,8 @@ pub fn run() {
             cmd::fs::fs_delete,
             cmd::picker::picker_query,
             cmd::picker::picker_rank,
+            cmd::search::search_query,
+            cmd::search::search_cancel,
         ])
         .on_window_event(|window, event| {
             // A close from the window manager — Alt+F4, the compositor's own button — never

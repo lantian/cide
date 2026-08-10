@@ -11,3 +11,20 @@ nucleo = { workspace = true }
 # `Nucleo::tick` needs `&mut`, so the worker sits behind a mutex while the injector does
 # not. `parking_lot`'s guards are what keep that cheap enough to take on every keystroke.
 parking_lot = { workspace = true }
+
+# --- content search (M11) ---
+# The same parallel gitignore-aware walker `cide-fs` indexes with. A content search that
+# used its own directory traversal would drift from the file tree the first time somebody
+# changed one of them.
+ignore = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `Filter` is the ignore decision the walk and the watcher share, and `content::Search`
+# takes it as a closure so this crate does not depend on `cide-fs` to run. One test drives
+# the real `Filter` anyway, because "the panel and the tree agree about `target/`" is the
+# claim, and a hand-rolled stub in its place would prove only that the closure is called.
+# (This is a dev-dependency cycle — `cide-fs` dev-depends on `cide-search` — which cargo
+# permits precisely because neither crate needs the other to build its own library.)
+cide-fs = { workspace = true }

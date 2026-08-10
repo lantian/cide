@@ -30,6 +30,8 @@ import type {
   PickerItem,
   ProjectId,
   QuitDecision,
+  SearchFrame,
+  SearchQuery,
   SessionState,
   Settings as SettingsDto,
   SettingsPatch,
@@ -1056,4 +1058,46 @@ export const claudeTasks = {
  */
 export function openLogDir(): Promise<string> {
   return invoke<string>('app_open_log_dir')
+}
+
+/* --------------------------------------------------------------------------------------
+ * Content search — the sidebar's ⌕ panel. (M11)
+ *
+ * Not the picker. `picker.query` ranks *paths* by a fuzzy score; this greps file *contents*
+ * and returns every matching line in walk order. They share the word and nothing else.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Ask for a page of a content search, starting one if this query is not the one running.
+ *
+ * A poll, like `picker.query`, and for the same reason: the walk produces results for
+ * seconds and the panel has to draw the first ones immediately. Call it again while
+ * `frame.running` is true, with `offset` advanced past the hits already appended — a poll
+ * during a search that has found 4 000 hits then carries the few found since the last one,
+ * not 4 000 rows a second time.
+ *
+ * The whole `query` is echoed back on the frame. Compare it before painting: a frame for the
+ * query the user has already typed past must be dropped, and the toggles are part of the
+ * identity (`case sensitive` off and on are two different searches over one pattern).
+ *
+ * Rejects with `NoIndex` for a project whose file walk has not started; that is the
+ * "opening…" state, not an error. See `store/fileIndex.ts`'s `isNoIndex`.
+ */
+export const search = {
+  query: (projectId: ProjectId, query: SearchQuery, offset = 0, limit?: number) =>
+    invoke<SearchFrame>('search_query', {
+      project: projectId,
+      query,
+      offset,
+      limit: limit ?? null,
+    }),
+
+  /**
+   * Stop the project's search and forget its results.
+   *
+   * Idempotent, and safe on a project that never searched — `false` simply means there was
+   * nothing to stop. The panel calls it when it unmounts or its input is emptied, so that a
+   * walk of a large repository does not keep running for a panel nobody can see.
+   */
+  cancel: (projectId: ProjectId) => invoke<boolean>('search_cancel', { project: projectId }),
 }

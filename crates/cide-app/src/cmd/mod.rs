@@ -19,3 +19,8 @@ pub mod window;
 // --- M8 ---
 pub mod fs;
 pub mod picker;
+
+// --- M11 ---
+// Content search. Separate from `picker` on purpose: that one ranks paths, this one greps
+// file contents, and the two share no state and no scoring.
+pub mod search;
