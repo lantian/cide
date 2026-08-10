@@ -424,7 +424,18 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Whether a process with this pid exists, erring towards "yes".
-fn pid_is_alive(pid: u32) -> bool {
+///
+/// # The one liveness rule in this repository
+///
+/// Public, and deliberately so: this is the rule [`sweep_stale`] is built on, and anything
+/// else that reaps a file keyed on a pid — the `cide-hooks-*.sock` sweep in
+/// `cide_claude::orphans`, for one — must use *this* function rather than a second copy of
+/// it. The trap a second copy always falls into is treating any `kill(2)` failure as death:
+/// `EPERM` means the process is alive and belongs to somebody else, and reading it as death
+/// deletes a live editor's lockfile or a live cide's socket. The asymmetry is deliberate and
+/// is the whole content of the function; duplicating it duplicates the chance of getting it
+/// backwards.
+pub fn pid_is_alive(pid: u32) -> bool {
     // `kill(0, ...)` addresses the caller's entire process group, so a zero pid in a lockfile
     // must never reach `kill`. It is nonsense in a lockfile anyway; call it alive and leave
     // the file for a human.

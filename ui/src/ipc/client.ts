@@ -973,3 +973,87 @@ export const paneSession = {
   /** Drop this pane's sink. The child keeps running; only this view of it ends. */
   detach: (pane: PaneId, id: SessionId) => invoke<void>('session_detach', { session: id, pane }),
 }
+
+/* --------------------------------------------------------------------------------------
+ * M11: the two named uses of the headless lane, the CLI version verdict, and the log
+ * directory. Appended as one block, per the house rule about this file.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Whether the installed `claude` is one this build's IDE protocol was checked against.
+ *
+ * The verdict is computed in Rust and the range is never mirrored here: it lives in
+ * `cide_ide_mcp::protocol::SUPPORTED_CLI`, and a copy in TypeScript would be a second place
+ * to update on the next CLI release — which is precisely the drift this exists to notice.
+ */
+export interface ClaudeCliSupport {
+  /** The parsed version, or null when nothing answered `--version`. */
+  version: string | null
+  /** The versions the protocol was verified against, already formatted for a human. */
+  verifiedRange: string
+  /** One sentence, or null when there is nothing worth saying. */
+  warning: string | null
+}
+
+/**
+ * One-shot Claude tasks that build their own prompt in Rust.
+ *
+ * Deliberately not `headless.run` with a prompt assembled here. The prompts have rules in
+ * them — no preamble, a bounded diff, "say when you cannot see the rest of the file" — and
+ * every one of those failures is silent and lands in the user's commit box. They are tested
+ * functions in `cide_claude::prompt`; this is the seam that reaches them.
+ */
+export const claudeTasks = {
+  /**
+   * Draft a commit message from what a commit would record.
+   *
+   * Rejects with `{kind: 'nothingToDescribe'}` when there is no diff, which is a disabled
+   * button rather than an error toast.
+   */
+  commitMessage: (projectId: ProjectId, repo: RepoId) =>
+    invoke<HeadlessResult>('claude_commit_message', { project: projectId, repo }),
+
+  /**
+   * Explain a selection. The *text* travels, not a path and a range: the buffer on screen may
+   * be dirty, and explaining what is on disk when the user asked about what they can see is
+   * the kind of wrong answer nobody catches.
+   */
+  explainSelection: (
+    projectId: ProjectId,
+    path: string,
+    startLine: number,
+    endLine: number,
+    text: string,
+    language: string | null = null,
+  ) =>
+    invoke<HeadlessResult>('claude_explain_selection', {
+      project: projectId,
+      path,
+      startLine,
+      endLine,
+      text,
+      language,
+    }),
+
+  /**
+   * The CLI-version verdict. Degrades to "nothing to report" rather than throwing, because
+   * it renders inside a settings section that must still draw without it.
+   */
+  cliSupport: (): Promise<ClaudeCliSupport> =>
+    pendingCommand<ClaudeCliSupport>(
+      'claude_cli_support',
+      () => invoke<ClaudeCliSupport>('claude_cli_support'),
+      { version: null, verifiedRange: 'unknown', warning: null },
+    ),
+}
+
+/**
+ * Open the directory `tauri-plugin-log` writes to, and return its path.
+ *
+ * Rust does the opening: the `opener` plugin's JS command is capability-gated per window and
+ * a detached-pane window deliberately has none, so going through it would make this work in
+ * some windows and not others for reasons no user could guess.
+ */
+export function openLogDir(): Promise<string> {
+  return invoke<string>('app_open_log_dir')
+}

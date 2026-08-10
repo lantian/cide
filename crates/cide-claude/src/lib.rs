@@ -15,12 +15,23 @@
 //! silently bill a Console organisation for a user on a Claude Max plan. Children inherit
 //! their authentication by inheriting the environment, which is all they need.
 
+//! # Two things that only matter when cide dies badly
+//!
+//! [`orphans`] holds both: `PR_SET_PDEATHSIG`, so a `SIGKILL` of this process takes its
+//! children with it, and the sweep for the hook sockets a previous hard kill left behind.
+//! Neither has a clean-shutdown path to live on, which is exactly why they are here.
+
 pub mod headless;
 pub mod hook;
+pub mod orphans;
+pub mod prompt;
 pub mod settings;
 pub mod state;
+pub mod version;
 
 pub use headless::{Headless, ToolAccess};
 pub use hook::{HookEvent, HookFrame};
+pub use orphans::{arm, on_spawn_thread, sweep_hook_sockets};
 pub use settings::{StatusLine, inline_settings};
 pub use state::{is_permission_request, next_state};
+pub use version::{Support, check_once};

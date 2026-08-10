@@ -14,8 +14,15 @@
  * Everything below the nav is presentational — `sections.tsx` takes settings and callbacks —
  * so this component is the only place in the screen that touches the store.
  */
-import { useCallback, useState } from 'react'
-import { settings as settingsApi, type ProjectId, type SettingsSection } from '@/ipc/client'
+import { useCallback, useEffect, useState } from 'react'
+import {
+  claudeTasks,
+  openLogDir,
+  settings as settingsApi,
+  type ClaudeCliSupport,
+  type ProjectId,
+  type SettingsSection,
+} from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { SECTIONS, renderSection } from './sections'
 import { useSettings, useSettingsActions } from './useSettings'
@@ -33,6 +40,43 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   const settings = useSettings()
   const claudeVersion = useWorkspace((s) => s.boot?.capabilities.claudeVersion ?? null)
   const { patch, setTheme, setWindowMode } = useSettingsActions()
+
+  /**
+   * The CLI-version verdict, fetched once per mount.
+   *
+   * The probe behind it is latched in Rust for the life of the process, so this costs one IPC
+   * round trip and never a `claude --version` per render — and the log warning it triggers is
+   * written once however many panes or settings tabs exist. `cliSupport` degrades to a
+   * warning-free value rather than throwing, so a build without the command still draws.
+   */
+  const [cliSupport, setCliSupport] = useState<ClaudeCliSupport | null>(null)
+  useEffect(() => {
+    let live = true
+    void claudeTasks.cliSupport().then((support) => {
+      if (live) setCliSupport(support)
+    })
+    return () => {
+      live = false
+    }
+  }, [])
+
+  /**
+   * The log directory, resolved by opening it.
+   *
+   * Not fetched on mount: the path is only interesting once the user has asked for it, and
+   * the command's whole job is the side effect. It is kept afterwards so the machine where no
+   * file manager answered still ends up showing a path that can be copied — see
+   * `PathReadout`.
+   */
+  const [logDir, setLogDir] = useState<string | null>(null)
+  const revealLogDir = useCallback(() => {
+    void openLogDir()
+      .then(setLogDir)
+      // Rejects only when the platform has no log directory or it could not be created,
+      // neither of which the user can act on beyond reading the log — which is the thing they
+      // cannot reach. The Rust side has already logged it.
+      .catch(() => setLogDir(null))
+  }, [])
 
   const select = useCallback(
     (next: SettingsSection) => {
@@ -92,6 +136,9 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
               setTheme,
               setWindowMode,
               claudeVersion,
+              cliSupport,
+              openLogDir: revealLogDir,
+              logDir,
             })
           )}
         </div>

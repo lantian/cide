@@ -247,6 +247,10 @@ pub fn run() {
             cmd::settings::keymap_report,
             cmd::settings::graphics_status,
             cmd::settings::claude_headless,
+            cmd::settings::claude_commit_message,
+            cmd::settings::claude_explain_selection,
+            cmd::settings::claude_cli_support,
+            cmd::settings::app_open_log_dir,
             cmd::window::window_detach_pane,
             cmd::window::window_redock_pane,
             cmd::window::window_set_mode,
@@ -289,6 +293,15 @@ pub fn run() {
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());
+
+            // Before the listener binds, so a `SIGKILL`ed previous run's socket is gone
+            // rather than accumulating one file per hard kill for the life of the account.
+            // Keyed on pid liveness and refuses anything it cannot establish as dead — see
+            // `cide_claude::orphans::sweep_hook_sockets`.
+            let swept = cide_claude::orphans::sweep_hook_sockets();
+            if swept > 0 {
+                tracing::info!(swept, "removed hook sockets left by a previous run");
+            }
 
             // Before any pane spawns, because a child that starts without `CIDE_HOOK_SOCK`
             // in its environment never reports at all — there is no later moment at which it

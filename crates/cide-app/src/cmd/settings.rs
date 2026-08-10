@@ -17,16 +17,17 @@
 //! [`apply_graphics_overrides`] for the launch-time half, which is called from `main` before
 //! `graphics::apply` and before anything touches GTK.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cide_core::keymap::{self, KeymapDiagnostic};
 use cide_core::{CoreError, persist, workspace};
+use cide_ipc::git::DiffSide;
 use cide_ipc::{
     GraphicsRung, GraphicsSettings, GraphicsStatus, HeadlessError, HeadlessRequest, HeadlessResult,
     KeymapConflict, KeymapProblem, KeymapReport, Pane, PaneId, PaneKind, PaneRole, ProjectId,
-    Settings, SettingsPatch, SettingsSection, TabId, TabKind,
+    RepoId, Settings, SettingsPatch, SettingsSection, TabId, TabKind,
 };
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::workspace_state::WorkspaceState;
 
@@ -418,28 +419,314 @@ pub async fn claude_headless(
     project: ProjectId,
     request: HeadlessRequest,
 ) -> Result<HeadlessResult, HeadlessError> {
-    let cwd: Option<PathBuf> = state.with(|ws| {
-        workspace::project(ws, project)
-            .ok()
-            .and_then(|p| p.roots.first().map(|r| r.path.clone()))
-    });
-    let Some(cwd) = cwd else {
-        return Err(HeadlessError::NoProject {
+    let cwd = project_root(&state, project)?;
+    run_headless(cwd, request).await
+}
+
+/// The project's first root, which is the directory a one-shot runs in.
+///
+/// It decides which `CLAUDE.md` and which settings the CLI picks up, so a guess would quietly
+/// answer about the wrong repository — hence the hard error rather than a fallback to `$HOME`.
+fn project_root(state: &WorkspaceState, project: ProjectId) -> Result<PathBuf, HeadlessError> {
+    state
+        .with(|ws| {
+            workspace::project(ws, project)
+                .ok()
+                .and_then(|p| p.roots.first().map(|r| r.path.clone()))
+        })
+        .ok_or_else(|| HeadlessError::NoProject {
             project: project.to_string(),
-        });
-    };
+        })
+}
+
+/// Run one prompt off the UI thread.
+///
+/// The blocking work goes to `spawn_blocking` because `cide_claude::headless::run` is
+/// deliberately synchronous — it owns three pipe-draining threads and a poll loop, and none of
+/// that wants an async runtime. The thread it lands on also stays blocked until the child is
+/// gone, which is what makes `PR_SET_PDEATHSIG` on that child safe: the signal fires when the
+/// *forking thread* exits, so a spawn from a thread that returns first would kill the run.
+async fn run_headless(
+    cwd: PathBuf,
+    request: HeadlessRequest,
+) -> Result<HeadlessResult, HeadlessError> {
+    // Latched, so this is a probe on the first one-shot of the process and free afterwards.
+    // Worth doing here rather than only at startup: a user whose CLI self-updated mid-session
+    // gets the warning next to the run it might explain.
+    cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM));
 
     // The bare name, resolved by `PATH` — the same thing every pane spawns. Resolving it
     // ourselves would pin whichever version was on `PATH` at launch, and the CLI updates
     // itself underneath a running app.
     let run = cide_claude::Headless::new(request, cwd);
     tauri::async_runtime::spawn_blocking(move || {
-        cide_claude::headless::run(std::path::Path::new("claude"), &run)
+        cide_claude::headless::run(Path::new(CLAUDE_PROGRAM), &run)
     })
     .await
     .map_err(|e| HeadlessError::NotInstalled {
         detail: format!("the headless worker did not finish: {e}"),
     })?
+}
+
+/// Resolved by `PATH`, never by us. See [`run_headless`].
+const CLAUDE_PROGRAM: &str = "claude";
+
+// --- the two named uses of the headless lane ----------------------------------------------
+
+/// Why a one-shot built on top of the workspace could not even be started.
+///
+/// A local enum rather than a `cide-ipc` DTO, matching `cmd::session::SessionError`: nothing
+/// here crosses the wire as *data*, only as a rejection, and Tauri types a rejected promise as
+/// `unknown` on the frontend regardless. Putting it in `cide-ipc` would mint a `ts-rs` type
+/// with no reader.
+///
+/// Tagged, so the caller branches on a variant rather than matching on prose — "nothing is
+/// staged" wants a hint and a disabled button, while a failed run wants a retry.
+#[derive(Debug, thiserror::Error)]
+pub enum ClaudeTaskError {
+    #[error("{0}")]
+    Headless(#[from] HeadlessError),
+    /// Discovering the repository, opening it, or diffing it failed. Carries `cide-git`'s own
+    /// message: "not a git repository" and "index changed externally" are different problems
+    /// with different remedies, and flattening them into one would lose that.
+    #[error("{message}")]
+    Git { message: String },
+    /// The commit would be empty. Not an error the user should see as a toast — it is a
+    /// disabled button — which is why it is its own variant rather than a `Git` message.
+    #[error("there is nothing staged to describe")]
+    NothingToDescribe,
+}
+
+impl serde::Serialize for ClaudeTaskError {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let kind = match self {
+            Self::Headless(_) => "headless",
+            Self::Git { .. } => "git",
+            Self::NothingToDescribe => "nothingToDescribe",
+        };
+        let mut st = s.serialize_struct("ClaudeTaskError", 2)?;
+        st.serialize_field("kind", kind)?;
+        st.serialize_field("message", &self.to_string())?;
+        st.end()
+    }
+}
+
+impl From<cide_ipc::git::GitError> for ClaudeTaskError {
+    fn from(e: cide_ipc::git::GitError) -> Self {
+        Self::Git {
+            message: e.to_string(),
+        }
+    }
+}
+
+/// Draft a commit message for what is staged, for the git panel's commit box.
+///
+/// # Why the diff is read here and not passed in
+///
+/// The panel has a tree of changed *files*; it has never held the patch text, and having it
+/// fetch one diff per file to concatenate them would be a round trip per file and a different
+/// answer from what `git commit` would actually record. Reading it in one pass through
+/// `cide-git` is both cheaper and the same diff the commit itself will contain.
+///
+/// # Staged, with a deliberate fallback
+///
+/// Staging-area mode commits the index, so `Staged` is the right diff. Changelist mode — this
+/// app's default — commits from the working tree and may have nothing in the index at all, so
+/// an empty staged diff falls back to `Combined` rather than refusing. Refusing would make the
+/// button dead for the majority of this app's users while looking like a model failure.
+///
+/// `async` for the same reason as [`claude_headless`]: this waits on a model turn, and a
+/// synchronous command would hold the GTK loop for the duration.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn claude_commit_message(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+) -> Result<HeadlessResult, ClaudeTaskError> {
+    let roots: Vec<PathBuf> = state.with(|ws| {
+        workspace::project(ws, project)
+            .map(|p| p.roots.iter().map(|r| r.path.clone()).collect())
+            .unwrap_or_default()
+    });
+    if roots.is_empty() {
+        return Err(ClaudeTaskError::Headless(HeadlessError::NoProject {
+            project: project.to_string(),
+        }));
+    }
+    let root = cide_git::repo::find(&roots, repo)
+        .map_err(ClaudeTaskError::from)?
+        .root;
+
+    let (diff, branch) = staged_diff(&root)?;
+    if diff.trim().is_empty() {
+        return Err(ClaudeTaskError::NothingToDescribe);
+    }
+
+    let request = cide_claude::prompt::commit_message(&diff, branch.as_deref());
+    Ok(run_headless(root, request).await?)
+}
+
+/// The patch text a commit would record, and the branch it would land on.
+///
+/// Split out from the command so the fallback rule above is one readable function rather than
+/// a nested match inside a handler. Everything it touches is `cide-git`'s; nothing here knows
+/// what a hunk is.
+fn staged_diff(root: &Path) -> Result<(String, Option<String>), ClaudeTaskError> {
+    let repo = cide_git::repo::open(root)?;
+
+    // A closure rather than a free function because its parameter would have to be named, and
+    // its type is `git2::Repository` — which `cide-git` does not re-export and this crate must
+    // not depend on. Adding `git2` to the app crate to spell one signature would put a git
+    // implementation inside the glue layer for the sake of tidiness.
+    let render = |side: DiffSide| -> Result<String, cide_ipc::git::GitError> {
+        let diff = cide_git::diff::build(&repo, cide_git::diff::DiffRequest::new(side), None)?;
+        let mut out = String::new();
+        for file in cide_git::diff::raw_files(&diff)? {
+            // Lossy, and that is the right call: a diff containing one file with invalid
+            // UTF-8 should still produce a commit message about the other twelve.
+            out.push_str(&String::from_utf8_lossy(&file.render()));
+        }
+        Ok(out)
+    };
+
+    let mut text = render(DiffSide::Staged)?;
+    if text.trim().is_empty() {
+        text = render(DiffSide::Combined)?;
+    }
+
+    // Best-effort: a detached HEAD or an unborn branch is a perfectly ordinary state to
+    // commit from, and losing the branch hint is not worth failing the whole call for.
+    let branch = cide_git::status::branch_info(&repo)
+        .ok()
+        .filter(|info| !info.detached && !info.unborn)
+        .map(|info| info.head);
+
+    Ok((text, branch))
+}
+
+/// Explain a selected region of a file, for the editor's context menu.
+///
+/// The selection travels as text rather than as a path and a range for the child to read: the
+/// buffer on screen may be dirty, and explaining what is on disk when the user asked about
+/// what they are looking at is the kind of wrong answer that is hard to notice. It also means
+/// the run needs no tools at all — see `cide_claude::prompt`.
+#[tauri::command(rename_all = "camelCase")]
+// The parameters *are* the wire shape: the macro destructures a flat object the frontend
+// sends, so grouping them into a struct would add a type that exists only to be taken apart
+// again. `session_spawn` carries the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
+pub async fn claude_explain_selection(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    path: String,
+    start_line: u32,
+    end_line: u32,
+    text: String,
+    language: Option<String>,
+) -> Result<HeadlessResult, HeadlessError> {
+    let cwd = project_root(&state, project)?;
+    let request = cide_claude::prompt::explain_selection(
+        &path,
+        language.as_deref(),
+        start_line,
+        end_line,
+        &text,
+    );
+    run_headless(cwd, request).await
+}
+
+// --- the CLI version check ----------------------------------------------------------------
+
+/// What `claude --version` says, against what the IDE protocol was verified with.
+///
+/// A separate command from `app.getBootstrap`'s `claudeVersion`, which is the raw string.
+/// This is the *verdict*, and the verdict has to come from Rust: the range lives in
+/// `cide_ide_mcp::protocol::SUPPORTED_CLI`, and a copy of it in TypeScript would be a second
+/// place to update on the next release — which is exactly the drift this is meant to detect.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeCliSupport {
+    /// The version as parsed, or `None` when nothing answered `--version`.
+    pub version: Option<String>,
+    /// The versions this build's protocol description was checked against, for a human.
+    pub verified_range: String,
+    /// One sentence, when there is something to say. `None` on a verified CLI: a note that
+    /// says "everything is fine" on every launch is a note nobody reads on the launch it
+    /// matters.
+    pub warning: Option<String>,
+}
+
+/// Whether the installed CLI is one this build's IDE protocol was ever checked against.
+///
+/// The probe behind this is latched for the life of the process, so the Settings screen
+/// re-reading it costs nothing and the warning reaches the log exactly once however many
+/// panes are open — which is the requirement: a per-pane warning is a warning that has been
+/// trained out of the reader by the time it means something.
+///
+/// `async`, with the probe on the blocking pool, and it has to be. A Tauri command that is not
+/// `async` runs on the main thread, which here is the GTK loop; the *first* call is the one
+/// that misses the latch and actually runs `claude --version`, and `claude` is a Node.js
+/// program whose startup is measured in hundreds of milliseconds. Sync, that is every window
+/// in the application frozen for the length of a Node boot at the exact moment the user opened
+/// Settings — the same defect `session_spawn` and `session_scrollback` were moved off the main
+/// thread for, and one that would never reproduce for whoever had already opened Settings once
+/// in that session.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn claude_cli_support() -> ClaudeCliSupport {
+    // A join failure means the pool is going away, which is a shutting-down application. The
+    // no-CLI answer is the honest one to draw with and this screen must still render.
+    tauri::async_runtime::spawn_blocking(cli_support)
+        .await
+        .unwrap_or_else(|_| ClaudeCliSupport {
+            version: None,
+            verified_range: cide_claude::version::verified_range(),
+            warning: None,
+        })
+}
+
+/// The verdict, computed synchronously. Separate from the command so a test can call it
+/// without an async runtime, and so the command body is only the threading decision.
+fn cli_support() -> ClaudeCliSupport {
+    let support = cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM));
+    ClaudeCliSupport {
+        version: support.version().map(str::to_string),
+        verified_range: cide_claude::version::verified_range(),
+        warning: support.is_warning().then(|| support.message()),
+    }
+}
+
+// --- the log directory --------------------------------------------------------------------
+
+/// Open the directory `tauri-plugin-log` writes to, in the desktop's file manager.
+///
+/// The plugin has been installed since the first milestone and there has been no way to reach
+/// what it writes, which makes "send me your log" a request the user cannot act on. Returns
+/// the path as well as opening it, so a screen can show it for the case where no file manager
+/// is installed — a headless-ish Linux desktop being exactly where the logs are wanted.
+///
+/// Opened from Rust rather than through the `opener` plugin's JS command on purpose: the JS
+/// path is capability-gated per window, and a detached pane window deliberately has no
+/// `opener` permission. Doing it here means the same gesture works from every window without
+/// widening what a webview may open to include arbitrary paths.
+#[tauri::command(rename_all = "camelCase")]
+pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("this platform has no log directory: {e}"))?;
+
+    // The directory does not exist until the plugin writes its first line, and asking a file
+    // manager to open a path that is not there is an error dialog with no explanation in it.
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("could not open {}: {e}", dir.display()))?;
+
+    Ok(dir.display().to_string())
 }
 
 #[cfg(test)]
@@ -589,6 +876,174 @@ mod tests {
             ..GraphicsSettings::default()
         };
         assert!(overrides_for(true, &settings).is_empty());
+    }
+
+    #[test]
+    fn a_task_error_serialises_as_a_kind_the_frontend_can_branch_on() {
+        // The whole reason this is not a `String`. "nothing to describe" is a disabled button
+        // and a hint; a failed run is a retry; a git failure is neither. A frontend matching
+        // on prose would break the moment one of these messages was reworded.
+        let kinds = [
+            (ClaudeTaskError::NothingToDescribe, "nothingToDescribe"),
+            (
+                ClaudeTaskError::Git {
+                    message: "not a repository".into(),
+                },
+                "git",
+            ),
+            (
+                ClaudeTaskError::Headless(HeadlessError::TimedOut { seconds: 180 }),
+                "headless",
+            ),
+        ];
+        for (error, expected) in kinds {
+            let value = serde_json::to_value(&error).expect("serialises");
+            assert_eq!(value["kind"], expected);
+            assert!(
+                value["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "{expected} carried no message"
+            );
+        }
+    }
+
+    /// A throwaway repository with one commit, for the diff tests below.
+    ///
+    /// Driven through the `git` binary rather than `git2`, for the reason `staged_diff` gives
+    /// for not naming a `git2` type: this crate must not depend on a git implementation. It is
+    /// also the right reference — the question these tests ask is "does this produce what a
+    /// commit would record", and only git can answer that authoritatively.
+    ///
+    /// Every `git` invocation carries `-c` overrides for the settings a developer's own
+    /// `~/.gitconfig` could otherwise change the answer with. `commit.gpgsign` is the one that
+    /// would not merely alter the output but fail the commit outright, on the machine of
+    /// anybody who signs by default.
+    struct TempRepo {
+        root: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("cide-claude-task-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("temp repo");
+            let repo = Self { root };
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.write("kept.txt", "one\ntwo\nthree\n");
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-qm", "base"]);
+            repo
+        }
+
+        fn git(&self, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(&self.root)
+                .args([
+                    "-c",
+                    "user.name=cide tests",
+                    "-c",
+                    "user.email=tests@cide.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("running git {args:?}: {e}"));
+            assert!(
+                output.status.success(),
+                "git {args:?} failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn write(&self, name: &str, body: &str) {
+            std::fs::write(self.root.join(name), body).expect("write");
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_staged_change_becomes_the_patch_text_a_commit_would_record() {
+        // The end-to-end question, and the one nothing else here asks: `claude_commit_message`
+        // is only worth anything if what reaches the prompt is a real unified diff. Every
+        // piece between the command and the model — `repo::open`, `diff::build`,
+        // `raw_files`, `RawFile::render` — is exercised by this and by nothing else, and a
+        // silent empty string here is `NothingToDescribe` on a repository with staged work.
+        let repo = TempRepo::new("staged");
+        repo.write("kept.txt", "one\nTWO\nthree\n");
+        repo.git(&["add", "kept.txt"]);
+
+        let (diff, branch) = staged_diff(&repo.root).expect("a staged change");
+
+        assert!(diff.contains("diff --git"), "no patch header:\n{diff}");
+        assert!(diff.contains("+++ b/kept.txt"), "no file header:\n{diff}");
+        assert!(diff.contains("+TWO"), "the addition is missing:\n{diff}");
+        assert!(diff.contains("-two"), "the deletion is missing:\n{diff}");
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn an_empty_index_falls_back_to_the_working_tree_instead_of_refusing() {
+        // Changelist mode is this app's default and commits from the working tree, so for most
+        // users the index is empty at the moment they press the button. Without the fallback
+        // the staged diff is empty, the command answers `NothingToDescribe`, and the feature
+        // is dead for the majority of this application's users while looking like a model that
+        // declined to answer.
+        let repo = TempRepo::new("unstaged");
+        repo.write("kept.txt", "one\ntwo\nCHANGED\n");
+
+        let (diff, _) = staged_diff(&repo.root).expect("a working-tree change");
+
+        assert!(
+            diff.contains("+CHANGED"),
+            "an unstaged change produced no diff, so the button is dead in changelist mode:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn a_clean_repository_produces_nothing_to_describe_rather_than_an_empty_prompt() {
+        // The other half of the fallback: it must not be so eager that a clean tree yields a
+        // whitespace-only diff, which would send the model a prompt with no diff in it and
+        // bill for whatever it invented.
+        let repo = TempRepo::new("clean");
+
+        let (diff, _) = staged_diff(&repo.root).expect("a clean work tree is not an error");
+
+        assert!(
+            diff.trim().is_empty(),
+            "a clean repository diffed as:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn a_commit_message_over_something_that_is_not_a_repository_is_a_git_error() {
+        // Rather than a panic or a `NoProject`. The project's root is perfectly real here —
+        // it is simply not a work tree, which is an ordinary state for a project opened on a
+        // scratch directory.
+        let outside = std::env::temp_dir();
+        let error = staged_diff(&outside).expect_err("a temp dir is not a work tree");
+        assert!(
+            matches!(error, ClaudeTaskError::Git { .. }),
+            "{error:?} is not the variant the panel branches on"
+        );
+    }
+
+    #[test]
+    fn the_cli_support_verdict_carries_the_range_and_warns_only_when_there_is_news() {
+        // `claude` may or may not be installed on the machine running this, so the assertion
+        // is on the invariants rather than on a version: the range is always populated, and a
+        // warning is present exactly when the verdict is one.
+        let support = cli_support();
+        assert!(!support.verified_range.is_empty());
+        let expected = cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM)).is_warning();
+        assert_eq!(support.warning.is_some(), expected);
     }
 
     #[test]

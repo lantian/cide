@@ -180,12 +180,65 @@ export function Group({ title, children }: { title?: string | undefined; childre
   )
 }
 
-/** A block of prose that explains something the controls cannot. */
-export function Note({ title, children }: { title?: string | undefined; children: ReactNode }) {
+/**
+ * A block of prose that explains something the controls cannot.
+ *
+ * `tone="warn"` recolours the left rule only. A whole yellow panel would out-shout the
+ * section it sits in, and the one warning this screen carries — an unverified `claude` — is a
+ * thing to notice on the way past rather than an error to stop at.
+ */
+export function Note({
+  title,
+  tone = 'info',
+  children,
+}: {
+  title?: string | undefined
+  tone?: 'info' | 'warn' | undefined
+  children: ReactNode
+}) {
   return (
-    <div className={styles.note}>
+    <div className={tone === 'warn' ? `${styles.note} ${styles.noteWarn}` : styles.note}>
       {title !== undefined && <div className={styles.noteTitle}>{title}</div>}
       {children}
     </div>
+  )
+}
+
+/**
+ * A filesystem path shown under an action row.
+ *
+ * Selectable and monospaced on purpose. The whole reason to print the path next to a button
+ * that opens it is the machine where the button does nothing — a desktop with no file manager
+ * registered for `inode/directory` — and on that machine the only useful thing is a path the
+ * user can copy into a terminal.
+ */
+export function PathReadout({ path }: { path: string }) {
+  return <div className={styles.pathReadout}>{path}</div>
+}
+
+export interface ActionButtonProps {
+  label: string
+  onClick: () => void
+  disabled?: boolean | undefined
+}
+
+/**
+ * A small secondary button, for a row whose control is an action rather than a value.
+ *
+ * The mock has no button in Settings because the mock has no action rows; "open the log
+ * directory" is the first. Drawn as a quieter sibling of `Segmented` — same height, same
+ * border, same radius — so it reads as part of the same form rather than as something
+ * borrowed from elsewhere in the app.
+ */
+export function ActionButton({ label, onClick, disabled }: ActionButtonProps) {
+  return (
+    <button
+      type="button"
+      className={styles.action}
+      disabled={disabled === true}
+      onClick={onClick}
+    >
+      {label}
+    </button>
   )
 }
