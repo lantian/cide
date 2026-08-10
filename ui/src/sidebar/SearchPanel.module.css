@@ -1,0 +1,266 @@
+/*
+ * The 252px search panel.
+ *
+ * The width, the 30px uppercase header and the 21px mono rows are the Explorer's, restated
+ * rather than imported: `FileTree.module.css` is that component's private surface, and two
+ * panels sharing one module would make every change to the tree a change here. What must not
+ * drift is `--w-sidebar-files` and the 21px row, which is why both come from the token and
+ * from a comment naming the file that agrees with them.
+ *
+ * Every colour is a token from `styles/tokens.css`, so both themes work without a second rule
+ * anywhere in this file.
+ */
+
+.panel {
+  width: var(--w-sidebar-files);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+
+.header {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+  user-select: none;
+}
+
+.headerTitle {
+  flex: none;
+}
+
+/* The readout. Mono and tabular so a climbing count does not shift the label beside it. */
+.headerMeta {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.input {
+  width: 100%;
+  height: 24px;
+  box-sizing: border-box;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.toggles {
+  display: flex;
+  gap: 4px;
+}
+
+/*
+ * The three switches. Mono, because two of the three labels (`Aa`, `.*`) are read as code and
+ * a proportional font makes `.*` almost invisible at this size.
+ */
+.toggle {
+  flex: none;
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1;
+  cursor: default;
+}
+
+.toggle:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.toggleOn,
+.toggleOn:hover {
+  border-color: var(--accent-dim);
+  background: var(--sel);
+  color: var(--text-hi);
+}
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.viewport {
+  position: relative;
+  width: 100%;
+}
+
+/* Both row kinds are absolutely positioned by the virtualizer and are 21px tall. */
+.fileRow,
+.hitRow {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px 0 6px;
+  border: 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  text-align: left;
+  cursor: default;
+  color: var(--text);
+}
+
+.fileRow:hover,
+.hitRow:hover {
+  background: var(--chrome-hi);
+}
+
+/* A file heading reads as a heading: dimmer than its hits, and never truncated on the left —
+   the tail of a path is what identifies it, so the ellipsis goes at the front. */
+.fileName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  color: var(--dim);
+}
+
+.fileCount {
+  flex: none;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Matches the file tree's 11px twisty column, so the two sidebars line up. */
+.twisty {
+  flex: none;
+  width: 11px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.glyph {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  color: var(--faint);
+  font-size: 10.5px;
+}
+
+.hitRow {
+  /* Indented under its heading by the tree's own 12px step. */
+  padding-left: 18px;
+}
+
+.lineNo {
+  flex: none;
+  min-width: 26px;
+  text-align: right;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.lineText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * The matched substring. `--accent` from the mock, with no background: a highlight block at
+ * 11.5px inside a 21px row leaves no room for the descenders, and the accent on its own is
+ * unambiguous against `--text`.
+ */
+.match {
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* The empty, searching and no-results states. One box, three different sentences. */
+.hint {
+  padding: 12px 10px;
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.hintMeta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 10px;
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* `--yellow`, not `--red`: an unparsable regex is a half-typed one, not a failure. */
+.noticeLabel {
+  color: var(--yellow);
+}
+
+.noticeCode {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}

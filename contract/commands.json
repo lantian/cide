@@ -74,6 +74,8 @@
   "project_close",
   "project_open",
   "project_reorder",
+  "search_cancel",
+  "search_query",
   "session_ack",
   "session_attach",
   "session_detach",

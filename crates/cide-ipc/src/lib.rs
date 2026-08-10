@@ -36,6 +36,9 @@ pub mod search;
 
 pub use fs::{FsChange, FsStatus, TreeRow, TreeRowKind, WatchBackend, WatchStatus};
 pub use search::{PickerFrame, PickerItem, PickerRow};
+// M11: the content search's own wire types. Same module, different job — see the section
+// comment in `search.rs` for why they are not the picker's.
+pub use search::{SearchFrame, SearchHit, SearchMode, SearchQuery};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

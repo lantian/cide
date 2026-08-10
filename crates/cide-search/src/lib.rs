@@ -19,6 +19,17 @@
 //! Frames are capped at [`MAX_FRAME`] rows. A keystroke that matched 100k paths must not put
 //! 100k rows on the IPC channel to draw twelve of them.
 
+//! # Two different jobs behind one crate name (M11)
+//!
+//! Everything above is the fuzzy picker. [`content`] is a *grep* — the same word, a
+//! different thing: it reads file contents rather than ranking paths, it returns every match
+//! rather than the best ones, and it does not score at all. They share this crate because
+//! they share nothing else and both are "search" to the rest of the app; they share no code,
+//! deliberately, because a subsequence score is the wrong ranking for a grep and a line
+//! number is meaningless to a picker.
+
+pub mod content;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cide_ipc::{PickerFrame, PickerRow};

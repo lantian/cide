@@ -63,6 +63,14 @@ notify-debouncer-full = "0.7.0"
 ignore = "0.4.33"
 globset = "0.4.20"
 nucleo = "0.5.0"
+# Content search. `nucleo` is a fuzzy matcher over paths and is the wrong tool for a grep:
+# it scores a subsequence, and "every line that loosely resembles the query" is noise when
+# the user asked for `fn spawn`. `regex` also carries the *literal* mode, via
+# `regex::escape` — one engine means the case-sensitivity and whole-word toggles behave
+# identically in both modes, and its literal prefilters make an escaped pattern about as
+# fast as a hand-written `memmem`. Already in the graph as a transitive dependency of
+# `ignore`, so naming it here costs no new compilation.
+regex = "1.13.1"
 tree-sitter = "0.26.11"
 
 # --- async / mcp ---
