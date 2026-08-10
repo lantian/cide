@@ -254,9 +254,12 @@ pub async fn session_spawn(
     // and `pane_bind_session` is the one place that knows both. Binding early would have to
     // invent a pane id and then correct it.
 
-    // Before the registry insert, so no window can learn about this session and start
-    // polling it before something is watching for its death.
-    crate::lifecycle::watch_for_exit(app.clone(), id, Arc::clone(&session));
+    // Before the registry insert, so no window can learn about this session before something
+    // is watching for its death. The watcher is a callback on the reaper now rather than a
+    // thread of its own, and registering it after the child has already gone is safe — it
+    // fires immediately instead of never — but registering it first keeps the ordering
+    // obvious rather than relying on that.
+    crate::lifecycle::watch_for_exit(app.clone(), id, &session);
 
     registry.insert(id, session);
     Ok(id)

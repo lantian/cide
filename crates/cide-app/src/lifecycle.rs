@@ -24,7 +24,7 @@ use cide_ipc::{
     Pane, PaneId, PaneKind, Project, ProjectId, SessionId, SessionState, TabId, WindowLabel,
     WindowRole, Workspace,
 };
-use cide_pty::PtySession;
+use cide_pty::{Exit, PtySession};
 use tauri::{AppHandle, Manager};
 
 use crate::state::SessionRegistry;
@@ -314,34 +314,16 @@ fn deliver(_pid: u32, _rung: Rung) {}
 
 // --- exit -------------------------------------------------------------------------------
 
-/// How often a watcher asks whether its child has gone.
+/// The code reported for a child whose status could not be read at all.
 ///
-/// A poll, and it should not be one. The honest shape is a callback from `spawn_reaper` in
-/// `cide-pty`, which already blocks in `child.wait()` and knows the exit status the moment
-/// it returns — that is the version that would also carry a real exit code. It is not what
-/// is written here because `cide-pty` is outside this change's remit; see
-/// [`UNKNOWN_EXIT_CODE`].
-///
-/// What this *does* replace is far worse: every pane in every window used to ask
-/// `session.hasExited` over IPC once a second, forever. This is one atomic load per session
-/// on a thread that ends the moment the child does.
-const EXIT_POLL: Duration = Duration::from_millis(200);
+/// Re-exported rather than redefined: the only place that can know is `cide-pty`'s reaper,
+/// which is where the constant now lives. This alias exists so the name still reads as part
+/// of this module's vocabulary — [`report_exit`] is the one thing that publishes it.
+pub use cide_pty::UNKNOWN_EXIT_CODE;
 
-/// The code reported for a child whose status nobody kept.
+/// Report a session's death exactly once, with the status the reaper actually saw.
 ///
-/// `cide_pty::spawn_reaper` calls `child.wait()` and drops the `ExitStatus` on the floor,
-/// and once it has reaped there is no second answer to ask for — `waitpid` on that pid
-/// returns `ECHILD`. So this reports "it ended, and this build cannot say how".
-///
-/// -1 rather than 0: nothing consumes the number today (`SessionState::is_live` is false for
-/// every `Exited`, whatever the code), and a fabricated success is the one value that could
-/// later be mistaken for a real one. Fixing it properly means threading the status out of
-/// `cide-pty`.
-pub const UNKNOWN_EXIT_CODE: i32 = -1;
-
-/// Watch one session and report its death exactly once.
-///
-/// Two things happen when a child goes, and both were missing:
+/// Two things happen when a child goes:
 ///
 /// * `SessionState::Exited` is emitted, which is what lets a pane print `— exited —` from an
 ///   event instead of polling for it; and
@@ -350,27 +332,33 @@ pub const UNKNOWN_EXIT_CODE: i32 = -1;
 ///   about interrupting a session that no longer exists — and warning about nothing is how
 ///   users learn to dismiss that dialog unread.
 ///
-/// A thread per session rather than one sweeper over the registry: this one starts where the
-/// session does (`session_spawn` owns both), needs no scheduling, and ends by itself.
-pub fn watch_for_exit(app: AppHandle, id: SessionId, session: Arc<PtySession>) {
-    let spawned = thread::Builder::new()
-        .name("cide-session-exit".into())
-        .spawn(move || {
-            while !session.has_exited() {
-                thread::sleep(EXIT_POLL);
-            }
-            report_exit(&app, id);
-        });
-
-    if let Err(error) = spawned {
-        // The session is perfectly usable; what is lost is the `— exited —` marker and the
-        // close confirm's ability to tell this session apart from a live one.
-        tracing::error!(%error, session = %id, "no exit watcher for this session");
-    }
+/// A callback on `cide-pty`'s reaper thread, not a watcher thread of our own. The previous
+/// version spawned one thread per session to poll `has_exited()` every 200 ms, and it could
+/// not do better than [`UNKNOWN_EXIT_CODE`]: by the time a poll noticed, `wait()` had already
+/// consumed the status and `waitpid` on that pid answers `ECHILD`. `PtySession::on_exit`
+/// hands the status over at the one moment it exists, and costs no thread and no wakeups.
+///
+/// Registration cannot lose the race, either: a child that is already reaped calls back
+/// immediately rather than never — see [`cide_pty::PtySession::on_exit`].
+pub fn watch_for_exit(app: AppHandle, id: SessionId, session: &Arc<PtySession>) {
+    session.on_exit(move |exit| report_exit(&app, id, &exit));
 }
 
-/// Announce that `id` has ended. Separate from the thread so it can be called directly.
-fn report_exit(app: &AppHandle, id: SessionId) {
+/// Announce that `id` has ended. Separate from the callback so it can be called directly.
+fn report_exit(app: &AppHandle, id: SessionId, exit: &Exit) {
+    // Worth a line, and worth it at `warn`: a session that ended badly is the one the user
+    // comes asking about ("it just vanished"), and by then the pane has been closed and the
+    // log is the only thing left that can answer. A clean exit is the ordinary case and says
+    // nothing at info level either, because every quit produces one per pane.
+    if is_abnormal(exit) {
+        match &exit.signal {
+            Some(signal) => {
+                tracing::warn!(session = %id, code = exit.code, %signal, "a session was killed")
+            }
+            None => tracing::warn!(session = %id, code = exit.code, "a session exited non-zero"),
+        }
+    }
+
     // The hook server first. The emit is what wakes the frontend, and a window that reacted
     // by asking which sessions are live must not be told this one still is.
     if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
@@ -384,10 +372,18 @@ fn report_exit(app: &AppHandle, id: SessionId) {
     crate::emit::session_state(
         app,
         &id.to_string(),
-        SessionState::Exited {
-            code: UNKNOWN_EXIT_CODE,
-        },
+        SessionState::Exited { code: exit.code },
     );
+}
+
+/// Whether an exit is worth telling the log about.
+///
+/// Anything that is not a clean zero — a non-zero status, a signal, or a status nobody could
+/// read. Deliberately not "was it signalled": `claude` exiting 1 because it hit an error is
+/// exactly as interesting to someone whose pane vanished as `claude` being OOM-killed, and
+/// the two used to be indistinguishable anyway.
+fn is_abnormal(exit: &Exit) -> bool {
+    !exit.is_success()
 }
 
 // --- restore --------------------------------------------------------------------------
@@ -733,6 +729,101 @@ mod tests {
             unsafe { libc::kill(-pid, 0) } != 0,
             "a descendant outlived the ladder"
         );
+    }
+
+    /// The end of the chain this change exists to fix: a real child, a real signal, and the
+    /// number that reaches `SessionState::Exited`.
+    ///
+    /// Asserted through `PtySession::on_exit` rather than through `report_exit`, which needs
+    /// an `AppHandle` a unit test has no way to build. What is being checked is the value
+    /// the emit would carry, which is the part that used to be invented.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_killed_outright_reports_the_signal_it_died_of() {
+        let dir = temp_dir("exit-code");
+        let armed = dir.join("armed");
+        // The traps have to be in place before the first rung, exactly as in
+        // `the_kill_rung_takes_the_whole_group`. Signalling a shell that is still starting
+        // kills it under the default disposition, and the ladder then stops at SIGHUP — the
+        // first draft of this test asserted 137 and got a perfectly correct 129.
+        let script = format!(
+            "trap '' HUP TERM; : > {armed}; while :; do sleep 0.05; done",
+            armed = armed.display(),
+        );
+        let spec = cide_pty::SpawnSpec::new("/bin/sh", dir.clone())
+            .arg("-c")
+            .arg(script);
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !armed.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(armed.is_file(), "the fixture never armed its traps");
+
+        let (tx, rx) = std::sync::mpsc::channel::<Exit>();
+        session.on_exit(move |exit| {
+            let _ = tx.send(exit);
+        });
+
+        let ladder = Ladder {
+            hup_grace: Duration::from_millis(100),
+            term_grace: Duration::from_millis(100),
+            kill_grace: Duration::from_millis(500),
+            poll: Duration::from_millis(10),
+        };
+        stop_children(std::slice::from_ref(&session), ladder);
+
+        let exit = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the exit watcher was never called");
+        assert_eq!(
+            exit.code,
+            128 + libc::SIGKILL,
+            "a child that ignored both gentle rungs must report the kill, not -1: {exit:?}"
+        );
+        assert!(is_abnormal(&exit));
+        assert_eq!(
+            SessionState::Exited { code: exit.code },
+            SessionState::Exited { code: 137 },
+            "the state the frontend receives carries the real code"
+        );
+    }
+
+    #[test]
+    fn a_session_that_finished_cleanly_reports_zero_and_says_nothing() {
+        let spec = cide_pty::SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("exit 0");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let (tx, rx) = std::sync::mpsc::channel::<Exit>();
+        session.on_exit(move |exit| {
+            let _ = tx.send(exit);
+        });
+
+        let exit = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the exit watcher was never called");
+        assert_eq!(exit.code, 0);
+        assert!(
+            !is_abnormal(&exit),
+            "an ordinary quit must not warn once per pane"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_status_is_still_worth_a_log_line() {
+        // The one case with no answer. It has to warn, because "this build could not tell"
+        // is exactly the thing a user chasing a vanished pane needs to know.
+        assert!(is_abnormal(&Exit {
+            code: UNKNOWN_EXIT_CODE,
+            signal: None,
+        }));
+        assert!(is_abnormal(&Exit {
+            code: 1,
+            signal: None,
+        }));
     }
 
     /// A workspace with one project whose console holds the primary Claude pane plus a

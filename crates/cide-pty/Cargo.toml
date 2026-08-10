@@ -18,3 +18,9 @@ crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# `strsignal`, and only that. `portable-pty` hands a signalled child's death back as a
+# localised *name* with the number thrown away, so mapping the name back to `128 + n` means
+# asking the same libc that produced it — see `signal_number`.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
