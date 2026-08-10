@@ -114,6 +114,27 @@
   /* Diff row backgrounds. Denser than the dark theme's: a 10% tint washes out on white. */
   --diff-add-bg: rgba(47, 122, 61, 0.12);
   --diff-del-bg: rgba(192, 51, 43, 0.1);
+
+  /*
+   * The modal scrim, and the terminal's ANSI colour 0. Both are here because both were
+   * hardcoded somewhere that only ever looked right on a dark ground.
+   *
+   * `--scrim` was `rgba(0,0,0,.42)` inline in two stylesheets. Over a dark app that dims;
+   * over a white one it composites to a flat mid-grey and the whole window reads as switched
+   * off rather than as having something in front of it. Lighter and warmer here, so the
+   * accent family stays coherent while the dialog still lifts off the page.
+   */
+  --scrim: rgba(38, 24, 18, 0.28);
+  /*
+   * ANSI black — colour 0 — is INK on a white terminal, not a background tint.
+   *
+   * It used to point at `--panel-2`, which is the right answer in the dark theme (colour 0
+   * sits just under the background, which is the convention every dark scheme follows) and
+   * catastrophic in a white one: `--panel-2` is #f6f6f9 against a #ffffff terminal, 1.08:1,
+   * so anything a program printed in black was invisible. Claude Code draws box-drawing and
+   * dim rules in exactly that slot.
+   */
+  --term-black: #16151a;
 }
 
 /* Transcribed verbatim from the design mock, and unchanged by the move to a light default. */
@@ -164,6 +185,10 @@
   /* Diff row backgrounds, from the mock's inline rgba() values. */
   --diff-add-bg: rgba(143, 191, 122, 0.1);
   --diff-del-bg: rgba(224, 108, 117, 0.1);
+
+  /* Both keep the values that were hardcoded for this theme, so dark is unchanged. */
+  --scrim: rgba(0, 0, 0, 0.42);
+  --term-black: #0e0e10;
 }
 
 :root {

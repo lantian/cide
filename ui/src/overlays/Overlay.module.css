@@ -23,11 +23,10 @@
    * `--bg`/`--chrome` were why the light theme read as grey at rest, and those are
    * `tokens.css`'s to fix, not this rule's.)
    *
-   * So the value moves behind `--scrim`. **`tokens.css` does not define it yet** — until it
-   * does, both themes resolve to the fallback and the light scrim is unchanged. The literal
-   * is the fallback, not the intent: it keeps the dark theme exactly as the mock draws it.
-   * Do not fold it back into the mock's single value; add the token instead, dark
-   * `rgba(0,0,0,.42)` and light something near `rgba(0,0,0,.18)`.
+   * So the value lives in `--scrim`, which `tokens.css` now defines per theme: the mock's
+   * `rgba(0,0,0,.42)` for dark, and a lighter warm wash for light. The literal here is only a
+   * fallback and is deliberately the dark value — if the token ever goes missing again, the
+   * theme that still looks right is the one the mock specifies.
    */
   background: var(--scrim, rgba(0, 0, 0, 0.42));
   display: flex;

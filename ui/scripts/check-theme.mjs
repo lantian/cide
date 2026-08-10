@@ -27,7 +27,7 @@
  * Run: `pnpm --dir ui run check:theme`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -212,8 +212,8 @@ try {
 
   // The point of the exercise. If these resolved alike, switching would be a no-op and
   // `retheme`'s signature check would correctly — and uselessly — skip every terminal.
-  const dark = resolveTheme(themeRules, 'dark', TERMINAL_TOKENS)
-  const light = resolveTheme(themeRules, 'light', TERMINAL_TOKENS)
+  const dark = resolveTheme(themeRules, 'dark', [...TERMINAL_TOKENS, '--panel'])
+  const light = resolveTheme(themeRules, 'light', [...TERMINAL_TOKENS, '--panel'])
   eq(
     TERMINAL_TOKENS.filter((t) => (dark[t] ?? '') === ''),
     [],
@@ -230,11 +230,92 @@ try {
     'the two palettes give terminals different colours, so a switch is visible in them',
   )
 
+  // --- and whether those colours can actually be SEEN on that background ------------------
+  //
+  // Definedness is not the whole bug. ANSI black pointed at `--panel-2`, which is defined in
+  // both palettes and is the right answer in dark (colour 0 sits just under the background,
+  // as every dark scheme has it) — and in the new white theme resolved to #f6f6f9 on a
+  // #ffffff terminal: 1.08:1. Anything a program printed in black was invisible, which from
+  // the user's chair looks exactly like the theme switch this whole change is about failing
+  // to reach that terminal. The gate above stayed green through all of it.
+  //
+  // 3:1 rather than AA's 4.5:1 for body text. Terminal colours are not body text, so the floor
+  // is set where "a human cannot see this at all" lives, not where "comfortable" does.
+  //
+  // The exemptions are per theme, and that asymmetry IS the rule rather than a softening of
+  // it. A dark scheme is conventionally expected to sink colour 0 into its background — that
+  // is what makes it usable as a shadow and a fill — so `black` at 1.06:1 on #151518 is
+  // correct there and would be a bug in a white terminal. `brightBlack` is the dim-grey slot
+  // by universal convention and is only ever asked to be *quiet*, not invisible; it is
+  // exempted in dark alone, and clears the floor unaided in light.
+  //
+  // The consequence worth stating: `black` is checked in light, which is precisely the bug
+  // this was written after. Move colour 0 back to a near-background token and the light case
+  // fails while dark stays green.
+  const INK_FLOOR = 3
+  const CONVENTIONALLY_QUIET = { dark: ['black', 'brightBlack'], light: [] }
+  const inkSlots = TERMINAL_SLOTS.filter(
+    ([slot]) => !['background', 'cursorAccent', 'selectionBackground'].includes(slot),
+  )
+  for (const [name, palette] of [['dark', dark], ['light', light]]) {
+    const ground = palette['--panel']
+    const invisible = inkSlots
+      .filter(([slot]) => !CONVENTIONALLY_QUIET[name].includes(slot))
+      .map(([slot, token]) => [slot, palette[token], contrast(palette[token], ground)])
+      .filter(([, , ratio]) => ratio !== null && ratio < INK_FLOOR)
+      .map(([slot, value, ratio]) => `${slot}=${value} ${ratio.toFixed(2)}:1`)
+    eq(
+      invisible,
+      [],
+      `every ink colour clears ${INK_FLOOR}:1 on the ${name} terminal background ${ground}`,
+    )
+  }
+
+  // --- every token any stylesheet asks for, not just the terminal's -----------------------
+  //
+  // The gap this closes, found by review after it had already shipped: a CSS module wrote
+  // `var(--scrim, rgba(0,0,0,.42))` for a token `tokens.css` defined in neither palette. CSS
+  // has no undefined-variable error — it silently takes the fallback — so both themes kept
+  // painting the dark literal, the change was a no-op in the light theme it was written for,
+  // and all thirteen check scripts stayed green. The terminal half above catches exactly this
+  // for `TERMINAL_TOKENS`; there was nothing watching the other ~40 stylesheets.
+  //
+  // Resolved against every document-level rule in `tokens.css`, not only the palette ones,
+  // because the structural tokens (`--font-ui`, the fixed chrome heights) live in a separate
+  // `:root` block and are legitimately theme-independent.
+  const docRules = rules.filter((r) => themeLevel(r.selector))
+  const referenced = new Map()
+  for (const file of cssModules('src')) {
+    const body = readFileSync(file, 'utf8')
+    // Properties a module defines for itself are not tokens.css's to supply.
+    const local = new Set([...body.matchAll(/(--[\w-]+)\s*:/g)].map((m) => m[1]))
+    for (const m of body.matchAll(/var\(\s*(--[\w-]+)/g)) {
+      if (local.has(m[1])) continue
+      if (!referenced.has(m[1])) referenced.set(m[1], file)
+    }
+  }
+  ok(referenced.size > 0, 'the stylesheets reference tokens at all')
+
+  const wanted = [...referenced.keys()].sort()
+  const darkAll = resolveTheme(docRules, 'dark', wanted)
+  const lightAll = resolveTheme(docRules, 'light', wanted)
+  for (const theme of [['dark', darkAll], ['light', lightAll]]) {
+    eq(
+      wanted.filter((t) => (theme[1][t] ?? '') === '').map((t) => `${t} (${referenced.get(t)})`),
+      [],
+      `every token the stylesheets use resolves under ${theme[0]} — a missing one takes its ` +
+        `\`var()\` fallback in silence`,
+    )
+  }
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
   }
-  console.log(`theme: ok (${themeRules.length} palette rules, ${TERMINAL_TOKENS.length} tokens)`)
+  console.log(
+    `theme: ok (${themeRules.length} palette rules, ${TERMINAL_TOKENS.length} terminal tokens, ` +
+      `${referenced.size} referenced by stylesheets)`,
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }
@@ -301,4 +382,43 @@ function resolveTheme(themeRules, theme, tokens) {
   for (const rule of themeRules) if (isBase(rule.selector)) apply(rule)
   for (const rule of themeRules) if (themeNames(rule.selector).includes(theme)) apply(rule)
   return values
+}
+
+/** Every `*.module.css` under `dir`, recursively. */
+function cssModules(dir) {
+  const out = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...cssModules(path))
+    else if (entry.name.endsWith('.module.css')) out.push(path)
+  }
+  return out
+}
+
+/**
+ * WCAG contrast ratio between two `#rgb`/`#rrggbb` colours, or `null` if either is not one.
+ *
+ * `null` rather than a throw or a 1: a token legitimately holding an `rgba()` or a gradient is
+ * not a failure, it is simply not something this ratio is defined for. Returning 1 would
+ * report every such token as invisible and train the reader to ignore this check.
+ */
+function contrast(a, b) {
+  const la = luminance(a)
+  const lb = luminance(b)
+  if (la === null || lb === null) return null
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+}
+
+/** Relative luminance per WCAG 2.x, or `null` for anything that is not a hex colour. */
+function luminance(colour) {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((colour ?? '').trim())
+  if (!hex) return null
+  const digits =
+    hex[1].length === 3
+      ? [...hex[1]].map((c) => c + c)
+      : [hex[1].slice(0, 2), hex[1].slice(2, 4), hex[1].slice(4, 6)]
+  const [r, g, b] = digits
+    .map((d) => parseInt(d, 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)))
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
 }

@@ -110,7 +110,7 @@ export const TERMINAL_SLOTS: readonly (readonly [slot: string, token: string])[]
   ['cursor', '--accent'],
   ['cursorAccent', '--panel'],
   ['selectionBackground', '--sel'],
-  ['black', '--panel-2'],
+  ['black', '--term-black'],
   ['red', '--red'],
   ['green', '--green'],
   ['yellow', '--yellow'],
