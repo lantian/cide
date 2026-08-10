@@ -12,13 +12,44 @@
  *    renumbers everything after the change; a cache that is subtly wrong about row 900 shows
  *    the user a file that is not there.
  *
- * Everything reaches Rust through `pendingCommand`, because none of `fs_tree_rows`,
- * `fs_tree_count`, `fs_expand`, `fs_collapse` or `fs_reveal` exists yet. A missing handler
- * yields an empty tree and one log line, never a rejected promise inside a render.
+ * Everything reaches Rust through [`tree`] below, which layers two different kinds of "no
+ * answer" on top of each other: a handler that is not in this build at all (`pendingCommand`
+ * — an empty tree and one log line, never a rejected promise inside a render), and a project
+ * whose walk has not started yet (`NoIndex` — an empty tree and nothing else, because it is
+ * about to fill in). Conflating them is what made a freshly opened project claim the build
+ * was missing its file commands.
  */
 import { create } from 'zustand'
 import { fs as fsApi, isDegraded, pendingCommand, type ProjectId, type TreeRow } from '@/ipc/client'
+import { isNoIndex } from '@/store/fileIndex'
 import { CHUNK_CAP, CHUNK_ROWS, chunkOf, chunkRequest, chunksFor, chunksToEvict } from './rowWindow'
+
+/**
+ * A tree command, with "the index is not built yet" separated from "there is no such
+ * handler".
+ *
+ * The store attaches to a project the moment it becomes active, which is *before*
+ * `store/workspace.ts` has finished asking Rust to walk it — necessarily so, since the walk
+ * takes seconds on a large repository and the panel is not going to wait. Every call in that
+ * window is answered `NoIndex`, and routing that through `pendingCommand` alone latched
+ * `degraded`, whose notice reads "not registered in this build". Permanently: the flag never
+ * clears. So the honest answer for `NoIndex` is the fallback with no flag raised, and the
+ * `cide://fs-status` the walk emits at its end is what brings the rows in — see `Explorer`.
+ */
+async function tree<T>(name: string, call: () => Promise<T>, fallback: T): Promise<T> {
+  return pendingCommand(
+    name,
+    async () => {
+      try {
+        return await call()
+      } catch (error) {
+        if (isNoIndex(error)) return fallback
+        throw error
+      }
+    },
+    fallback,
+  )
+}
 
 interface FileTreeStore {
   project: ProjectId | null
@@ -26,7 +57,10 @@ interface FileTreeStore {
   count: number
   /** Resident rows, keyed by chunk index. */
   chunks: Map<number, TreeRow[]>
-  /** True once any `fs_*` call has failed, i.e. the commands are not in this build. */
+  /**
+   * True once an `fs_*` call has failed for a reason other than "not indexed yet", i.e. the
+   * commands are not in this build. A project waiting for its first walk is not degraded.
+   */
   degraded: boolean
   /**
    * A row index the tree should scroll to, set by `reveal` and cleared by the component
@@ -85,7 +119,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     if (project === null) return
 
     const mine = generation
-    const count = await pendingCommand('fs_tree_count', () => fsApi.treeCount(project), 0)
+    const count = await tree('fs_tree_count', () => fsApi.treeCount(project), 0)
     if (generation !== mine) return
     set({ count, degraded: isDegraded('fs_tree_count') })
   },
@@ -126,7 +160,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // two would be separate round trips against a tree that another expand could change
     // between them, and the virtualizer would briefly size itself to a count that never
     // matched the rows.
-    const count = await pendingCommand(name, call, get().count)
+    const count = await tree(name, call, get().count)
     resetCache()
     set({ count, chunks: new Map(), degraded: isDegraded(name) })
   },
@@ -138,7 +172,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // `fs_reveal` answers `null` for a path outside the index — a stale picker row, or a
     // file deleted between the pick and the reveal. Treated as "nothing to scroll to"
     // rather than coerced to a row number.
-    const index = await pendingCommand('fs_reveal', () => fsApi.reveal(project, path), null)
+    const index = await tree('fs_reveal', () => fsApi.reveal(project, path), null)
     // The project can be swapped out from under a reveal — `attach` is what a project switch
     // runs — and writing this count and this index into the new project's tree would scroll it
     // to a row belonging to the old one.
@@ -147,7 +181,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // Revealing expands ancestors, so the flattening moved; everything cached is stale.
     resetCache()
     const mine = generation
-    const count = await pendingCommand('fs_tree_count', () => fsApi.treeCount(project), get().count)
+    const count = await tree('fs_tree_count', () => fsApi.treeCount(project), get().count)
     // The same guard `attach` and `refresh` carry, for the same reason: an expand or a watcher
     // refresh that landed while this count was in flight has already re-flattened the tree, so
     // both the count and the row index below describe a shape that is gone.
@@ -164,7 +198,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     if (project === null) return
     resetCache()
     const mine = generation
-    const count = await pendingCommand('fs_tree_count', () => fsApi.treeCount(project), get().count)
+    const count = await tree('fs_tree_count', () => fsApi.treeCount(project), get().count)
     if (generation !== mine) return
     set({ count, chunks: new Map() })
   },
@@ -185,7 +219,7 @@ async function loadChunk(
     return
   }
 
-  const rows = await pendingCommand(
+  const rows = await tree(
     'fs_tree_rows',
     () => fsApi.treeRows(project, offset, len),
     [] as TreeRow[],

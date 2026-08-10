@@ -1,21 +1,24 @@
 /**
  * Ctrl+P — the file picker.
  *
- * The candidate set lives in Rust and streams: `picker_open` starts a session, frames of at
- * most 200 rows arrive on a channel as the walk finds them, and `picker_query` re-runs the
- * match. That shape is what makes the picker usable on a 100k-file repository *before*
- * indexing finishes, which is M8's acceptance criterion — a command that returned a `Vec`
- * would make the first keystroke wait for the walk.
+ * The candidate set lives in Rust and streams: `fs.index` walks the project while
+ * `picker_query` answers from the matcher it is filling, and the frame says `running` while
+ * that is still true. That shape is what makes the picker usable on a 100k-file repository
+ * *before* indexing finishes, which is M8's acceptance criterion — a command that returned a
+ * `Vec` would make the first keystroke wait for the walk. The property is asserted end to
+ * end in `crates/cide-app/src/cmd/fs.rs`.
  *
- * None of those three commands exist yet (`cide-fs`/`cide-search` are being built in
- * parallel), so every call goes through `pendingCommand` and a missing handler shows an
- * empty list with a reason rather than an unhandled rejection.
+ * Two kinds of non-answer are distinguished below and neither is allowed to reject into a
+ * render: a handler missing from the build (`pendingCommand`, one log line and a named
+ * reason), and a project whose walk has not started (`NoIndex`, which is `Indexing…` and
+ * another poll).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ModalShell, Hint } from './ModalShell'
 import { kindBadge, matchCounter } from './format'
 import { isListKey, listAction } from './listKeys'
+import { isNoIndex } from '@/store/fileIndex'
 import {
   pendingCommand,
   picker as pickerApi,
@@ -72,6 +75,8 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
   /** Bumped per query so a late frame for an older query is dropped. */
   const queryGeneration = useRef(0)
   const [failed, setFailed] = useState(false)
+  /** The project exists but its walk has not started yet. Distinct from `failed`. */
+  const [awaitingIndex, setAwaitingIndex] = useState(false)
 
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -93,18 +98,42 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
     let timer: ReturnType<typeof setTimeout> | undefined
 
     const poll = () => {
-      void pendingCommand('picker_query', () => pickerApi.query(project, query), null).then(
-        (incoming) => {
-          if (cancelled || generation !== queryGeneration.current) return
-          if (incoming === null) {
-            setFailed(true)
-            return
+      /*
+       * Three outcomes, not two.
+       *
+       * `NoIndex` is not a failure here: the project's walk is started by
+       * `store/workspace.ts` and Ctrl+P can beat it by a frame, or arrive during the moment
+       * a re-index has taken the old entry out. Treating it as one put *File index
+       * unavailable — picker_query is not registered in this build* in front of a user whose
+       * index was about to exist, and left it there, because `failed` never clears.
+       */
+      void pendingCommand<PickerFrame | 'notIndexedYet' | null>(
+        'picker_query',
+        async () => {
+          try {
+            return await pickerApi.query(project, query)
+          } catch (error) {
+            if (isNoIndex(error)) return 'notIndexedYet'
+            throw error
           }
-          setFrame(incoming)
-          // Only while the index is still growing. A settled index is polled once.
-          if (incoming.running) timer = setTimeout(poll, 120)
         },
-      )
+        null,
+      ).then((incoming) => {
+        if (cancelled || generation !== queryGeneration.current) return
+        if (incoming === null) {
+          setFailed(true)
+          return
+        }
+        if (incoming === 'notIndexedYet') {
+          setAwaitingIndex(true)
+          timer = setTimeout(poll, 120)
+          return
+        }
+        setAwaitingIndex(false)
+        setFrame(incoming)
+        // Only while the index is still growing. A settled index is polled once.
+        if (incoming.running) timer = setTimeout(poll, 120)
+      })
     }
     poll()
 
@@ -184,11 +213,15 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
     >
       {failed ? (
         <div className={styles.status}>
-          File index unavailable — <code>picker_open</code> is not registered in this build.
+          File index unavailable — <code>picker_query</code> is not registered in this build.
         </div>
       ) : hits.length === 0 ? (
         <div className={styles.status}>
-          {frame?.running === true ? 'Indexing…' : query === '' ? 'Type to search' : 'No matches'}
+          {frame?.running === true || awaitingIndex
+            ? 'Indexing…'
+            : query === ''
+              ? 'Type to search'
+              : 'No matches'}
         </div>
       ) : (
         <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>

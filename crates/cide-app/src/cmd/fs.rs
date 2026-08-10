@@ -5,14 +5,32 @@
 //! below it is containment — every path argument is checked against the project's roots
 //! before anything touches the disk, because this is where a path stops being a value the
 //! backend produced and becomes one the webview sent back.
+//!
+//! # Why every handler here is `async`
+//!
+//! Nothing in this file is asynchronous work; all of it is *blocking* work — a walk, a lock,
+//! a `read(2)`. A synchronous `#[tauri::command]` runs on the main thread, so a walk of a
+//! large repository froze the window it was opened from, and even the cheap handlers queued
+//! behind it. Declaring them `async` moves the body to Tauri's async runtime, which is not
+//! enough on its own: that runtime is a small pool shared with the IDE server, and a walk
+//! parked on one of its workers starves everything else the pool owes an answer to. So each
+//! handler resolves its `State` arguments — map lookups, microseconds — and hands the rest to
+//! [`blocking`], which is the pool that exists for exactly this.
+//!
+//! The bodies of the three handlers the picker's streaming property runs through are named
+//! functions ([`index_project`], [`status_of`], and `picker::query_project`) rather than
+//! bodies inline in the `#[tauri::command]` items. Tauri's argument extraction is the only
+//! thing that separates the two, and it is what makes the test at the foot of this file able
+//! to drive the real command layer.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cide_fs::{FsError, ops};
 use cide_ipc::{FsStatus, ProjectId, TreeRow};
 use tauri::{Manager, State};
 
-use crate::files::FsRegistry;
+use crate::files::{FsEvents, FsRegistry};
 use crate::workspace_state::WorkspaceState;
 
 /// The most rows one request will return.
@@ -28,6 +46,25 @@ fn project_fs(
     registry.get(project).ok_or(FsError::NoIndex)
 }
 
+/// Run a handler's blocking half on the blocking pool.
+///
+/// The join can only fail if the job panicked or the runtime is shutting down. Reported as
+/// an `Io` error naming the command rather than re-panicked: re-panicking would take out a
+/// runtime worker over one bad path, and the frontend would see a command that never
+/// resolves — which is indistinguishable from a hung app. Same shape as `cmd::file::blocking`
+/// and for the same reasons.
+async fn blocking<T: Send + 'static>(
+    what: &'static str,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, FsError> {
+    tauri::async_runtime::spawn_blocking(job)
+        .await
+        .map_err(|error| FsError::Io {
+            path: what.to_string(),
+            message: format!("the worker running this command failed: {error}"),
+        })
+}
+
 /// Walk a project's roots and start watching them.
 ///
 /// Called by the frontend after `project.open` rather than from `project_open` itself: the
@@ -35,7 +72,7 @@ fn project_fs(
 /// empty tree that fills in is better than one that hangs before it appears. The picker is
 /// answerable from the moment this starts.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_index(
+pub async fn fs_index(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     registry: State<'_, FsRegistry>,
@@ -46,65 +83,121 @@ pub fn fs_index(
             .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
             .unwrap_or_default()
     });
+    index_project(Arc::new(app), &registry, project, roots).await
+}
+
+/// [`fs_index`] with its two Tauri-injected arguments already resolved to values.
+///
+/// Returns the status a *second* caller would get — `indexing: true` and a live picker —
+/// when a walk for this project is already running, rather than starting a second walk of
+/// the same tree. Two windows both reacting to `project.open` is the ordinary case, not an
+/// error one.
+pub(crate) async fn index_project(
+    events: Arc<dyn FsEvents>,
+    registry: &FsRegistry,
+    project: ProjectId,
+    roots: Vec<PathBuf>,
+) -> Result<FsStatus, FsError> {
     if roots.is_empty() {
         return Err(FsError::NoIndex);
     }
-    Ok(registry.index(&app, project, roots))
+    match registry.claim(project, roots) {
+        Ok(walk) => blocking("fs_index", move || walk.run(events, project)).await,
+        Err(already_running) => Ok(already_running),
+    }
 }
 
 /// Drop a project's index and stop watching it. Idempotent.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_close(registry: State<'_, FsRegistry>, project: ProjectId) -> bool {
-    registry.remove(project)
+pub async fn fs_close(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<bool, FsError> {
+    // Taken out of the registry here — a map operation — and *dropped* on a worker. The drop
+    // is what stops the watcher thread and frees a matcher that may hold 100 000 candidates,
+    // and doing that on the async runtime is the same mistake as walking there.
+    let taken = registry.remove(project);
+    let existed = taken.is_some();
+    blocking("fs_close", move || drop(taken)).await?;
+    Ok(existed)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_status(registry: State<'_, FsRegistry>, project: ProjectId) -> Result<FsStatus, FsError> {
-    Ok(project_fs(&registry, project)?.status())
+pub async fn fs_status(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<FsStatus, FsError> {
+    status_of(&registry, project).await
+}
+
+/// [`fs_status`] without Tauri's argument extraction. See the module note.
+pub(crate) async fn status_of(
+    registry: &FsRegistry,
+    project: ProjectId,
+) -> Result<FsStatus, FsError> {
+    let fs = project_fs(registry, project)?;
+    blocking("fs_status", move || fs.status()).await
 }
 
 /// How many rows the tree currently has. The virtual scroller's range.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_tree_count(registry: State<'_, FsRegistry>, project: ProjectId) -> Result<u32, FsError> {
-    Ok(project_fs(&registry, project)?.with_index(|index| index.count() as u32))
+pub async fn fs_tree_count(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<u32, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_tree_count", move || {
+        fs.with_index(|index| index.count() as u32)
+    })
+    .await
 }
 
 /// The rows in `[offset, offset + len)`.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_tree_rows(
+pub async fn fs_tree_rows(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     offset: u32,
     len: u32,
 ) -> Result<Vec<TreeRow>, FsError> {
+    let fs = project_fs(&registry, project)?;
     let len = (len as usize).min(MAX_ROWS);
-    Ok(project_fs(&registry, project)?.with_index(|index| index.rows(offset as usize, len)))
+    blocking("fs_tree_rows", move || {
+        fs.with_index(|index| index.rows(offset as usize, len))
+    })
+    .await
 }
 
 /// Expand a directory. Returns the new row count.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_expand(
+pub async fn fs_expand(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
-    fs.with_index_mut(|index| index.expand(&path))
-        .map(|n| n as u32)
-        .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
+    blocking("fs_expand", move || {
+        fs.with_index_mut(|index| index.expand(&path))
+            .map(|n| n as u32)
+            .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
+    })
+    .await?
 }
 
 /// Collapse a directory. Returns the new row count.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_collapse(
+pub async fn fs_collapse(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
-    fs.with_index_mut(|index| index.collapse(&path))
-        .map(|n| n as u32)
-        .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
+    blocking("fs_collapse", move || {
+        fs.with_index_mut(|index| index.collapse(&path))
+            .map(|n| n as u32)
+            .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
+    })
+    .await?
 }
 
 /// Expand everything above a path and return the row it sits on.
@@ -113,63 +206,78 @@ pub fn fs_collapse(
 /// gitignored, or that has just been deleted, is an ordinary thing for the editor to ask and
 /// the honest answer is "there is no row for that".
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_reveal(
+pub async fn fs_reveal(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
 ) -> Result<Option<u32>, FsError> {
     let fs = project_fs(&registry, project)?;
-    Ok(fs.with_index_mut(|index| index.reveal(&path).map(|n| n as u32)))
+    blocking("fs_reveal", move || {
+        fs.with_index_mut(|index| index.reveal(&path).map(|n| n as u32))
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_read_file(
+pub async fn fs_read_file(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
 ) -> Result<String, FsError> {
     let fs = project_fs(&registry, project)?;
-    ops::check_within(&fs.root_paths(), &path)?;
-    ops::read_to_string(&path)
+    blocking("fs_read_file", move || {
+        ops::check_within(&fs.root_paths(), &path)?;
+        ops::read_to_string(&path)
+    })
+    .await?
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_write_file(
+pub async fn fs_write_file(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
     contents: String,
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
-    ops::check_within(&fs.root_paths(), &path)?;
-    ops::write(&path, &contents)
+    blocking("fs_write_file", move || {
+        ops::check_within(&fs.root_paths(), &path)?;
+        ops::write(&path, &contents)
+    })
+    .await?
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_create(
+pub async fn fs_create(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
     directory: bool,
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
-    ops::check_within(&fs.root_paths(), &path)?;
-    ops::create(&path, directory)
+    blocking("fs_create", move || {
+        ops::check_within(&fs.root_paths(), &path)?;
+        ops::create(&path, directory)
+    })
+    .await?
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_rename(
+pub async fn fs_rename(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     from: PathBuf,
     to: PathBuf,
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
-    let roots = fs.root_paths();
-    ops::check_within(&roots, &from)?;
-    ops::check_within(&roots, &to)?;
-    ops::check_not_root(&roots, &from)?;
-    ops::rename(&from, &to)
+    blocking("fs_rename", move || {
+        let roots = fs.root_paths();
+        ops::check_within(&roots, &from)?;
+        ops::check_within(&roots, &to)?;
+        ops::check_not_root(&roots, &from)?;
+        ops::rename(&from, &to)
+    })
+    .await?
 }
 
 /// Move paths to the desktop trash. Returns where each one landed.
@@ -183,40 +291,401 @@ pub fn fs_rename(
 /// through cannot be undone — the paths already trashed are reported in the error so the
 /// caller knows what actually moved rather than assuming nothing did.
 #[tauri::command(rename_all = "camelCase")]
-pub fn fs_delete(
+pub async fn fs_delete(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     paths: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, FsError> {
     let fs = project_fs(&registry, project)?;
-    let roots = fs.root_paths();
-    for path in &paths {
-        ops::check_within(&roots, path)?;
-        ops::check_not_root(&roots, path)?;
-    }
-    let mut trashed = Vec::with_capacity(paths.len());
-    for path in &paths {
-        match ops::delete(path) {
-            Ok(dest) => trashed.push(dest),
-            Err(err) => {
-                tracing::warn!(
-                    failed = %path.display(),
-                    already_trashed = trashed.len(),
-                    "a multi-path delete stopped part way through"
-                );
-                return Err(FsError::PartialDelete {
-                    trashed: trashed.iter().map(|p| p.display().to_string()).collect(),
-                    error: err.to_string(),
-                });
+    blocking("fs_delete", move || {
+        let roots = fs.root_paths();
+        for path in &paths {
+            ops::check_within(&roots, path)?;
+            ops::check_not_root(&roots, path)?;
+        }
+        let mut trashed = Vec::with_capacity(paths.len());
+        for path in &paths {
+            match ops::delete(path) {
+                Ok(dest) => trashed.push(dest),
+                Err(err) => {
+                    tracing::warn!(
+                        failed = %path.display(),
+                        already_trashed = trashed.len(),
+                        "a multi-path delete stopped part way through"
+                    );
+                    return Err(FsError::PartialDelete {
+                        trashed: trashed.iter().map(|p| p.display().to_string()).collect(),
+                        error: err.to_string(),
+                    });
+                }
             }
         }
-    }
-    Ok(trashed)
+        Ok(trashed)
+    })
+    .await?
 }
 
 /// Stop watching everything. The quit path.
 pub fn close_all(app: &tauri::AppHandle) {
     if let Some(registry) = app.try_state::<FsRegistry>() {
         registry.close_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The picker answers *through the command layer* while the walk is still running.
+    //!
+    //! `cide-fs/tests/large_repo.rs` already proves the walker streams into the matcher, and
+    //! `cide-search` proves the matcher answers while it is being filled. Neither says
+    //! anything about this file: the seam they exercise is two crates below the handlers, and
+    //! every wiring mistake that could break the property for a user lives here — claiming the
+    //! project after the walk instead of before it, running the walk inside the lock the
+    //! status handler takes, or (the version this replaced) simply awaiting the walk before
+    //! answering anything.
+    //!
+    //! What is asserted is deliberately not "the picker eventually returns matches". It is
+    //! that a frame with matches was taken *between two `fs_status` readings that both said
+    //! `indexing: true`*, **early**. Two claims, and the second one was not obvious:
+    //!
+    //! * The brackets. Reading the status only before the query leaves a hole big enough to
+    //!   drive the bug through: the walk can finish in between, and the frame then says
+    //!   nothing. Two readings, one on each side, put the frame provably inside the walk.
+    //! * The clock. The brackets alone are not enough, and this was measured rather than
+    //!   reasoned about. A build whose sink collects every entry into a `Vec` and pushes the
+    //!   lot into the matcher after `Index::build` returns *still* holds `indexing: true`
+    //!   through that final injection, and a poll landing in that window sees matches, a
+    //!   small `total`, and `indexing: true` on both sides. Against that mutant the bracket
+    //!   assertion alone passed one run in three. What it cannot fake is *when*: its first
+    //!   match arrives at 96-100% of the walk, a real one at under 15%.
+    //!
+    //! Nothing here touches a path outside `cide_fs::testing::scratch`, and the tree goes when
+    //! the `Scratch` drops — including while unwinding.
+
+    use super::*;
+    use crate::cmd::picker::query_project;
+    use cide_fs::testing::{Scratch, scratch};
+    use cide_ipc::FsChange;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The fuzzy needle. `q` and `z` appear nowhere else in the corpus, so a query for it
+    /// cannot be satisfied by filler — fuzzy matching is subsequence matching, and a needle
+    /// the filler can spell out makes `matched > 0` mean nothing.
+    const NEEDLE: &str = "zqneedle";
+
+    /// 30 000 files.
+    ///
+    /// The size is set by the clock assertion rather than by taste. The picker's first answer
+    /// costs a roughly fixed few milliseconds — one walk batch plus `nucleo`'s first tick —
+    /// while the walk itself grows with the corpus, so the ratio between them is only
+    /// meaningful once the walk is comfortably longer than that constant. Measured here:
+    /// 12 000 files walk in ~30 ms and the first match lands at ~8 ms (27%), which is too
+    /// close to [`EARLY`] to bet a suite on; 30 000 walk in 66-89 ms with the first match
+    /// still at ~8 ms (~10%). Writing the corpus is the cost, and at this size it is under
+    /// 200 ms for the whole test. The 100 000-file case belongs to `cide-fs` and is
+    /// `#[ignore]`d there for the inodes it writes.
+    const PACKAGES: usize = 24;
+    const PER_PACKAGE: usize = 1250;
+    const NEEDLE_EVERY: usize = 25;
+
+    /// A first match is "streamed" if it arrived in the first third of the walk.
+    ///
+    /// Three rather than ten — `large_repo.rs`'s factor at 100 000 files — because this walk
+    /// is a tenth of that one's and the picker's fixed startup cost is a bigger share of it.
+    /// The measured separation is wide either way: ~10% for a streaming build, 96-100% for one
+    /// that injects after the walk.
+    const EARLY: u32 = 3;
+
+    /// Five walks before giving up on *observing* anything.
+    ///
+    /// The retry is for the machine, not for the code, and the reasoning is `large_repo.rs`'s:
+    /// `nucleo` scores on its own thread pool, and on a box whose cores are all busy that pool
+    /// can go unscheduled for a whole walk, so every frame reads `(0, 0)`. Five independent
+    /// attempts put that at roughly one run in a thousand. A build that does not stream fails
+    /// all five every time, because every one of its attempts is late by the same amount.
+    const ATTEMPTS: usize = 5;
+
+    /// Events go nowhere. Counted anyway: `fs.index` emitting `cide://fs-status` at both ends
+    /// is what tells the explorer to re-read a tree that was empty when it attached, and a
+    /// walk that emitted nothing would leave the sidebar blank until the first file changed.
+    #[derive(Default)]
+    struct Counting {
+        statuses: AtomicU32,
+    }
+
+    impl FsEvents for Counting {
+        fn status(&self, _project: ProjectId, _status: &FsStatus) {
+            self.statuses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn changed(&self, _project: ProjectId, _change: &FsChange) {}
+    }
+
+    /// Write `PACKAGES` × `PER_PACKAGE` empty files under a fresh scratch directory.
+    ///
+    /// Threaded because at this size the `create` syscalls cost several times the walk they
+    /// exist for, and a test whose setup dominates its subject is one people delete.
+    fn corpus(tag: &str) -> Scratch {
+        let dir = scratch(tag);
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(PACKAGES);
+        let per_thread = PACKAGES.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for chunk in 0..threads {
+                let base: &Path = dir.path();
+                scope.spawn(move || {
+                    for p in (chunk * per_thread)..((chunk + 1) * per_thread).min(PACKAGES) {
+                        let sub = base.join(format!("pkg{p:05}/src"));
+                        std::fs::create_dir_all(&sub).expect("create a package directory");
+                        for f in 0..PER_PACKAGE {
+                            let n = p * PER_PACKAGE + f;
+                            let name = if n.is_multiple_of(NEEDLE_EVERY) {
+                                format!("{NEEDLE}{n}.rs")
+                            } else {
+                                format!("filler{n}.rs")
+                            };
+                            std::fs::write(sub.join(name), []).expect("write a corpus file");
+                        }
+                    }
+                });
+            }
+        });
+        dir
+    }
+
+    /// One frame taken while `fs_status` said `indexing: true` on both sides of it.
+    #[derive(Debug, Clone, Copy)]
+    struct MidWalk {
+        matched: u32,
+        /// `item_count()` — what `nucleo::tick` had ingested when the frame was taken. It
+        /// lags the injector, so it is context rather than evidence.
+        total: u32,
+        /// How long after the walk was started this frame came back.
+        at: Duration,
+    }
+
+    /// Poll `picker_query` and `fs_status` the way the overlay does, until either a frame
+    /// with matches comes back mid-walk or the walk finishes.
+    ///
+    /// Returns how many frames were taken mid-walk alongside the first that had matches, so a
+    /// run that observed *nothing* can be reported as the inconclusive thing it is rather
+    /// than as a pass.
+    async fn watch_one_walk(
+        registry: &FsRegistry,
+        project: ProjectId,
+        started: Instant,
+    ) -> (usize, Option<MidWalk>) {
+        let mut mid_walk_frames = 0usize;
+        loop {
+            // `NoIndex` here means the spawned task has not claimed the project yet — a race
+            // with a task started microseconds ago, not a failure.
+            let Ok(before) = status_of(registry, project).await else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if !before.indexing {
+                return (mid_walk_frames, None);
+            }
+
+            let frame = query_project(registry, project, NEEDLE.to_string(), Some(50))
+                .await
+                .expect("picker_query is answerable the whole time the walk runs");
+            let at = started.elapsed();
+
+            // The closing bracket. Without it the frame could have been taken after the last
+            // inode was read, which is exactly the case this test exists to rule out.
+            let after = status_of(registry, project)
+                .await
+                .expect("the project is still indexed");
+            if !after.indexing {
+                return (mid_walk_frames, None);
+            }
+
+            mid_walk_frames += 1;
+            if frame.matched > 0 {
+                return (
+                    mid_walk_frames,
+                    Some(MidWalk {
+                        matched: frame.matched,
+                        total: frame.total,
+                        at,
+                    }),
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_picker_answers_early_in_the_walk_the_command_layer_started() {
+        let corpus = corpus("cmd-stream");
+        let counter = Arc::new(Counting::default());
+        let mut mid_walk_frames = 0usize;
+        let mut streamed: Option<MidWalk> = None;
+        // Frames that had matches but arrived too late to be evidence of streaming, kept for
+        // the failure message: "nothing matched" and "everything matched at the end" are
+        // different bugs and send a reader to different code.
+        let mut late: Vec<(MidWalk, Duration)> = Vec::new();
+
+        for _ in 0..ATTEMPTS {
+            // A registry per attempt, not one reused across all five. `Indexing::run` clears
+            // the matcher *after* the claim, so a retry against a registry that already holds
+            // the corpus has a window where the picker answers from the previous walk with
+            // `indexing: true` — a frame that would pass this test while proving nothing.
+            let registry = Arc::new(FsRegistry::default());
+            let project = ProjectId::new();
+            let started = Instant::now();
+
+            let walk = {
+                let registry = Arc::clone(&registry);
+                let events: Arc<dyn FsEvents> = counter.clone();
+                let roots = vec![corpus.path().to_path_buf()];
+                tokio::spawn(async move { index_project(events, &registry, project, roots).await })
+            };
+
+            let (frames, found) = watch_one_walk(&registry, project, started).await;
+            mid_walk_frames += frames;
+
+            let status = walk
+                .await
+                .expect("the indexing task")
+                .expect("fs_index over a directory that exists");
+            // Everything after the last inode — installing the index, starting the watcher —
+            // is counted as part of the walk, which can only make the ratio below *kinder*
+            // to a build that does not stream.
+            let walked = started.elapsed();
+            assert!(
+                !status.indexing,
+                "fs_index answered with a walk it had not finished"
+            );
+            assert_eq!(
+                status.files,
+                (PACKAGES * PER_PACKAGE) as u32,
+                "the walk did not report the corpus it was pointed at"
+            );
+
+            // Stops the watcher this walk started before the next attempt plants another.
+            drop(registry.remove(project));
+
+            match found {
+                Some(seen) if seen.at * EARLY < walked => {
+                    streamed = Some(seen);
+                    break;
+                }
+                Some(seen) => late.push((seen, walked)),
+                None => {}
+            }
+        }
+
+        assert!(
+            mid_walk_frames > 0,
+            "every poll landed after the walk had finished, so nothing was observed either \
+             way — {} files is no longer enough of a corpus to see the property on this \
+             machine. This is an inconclusive run, not a pass.",
+            PACKAGES * PER_PACKAGE
+        );
+        let seen = streamed.unwrap_or_else(|| {
+            panic!(
+                "in {ATTEMPTS} walks, picker_query never returned a match in the first \
+                 1/{EARLY} of one. {mid_walk_frames} frames were taken while fs_status \
+                 reported indexing: true on both sides of them; the ones that matched at all \
+                 arrived at {late:?} (frame, walk). The picker is not being filled as the \
+                 walk runs — it is being filled after it."
+            )
+        });
+        assert!(
+            seen.total < (PACKAGES * PER_PACKAGE) as u32,
+            "the matcher already held the whole corpus when it answered ({} matched of {} \
+             injected, corpus {}), so the frame says nothing about streaming",
+            seen.matched,
+            seen.total,
+            PACKAGES * PER_PACKAGE
+        );
+        assert!(
+            counter.statuses.load(Ordering::Relaxed) >= 2,
+            "fs.index emitted no cide://fs-status frames; the explorer would never re-read \
+             the tree it attached to while it was empty"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_index_while_the_first_is_walking_does_not_start_a_second_walk() {
+        let corpus = corpus("cmd-reindex");
+        let registry = Arc::new(FsRegistry::default());
+        let counter = Arc::new(Counting::default());
+        let project = ProjectId::new();
+        let roots = vec![corpus.path().to_path_buf()];
+
+        let first = {
+            let registry = Arc::clone(&registry);
+            let events: Arc<dyn FsEvents> = counter.clone();
+            let roots = roots.clone();
+            tokio::spawn(async move { index_project(events, &registry, project, roots).await })
+        };
+
+        // Wait for the walk to be genuinely in flight before asking again. Issuing the second
+        // call blind would usually land after the first had finished, and then this test would
+        // be about re-indexing rather than about the concurrent case.
+        let mut walking = false;
+        while !first.is_finished() {
+            if matches!(status_of(&registry, project).await, Ok(s) if s.indexing) {
+                walking = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            walking,
+            "the walk finished before it could be caught in flight; nothing was observed \
+             about the concurrent case"
+        );
+
+        // Both windows react to `project.open`, so a second `fs.index` mid-walk is the
+        // ordinary case rather than an error one. `indexing: true` coming straight back is
+        // the signature of the already-running branch: had it claimed a second walk, it
+        // would have awaited that walk and answered `indexing: false` with the corpus
+        // injected twice.
+        let events: Arc<dyn FsEvents> = counter.clone();
+        let second = index_project(events, &registry, project, roots.clone())
+            .await
+            .expect("a second fs_index is not an error");
+        assert!(
+            second.indexing,
+            "a second fs.index during a walk answered as if it had done a walk of its own"
+        );
+
+        let first = first.await.expect("the first walk").expect("fs_index");
+        assert!(
+            !first.indexing,
+            "the flag outlived the walk that set it, so every later fs.index would return \
+             early for ever"
+        );
+        assert_eq!(
+            first.files,
+            (PACKAGES * PER_PACKAGE) as u32,
+            "the corpus was walked more or less than once"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_project_with_no_roots_has_no_index_rather_than_an_empty_one() {
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        // `fs_index` resolves the roots from the workspace, and a project id the workspace
+        // does not know answers with an empty list. Indexing that would register an entry
+        // whose picker is permanently empty and whose tree is permanently zero rows, which
+        // reads to every caller as "this repository has no files".
+        let error = index_project(events, &registry, project, Vec::new())
+            .await
+            .expect_err("a rootless project cannot be indexed");
+        assert_eq!(error, FsError::NoIndex);
+        assert!(status_of(&registry, project).await.is_err());
     }
 }
