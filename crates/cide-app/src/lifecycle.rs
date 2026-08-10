@@ -341,10 +341,31 @@ pub use cide_pty::UNKNOWN_EXIT_CODE;
 /// Registration cannot lose the race, either: a child that is already reaped calls back
 /// immediately rather than never — see [`cide_pty::PtySession::on_exit`].
 pub fn watch_for_exit(app: AppHandle, id: SessionId, session: &Arc<PtySession>) {
-    session.on_exit(move |exit| report_exit(&app, id, &exit));
+    watch_exit_with(session, move |exit| report_exit(&app, id, &exit));
 }
 
-/// Announce that `id` has ended. Separate from the callback so it can be called directly.
+/// The registration, with the reporting left to the caller.
+///
+/// Split out purely so a test can drive it: `report_exit` needs an `AppHandle`, and this
+/// build cannot make one — `tauri`'s mock app is behind a feature it does not enable, for
+/// the same reason `hooks.rs` keeps its logic in free functions. Everything above this line
+/// that could be wrong now has a test; what is left untested is the one line of
+/// [`watch_for_exit`] that composes the two, and `emit` itself.
+fn watch_exit_with(session: &Arc<PtySession>, report: impl FnOnce(Exit) + Send + 'static) {
+    session.on_exit(report);
+}
+
+/// What the frontend is told about a session that has ended.
+///
+/// A named function rather than an inline literal at the emit below, because this value *is*
+/// the change: it used to be a fabricated [`UNKNOWN_EXIT_CODE`] for every dead pane whatever
+/// had happened, and a test that rebuilt `SessionState::Exited { code: exit.code }` by hand
+/// to compare against would assert nothing about the code that ships.
+fn exit_state(exit: &Exit) -> SessionState {
+    SessionState::Exited { code: exit.code }
+}
+
+/// Announce that `id` has ended, on `cide-pty`'s reaper thread.
 fn report_exit(app: &AppHandle, id: SessionId, exit: &Exit) {
     // Worth a line, and worth it at `warn`: a session that ended badly is the one the user
     // comes asking about ("it just vanished"), and by then the pane has been closed and the
@@ -369,11 +390,7 @@ fn report_exit(app: &AppHandle, id: SessionId, exit: &Exit) {
     // printed, and a pane that is re-mounted, re-docked or rehydrated after the exit still
     // has to be able to paint it — removing the entry would turn `session_scrollback` into
     // `NoSuchSession` and leave the pane blank instead of showing what happened.
-    crate::emit::session_state(
-        app,
-        &id.to_string(),
-        SessionState::Exited { code: exit.code },
-    );
+    crate::emit::session_state(app, &id.to_string(), exit_state(exit));
 }
 
 /// Whether an exit is worth telling the log about.
@@ -734,9 +751,12 @@ mod tests {
     /// The end of the chain this change exists to fix: a real child, a real signal, and the
     /// number that reaches `SessionState::Exited`.
     ///
-    /// Asserted through `PtySession::on_exit` rather than through `report_exit`, which needs
-    /// an `AppHandle` a unit test has no way to build. What is being checked is the value
-    /// the emit would carry, which is the part that used to be invented.
+    /// Driven through `watch_exit_with` and `exit_state` — this module's own two halves of
+    /// the chain — rather than through `report_exit`, which needs an `AppHandle` no test in
+    /// this build can make. Registering with `session.on_exit` directly and then comparing
+    /// a hand-built `SessionState::Exited { code: exit.code }` against `137` is what the
+    /// first version of this test did, and it is `assert_eq!(exit.code, 137)` written twice:
+    /// green with every line of this module deleted.
     #[cfg(unix)]
     #[test]
     fn a_session_killed_outright_reports_the_signal_it_died_of() {
@@ -762,7 +782,7 @@ mod tests {
         assert!(armed.is_file(), "the fixture never armed its traps");
 
         let (tx, rx) = std::sync::mpsc::channel::<Exit>();
-        session.on_exit(move |exit| {
+        watch_exit_with(&session, move |exit| {
             let _ = tx.send(exit);
         });
 
@@ -783,10 +803,12 @@ mod tests {
             "a child that ignored both gentle rungs must report the kill, not -1: {exit:?}"
         );
         assert!(is_abnormal(&exit));
+        // The literal, not `exit.code` again: this is the value the emit puts on the wire,
+        // and 137 is what a user reading the pane has to see for an OOM kill.
         assert_eq!(
-            SessionState::Exited { code: exit.code },
+            exit_state(&exit),
             SessionState::Exited { code: 137 },
-            "the state the frontend receives carries the real code"
+            "the state the frontend receives does not carry the real code"
         );
     }
 
@@ -798,7 +820,7 @@ mod tests {
         let session = PtySession::spawn(spec).expect("spawn sh");
 
         let (tx, rx) = std::sync::mpsc::channel::<Exit>();
-        session.on_exit(move |exit| {
+        watch_exit_with(&session, move |exit| {
             let _ = tx.send(exit);
         });
 
@@ -806,10 +828,29 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the exit watcher was never called");
         assert_eq!(exit.code, 0);
+        assert_eq!(exit_state(&exit), SessionState::Exited { code: 0 });
         assert!(
             !is_abnormal(&exit),
             "an ordinary quit must not warn once per pane"
         );
+    }
+
+    #[test]
+    fn a_status_nobody_could_read_is_published_as_unknown_rather_than_as_success() {
+        // `SessionState::is_live` is false for every `Exited` whatever the code, so nothing
+        // downstream would notice a 0 here — which is exactly why it has to be pinned. The
+        // pane prints this number, and "it finished, and it worked" is the one thing the
+        // one case with no answer must not claim.
+        let unknown = Exit {
+            code: UNKNOWN_EXIT_CODE,
+            signal: None,
+        };
+        assert_eq!(
+            exit_state(&unknown),
+            SessionState::Exited { code: -1 },
+            "an unreadable status was published as something a reader could believe"
+        );
+        assert_ne!(exit_state(&unknown), SessionState::Exited { code: 0 });
     }
 
     #[test]

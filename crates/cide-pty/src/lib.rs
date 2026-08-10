@@ -824,11 +824,24 @@ fn spawn_reaper(
         .name("cide-pty-reap".into())
         .spawn(move || {
             let exit = classify(child.wait());
-            // Status first, then the flag. Both orders are correct for `has_exited` (the
-            // coalescer sets it independently anyway), but this one means a caller that
-            // sees `has_exited()` flip *because of the reaper* can already read the status.
-            settle(&slot, exit);
+            // Three steps, and the order is the whole point.
+            //
+            // 1. Store the status, so `has_exited()` can never flip ahead of
+            //    `exit_status()` — a caller that sees the flag go true because of *this*
+            //    thread can already read how it went.
+            // 2. Set the flag, which is what the shutdown ladder is polling.
+            // 3. Only then run the watchers, which are arbitrary caller code.
+            //
+            // Running the watchers before step 2 was the first version of this, and it
+            // makes "is this child dead yet" hostage to whatever a watcher does —
+            // `cide-app`'s emits a Tauri event. A watcher that panicked would unwind this
+            // thread with `exited` still false for a child that is provably gone, and
+            // `stop_children` would then wait out every rung of the ladder on a corpse.
+            let waiting = settle(&slot, &exit);
             exited.store(true, Ordering::Release);
+            for callback in waiting {
+                callback(exit.clone());
+            }
         })
         .expect("spawn pty reaper thread");
 }
@@ -855,25 +868,24 @@ fn classify(status: std::io::Result<portable_pty::ExitStatus>) -> Exit {
     }
 }
 
-/// Publish `exit` and hand it to everyone who was waiting.
-fn settle(slot: &Mutex<ExitSlot>, exit: Exit) {
-    let waiting = {
-        let mut guard = slot.lock();
-        match std::mem::replace(&mut *guard, ExitSlot::Reaped(exit.clone())) {
-            ExitSlot::Running(waiting) => waiting,
-            // Unreachable: one reaper thread per session, and it settles once. Restoring the
-            // first answer rather than trusting the second is the conservative choice if
-            // that ever stops being true — the first reap is the real one.
-            ExitSlot::Reaped(first) => {
-                *guard = ExitSlot::Reaped(first);
-                Vec::new()
-            }
+/// Publish `exit` into the slot and hand back everyone who was waiting on it.
+///
+/// Deliberately does *not* call the watchers itself. They are arbitrary caller code and the
+/// caller has one more thing to do first — see [`spawn_reaper`] — so returning them keeps
+/// the ordering decision in the one place that can see all of it. Calling them here would
+/// also have to be outside the lock anyway: a watcher that asks this session anything would
+/// otherwise deadlock against `on_exit`.
+fn settle(slot: &Mutex<ExitSlot>, exit: &Exit) -> Vec<ExitCallback> {
+    let mut guard = slot.lock();
+    match std::mem::replace(&mut *guard, ExitSlot::Reaped(exit.clone())) {
+        ExitSlot::Running(waiting) => waiting,
+        // Unreachable: one reaper thread per session, and it settles once. Restoring the
+        // first answer rather than trusting the second is the conservative choice if
+        // that ever stops being true — the first reap is the real one.
+        ExitSlot::Reaped(first) => {
+            *guard = ExitSlot::Reaped(first);
+            Vec::new()
         }
-    };
-    // Outside the lock: a callback that asks this session anything would otherwise deadlock
-    // against `on_exit`.
-    for callback in waiting {
-        callback(exit.clone());
     }
 }
 
@@ -889,15 +901,31 @@ fn settle(slot: &Mutex<ExitSlot>, exit: Exit) {
 /// an invented signal.
 #[cfg(unix)]
 fn signal_number(name: &str) -> Option<i32> {
-    // `portable-pty`'s own fallback spelling when `strsignal` returns null. Cheaper to parse
-    // than to scan for, and it is the one case where the number is right there in the text.
-    if let Some(rest) = name.strip_prefix("Signal ") {
-        return rest.trim().parse().ok();
+    // `portable-pty`'s own fallback spelling when `strsignal` returns null, and the one case
+    // the table scan below cannot answer: a name libc would not produce is a name libc will
+    // not match either.
+    //
+    // Falls *through* rather than returning on a name that merely begins this way without
+    // carrying a number — a `return … .ok()` here would skip the table entirely for any
+    // locale whose real signal names happen to start "Signal …". The range check is not
+    // decoration either: the caller computes `128 + n` from this, and `"Signal 2147483647"`
+    // would overflow that and panic in a debug build.
+    if let Some(rest) = name.strip_prefix("Signal ")
+        && let Ok(n) = rest.trim().parse::<i32>()
+        && (1..=MAX_SIGNAL).contains(&n)
+    {
+        return Some(n);
     }
-    // 64 covers every standard signal plus the real-time range on Linux; scanning stops at
-    // the first hit and only ever runs once per session.
-    (1..=64).find(|&n| signal_name(n).as_deref() == Some(name))
+    // Scanning stops at the first hit and only ever runs once per session.
+    (1..=MAX_SIGNAL).find(|&n| signal_name(n).as_deref() == Some(name))
 }
+
+/// The highest signal number this will believe in.
+///
+/// 64 covers every standard signal plus the whole real-time range on Linux. It is a bound on
+/// what `128 + n` may be built from as much as it is a scan limit.
+#[cfg(unix)]
+const MAX_SIGNAL: i32 = 64;
 
 #[cfg(not(unix))]
 fn signal_number(_name: &str) -> Option<i32> {
@@ -1141,12 +1169,34 @@ mod tests {
         // build the name, so a round trip has to be the identity. Checked across the whole
         // range rather than for SIGKILL alone, because the failure mode is one name that
         // collides or comes back reworded under a different locale.
+        let mut checked = 0;
         for n in 1..=31 {
             let Some(name) = signal_name(n) else { continue };
+            checked += 1;
             assert_eq!(
                 signal_number(&name),
                 Some(n),
                 "signal {n} is called {name:?} and did not map back"
+            );
+        }
+
+        // The floor is what makes this a claim. The `else { continue }` above is there
+        // because a platform need not name every number, but it also means a `signal_name`
+        // that answered for nothing at all would sail through the loop having proved
+        // nothing — stubbing it to know only SIGKILL left this test green.
+        assert!(
+            checked >= 28,
+            "libc named only {checked} of signals 1..=31; the round trip proved almost nothing"
+        );
+
+        // And by name, the three the rest of this crate and `cide-app`'s ladder reason
+        // about: a table that lost exactly these would still clear the floor above.
+        for wanted in [libc::SIGHUP, libc::SIGKILL, libc::SIGTERM] {
+            let name = signal_name(wanted).unwrap_or_else(|| panic!("libc will not name {wanted}"));
+            assert_eq!(
+                signal_number(&name),
+                Some(wanted),
+                "{name:?} did not map back"
             );
         }
     }
@@ -1158,6 +1208,20 @@ mod tests {
         // carries the number in the text, and a name from nowhere, which carries nothing.
         assert_eq!(signal_number("Signal 9"), Some(9));
         assert_eq!(signal_number("not a signal anybody named"), None);
+
+        // A number outside the range `128 + n` can be built from is refused rather than
+        // believed. `128 + 2147483647` overflows `i32`, which panics a debug build — a
+        // process-wide crash to report an exit code, from a string that arrived as data.
+        assert_eq!(signal_number("Signal 2147483647"), None);
+        assert_eq!(signal_number("Signal 0"), None);
+        assert_eq!(
+            classify(Ok(portable_pty::ExitStatus::with_signal(
+                "Signal 2147483647"
+            )))
+            .code,
+            1,
+            "an out-of-range number must report the flat status, not overflow `128 + n`"
+        );
 
         let exit = classify(Ok(portable_pty::ExitStatus::with_signal(
             "not a signal anybody named",
@@ -1249,6 +1313,51 @@ mod tests {
             seen.push(exit.code);
         }
         assert_eq!(seen, vec![4, 4, 4], "a parked watcher was skipped");
+    }
+
+    #[test]
+    fn settling_hands_the_watchers_back_rather_than_running_them() {
+        // `has_exited()` is what `cide-app`'s shutdown ladder polls, and watchers are
+        // arbitrary caller code — the one that ships emits a Tauri event. So the reaper has
+        // one more thing to do, `exited.store(true)`, before any of them gets the thread,
+        // and `settle` returning them instead of calling them is what leaves that order the
+        // reaper's to choose. This is the unit that can be checked: end to end the coalescer
+        // sets the same flag on EOF, which Linux delivers as soon as the pty's session
+        // leader dies, so an integration test of the order would pass either way.
+        //
+        // The status has to be published before anyone is called, too — a watcher that asks
+        // `exit_status()` must not be told `None` about the very exit it is being handed.
+        let ran = Arc::new(AtomicBool::new(false));
+        let slot = {
+            let ran = Arc::clone(&ran);
+            let callback: ExitCallback = Box::new(move |_| ran.store(true, Ordering::Release));
+            Mutex::new(ExitSlot::Running(vec![callback]))
+        };
+
+        let exit = Exit {
+            code: 7,
+            signal: None,
+        };
+        let waiting = settle(&slot, &exit);
+
+        assert_eq!(
+            waiting.len(),
+            1,
+            "settle swallowed the parked watcher instead of handing it back"
+        );
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "settle called the watcher itself; the reaper can no longer order the two"
+        );
+        assert!(
+            matches!(&*slot.lock(), ExitSlot::Reaped(settled) if settled == &exit),
+            "the status was not published before the watchers were handed over"
+        );
+
+        for callback in waiting {
+            callback(exit.clone());
+        }
+        assert!(ran.load(Ordering::Acquire));
     }
 
     #[test]

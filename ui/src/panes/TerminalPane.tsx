@@ -12,6 +12,7 @@ import { useEffect, useRef } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
+import { exitMarkerBytes } from './exitMarker'
 import {
   events,
   paneSession,
@@ -168,22 +169,26 @@ function syncSize(paneId: string): void {
  * user-visible proof that `drop(pair.slave)` works, because without that drop the master
  * never sees EOF and this branch is never reached.
  *
- * Written into the terminal rather than rendered as React chrome: it belongs at the end of
- * the transcript, where a shell would print it, and it then survives scrollback, re-mounts
- * and detach the same way every other byte in the pane does.
+ * Written into the terminal rather than rendered as React chrome: see `exitMarker.ts`, which
+ * owns the wording and the framing so that a check script can run them without a DOM.
  *
- * SGR 2 is dim — the ANSI analogue of the `--faint` token the design uses for spent text.
+ * `code` is the child's real status — 1 for a failure, 137 for the OOM reaper, 143 for the
+ * SIGTERM this app sends on quit — and it is omitted on the one path that cannot know it.
+ * Rust reports these honestly now; before this it published a flat -1 for every dead pane,
+ * and the pane printed nothing but `— exited —` either way, so a session the machine killed
+ * looked exactly like one that finished.
  *
- * Returns whether this call is the one that wrote it. Exit now reaches a pane from two
+ * Returns whether this call is the one that wrote it. Exit reaches a pane from two
  * directions — the `cide://session-state` event, and the one-shot check for a session that
  * was already dead before this pane attached — and `onExit` must fire once however many
- * arrive.
+ * arrive. The first one to arrive is the one whose code is shown; that is the event whenever
+ * the pane was mounted at the time, which is every case but rehydration.
  */
-function markExited(paneId: string): boolean {
+function markExited(paneId: string, code?: number): boolean {
   const host = getHost(paneId)
   if (host.exitMarked) return false
   host.exitMarked = true
-  host.terminal?.term.write('\r\n\x1b[2m— exited —\x1b[0m\r\n')
+  host.terminal?.term.write(exitMarkerBytes(code))
   return true
 }
 
@@ -408,7 +413,9 @@ export function TerminalPane({
         // Not `id` from the async block above: this handler outlives it, and a pane that
         // respawned holds a different session by now.
         if (session !== getHost(paneId).sessionId) return
-        if (markExited(paneId)) exitCb.current?.()
+        // `state.code` is the whole reason the Rust side threads the status out of `wait()`.
+        // Dropping it here was the last link in the chain, and it made the change invisible.
+        if (markExited(paneId, state.code)) exitCb.current?.()
       })
       .then((fn) => {
         if (disposed) fn()
