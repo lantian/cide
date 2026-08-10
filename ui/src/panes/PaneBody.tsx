@@ -63,31 +63,20 @@ export function PaneBody({
   restore,
   onSessionBound,
 }: PaneBodyProps): ReactNode {
-  // A file is a document too: no session, no spawn, nothing to resume. (M9)
+  // Every hook first, unconditionally, before the dispatch below returns for anything.
   //
-  // Dispatched on the PANE kind, not the tab kind. Splitting a File tab creates a Claude
-  // pane — `default_intent` says so — and keying this on the tab would render a second
-  // independent `EditorPane` over the same path in it. Two editors over one file, each with
-  // its own CodeMirror state and neither aware of the other, against a single tab-level
-  // dirty flag: saving in one would clear the close guard while the other still held
-  // unsaved text. Keying on the pane means a File tab has exactly one editor, which is what
-  // makes one dirty flag per tab the right shape rather than a race.
-  if (editor && pane.kind === 'editor') {
-    return <EditorPane path={editor.path} root={cwd} project={project} tab={editor.tab} />
-  }
-
-  // A diff is a document, not a process: it never spawns and has no session to adopt. The
-  // `ClaudeMcp` case is the one that matters, because it is holding an agent turn open.
-  if (diff && diff.origin.kind === 'claudeMcp' && project) {
-    return (
-      <ClaudeDiffPane
-        project={project}
-        requestId={diff.origin.requestId}
-        oldPath={diff.oldPath}
-        newPath={diff.newPath}
-      />
-    )
-  }
+  // This used to sit *after* the editor and diff early returns, which is a rules-of-hooks
+  // violation: React identifies a hook by its call order within a component, so a render
+  // that returns early declares fewer hooks than one that does not, and every later hook
+  // shifts by one. It was harmless only because a pane's kind is fixed for the life of a
+  // mount — a property of today's callers, not a guarantee any of them promise, and one
+  // React's own lint will not accept regardless.
+  //
+  // Hoisting is free here. The initialiser is a pure read of the host registry, and for the
+  // two document cases `restore` is `undefined` anyway — `lifecycle::entry_for` plans an
+  // entry only for a Claude or Shell pane — so `held` computes to `false` and is never
+  // consulted. What is *not* free is reordering these two calls relative to each other, or
+  // moving them below the splash branch that reads them.
 
   // Whether this pane is held at a splash instead of spawning.
   //
@@ -120,6 +109,32 @@ export function PaneBody({
     () => restore !== undefined && !restore.eager && paneSessionId(pane.id) === undefined,
   )
   const [resumed, setResumed] = useState(false)
+
+  // A file is a document too: no session, no spawn, nothing to resume. (M9)
+  //
+  // Dispatched on the PANE kind, not the tab kind. Splitting a File tab creates a Claude
+  // pane — `default_intent` says so — and keying this on the tab would render a second
+  // independent `EditorPane` over the same path in it. Two editors over one file, each with
+  // its own CodeMirror state and neither aware of the other, against a single tab-level
+  // dirty flag: saving in one would clear the close guard while the other still held
+  // unsaved text. Keying on the pane means a File tab has exactly one editor, which is what
+  // makes one dirty flag per tab the right shape rather than a race.
+  if (editor && pane.kind === 'editor') {
+    return <EditorPane path={editor.path} root={cwd} project={project} tab={editor.tab} />
+  }
+
+  // A diff is a document, not a process: it never spawns and has no session to adopt. The
+  // `ClaudeMcp` case is the one that matters, because it is holding an agent turn open.
+  if (diff && diff.origin.kind === 'claudeMcp' && project) {
+    return (
+      <ClaudeDiffPane
+        project={project}
+        requestId={diff.origin.requestId}
+        oldPath={diff.oldPath}
+        newPath={diff.newPath}
+      />
+    )
+  }
 
   if (held && !resumed) {
     // A shell has no conversation to resume. Its scrollback is genuinely gone, so it

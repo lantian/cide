@@ -101,6 +101,58 @@ impl Default for CreditPolicy {
 /// Size of each blocking read from the PTY master.
 const READ_BUF: usize = 64 * 1024;
 
+/// Reported when the child was reaped but its status could not be read.
+///
+/// `child.wait()` returning an error is the only way to get here — the pid was already
+/// reaped by something else, or the syscall failed. -1 rather than 0 because a fabricated
+/// success is the one value that could later be mistaken for a real one, and the shell's
+/// status space is 0..=255 so nothing legitimate collides with it.
+pub const UNKNOWN_EXIT_CODE: i32 = -1;
+
+/// How a child ended.
+///
+/// # Why the code is not just `ExitStatus::exit_code()`
+///
+/// `portable-pty` converts a `std::process::ExitStatus` into its own type and, for a child
+/// that died of a signal, throws the signal *number* away and keeps a strsignal *name* —
+/// filling `code` with a flat 1. That makes an OOM kill (SIGKILL) indistinguishable from
+/// `exit 1`, and indistinguishable from the SIGTERM the app itself sends on quit, which is
+/// exactly the distinction anyone reading an exit code wants. So [`signal_number`] maps the
+/// name back and this carries the shell's `128 + signum` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exit {
+    /// The shell convention: the child's own status, or `128 + signum` when a signal ended
+    /// it, or [`UNKNOWN_EXIT_CODE`] when the status could not be read at all.
+    pub code: i32,
+    /// The signal's name — `"Killed"`, `"Terminated"` — when a signal ended the child.
+    ///
+    /// Kept beside the code because the code is a number a log reader has to decode and
+    /// this is the sentence they were looking for. `None` for an ordinary exit.
+    pub signal: Option<String>,
+}
+
+impl Exit {
+    /// Whether this is the ordinary "it finished, and it worked" case.
+    pub fn is_success(&self) -> bool {
+        self.code == 0
+    }
+}
+
+/// Called once, on the reaper thread, when the child has been reaped.
+type ExitCallback = Box<dyn FnOnce(Exit) + Send + 'static>;
+
+/// The reaper's answer, and whoever is waiting on it.
+///
+/// One slot behind one lock rather than a channel, because there are two arrival orders and
+/// both are ordinary: a watcher registered while the child was still running has to be
+/// parked, and one registered after it died has to be answered immediately. A channel makes
+/// the second case a message with no receiver — which is precisely the bug the polling
+/// version in `cide-app` existed to work around.
+enum ExitSlot {
+    Running(Vec<ExitCallback>),
+    Reaped(Exit),
+}
+
 /// Lines of scrollback the vt100 mirror retains for reattach.
 const SCROLLBACK: usize = 5_000;
 
@@ -287,6 +339,13 @@ pub struct PtySession {
     geometry: Mutex<Geometry>,
     child_pid: Option<u32>,
     exited: Arc<AtomicBool>,
+    /// The reaper's answer. Separate from `exited` on purpose: `exited` is *also* set by the
+    /// coalescer when the master reaches EOF, which can happen before — or, if a descendant
+    /// is still holding the pty open, after — the child is actually reaped. `has_exited()`
+    /// answers "is this pane dead" as early as possible, which is what the `— exited —`
+    /// marker and the credit watchdog want; this answers "and how", which only the reaper
+    /// knows.
+    exit: Arc<Mutex<ExitSlot>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     credit: CreditPolicy,
 }
@@ -355,7 +414,8 @@ impl PtySession {
         spawn_writer(writer, writer_rx);
 
         let killer = child.clone_killer();
-        spawn_reaper(child, Arc::clone(&exited));
+        let exit = Arc::new(Mutex::new(ExitSlot::Running(Vec::new())));
+        spawn_reaper(child, Arc::clone(&exited), Arc::clone(&exit));
 
         Ok(Arc::new(Self {
             master: Mutex::new(pair.master),
@@ -366,6 +426,7 @@ impl PtySession {
             geometry: Mutex::new(spec.geometry),
             child_pid,
             exited,
+            exit,
             killer: Mutex::new(killer),
             credit: spec.credit,
         }))
@@ -379,8 +440,56 @@ impl PtySession {
         self.child_pid
     }
 
+    /// Whether this pane's child is gone, as early as anything here can tell.
+    ///
+    /// Set by whichever of the two observers gets there first: the coalescer, when the pty
+    /// master reaches EOF, or the reaper, when `wait()` returns. Deliberately *not*
+    /// tightened to "has been reaped" — the `— exited —` marker and the shutdown ladder
+    /// both want the earliest honest answer, and [`Self::exit_status`] is where the precise
+    /// one lives.
     pub fn has_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+
+    /// How the child ended, or `None` while it is still running or not yet reaped.
+    ///
+    /// `has_exited()` can be true while this is still `None`: EOF on the master and the
+    /// reaper's `wait()` are two different events on two different threads. A caller that
+    /// needs the status should use [`Self::on_exit`] rather than poll this, which is here
+    /// for tests and the debug overlay.
+    pub fn exit_status(&self) -> Option<Exit> {
+        match &*self.exit.lock() {
+            ExitSlot::Running(_) => None,
+            ExitSlot::Reaped(exit) => Some(exit.clone()),
+        }
+    }
+
+    /// Call `f` once, with the real exit status, when the child is reaped.
+    ///
+    /// Runs on the reaper thread, so `f` must not block for long — it is what makes the
+    /// pty threads' shutdown observable. If the child has *already* been reaped, `f` runs
+    /// immediately on the calling thread instead of never: registration racing the child's
+    /// death is ordinary (a one-shot `claude --version` can be gone before `spawn` has
+    /// returned), and a watcher that silently missed its event is how a pane ends up
+    /// showing a live cursor on a dead process.
+    ///
+    /// The alternative that lost was polling `has_exited()` on a thread per session, which
+    /// is what `cide-app` did before this existed: it cost a wakeup every 200 ms per pane
+    /// and, worse, could only ever report that the child was gone — never how, because by
+    /// the time it noticed, `waitpid` had already been called and answers `ECHILD`.
+    pub fn on_exit(&self, f: impl FnOnce(Exit) + Send + 'static) {
+        let mut slot = self.exit.lock();
+        let exit = match &mut *slot {
+            ExitSlot::Running(waiting) => {
+                waiting.push(Box::new(f));
+                return;
+            }
+            ExitSlot::Reaped(exit) => exit.clone(),
+        };
+        // Never with the lock held: `f` is arbitrary caller code and may well ask this
+        // session something.
+        drop(slot);
+        f(exit);
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -701,14 +810,113 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>, rx: Receiver<Vec<u8>>) {
         .expect("spawn pty writer thread");
 }
 
-fn spawn_reaper(mut child: Box<dyn portable_pty::Child + Send + Sync>, exited: Arc<AtomicBool>) {
+/// Reap the child and publish how it went.
+///
+/// This thread is the only place the exit status exists. `wait()` consumes it — a second
+/// `waitpid` on that pid answers `ECHILD` — so a status dropped here is gone for good,
+/// which is why the previous version could only ever report -1.
+fn spawn_reaper(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    exited: Arc<AtomicBool>,
+    slot: Arc<Mutex<ExitSlot>>,
+) {
     thread::Builder::new()
         .name("cide-pty-reap".into())
         .spawn(move || {
-            let _ = child.wait();
+            let exit = classify(child.wait());
+            // Status first, then the flag. Both orders are correct for `has_exited` (the
+            // coalescer sets it independently anyway), but this one means a caller that
+            // sees `has_exited()` flip *because of the reaper* can already read the status.
+            settle(&slot, exit);
             exited.store(true, Ordering::Release);
         })
         .expect("spawn pty reaper thread");
+}
+
+/// Turn what `wait()` returned into the status we report.
+fn classify(status: std::io::Result<portable_pty::ExitStatus>) -> Exit {
+    let Ok(status) = status else {
+        return Exit {
+            code: UNKNOWN_EXIT_CODE,
+            signal: None,
+        };
+    };
+    match status.signal() {
+        Some(name) => Exit {
+            // `exit_code()` is a flat 1 for every signalled child, so falling back to it
+            // when the name will not map is a last resort rather than the answer.
+            code: signal_number(name).map_or_else(|| status.exit_code() as i32, |n| 128 + n),
+            signal: Some(name.to_string()),
+        },
+        None => Exit {
+            code: status.exit_code() as i32,
+            signal: None,
+        },
+    }
+}
+
+/// Publish `exit` and hand it to everyone who was waiting.
+fn settle(slot: &Mutex<ExitSlot>, exit: Exit) {
+    let waiting = {
+        let mut guard = slot.lock();
+        match std::mem::replace(&mut *guard, ExitSlot::Reaped(exit.clone())) {
+            ExitSlot::Running(waiting) => waiting,
+            // Unreachable: one reaper thread per session, and it settles once. Restoring the
+            // first answer rather than trusting the second is the conservative choice if
+            // that ever stops being true — the first reap is the real one.
+            ExitSlot::Reaped(first) => {
+                *guard = ExitSlot::Reaped(first);
+                Vec::new()
+            }
+        }
+    };
+    // Outside the lock: a callback that asks this session anything would otherwise deadlock
+    // against `on_exit`.
+    for callback in waiting {
+        callback(exit.clone());
+    }
+}
+
+/// The number behind a strsignal name, so `128 + n` can be reported.
+///
+/// A reverse lookup rather than a guess: `portable-pty` produced the name by calling
+/// `strsignal` in *this* process, so asking the same libc in the same locale for the same
+/// strings gets the same table back. A hardcoded English list would be wrong for any user
+/// whose `LC_MESSAGES` is not English — and wrong silently, reporting `exit 1` for an OOM
+/// kill, which is the failure this whole change exists to remove.
+///
+/// `None` when nothing matches, which the caller reports as the flat status rather than as
+/// an invented signal.
+#[cfg(unix)]
+fn signal_number(name: &str) -> Option<i32> {
+    // `portable-pty`'s own fallback spelling when `strsignal` returns null. Cheaper to parse
+    // than to scan for, and it is the one case where the number is right there in the text.
+    if let Some(rest) = name.strip_prefix("Signal ") {
+        return rest.trim().parse().ok();
+    }
+    // 64 covers every standard signal plus the real-time range on Linux; scanning stops at
+    // the first hit and only ever runs once per session.
+    (1..=64).find(|&n| signal_name(n).as_deref() == Some(name))
+}
+
+#[cfg(not(unix))]
+fn signal_number(_name: &str) -> Option<i32> {
+    None
+}
+
+/// What libc calls signal `n`, or `None` if it will not say.
+#[cfg(unix)]
+fn signal_name(n: i32) -> Option<String> {
+    // SAFETY: `strsignal` takes an int and returns a pointer to a string libc owns — a
+    // static for a known signal, a per-thread buffer for an unknown one. We copy it out
+    // before returning and never free it, and never hold it across another libc call.
+    let ptr = unsafe { libc::strsignal(n) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: non-null and NUL-terminated by the contract of `strsignal`.
+    let name = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    Some(name.to_string_lossy().into_owned())
 }
 
 // `TrySendError` is re-exported for callers that want a non-blocking write path later.
@@ -835,6 +1043,223 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(session.has_exited(), "child exit was never observed");
+    }
+
+    /// Block until the child has been reaped, or give up. Returns the status.
+    ///
+    /// `has_exited()` is not the condition: it flips on EOF too, and EOF is a different
+    /// thread's event. Waiting on the *status* is what these tests are actually about.
+    fn await_exit(session: &PtySession) -> Exit {
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline {
+            if let Some(exit) = session.exit_status() {
+                return exit;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the child was never reaped");
+    }
+
+    #[test]
+    fn an_ordinary_exit_code_is_reported_verbatim() {
+        // The whole point of threading the status out: 7 has to arrive as 7, not as the
+        // flat -1 the app used to publish for every dead session.
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("exit 7");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let exit = await_exit(&session);
+        assert_eq!(exit.code, 7, "the child's own status was not reported");
+        assert_eq!(exit.signal, None, "nothing signalled this child");
+        assert!(!exit.is_success());
+    }
+
+    #[test]
+    fn a_clean_exit_is_zero_and_carries_no_signal() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("exit 0");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let exit = await_exit(&session);
+        assert_eq!(exit.code, 0);
+        assert!(exit.is_success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_child_is_distinguishable_from_one_that_failed() {
+        // The case the whole change exists for. `claude` killed by the OOM reaper and
+        // `claude` exiting 1 are the same event to anyone reading `portable-pty`'s status,
+        // which fills `exit_code` with a flat 1 for *every* signalled child. 137 vs 1 is
+        // the difference between "your machine ran out of memory" and "it reported an
+        // error", and the user only ever sees the number.
+        let killed = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("kill -KILL $$");
+        let killed = PtySession::spawn(killed).expect("spawn sh");
+        let killed = await_exit(&killed);
+
+        let failed = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("exit 1");
+        let failed = PtySession::spawn(failed).expect("spawn sh");
+        let failed = await_exit(&failed);
+
+        assert_eq!(killed.code, 128 + libc::SIGKILL, "SIGKILL must read as 137");
+        assert!(
+            killed.signal.is_some(),
+            "a signalled child must name its signal: {killed:?}"
+        );
+        assert_eq!(failed.code, 1);
+        assert_eq!(failed.signal, None);
+        assert_ne!(
+            killed.code, failed.code,
+            "an OOM kill and `exit 1` reported the same thing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminated_child_is_distinguishable_from_a_killed_one() {
+        // The app's own shutdown ladder sends SIGHUP then SIGTERM, so "the user quit" has
+        // to read differently from "something killed it".
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("kill -TERM $$");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let exit = await_exit(&session);
+        assert_eq!(exit.code, 128 + libc::SIGTERM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_signal_name_libc_gives_us_maps_back_to_its_number() {
+        // `signal_number` is a reverse lookup over exactly the table `portable-pty` used to
+        // build the name, so a round trip has to be the identity. Checked across the whole
+        // range rather than for SIGKILL alone, because the failure mode is one name that
+        // collides or comes back reworded under a different locale.
+        for n in 1..=31 {
+            let Some(name) = signal_name(n) else { continue };
+            assert_eq!(
+                signal_number(&name),
+                Some(n),
+                "signal {n} is called {name:?} and did not map back"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unmappable_signal_name_falls_back_rather_than_inventing_a_number() {
+        // Two shapes of "we cannot tell": portable-pty's own `Signal N` spelling, which
+        // carries the number in the text, and a name from nowhere, which carries nothing.
+        assert_eq!(signal_number("Signal 9"), Some(9));
+        assert_eq!(signal_number("not a signal anybody named"), None);
+
+        let exit = classify(Ok(portable_pty::ExitStatus::with_signal(
+            "not a signal anybody named",
+        )));
+        assert_eq!(
+            exit.code, 1,
+            "an unmappable name must report the flat status, not `128 + garbage`"
+        );
+        assert_eq!(exit.signal.as_deref(), Some("not a signal anybody named"));
+    }
+
+    #[test]
+    fn a_wait_that_failed_reports_unknown_rather_than_success() {
+        // The one path that has no answer. Reporting 0 here would be a fabricated success
+        // — the single value that could later be mistaken for a real one.
+        let exit = classify(Err(std::io::Error::from_raw_os_error(10)));
+        assert_eq!(exit.code, UNKNOWN_EXIT_CODE);
+        assert_eq!(exit.signal, None);
+        assert!(!exit.is_success());
+    }
+
+    #[test]
+    fn a_watcher_registered_before_the_child_dies_is_called_once() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            // Long enough that registration is comfortably first, short enough that the
+            // test does not sit on it.
+            .arg("sleep 0.3; exit 5");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let (tx, rx) = mpsc::channel::<Exit>();
+        session.on_exit(move |exit| {
+            let _ = tx.send(exit);
+        });
+
+        let exit = rx
+            .recv_timeout(DEADLINE)
+            .expect("the watcher was never called");
+        assert_eq!(exit.code, 5);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the watcher fired more than once"
+        );
+    }
+
+    #[test]
+    fn a_watcher_registered_after_the_child_dies_still_fires() {
+        // A one-shot child can be gone before `spawn` has returned. A watcher that silently
+        // missed its event is how a pane ends up showing a live cursor on a dead process —
+        // which is why this is answered from the stored status rather than parked for an
+        // event that already happened.
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("exit 3");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        let reaped = await_exit(&session);
+        assert_eq!(reaped.code, 3);
+
+        let (tx, rx) = mpsc::channel::<Exit>();
+        session.on_exit(move |exit| {
+            let _ = tx.send(exit);
+        });
+        let exit = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a late watcher was dropped on the floor");
+        assert_eq!(exit.code, 3);
+    }
+
+    #[test]
+    fn every_watcher_gets_the_answer() {
+        // The app registers one, but the mirror/detach story means "one pane per session"
+        // has never been a safe assumption here.
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 0.2; exit 4");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let (tx, rx) = mpsc::channel::<Exit>();
+        for _ in 0..3 {
+            let tx = tx.clone();
+            session.on_exit(move |exit| {
+                let _ = tx.send(exit);
+            });
+        }
+        drop(tx);
+
+        let mut seen = Vec::new();
+        while let Ok(exit) = rx.recv_timeout(DEADLINE) {
+            seen.push(exit.code);
+        }
+        assert_eq!(seen, vec![4, 4, 4], "a parked watcher was skipped");
+    }
+
+    #[test]
+    fn exit_status_is_none_while_the_child_runs() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 30");
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        assert_eq!(session.exit_status(), None);
+        assert!(!session.has_exited());
+        session.kill();
     }
 
     #[test]
