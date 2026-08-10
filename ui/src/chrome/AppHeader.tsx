@@ -31,7 +31,27 @@ export interface AppHeaderProps {
   onClose?: ((id: string) => void) | undefined
   onNew?: (() => void) | undefined
   onToggleTheme?: (() => void) | undefined
+  /**
+   * Split the focused pane of the active tab.
+   *
+   * The header's ⊞ is the same gesture `TabStrip`'s already is, aimed at whatever pane has
+   * focus, so a host supplies the same call:
+   * `useWorkspace`'s `splitPane(project, tab.id, tab.tree.focused, 'row', 'after')`. The
+   * intent is left `null` on purpose — which pane kind a split produces is the domain's
+   * decision, not the header's.
+   *
+   * Omitted renders the button **disabled**, not inert. There is no project, or no host that
+   * can split, and a control that looks live and does nothing is indistinguishable from a
+   * broken app — which is the state this header shipped in.
+   */
   onSplit?: (() => void) | undefined
+  /**
+   * Detach the focused pane into its own window.
+   *
+   * A host supplies `useWorkspace`'s `detachPane(project, tab.id, tab.tree.focused)`, which
+   * measures the pane and forwards to `window_detach_pane`. Same disabled-when-absent
+   * contract as `onSplit`.
+   */
   onDetach?: (() => void) | undefined
 }
 
@@ -139,15 +159,34 @@ export function AppHeader({
         <button type="button" className={styles.action} title="Toggle theme" onClick={onToggleTheme}>
           ◐
         </button>
+        {/*
+         * ⊞ and ⧉ are disabled when no host supplied a handler, rather than drawn live and
+         * doing nothing on click. Both spent a milestone in the latter state, which reads
+         * exactly like a broken app: there is no feedback to distinguish "this window cannot
+         * split right now" from "the split command crashed".
+         *
+         * `disabled` rather than hiding them: the mock states three actions in this corner,
+         * and a control that vanishes when unavailable teaches nothing about why. The title
+         * carries the reason, since the glyph cannot.
+         */}
         <button
           type="button"
           className={`${styles.action} ${styles.actionSplit}`}
-          title="Split pane"
+          title={onSplit === undefined ? 'Split pane — unavailable in this window' : 'Split pane'}
+          disabled={onSplit === undefined}
           onClick={onSplit}
         >
           ⊞
         </button>
-        <button type="button" className={styles.action} title="Detach window" onClick={onDetach}>
+        <button
+          type="button"
+          className={styles.action}
+          title={
+            onDetach === undefined ? 'Detach window — unavailable in this window' : 'Detach window'
+          }
+          disabled={onDetach === undefined}
+          onClick={onDetach}
+        >
           ⧉
         </button>
       </div>

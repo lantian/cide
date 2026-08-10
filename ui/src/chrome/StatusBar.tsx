@@ -9,6 +9,7 @@
  * Every field is a prop with a placeholder default. The bar reads nothing from the store,
  * so it stays a pure render target that a screenshot test can drive directly.
  */
+import { NO_DIAGNOSTICS_SOURCE } from '@/sidebar/ProblemsPanel/model'
 import styles from './StatusBar.module.css'
 
 export interface Diagnostics {
@@ -27,8 +28,18 @@ export interface StatusBarProps {
   encoding?: string | undefined
 }
 
-const DIAGNOSTICS_PENDING =
-  'Diagnostics need a language server. None runs in v1; counts arrive with the language-server milestone.'
+/*
+ * The wording now lives in `sidebar/ProblemsPanel/model.ts`, because the problems panel says
+ * the same thing at length and these two are the only surfaces that speak for the missing
+ * analyser. Two hand-kept copies of a user-visible claim are two claims, and this one had
+ * already been written twice by the time the panel existed.
+ *
+ * The import goes chrome → sidebar, which is the wrong direction for a component but not for
+ * this: `model.ts` is pure, importless data, so the bar stays a render target that pulls in
+ * no store and no React tree. `ui/scripts/check-problems.mjs` fails if this file grows its
+ * own copy of the sentence again.
+ */
+const DIAGNOSTICS_PENDING = NO_DIAGNOSTICS_SOURCE
 
 const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.'
 

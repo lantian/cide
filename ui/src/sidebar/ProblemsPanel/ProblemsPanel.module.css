@@ -1,0 +1,243 @@
+/*
+ * The problems panel.
+ *
+ * Width and header are the explorer's, from `--w-sidebar-files` and its 30px/10.5px/uppercase
+ * header — not because problems and files are the same kind of list, but because the two are
+ * mutually exclusive sidebar views and the editor beside them must not shift by a pixel when
+ * the rail switches between them. A third width token was the alternative; it would have made
+ * every view change reflow the pane grid.
+ *
+ * Every colour is a token, so both themes work without a second rule anywhere in this file.
+ */
+
+.panel {
+  width: var(--w-sidebar-files);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.header {
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+  user-select: none;
+}
+
+.headerTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Mono and tabular, matching the explorer's row counter — including when it holds the em
+   dash, which is the whole point of that slot in this panel. */
+.headerMeta {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px 12px 16px;
+  /* Prose, and the explainer is the point of the surface in v1 — it has to be selectable
+     and quotable, unlike the chrome around it which sets `user-select: none` globally. */
+  user-select: text;
+}
+
+/* The one claim the panel makes. Sized above the body text because it is the answer; the
+   paragraphs under it are the reasoning. */
+.claim {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-hi);
+}
+
+/* Unknown is dim, not red: nothing is broken and nothing is wrong — it is simply unmeasured,
+   and an alarm colour here would make a missing feature look like a fault. */
+.claimUnknown {
+  color: var(--dim);
+}
+
+.claimClean {
+  color: var(--green);
+}
+
+.claimCounts {
+  color: var(--text-hi);
+}
+
+.detail {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--faint);
+}
+
+.note {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.noteHead {
+  margin: 12px 0 0;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.noteHead:first-child {
+  margin-top: 0;
+}
+
+.list {
+  margin: 4px 0 0;
+  /* The marker sits in the padding; 16px keeps the text flush with the paragraphs above so
+     the block reads as one column rather than two indents. */
+  padding-left: 16px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--faint);
+}
+
+.note code,
+.list code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text);
+}
+
+/* --- The list, for the day something fills it. ------------------------------------- */
+
+.groups {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.groupHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.groupPath {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  /* Clipped at the end, with the full path in the group's `title`. `direction: rtl` would
+     keep the more informative tail visible, but it also reorders the leading and trailing
+     punctuation of a path under the bidi algorithm — a wrong path is worse than a clipped
+     one. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.groupCount {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  text-align: left;
+}
+
+/* Only the wired form gets hover and a pointer: an un-wired row is text, and dressing it as
+   a control is the exact bug this panel was written to stop repeating. */
+.rowButton {
+  cursor: pointer;
+}
+
+.rowButton:hover {
+  background: var(--chrome-hi);
+}
+
+.rowButton:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.glyph {
+  flex: none;
+  width: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.error {
+  color: var(--red);
+}
+
+.warning {
+  color: var(--yellow);
+}
+
+.info {
+  color: var(--blue);
+}
+
+.hint {
+  color: var(--faint);
+}
+
+.message {
+  flex: 1;
+  min-width: 0;
+  /* Two lines of message beat an ellipsis in a 252px panel: a truncated compiler error is
+     usually truncated exactly where it becomes useful. */
+  overflow-wrap: anywhere;
+}
+
+.code {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.where {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
