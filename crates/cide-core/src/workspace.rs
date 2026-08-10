@@ -122,6 +122,7 @@ pub fn open_project(
             tabs: vec![console],
             active_tab,
             detached: IndexMap::new(),
+            dock_anchors: IndexMap::new(),
             primary_session,
         },
     );
@@ -501,6 +502,9 @@ pub fn adopt_shell_window(ws: &mut Workspace, label: WindowLabel) {
 /// attaches to the *same* `SessionId` and the child process never notices. That is the
 /// whole reason sessions are owned by the registry rather than by the tree.
 ///
+/// Its position is recorded too, in `project.dock_anchors`, so [`redock_pane`] can put it
+/// back in the split it came out of instead of merely somewhere in the same tab.
+///
 /// Returns the label of the window to create. The caller opens it; this module has no idea
 /// what a window really is.
 pub fn detach_pane(
@@ -512,14 +516,25 @@ pub fn detach_pane(
     // `take_pane` enforces the same refusals as closing: the console's primary pane cannot
     // leave while it is alone, and neither can a tab's last pane. Detaching the only pane
     // of a tab would leave an empty tab behind, which the tree has no way to represent.
-    let taken = {
+    let (taken, anchor) = {
         let t = tab_mut(ws, project, tab)?;
-        layout::take_pane(&mut t.tree, pane)?
+        // Read before the surgery, in this order and not the other: `take_pane` collapses the
+        // split the anchor describes, so asking afterwards would find nothing to record.
+        let anchor = layout::anchor_of(&t.tree, pane);
+        let taken = layout::take_pane(&mut t.tree, pane)?;
+        (taken, anchor)
     };
 
     let label = WindowLabel::detached_pane();
     let p = project_mut(ws, project)?;
     p.detached.insert(pane, taken);
+    // `None` only for a pane that is its tab's whole tree, which `take_pane` has already
+    // refused above — so in practice this always records. Kept as an `Option` rather than an
+    // `expect` because the absence is a real state the re-dock path must handle anyway: a
+    // workspace written by a build older than this one has no anchors at all.
+    if let Some(anchor) = anchor {
+        p.dock_anchors.insert(pane, anchor);
+    }
     ws.windows.insert(
         label.clone(),
         WindowRole::DetachedPane { project, tab, pane },
@@ -530,10 +545,19 @@ pub fn detach_pane(
 
 /// Put a detached pane back where it came from.
 ///
-/// It re-enters beside whatever currently holds focus in its home tab, which is the closest
-/// thing to "where it was" once the tree has moved on — the sibling it used to share a
-/// split with may itself have been closed. Exactness is not available here and pretending
-/// otherwise would mean storing a path that goes stale.
+/// **Exactly** where it came from, whenever that is still a place: [`detach_pane`] recorded
+/// the sibling node, the axis, the side and the ratio of the split it was torn out of, and
+/// if that sibling is still in the home tab the split is rebuilt around it — same divider
+/// id, same ratio. That is the case the gesture is usually made of: detach, look at it on
+/// the other monitor, put it back, with the tab untouched in between. Coming back into a
+/// fresh 50/50 there is not a rounding error, it is a resize, and a resized terminal makes a
+/// `claude` TUI repaint its whole transcript.
+///
+/// The anchor can still go stale — the sibling may have been closed, or the home tab may be
+/// gone entirely and the pane lands in the console — and then it falls back to entering
+/// beside whatever currently holds focus. That fallback is the right answer rather than a
+/// failure: the position the user is asking for no longer exists, so the pane goes where
+/// their attention is, which is what the previous unconditional behaviour did for every case.
 ///
 /// Returns the window label that should now close.
 pub fn redock_pane(ws: &mut Workspace, label: &WindowLabel) -> Result<WindowLabel> {
@@ -544,9 +568,13 @@ pub fn redock_pane(ws: &mut Workspace, label: &WindowLabel) -> Result<WindowLabe
         )));
     };
 
-    let Some(taken) = project_mut(ws, project)?.detached.shift_remove(&pane) else {
+    let p = project_mut(ws, project)?;
+    let Some(taken) = p.detached.shift_remove(&pane) else {
         return Err(CoreError::NoSuchPane(pane));
     };
+    // Removed whether or not it gets used: the pane is about to stop being detached, and an
+    // anchor outliving it would be a record of a position for a pane that has one.
+    let anchor = p.dock_anchors.shift_remove(&pane);
 
     // The home tab may have been closed while the pane was out. Its console always exists,
     // so that is where it lands rather than being lost with the window.
@@ -557,8 +585,19 @@ pub fn redock_pane(ws: &mut Workspace, label: &WindowLabel) -> Result<WindowLabe
     };
 
     let t = tab_mut(ws, project, home)?;
-    let target = t.tree.focused;
-    layout::insert_pane(&mut t.tree, target, Axis::Row, Side::After, taken)?;
+    // `can_restore` also settles the landed-in-the-console case for free: node ids are unique
+    // across the workspace, so an anchor from a closed tab matches nothing in the console and
+    // takes the fallback without needing a separate check for it.
+    let restore = anchor.filter(|a| layout::can_restore(&t.tree, a));
+    match restore {
+        Some(anchor) => {
+            layout::insert_pane_at(&mut t.tree, &anchor, taken)?;
+        }
+        None => {
+            let target = t.tree.focused;
+            layout::insert_pane(&mut t.tree, target, Axis::Row, Side::After, taken)?;
+        }
+    }
 
     ws.windows.shift_remove(label);
     bump(ws);
@@ -746,6 +785,19 @@ pub fn validate(ws: &Workspace) -> Result<()> {
             if !panes.insert(*pane_id) {
                 return Err(CoreError::Invariant(format!(
                     "pane {pane_id} is detached but also live in a tab"
+                )));
+            }
+        }
+        // Anchors are a side map on `detached` and are inserted and removed with it. One left
+        // behind describes where a pane that is no longer detached used to sit, and the pane
+        // it names is by then live in some tab — where a later re-dock of a *different* pane
+        // could match its sibling and rebuild a split that nothing asked for. The stored
+        // sibling is deliberately not checked: it is allowed to be stale, which is the whole
+        // reason `redock_pane` tests it before trusting it.
+        for pane_id in p.dock_anchors.keys() {
+            if !p.detached.contains_key(pane_id) {
+                return Err(CoreError::Invariant(format!(
+                    "pane {pane_id} has a dock anchor but is not detached"
                 )));
             }
         }
@@ -1162,7 +1214,25 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cide_ipc::LayoutNode;
+    use cide_ipc::{LayoutNode, SplitId};
+
+    /// Every divider id under a node, outermost first.
+    ///
+    /// `layout` has its own collector but keeps it private, and these tests want only the
+    /// ids; duplicating five lines is cheaper than widening that module's surface for a test.
+    fn collect_split_ids_of(node: &LayoutNode) -> Vec<SplitId> {
+        let mut out = Vec::new();
+        push_split_ids(node, &mut out);
+        out
+    }
+
+    fn push_split_ids(node: &LayoutNode, out: &mut Vec<SplitId>) {
+        if let LayoutNode::Split { id, a, b, .. } = node {
+            out.push(*id);
+            push_split_ids(a, out);
+            push_split_ids(b, out);
+        }
+    }
 
     fn open(ws: &mut Workspace, path: &str) -> ProjectId {
         open_project(ws, vec![PathBuf::from(path)], None).expect("a rooted project opens")
@@ -1769,6 +1839,95 @@ mod tests {
         validate(&ws).expect("valid");
     }
 
+    /// The criterion: "re-dock restores its tree position". Detach, change nothing, re-dock —
+    /// and the tab is the tree it was, ratio included.
+    ///
+    /// The ratio is the half that costs something. A pane that was 70/30 coming back 50/50
+    /// resizes the terminal inside it, and a resized `claude` TUI repaints its entire
+    /// transcript; so the console is deliberately dragged off centre before the detach, and
+    /// the whole `root` is compared rather than "is the pane back in this tab".
+    #[test]
+    fn redocking_an_unchanged_tab_restores_the_exact_position_and_ratio() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let extra = split_console(&mut ws, id);
+
+        // A third pane, so the detached one is torn out of a nested split rather than the
+        // root: a re-dock that merely re-split the tab at top level would pass on two panes.
+        let (deep, before) = {
+            let t = tab_mut(&mut ws, id, console).expect("exists");
+            let deep = layout::split(&mut t.tree, extra, Axis::Col, Side::After, aux_pane())
+                .expect("splits");
+            // Both dividers off 0.5, which is what a fresh split writes — a restore that lost
+            // the ratio would otherwise still match whichever one had never been dragged.
+            for (split, ratio) in collect_split_ids_of(&t.tree.root)
+                .into_iter()
+                .zip([0.71_f32, 0.29])
+            {
+                layout::set_ratio(&mut t.tree, split, ratio).expect("a live divider moves");
+            }
+            (deep, t.tree.clone())
+        };
+
+        let label = detach_pane(&mut ws, id, console, deep).expect("detaches");
+        assert!(
+            project(&ws, id)
+                .expect("exists")
+                .dock_anchors
+                .contains_key(&deep),
+            "detaching recorded where the pane was"
+        );
+        redock_pane(&mut ws, &label).expect("redocks");
+
+        let after = &tab(&ws, id, console).expect("exists").tree;
+        assert_eq!(
+            after.root, before.root,
+            "the tree came back a different shape or with a different ratio"
+        );
+        assert_eq!(after.focused, deep, "the pane just put back holds focus");
+        assert!(
+            project(&ws, id).expect("exists").dock_anchors.is_empty(),
+            "the anchor is spent, not left behind for a pane that is no longer detached"
+        );
+        validate(&ws).expect("valid");
+    }
+
+    /// The other half: the position the anchor names can genuinely stop existing, and then
+    /// falling back to the focus-adjacent placement is the right answer rather than an error.
+    #[test]
+    fn redocking_falls_back_to_focus_when_the_anchor_has_closed() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let primary = tab(&ws, id, console).expect("exists").tree.focused;
+        let extra = split_console(&mut ws, id);
+        let deep = {
+            let t = tab_mut(&mut ws, id, console).expect("exists");
+            layout::split(&mut t.tree, extra, Axis::Col, Side::After, aux_pane()).expect("splits")
+        };
+
+        let label = detach_pane(&mut ws, id, console, deep).expect("detaches");
+        let anchor = project(&ws, id).expect("exists").dock_anchors[&deep].clone();
+        // `deep` split against `extra`; closing it is what takes the anchor's sibling away.
+        close_pane(&mut ws, id, console, extra, false).expect("closes");
+
+        redock_pane(&mut ws, &label).expect("redocks anyway");
+
+        let t = tab(&ws, id, console).expect("exists");
+        assert!(
+            t.tree.panes.contains_key(&deep),
+            "a stale anchor must not cost the user the pane"
+        );
+        assert!(
+            !collect_split_ids_of(&t.tree.root).contains(&anchor.split),
+            "the recorded divider is not resurrected — that position is gone"
+        );
+        // Focus-adjacent: the only pane left was the primary, so the pane comes back beside it.
+        assert_eq!(layout::leaves(&t.tree.root), vec![primary, deep]);
+        validate(&ws).expect("valid");
+    }
+
     #[test]
     fn a_pane_whose_home_tab_closed_redocks_into_the_console() {
         let mut ws = Workspace::default();
@@ -1804,6 +1963,32 @@ mod tests {
             );
         }
         validate(&ws).expect("valid");
+    }
+
+    /// The anchor map is a side map on `detached`, and nothing in the type system ties them
+    /// together. An anchor for a pane that is back in a tab is not merely untidy: it names a
+    /// sibling that is live again, so it would be *restorable*, and a future re-dock reading
+    /// it would rebuild a split for a pane that never left.
+    #[test]
+    fn validate_rejects_an_anchor_for_a_pane_that_is_not_detached() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let extra = split_console(&mut ws, id);
+        let label = detach_pane(&mut ws, id, console, extra).expect("detaches");
+        let anchor = project(&ws, id).expect("exists").dock_anchors[&extra].clone();
+        redock_pane(&mut ws, &label).expect("redocks");
+        validate(&ws).expect("a spent anchor is removed with the pane it described");
+
+        project_mut(&mut ws, id)
+            .expect("exists")
+            .dock_anchors
+            .insert(extra, anchor);
+
+        let Err(CoreError::Invariant(msg)) = validate(&ws) else {
+            panic!("an anchor outliving its detachment must be reported");
+        };
+        assert!(msg.contains(&extra.to_string()));
     }
 
     #[test]

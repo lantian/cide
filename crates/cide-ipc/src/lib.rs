@@ -25,8 +25,9 @@ pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,
 };
 pub use workspace::{
-    DiffAnswer, DiffOrigin, DiffSpec, Direction, LayoutNode, MAX_RATIO, MIN_RATIO, Pane, PaneTree,
-    Project, ProjectRoot, SettingsSection, Tab, TabKind, WindowRole, Workspace,
+    DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, LayoutNode, MAX_RATIO,
+    MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, SettingsSection, Tab, TabKind, WindowRole,
+    Workspace,
 };
 
 // --- M8: file tree, watcher, pickers ---

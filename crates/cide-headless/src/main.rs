@@ -645,6 +645,7 @@ mod tests {
             active_tab: home.id,
             tabs: vec![home, editor],
             detached: Default::default(),
+            dock_anchors: Default::default(),
             primary_session: SessionId::new(),
         };
 
