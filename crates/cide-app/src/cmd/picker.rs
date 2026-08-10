@@ -54,9 +54,29 @@ pub(crate) async fn query_project(
     // from the registry while this frame is being taken, and the matcher has to outlive the
     // registry entry for as long as the query is in flight.
     blocking(move || {
+        // Read *before* the frame, and the order is the whole correctness argument.
+        //
+        // `running` is what the overlay uses to decide whether to ask again, but
+        // `Matcher::frame` fills it from `nucleo::tick`, which answers a narrower question:
+        // "does the scorer still have queued work". Those come apart at the one moment that
+        // matters. `FsRegistry::claim` registers the project *before* the walk reads an
+        // inode — deliberately, so the picker is answerable from the first instant — so a
+        // Ctrl+P in the gap before the first batch lands finds an empty, idle matcher and
+        // `nucleo` says `running: false`. The overlay believed it, stopped polling, and left
+        // the user an empty picker over a repository that was mid-walk until they typed
+        // another character. Opening the picker right after opening a project is the ordinary
+        // way to hit that.
+        //
+        // Reading the flag first is the conservative order: if the walk finishes between here
+        // and the frame, this costs one extra poll that comes back settled. Reading it after
+        // would let a walk that ended just after the snapshot was taken report `running:
+        // false` for a frame that is missing the items it was still pushing.
+        let indexing = fs.is_indexing();
         let matcher = fs.matcher();
         matcher.query(&query);
-        matcher.frame(limit.unwrap_or(DEFAULT_LIMIT) as usize)
+        let mut frame = matcher.frame(limit.unwrap_or(DEFAULT_LIMIT) as usize);
+        frame.running |= indexing;
+        frame
     })
     .await
 }

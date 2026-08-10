@@ -413,14 +413,45 @@ mod tests {
     #[derive(Default)]
     struct Counting {
         statuses: AtomicU32,
+        /// Statuses that said `indexing: true` — **exactly one per walk**, which makes this
+        /// an exact count of walks started rather than an approximate one.
+        ///
+        /// `Indexing::run` emits its opening status while the claim's flag is still set, and
+        /// every other emission in the file happens after `drop(guard)` has cleared it: the
+        /// closing status, and the watcher thread's own first status. Counting *all* statuses
+        /// instead would make any assertion about "how many walks ran" race that watcher
+        /// thread, which emits whenever it is scheduled.
+        walks_started: AtomicU32,
     }
 
     impl FsEvents for Counting {
-        fn status(&self, _project: ProjectId, _status: &FsStatus) {
+        fn status(&self, _project: ProjectId, status: &FsStatus) {
             self.statuses.fetch_add(1, Ordering::Relaxed);
+            if status.indexing {
+                self.walks_started.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         fn changed(&self, _project: ProjectId, _change: &FsChange) {}
+    }
+
+    /// Ask the picker until it has scored `expected` matches, or give up.
+    ///
+    /// `nucleo` scores on its own thread pool and `frame` only spends a bounded slice waiting
+    /// for it, so the first frame after an injection legitimately reports fewer matches than
+    /// are in the matcher. Polling for the settled answer keeps the assertions below about
+    /// *what the matcher holds* rather than about how promptly a thread pool was scheduled.
+    async fn settled_matches(registry: &FsRegistry, project: ProjectId, expected: u32) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let frame = query_project(registry, project, NEEDLE.to_string(), Some(50))
+                .await
+                .expect("the picker answers for an indexed project");
+            if frame.matched >= expected || Instant::now() >= deadline {
+                return frame.matched;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Write `PACKAGES` × `PER_PACKAGE` empty files under a fresh scratch directory.
@@ -666,10 +697,220 @@ mod tests {
         assert_eq!(
             first.files,
             (PACKAGES * PER_PACKAGE) as u32,
-            "the corpus was walked more or less than once"
+            "the walk did not report the corpus it was pointed at"
+        );
+        // The count, not the file total. `files` is the size of whatever index ended up
+        // installed, so it reads the same whether the corpus was walked once or twice — the
+        // message this assertion replaced claimed to check "more or less than once" and
+        // checked no such thing.
+        assert_eq!(
+            counter.walks_started.load(Ordering::Relaxed),
+            1,
+            "the corpus was walked more than once"
         );
 
         drop(registry.remove(project));
+    }
+
+    /// A second `fs.index` for a project that has *already been walked* must do nothing.
+    ///
+    /// This is the ordinary case rather than an exotic one, and it is not the one the
+    /// concurrent test above covers. `store/workspace.ts` remembers what *this window* has
+    /// indexed, but that memory is module state in one webview: a second window — and a
+    /// detached pane is a window — starts with an empty map and asks for every project in the
+    /// workspace on its first snapshot, long after the first window's walk finished. So does
+    /// a reloaded webview. `ui/src/ipc/client.ts` promises the command behaves ("Safe to call
+    /// twice; the second is a no-op") and the frontend relies on that promise instead of
+    /// deciding which window owns a project.
+    ///
+    /// The cost of getting it wrong is not just a wasted walk. `Indexing::run` opens by
+    /// dropping the watcher and clearing the matcher, so a re-walk blanks the *first*
+    /// window's Ctrl+P and stops its file events until the new walk catches up — seconds, on
+    /// the large repository this milestone exists for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_index_of_a_walked_project_does_not_walk_it_again() {
+        const FILES: u32 = 8;
+        let dir = scratch("cmd-reindex-settled");
+        for n in 0..FILES {
+            std::fs::write(dir.path().join(format!("{NEEDLE}{n}.rs")), []).expect("a corpus file");
+        }
+        let registry = FsRegistry::default();
+        let counter = Arc::new(Counting::default());
+        let project = ProjectId::new();
+        let roots = vec![dir.path().to_path_buf()];
+
+        let events: Arc<dyn FsEvents> = counter.clone();
+        let first = index_project(events, &registry, project, roots.clone())
+            .await
+            .expect("the first index");
+        assert_eq!(first.files, FILES, "the walk did not see the corpus");
+        assert_eq!(
+            counter.walks_started.load(Ordering::Relaxed),
+            1,
+            "the first fs.index did not walk"
+        );
+        let before = settled_matches(&registry, project, FILES).await;
+        assert_eq!(
+            before, FILES,
+            "the picker did not end up holding the corpus"
+        );
+
+        let events: Arc<dyn FsEvents> = counter.clone();
+        let second = index_project(events, &registry, project, roots)
+            .await
+            .expect("a second fs.index is not an error");
+
+        assert_eq!(
+            counter.walks_started.load(Ordering::Relaxed),
+            1,
+            "a second fs.index over the same roots started a second walk. A second window \
+             opening on this project would re-walk the whole repository and, worse, blank the \
+             matcher and drop the watcher the first window is using."
+        );
+        assert_eq!(
+            second.files, first.files,
+            "the no-op answered with a different tree than the walk built"
+        );
+        assert!(
+            !second.indexing,
+            "the no-op answered as if a walk were running, so the picker would poll for a \
+             walk that is never going to end"
+        );
+        // The observable the user would have lost. `matched`, not a status field, because the
+        // matcher being cleared is what empties Ctrl+P.
+        let after = query_project(&registry, project, NEEDLE.to_string(), Some(50))
+            .await
+            .expect("the picker still answers");
+        assert_eq!(
+            after.matched, before,
+            "the second fs.index cleared the matcher, so opening a second window empties the \
+             first window's file picker"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// A project whose roots changed is still re-walked — the no-op above must not swallow it.
+    ///
+    /// The pair matters: making a repeat `fs.index` cheap is only correct if "repeat" means
+    /// *the same roots*. A project that gains a submodule root and is then never re-walked is
+    /// the silent half of this bug — a tree permanently missing a directory, with no error
+    /// anywhere to say why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_project_whose_roots_changed_is_walked_again() {
+        let first_root = scratch("cmd-roots-a");
+        let second_root = scratch("cmd-roots-b");
+        std::fs::write(first_root.path().join(format!("{NEEDLE}0.rs")), []).expect("a file");
+        std::fs::write(second_root.path().join(format!("{NEEDLE}1.rs")), []).expect("a file");
+        std::fs::write(second_root.path().join(format!("{NEEDLE}2.rs")), []).expect("a file");
+
+        let registry = FsRegistry::default();
+        let counter = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        let events: Arc<dyn FsEvents> = counter.clone();
+        let one = index_project(
+            events,
+            &registry,
+            project,
+            vec![first_root.path().to_path_buf()],
+        )
+        .await
+        .expect("the first index");
+        assert_eq!(one.files, 1);
+
+        let events: Arc<dyn FsEvents> = counter.clone();
+        let two = index_project(
+            events,
+            &registry,
+            project,
+            vec![
+                first_root.path().to_path_buf(),
+                second_root.path().to_path_buf(),
+            ],
+        )
+        .await
+        .expect("the re-index");
+
+        assert_eq!(
+            counter.walks_started.load(Ordering::Relaxed),
+            2,
+            "a project that gained a root was not walked again, so the new root's files exist \
+             in neither the tree nor the picker"
+        );
+        assert_eq!(
+            two.files, 3,
+            "the re-index reported the old root set rather than the new one"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// A frame taken before the walk has injected anything still says "ask me again".
+    ///
+    /// `PickerFrame::running` is the overlay's entire stopping condition — `FilePicker.tsx`
+    /// re-polls if and only if it is set — but `Matcher::frame` fills it from `nucleo::tick`,
+    /// which reports whether the *scorer* has queued work, not whether the walk is done. The
+    /// two disagree in exactly one place, and `claim` putting the project in the registry
+    /// before the walk starts is what makes that place reachable: between the claim and the
+    /// first batch the matcher is empty and idle, so `nucleo` reports `running: false` over a
+    /// repository that has not been read yet. The overlay stops polling and shows an empty
+    /// list until the user types another character — and Ctrl+P straight after opening a
+    /// project lands there.
+    ///
+    /// Held rather than raced: the claim is kept un-run, which *is* that window, so this
+    /// tests the property instead of trying to hit a few microseconds of a real walk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_taken_before_the_walk_injects_anything_still_asks_to_be_polled() {
+        let dir = scratch("cmd-picker-early");
+        std::fs::write(dir.path().join(format!("{NEEDLE}0.rs")), []).expect("a corpus file");
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+
+        let claimed = registry
+            .claim(project, vec![dir.path().to_path_buf()])
+            .expect("a project nobody has indexed claims");
+
+        let frame = query_project(&registry, project, NEEDLE.to_string(), Some(50))
+            .await
+            .expect("the picker is answerable from the instant the project is claimed");
+        assert_eq!(frame.matched, 0, "nothing has been walked yet");
+        assert!(
+            frame.running,
+            "the frame said the picker had settled while the walk had not read an inode. The \
+             overlay stops polling on exactly this and would show an empty Ctrl+P over a \
+             repository it is in the middle of indexing."
+        );
+
+        // Dropping the claim without running it clears the flag, which is the same guard that
+        // covers a walk that panicked — and the picker must then stop asking.
+        drop(claimed);
+        let settled = query_project(&registry, project, NEEDLE.to_string(), Some(50))
+            .await
+            .expect("still answerable");
+        assert!(
+            !settled.running,
+            "`running` outlived the walk, so the overlay would poll for ever"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// `FsError::NoIndex` reaches the webview as `{"kind":"noIndex"}`.
+    ///
+    /// Pinned here because two frontend behaviours are matched on that exact tag and nothing
+    /// else in the workspace checks it: `ui/src/store/fileIndex.ts`'s `isNoIndex` is what
+    /// stops a project that is merely mid-walk from being reported as *"fs_tree_count is not
+    /// registered in this build"*, and it is what makes the picker say `Indexing…` and poll.
+    /// Both fail *open* — a predicate that stops matching does not throw, it silently restores
+    /// the exact bug it was written for — and `check-picker.mjs` asserts against a hand-written
+    /// `{ kind: 'noIndex' }` fixture that cannot notice the Rust moving out from under it.
+    #[test]
+    fn no_index_serialises_as_the_tag_the_frontend_matches_on() {
+        assert_eq!(
+            serde_json::to_value(FsError::NoIndex).expect("FsError is Serialize"),
+            serde_json::json!({ "kind": "noIndex" }),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

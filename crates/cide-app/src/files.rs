@@ -82,14 +82,34 @@ impl FsRegistry {
 
     /// Claim a project for indexing, creating its entry if it has none.
     ///
-    /// Cheap by construction — map bookkeeping and one atomic, no I/O — so it stays on the
-    /// caller's thread. The walk it hands back is the part that belongs on a blocking one,
-    /// and separating them is what lets `fs_index` be an async command: the entry is in the
-    /// registry, and so answerable by the picker, before the walk has read a single inode.
+    /// Cheap: map bookkeeping, two atomics, and — when the entry is new — the handful of
+    /// `stat`s [`Filter::build`] spends on the global gitignore and each root's
+    /// `info/exclude`. Bounded by the number of roots rather than by the size of the tree,
+    /// which is what lets it stay on the caller's thread while the walk it hands back goes to
+    /// a blocking one. That split is what lets `fs_index` be an async command: the entry is
+    /// in the registry, and so answerable by the picker, before the walk has read a single
+    /// inode of the project.
     ///
-    /// `Err(status)` means a walk is already running for this project. That status is the
-    /// honest answer for a second `fs.index` — a live picker and an `indexing: true` the
-    /// caller can watch — rather than a second walk of the same tree.
+    /// # `Err(status)` — there is nothing to do
+    ///
+    /// Two cases, and the caller wants the same thing from both: the status of the index that
+    /// already exists, not a second walk of the same tree.
+    ///
+    /// * A walk is **running**. The honest answer is that walk's `indexing: true` and its
+    ///   live picker.
+    /// * A walk has already **finished** over exactly these roots. This is the every-day
+    ///   case, not the rare one: `store/workspace.ts` remembers what it has indexed, but that
+    ///   memory is module state in one webview, so a second window, a detached pane, or a
+    ///   reloaded webview asks again for every open project — with the first walk long since
+    ///   done. `ui/src/ipc/client.ts` documents the command as "safe to call twice; the
+    ///   second is a no-op", and this is where that becomes true. Re-walking instead is worse
+    ///   than wasteful: [`Indexing::run`] opens by dropping the watcher and clearing the
+    ///   matcher, so the second window's request would empty the *first* window's Ctrl+P and
+    ///   stop its file events for the length of a fresh walk.
+    ///
+    /// A project whose **roots changed** is not either case — its entry is dropped below and
+    /// it is walked again. That distinction is the whole reason this is keyed on the root
+    /// list rather than on the project id.
     pub fn claim(&self, project: ProjectId, roots: Vec<PathBuf>) -> Result<Indexing, FsStatus> {
         // A project can gain or lose a root between two indexings. Reusing the old entry
         // would then walk the old set for ever, with no error anywhere to say so — the tree
@@ -114,6 +134,13 @@ impl FsRegistry {
         let fs = Arc::clone(entry.value());
         drop(entry);
 
+        // Checked before the flag is taken, so a repeat call neither walks nor disturbs the
+        // flag a concurrent walk owns. `walked` is only ever set by a walk that ran to
+        // completion, which is what keeps the panic-retry property the guard below exists
+        // for: a walk that unwound leaves `walked` false, so the retry still walks.
+        if fs.walked.load(Ordering::Acquire) {
+            return Err(fs.status());
+        }
         if fs.indexing.swap(true, Ordering::AcqRel) {
             let status = fs.status();
             return Err(status);
@@ -188,6 +215,12 @@ impl Indexing {
         });
         *fs.watcher.lock() = Some(watcher);
 
+        // Last, and only on this path. `FsRegistry::claim` reads it to turn a repeat
+        // `fs.index` into a no-op, so it must mean "this tree has been walked and is being
+        // watched" and nothing weaker — set it before `Watcher::start` and a walk that failed
+        // to start a watcher would be permanently unwatchable with no way to ask again.
+        fs.walked.store(true, Ordering::Release);
+
         let status = fs.status();
         events.status(project, &status);
         status
@@ -214,6 +247,11 @@ pub struct ProjectFs {
     watcher: Mutex<Option<Watcher>>,
     watch_status: Mutex<WatchStatus>,
     indexing: AtomicBool,
+    /// A walk has run to completion over [`Self::roots`] and a watcher is installed.
+    ///
+    /// Distinct from `!indexing`, which is also true *before* the first walk. This is what
+    /// makes a repeat `fs.index` a no-op; see [`FsRegistry::claim`].
+    walked: AtomicBool,
 }
 
 impl ProjectFs {
@@ -233,6 +271,7 @@ impl ProjectFs {
                 watched_dirs: 0,
             }),
             indexing: AtomicBool::new(false),
+            walked: AtomicBool::new(false),
         }
     }
 
@@ -242,6 +281,12 @@ impl ProjectFs {
 
     pub fn matcher(&self) -> &NucleoMatcher {
         &self.matcher
+    }
+
+    /// Is a walk running? One atomic — [`Self::status`] answers the same question but locks
+    /// the index and the watch status to do it, and `picker_query` asks this per keystroke.
+    pub fn is_indexing(&self) -> bool {
+        self.indexing.load(Ordering::Acquire)
     }
 
     /// Read the tree. Held only for the length of one window request.

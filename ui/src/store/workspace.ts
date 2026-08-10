@@ -155,11 +155,18 @@ let indexedProjects = new Map<string, string>()
  * the picker would depend on the sidebar being mounted.
  *
  * Every window runs this against the same workspace, so `fs.index` is called once per window
- * per project. That is deliberate and handled on the Rust side rather than here: a second
- * `fs.index` while the first walk is running answers with that walk's status instead of
- * starting another (`FsRegistry::claim`), and `fs.close` is idempotent. Suppressing it here
- * instead would mean deciding which window "owns" a project, which nothing else in this app
- * has to decide.
+ * per project. That is deliberate and handled on the Rust side rather than here: `fs.index`
+ * over roots that have already been walked is a no-op that answers with the existing index's
+ * status, whether the first walk is still running or finished long ago (`FsRegistry::claim`),
+ * and `fs.close` is idempotent. Suppressing it here instead would mean deciding which window
+ * "owns" a project, which nothing else in this app has to decide.
+ *
+ * The *finished* half of that guarantee is the one this window depends on and the one that
+ * was missing: `indexedProjects` is module state in one webview, so a second window — and a
+ * detached pane is a window — starts with an empty map and asks for every open project long
+ * after the first window's walk is done. A re-walk there is not merely wasted work; the walk
+ * begins by clearing the matcher and dropping the watcher, so it would empty the *first*
+ * window's Ctrl+P and stop its file events. `cmd::fs::tests` pins both halves.
  */
 function syncFileIndex(workspace: Workspace): void {
   const open: IndexTarget[] = Object.values(workspace.projects).map((project) => ({
