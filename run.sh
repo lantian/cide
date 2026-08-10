@@ -10,7 +10,16 @@
 # windows — the restore path caps this too, but finding out before a window appears is
 # better than finding out after.
 #
-#   ./run.sh                      # normal launch
+# A DEBUG build loads its frontend from the Vite dev server, not from `ui/dist`.
+# `tauri.conf.json` sets `devUrl: http://localhost:1420`, and that URL is what the debug
+# binary opens. Running it with nothing on 1420 is the white window with "Could not connect
+# to localhost" — the app is fine, it simply has no document. So this script starts Vite and
+# waits for the port before launching, and stops it again on the way out.
+#
+# `--release` skips all of that: a release build embeds `frontendDist`, so it needs no server.
+#
+#   ./run.sh                      # normal launch (starts Vite if it is not already up)
+#   ./run.sh --release            # build and run the release binary; no dev server
 #   ./run.sh --bench              # IPC transport gate (M0), prints and exits
 #   ./run.sh --audit-chrome       # chrome vs the design mock (M3), prints and exits
 #   ./run.sh --audit-panes        # pane host registry under churn (M4)
@@ -22,24 +31,32 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
-BIN=./target/debug/cide
 WORKSPACE="${XDG_STATE_HOME:-$HOME/.local/state}/cide/workspace.json"
 MAX_WINDOWS=8
+DEV_PORT=1420
 
 env_flags=()
 fresh=0
+release=0
 
 for arg in "$@"; do
   case "$arg" in
+    --release)        release=1 ;;
     --bench)          env_flags+=(CIDE_BENCH=1) ;;
     --audit-chrome)   env_flags+=(CIDE_AUDIT=1) ;;
     --audit-panes)    env_flags+=(CIDE_AUDIT_PANES=1) ;;
     --audit-windows)  env_flags+=(CIDE_AUDIT_WINDOWS=1) ;;
     --on-top)         env_flags+=(CIDE_ON_TOP=1) ;;
     --fresh)          fresh=1 ;;
-    *) echo "unknown option: $arg" >&2; sed -n '15,23p' "$0" >&2; exit 2 ;;
+    *) echo "unknown option: $arg" >&2; sed -n '20,29p' "$0" >&2; exit 2 ;;
   esac
 done
+
+if [ "$release" = 1 ]; then
+  BIN=./target/release/cide
+else
+  BIN=./target/debug/cide
+fi
 
 # --- stop whatever is already running -------------------------------------------------
 
@@ -101,9 +118,66 @@ fi
 # --- launch ----------------------------------------------------------------------------
 
 if [ ! -x "$BIN" ]; then
-  echo "[run] $BIN is missing; run: cargo build -p cide-app" >&2
+  if [ "$release" = 1 ]; then
+    echo "[run] $BIN is missing; run: pnpm --dir ui build && cargo build --release -p cide-app" >&2
+  else
+    echo "[run] $BIN is missing; run: cargo build -p cide-app" >&2
+  fi
   exit 1
 fi
 
+# --- the frontend the binary will ask for ----------------------------------------------
+
+port_open() { (exec 3<>/dev/tcp/127.0.0.1/"$DEV_PORT") 2>/dev/null; }
+
+vite_pid=""
+cleanup() {
+  # Only ever the Vite this script started. One that was already running belongs to whoever
+  # started it — killing their dev server on our way out would be a surprising thing to do.
+  if [ -n "$vite_pid" ]; then
+    echo "[run] stopping the dev server this script started ($vite_pid)"
+    kill -TERM "$vite_pid" 2>/dev/null
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if [ "$release" = 1 ]; then
+  if [ ! -f ui/dist/index.html ]; then
+    echo "[run] ui/dist is missing; run: pnpm --dir ui build" >&2
+    exit 1
+  fi
+else
+  if port_open; then
+    echo "[run] dev server already listening on $DEV_PORT"
+  else
+    echo "[run] starting the Vite dev server (the debug build loads its UI from :$DEV_PORT)"
+    pnpm --dir ui dev >/tmp/cide-vite.log 2>&1 &
+    vite_pid=$!
+
+    # Wait for the port rather than sleeping: Vite's start time depends on the cache, and a
+    # fixed sleep is either too short (white window again) or wasted every launch.
+    for _ in $(seq 1 100); do
+      port_open && break
+      # If Vite died, stop waiting for a port that is never coming.
+      kill -0 "$vite_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+
+    if ! port_open; then
+      echo "[run] the dev server did not come up on $DEV_PORT. Last lines:" >&2
+      tail -n 15 /tmp/cide-vite.log >&2
+      echo "[run] Or run without one:  ./run.sh --release" >&2
+      exit 1
+    fi
+    echo "[run] dev server ready on $DEV_PORT"
+  fi
+fi
+
+# --- launch ----------------------------------------------------------------------------
+
 echo "[run] starting ${env_flags[*]:-} $BIN"
-exec env "${env_flags[@]}" "$BIN"
+# Not `exec`: this shell has to outlive the app to stop the dev server it started.
+env "${env_flags[@]}" "$BIN"
+status=$?
+echo "[run] cide exited with status $status"
+exit "$status"

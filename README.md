@@ -21,14 +21,32 @@ audit.
 ## Run it
 
 ```sh
-cd ui && pnpm install && pnpm build && cd ..
+pnpm --dir ui install
 cargo build -p cide-app
 ./run.sh
 ```
 
-**Use `./run.sh` rather than launching the binary directly.** It stops any instance already
-running before starting a new one, reaps `claude` children orphaned by a previous crash, and
-refuses to start when the saved workspace would open more than eight windows.
+**Use `./run.sh` rather than launching the binary directly.** Beyond the process hygiene
+below, it starts the piece a debug build cannot do without.
+
+A **debug** build does not load `ui/dist`. `tauri.conf.json` sets
+`devUrl: http://localhost:1420`, and that URL is baked into the binary — so launching
+`./target/debug/cide` with nothing on port 1420 gives a white window and
+`Could not connect to localhost: Connection refused`. The app is running correctly; it just
+has no document. `run.sh` starts Vite, waits for the port, and stops it again on exit.
+
+If you would rather not have a dev server at all, `./run.sh --release` runs a release build,
+which embeds the frontend:
+
+```sh
+pnpm --dir ui build
+cargo build --release -p cide-app
+./run.sh --release
+```
+
+`run.sh` also stops any instance already running before starting a new one, reaps `claude`
+children orphaned by a previous crash, and refuses to start when the saved workspace would
+open more than eight windows.
 
 That last guard is not hypothetical. A workspace here accumulated 242 copies of one
 directory, was left in per-project window mode, and the restore path faithfully opened a
@@ -37,6 +55,7 @@ the way: opening an already-open path activates it instead of duplicating it, th
 caps how many windows a file may produce, and `run.sh` checks before anything is on screen.
 
 ```sh
+./run.sh --release          # release build; embeds the UI, needs no dev server
 ./run.sh --fresh            # start from an empty workspace
 ./run.sh --bench            # IPC transport gate (M0)
 ./run.sh --audit-chrome     # chrome vs the design mock (M3)
