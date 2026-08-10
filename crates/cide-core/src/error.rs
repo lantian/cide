@@ -40,9 +40,16 @@ pub enum CoreError {
     #[error("{} would be discarded: {}", plural(tabs.len()), names(tabs))]
     UnsavedChanges { tabs: Vec<UnsavedTab> },
 
-    /// The primary Claude pane cannot be closed while it is the only pane in its tab —
-    /// that would leave the pinned console empty with no way back.
-    #[error("the primary Claude pane cannot be closed while it is the only pane")]
+    /// The primary Claude pane cannot leave its tab — not by closing, and not by detaching
+    /// into a window of its own. It is the project's conversation, and the pinned console
+    /// exists to show it.
+    ///
+    /// The "while it is the only pane" qualifier this used to carry was dropped when
+    /// `layout::take_pane` started refusing the role outright: keeping it meant the message
+    /// contradicted itself out loud on the exact gesture that produces it — a user closing
+    /// the primary of a two-pane console being told it cannot be closed while it is the only
+    /// pane, with a second pane visible beside it.
+    #[error("the project console's primary Claude pane cannot be closed or detached")]
     PanePrimary,
 
     /// A project must keep at least its console tab.

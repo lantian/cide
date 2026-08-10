@@ -19,6 +19,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { terminalKeyGate } from '@/keys/gate'
+import { terminalKeyBytes } from './keys'
 import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
 
@@ -93,17 +94,37 @@ export function createTerminal(): TerminalHandle {
   term.unicode.activeVersion = '15-graphemes'
 
   /*
-   * Entry point 1 of the key gate.
+   * Entry point 1 of the key gate, plus the chords the terminal has to encode itself.
    *
-   * This runs BEFORE xterm processes the key, and returning false is the only thing that
+   * The gate runs BEFORE xterm processes the key, and returning false is the only thing that
    * stops `^P` being written to the PTY. A window listener — entry point 2, installed in
    * `App` — is neither sufficient nor correct on its own here: by the time a keydown
    * bubbles to the window, xterm has already forwarded the byte, and Ctrl+P and Ctrl+K
    * both mean something to readline. So the decision has to precede byte forwarding, which
    * is why the gate has two entry points and a test asserting they resolve every chord
    * identically (`ui/scripts/check-key-gate.mjs`).
+   *
+   * `attachCustomKeyEventHandler` takes exactly one function and a second call replaces the
+   * first, so Shift+Enter cannot be a handler of its own — it has to be composed here, and
+   * the composition order is the contract: **the gate decides first**. A chord the user has
+   * bound stays bound; only a keystroke the gate passes through is eligible to be re-encoded.
+   * Doing it the other way round would make a `shift+enter` binding in `keymap.json`
+   * unreachable inside terminals with nothing on screen to say why.
    */
-  term.attachCustomKeyEventHandler(terminalKeyGate)
+  term.attachCustomKeyEventHandler((ev) => {
+    if (!terminalKeyGate(ev)) return false
+
+    const bytes = terminalKeyBytes(ev)
+    if (bytes === null) return true
+
+    // `input` rather than reaching for the PTY directly: it is xterm's own "as if typed"
+    // path, so the bytes go out through the same `onData` the pane already listens on, and
+    // the side effects of typing — scroll to bottom, clear the selection — still happen.
+    // Returning false is what stops xterm also sending its own bare `\r` behind us.
+    ev.preventDefault()
+    term.input(bytes, true)
+    return false
+  })
 
   const handle: TerminalHandle = {
     term,

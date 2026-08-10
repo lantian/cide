@@ -96,8 +96,10 @@ pub fn pane_split(
 
 /// Close a pane.
 ///
-/// Refused for the console's primary pane while it is alone ([`CoreError::PanePrimary`]) and
-/// for the last pane of any tab ([`CoreError::LastPane`]). The session is untouched: it is
+/// Refused for the console's primary pane ([`CoreError::PanePrimary`]) however many panes
+/// the tab has, and for the last pane of any tab ([`CoreError::LastPane`]). The frontend
+/// withholds the close button for the primary as a courtesy; this is the enforcement.
+/// The session is untouched: it is
 /// owned by the registry, and a closed pane is a detached sink, not a dead process. The
 /// caller decides separately whether the child should also go.
 #[tauri::command(rename_all = "camelCase")]

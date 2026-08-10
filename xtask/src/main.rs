@@ -8,8 +8,11 @@
 //! * `contract-check`     — reflect over the registered commands and events and diff them
 //!   against `contract/{commands,events}.json`, so adding a command is a deliberate
 //!   three-file change that a reviewer can see.
-//! * `bench-ipc`          — measure the PTY transport. See `BENCH.md`; this is the M0
-//!   GO/NO-GO gate.
+//! * `bench-ipc`          — measure the PTY transport: build `cide-app`, run it under
+//!   `CIDE_BENCH=1`, print the report and exit non-zero on NO-GO. This is the M0 GO/NO-GO
+//!   gate. It needs a display, and it needs a frontend for the binary to load — a Vite dev
+//!   server on :1420 for the debug profile, a built `ui/dist` for `--release`. See
+//!   `BENCH.md`.
 //! * `package`            — preflight the Linux packaging and print the plan; `--write`
 //!   regenerates the Flatpak files and `--check` gates them. It builds nothing unless asked
 //!   with `--run`. See `package.rs` and `docs/adr/0007`.
@@ -36,7 +39,11 @@ cargo xtask <task>
 Tasks:
   codegen [--check]        regenerate ui/src/ipc/generated.ts from cide-ipc
   contract-check [--write] diff the live command/event surface against contract/*.json
-  bench-ipc                measure IPC throughput (M0 GO/NO-GO gate)
+  bench-ipc [--release]    measure IPC throughput (M0 GO/NO-GO gate). Builds cide-app,
+            [--no-build]     runs it under CIDE_BENCH=1, prints the report and fails on
+                             NO-GO. Needs a display. The debug profile also needs the Vite
+                             dev server on :1420 (`pnpm --dir ui dev`); --release builds
+                             ui/dist and embeds it instead. See BENCH.md.
   package [targets] [...]  preflight the Linux packaging and print the plan
                              targets: --appimage --deb --flatpak (default: all)
                              --write  regenerate packaging/flatpak/*
@@ -81,7 +88,8 @@ fn main() -> ExitCode {
         "contract-check" => {
             flags(&rest, &["--write"]).and_then(|f| contract_check(f.contains("--write")))
         }
-        "bench-ipc" => bench_ipc(),
+        "bench-ipc" => flags(&rest, &["--release", "--no-build"])
+            .and_then(|f| bench_ipc(f.contains("--release"), !f.contains("--no-build"))),
         "package" => flags(
             &rest,
             &[
@@ -573,13 +581,220 @@ fn scan_events(path: &Path) -> Result<BTreeSet<String>> {
 
 // --- bench-ipc -------------------------------------------------------------------------
 
-fn bench_ipc() -> anyhow::Result<()> {
-    // Deliberately an instruction rather than a spawn. The measurement only means anything
-    // when it runs through a real webview on a real compositor, and BENCH.md is where the
-    // numbers and the GO/NO-GO floor are recorded.
-    anyhow::bail!(
-        "run `cargo build -p cide-app && CIDE_BENCH=1 ./target/debug/cide` — see BENCH.md"
-    )
+/// How long the app gets to open a window, run the measurement and exit.
+///
+/// Generous on purpose: the gate now moves several GiB through the pull path, and a debug
+/// build on a loaded machine is slow. It exists only so a window that never appears — a
+/// compositor refusing the surface, a webview that failed to create — fails the task instead
+/// of hanging a CI job until the job's own timeout kills it with no output.
+const BENCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// How often the deadline is checked while the app runs.
+const BENCH_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The port `tauri.conf.json` names as `devUrl`.
+///
+/// A *debug* `cide` does not embed a frontend: `frontendDist` is only compiled in for a
+/// release build, and the debug binary opens `http://localhost:1420` instead. With nothing
+/// listening there the window comes up on WebKitGTK's "could not connect" page, which
+/// never reaches `runBench`, never calls `diag_bench_report` and never exits — so the gate
+/// would sit out the whole [`BENCH_TIMEOUT`] and then report a timeout. Fifteen minutes to
+/// say "you forgot the dev server" is not a gate. `run.sh` starts Vite for this same reason.
+const DEV_SERVER_PORT: u16 = 1420;
+
+/// How long to wait for the loopback connect that answers "is the dev server up".
+///
+/// Loopback either accepts immediately or refuses immediately; the timeout is only so a
+/// pathological firewall rule that black-holes the SYN cannot hang the gate before it has
+/// even started.
+const DEV_SERVER_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Is something accepting connections on `port` on the loopback interface?
+///
+/// A bare connect rather than an HTTP request: the question is only whether the debug
+/// binary will find *a* server where it is about to look, and Vite accepts on the same
+/// socket it serves on. Asking for a document instead would mean deciding what a valid
+/// answer looks like, which is the webview's job and not this one's.
+fn port_listening(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, DEV_SERVER_PROBE).is_ok()
+}
+
+/// The GO/NO-GO answer parsed out of a report.
+#[derive(Debug, PartialEq, Eq)]
+struct Verdict {
+    go: bool,
+    line: String,
+}
+
+/// Read the verdict line out of a benchmark report.
+///
+/// Anchored with `starts_with` rather than `contains`, which is the whole reason this is a
+/// named function with tests: `"NO-GO — …"` contains `"GO"`, so the obvious inline check is
+/// a gate that passes exactly when it should fail. With the anchor the two arms are
+/// mutually exclusive and their order does not matter — the anchor is doing the work, not
+/// the ordering, and `a_no_go_report_is_not_mistaken_for_a_pass` is what keeps it that way.
+fn bench_verdict(report: &str) -> Option<Verdict> {
+    report.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with("NO-GO") {
+            Some(Verdict {
+                go: false,
+                line: line.to_string(),
+            })
+        } else if line.starts_with("GO") {
+            Some(Verdict {
+                go: true,
+                line: line.to_string(),
+            })
+        } else {
+            None
+        }
+    })
+}
+
+/// Run the M0 GO/NO-GO gate: build the app, run it under `CIDE_BENCH=1`, judge the report.
+///
+/// This used to `bail!` with the command to type. That is not a gate — it fails identically
+/// on a fast machine and a slow one — so it now does what it was telling you to do. The
+/// measurement still has to happen inside a real webview on a real compositor; what changed
+/// is that the driving, the timeout and the verdict are here instead of in a human's memory.
+///
+/// **It needs a display.** There is no headless mode: the number being measured is the cost
+/// of a payload crossing into a live WebKitGTK webview, and a mocked one would measure
+/// nothing anyone cares about. The display check up front is so that absence is reported as
+/// itself rather than as a webview crash.
+///
+/// **And it needs a frontend**, which is not the same thing in both profiles and is the one
+/// way this task can look like it works and quietly not:
+///
+/// * debug — the binary loads `devUrl`, so a Vite dev server has to be listening on
+///   [`DEV_SERVER_PORT`]. Without one the window opens on a connection-error page, `runBench`
+///   never runs, and the only symptom is the full [`BENCH_TIMEOUT`] elapsing.
+/// * `--release` — the binary embeds `ui/dist`, which `cargo build --release -p cide-app`
+///   does *not* produce: `beforeBuildCommand` belongs to `cargo tauri build`. So the frontend
+///   is built here, first, explicitly.
+///
+/// Both are checked before anything is compiled, so the refusal costs a second rather than a
+/// full build.
+fn bench_ipc(release: bool, build: bool) -> anyhow::Result<()> {
+    let root = workspace_root()?;
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        bail!(
+            "no WAYLAND_DISPLAY and no DISPLAY — this gate measures a real webview and cannot \
+             run headless. See BENCH.md."
+        );
+    }
+
+    if !release && !port_listening(DEV_SERVER_PORT) {
+        bail!(
+            "nothing is listening on 127.0.0.1:{DEV_SERVER_PORT}, and a debug `cide` loads its \
+             UI from there rather than from ui/dist. It would open a connection-error page, \
+             never reach the benchmark, and time out after {}s.\n\n\
+             Start one:   pnpm --dir ui dev\n\
+             Or measure the build worth quoting, which embeds its own frontend:\n\
+             \x20            cargo xtask bench-ipc --release",
+            BENCH_TIMEOUT.as_secs()
+        );
+    }
+
+    if build {
+        // The frontend first, and only for `--release`. A release `cide` embeds `ui/dist` at
+        // compile time and `cargo build` does not run `tauri.conf.json`'s
+        // `beforeBuildCommand` — only `cargo tauri build` does — so skipping this measures
+        // whatever `ui/dist` was last left holding. That is not a harmless staleness here:
+        // what this gate measures is decided by frontend constants (`PULL_ITERATIONS`,
+        // `SIZES`), so an old `ui/dist` produces a confident report of the wrong code that
+        // is indistinguishable from a report of the right one.
+        if release {
+            let status = Command::new("pnpm")
+                .current_dir(&root)
+                .args(["--dir", "ui", "build"])
+                .status()
+                .context("running pnpm --dir ui build (needed: --release embeds ui/dist)")?;
+            if !status.success() {
+                bail!("pnpm --dir ui build failed");
+            }
+        }
+
+        let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        cargo.current_dir(&root).args(["build", "-p", "cide-app"]);
+        if release {
+            cargo.arg("--release");
+        }
+        let status = cargo.status().context("running cargo build -p cide-app")?;
+        if !status.success() {
+            bail!("cargo build -p cide-app failed");
+        }
+    }
+
+    let profile = if release { "release" } else { "debug" };
+    let binary = root.join("target").join(profile).join("cide");
+    if !binary.exists() {
+        bail!(
+            "{} does not exist — drop --no-build, or build it first",
+            binary.display()
+        );
+    }
+
+    // stdout to a file rather than a pipe. A pipe would have to be drained while the child
+    // runs or the child blocks once the buffer fills, and draining concurrently with a
+    // deadline needs a reader thread; a file has neither problem and leaves the artefact
+    // behind for anyone who wants to paste it into BENCH.md.
+    let log = root.join("target").join("bench-ipc.out");
+    let sink = fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+
+    let mut child = Command::new(&binary)
+        .current_dir(&root)
+        .env("CIDE_BENCH", "1")
+        .stdout(Stdio::from(sink))
+        // Inherited, so the app's tracing log stays visible while the gate runs — on a
+        // machine where the window never appears, that log is the only explanation there is.
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", binary.display()))?;
+
+    let deadline = std::time::Instant::now() + BENCH_TIMEOUT;
+    let status = loop {
+        match child.try_wait().context("waiting for the bench run")? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "the bench run did not finish within {}s — killed. Partial output: {}",
+                    BENCH_TIMEOUT.as_secs(),
+                    log.display()
+                );
+            }
+            None => std::thread::sleep(BENCH_POLL),
+        }
+    };
+
+    let report = fs::read_to_string(&log).with_context(|| format!("reading {}", log.display()))?;
+    print!("{report}");
+
+    if !status.success() {
+        bail!("the app exited with {status} — see {}", log.display());
+    }
+
+    // No verdict means the window opened but the measurement never reported, which is a
+    // failed gate and not a passed one. Silence is the answer this used to give by accident.
+    let Some(verdict) = bench_verdict(&report) else {
+        bail!(
+            "the run produced no GO/NO-GO line — see {}. The webview may have failed to \
+             reach `runBench`.",
+            log.display()
+        );
+    };
+    if !verdict.go {
+        bail!("{}", verdict.line);
+    }
+
+    eprintln!("xtask: {}", verdict.line);
+    eprintln!("xtask: full report written to {}", log.display());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -588,6 +803,77 @@ mod tests {
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A report shaped exactly like `formatReport` in `ui/src/bench/ipcBench.ts` produces.
+    fn report(verdict: &str) -> String {
+        format!(
+            "custom protocol : YES (fast path)\n\
+             webkit          : 605.1.15\n\
+             \n\
+             | transport            | payload  | iters | MiB/s   | mean ms | p99 ms |\n\
+             | pull (Response raw)  | 8 KiB    | 10000 |    78.1 |   0.100 |  1.000 |\n\
+             \n\
+             {verdict}\n"
+        )
+    }
+
+    /// The dev-server probe has to answer "yes" to a real listener, or the release-less gate
+    /// refuses a run that would have worked.
+    #[test]
+    fn a_listening_socket_is_seen() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("bound").port();
+        assert!(port_listening(port));
+    }
+
+    /// And "no" to a closed one, which is the direction that saves the fifteen minutes.
+    ///
+    /// The port is obtained by binding and dropping rather than hardcoded: a fixed number
+    /// would make this test depend on nothing else on the machine having chosen it, and the
+    /// one it would fail on is a developer who happens to be running Vite.
+    #[test]
+    fn a_closed_port_is_not_a_dev_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("bound").port();
+        drop(listener);
+        assert!(!port_listening(port));
+    }
+
+    #[test]
+    fn a_go_report_is_read_as_a_pass() {
+        let text = report("GO — raw pull peaks at 195.3 MiB/s, above the 30 MiB/s floor.");
+        let verdict = bench_verdict(&text).expect("the report has a verdict line");
+        assert!(verdict.go);
+        assert!(verdict.line.starts_with("GO —"));
+    }
+
+    /// The one that matters: `NO-GO` contains `GO`, so a naive `contains` check reports the
+    /// failing run as a passing one — a gate that is green exactly when it should be red.
+    #[test]
+    fn a_no_go_report_is_not_mistaken_for_a_pass() {
+        let text = report("NO-GO — raw pull peaks at 12.4 MiB/s, below the 30 MiB/s floor.");
+        let verdict = bench_verdict(&text).expect("the report has a verdict line");
+        assert!(!verdict.go);
+        assert!(verdict.line.contains("12.4"));
+    }
+
+    /// A run whose webview never reached the measurement prints a table-less log. That is a
+    /// failed gate, so the absence has to be distinguishable from a pass.
+    #[test]
+    fn a_report_with_no_verdict_line_yields_none() {
+        assert_eq!(bench_verdict("custom protocol : YES\nwebkit : 605\n"), None);
+        assert_eq!(bench_verdict(""), None);
+    }
+
+    /// `println!` in `diag_bench_report` wraps the report in blank lines, and a shell may
+    /// add its own indentation when the log is pasted around. Trimming is what makes the
+    /// parse survive that.
+    #[test]
+    fn a_verdict_line_is_found_through_surrounding_whitespace() {
+        let verdict = bench_verdict("\n\n   GO — fine.\n\n").expect("found");
+        assert!(verdict.go);
+        assert_eq!(verdict.line, "GO — fine.");
     }
 
     #[test]
