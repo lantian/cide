@@ -30,6 +30,7 @@
 //! acceptable for the same reason [`crate::lifecycle::stop_children`] is: the process is on
 //! its way out and the alternative is leaving a `claude` mid-turn.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cide_ide_mcp::{
@@ -207,10 +208,51 @@ impl IdeServers {
 /// `workspaceFolders`, so a `claude` started in a project's second root would otherwise not
 /// see this server as its own.
 fn servable_projects(ws: &Workspace) -> Vec<(ProjectId, Vec<PathBuf>)> {
-    let mut targets: Vec<(ProjectId, Vec<PathBuf>)> = ws
-        .projects
-        .iter()
-        .map(|(id, p)| (*id, p.roots.iter().map(|r| r.path.clone()).collect()))
+    // What each restored window is *showing* comes first, and header order fills in behind
+    // it. This ordering exists only for the cap below, and it is what makes the cap safe: in
+    // header order a workspace whose active project sits past index 32 would launch with 32
+    // servers for projects that are not on screen and none for the one that is — silently,
+    // since a missing server looks exactly like Claude having no IDE. Ordering by what is
+    // visible means the cap can only ever cost a project the user cannot currently see.
+    //
+    // Only `active` and the detached windows' own project, not every id in a stacked
+    // window's `projects` list: in `Stacked` mode that list is every project in the
+    // workspace, so honouring it would restore header order and hand the cap back its bug.
+    let mut order: Vec<ProjectId> = Vec::with_capacity(ws.projects.len());
+    let mut seen: HashSet<ProjectId> = HashSet::with_capacity(ws.projects.len());
+    let mut want = |id: ProjectId, order: &mut Vec<ProjectId>| {
+        // A window naming a project the workspace does not hold fails validation, so this is
+        // belt-and-braces — but `servable_projects` runs on a file we have just read from
+        // disk, and a `roots` lookup that misses would otherwise publish an empty lockfile.
+        if ws.projects.contains_key(&id) && seen.insert(id) {
+            order.push(id);
+        }
+    };
+    for role in ws.windows.values() {
+        match role {
+            cide_ipc::WindowRole::Shell { active, .. } => {
+                if let Some(id) = active {
+                    want(*id, &mut order);
+                }
+            }
+            cide_ipc::WindowRole::DetachedPane { project, .. }
+            | cide_ipc::WindowRole::DetachedTab { project, .. } => want(*project, &mut order),
+        }
+    }
+    for id in ws.projects.keys() {
+        want(*id, &mut order);
+    }
+
+    let mut targets: Vec<(ProjectId, Vec<PathBuf>)> = order
+        .into_iter()
+        .map(|id| {
+            let roots = ws.projects[&id]
+                .roots
+                .iter()
+                .map(|r| r.path.clone())
+                .collect();
+            (id, roots)
+        })
         .collect();
 
     // The same reasoning as `restore_windows`' window cap, and the same incident behind it: a
@@ -436,8 +478,17 @@ pub fn pending_request_ids(state: &WorkspaceState, project: ProjectId) -> Vec<St
 mod tests {
     use super::*;
 
-    /// The regression this module's `ensure_all` exists for: a restored workspace's projects
-    /// reach `ensure`.
+    /// Every restored project appears in the list `ensure_all` walks.
+    ///
+    /// **What this does not cover, deliberately and unhappily:** that `setup` calls
+    /// `ensure_all` at all. Deleting that call leaves this file's four tests green — the
+    /// wiring is one line in `crate::run`'s `setup` closure, `ensure` binds a port and
+    /// writes into the user's real `~/.claude/ide`, and `tauri`'s mock app is behind a
+    /// feature this build does not enable, so there is no seam between the two that a test
+    /// can hold. This is the same limitation `hooks::live_in` documents, handled the same
+    /// way: everything that can be *wrong* was pushed down into `servable_projects`, which
+    /// is what these tests hold, and the call site above it is a single unconditional line
+    /// with nothing to get subtly wrong.
     ///
     /// Servers used to start only from `project_open`, so a launch that loaded
     /// `workspace.json` gave every project panes with no `CLAUDE_CODE_SSE_PORT`. The
@@ -510,5 +561,67 @@ mod tests {
         // The ones that are served are the header's leftmost, not an arbitrary subset: the
         // map's insertion order is the tab order the user sees.
         assert_eq!(served[0].1, vec![PathBuf::from("/home/dev/p0")]);
+    }
+
+    /// The cap must never take the server away from the project that is on screen.
+    ///
+    /// Straight header order does exactly that: a workspace of 40 whose active project is
+    /// the last one would launch having bound 32 ports for projects behind the tab strip and
+    /// none for the one in front of the user — and a project with no server is
+    /// indistinguishable, from the pane, from Claude simply having no IDE.
+    #[test]
+    fn the_cap_never_drops_the_project_a_window_is_showing() {
+        let mut ws = Workspace::default();
+        let ids: Vec<ProjectId> = (0..40)
+            .map(|i| {
+                cide_core::workspace::open_project(
+                    &mut ws,
+                    vec![format!("/home/dev/p{i}").into()],
+                    None,
+                )
+                .expect("a rooted project opens")
+            })
+            .collect();
+        // Through the real gesture: `rebuild_windows` leaves `active` on the first project
+        // opened, and clicking the fortieth header tab is what moves it.
+        let on_screen = ids[39];
+        cide_core::workspace::activate_project(&mut ws, on_screen);
+
+        let served = servable_projects(&ws);
+        assert_eq!(served.len(), 32);
+        assert_eq!(
+            served[0].0, on_screen,
+            "the visible project is served first"
+        );
+        // And the cap still spends the rest of its budget on the header's leftmost, rather
+        // than on whatever the window list happened to mention.
+        assert_eq!(served[1].1, vec![PathBuf::from("/home/dev/p0")]);
+    }
+
+    /// A detached window has no tab strip and no `active` — its project is what it shows.
+    #[test]
+    fn a_detached_window_counts_as_showing_its_project() {
+        let mut ws = Workspace::default();
+        let ids: Vec<ProjectId> = (0..40)
+            .map(|i| {
+                cide_core::workspace::open_project(
+                    &mut ws,
+                    vec![format!("/home/dev/p{i}").into()],
+                    None,
+                )
+                .expect("a rooted project opens")
+            })
+            .collect();
+        ws.windows.insert(
+            cide_ipc::WindowLabel("pane:test".into()),
+            cide_ipc::WindowRole::DetachedPane {
+                project: ids[38],
+                tab: cide_ipc::TabId::new(),
+                pane: PaneId::new(),
+            },
+        );
+
+        let served: Vec<ProjectId> = servable_projects(&ws).into_iter().map(|(p, _)| p).collect();
+        assert!(served.contains(&ids[38]));
     }
 }

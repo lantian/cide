@@ -81,6 +81,7 @@ import {
   type RepoId,
 } from '@/ipc/client'
 import { markDiffPaneAvailable } from '@/sidebar/GitPanel/diffHost'
+import { noteRepoRoots, repoRoot, touchesFile } from '@/sidebar/GitPanel/repoRoots'
 import styles from './GitDiffPane.module.css'
 
 /*
@@ -411,9 +412,19 @@ export interface GitDiffPaneProps {
   project: ProjectId
   /** The tab's spec. Only a `git` origin renders here; a Claude one belongs to `DiffPane`. */
   spec: DiffSpec
+  /**
+   * Whether this tab is the one on screen.
+   *
+   * `TabContent` keeps every tab of the project mounted and hides all but one with
+   * `visibility: hidden`, so the DOM alone cannot answer this — it is the same flag its
+   * `renderTree` already hands the WebGL pool and the focus restorer. Omitting it is safe and
+   * means "assume visible": the pane then refetches the moment its file changes, which is
+   * what it did before this argument existed.
+   */
+  visible?: boolean
 }
 
-export function GitDiffPane({ project, spec }: GitDiffPaneProps): ReactNode {
+export function GitDiffPane({ project, spec, visible = true }: GitDiffPaneProps): ReactNode {
   if (spec.origin.kind !== 'git') {
     // Not reachable through `tab_open_diff`, which only ever writes a git origin. Said out
     // loud rather than rendered blank so a mis-wired host sees why nothing is here.
@@ -422,7 +433,16 @@ export function GitDiffPane({ project, spec }: GitDiffPaneProps): ReactNode {
   const { repo, path, side } = spec.origin
   // Keyed on the file, so a tab that comes to show a different diff re-derives everything
   // rather than painting the previous file's selection against the new file's line numbers.
-  return <GitDiff key={`${repo} ${path}`} project={project} repo={repo} path={path} from={side} />
+  return (
+    <GitDiff
+      key={`${repo} ${path}`}
+      project={project}
+      repo={repo}
+      path={path}
+      from={side}
+      visible={visible}
+    />
+  )
 }
 
 interface GitDiffProps {
@@ -431,9 +451,10 @@ interface GitDiffProps {
   path: string
   /** The side the tab was opened on. The pane owns it from here. */
   from: DiffSide
+  visible: boolean
 }
 
-function GitDiff({ project, repo, path, from }: GitDiffProps): ReactNode {
+function GitDiff({ project, repo, path, from, visible }: GitDiffProps): ReactNode {
   const [side, setSide] = useState<DiffSide>(from)
   const [diff, setDiff] = useState<FileDiff | null>(null)
   const [reason, setReason] = useState<string | null>(null)
@@ -443,12 +464,18 @@ function GitDiff({ project, repo, path, from }: GitDiffProps): ReactNode {
   const [busy, setBusy] = useState(false)
   /** Bumped to re-run the fetch; a git mutation anywhere invalidates this view. */
   const [nonce, setNonce] = useState(0)
+  /** Something invalidated this view while the tab was behind another one. See below. */
+  const [stale, setStale] = useState(false)
 
   // Read through refs inside the fetch so a re-render caused by a tick cannot re-run it, and
   // so the staleness check can see the marks without depending on them.
   const marksRef = useRef<Marks>(marks)
   marksRef.current = marks
   const revRef = useRef<string | null>(null)
+  // The invalidation listeners below are subscribed once per file and must not be torn down
+  // and rebuilt every time the user switches tabs, so visibility reaches them through a ref.
+  const visibleRef = useRef(visible)
+  visibleRef.current = visible
 
   const partials = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
   const held = useMemo(
@@ -499,9 +526,45 @@ function GitDiff({ project, repo, path, from }: GitDiffProps): ReactNode {
     }
   }, [project, repo, path, side, nonce])
 
-  // A mutation cide made anywhere invalidates this view — including one made in the panel
-  // beside it, or in another window. Tool events cover the case with no cide mutation at all:
-  // an agent writing the file this tab is showing.
+  /*
+   * What invalidates this view, and what does not.
+   *
+   * A mutation cide made anywhere invalidates it — including one made in the panel beside it,
+   * or in another window. Tool events cover the case with no cide mutation at all: an agent
+   * writing the file this tab is showing.
+   *
+   * # Both filters are load-bearing
+   *
+   * `cide://session-tool` is emitted with `AppHandle::emit`, which reaches **every window**,
+   * and it names a session rather than a project. So this handler hears every tool call every
+   * Claude in the app makes, in any project. `TabContent` keeps every tab of the project
+   * mounted at once — that is what makes switching tabs free — so an unfiltered bump meant N
+   * open diff tabs each issuing a `git_diff_file` on every tool call anywhere, and all but at
+   * most one of those tabs was behind another one.
+   *
+   * The event names the paths it touched, which is the filter: a tool call is only this tab's
+   * business if it wrote *this tab's file*. Project scoping falls out of the same comparison
+   * rather than needing a `project` field on the event, because an absolute path under another
+   * project's root is not this file — see `repoRoots.touchesFile`.
+   *
+   * `cide://git-status` already carries a project and stays filtered on it alone. It is not
+   * narrowed to the path as well: it fires once per cide mutation rather than once per tool
+   * call, so it is not the storm, and staging a *neighbouring* file does move this view — the
+   * `held` line and the side switcher both describe an index that just changed.
+   *
+   * # Hidden tabs defer rather than skip
+   *
+   * A hidden tab records that it is stale and fetches when it is next revealed, once, however
+   * many events went by. It deliberately does not refetch on *every* reveal: the whole reason
+   * `TabContent` keeps tabs mounted is that coming back to one is instant, and a tab that
+   * re-reads a 4,000-line diff every time it is looked at would trade the storm for a stutter
+   * on a gesture people make constantly. So the cost is paid exactly when the file it is
+   * showing actually moved, and a tab nobody touched draws from the state it already has.
+   *
+   * The one thing this gives up is a hidden tab that is *watched* rather than looked at —
+   * split off into its own window, say. That case is not reachable today: a detached window
+   * hosts a pane, not a tab, and its tab is by definition the visible one in its own shell.
+   */
   useEffect(() => {
     let gone = false
     let timer: number | null = null
@@ -509,8 +572,14 @@ function GitDiff({ project, repo, path, from }: GitDiffProps): ReactNode {
     const bump = () => {
       if (timer !== null) window.clearTimeout(timer)
       // One edit reports several paths and a `git_status` broadcast follows every mutation, so
-      // the triggers arrive together; coalescing them is one fetch instead of three.
-      timer = window.setTimeout(() => setNonce((n) => n + 1), 120)
+      // the triggers arrive together; coalescing them is one fetch instead of three. Which of
+      // the two this becomes is decided when the timer fires, not when it is set: a tab
+      // revealed inside the window fetches straight away rather than waiting to be revealed
+      // again.
+      timer = window.setTimeout(() => {
+        if (visibleRef.current) setNonce((n) => n + 1)
+        else setStale(true)
+      }, 120)
     }
     const track = (p: Promise<() => void>) => {
       void p
@@ -521,17 +590,33 @@ function GitDiff({ project, repo, path, from }: GitDiffProps): ReactNode {
         .catch((e: unknown) => diag.log(`git diff pane: events unavailable: ${String(e)}`))
     }
     track(
-      events.onGitStatus((forProject) => {
+      events.onGitStatus((forProject, tree) => {
+        // Noted whoever it is for: the roots in another project's tree are still true, and a
+        // tab in this window may be showing one of those repos after a project switch.
+        noteRepoRoots(tree)
         if (forProject === project) bump()
       }),
     )
-    track(events.onSessionTool(() => bump()))
+    track(
+      events.onSessionTool((_session, paths) => {
+        if (touchesFile(paths, repoRoot(repo), path)) bump()
+      }),
+    )
     return () => {
       gone = true
       if (timer !== null) window.clearTimeout(timer)
       for (const fn of unlisten) fn()
     }
-  }, [project])
+  }, [project, repo, path])
+
+  // Reveal is where a deferred fetch is spent. The flag is cleared by the reveal and not by
+  // the fetch's outcome: a file staged away answers `NoSuchChange` for as long as it stays
+  // that way, and a flag that only cleared on success would re-arm every render into a loop.
+  useEffect(() => {
+    if (!visible || !stale) return
+    setStale(false)
+    setNonce((n) => n + 1)
+  }, [visible, stale])
 
   const switchSide = useCallback((next: DiffSide) => {
     // Positions do not transfer between sides; see the module comment.

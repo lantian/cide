@@ -62,6 +62,7 @@ try {
       files: [
         join(UI, 'src', 'sidebar', 'GitPanel', 'diffSelection.ts'),
         join(UI, 'src', 'sidebar', 'GitPanel', 'partialStore.ts'),
+        join(UI, 'src', 'sidebar', 'GitPanel', 'repoRoots.ts'),
       ],
     }),
   )
@@ -72,6 +73,7 @@ try {
 
   const s = await import(`file://${join(out, 'sidebar', 'GitPanel', 'diffSelection.js')}`)
   const store = await import(`file://${join(out, 'sidebar', 'GitPanel', 'partialStore.js')}`)
+  const roots = await import(`file://${join(out, 'sidebar', 'GitPanel', 'repoRoots.js')}`)
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -407,6 +409,90 @@ try {
   ok(store.getSnapshot() === store.getSnapshot(), 'the snapshot is stable between changes')
   ok(store.getServerSnapshot() === store.getSnapshot(), 'and SSR sees the same identity')
   store.clearAllPartials()
+
+  /* --- which tool calls a diff tab is allowed to care about -------------------------------
+   *
+   * `cide://session-tool` reaches every window and names a session, not a project, so an
+   * unfiltered diff tab refetched on every tool call any Claude in the app made. `TabContent`
+   * keeps every tab mounted, so that was N `git_diff_file` calls per tool call, nearly all of
+   * them for tabs nobody was looking at. The filter below is the fix, and the case that makes
+   * it worth pinning is the *second* project: two checkouts with the same `src/main.rs`.
+   */
+  const ROOT = '/home/dev/work/cide'
+  const ELSEWHERE = '/home/dev/work/other'
+  const touches = (paths, root, path) => roots.touchesFile(paths, root, path)
+
+  ok(
+    touches([`${ROOT}/src/main.rs`], ROOT, 'src/main.rs'),
+    'a tool call on this tab’s own file is this tab’s business',
+  )
+  eq(
+    touches([`${ELSEWHERE}/src/main.rs`], ROOT, 'src/main.rs'),
+    false,
+    'the same relative path in another project is a different file and must not refetch',
+  )
+  eq(
+    touches([`${ROOT}/src/other.rs`, `${ROOT}/README.md`], ROOT, 'src/main.rs'),
+    false,
+    'a tool call on a neighbouring file in the same repo does not move this diff',
+  )
+  ok(
+    touches([`${ROOT}/README.md`, `${ROOT}/src/main.rs`], ROOT, 'src/main.rs'),
+    'one edit reports several paths and any of them may be the one',
+  )
+  eq(touches([], ROOT, 'src/main.rs'), false, 'no paths, no fetch')
+  ok(
+    touches([`${ROOT}/src/main.rs`], `${ROOT}/`, 'src/main.rs'),
+    'a trailing separator on the root does not produce a double slash that matches nothing',
+  )
+  eq(
+    touches([`${ROOT}/src/main.rs.bak`], ROOT, 'src/main.rs'),
+    false,
+    'a path this one is a prefix of is not this one',
+  )
+
+  // The fallback, for a window that has not seen a `ChangesTree` yet — the sidebar on Files,
+  // no mutation yet, so no root is known. Loose on purpose: the cost of a false positive is
+  // one wasted fetch, the cost of a false negative is a tab that stops following its file.
+  ok(
+    touches([`${ROOT}/src/main.rs`], null, 'src/main.rs'),
+    'without a root the tail still matches, so the tab keeps following its file',
+  )
+  ok(
+    touches([`${ELSEWHERE}/src/main.rs`], null, 'src/main.rs'),
+    'and matches another project too — the admitted cost of not knowing the root',
+  )
+  eq(
+    touches([`${ROOT}/src/other.rs`], null, 'src/main.rs'),
+    false,
+    'the fallback is still a path match, not “refetch on everything”',
+  )
+  eq(
+    touches([`${ROOT}/vendor/src/main.rs`], ROOT, 'src/main.rs'),
+    false,
+    'with a root known, a deeper file with the same tail is rejected',
+  )
+
+  // The registry that supplies the root. `RepoChanges` is flat — submodules arrive as their
+  // own entry — so this is a walk, not a recursion.
+  eq(roots.repoRoot('r1'), null, 'a repo no tree has named yet has no root')
+  roots.noteRepoRoots({
+    repos: [
+      { repo: { id: 'r1', root: ROOT } },
+      { repo: { id: 'r2', root: `${ROOT}/vendor/sub` } },
+    ],
+  })
+  eq(roots.repoRoot('r1'), ROOT, 'a tree teaches the root of every repo in it')
+  eq(roots.repoRoot('r2'), `${ROOT}/vendor/sub`, 'including submodules, which arrive flat')
+  ok(
+    touches([`${ROOT}/vendor/sub/src/main.rs`], roots.repoRoot('r2'), 'src/main.rs'),
+    'a submodule’s src/main.rs is its own, not the parent repo’s',
+  )
+  eq(
+    touches([`${ROOT}/vendor/sub/src/main.rs`], roots.repoRoot('r1'), 'src/main.rs'),
+    false,
+    'and the parent repo does not claim it',
+  )
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

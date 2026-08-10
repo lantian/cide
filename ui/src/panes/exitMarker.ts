@@ -17,10 +17,13 @@
  *
  * Three cases, and only one of them is a number anybody wants on screen:
  *
- * * `undefined` — this pane learned about the exit from `session.hasExited`, which answers a
- *   boolean. That is the rehydration path: a host evicted and re-created after its child had
- *   already gone, where the `cide://session-state` event fired before anything was listening.
- *   No number exists to show.
+ * * `undefined` — nothing can say. That is the rehydration path: a host evicted and re-created
+ *   after its child had already gone, where the `cide://session-state` event fired before
+ *   anything was listening. It used to mean "this pane asked `session.hasExited`, which
+ *   answers a boolean" — a code that existed and was never requested. {@link markFor} narrows
+ *   it to the one case where no number exists anywhere: a session the registry has never
+ *   heard of, restored from `workspace.json` after the process that owned it died with the
+ *   app.
  * * `0` — it finished, and it worked. `— exited (0) —` is noise on the ordinary case, and
  *   noise on the ordinary case is how a marker stops being read at all.
  * * negative — `cide_pty::UNKNOWN_EXIT_CODE`, meaning `wait()` itself failed and this build
@@ -50,4 +53,65 @@ export function exitMarkerText(code?: number): string {
  */
 export function exitMarkerBytes(code?: number): string {
   return `\r\n\x1b[2m${exitMarkerText(code)}\x1b[0m\r\n`
+}
+
+/**
+ * What the registry can still say about a session whose pane was not there to hear it die.
+ *
+ * The rehydration path — a host evicted and re-created after its child had already gone —
+ * asks a question rather than listening for an event, and the question it asks today is
+ * `session_has_exited`, which answers a boolean. That is why the marker on that path never
+ * carries a number: the number exists, it is just not on the wire. See the note on
+ * `showsCode` above, and the report accompanying this change for the command that would
+ * carry it.
+ *
+ * Four answers, because `cide-pty` genuinely has four states to report and collapsing any two
+ * of them loses the code again:
+ *
+ * * `running` — the child is alive. The pane was rehydrated over a session that outlived it,
+ *   which is the ordinary case and the reason the question is asked at all.
+ * * `reaping` — `Session::has_exited()` is true but `Session::exit_status()` is still `None`.
+ *   EOF on the pty master and the reaper's `wait()` are two events on two threads, and this is
+ *   the window between them. The code exists and is milliseconds away on
+ *   `cide://session-state`.
+ * * `exited` — reaped, with the status `wait()` returned.
+ * * `unknown` — the registry never held this id. A `SessionId` restored from `workspace.json`
+ *   after a restart is exactly this: the process that owned it is gone and no code survives
+ *   anywhere. This is the only answer for which a bare `— exited —` is the truth.
+ *
+ * Mirrors the shape a `session_exit` command would return. Declared here rather than waited
+ * for because this module is where the decision belongs and where a check script can reach
+ * it; when the command lands, this type is replaced by the generated one and nothing else
+ * moves.
+ */
+export type ExitAnswer =
+  | { kind: 'running' }
+  | { kind: 'reaping' }
+  | { kind: 'exited'; code: number }
+  | { kind: 'unknown' }
+
+/**
+ * What the one-shot rehydration check should do with that answer.
+ *
+ * `null` means *do not write the marker*, and it covers two different reasons that must not be
+ * merged. `running` is obvious. `reaping` is the interesting one: the pane is about to be told
+ * the real code by `cide://session-state`, and `markExited` is one-shot — whichever call
+ * arrives first is the one whose code is shown — so marking now would win the race and print
+ * the codeless line a fraction of a second before the number turned up. Losing the code to a
+ * thread scheduling accident is precisely the failure this whole path exists to end, so the
+ * check declines and lets the event do it.
+ *
+ * Otherwise it is the argument for `exitMarkerBytes`: a real status, or `undefined` for the
+ * session nothing can speak for.
+ */
+export function markFor(answer: ExitAnswer): { code?: number } | null {
+  switch (answer.kind) {
+    case 'running':
+    case 'reaping':
+      return null
+    case 'exited':
+      return { code: answer.code }
+    case 'unknown':
+      return {}
+  }
 }
