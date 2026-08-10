@@ -26,8 +26,8 @@
 use std::collections::HashSet;
 
 use cide_ipc::{
-    Axis, Direction, LayoutNode, MAX_RATIO, MIN_RATIO, Pane, PaneId, PaneRole, PaneTree, Side,
-    SplitId,
+    Axis, Direction, DockAnchor, DockSibling, LayoutNode, MAX_RATIO, MIN_RATIO, Pane, PaneId,
+    PaneRole, PaneTree, Side, SplitId,
 };
 use indexmap::IndexMap;
 
@@ -76,6 +76,75 @@ pub fn insert_pane(
     pane: Pane,
 ) -> Result<PaneId> {
     attach(tree, target, axis, side, pane)
+}
+
+/// Describe where `pane` sits, so [`insert_pane_at`] can later put it back exactly.
+///
+/// Must be read **before** [`take_pane`]: taking the pane collapses the very split this
+/// describes, and afterwards there is nothing left to look at.
+///
+/// `None` when the pane is the whole tree — it has no parent split, so there is no position
+/// to remember. [`take_pane`] refuses that case anyway, so a caller pairing the two never
+/// stores a `None` for a pane that actually left.
+pub fn anchor_of(tree: &PaneTree, pane: PaneId) -> Option<DockAnchor> {
+    find_parent(&tree.root, pane)
+}
+
+/// Whether [`insert_pane_at`] would restore `anchor` exactly, rather than erroring.
+///
+/// Separate from the insertion so a caller can choose a fallback instead of failing: an
+/// anchor going stale is the normal cost of leaving a pane out while the tab moves on, not
+/// an error anybody can act on.
+pub fn can_restore(tree: &PaneTree, anchor: &DockAnchor) -> bool {
+    contains_node(&tree.root, anchor.sibling) && !contains_split(&tree.root, anchor.split)
+}
+
+/// Put a pane back in the exact split it was detached from.
+///
+/// Rebuilds the parent split around `anchor.sibling` with the recorded axis, side, divider
+/// id and ratio, which is what makes detach/re-dock a no-op on the tree rather than a
+/// re-layout. Errors when the sibling is gone or the divider id is somehow live again; ask
+/// [`can_restore`] first and fall back rather than treating that as a failure.
+///
+/// The ratio is clamped and NaN-guarded here rather than trusted: an anchor survives a quit
+/// in `workspace.json`, and a hand-edited or corrupt file must not be able to write a ratio
+/// that [`validate`] would then reject.
+pub fn insert_pane_at(tree: &mut PaneTree, anchor: &DockAnchor, pane: Pane) -> Result<PaneId> {
+    if tree.panes.contains_key(&pane.id) {
+        return Err(CoreError::Invariant(format!(
+            "pane {} is already in this tree",
+            pane.id
+        )));
+    }
+    // Split ids address dividers, and `validate` requires them unique. Reinstating one that
+    // is somehow live again would put two dividers under one id and make `set_ratio` drag
+    // both, so refuse instead — `can_restore` reports the same condition in advance.
+    if contains_split(&tree.root, anchor.split) {
+        return Err(CoreError::Invariant(format!(
+            "split {} is already in this tree",
+            anchor.split
+        )));
+    }
+
+    let id = pane.id;
+    let ratio = if anchor.ratio.is_finite() {
+        anchor.ratio.clamp(MIN_RATIO, MAX_RATIO)
+    } else {
+        0.5
+    };
+    if !graft_at(&mut tree.root, anchor, ratio, id) {
+        return Err(match anchor.sibling {
+            DockSibling::Pane { pane } => CoreError::NoSuchPane(pane),
+            DockSibling::Split { split } => CoreError::NoSuchSplit(split),
+        });
+    }
+
+    tree.panes.insert(id, pane);
+    // Same coupling as `attach`: the pane the user just dropped back takes focus, and a
+    // maximized flag left set would hide it behind whatever was maximized.
+    tree.focused = id;
+    tree.maximized = None;
+    Ok(id)
 }
 
 /// Remove a leaf and collapse its parent split into the surviving sibling.
@@ -411,6 +480,96 @@ fn graft(node: &mut LayoutNode, target: PaneId, axis: Axis, side: Side, new_pane
         LayoutNode::Leaf { .. } => false,
         LayoutNode::Split { a, b, .. } => {
             graft(a, target, axis, side, new_pane) || graft(b, target, axis, side, new_pane)
+        }
+    }
+}
+
+/// The split that has `pane` as a direct child, described as a [`DockAnchor`].
+fn find_parent(node: &LayoutNode, pane: PaneId) -> Option<DockAnchor> {
+    let LayoutNode::Split {
+        id,
+        axis,
+        a,
+        b,
+        ratio,
+    } = node
+    else {
+        return None;
+    };
+
+    // `a` and `b` are the only two places the pane can be a *direct* child; anywhere else it
+    // belongs to a deeper split, which the recursion finds instead.
+    let side = match (a.as_ref(), b.as_ref()) {
+        (LayoutNode::Leaf { pane: p }, _) if *p == pane => Some(Side::Before),
+        (_, LayoutNode::Leaf { pane: p }) if *p == pane => Some(Side::After),
+        _ => None,
+    };
+    if let Some(side) = side {
+        let sibling = node_ref(match side {
+            Side::Before => b,
+            Side::After => a,
+        });
+        return Some(DockAnchor {
+            sibling,
+            split: *id,
+            axis: *axis,
+            side,
+            ratio: *ratio,
+        });
+    }
+
+    find_parent(a, pane).or_else(|| find_parent(b, pane))
+}
+
+/// Name a node by whichever id it carries.
+fn node_ref(node: &LayoutNode) -> DockSibling {
+    match node {
+        LayoutNode::Leaf { pane } => DockSibling::Pane { pane: *pane },
+        LayoutNode::Split { id, .. } => DockSibling::Split { split: *id },
+    }
+}
+
+fn contains_node(node: &LayoutNode, wanted: DockSibling) -> bool {
+    if node_ref(node) == wanted {
+        return true;
+    }
+    match node {
+        LayoutNode::Leaf { .. } => false,
+        LayoutNode::Split { a, b, .. } => contains_node(a, wanted) || contains_node(b, wanted),
+    }
+}
+
+fn contains_split(node: &LayoutNode, wanted: SplitId) -> bool {
+    contains_node(node, DockSibling::Split { split: wanted })
+}
+
+/// Wrap the anchor's sibling node in the split it used to share with `new_pane`.
+///
+/// The mirror image of [`prune`]: where that collapses a split into the survivor, this
+/// re-expands the survivor into a split. Reports whether the sibling was found.
+fn graft_at(node: &mut LayoutNode, anchor: &DockAnchor, ratio: f32, new_pane: PaneId) -> bool {
+    if node_ref(node) == anchor.sibling {
+        // The placeholder is dropped on the next line; it exists only so the sibling — which
+        // may be a whole subtree — can be moved into the new split rather than cloned.
+        let old = std::mem::replace(node, LayoutNode::Leaf { pane: new_pane });
+        let new = LayoutNode::Leaf { pane: new_pane };
+        let (a, b) = match anchor.side {
+            Side::Before => (new, old),
+            Side::After => (old, new),
+        };
+        *node = LayoutNode::Split {
+            id: anchor.split,
+            axis: anchor.axis,
+            a: Box::new(a),
+            b: Box::new(b),
+            ratio,
+        };
+        return true;
+    }
+    match node {
+        LayoutNode::Leaf { .. } => false,
+        LayoutNode::Split { a, b, .. } => {
+            graft_at(a, anchor, ratio, new_pane) || graft_at(b, anchor, ratio, new_pane)
         }
     }
 }
@@ -1522,5 +1681,168 @@ mod tests {
             panic!("a pane whose key and id disagree must be reported");
         };
         assert!(msg.contains(&p1.to_string()) && msg.contains(&stray.to_string()));
+    }
+
+    /// Take a pane out and put it back by its anchor: the tree must be bit-for-bit what it
+    /// was, divider ids and ratios included.
+    ///
+    /// Every pane of the five-pane fixture is tried rather than one hand-picked case,
+    /// because the interesting variation is *what the sibling is*: `p1` leaves a whole
+    /// subtree behind, `p4` leaves a leaf, and a restore that re-entered beside some leaf
+    /// inside a subtree would pass the leaf cases and quietly nest the others one level deep.
+    #[test]
+    fn an_anchor_puts_a_pane_back_in_the_split_it_left() {
+        let (fixture, ids) = asymmetric();
+        // A ratio nobody would land on by accident: 0.5 is what a fresh split writes, so a
+        // restore that forgot the ratio entirely would still match if the fixture kept it.
+        let mut fixture = fixture;
+        let splits = {
+            let mut out = Vec::new();
+            collect_splits(&fixture.root, &mut out);
+            out
+        };
+        for (i, (id, _)) in splits.iter().enumerate() {
+            set_ratio(&mut fixture, *id, 0.18 + 0.13 * i as f32).expect("a live divider moves");
+        }
+
+        for pane in ids {
+            let mut tree = fixture.clone();
+            let anchor = anchor_of(&tree, pane).expect("a pane below the root has a parent split");
+            let taken = take_pane(&mut tree, pane).expect("a pane with a sibling can leave");
+
+            assert!(
+                can_restore(&tree, &anchor),
+                "nothing changed while the pane was out, so its anchor is still good"
+            );
+            insert_pane_at(&mut tree, &anchor, taken).expect("restores");
+
+            assert_eq!(
+                tree.root, fixture.root,
+                "pane {pane} came back to a different shape"
+            );
+            assert_eq!(
+                tree.panes, fixture.panes,
+                "pane {pane}: the side map drifted"
+            );
+            assert_eq!(tree.focused, pane, "the pane just dropped back takes focus");
+            validate(&tree).expect("valid");
+        }
+    }
+
+    /// The sibling closing while the pane is out is the case the old code assumed was the
+    /// only one. It must be *detected*, not restored wrongly.
+    #[test]
+    fn an_anchor_whose_sibling_has_closed_cannot_be_restored() {
+        let (mut tree, [p1, p2, p3, p4, _p5]) = asymmetric();
+        let anchor = anchor_of(&tree, p4).expect("has a parent");
+        let taken = take_pane(&mut tree, p4).expect("leaves");
+        let DockSibling::Pane { pane: sibling } = anchor.sibling else {
+            panic!("p4 split against a leaf");
+        };
+        assert_eq!(sibling, p3, "the fixture's shape is what this test assumes");
+
+        close(&mut tree, sibling).expect("the sibling closes while the pane is out");
+
+        assert!(!can_restore(&tree, &anchor));
+        assert_eq!(
+            insert_pane_at(&mut tree, &anchor, taken),
+            Err(CoreError::NoSuchPane(sibling)),
+            "the refusal names the node that went away, so a caller can say why it fell back"
+        );
+        // And the tree is untouched by the refusal — the caller still has a pane to place.
+        assert!(!tree.panes.contains_key(&p4));
+        assert!(tree.panes.contains_key(&p1) && tree.panes.contains_key(&p2));
+        validate(&tree).expect("valid");
+    }
+
+    /// A subtree sibling can go away without any single pane doing so: close enough of it and
+    /// the split that named it collapses.
+    #[test]
+    fn an_anchor_naming_a_split_goes_stale_when_that_split_collapses() {
+        let (mut tree, [_p1, p2, p3, p4, _p5]) = asymmetric();
+        let anchor = anchor_of(&tree, p2).expect("has a parent");
+        let DockSibling::Split { .. } = anchor.sibling else {
+            panic!("p2 split against a subtree, which is the case this test is about");
+        };
+        let taken = take_pane(&mut tree, p2).expect("leaves");
+        assert!(can_restore(&tree, &anchor));
+
+        // Collapsing the sibling subtree into a single leaf destroys the split the anchor
+        // names, even though the pane that survived it is still there — which is exactly the
+        // stale case a pane-id-only anchor could not see.
+        close(&mut tree, p3).expect("closes");
+        assert!(tree.panes.contains_key(&p4), "a pane of it survives");
+
+        assert!(
+            !can_restore(&tree, &anchor),
+            "the subtree is gone even though its panes are not"
+        );
+        assert!(matches!(
+            insert_pane_at(&mut tree, &anchor, taken),
+            Err(CoreError::NoSuchSplit(_))
+        ));
+    }
+
+    /// The root leaf has no parent split, so there is no position to record. `take_pane`
+    /// refuses it anyway; the two must agree rather than one of them panicking.
+    #[test]
+    fn the_only_pane_in_a_tree_has_no_anchor() {
+        let pane = primary();
+        let id = pane.id;
+        let tree = new_tree(pane);
+
+        assert!(anchor_of(&tree, id).is_none());
+        assert!(
+            anchor_of(&tree, PaneId::new()).is_none(),
+            "nor does a stranger"
+        );
+    }
+
+    /// An anchor is persisted, so it can come back from a file that was hand-edited, written
+    /// by a different build, or corrupted. A ratio outside the band would fail `validate` on
+    /// the very next check — silently rejecting the whole workspace as corrupt over a
+    /// cosmetic number — so it is clamped where it is read.
+    #[test]
+    fn a_restored_ratio_is_clamped_and_nan_guarded() {
+        let (fixture, [p1, ..]) = asymmetric();
+
+        for (stored, expected) in [(5.0_f32, MAX_RATIO), (-2.0, MIN_RATIO), (f32::NAN, 0.5)] {
+            let mut tree = fixture.clone();
+            let mut anchor = anchor_of(&tree, p1).expect("has a parent");
+            anchor.ratio = stored;
+            let taken = take_pane(&mut tree, p1).expect("leaves");
+
+            insert_pane_at(&mut tree, &anchor, taken).expect("restores");
+
+            let mut splits = Vec::new();
+            collect_splits(&tree.root, &mut splits);
+            let (_, ratio) = splits
+                .iter()
+                .find(|(id, _)| *id == anchor.split)
+                .expect("the recorded divider is back");
+            assert_eq!(*ratio, expected, "stored ratio {stored}");
+            validate(&tree).expect("valid");
+        }
+    }
+
+    /// Reinstating the recorded divider id is what keeps a drag in flight pointing at the
+    /// same divider. It is also the one way this can break an invariant, so the impossible
+    /// case is refused rather than trusted.
+    #[test]
+    fn restoring_a_divider_id_that_is_somehow_live_is_refused() {
+        let (mut tree, [p1, ..]) = asymmetric();
+        let mut anchor = anchor_of(&tree, p1).expect("has a parent");
+        let taken = take_pane(&mut tree, p1).expect("leaves");
+
+        let mut splits = Vec::new();
+        collect_splits(&tree.root, &mut splits);
+        anchor.split = splits.first().expect("the tree still has dividers").0;
+
+        assert!(!can_restore(&tree, &anchor));
+        assert!(matches!(
+            insert_pane_at(&mut tree, &anchor, taken),
+            Err(CoreError::Invariant(_))
+        ));
+        validate(&tree).expect("the refusal left the tree alone");
     }
 }

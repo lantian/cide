@@ -509,6 +509,7 @@ mod tests {
             tabs: vec![home, settings],
             active_tab,
             detached: IndexMap::new(),
+            dock_anchors: IndexMap::new(),
             primary_session,
         }
     }
@@ -666,6 +667,89 @@ mod tests {
             mangled.projects[&project_id].detached.is_empty(),
             "a missing `detached` defaults to empty rather than failing, which is the point"
         );
+    }
+
+    /// A workspace is saved with its panes still detached, so the position a detached pane
+    /// re-docks into has to survive a quit — otherwise the one gesture that most obviously
+    /// *should* be exact (detach, quit, relaunch, put it back) is the one that never is.
+    ///
+    /// The proof is the re-dock itself, performed on the workspace that came off disk and
+    /// compared against the tree as it stood before the detach. Asserting only that the map
+    /// round-trips would pass on an anchor whose `ratio` serialised as a string or whose
+    /// `sibling` tag was renamed, because nothing would have tried to *use* it.
+    #[test]
+    fn a_detached_panes_position_survives_a_quit() {
+        let dir = TempDir::new("dock-anchor");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = crate::workspace::demo_workspace();
+        let (project_id, tab_id, pane_id) = {
+            let (id, p) = workspace.projects.first().expect("a demo project");
+            let console = &p.tabs[0];
+            // The last pane of the console: it sits deepest in the tree, so a restore that
+            // re-split at the root rather than at the recorded sibling would show up here.
+            let pane = *console.tree.panes.keys().next_back().expect("panes");
+            (*id, console.id, pane)
+        };
+        // Drag *the pane's own divider* off the 0.5 a fresh split writes, so a lost ratio
+        // cannot pass by coincidence — and so the number under test is the one the re-dock
+        // has to reinstate rather than one belonging to a split that never collapsed.
+        let before = {
+            let t = crate::workspace::tab_mut(&mut workspace, project_id, tab_id).expect("exists");
+            let divider = crate::layout::anchor_of(&t.tree, pane_id)
+                .expect("a console pane below the root")
+                .split;
+            crate::layout::set_ratio(&mut t.tree, divider, 0.73).expect("a live divider moves");
+            t.tree.clone()
+        };
+
+        let label = crate::workspace::detach_pane(&mut workspace, project_id, tab_id, pane_id)
+            .expect("detach");
+        let anchors = workspace.projects[&project_id].dock_anchors.clone();
+        assert_eq!(anchors.len(), 1, "detaching recorded where the pane was");
+
+        save_atomic(&path, &workspace).expect("save");
+        let mut loaded = load(&path);
+
+        assert_eq!(
+            loaded.projects[&project_id].dock_anchors, anchors,
+            "the anchor comes back: sibling, divider id, axis, side and ratio"
+        );
+        // The bytes, not just the Rust round trip: `dockAnchors` and the nested `sibling` tag
+        // are read by nothing in Rust that would notice a rename, and `DockSibling` is a
+        // tagged enum with struct variants — the shape this project has already shipped a bug
+        // in once, for want of `rename_all_fields`.
+        let raw = fs::read_to_string(&path).expect("read the file back");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let stored = &value["projects"][project_id.to_string()]["dockAnchors"][pane_id.to_string()];
+        assert!(
+            stored.is_object(),
+            "the anchor is written under `dockAnchors`"
+        );
+        assert!(
+            stored["sibling"]["kind"] == "pane" || stored["sibling"]["kind"] == "split",
+            "the sibling keeps its camelCase tag, got {:?}",
+            stored["sibling"]
+        );
+        // Compared with a tolerance, not for equality: serde_json widens the `f32` to `f64`
+        // before writing, so the file reads `0.7300000190734863` and an exact match would be
+        // asserting the widening rather than the ratio.
+        let ratio = stored["ratio"].as_f64().expect("the ratio is a number");
+        assert!(
+            (ratio - 0.73).abs() < 1e-6,
+            "the divider position is written as a number, got {ratio}"
+        );
+
+        // And it is still usable: the tab comes back the tree it was, ratio included.
+        crate::workspace::redock_pane(&mut loaded, &label).expect("redocks after the reload");
+        let after = &crate::workspace::tab(&loaded, project_id, tab_id)
+            .expect("exists")
+            .tree;
+        assert_eq!(
+            after.root, before.root,
+            "the position did not survive the quit"
+        );
+        crate::workspace::validate(&loaded).expect("valid");
     }
 
     /// `DiffOrigin` has struct variants, and a `serde(tag)` enum with struct variants needs

@@ -22,7 +22,7 @@ use ts_rs::TS;
 
 use crate::ids::*;
 use crate::settings::Settings;
-use crate::{Axis, PaneKind, PaneRole};
+use crate::{Axis, PaneKind, PaneRole, Side};
 
 /// The persisted root. Everything durable hangs off this.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -119,6 +119,21 @@ pub struct Project {
     /// destroyed and rebuilt, which would lose the binding to its conversation.
     #[serde(default)]
     pub detached: IndexMap<PaneId, Pane>,
+    /// Where each entry of `detached` sat in its tab's tree, so re-docking can put it back
+    /// exactly rather than merely nearby.
+    ///
+    /// A **second map keyed the same way** rather than a field on the `detached` value: that
+    /// map's value type is the wire shape the detached-pane window renders (`App.tsx` reads
+    /// `project.detached[pane]` and expects a `Pane`), and wrapping it in a record would make
+    /// every reader of a torn-out pane reach through a field that only re-docking cares
+    /// about. The two are inserted and removed together in `cide-core::workspace`, and
+    /// `validate` refuses an anchor whose pane is not detached.
+    ///
+    /// Sparse by design: an entry is absent for a pane detached by an older build, and a
+    /// present entry can still go stale — the sibling it names may have been closed while the
+    /// pane was out. Re-docking checks before it trusts one.
+    #[serde(default)]
+    pub dock_anchors: IndexMap<PaneId, DockAnchor>,
     /// Immortal while the project is open. For a Claude pane this id *is* the value passed
     /// to `claude --session-id`, so restoring a workspace needs no extra bookkeeping to map
     /// a pane back to its conversation.
@@ -314,6 +329,55 @@ pub enum LayoutNode {
 /// Splits never collapse a child to nothing: below this a pane cannot show its title bar.
 pub const MIN_RATIO: f32 = 0.1;
 pub const MAX_RATIO: f32 = 0.9;
+
+/// Enough of a pane's old position to rebuild the split that detaching collapsed.
+///
+/// Detaching a pane removes its leaf and folds the parent split into whatever was on the
+/// other side. Everything that split knew — its axis, its divider position, which half the
+/// pane occupied — is gone with it, and a re-dock that does not remember it can only guess.
+/// The guess is visible: a pane that was 70/30 coming back as 50/50 resizes a terminal, and
+/// a reflowed `claude` TUI redraws its whole transcript.
+///
+/// What is stored is the *sibling node*, not a path from the root. A path indexes positions
+/// and every position shifts when any other pane in the tab is closed or split; a node id
+/// either still exists or plainly does not, which is exactly the question re-docking needs
+/// answered. Storing the sibling also handles the case a pane id alone cannot: the pane may
+/// have been split against a whole subtree, and re-entering "beside" some leaf inside that
+/// subtree would nest it one level too deep.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DockAnchor {
+    /// The node left behind when the split collapsed. The pane goes back beside *this*.
+    pub sibling: DockSibling,
+    /// The id of the collapsed split, reinstated rather than minted afresh so that anything
+    /// keyed on the divider — a drag in flight, a ratio the frontend is animating — refers to
+    /// the same divider it did before the detach.
+    pub split: SplitId,
+    pub axis: Axis,
+    /// Which half of the split the detached pane occupied, in the same sense as the `side`
+    /// passed to a split: `Before` means it was child `a`.
+    pub side: Side,
+    /// The collapsed split's ratio — the fraction that went to child `a`, so it is read
+    /// together with `side` rather than being "the pane's share".
+    pub ratio: f32,
+}
+
+/// One node of a pane tree, named by whichever id it carries.
+///
+/// A leaf is its pane and an interior node is its split; both id spaces are UUIDs minted
+/// once, so a lookup answers "still there" or "gone" with no ambiguity in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum DockSibling {
+    Pane { pane: PaneId },
+    Split { split: SplitId },
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
