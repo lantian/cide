@@ -377,8 +377,15 @@ mod tests {
         }
     }
 
+    /// The mock's titles, except for the two the rows model deliberately re-worded.
+    ///
+    /// `pane.split.right` and `pane.split.down` name two different gestures now — a tile in
+    /// this row, a full-width row below it — and the mock's bare "Split pane right/down" gave
+    /// a user no way to tell which was which. That is the whole complaint this milestone
+    /// answers, so the divergence is the point rather than drift; the other four are still
+    /// the mock's own strings.
     #[test]
-    fn titles_match_the_palette_mock_exactly() {
+    fn titles_are_the_mocks_except_the_two_the_rows_model_renamed() {
         for (id, title) in [
             ("pane.split.right", "Split pane right (adds a tile)"),
             ("pane.split.down", "Split pane down (adds a row)"),

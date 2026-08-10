@@ -127,6 +127,14 @@ export function flattenChain(node: SplitNode): Chain {
   return { axis: node.axis, members, dividers, fractions }
 }
 
+/**
+ * A chain member's React key: its own id, which no insertion elsewhere in the chain can
+ * change. Exported so `check:rows` can pin the property the keying exists for.
+ */
+export function memberKey(member: LayoutNode): string {
+  return member.kind === 'leaf' ? member.pane : member.id
+}
+
 interface ChainNodeProps {
   chain: Chain
   /** One per member, already walked, in order. */
@@ -146,7 +154,7 @@ function ChainNode({
 }: ChainNodeProps) {
   const gridRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
-  const { axis, fractions, dividers } = chain
+  const { axis, fractions, dividers, members } = chain
 
   // Deliberately runs on every render, with no dependency array.
   //
@@ -180,13 +188,19 @@ function ChainNode({
       data-axis={axis}
       style={{ ...style, ...layout }}
     >
-      {rendered.map((member, i) => (
+      {members.map((member, i) => (
         // A `Fragment`, not a wrapper element: two children per member — the member and the
         // divider after it — and anything real between them and the grid would break the
-        // explicit track placement below. Keyed by the divider's own id rather than by array
-        // index, so React reuses the right subtree when a tile is inserted mid-row.
-        <Fragment key={dividers[i] ?? 'end'}>
-          {member}
+        // explicit track placement below.
+        //
+        // Keyed by the *member's* own id, never by the array index and never by the divider
+        // beside it. Both of those move when a tile is inserted mid-row — divider `k`
+        // separates members `k` and `k + 1`, so an insertion shifts every later divider onto
+        // a different member — and React would then unmount live terminals that merely
+        // shuffled along the row. A leaf's `PaneId` and a cross-axis member's `SplitId` both
+        // survive an insertion anywhere else in the chain.
+        <Fragment key={memberKey(member)}>
+          {rendered[i]}
           {i < dividers.length && (
             <Splitter
               split={dividers[i] as SplitId}
@@ -263,8 +277,13 @@ function walk(node: LayoutNode, ctx: WalkContext, style: CSSProperties | undefin
   })
 
   return (
+    // Keyed by the chain root's own split id, which an insertion anywhere inside the chain
+    // leaves alone. `dividers[0]` looks equivalent and is not: it is the deepest split down
+    // the `a` spine, so adding a tile beside the *first* tile of a row mints a new one and
+    // React would remount that row's entire grid — every terminal in it — for a gesture that
+    // touched one cell.
     <ChainNode
-      key={chain.dividers[0]}
+      key={node.id}
       chain={chain}
       rendered={rendered}
       maximizedMember={holder}

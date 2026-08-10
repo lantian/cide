@@ -14,7 +14,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { LayoutNode, Pane, PaneId, PaneTree, SplitId } from '@/ipc/generated'
 import { applyDrag } from './Splitter'
-import { SplitTree } from './SplitTree'
+import { flattenChain, memberKey, SplitTree } from './SplitTree'
 
 const pane = (n: number): Pane => ({
   id: `pane-${n}` as PaneId,
@@ -57,6 +57,54 @@ export const FIXTURE: PaneTree = {
     Pane
   >,
 }
+
+/**
+ * `Row(Row(a, b), c)` — the same three tiles, leaning the other way.
+ *
+ * `FIXTURE` is a right-hand comb, and a comb is the one shape where in-order and pre-order
+ * traversal give the *same* divider list. So it cannot tell the two apart, and the divider
+ * index is the single contract this renderer shares with `cide-core`: the frontend hands a
+ * drag `dividers[k]`'s id and a pair share, and Rust resolves that id back to `k` through
+ * its own in-order walk. Get the orders out of step and a drag silently moves the wrong
+ * pair. A left-leaning chain is not a curiosity either — `add_row` with no anchor wraps the
+ * whole root, which is what `pane.addRow`'s default does, so appending rows builds exactly
+ * this shape.
+ *
+ * Ratios 2/3 and 0.5 multiply out to three equal thirds.
+ */
+const LEANING: PaneTree = {
+  root: split(
+    'lean-outer',
+    'row',
+    split('lean-inner', 'row', leaf(1), leaf(2), 0.5),
+    leaf(3),
+    2 / 3,
+  ),
+  focused: pane(1).id,
+  maximized: null,
+  panes: Object.fromEntries([1, 2, 3].map((n) => [pane(n).id, pane(n)])) as Record<PaneId, Pane>,
+}
+
+/**
+ * Row one after `add_tile` beside its *first* tile — exactly what `graft` writes: the leaf is
+ * replaced in place by a fresh two-child split, so the chain root keeps its id while a new
+ * divider appears at the head of the in-order list.
+ *
+ * The reason this fixture exists: member keys must be stable across that insertion, or React
+ * remounts terminals that only shuffled along the row. Keying by `dividers[k]` looks
+ * equivalent and is not — `dividers[0]` is the one id the insertion does change.
+ */
+const ROW_ONE = (FIXTURE.root as Extract<LayoutNode, { kind: 'split' }>).a
+const ROW_ONE_AFTER = split(
+  'split-r1a',
+  'row',
+  split('split-r1new', 'row', leaf(1), leaf(7), 0.5),
+  (ROW_ONE as Extract<LayoutNode, { kind: 'split' }>).b,
+  0.5,
+) as Extract<LayoutNode, { kind: 'split' }>
+
+const before = flattenChain(ROW_ONE as Extract<LayoutNode, { kind: 'split' }>)
+const after = flattenChain(ROW_ONE_AFTER)
 
 interface Element {
   tag: string
@@ -149,6 +197,7 @@ function render(tree: PaneTree, withAddRow: boolean) {
 const plain = render(FIXTURE, true)
 const maximized = render({ ...FIXTURE, maximized: pane(3).id, focused: pane(3).id }, true)
 const noStrip = render(FIXTURE, false)
+const leaning = render(LEANING, false)
 
 // The pure drag, checked without a DOM at all. `t` is an exact binary fraction on purpose:
 // the claim is that untouched members are *copied*, and a value that rounds would make the
@@ -171,6 +220,20 @@ console.log(
       addRow: maximized.addRow,
     },
     noStrip: { addRow: noStrip.addRow, splitters: noStrip.splitters.length },
+    leaning: {
+      chains: leaning.chains.length,
+      fractions: leaning.chains[0]?.fractions ?? [],
+      // In document order, which for a grid whose members are placed on explicit tracks is
+      // also left-to-right order.
+      splitters: leaning.splitters.map((s) => s.split),
+    },
+    keys: {
+      before: before.members.map(memberKey),
+      after: after.members.map(memberKey),
+      // The id the insertion moves, and the one it leaves alone.
+      dividerZeroMoved: before.dividers[0] !== after.dividers[0],
+      chainRootHeld: ROW_ONE_AFTER.id === (ROW_ONE as Extract<LayoutNode, { kind: 'split' }>).id,
+    },
     drag: {
       out: dragged,
       untouchedIdentical: dragged[2] === input[2] && dragged[3] === input[3],

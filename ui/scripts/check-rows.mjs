@@ -122,6 +122,21 @@ try {
     'the one horizontal divider is the spine’s, and it is the only track that spans the tab',
   )
 
+  // --- adding a tile must not remount the tiles already there -------------------------------
+  //
+  // React reconciles a chain's members by key. Every surviving member has to keep its key
+  // across an insertion, or a live terminal is torn down and rebuilt for a gesture that
+  // touched a different cell.
+
+  eq(d.keys.before, ['pane-1', 'pane-2', 'pane-3', 'pane-4'], 'row one before the insertion')
+  eq(
+    d.keys.after,
+    ['pane-1', 'pane-7', 'pane-2', 'pane-3', 'pane-4'],
+    'and after it: every original key survives, in order, with the newcomer between them',
+  )
+  ok(d.keys.dividerZeroMoved, 'while `dividers[0]` does move — which is why it cannot be the key')
+  ok(d.keys.chainRootHeld, 'the chain root keeps its id, so it can key the grid itself')
+
   // --- moving a divider copies every other track -------------------------------------------
 
   eq(d.drag.out, [0.375, 0.125, 0.25, 0.25], 'the pair splits 75/25 of its own 0.5')
@@ -139,6 +154,21 @@ try {
   )
   eq(d.noStrip.addRow, 0, 'and nothing renders when the host offers no such gesture')
   eq(d.noStrip.splitters, 5, 'the tree still draws, and still resizes, without it')
+
+  // --- divider k is the k-th split in IN-ORDER, which is the contract with Rust -----------
+  //
+  // The fixture above is a right-hand comb, where in-order and pre-order agree, so it cannot
+  // see this. `Row(Row(a, b), c)` can: a drag sends `dividers[k]`'s id and a pair share, and
+  // `cide-core::set_ratio` resolves that id back to `k` through its own in-order walk. Out of
+  // step, the leftmost divider would resize the rightmost pair.
+
+  eq(d.leaning.chains, 1, 'a left-leaning chain flattens to one grid too')
+  near(d.leaning.fractions, [1 / 3, 1 / 3, 1 / 3], 'and to three equal thirds')
+  eq(
+    d.leaning.splitters,
+    ['lean-inner', 'lean-outer'],
+    'the leftmost divider is the inner split — pre-order would hand Rust the outer one',
+  )
 
   // --- maximize still hides everything it used to -------------------------------------------
 
