@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "check:close": "node scripts/check-close-confirm.mjs",
+    "check:editor": "node scripts/check-editor.mjs",
     "check:format": "node scripts/check-status-format.mjs",
     "check:git": "node scripts/check-git-tree.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
