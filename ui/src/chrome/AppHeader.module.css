@@ -26,8 +26,16 @@
   cursor: pointer;
 }
 
-/* The only literal colours in the design: the traffic lights read as themselves in both
-   themes, so they are deliberately not tokens. */
+/*
+ * The only literal colours left in the app, and deliberately so: these are a fixed motif,
+ * like a logo, not palette. A user who sees amber-then-green anywhere else reads these three
+ * as the same control, and tokenising them would repaint the close button `--red` — which
+ * moves with the theme and, in a white light theme, stops matching every other OS's lights.
+ *
+ * They therefore do NOT change on a theme switch. That is correct, not a missed token, and
+ * not the reason a theme switch leaves patches behind. Leave them; do not churn them on the
+ * next sweep for hardcoded colour.
+ */
 .close {
   background: #e0655b;
 }

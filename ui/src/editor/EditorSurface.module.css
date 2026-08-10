@@ -234,6 +234,37 @@
   background: var(--accent-dim);
 }
 
+/*
+ * Find-in-file hits.
+ *
+ * `find.ts` replaces the stock search *panel* but not the highlighting, so until now these
+ * two classes were the one part of the editor still painted by `@codemirror/search`'s base
+ * theme: `#ffff0054` for a hit and `#ff6a0054` for the current one. Literal, and — because
+ * `EditorSurface.tsx` never adds `EditorView.darkTheme.of(true)` — always the `&light`
+ * branch of that theme, so the same yellow-over-orange wash was painted on both palettes and
+ * survived every theme switch.
+ *
+ * Overriding here rather than declaring darkness in the `.ts`: the darkness facet is read
+ * once per state, so it would still need rebuilding the editor on a theme switch, whereas a
+ * `var()` follows `data-theme` for free. `&light X` finishes as two classes, so the three
+ * and four here win outright rather than on source order.
+ *
+ * The accent pair rather than `--yellow`: a hit is the app's own emphasis, not a warning,
+ * and the dim/solid split is what separates "a match" from "the match you are standing on".
+ * Sharing `--accent-dim` with `.cm-selectionMatch` above is deliberate — both mean "another
+ * occurrence of this" — and only the current hit needs to break away from them.
+ */
+.body :global(.cm-editor .cm-searchMatch) {
+  background: var(--accent-dim);
+}
+
+.body :global(.cm-editor .cm-searchMatch.cm-searchMatch-selected) {
+  background: var(--accent);
+  /* `--bg`, not a literal white: the accent is a light orange on the dark palette and a
+     darker one on the light palette, and the app's own ground inverts to match both. */
+  color: var(--bg);
+}
+
 /* --- minimap --------------------------------------------------------------------------- */
 
 .body :global(.cm-cide-minimap) {

@@ -2,9 +2,11 @@
  * The one 620px modal shell, shared by the file picker and the command palette.
  *
  * Every number here is transcribed from the mock's overlay spec: 620px wide, `--chrome`
- * ground, a 1px `--border` outline, 9px radius, `--shadow`, 96px from the top of the window
- * over `rgba(0,0,0,.42)`. The two overlays differ in their rows and their prompt glyph and
- * in nothing else, which is why there is one shell and not two.
+ * ground, a 1px `--border` outline, 9px radius, `--shadow`, 96px from the top of the window.
+ * The two overlays differ in their rows and their prompt glyph and in nothing else, which is
+ * why there is one shell and not two.
+ *
+ * The scrim is the one place this file departs from the mock — see `.scrim`.
  */
 
 .scrim {
@@ -12,11 +14,18 @@
   inset: 0;
   z-index: 60;
   /*
-   * The one literal colour in this file. It is a scrim opacity, not a surface colour: no
-   * token names it, and it must be the same in both themes — a light-theme scrim built from
-   * a light token would not darken anything.
+   * The mock spells this `rgba(0,0,0,.42)` and an earlier comment here defended it as
+   * necessarily theme-independent. That was half right. A scrim must be built from a *dark*
+   * colour in both themes — a light-theme scrim made of a light token recedes nothing — but
+   * one alpha cannot serve both. Over `--bg` at #111113 the wash is barely visible; over the
+   * white light ground the user asked for, 42% black lands on #949494, which is most of why
+   * the light theme reads as grey rather than white.
+   *
+   * So the value moves behind `--scrim`, which `tokens.css` sets per theme. The literal here
+   * is the fallback, not the intent: it keeps the dark theme exactly as the mock draws it if
+   * the token is ever missing. Do not fold it back into the mock's single value.
    */
-  background: rgba(0, 0, 0, 0.42);
+  background: var(--scrim, rgba(0, 0, 0, 0.42));
   display: flex;
   justify-content: center;
   align-items: flex-start;
