@@ -606,15 +606,21 @@ mod tests {
     }
 
     /// The reason the whole-word wrapper is `\b(?:…)\b`.
+    ///
+    /// The corpus has to exercise the *first* alternative, which is the one the broken
+    /// wrapping loses its trailing `\b` on: `\bspawn|kill\b` parses as `(\bspawn)|(kill\b)`,
+    /// so `killed` is correctly rejected by either wrapping and proves nothing, while
+    /// `spawned` is matched only by the broken one. This test asserted on `killed` until a
+    /// review mutated `\b(?:{body})\b` to `\b{body}\b` and watched it stay green.
     #[test]
     fn whole_word_binds_to_the_whole_regex_and_not_to_its_first_branch() {
         let mut q = query("spawn|kill", SearchMode::Regex);
         q.whole_word = true;
-        let hits = scan("killed\nkill\n", &q, &Limits::default());
+        let hits = scan("spawned\nkilled\nspawn\nkill\n", &q, &Limits::default());
         assert_eq!(
             hits.into_iter().map(|h| h.0).collect::<Vec<_>>(),
-            vec![2],
-            "`killed` is not the word `kill`"
+            vec![3, 4],
+            "`spawned` is not the word `spawn` — and only the first alternative can show it"
         );
     }
 

@@ -31,7 +31,7 @@ import {
   type SearchQuery,
 } from '@/ipc/client'
 import { isNoIndex } from '@/store/fileIndex'
-import { EMPTY_QUERY, sameQuery } from './SearchModel'
+import { EMPTY_QUERY, sameQuery, spliceHits } from './SearchModel'
 
 /**
  * How long the input sits still before a walk starts.
@@ -124,6 +124,31 @@ function idle(query: SearchQuery, running: boolean): SearchFrame {
 }
 
 /**
+ * A poll's answer, and whether it is a real frame or the `NoIndex` stand-in.
+ *
+ * The flag is carried rather than inferred from the counters. It used to be read off
+ * `scanned === 0 && total === 0`, which is not the same predicate: `search_query` dispatches
+ * the walk to a blocking worker and returns *without awaiting it*, so the very first frame of
+ * every healthy search also has `scanned === 0` and `total === 0`. That inference put every
+ * search on the 400 ms retry cadence for its first step, which is the opposite of what the
+ * streaming design is for — the whole point of a walk that hands over one file's hits at a
+ * time is that the first ones paint immediately.
+ */
+interface Polled {
+  frame: SearchFrame
+  /** The project has no file index yet. A retry, not progress; see [`NO_INDEX_MS`]. */
+  noIndex: boolean
+  /**
+   * The frame is a stand-in this module made up, not an answer from Rust.
+   *
+   * Its zeroes are "nothing is known", not "nothing was found", so they are not written over
+   * the counters — a `NoIndex` arriving mid-search (the project was closed under the panel)
+   * must not repaint a full result list as `no results`.
+   */
+  stub: boolean
+}
+
+/**
  * One poll.
  *
  * Separated from the store so the loop is readable as a loop. It reads the state fresh at
@@ -135,29 +160,43 @@ async function pump(gen: number): Promise<void> {
   const project = before.project
   if (project === null || gen !== generation) return
 
-  const frame = await pendingCommand(
+  const polled = await pendingCommand<Polled>(
     COMMAND,
     async () => {
       try {
-        return await searchApi.query(project, before.query, before.hits.length)
+        return {
+          frame: await searchApi.query(project, before.query, before.hits.length),
+          noIndex: false,
+          stub: false,
+        }
       } catch (error) {
         // The walk has not started yet. Not a failure — the panel keeps asking.
-        if (isNoIndex(error)) return idle(before.query, true)
+        if (isNoIndex(error)) {
+          return { frame: idle(before.query, true), noIndex: true, stub: true }
+        }
         throw error
       }
     },
-    idle(before.query, false),
+    { frame: idle(before.query, false), noIndex: false, stub: true },
   )
+  const frame = polled.frame
 
   if (gen !== generation) return
   const state = useSearch.getState()
   if (state.project !== project || !sameQuery(frame.query, state.query)) return
 
+  // A stand-in carries no counts to write down; only the degraded flag it may have set.
+  if (polled.stub) {
+    useSearch.setState({ running: frame.running, degraded: isDegraded(COMMAND) })
+    // `NoIndex` is the only stand-in that is worth asking again about, and it is a retry
+    // rather than progress — nothing is happening yet, so it gets the slow cadence.
+    if (polled.noIndex) schedule(gen, NO_INDEX_MS)
+    return
+  }
+
   useSearch.setState({
-    // A frame that answers an offset other than the end of what is held is dropped: appending
-    // it would leave a gap or a duplicate, and both are worse than one missed page, which the
-    // next poll re-asks for anyway.
-    hits: frame.offset === state.hits.length ? [...state.hits, ...frame.hits] : state.hits,
+    // Append, or resynchronise if a second window restarted the walk. See `spliceHits`.
+    hits: spliceHits(state.hits, frame.offset, frame.hits),
     total: frame.total,
     files: frame.files,
     scanned: frame.scanned,
@@ -167,10 +206,12 @@ async function pump(gen: number): Promise<void> {
     degraded: isDegraded(COMMAND),
   })
 
+  // A real frame from a running walk: poll at the fast cadence, including the very first one,
+  // whose counters are zero only because the handler returns before the worker has read a
+  // byte. Reading those zeroes as "no index yet" is what used to put a 400 ms floor under the
+  // first hit of every search.
   if (!frame.running) return
-  // `scanned === 0` with `running` is the `NoIndex` retry above, which has nothing to report
-  // yet; anything else is a live walk.
-  schedule(gen, frame.scanned === 0 && frame.total === 0 ? NO_INDEX_MS : POLL_MS)
+  schedule(gen, POLL_MS)
 }
 
 /**

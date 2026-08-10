@@ -147,8 +147,19 @@ impl Job {
     /// A swap rather than a load and a store: two windows polling the same new query at the
     /// same moment would both see "not started" and run two walks of the same tree, both
     /// appending into one buffer — every hit twice.
+    ///
+    /// `running` goes up here and not at the point the walk is handed to `spawn_blocking`.
+    /// Between the two the caller reads the whole directory list out of the index, which is
+    /// milliseconds on a large repository — and a second window polling inside that gap would
+    /// see a job that is started, not running and holding no hits, which is indistinguishable
+    /// from a finished search that found nothing. It would paint `No results` and stop
+    /// polling. The caller puts it back down on the paths that dispatch no walk.
     fn claim(&self) -> bool {
-        !self.started.swap(true, Ordering::AcqRel)
+        let first = !self.started.swap(true, Ordering::AcqRel);
+        if first {
+            self.running.store(true, Ordering::Release);
+        }
+        first
     }
 
     /// The blocking half: build the shared ignore rules, then walk.
@@ -156,12 +167,22 @@ impl Job {
     /// **Blocking**, for as long as the tree takes. `spawn_blocking` is the only caller.
     fn walk(&self, roots: Vec<SearchRoot>, dirs: Vec<PathBuf>, regex: Regex) {
         // The same type the file tree and the watcher consult, rebuilt from the directories
-        // this project's walk actually visited — so a hit can never appear for a path the
-        // tree refuses to show. Rebuilt rather than borrowed because `ProjectFs` keeps its
-        // `Filter` private and `crates/cide-app/src/files.rs` is not this milestone's file to
-        // change; the inputs are identical, so the two agree by construction. It is a few
-        // thousand `stat`s on a large project, which is why it happens here on the blocking
-        // worker rather than in the handler.
+        // this project's walk actually visited, and handed to the search as its final say.
+        //
+        // Belt and braces, and worth being precise about: today it excludes nothing that
+        // `content`'s own `WalkBuilder` has not already excluded, because both are driven by
+        // the same `.gitignore` files and the same `hidden`/`git_*` settings — a review
+        // replaced this with `admits: None` and every test still passed. What it buys is that
+        // the search follows the *tree* rather than a second copy of the tree's rules: the
+        // day `Filter` grows a rule the walker has no setting for, the search inherits it
+        // instead of quietly disagreeing about which files exist.
+        //
+        // Rebuilt rather than borrowed because `ProjectFs` keeps its `Filter` private and
+        // `crates/cide-app/src/files.rs` is not this milestone's file to change; the inputs
+        // are identical, so the two agree by construction. It is a few thousand `stat`s on a
+        // large project, which is why it happens here on the blocking worker rather than in
+        // the handler — and it is the reason to hand this a real accessor when `files.rs` is
+        // next open.
         let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
         let filter = Filter::build(&root_paths, dirs.iter().map(|p| p.as_path()));
         let admits = |path: &Path, is_dir: bool| filter.admits(path, is_dir);
@@ -240,9 +261,12 @@ pub async fn search_query(
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = offset.unwrap_or(0);
 
+    // `claim` also marks the job running; see its note. The two paths below that dispatch no
+    // walk have to put that back down.
     if job.claim() {
         if !cide_search::content::is_searchable(&job.query) {
             // Nothing to search for. Not an error and not a walk — the panel's empty state.
+            job.running.store(false, Ordering::Release);
         } else {
             match cide_search::content::compile(&job.query) {
                 Ok(regex) => {
@@ -259,7 +283,6 @@ pub async fn search_query(
                     // project that can be closed while the walk runs.
                     let dirs = project_fs.with_index(|index| index.dir_paths());
 
-                    job.running.store(true, Ordering::Release);
                     let job = Arc::clone(&job);
                     // Not awaited. The frame below is the empty first one, and the panel
                     // polls for the rest.
@@ -269,6 +292,7 @@ pub async fn search_query(
                     // Half of every regex is unparsable while it is being typed. The frame
                     // carries it and the panel shows it in place of the results.
                     job.found.lock().error = Some(pattern_error(&error));
+                    job.running.store(false, Ordering::Release);
                 }
             }
         }
@@ -390,6 +414,24 @@ mod tests {
         assert!(!Arc::ptr_eq(&insensitive, &after));
     }
 
+    /// A claimed job is *running* from that instant, not from the moment its walk is handed
+    /// to `spawn_blocking`.
+    ///
+    /// The gap between the two is the handler reading every directory out of the index. A
+    /// second window polling inside it used to get `started, not running, no hits`, which the
+    /// panel reads as a finished search with no results — it paints `No results` and stops
+    /// polling, for a search that is about to produce thousands.
+    #[test]
+    fn a_claimed_job_is_running_before_its_walk_is_dispatched() {
+        let job = Job::new(query("alpha"));
+        assert!(!job.frame(0, 10).running, "not until somebody claims it");
+        assert!(job.claim());
+        assert!(
+            job.frame(0, 10).running,
+            "a poll racing the dispatch must not see a search that looks finished"
+        );
+    }
+
     /// The walk is dispatched once, however many windows poll it.
     #[test]
     fn a_finished_search_is_not_walked_again_by_the_next_poll() {
@@ -438,13 +480,12 @@ mod tests {
         std::fs::write(dir.join("target/out.log"), "zqneedle\n").unwrap();
 
         let job = Job::new(query("zqneedle"));
-        assert!(job.claim());
-        job.running.store(true, Ordering::Release);
+        assert!(job.claim(), "which is also what marks it running");
         let roots = vec![SearchRoot::new(dir.path())];
         let dirs = vec![dir.to_path_buf(), dir.join("src")];
         job.walk(
             roots,
-            dirs,
+            dirs.clone(),
             cide_search::content::compile(&job.query).unwrap(),
         );
 
@@ -468,6 +509,15 @@ mod tests {
         assert!(
             every.iter().all(|rel| rel.starts_with("src/")),
             "a hit inside target/ is a hit the tree cannot open: {every:?}"
+        );
+        // Which of the two agreeing gates did that: the walker's own `.gitignore` handling.
+        // Naming it here rather than crediting the shared `Filter` — `admits: None` passes
+        // this test, and the file-level filter call has its own test in
+        // `cide-search/tests/content_walk.rs`, where a closure can be made to disagree.
+        assert!(
+            !cide_fs::Filter::build(&[dir.to_path_buf()], dirs.iter().map(|p| p.as_path()))
+                .admits(&dir.join("target/out.log"), false),
+            "and the shared filter agrees with it, which is the invariant that has to hold"
         );
     }
 

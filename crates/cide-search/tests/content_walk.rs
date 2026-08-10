@@ -220,6 +220,101 @@ fn the_shared_filter_is_what_decides_what_is_searched() {
     assert_eq!(outcome.scanned, 0, "a rejected file is not even opened");
 }
 
+/// The filter is consulted on *files*, not only on the directories above them.
+///
+/// The `admits` closure here says yes to every directory, so the walk descends everywhere and
+/// `ignore`'s own `.gitignore` handling has nothing to exclude — the only thing that can keep
+/// `secret.txt` out of the results is the per-file question. Deleting that call site leaves
+/// [`the_shared_filter_is_what_decides_what_is_searched`] green, because its "nothing is
+/// admitted" closure rejects the root directory and the walk never reaches a file at all; a
+/// review mutated the file-level check away and found nothing failed.
+#[test]
+fn the_filter_is_asked_about_every_file_and_not_only_about_directories() {
+    let dir = scratch("search-file-filter");
+    write(dir.join("keep.txt"), format!("{NEEDLE}\n"));
+    write(dir.join("secret.txt"), format!("{NEEDLE}\n"));
+    write(dir.join("sub/keep.txt"), format!("{NEEDLE}\n"));
+
+    let asked = Mutex::new(Vec::<PathBuf>::new());
+    let admits = |path: &Path, is_dir: bool| {
+        asked.lock().unwrap().push(path.to_path_buf());
+        // Every directory is fine; one file is not.
+        is_dir || path.file_name().is_none_or(|n| n != "secret.txt")
+    };
+
+    let regex = compile(&literal(NEEDLE)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let scanned = AtomicU32::new(0);
+    let mut hits = Vec::new();
+    Search {
+        roots: &[SearchRoot::new(dir.path())],
+        regex: &regex,
+        limits: Limits::default(),
+        admits: Some(&admits),
+        cancel: &cancel,
+        progress: Some(&scanned),
+    }
+    .run(&mut |batch| hits.extend_from_slice(batch));
+
+    let mut rels: Vec<&str> = hits.iter().map(|h| h.rel.as_str()).collect();
+    rels.sort_unstable();
+    assert_eq!(
+        rels,
+        ["keep.txt", "sub/keep.txt"],
+        "the refused file is the only one missing: {hits:#?}"
+    );
+    assert_eq!(scanned.load(Ordering::Acquire), 2, "it was never opened");
+    let asked = asked.lock().unwrap();
+    assert!(
+        asked.iter().any(|p| p.ends_with("secret.txt")),
+        "the filter has to have been asked about it: {asked:#?}"
+    );
+}
+
+/// A refused directory is pruned, not walked and then rejected file by file.
+///
+/// The distinction is invisible in the results — both produce no hits — and it is the whole
+/// difference between skipping `target/` and reading every file in it. Asserting it needs the
+/// closure to record what it was asked, which is why it is a test rather than a comment.
+#[test]
+fn a_refused_directory_is_never_descended_into() {
+    let dir = scratch("search-prune");
+    write(dir.join("keep.txt"), format!("{NEEDLE}\n"));
+    for f in 0..8 {
+        write(dir.join(format!("heavy/f{f}.txt")), format!("{NEEDLE}\n"));
+    }
+
+    let asked = Mutex::new(Vec::<PathBuf>::new());
+    let admits = |path: &Path, _is_dir: bool| {
+        asked.lock().unwrap().push(path.to_path_buf());
+        !path.ends_with("heavy")
+    };
+
+    let regex = compile(&literal(NEEDLE)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut hits = Vec::new();
+    Search {
+        roots: &[SearchRoot::new(dir.path())],
+        regex: &regex,
+        limits: Limits::default(),
+        admits: Some(&admits),
+        cancel: &cancel,
+        progress: None,
+    }
+    .run(&mut |batch| hits.extend_from_slice(batch));
+
+    assert_eq!(hits.len(), 1, "only the file outside the pruned tree");
+    let asked = asked.lock().unwrap();
+    // `heavy` itself is asked about — that is the refusal. What must not appear is anything
+    // *under* it, so the directory itself is excluded from the check by `p != heavy`.
+    let heavy = dir.join("heavy");
+    assert!(
+        !asked.iter().any(|p| *p != heavy && p.starts_with(&heavy)),
+        "the filter was asked about something inside a directory it had already refused, \
+         which means the subtree was walked rather than pruned: {asked:#?}"
+    );
+}
+
 #[test]
 fn a_multi_root_project_labels_every_hit_with_its_root() {
     let dir = scratch("search-multi");

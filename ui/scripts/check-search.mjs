@@ -61,6 +61,7 @@ try {
     groupHits,
     panelState,
     sameQuery,
+    spliceHits,
     splitHighlight,
     summarize,
     trimIndent,
@@ -186,6 +187,43 @@ try {
     'a  b',
     'only leading whitespace goes',
   )
+
+  eq(
+    trimIndent({ ...hit('a.rs', 1), text: '    let x', start: 0, end: 4 }),
+    { path: '/root/a.rs', rel: 'a.rs', line: 1, text: '    let x', start: 0, end: 4 },
+    'a match ON the indentation is not trimmed away — trimming it would erase the highlight',
+  )
+  eq(
+    splitHighlight(
+      trimIndent({ ...hit('a.rs', 1), text: '\tlet x', start: 0, end: 1 }).text,
+      trimIndent({ ...hit('a.rs', 1), text: '\tlet x', start: 0, end: 1 }).start,
+      trimIndent({ ...hit('a.rs', 1), text: '\tlet x', start: 0, end: 1 }).end,
+    ),
+    { before: '', match: '\t', after: 'let x' },
+    'searching for a tab still points at the tab',
+  )
+
+  /* ------------------------------------------------------------------- appending pages */
+
+  // The ordinary poll: the page lands at the end of what is held.
+  eq(spliceHits([1, 2, 3], 3, [4, 5]), [1, 2, 3, 4, 5], 'a page at the end is appended')
+  eq(spliceHits([], 0, [1]), [1], 'the first page of a new search')
+  eq(spliceHits([1, 2], 2, []), [1, 2], 'an empty page changes nothing')
+  // The case the panel used to get stuck on for ever: a second window restarted the walk, so
+  // the backend list is shorter than the local one and every later poll asks past its end.
+  eq(
+    spliceHits([1, 2, 3, 4, 5], 0, [9]),
+    [9],
+    'a job restarted under the panel resynchronises rather than dropping the frame',
+  )
+  eq(
+    spliceHits([1, 2, 3, 4, 5], 2, [9]),
+    [1, 2, 9],
+    'and it truncates to the answered offset, so no gap can open',
+  )
+  // Offsets arrive over IPC; nothing here may produce a sparse array or a negative slice.
+  eq(spliceHits([1, 2], 99, [3]), [1, 2, 3], 'an offset past the end cannot leave a hole')
+  eq(spliceHits([1, 2], -4, [3]), [3], 'a negative offset is clamped to the start')
 
   /* --------------------------------------------------------------------- panel states */
 

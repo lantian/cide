@@ -89,6 +89,30 @@ export function groupHits(hits: readonly Hit[], collapsed: ReadonlySet<string>):
   return rows
 }
 
+/**
+ * Fold one polled page into the hits already held.
+ *
+ * The backend answers `offset = min(asked, total)`, and the panel always asks from the end of
+ * what it holds — so the answered offset is at most the held length, never past it, and the
+ * two cases are:
+ *
+ * - `offset === held.length`, every ordinary poll: a plain append.
+ * - `offset < held.length`: the job answering this project was replaced under the panel — a
+ *   second window searching the same project restarted the walk — so its list is shorter than
+ *   the local one and the page is the start of a *new* result set. Truncating to `offset`
+ *   before appending resynchronises on the backend, which is the authority.
+ *
+ * Dropping the mismatched frame instead does not recover: the next poll asks from the same
+ * unchanged length and gets the same short answer, for ever. That is what this used to do.
+ *
+ * Slicing to `offset` is also what makes a gap impossible, which is the property that matters
+ * more than either case — a gap is a hit the user is never shown and never learns about.
+ */
+export function spliceHits<T>(held: readonly T[], offset: number, page: readonly T[]): T[] {
+  const at = Number.isFinite(offset) ? Math.min(Math.max(Math.trunc(offset), 0), held.length) : 0
+  return [...held.slice(0, at), ...page]
+}
+
 /** The three pieces a hit's line is drawn in: the match, and what surrounds it. */
 export interface Highlight {
   before: string
@@ -150,6 +174,12 @@ export function trimIndent(hit: Hit): Hit {
   const trimmed = hit.text.replace(/^[ \t]+/, '')
   const shift = hit.text.length - trimmed.length
   if (shift === 0) return hit
+  // A match that starts inside the indentation is a match *on* the indentation — searching for
+  // a tab, or for two spaces. Trimming it away would leave `start` and `end` both clamped to
+  // 0, which draws the row with no highlight at all: the panel would show the hit and refuse
+  // to say where it is. The row is left untrimmed instead, which is the only way the match can
+  // still be pointed at.
+  if (hit.start < shift) return hit
   return {
     ...hit,
     text: trimmed,
