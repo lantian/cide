@@ -102,7 +102,9 @@
 .bench {
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.42);
+  /* The modal scrim, same as `Overlay.module.css` — see there for why this is a per-theme
+     token rather than the mock's single `rgba(0,0,0,.42)`. */
+  background: var(--scrim, rgba(0, 0, 0, 0.42));
   display: flex;
   justify-content: center;
   padding-top: 96px;
