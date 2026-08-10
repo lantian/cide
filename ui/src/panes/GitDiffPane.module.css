@@ -1,0 +1,358 @@
+/*
+ * The git diff pane.
+ *
+ * Every colour is a token, so both themes work without a second stylesheet — the tokens are
+ * redefined under `[data-theme='light']` in `styles/tokens.css` and nothing here hardcodes a
+ * value. `--diff-add-bg` and `--diff-del-bg` are the mock's own row tints and already carry
+ * a per-theme alpha; selection is drawn on top of them with `--sel`, which is why the
+ * selected rule comes after the origin rules rather than being merged into them.
+ *
+ * The row is a four-column grid with the text in the last cell, not a table: the gutters
+ * have to stay put while a long line wraps, and a wrapped `<tr>` re-flows its cells. The
+ * columns are sized in `ch` off the monospace face so the numbers line up with the code.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.notice {
+  padding: 12px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.noticeWhy {
+  margin-top: 4px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  /* A libgit2 message can be long and has no spaces to break on. */
+  overflow-wrap: anywhere;
+}
+
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--h-panetitle);
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--chrome);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.arrow {
+  flex: none;
+  color: var(--faint);
+}
+
+.status {
+  flex: none;
+  color: var(--faint);
+}
+
+/* Pushed right so a long path clips against the switcher rather than shifting it. */
+.sides {
+  flex: none;
+  display: flex;
+  margin-left: auto;
+  padding-left: 8px;
+  gap: 2px;
+}
+
+.side {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.side:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.sideOn {
+  border-color: var(--border);
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
+.note {
+  flex: none;
+  margin: 0;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  color: var(--yellow);
+  font-size: 11.5px;
+}
+
+.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  /* The app root sets `user-select: none`; a diff is text people copy out of. */
+  user-select: text;
+}
+
+.hunk {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.hunkHeader {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--chrome);
+  color: var(--dim);
+}
+
+.hunkTitle {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.caret {
+  flex: none;
+  color: var(--faint);
+}
+
+.hunkAction {
+  flex: none;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.hunkAction:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.hunkAction:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The tri-state box. `–` for a partially selected hunk, matching the panel's TriCheckbox. */
+.box {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text-hi);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.box[data-state='all'],
+.box[data-state='some'] {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.lines {
+  display: flex;
+  flex-direction: column;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 16px 5ch 5ch 2ch 1fr;
+  align-items: start;
+  gap: 0;
+  padding-right: 8px;
+}
+
+.context {
+  background: transparent;
+}
+
+.addition {
+  background: var(--diff-add-bg);
+}
+
+.deletion {
+  background: var(--diff-del-bg);
+}
+
+/*
+ * Selection wins over the row tint, because "will this be staged" is the question the pane
+ * is for and the add/delete colour is only context for it. Last in source order and equally
+ * specific, so it applies on top.
+ */
+.row[data-selected='true'] {
+  background: var(--sel);
+}
+
+.lineBox {
+  width: 12px;
+  height: 12px;
+  margin: 2px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: var(--panel-2);
+  color: var(--text-hi);
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.row[data-selected='true'] .lineBox {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.lineBox:disabled {
+  /* A context line has nothing to stage; the box is kept for the column, not the gesture. */
+  visibility: hidden;
+  cursor: default;
+}
+
+.lineno {
+  padding-right: 1ch;
+  color: var(--faint);
+  text-align: right;
+  user-select: none;
+}
+
+.sign {
+  color: var(--dim);
+  text-align: center;
+  user-select: none;
+}
+
+.text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.noNewline {
+  color: var(--faint);
+}
+
+.actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--chrome);
+}
+
+.count {
+  margin-right: auto;
+  color: var(--dim);
+  font-size: 11.5px;
+}
+
+.kind {
+  color: var(--faint);
+  font-family: var(--font-mono);
+}
+
+.button {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+  color: var(--bg);
+}

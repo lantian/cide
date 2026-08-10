@@ -110,6 +110,22 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
           {git.unavailable}
         </p>
       )}
+      {/*
+        * A held partial selection changes what Commit writes, and nothing else in this panel
+        * would show it: the row still reads as one ticked file. An invisible modifier on the
+        * button that rewrites history is not acceptable, so it is named here with the way out
+        * beside it. The count is files, not lines — the pane that made the selection is where
+        * the lines are.
+        */}
+      {git.partials.length > 0 && (
+        <p className={`${styles.note} ${styles.noteWarn}`} data-audit="gitPartials">
+          {git.partials.length} file{git.partials.length === 1 ? '' : 's'} will be committed in
+          part.{' '}
+          <button type="button" className={styles.noteAction} onClick={git.clearPartials}>
+            Use whole files
+          </button>
+        </p>
+      )}
 
       <div className={styles.body} role="tabpanel" aria-label={tab === 'commit' ? 'Commit' : 'Shelf'}>
         {tab === 'commit' ? (
