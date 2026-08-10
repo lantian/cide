@@ -14,7 +14,7 @@ use cide_core::document;
 use cide_core::workspace;
 use cide_core::{CoreError, Result};
 use cide_ipc::{FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId, TabId, TabKind};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::cmd::project::Mutated;
 use crate::workspace_state::WorkspaceState;
@@ -124,4 +124,38 @@ async fn blocking<T: Send + 'static>(
         Ok(result) => result,
         Err(error) => Err(CoreError::Io(format!("file worker failed: {error}"))),
     }
+}
+
+/// Report the editor's selection to the project's Claude sessions.
+///
+/// The gap this closes: `IdeServer::selection_changed` existed, was unit-tested, and had no
+/// producer — nothing in `cide-app` called it and there was no command to reach it from.
+/// A handler with no caller is a feature that passes its tests and has never run.
+///
+/// **Line numbers are 0-based on the wire** and 1-based everywhere a human sees them, so the
+/// conversion happens here, at the boundary, exactly once. CodeMirror counts lines from 1.
+///
+/// Debounced on the frontend, not here: a selection drag fires per animation frame, and a
+/// command per frame would be an IPC round trip per frame.
+#[tauri::command(rename_all = "camelCase")]
+pub fn claude_selection_changed(
+    app: tauri::AppHandle,
+    project: cide_ipc::ProjectId,
+    path: String,
+    text: String,
+    start_line: u32,
+    end_line: u32,
+) {
+    let Some(servers) = app.try_state::<crate::ide::IdeServers>() else {
+        return;
+    };
+    servers.selection_changed(
+        project,
+        cide_ide_mcp::SelectionChanged {
+            file_path: path,
+            text,
+            start_line: start_line.saturating_sub(1),
+            end_line: end_line.saturating_sub(1),
+        },
+    );
 }

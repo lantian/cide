@@ -6,6 +6,7 @@
   "claude_diff_content",
   "claude_diff_result",
   "claude_headless",
+  "claude_selection_changed",
   "diag_bench_report",
   "diag_echo_bytes",
   "diag_log",

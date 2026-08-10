@@ -20,7 +20,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { EditorSurface } from '@/editor/EditorSurface'
-import { diag, events, file as fileApi } from '@/ipc/client'
+import { claude as claudeApi, diag, events, file as fileApi } from '@/ipc/client'
 import styles from './EditorPane.module.css'
 
 export interface EditorPaneProps {
@@ -68,6 +68,38 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
       void fileApi.setDirty(project, tab, dirty).catch(() => {})
     },
     [project, tab],
+  )
+
+  /**
+   * Tell the project's Claude sessions where the caret is.
+   *
+   * Debounced, and that is the whole reason this is not a straight call: a selection drag
+   * fires the editor's update listener once per animation frame, and one IPC round trip per
+   * frame during a drag is the kind of cost that only shows up on someone else's machine.
+   * 80 ms is below the threshold where a status readout feels stale and well above a frame.
+   *
+   * Fire-and-forget: the notification is advisory — Claude Code shows it in its status line
+   * — and a failed send must never interrupt typing. A project with no IDE server, or no
+   * connected `claude`, drops it on the Rust side with a debug log.
+   */
+  const selectionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const reportSelection = useCallback(
+    (sel: { text: string; startLine: number; endLine: number }) => {
+      if (project === undefined) return
+      if (selectionTimer.current !== undefined) clearTimeout(selectionTimer.current)
+      selectionTimer.current = setTimeout(() => {
+        void claudeApi.selectionChanged(project, path, sel.text, sel.startLine, sel.endLine)
+      }, 80)
+    },
+    [project, path],
+  )
+
+  // A pending report for a pane that has gone would fire against an unmounted editor.
+  useEffect(
+    () => () => {
+      if (selectionTimer.current !== undefined) clearTimeout(selectionTimer.current)
+    },
+    [],
   )
 
   const read = useCallback(
@@ -194,6 +226,7 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           readOnly={!load.writable}
           onDirtyChange={reportDirty}
           onSave={onSave}
+          onSelection={reportSelection}
         />
       </div>
     </div>

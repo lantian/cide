@@ -124,6 +124,29 @@ function syncSize(paneId: string): void {
   })
 }
 
+/**
+ * Write `— exited —` into the pane whose child has gone.
+ *
+ * M2's acceptance criterion is "kill the child: EOF arrives and the pane shows `— exited —`",
+ * and that string existed only in a comment. `TerminalPane` declared an `onExit` prop and no
+ * caller ever passed one, so a dead child produced no visible change anywhere: the cursor
+ * sat there and the pane looked idle. The criterion is not decoration — it is the only
+ * user-visible proof that `drop(pair.slave)` works, because without that drop the master
+ * never sees EOF and this branch is never reached.
+ *
+ * Written into the terminal rather than rendered as React chrome: it belongs at the end of
+ * the transcript, where a shell would print it, and it then survives scrollback, re-mounts
+ * and detach the same way every other byte in the pane does.
+ *
+ * SGR 2 is dim — the ANSI analogue of the `--faint` token the design uses for spent text.
+ */
+function markExited(paneId: string): void {
+  const host = getHost(paneId)
+  if (host.exitMarked) return
+  host.exitMarked = true
+  host.terminal?.term.write('\r\n\x1b[2m— exited —\x1b[0m\r\n')
+}
+
 async function sessionFor(paneId: string, spec: TerminalSpec, geometry: Geometry): Promise<string> {
   const host = getHost(paneId)
   // The host may already know its session: this pane is re-mounting, or it was evicted and
@@ -284,6 +307,7 @@ export function TerminalPane({
       if (!id) return
       if (await sessionApi.hasExited(id)) {
         window.clearInterval(poll)
+        markExited(paneId)
         exitCb.current?.()
       }
     }, 1000)

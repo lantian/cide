@@ -99,6 +99,19 @@ export interface EditorSurfaceProps {
   onSave?: ((text: string) => void | Promise<void>) | undefined
   /** Called on focus, so the pane tree can follow the caret. */
   onFocus?: (() => void) | undefined
+  /**
+   * The selection, for Claude Code's `selection_changed` notification.
+   *
+   * Lines are **1-based here** and converted to the protocol's 0-based at the Rust boundary,
+   * so nothing in between has to remember which convention it is holding. Fires on every
+   * selection change including an empty one — a caret move is a selection of zero
+   * characters, and the CLI's status wants to follow the caret, not only a highlight.
+   *
+   * Debouncing is the caller's: a drag fires this once per animation frame.
+   */
+  onSelection?:
+    | ((selection: { text: string; startLine: number; endLine: number }) => void)
+    | undefined
 }
 
 /** The `crates › cide-core › src › lib.rs` trail. */
@@ -127,6 +140,7 @@ export function EditorSurface({
   onDirtyChange,
   onSave,
   onFocus,
+  onSelection,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const readoutRef = useRef<HTMLDivElement | null>(null)
@@ -140,6 +154,8 @@ export function EditorSurface({
   dirtyCb.current = onDirtyChange
   const focusCb = useRef(onFocus)
   focusCb.current = onFocus
+  const selectionCb = useRef(onSelection)
+  selectionCb.current = onSelection
 
   const segments = useMemo(() => breadcrumbSegments(path, root), [path, root])
   const language = useMemo(() => languageName(path), [path])
@@ -231,6 +247,14 @@ export function EditorSurface({
           if (el !== null) {
             el.textContent = `${language} · UTF-8 · ${lineEnding} · ${cursorLabel(update.state)}`
           }
+          // Read from `update.state`, not from a captured view: this listener outlives
+          // several states and the one that changed is the one to report.
+          const { from, to } = update.state.selection.main
+          selectionCb.current?.({
+            text: update.state.sliceDoc(from, to),
+            startLine: update.state.doc.lineAt(from).number,
+            endLine: update.state.doc.lineAt(to).number,
+          })
         }
         if (update.docChanged && baseline !== null) {
           // `Text.eq` compares lengths and line counts first, so the common case — a typed

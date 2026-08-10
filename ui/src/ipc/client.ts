@@ -210,7 +210,6 @@ export const pane = {
       intent,
     }),
 
-  /** Rejected for the console's primary pane and for a tab's last pane. */
   /**
    * Rejected for the console's primary pane, for a tab's last pane, and — without `force` —
    * for an editor pane holding unsaved edits. That last one is the same refusal `tab.close`
@@ -321,6 +320,31 @@ export const claude = {
       project: projectId,
       requestId,
     }),
+
+  /**
+   * Tell every connected `claude` in the project where the editor selection is.
+   *
+   * Broadcast rather than addressed, unlike `at_mentioned`: a mention is a message aimed at
+   * one conversation, a selection is a fact about the editor, and when an editor is focused
+   * there is no "current" Claude pane to aim at.
+   *
+   * Lines are 1-based here and converted to the protocol's 0-based in Rust, at the boundary,
+   * exactly once.
+   */
+  selectionChanged: (
+    projectId: ProjectId,
+    path: string,
+    text: string,
+    startLine: number,
+    endLine: number,
+  ) =>
+    invoke<void>('claude_selection_changed', {
+      project: projectId,
+      path,
+      text,
+      startLine,
+      endLine,
+    }).catch(() => {}),
 
   /** Answer a diff. `acceptedEdited` carries the buffer the user actually has on screen. */
   answer: (projectId: ProjectId, requestId: string, outcome: DiffAnswer) =>

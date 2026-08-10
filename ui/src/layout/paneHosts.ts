@@ -34,6 +34,14 @@ export interface PaneHost {
   terminal?: TerminalHandle
   /** True once `term.open()` has run. Checked so it can never run twice. */
   opened: boolean
+  /**
+   * Set once `— exited —` has been written into this pane.
+   *
+   * On the host rather than in React state because the host outlives every mount: a pane
+   * that is switched away from and back, detached, or evicted and rehydrated must not print
+   * the marker a second time.
+   */
+  exitMarked?: boolean
   /** Set when a released host must clear its terminal before re-reading the mirror. */
   needsReset: boolean
   /**

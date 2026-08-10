@@ -135,6 +135,13 @@ impl IdeServers {
         }
     }
 
+    /// Tell every connected `claude` in a project where the editor selection is.
+    pub fn selection_changed(&self, project: ProjectId, payload: cide_ide_mcp::SelectionChanged) {
+        if let Some(entry) = self.servers.get(&project) {
+            entry.server.selection_changed_all(payload);
+        }
+    }
+
     /// Stop a project's server, resolving anything it still owes.
     pub fn stop(&self, project: ProjectId) {
         let Some((_, entry)) = self.servers.remove(&project) else {

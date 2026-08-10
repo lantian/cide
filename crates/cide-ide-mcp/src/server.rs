@@ -203,6 +203,20 @@ impl Inner {
             .find(|(pid, _)| c.pane_of_pid.get(pid).map(String::as_str) == Some(pane))
             .map(|(_, conn)| conn.out.clone())
     }
+
+    /// Every connection that has announced a pid and been bound to a pane.
+    ///
+    /// A connection with no pid never sent `ide_connected`, so nothing knows which pane it
+    /// belongs to; including it would send a selection to a `claude` that may not be in this
+    /// project at all.
+    fn senders_for_all_panes(&self) -> Vec<mpsc::UnboundedSender<Message>> {
+        let c = self.conns.lock();
+        c.open
+            .values()
+            .filter(|conn| conn.pid.is_some_and(|pid| c.pane_of_pid.contains_key(&pid)))
+            .map(|conn| conn.out.clone())
+            .collect()
+    }
 }
 
 /// The IDE server for one project.
@@ -312,6 +326,23 @@ impl IdeServer {
             protocol::notify::SELECTION_CHANGED,
             selection_params(&payload),
         );
+    }
+
+    /// Tell **every** connected `claude` in this project where the editor selection is.
+    ///
+    /// Broadcast rather than addressed to one pane, which is the opposite of `at_mentioned`
+    /// and deliberate. An `@`-mention is a message the user aimed at one conversation; a
+    /// selection is a fact about the editor, and a project with two Claude panes has two
+    /// conversations that both benefit from knowing it. Addressing one would mean picking a
+    /// "current" Claude, and when an editor is focused there isn't one.
+    pub fn selection_changed_all(&self, payload: SelectionChanged) {
+        let params = selection_params(&payload);
+        for out in self.inner.senders_for_all_panes() {
+            send_json(
+                &out,
+                &Notification::new(protocol::notify::SELECTION_CHANGED, params.clone()),
+            );
+        }
     }
 
     /// Put a file reference into the prompt of the `claude` in `pane`.

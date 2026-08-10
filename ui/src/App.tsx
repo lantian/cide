@@ -52,6 +52,7 @@ import {
   settings as settingsApi,
   type PaneRestore,
   type ProjectId,
+  type SplitIntent,
   type TabId,
 } from '@/ipc/client'
 import { runBench, formatReport } from '@/bench/ipcBench'
@@ -364,6 +365,22 @@ export function App() {
         : boot.role.project
   const activeProject = activeProjectId ? (boot?.workspace.projects[activeProjectId] ?? null) : null
 
+  /**
+   * The tab and pane the user is looking at.
+   *
+   * Derived once and shared by the key context, the status bar and the command dispatcher.
+   * Three separate derivations of "what is focused" is three chances for a command to act
+   * on something other than what the `when` clause was evaluated against.
+   */
+  const focused = (() => {
+    const tab = activeProject?.tabs.find((t) => t.id === activeProject.activeTab)
+    if (!tab) return undefined
+    const pane = tab.tree.panes[tab.tree.focused]
+    if (!pane) return undefined
+    return { tab, pane }
+  })()
+  const focusedSession = focused?.pane.session ?? undefined
+
   /*
    * Key context: the `when` clauses in the keymap are evaluated against this.
    *
@@ -374,8 +391,11 @@ export function App() {
   const keyContext = {
     projectOpen: activeProjectId !== null,
     overlayOpen: overlay !== null,
-    editorFocused: false,
-    terminalFocused: overlay === null,
+    editorFocused: focused?.pane.kind === 'editor',
+    terminalFocused: overlay === null && focused?.pane.kind !== 'editor',
+    // Gates `claude.fork`, `claude.mirror` and `claude.split.newSession` — all three act on
+    // the focused session, so none of them means anything without a Claude pane to act on.
+    claudePaneFocused: focused?.pane.kind === 'claude',
     sidebarFiles: view === 'files',
     sidebarGit: view === 'git',
   }
@@ -386,10 +406,48 @@ export function App() {
    */
   const runCommand = createDispatcher({
     fallback: (command) => {
-      if (command === 'workbench.showFilePicker') setOverlay('files')
-      else if (command === 'workbench.showCommandPalette') setOverlay('commands')
-      else if (command === 'workbench.closeOverlay') setOverlay(null)
-      else diag.log(`command not handled by this window: ${command}`)
+      if (command === 'workbench.showFilePicker') return setOverlay('files')
+      if (command === 'workbench.showCommandPalette') return setOverlay('commands')
+      if (command === 'workbench.closeOverlay') return setOverlay(null)
+
+      /*
+       * The split family, including the two the project exists for.
+       *
+       * `claude.fork` and `claude.mirror` were in the command registry — so the palette
+       * listed them — and in `SplitIntent`, and wired end to end through `spawnPlans` to a
+       * `--fork-session` invocation verified against the real CLI. And nothing dispatched
+       * them: running either from the palette fell through to a diagnostic log. The hardest
+       * feature in the project was unreachable by any gesture, which is why "it is
+       * implemented" and "a user can do it" are different claims.
+       */
+      if (!activeProject || !focused) {
+        return diag.log(`no focused pane for: ${command}`)
+      }
+      const split = (axis: 'row' | 'col', intent: SplitIntent | null) =>
+        void splitPane(activeProject.id, focused.tab.id, focused.pane.id, axis, 'after', intent)
+
+      switch (command) {
+        case 'pane.split.right':
+          return split('row', null)
+        case 'pane.split.down':
+          return split('col', null)
+        case 'claude.split.newSession':
+          return split('col', { kind: 'newClaude' })
+        case 'claude.fork':
+          // Branches the focused conversation: shared history to this point, then divergent.
+          return split('col', { kind: 'forkPrimary' })
+        case 'claude.mirror': {
+          // No new process — a second sink on the session already running. Meaningless
+          // without one, so it reports rather than splitting into an empty pane.
+          const session = focused.pane.session
+          if (!session) return diag.log('mirror: the focused pane has no session yet')
+          return split('row', { kind: 'mirror', session })
+        }
+        case 'terminal.splitBelow':
+          return split('col', { kind: 'shell' })
+        default:
+          return diag.log(`command not handled by this window: ${command}`)
+      }
     },
     showSidebar: (next) => setView(next),
   })
@@ -411,11 +469,6 @@ export function App() {
   // Claude panes side by side, showing whichever reported last would make the token figure
   // flicker between two conversations and belong to neither.
   const statusBySession = useSessionStatus((s) => s.bySession)
-  const focusedSession = (() => {
-    const tab = activeProject?.tabs.find((t) => t.id === activeProject.activeTab)
-    if (!tab) return undefined
-    return tab.tree.panes[tab.tree.focused]?.session ?? undefined
-  })()
   const claudeReadout = focusedSession
     ? formatClaude(statusBySession[focusedSession])
     : undefined
