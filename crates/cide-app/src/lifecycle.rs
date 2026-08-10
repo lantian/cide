@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use cide_core::workspace;
 use cide_ipc::{
-    Pane, PaneId, PaneKind, Project, ProjectId, SessionId, TabId, WindowLabel, WindowRole,
-    Workspace,
+    Pane, PaneId, PaneKind, Project, ProjectId, SessionId, SessionState, TabId, WindowLabel,
+    WindowRole, Workspace,
 };
 use cide_pty::PtySession;
 use tauri::{AppHandle, Manager};
@@ -311,6 +311,84 @@ fn deliver(pid: u32, rung: Rung) {
 /// need a job object rather than a translation of `kill(2)`.
 #[cfg(not(unix))]
 fn deliver(_pid: u32, _rung: Rung) {}
+
+// --- exit -------------------------------------------------------------------------------
+
+/// How often a watcher asks whether its child has gone.
+///
+/// A poll, and it should not be one. The honest shape is a callback from `spawn_reaper` in
+/// `cide-pty`, which already blocks in `child.wait()` and knows the exit status the moment
+/// it returns — that is the version that would also carry a real exit code. It is not what
+/// is written here because `cide-pty` is outside this change's remit; see
+/// [`UNKNOWN_EXIT_CODE`].
+///
+/// What this *does* replace is far worse: every pane in every window used to ask
+/// `session.hasExited` over IPC once a second, forever. This is one atomic load per session
+/// on a thread that ends the moment the child does.
+const EXIT_POLL: Duration = Duration::from_millis(200);
+
+/// The code reported for a child whose status nobody kept.
+///
+/// `cide_pty::spawn_reaper` calls `child.wait()` and drops the `ExitStatus` on the floor,
+/// and once it has reaped there is no second answer to ask for — `waitpid` on that pid
+/// returns `ECHILD`. So this reports "it ended, and this build cannot say how".
+///
+/// -1 rather than 0: nothing consumes the number today (`SessionState::is_live` is false for
+/// every `Exited`, whatever the code), and a fabricated success is the one value that could
+/// later be mistaken for a real one. Fixing it properly means threading the status out of
+/// `cide-pty`.
+pub const UNKNOWN_EXIT_CODE: i32 = -1;
+
+/// Watch one session and report its death exactly once.
+///
+/// Two things happen when a child goes, and both were missing:
+///
+/// * `SessionState::Exited` is emitted, which is what lets a pane print `— exited —` from an
+///   event instead of polling for it; and
+/// * the hook server *forgets* the session. Without that, a `claude` that dies mid-turn is
+///   remembered as `Busy` for the rest of the process's life, so the close confirm warns
+///   about interrupting a session that no longer exists — and warning about nothing is how
+///   users learn to dismiss that dialog unread.
+///
+/// A thread per session rather than one sweeper over the registry: this one starts where the
+/// session does (`session_spawn` owns both), needs no scheduling, and ends by itself.
+pub fn watch_for_exit(app: AppHandle, id: SessionId, session: Arc<PtySession>) {
+    let spawned = thread::Builder::new()
+        .name("cide-session-exit".into())
+        .spawn(move || {
+            while !session.has_exited() {
+                thread::sleep(EXIT_POLL);
+            }
+            report_exit(&app, id);
+        });
+
+    if let Err(error) = spawned {
+        // The session is perfectly usable; what is lost is the `— exited —` marker and the
+        // close confirm's ability to tell this session apart from a live one.
+        tracing::error!(%error, session = %id, "no exit watcher for this session");
+    }
+}
+
+/// Announce that `id` has ended. Separate from the thread so it can be called directly.
+fn report_exit(app: &AppHandle, id: SessionId) {
+    // The hook server first. The emit is what wakes the frontend, and a window that reacted
+    // by asking which sessions are live must not be told this one still is.
+    if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
+        hooks.forget(id);
+    }
+
+    // The session stays in the registry. Its screen mirror is the last thing the child
+    // printed, and a pane that is re-mounted, re-docked or rehydrated after the exit still
+    // has to be able to paint it — removing the entry would turn `session_scrollback` into
+    // `NoSuchSession` and leave the pane blank instead of showing what happened.
+    crate::emit::session_state(
+        app,
+        &id.to_string(),
+        SessionState::Exited {
+            code: UNKNOWN_EXIT_CODE,
+        },
+    );
+}
 
 // --- restore --------------------------------------------------------------------------
 

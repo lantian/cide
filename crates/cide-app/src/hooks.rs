@@ -147,35 +147,83 @@ fn handle(stream: UnixStream, app: &AppHandle, states: &DashMap<SessionId, Sessi
     }
 }
 
+/// What one frame means for the frontend.
+///
+/// Routing and emitting used to be the same function, which is why the only test in this
+/// module asserted that a fresh `DashMap` is empty: every branch of the decision needed an
+/// `AppHandle`, and `tauri`'s mock app lives behind a feature this build does not enable.
+/// Splitting the decision out makes all four branches reachable from a unit test, and leaves
+/// [`apply`] with nothing in it that can be wrong.
+#[derive(Debug, Clone, PartialEq)]
+enum Effect {
+    /// The statusline's own JSON, forwarded whole.
+    Status {
+        session: String,
+        payload: serde_json::Value,
+    },
+    /// Files a tool touched — the fast buffer-reload path.
+    Tool { session: String, paths: Vec<String> },
+    /// A state transition the frontend should hear about.
+    State {
+        session: String,
+        state: SessionState,
+    },
+}
+
 /// Route one frame: update state, emit what the frontend needs.
 fn apply(frame: &HookFrame, app: &AppHandle, states: &DashMap<SessionId, SessionState>) {
+    for effect in decide(frame, states) {
+        match effect {
+            Effect::Status { session, payload } => {
+                crate::emit::session_status(app, &session, payload)
+            }
+            Effect::Tool { session, paths } => crate::emit::session_tool(app, &session, paths),
+            Effect::State { session, state } => crate::emit::session_state(app, &session, state),
+        }
+    }
+}
+
+/// Decide what a frame means, recording any transition in `states`.
+///
+/// Pure but for that one write, which is the point: everything a hook can be — an unknown
+/// event, an unknown session, a statusline, a tool call, a permission prompt — is decided
+/// here where a test can see it.
+fn decide(frame: &HookFrame, states: &DashMap<SessionId, SessionState>) -> Vec<Effect> {
     // The statusline is not a hook event and carries no `session_id` in the same shape; it is
     // handled first so it does not fall through the state machine.
     if frame.event == "statusline" {
-        if let Some(session) = frame.session_id() {
-            crate::emit::session_status(app, session, frame.payload.clone());
-        }
-        return;
+        return match frame.session_id() {
+            Some(session) => vec![Effect::Status {
+                session: session.to_owned(),
+                payload: frame.payload.clone(),
+            }],
+            None => Vec::new(),
+        };
     }
 
     let Some(event) = frame.kind() else {
         tracing::debug!(event = %frame.event, "hook event this build does not know");
-        return;
+        return Vec::new();
     };
 
     let Some(raw) = frame.session_id() else {
-        return;
+        return Vec::new();
     };
     let Ok(session) = raw.parse::<SessionId>() else {
         // A session uuid we did not mint. Reachable when a user runs `claude` by hand inside
         // a cide shell: it inherits `CIDE_HOOK_SOCK` and reports here, but no pane owns it.
         tracing::debug!(session = raw, "hook from a session this app does not own");
-        return;
+        return Vec::new();
     };
+
+    let mut effects = Vec::new();
 
     // Files first, so a reload is not held up behind a state transition that may not happen.
     if matches!(event, HookEvent::PostToolUse | HookEvent::PostToolBatch) {
-        crate::emit::session_tool(app, raw, frame.touched_paths());
+        effects.push(Effect::Tool {
+            session: raw.to_owned(),
+            paths: frame.touched_paths(),
+        });
     }
 
     let current = states
@@ -195,13 +243,30 @@ fn apply(frame: &HookFrame, app: &AppHandle, states: &DashMap<SessionId, Session
 
     if let Some(next) = next {
         states.insert(session, next);
-        crate::emit::session_state(app, raw, next);
+        effects.push(Effect::State {
+            session: raw.to_owned(),
+            state: next,
+        });
     }
+
+    effects
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    type States = DashMap<SessionId, SessionState>;
+
+    /// A frame as the CLI sends it: an event name and a payload naming a session.
+    fn frame(event: &str, session: &str) -> HookFrame {
+        HookFrame::new(event, json!({ "session_id": session }))
+    }
+
+    fn state_of(states: &States, session: SessionId) -> Option<SessionState> {
+        states.get(&session).map(|s| *s)
+    }
 
     #[test]
     fn the_socket_path_names_this_process() {
@@ -218,12 +283,218 @@ mod tests {
     }
 
     #[test]
+    fn a_statusline_frame_is_forwarded_whole_and_never_enters_the_state_machine() {
+        // The statusline is not a hook event. Routed through `kind()` it would parse as
+        // nothing and be dropped, and the status bar's token and cost figures — which have
+        // no other source — would silently stop arriving.
+        let states = States::new();
+        let session = SessionId::new();
+        let payload = json!({
+            "session_id": session.to_string(),
+            "model": { "display_name": "Sonnet" },
+            "cost": { "total_cost_usd": 0.42 },
+        });
+
+        let effects = decide(&HookFrame::new("statusline", payload.clone()), &states);
+
+        assert_eq!(
+            effects,
+            vec![Effect::Status {
+                session: session.to_string(),
+                payload,
+            }],
+            "the payload is forwarded untouched, not destructured"
+        );
+        assert!(
+            states.is_empty(),
+            "a statusline says nothing about whether the session is busy"
+        );
+    }
+
+    #[test]
+    fn a_statusline_with_no_session_is_dropped() {
+        let states = States::new();
+        assert!(decide(&HookFrame::new("statusline", json!({})), &states).is_empty());
+    }
+
+    #[test]
+    fn a_turn_starts_and_ends_on_the_session_that_reported_it() {
+        // The per-session claim: two panes are two conversations, and a prompt in one must
+        // not make the other look busy to the close confirm.
+        let states = States::new();
+        let busy = SessionId::new();
+        let idle = SessionId::new();
+        states.insert(idle, SessionState::Idle);
+
+        let effects = decide(&frame("UserPromptSubmit", &busy.to_string()), &states);
+        assert_eq!(
+            effects,
+            vec![Effect::State {
+                session: busy.to_string(),
+                state: SessionState::Busy,
+            }]
+        );
+        assert_eq!(state_of(&states, busy), Some(SessionState::Busy));
+        assert_eq!(
+            state_of(&states, idle),
+            Some(SessionState::Idle),
+            "the other session was not touched"
+        );
+
+        let effects = decide(&frame("Stop", &busy.to_string()), &states);
+        assert_eq!(
+            effects,
+            vec![Effect::State {
+                session: busy.to_string(),
+                state: SessionState::Idle,
+            }]
+        );
+        assert_eq!(state_of(&states, busy), Some(SessionState::Idle));
+    }
+
+    #[test]
+    fn a_subagent_stopping_leaves_the_turn_running() {
+        // The transition that must *not* happen. Marking a session idle when a subagent
+        // finishes means closing a project mid-task does not warn — the moment the warning
+        // matters most.
+        let states = States::new();
+        let session = SessionId::new();
+        states.insert(session, SessionState::Busy);
+
+        assert!(decide(&frame("SubagentStop", &session.to_string()), &states).is_empty());
+        assert_eq!(state_of(&states, session), Some(SessionState::Busy));
+    }
+
+    #[test]
+    fn a_tool_reports_its_files_before_its_state() {
+        // Ordering is load-bearing: the editor reload is the thing a user sees, and it must
+        // not queue behind a transition that may not even be emitted.
+        let states = States::new();
+        let session = SessionId::new();
+        let f = HookFrame::new(
+            "PostToolUse",
+            json!({
+                "session_id": session.to_string(),
+                "tool_input": { "file_path": "/w/src/main.rs" },
+            }),
+        );
+
+        assert_eq!(
+            decide(&f, &states),
+            vec![
+                Effect::Tool {
+                    session: session.to_string(),
+                    paths: vec!["/w/src/main.rs".to_string()],
+                },
+                Effect::State {
+                    session: session.to_string(),
+                    state: SessionState::Busy,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_notification_that_asks_for_permission_changes_the_state() {
+        // The one branch the state machine cannot decide, because it needs the payload text.
+        let states = States::new();
+        let session = SessionId::new();
+        states.insert(session, SessionState::Busy);
+
+        let chatter = HookFrame::new(
+            "Notification",
+            json!({ "session_id": session.to_string(), "message": "Compacting the transcript" }),
+        );
+        assert!(
+            decide(&chatter, &states).is_empty(),
+            "ordinary notifications say nothing about liveness"
+        );
+        assert_eq!(state_of(&states, session), Some(SessionState::Busy));
+
+        let asking = HookFrame::new(
+            "Notification",
+            json!({
+                "session_id": session.to_string(),
+                "message": "Claude needs your permission to use Bash",
+            }),
+        );
+        assert_eq!(
+            decide(&asking, &states),
+            vec![Effect::State {
+                session: session.to_string(),
+                state: SessionState::AwaitingPermission,
+            }]
+        );
+
+        // A second prompt while already waiting is not news. Without the filter every
+        // re-notification would re-emit, and the pane would flicker its badge.
+        assert!(decide(&asking, &states).is_empty());
+        assert_eq!(
+            state_of(&states, session),
+            Some(SessionState::AwaitingPermission)
+        );
+    }
+
+    #[test]
     fn an_unknown_session_is_ignored_rather_than_tracked() {
         // A `claude` a user starts by hand in a cide shell inherits CIDE_HOOK_SOCK and
         // reports here. It has no pane, so it must not appear in `live_sessions` and block a
         // close confirm on something the user never opened.
-        let states: DashMap<SessionId, SessionState> = DashMap::new();
-        assert!("not-a-uuid".parse::<SessionId>().is_err());
+        let states = States::new();
+
+        assert!(decide(&frame("UserPromptSubmit", "not-a-uuid"), &states).is_empty());
+        assert!(states.is_empty(), "an unowned session was tracked");
+
+        // Nor may a frame with no session at all create an entry.
+        assert!(decide(&HookFrame::new("Stop", json!({})), &states).is_empty());
         assert!(states.is_empty());
+    }
+
+    #[test]
+    fn an_event_this_build_does_not_know_costs_one_frame_and_no_state() {
+        // A CLI release that adds a hook point must not be able to move a session's state by
+        // falling through to some default.
+        let states = States::new();
+        let session = SessionId::new();
+        states.insert(session, SessionState::Busy);
+
+        assert!(decide(&frame("SomethingNew", &session.to_string()), &states).is_empty());
+        assert_eq!(state_of(&states, session), Some(SessionState::Busy));
+    }
+
+    #[test]
+    fn only_a_busy_or_asking_session_blocks_a_close() {
+        // What `live_sessions` filters on, asserted against the states `decide` actually
+        // produces rather than against the enum in the abstract.
+        let states = States::new();
+        let session = SessionId::new();
+
+        decide(&frame("SessionStart", &session.to_string()), &states);
+        assert_eq!(state_of(&states, session), Some(SessionState::Idle));
+        assert!(!SessionState::Idle.is_live());
+
+        decide(&frame("UserPromptSubmit", &session.to_string()), &states);
+        assert!(
+            state_of(&states, session)
+                .expect("the session is tracked")
+                .is_live()
+        );
+    }
+
+    #[test]
+    fn forgetting_a_session_takes_it_out_of_the_live_set() {
+        // `HookServer::forget` was dead code until the exit watcher called it. Without it a
+        // `claude` that dies mid-turn is remembered as Busy for the life of the process and
+        // the close confirm warns about interrupting a session that is already gone.
+        let states = States::new();
+        let session = SessionId::new();
+        decide(&frame("UserPromptSubmit", &session.to_string()), &states);
+        assert!(!states.is_empty());
+
+        states.remove(&session);
+        assert!(
+            states.iter().filter(|e| e.value().is_live()).count() == 0,
+            "a forgotten session still blocks a close"
+        );
     }
 }

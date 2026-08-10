@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cide_ipc::{Geometry, SessionId};
+use cide_ipc::{Geometry, PaneId, SessionId};
 use cide_pty::{Geometry as PtyGeometry, PtySession, Sink, SpawnSpec};
 use tauri::ipc::{Channel, InvokeResponseBody, Response};
 use tauri::{Manager, State};
@@ -128,18 +128,37 @@ fn pty_geometry(g: Geometry) -> PtyGeometry {
     PtyGeometry::new(g.cols, g.rows, g.cell_width, g.cell_height)
 }
 
+/// Run a blocking job on the pool and report a lost worker as a PTY error.
+///
+/// Mirrors `cmd::file::blocking`. A join failure means the task panicked or the runtime is
+/// going away; neither is something the frontend can act on differently from the operation
+/// itself failing, so it does not get an error variant of its own.
+async fn blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, SessionError> + Send + 'static,
+) -> Result<T, SessionError> {
+    match tauri::async_runtime::spawn_blocking(job).await {
+        Ok(result) => result,
+        Err(error) => Err(SessionError::Pty(format!("session worker failed: {error}"))),
+    }
+}
+
 /// Spawn a child for a pane.
 ///
 /// `resume` continues an existing conversation; `resume` with `fork` branches from it, so
 /// the new session shares history up to this point and then diverges while the parent is
 /// left untouched. Both are ignored for anything that is not the Claude CLI.
+///
+/// `async`, and the fork itself on the blocking pool, because this is the one session
+/// command that starts a process: `openpty` plus `fork`/`exec` plus four thread spawns, all
+/// of which ran on the webview's main thread. A window whose user split four panes at once
+/// paid for all four before it could paint anything.
 #[tauri::command(rename_all = "camelCase")]
 // A Tauri command's parameters are its wire shape: the frontend passes a flat object and the
 // macro destructures it. Grouping these into a struct to satisfy the lint would add a type
 // that exists only to be immediately taken apart, and would change the JSON the frontend
 // sends. `pane_split` carries the same allow for the same reason.
 #[allow(clippy::too_many_arguments)]
-pub fn session_spawn(
+pub async fn session_spawn(
     app: tauri::AppHandle,
     registry: State<'_, SessionRegistry>,
     program: String,
@@ -207,11 +226,17 @@ pub fn session_spawn(
         }
     }
 
-    let session = PtySession::spawn(spec).map_err(|e| SessionError::Pty(e.to_string()))?;
+    let session =
+        blocking(move || PtySession::spawn(spec).map_err(|e| SessionError::Pty(e.to_string())))
+            .await?;
 
     // The pid→pane binding is not done here: a session exists before it belongs to a pane,
     // and `pane_bind_session` is the one place that knows both. Binding early would have to
     // invent a pane id and then correct it.
+
+    // Before the registry insert, so no window can learn about this session and start
+    // polling it before something is watching for its death.
+    crate::lifecycle::watch_for_exit(app.clone(), id, Arc::clone(&session));
 
     registry.insert(id, session);
     Ok(id)
@@ -253,8 +278,12 @@ pub struct DiffContent {
 /// file without bound, and persist file contents long after the diff was answered. The
 /// broker already holds the proposal for exactly as long as it is relevant, so the frontend
 /// asks for it when it renders the tab and never afterwards.
+///
+/// `async` because it reads a file off disk. On the main thread that is a stall the length
+/// of one `read(2)` on whatever filesystem the project happens to live on — a network mount
+/// makes it a visible freeze at the moment a diff tab opens.
 #[tauri::command(rename_all = "camelCase")]
-pub fn claude_diff_content(
+pub async fn claude_diff_content(
     app: tauri::AppHandle,
     project: cide_ipc::ProjectId,
     request_id: String,
@@ -274,7 +303,9 @@ pub fn claude_diff_content(
 
     // A file the model is creating has no previous version; an empty left side is the
     // honest rendering of that, and is what makes the diff show as all-additions.
-    let original = std::fs::read_to_string(&request.params.old_file_path).unwrap_or_default();
+    let old_path = request.params.old_file_path.clone();
+    let original =
+        blocking(move || Ok(std::fs::read_to_string(&old_path).unwrap_or_default())).await?;
 
     Ok(DiffContent {
         original,
@@ -301,17 +332,30 @@ fn to_outcome(a: cide_ipc::DiffAnswer) -> cide_ide_mcp::DiffOutcome {
 /// The caller receives the current screen first (see [`session_scrollback`]) so a pane
 /// that opens onto an already-running session paints immediately instead of waiting for
 /// the child's next output.
+///
+/// `pane` names *which* pane is attaching, and leaving it out is what broke mirroring: see
+/// [`AttachmentKey`]. It is optional so a caller that does not name a pane still attaches,
+/// on the old window-wide slot.
+///
+/// `async` because the resize is an `ioctl` plus a `vt100` reflow of the whole scrollback,
+/// which is not work for the thread that also has to paint.
 #[tauri::command(rename_all = "camelCase")]
-pub fn session_attach(
+pub async fn session_attach(
     registry: State<'_, SessionRegistry>,
     window: tauri::Window,
     session: SessionId,
+    pane: Option<PaneId>,
     sink: Channel<InvokeResponseBody>,
     geometry: Geometry,
 ) -> Result<(), SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
-    s.resize(pty_geometry(geometry))
-        .map_err(|e| SessionError::Pty(e.to_string()))?;
+    let resized = Arc::clone(&s);
+    blocking(move || {
+        resized
+            .resize(pty_geometry(geometry))
+            .map_err(|e| SessionError::Pty(e.to_string()))
+    })
+    .await?;
 
     let sink: Arc<dyn Sink> =
         Arc::new(move |bytes: &[u8]| sink.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok());
@@ -321,13 +365,18 @@ pub fn session_attach(
         AttachmentKey {
             session,
             window: window.label().to_string(),
+            pane,
         },
         id,
     );
     Ok(())
 }
 
-/// Report that this window has finished processing `bytes` of the session's output.
+/// Report that this pane has finished processing `bytes` of the session's output.
+///
+/// The pane, not the window: credit is per sink, and two mirrors of one session render at
+/// their own speeds. Crediting by window would let a pane that is keeping up pay off the
+/// debt of one that has stalled, which is the flow control failing open.
 ///
 /// Called from `term.write`'s completion callback, which is the only moment xterm has
 /// actually parsed the bytes rather than merely received them. Until this arrives the bytes
@@ -336,16 +385,22 @@ pub fn session_attach(
 ///
 /// Silently ignores a session or attachment that has gone away. An ack racing a pane close
 /// is ordinary rather than exceptional, and there is nothing useful to tell the caller.
+///
+/// Stays synchronous, unlike its neighbours: this is the per-frame hot path and its whole
+/// body is a map lookup and an atomic add. Handing each one to the async runtime would cost
+/// a task spawn per frame to save nothing.
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_ack(
     registry: State<'_, SessionRegistry>,
     window: tauri::Window,
     session: SessionId,
+    pane: Option<PaneId>,
     bytes: usize,
 ) {
     let key = AttachmentKey {
         session,
         window: window.label().to_string(),
+        pane,
     };
     if let Some(sink) = registry.attachment(&key)
         && let Some(s) = registry.get(session)
@@ -354,15 +409,18 @@ pub fn session_ack(
     }
 }
 
+/// Drop one pane's sink. The session and its child are untouched.
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_detach(
     registry: State<'_, SessionRegistry>,
     window: tauri::Window,
     session: SessionId,
+    pane: Option<PaneId>,
 ) {
     let key = AttachmentKey {
         session,
         window: window.label().to_string(),
+        pane,
     };
     if let Some(sink) = registry.take_attachment(&key)
         && let Some(s) = registry.get(session)
@@ -377,13 +435,18 @@ pub fn session_detach(
 /// with a one-frame `cols-1 → cols` resize nudge, so the application repaints from its own
 /// model — covering sequences the screen mirror does not track (OSC 8 hyperlinks, OSC 52
 /// clipboard traffic, DEC 2026 synchronized-output framing).
+///
+/// `async` because serialising the mirror is not cheap: `state_formatted` walks every cell
+/// of a screen that may hold ten thousand lines of scrollback, and every pane in a restored
+/// workspace asks for one at the same moment.
 #[tauri::command(rename_all = "camelCase")]
-pub fn session_scrollback(
+pub async fn session_scrollback(
     registry: State<'_, SessionRegistry>,
     session: SessionId,
 ) -> Result<Response, SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
-    Ok(Response::new(s.screen_state()))
+    let state = blocking(move || Ok(s.screen_state())).await?;
+    Ok(Response::new(state))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -406,15 +469,22 @@ pub fn session_write(
     Ok(())
 }
 
+/// Push a new size at the child.
+///
+/// `async` for the same reason as [`session_attach`]: `vt100::Screen::set_size` reflows the
+/// whole scrollback, and this arrives on every frame of a window drag.
 #[tauri::command(rename_all = "camelCase")]
-pub fn session_resize(
+pub async fn session_resize(
     registry: State<'_, SessionRegistry>,
     session: SessionId,
     geometry: Geometry,
 ) -> Result<(), SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
-    s.resize(pty_geometry(geometry))
-        .map_err(|e| SessionError::Pty(e.to_string()))
+    blocking(move || {
+        s.resize(pty_geometry(geometry))
+            .map_err(|e| SessionError::Pty(e.to_string()))
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]

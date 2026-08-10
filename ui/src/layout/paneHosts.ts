@@ -166,6 +166,22 @@ export function peekHost(paneId: string): PaneHost | undefined {
 }
 
 /**
+ * The session this pane holds *in this process*, host resident or not.
+ *
+ * The ledger as well as the map, deliberately. `peekHost` alone answers "no" for a pane
+ * whose host was evicted while parked, and the one caller that asks — `PaneBody`, deciding
+ * whether to show the Resume splash — would then offer to resume a conversation that is
+ * already running in a terminal one tab away. `destroyHost` clears the ledger's copy, so a
+ * pane the user actually closed answers `undefined` again.
+ *
+ * Distinct from the domain's `pane.session`, which survives a restart and therefore names a
+ * child from a *previous* process. This is the one that means "a child is running now".
+ */
+export function paneSessionId(paneId: string): string | undefined {
+  return hosts.get(paneId)?.sessionId ?? ledger.get(paneId)?.sessionId
+}
+
+/**
  * Create this pane's terminal and open it into its host, once.
  *
  * Returns the existing handle on every later call. xterm's own guidance is that `open()`

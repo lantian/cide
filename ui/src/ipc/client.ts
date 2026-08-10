@@ -939,3 +939,37 @@ const degraded = new Set<string>()
 export function isDegraded(name: string): boolean {
   return degraded.has(name)
 }
+
+/**
+ * The three session calls that have to name a pane. (M7)
+ *
+ * A sink used to be keyed `(session, window)`, so two panes mirroring one session in one
+ * window were one attachment and the second silently detached the first — the one case
+ * mirroring exists for. The pane id is part of that key now, which means `attach`, `ack` and
+ * `detach` all have to carry it: an ack that names no pane credits a different sink, and a
+ * detach that names no pane drops a different pane's view.
+ *
+ * These supersede `session.attach` / `session.ack` / `session.detach` for anything that
+ * lives in a pane, which today is `TerminalPane` and nothing else. The originals still work
+ * — `pane` is optional on the Rust side, and omitting it means the old window-wide slot — so
+ * a caller outside a pane is not broken by this. New pane callers use these.
+ */
+export const paneSession = {
+  /** Attach this pane's sink. See `session.attach`; the pane is what keeps mirrors apart. */
+  attach: (pane: PaneId, id: SessionId, geo: Geometry, onData: (data: ArrayBuffer) => void) => {
+    const sink = new Channel<ArrayBuffer>()
+    sink.onmessage = onData
+    return invoke<void>('session_attach', { session: id, pane, sink, geometry: geo })
+  },
+
+  /**
+   * Report that this pane has parsed `bytes`. Fire-and-forget for the same reason
+   * `session.ack` is: it runs in `term.write`'s completion callback, once per frame.
+   */
+  ack: (pane: PaneId, id: SessionId, bytes: number) => {
+    void invoke<void>('session_ack', { session: id, pane, bytes }).catch(() => {})
+  },
+
+  /** Drop this pane's sink. The child keeps running; only this view of it ends. */
+  detach: (pane: PaneId, id: SessionId) => invoke<void>('session_detach', { session: id, pane }),
+}

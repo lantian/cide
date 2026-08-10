@@ -18,6 +18,7 @@ import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
 import { ResumeSplash, RestoredShellBanner } from '@/windows/ResumeSplash'
+import { paneSessionId } from '@/layout/paneHosts'
 import type { DiffSpec, Pane, PaneRestore } from '@/ipc/client'
 
 export interface PaneBodyProps {
@@ -88,12 +89,21 @@ export function PaneBody({
     )
   }
 
-  // A pane that is already bound to a session has nothing to decide: the child is running
-  // and the terminal attaches to it.
-  const bound = pane.session !== null
+  // A pane that already has a *running* child has nothing to decide: the terminal attaches
+  // to it and there is nothing to resume.
+  //
+  // Asked of the host registry, not of `pane.session`. That field is what the domain saved
+  // last time and it is set on every restored pane, so the predicate used to read
+  // `!bound` — and a restored pane is bound by definition, which made the Resume splash
+  // unreachable and every non-eager pane spawn silently on launch. That is precisely what
+  // `eager` exists to prevent: reopening a six-pane project started six agents.
+  //
+  // `paneSessionId` also survives host eviction, so a pane the user resumed and then left
+  // parked in another tab does not come back offering to resume itself a second time.
+  const started = paneSessionId(pane.id) !== undefined
 
-  // Only a plan entry can hold a pane back, and only before it has been asked.
-  const held = restore !== undefined && !restore.eager && !bound
+  // Only a plan entry can hold a pane back, and only before it has been started.
+  const held = restore !== undefined && !restore.eager && !started
   const [resumed, setResumed] = useState(false)
 
   if (held && !resumed) {
@@ -109,6 +119,7 @@ export function PaneBody({
             cwd={cwd}
             project={project}
             primarySession={primarySession}
+            restore={restore}
             onSessionBound={onSessionBound}
           />
         </>
@@ -125,11 +136,16 @@ export function PaneBody({
     )
   }
 
-  return <TerminalPane
-            pane={pane}
-            cwd={cwd}
-            project={project}
-            primarySession={primarySession}
-            onSessionBound={onSessionBound}
-          />
+  // `restore` travels on, always: it is what tells `specFor` to pass `--resume <id>` instead
+  // of adopting a `SessionId` whose process died with the last run.
+  return (
+    <TerminalPane
+      pane={pane}
+      cwd={cwd}
+      project={project}
+      primarySession={primarySession}
+      restore={restore}
+      onSessionBound={onSessionBound}
+    />
+  )
 }

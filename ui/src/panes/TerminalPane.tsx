@@ -12,7 +12,14 @@ import { useEffect, useRef } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
-import { session as sessionApi, type Geometry, type Pane } from '@/ipc/client'
+import {
+  events,
+  paneSession,
+  session as sessionApi,
+  type Geometry,
+  type Pane,
+  type PaneRestore,
+} from '@/ipc/client'
 
 export interface TerminalSpec {
   program: string
@@ -38,6 +45,16 @@ export interface TerminalPaneProps {
    * shape of the workspace.
    */
   primarySession?: string | undefined
+  /**
+   * This pane's entry in the launch plan, when the workspace was restored.
+   *
+   * Absent for a pane created during this run — those always spawn fresh, because the user
+   * just asked for them. Present, it is the only thing that knows the pane's `session` names
+   * a conversation from a *previous* process: `Resumable` becomes `claude --resume <id>`,
+   * and `Fresh` becomes an ordinary new session. Without it a restored pane attached to a
+   * `SessionId` no process has ever heard of and sat there blank.
+   */
+  restore?: PaneRestore | undefined
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
   onSessionBound?: ((session: string) => void) | undefined
   className?: string | undefined
@@ -79,11 +96,28 @@ function plausible(cols: number, rows: number): boolean {
   return cols >= 20 && rows >= 5
 }
 
-/** What a pane of each kind runs. A diff pane has no process at all. */
-function specFor(pane: Pane, cwd: string, project?: string): TerminalSpec | null {
+/**
+ * What a pane of each kind runs. A diff pane has no process at all.
+ *
+ * `restore` is what makes a restored Claude pane pick its conversation up rather than start
+ * a new one. `plan_restore` has already checked that Claude Code holds a transcript for that
+ * id under this cwd, so `Resumable` is a claim about the filesystem and not a guess; a
+ * `Fresh` entry — a shell, or a Claude pane whose transcript is gone — spawns as usual.
+ *
+ * A shell never resumes. `--resume` means nothing to bash, and its scrollback died with its
+ * process.
+ */
+function specFor(
+  pane: Pane,
+  cwd: string,
+  project?: string,
+  restore?: PaneRestore | undefined,
+): TerminalSpec | null {
   switch (pane.kind) {
-    case 'claude':
-      return { program: 'claude', args: [], cwd, project }
+    case 'claude': {
+      const resume = restore?.restore.kind === 'resumable' ? restore.restore.session : undefined
+      return { program: 'claude', args: [], cwd, project, resume }
+    }
     case 'shell':
       return { program: DEFAULT_SHELL, args: ['-l'], cwd, project }
     default:
@@ -139,12 +173,33 @@ function syncSize(paneId: string): void {
  * and detach the same way every other byte in the pane does.
  *
  * SGR 2 is dim — the ANSI analogue of the `--faint` token the design uses for spent text.
+ *
+ * Returns whether this call is the one that wrote it. Exit now reaches a pane from two
+ * directions — the `cide://session-state` event, and the one-shot check for a session that
+ * was already dead before this pane attached — and `onExit` must fire once however many
+ * arrive.
  */
-function markExited(paneId: string): void {
+function markExited(paneId: string): boolean {
   const host = getHost(paneId)
-  if (host.exitMarked) return
+  if (host.exitMarked) return false
   host.exitMarked = true
   host.terminal?.term.write('\r\n\x1b[2m— exited —\x1b[0m\r\n')
+  return true
+}
+
+/**
+ * Whether the Rust registry still holds a running child for this session.
+ *
+ * `hasExited` rejects with `noSuchSession` for an id the registry has never heard of, which
+ * is exactly what a `SessionId` restored from `workspace.json` is — the process that owned
+ * it is gone. Both answers mean the same thing here, so the rejection is a `false` rather
+ * than an error: this is a question, not an operation.
+ */
+async function sessionIsLive(session: string): Promise<boolean> {
+  return sessionApi.hasExited(session).then(
+    (exited) => !exited,
+    () => false,
+  )
 }
 
 async function sessionFor(paneId: string, spec: TerminalSpec, geometry: Geometry): Promise<string> {
@@ -173,6 +228,7 @@ export function TerminalPane({
   cwd,
   project,
   primarySession,
+  restore,
   onSessionBound,
   className,
   onExit,
@@ -192,6 +248,10 @@ export function TerminalPane({
   kindRef.current = pane.kind
   const primaryRef = useRef(primarySession)
   primaryRef.current = primarySession
+  // A ref, not a dependency: the plan is read once at launch and never refreshed, so its
+  // identity changing means the parent re-rendered, not that this pane should respawn.
+  const restoreRef = useRef(restore)
+  restoreRef.current = restore
   const domainSession = pane.session
 
   useEffect(() => {
@@ -199,13 +259,28 @@ export function TerminalPane({
     const handle = openTerminal(paneId)
     const { term, fit } = handle
 
-    // The domain may already hold a session for this pane — a restored workspace, or a pane
-    // that was detached and re-docked. Adopt it before considering a spawn.
-    if (domainSession && !getHost(paneId).sessionId) {
+    const restoreEntry = restoreRef.current
+
+    // The domain may already hold a session for this pane — a pane that was detached and
+    // re-docked, or one re-mounting after a split. Adopt it before considering a spawn.
+    //
+    // Not when this pane is in the launch plan. There, `pane.session` names a child from the
+    // process that wrote `workspace.json`, and adopting it attaches to a session the registry
+    // has never heard of: the pane comes up blank and stays that way. Such a pane spawns
+    // instead, resuming the old conversation when the plan says it can — but only
+    // after `sessionIsLive` has said the old id really is dead, because the plan is read once
+    // and a pane that has already spawned in this run still carries its entry. Re-docking one
+    // into a second window must not fork a rival child.
+    if (domainSession && !getHost(paneId).sessionId && restoreEntry === undefined) {
       getHost(paneId).sessionId = domainSession
     }
 
-    const spec = specFor({ ...pane, kind: kindRef.current }, cwdRef.current, projectRef.current)
+    const spec = specFor(
+      { ...pane, kind: kindRef.current },
+      cwdRef.current,
+      projectRef.current,
+      restoreEntry,
+    )
     if (spec === null) return
 
     // A split may have asked for something a pane's `kind` cannot express. Taken here, once:
@@ -237,6 +312,15 @@ export function TerminalPane({
       : FALLBACK
 
     ;(async () => {
+      // A planned pane's `pane.session` was not adopted above, because at launch it names a
+      // dead child. It is adopted here if the registry proves otherwise — which is the case
+      // for a pane that already spawned in this run and is now being re-docked or re-mounted
+      // in a window that still holds the plan.
+      if (restoreEntry !== undefined && domainSession && !getHost(paneId).sessionId) {
+        if (await sessionIsLive(domainSession)) getHost(paneId).sessionId = domainSession
+        if (disposed) return
+      }
+
       const id = await sessionFor(paneId, spec, geo)
       if (disposed) return
 
@@ -277,9 +361,13 @@ export function TerminalPane({
       // them, which is the rate the session should be pacing itself against. Acking on
       // arrival would report a speed this renderer cannot sustain and would turn credit
       // control back into no control at all.
-      await sessionApi.attach(id, geo, (data) => {
+      //
+      // Attaching *by pane*, not by window. Two panes mirroring one session in one window
+      // used to be one attachment on the Rust side, so opening a mirror detached the pane
+      // being mirrored — see `paneSession` in the IPC client.
+      await paneSession.attach(paneId, id, geo, (data) => {
         const bytes = new Uint8Array(data)
-        term.write(bytes, () => sessionApi.ack(id, bytes.byteLength))
+        term.write(bytes, () => paneSession.ack(paneId, id, bytes.byteLength))
       })
 
       if (alt) {
@@ -293,6 +381,12 @@ export function TerminalPane({
       // Now that the session exists, adopt the pane's real size. Layout has certainly
       // settled by this point — several IPC round trips have happened since mount.
       requestAnimationFrame(() => syncSize(paneId))
+
+      // A session that was already dead when this pane attached will never produce an event
+      // — the watcher fired before anyone was listening. One check, not a poll: this is the
+      // rehydration case (a host evicted and re-created after its child had gone), and it is
+      // answered once at attach time rather than every second for the life of the pane.
+      if (!(await sessionIsLive(id)) && markExited(paneId)) exitCb.current?.()
     })().catch((e) => console.error('[cide] terminal pane failed to start', e))
 
     const onData = term.onData((data) => {
@@ -300,26 +394,37 @@ export function TerminalPane({
       if (id) void sessionApi.write(id, data)
     })
 
-    // Exit polling is a placeholder: M7 replaces it with the `cide://session-state` event
-    // driven by Claude Code hooks, which knows the difference between "idle" and "gone".
-    const poll = window.setInterval(async () => {
-      const id = getHost(paneId).sessionId
-      if (!id) return
-      if (await sessionApi.hasExited(id)) {
-        window.clearInterval(poll)
-        markExited(paneId)
-        exitCb.current?.()
-      }
-    }, 1000)
+    // Exit arrives as an event now. It used to be a `session.hasExited` round trip per pane
+    // per second, forever, in every window — twelve panes was twelve IPC calls a second to
+    // learn nothing, and it still took up to a second to notice. `cide://session-state` is
+    // emitted once, by the watcher the session's own spawn started.
+    //
+    // Listening is asynchronous, so a pane disposed before the subscription lands has to
+    // unsubscribe the handle it never got to store.
+    let unlistenExit: (() => void) | null = null
+    void events
+      .onSessionState((session, state) => {
+        if (state.state !== 'exited') return
+        // Not `id` from the async block above: this handler outlives it, and a pane that
+        // respawned holds a different session by now.
+        if (session !== getHost(paneId).sessionId) return
+        if (markExited(paneId)) exitCb.current?.()
+      })
+      .then((fn) => {
+        if (disposed) fn()
+        else unlistenExit = fn
+      })
+      .catch((e) => console.error('[cide] terminal pane cannot hear about exits', e))
 
     return () => {
       disposed = true
       onData.dispose()
-      window.clearInterval(poll)
+      unlistenExit?.()
       const id = getHost(paneId).sessionId
       // Detach the sink, never the session: the child keeps running and this pane can be
-      // re-attached from another window without the process noticing.
-      if (id) void sessionApi.detach(id)
+      // re-attached from another window without the process noticing. By pane, so closing
+      // one mirror leaves the other attached.
+      if (id) void paneSession.detach(paneId, id)
     }
     // Deliberately keyed on the pane id and its domain session alone. Including the
     // callbacks or the pane object would tear down and re-attach the terminal on every
