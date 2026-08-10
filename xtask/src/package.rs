@@ -18,6 +18,24 @@
 //! effect of a task somebody typed to see what it would do is hostile. The default is a
 //! preflight and a printed plan. `--run` executes it.
 //!
+//! # `cide-hook` is a second binary, and the bundler does not know about it
+//!
+//! `cargo tauri build` bundles the `[[bin]]` targets of the crate holding `tauri.conf.json`
+//! and nothing else — `tauri-cli`'s `get_binaries` reads that one `Cargo.toml` plus its
+//! `src/bin/`. `cide-hook` is a separate workspace crate (it must be: it may not link tauri),
+//! so left alone the bundler ships an AppImage containing only `cide`. That package launches,
+//! looks correct, and every Claude session inside it runs with no hooks — no token figures, no
+//! fast buffer reload, and a close confirm that cannot tell busy from idle. Nothing errors;
+//! the features are simply absent.
+//!
+//! So the hook rides along as a Tauri *sidecar*: `bundle.externalBin` in `tauri.conf.json`
+//! names `../../target/release/cide-hook`, the bundler looks for that path with the target
+//! triple appended, and `Settings::copy_binaries` strips the triple back off when it copies
+//! it into `usr/bin/` — beside `cide`, which is exactly where `cmd::session::hook_settings`
+//! looks (`current_exe().parent().join("cide-hook")`). Two steps in the plan produce that
+//! suffixed copy. The alternative — `bundle.linux.appimage.files` — was rejected because it
+//! is AppImage-only, so the `.deb` would have silently kept shipping without the hook.
+//!
 //! # The Flatpak manifest is generated, not hand-maintained
 //!
 //! It restates facts that already live in `tauri.conf.json` and `Cargo.toml` — the app id,
@@ -40,6 +58,23 @@ const FLATPAK_DIR: &str = "packaging/flatpak";
 
 /// The directory `cargo tauri build` must run from — the crate holding `tauri.conf.json`.
 const APP_CRATE: &str = "crates/cide-app";
+
+/// The second binary. See the module docs: without it in the bundle the product runs with
+/// no hooks and nothing reports an error.
+const HOOK_BIN: &str = "cide-hook";
+
+/// Where the sidecar copy is written, relative to the workspace root. `tauri.conf.json`'s
+/// `externalBin` entry names the same path relative to `crates/cide-app`, and the two have to
+/// agree; `the_sidecar_path_matches_the_checked_in_config` asserts they do.
+const HOOK_SIDECAR_DIR: &str = "target/release";
+
+/// The `cargo-tauri` major version this configuration requires.
+///
+/// `tauri.conf.json` is a v2 schema and the workspace links tauri 2.x. A v1 `cargo-tauri`
+/// on `PATH` is the likely accident — it is what `cargo install tauri-cli` gave people for
+/// years — and it fails on this config with a schema error a long way from its cause, so the
+/// preflight names the version rather than only checking that *something* is installed.
+const TAURI_CLI_MAJOR: u64 = 2;
 
 /// The Flatpak runtime this manifest targets.
 ///
@@ -130,6 +165,20 @@ pub struct AppInfo {
     pub bundle_targets: Vec<String>,
     pub icons: Vec<String>,
     pub has_updater: bool,
+    /// `bundle.externalBin` — the sidecars the bundler copies beside the main binary.
+    pub external_bin: Vec<String>,
+}
+
+impl AppInfo {
+    /// Whether `bundle.externalBin` carries `cide-hook`.
+    ///
+    /// Matched on the file name so a change of directory in the config does not silently
+    /// turn this check off.
+    fn bundles_the_hook(&self) -> bool {
+        self.external_bin
+            .iter()
+            .any(|p| Path::new(p).file_name().is_some_and(|n| n == HOOK_BIN))
+    }
 }
 
 pub fn package(root: &Path, opts: Options) -> Result<()> {
@@ -142,6 +191,7 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
         return write_generated(root, &info);
     }
 
+    let triple = host_triple()?;
     let checks = preflight(root, &info, opts.targets);
     println!("preflight for {} {}", info.product_name, info.version);
     for check in &checks {
@@ -152,7 +202,7 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
         .filter(|c| matches!(c, Verdict::Fail(_)))
         .collect();
 
-    let steps = plan(&info, opts.targets);
+    let steps = plan(root, &info, opts.targets, &triple);
     println!("\nplan:");
     for step in &steps {
         println!("  $ {}", step.display());
@@ -177,16 +227,54 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
         step.execute(root)?;
     }
     println!("\npackaging complete; artefacts are under target/release/bundle/");
+    for (path, bytes) in artefacts(root) {
+        println!("  {path}  {:.1} MiB", bytes as f64 / (1024.0 * 1024.0));
+    }
     Ok(())
 }
 
+/// The bundles that exist under `target/release/bundle`, with their sizes.
+///
+/// Printed after a build because "it succeeded" is not the interesting part — a bundle that
+/// came out at 12 MiB has not picked up WebKit's helper processes, and the number is the
+/// cheapest way to notice.
+fn artefacts(root: &Path) -> Vec<(String, u64)> {
+    let mut found = Vec::new();
+    let bundle = root.join("target/release/bundle");
+    for sub in ["appimage", "deb"] {
+        let Ok(entries) = fs::read_dir(bundle.join(sub)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_artefact = path
+                .extension()
+                .is_some_and(|e| e == "AppImage" || e == "deb");
+            if is_artefact && let Ok(meta) = entry.metadata() {
+                found.push((
+                    format!(
+                        "target/release/bundle/{sub}/{}",
+                        entry.file_name().to_string_lossy()
+                    ),
+                    meta.len(),
+                ));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// One command in the plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Step {
     program: String,
     args: Vec<String>,
     /// Relative to the workspace root.
     cwd: String,
+    /// Environment to add, as `(name, value)`. Values that are paths are absolute, because
+    /// the process that reads them is several layers below this one and has its own cwd.
+    env: Vec<(String, String)>,
 }
 
 impl Step {
@@ -194,6 +282,9 @@ impl Step {
         let mut line = String::new();
         if self.cwd != "." {
             line.push_str(&format!("cd {} && ", self.cwd));
+        }
+        for (name, value) in &self.env {
+            line.push_str(&format!("{name}={value} "));
         }
         line.push_str(&self.program);
         for arg in &self.args {
@@ -212,6 +303,7 @@ impl Step {
         println!("\n$ {}", self.display());
         let status = Command::new(&self.program)
             .args(&self.args)
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(root.join(&self.cwd))
             .status()
             .with_context(|| format!("running `{}`", self.display()))?;
@@ -223,10 +315,28 @@ impl Step {
 }
 
 /// The commands that would produce the requested targets.
-pub fn plan(info: &AppInfo, targets: Targets) -> Vec<Step> {
+///
+/// `triple` is the host target triple, which the sidecar copy's file name has to carry —
+/// the bundler resolves `externalBin` by appending it.
+pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<Step> {
     let mut steps = Vec::new();
 
     if let Some(bundles) = targets.bundles() {
+        // The sidecar, first. `cargo tauri build` builds only the app crate, so nothing else
+        // in the plan would produce `cide-hook`, and the bundler's failure when the sidecar is
+        // missing names a path with a target triple in it that reads like a cross-compilation
+        // problem.
+        steps.extend(sidecar_steps(triple));
+
+        let mut env = Vec::new();
+        if targets.appimage {
+            let runtime = root.join(appimage_runtime_path(triple));
+            if !runtime.exists() {
+                steps.push(fetch_appimage_runtime(triple));
+            }
+            env.push((LDAI_RUNTIME_FILE.to_string(), runtime.display().to_string()));
+        }
+
         // Run from the app crate: `cargo tauri build` finds `tauri.conf.json` by walking up
         // from the working directory, and this workspace has no `src-tauri`.
         //
@@ -236,6 +346,7 @@ pub fn plan(info: &AppInfo, targets: Targets) -> Vec<Step> {
             program: "cargo".into(),
             args: vec!["tauri".into(), "build".into(), "--bundles".into(), bundles],
             cwd: APP_CRATE.into(),
+            env,
         });
     }
 
@@ -256,10 +367,99 @@ pub fn plan(info: &AppInfo, targets: Targets) -> Vec<Step> {
                 manifest_path(info),
             ],
             cwd: ".".into(),
+            env: Vec::new(),
         });
     }
 
     steps
+}
+
+/// Build `cide-hook` and leave it under the name the Tauri bundler resolves `externalBin` to.
+///
+/// `install -m755` rather than `cp` so the copy is executable even if the source somehow is
+/// not, and because it is one command a reader can paste — the printed plan is meant to be
+/// runnable by hand when this task is not.
+fn sidecar_steps(triple: &str) -> Vec<Step> {
+    vec![
+        Step {
+            program: "cargo".into(),
+            args: vec![
+                "build".into(),
+                "--release".into(),
+                "--locked".into(),
+                "-p".into(),
+                HOOK_BIN.into(),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+        },
+        Step {
+            program: "install".into(),
+            args: vec![
+                "-m755".into(),
+                format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"),
+                sidecar_path(triple),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+        },
+    ]
+}
+
+/// Where the suffixed copy of `cide-hook` goes, relative to the workspace root.
+fn sidecar_path(triple: &str) -> String {
+    format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}-{triple}")
+}
+
+/// The environment variable `linuxdeploy-plugin-appimage` turns into `--runtime-file`.
+const LDAI_RUNTIME_FILE: &str = "LDAI_RUNTIME_FILE";
+
+/// Where the prefetched AppImage type-2 runtime is kept, relative to the workspace root.
+const APPIMAGE_RUNTIME_DIR: &str = "target/appimage-runtime";
+
+fn appimage_runtime_path(triple: &str) -> String {
+    format!("{APPIMAGE_RUNTIME_DIR}/runtime-{}", runtime_arch(triple))
+}
+
+/// The architecture segment of the runtime's file name, which is the triple's first field —
+/// the same slice `tauri-bundler` takes for its own tool names.
+fn runtime_arch(triple: &str) -> &str {
+    triple.split('-').next().unwrap_or(triple)
+}
+
+/// Fetch the AppImage type-2 runtime ahead of the build.
+///
+/// **This step exists because of a hang, not a failure.** The last thing in the chain is
+/// `appimagetool`, several layers under `cargo tauri build`, and when it has no runtime file
+/// it fetches one from `github.com/AppImage/type2-runtime`. On this machine that download
+/// stalled: the socket went to CLOSE-WAIT and the process sat in `futex_do_wait` indefinitely,
+/// with `cargo tauri build` holding its pipes and printing nothing after "Bundling
+/// cide_0.1.0_amd64.AppImage". There is no timeout anywhere in that stack, so a packaging run
+/// simply never returns, and the last line it printed looks like success.
+///
+/// Fetching it here with `curl --retry`, which does fail rather than hang, and handing it over
+/// as `LDAI_RUNTIME_FILE`, takes the network out of the innermost layer. It also makes a
+/// second build offline-capable, which the layer below is not.
+fn fetch_appimage_runtime(triple: &str) -> Step {
+    let arch = runtime_arch(triple);
+    Step {
+        program: "curl".into(),
+        args: vec![
+            "-fsSL".into(),
+            "--retry".into(),
+            "3".into(),
+            "--max-time".into(),
+            "180".into(),
+            "--create-dirs".into(),
+            "-o".into(),
+            appimage_runtime_path(triple),
+            format!(
+                "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-{arch}"
+            ),
+        ],
+        cwd: ".".into(),
+        env: Vec::new(),
+    }
 }
 
 /// The manifest's path, relative to the workspace root.
@@ -298,17 +498,34 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets) -> Vec<Verdict> 
     }
 
     if targets.appimage || targets.deb {
-        out.push(match which("cargo-tauri") {
-            Some(path) => Verdict::Ok(format!("cargo-tauri at {}", path.display())),
-            None => Verdict::Fail(
-                "cargo-tauri is not on PATH — install it with `cargo install tauri-cli \
-                 --version ^2`"
-                    .into(),
-            ),
+        out.push(tauri_cli_check());
+        out.push(if info.bundles_the_hook() {
+            Verdict::Ok(format!(
+                "{TAURI_CONF} ships {HOOK_BIN} as a sidecar (bundle.externalBin)"
+            ))
+        } else {
+            // A failure, not a warning. The bundle would be produced, would install, would
+            // launch, and every session in it would run with no hooks — see the module docs.
+            Verdict::Fail(format!(
+                "{TAURI_CONF} has no `{HOOK_BIN}` in bundle.externalBin, so the package would \
+                 ship without it: `cargo tauri build` bundles only the app crate's own \
+                 binaries. Sessions would run with no hooks and nothing would report an error"
+            ))
         });
+        // The `externalBin` path is written relative to the app crate and hardcodes
+        // `target/release`. Cargo honours CARGO_TARGET_DIR, the config cannot, and the
+        // mismatch surfaces as a missing-sidecar error naming a path that does exist.
+        if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+            out.push(Verdict::Warn(format!(
+                "CARGO_TARGET_DIR is set to {}; `bundle.externalBin` in {TAURI_CONF} hardcodes \
+                 ../../{HOOK_SIDECAR_DIR}, so the sidecar must be copied there by hand",
+                dir.to_string_lossy()
+            )));
+        }
     }
 
     if targets.appimage {
+        out.push(webkit_helper_check());
         out.push(if info.has_updater {
             Verdict::Ok("the updater plugin is configured".into())
         } else {
@@ -348,6 +565,155 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets) -> Vec<Verdict> 
     }
 
     out
+}
+
+/// The directories `tauri-bundler` searches for WebKit's two helper processes, each joined
+/// with `webkit2gtk-4.1`. Copied from `bundle/linux/appimage/linuxdeploy.rs`, whose own
+/// comment on the list is `// TODO: Check if it's the same dir name on all systems`.
+const WEBKIT_SEARCH_DIRS: [&str; 4] = [
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/usr/libexec",
+];
+
+/// The two out-of-process helpers a WebKitGTK web view cannot render without.
+const WEBKIT_HELPERS: [&str; 2] = ["WebKitWebProcess", "WebKitNetworkProcess"];
+
+/// Whether the AppImage will carry WebKit's helper processes.
+///
+/// **This is the check that catches the quietest failure in this whole file.** The bundler
+/// puts `libwebkit2gtk-4.1.so.0` inside the AppImage, and that library spawns two helper
+/// executables to do anything at all. It tries to bring them along — it looks for them under
+/// `<libdir>/webkit2gtk-4.1/` — and when it does not find them it copies nothing and says
+/// nothing: the loop is `if source.exists()`, with no else. On openSUSE they live in
+/// `/usr/libexec/libwebkit2gtk-4_1-0/`, which is not a name on that list, so the bundle comes
+/// out without them and the run fails on a *different* machine, as a window that never paints.
+///
+/// A warning rather than a failure because it is not fatal on every host: nothing sets
+/// `WEBKIT_EXEC_PATH`, so the bundled library falls back to its compiled-in absolute path, and
+/// on a host whose WebKitGTK is laid out like the build machine's that path is there.
+fn webkit_helper_check() -> Verdict {
+    let bundled: Vec<&str> = WEBKIT_HELPERS
+        .into_iter()
+        .filter(|helper| {
+            WEBKIT_SEARCH_DIRS
+                .iter()
+                .any(|dir| Path::new(dir).join("webkit2gtk-4.1").join(helper).exists())
+        })
+        .collect();
+    if bundled.len() == WEBKIT_HELPERS.len() {
+        return Verdict::Ok("WebKit's helper processes will be bundled".into());
+    }
+    let elsewhere = find_webkit_helpers_elsewhere();
+    let found = match elsewhere {
+        Some(dir) => format!(" — this machine keeps them in {dir}"),
+        None => String::new(),
+    };
+    Verdict::Warn(format!(
+        "the AppImage will not contain {}: `cargo tauri build` only looks under \
+         <libdir>/webkit2gtk-4.1/ and copies nothing when they are absent{found}. Nothing \
+         sets WEBKIT_EXEC_PATH either, so the bundled libwebkit2gtk falls back to its \
+         compiled-in absolute path and the package only renders on a host that lays \
+         WebKitGTK out the way this machine does",
+        WEBKIT_HELPERS
+            .iter()
+            .filter(|h| !bundled.contains(h))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" and "),
+    ))
+}
+
+/// Where this machine actually keeps the helpers, if not where the bundler looks.
+///
+/// Only the directories the bundler already searches are scanned, one level down, which is
+/// enough for the `libwebkit2gtk-4_1-0` style of name and cheap enough to run every preflight.
+///
+/// A machine with both WebKitGTK ABIs installed has two such directories, and naming the 6.0
+/// one would send a reader to the GTK 4 build that Tauri 2 does not link. So the 4.1 spelling
+/// wins when both are there, and directory order decides nothing.
+fn find_webkit_helpers_elsewhere() -> Option<String> {
+    let mut fallback = None;
+    for dir in WEBKIT_SEARCH_DIRS {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().join(WEBKIT_HELPERS[0]).exists() {
+                continue;
+            }
+            let path = entry.path().display().to_string();
+            if path.contains("4_1") || path.contains("4.1") {
+                return Some(path);
+            }
+            fallback.get_or_insert(path);
+        }
+    }
+    fallback
+}
+
+/// Whether a `cargo-tauri` that can read a v2 config is installed.
+///
+/// The presence check this replaces passed on a `cargo-tauri 1.5.12`, which is what a machine
+/// that installed `tauri-cli` before Tauri 2 has. That build reads `tauri.conf.json` against
+/// the v1 schema and dies on `identifier`/`app`/`bundle` keys it does not know, several
+/// screens away from anything that says "wrong version".
+fn tauri_cli_check() -> Verdict {
+    let install =
+        format!("install it with `cargo install tauri-cli --version ^{TAURI_CLI_MAJOR} --locked`");
+    let Some(path) = which("cargo-tauri") else {
+        return Verdict::Fail(format!("cargo-tauri is not on PATH — {install}"));
+    };
+    let Ok(output) = Command::new(&path).arg("--version").output() else {
+        return Verdict::Warn(format!(
+            "cargo-tauri at {} would not report its version",
+            path.display()
+        ));
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    match parse_cli_major(&text) {
+        Some(TAURI_CLI_MAJOR) => Verdict::Ok(format!("{} at {}", text.trim(), path.display())),
+        Some(major) => Verdict::Fail(format!(
+            "cargo-tauri at {} is version {major}.x, but {TAURI_CONF} is a Tauri \
+             {TAURI_CLI_MAJOR} config and the workspace links tauri {TAURI_CLI_MAJOR}.x — \
+             {install}",
+            path.display()
+        )),
+        None => Verdict::Warn(format!(
+            "could not parse a version out of `cargo-tauri --version` ({:?})",
+            text.trim()
+        )),
+    }
+}
+
+/// Pull the major version out of `cargo-tauri --version`, which prints `tauri-cli 2.11.4`.
+fn parse_cli_major(output: &str) -> Option<u64> {
+    output
+        .split_whitespace()
+        .find_map(|word| word.split('.').next()?.parse::<u64>().ok())
+}
+
+/// This machine's target triple, which the sidecar's file name has to carry.
+///
+/// Asked of `rustc` rather than assembled from `std::env::consts`: those give `x86_64` and
+/// `linux` but not the vendor or the libc, and a musl host would get a name the bundler then
+/// fails to find.
+fn host_triple() -> Result<String> {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .context("running `rustc -vV` to learn this machine's target triple")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_host_triple(&text)
+        .ok_or_else(|| anyhow::anyhow!("`rustc -vV` printed no `host:` line:\n{text}"))
+}
+
+fn parse_host_triple(rustc_vv: &str) -> Option<String> {
+    rustc_vv
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|triple| triple.trim().to_string())
 }
 
 /// Ask flathub whether the runtime this manifest pins still exists.
@@ -656,6 +1022,7 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         bundle_targets: list(conf.pointer("/bundle/targets")),
         icons: list(conf.pointer("/bundle/icon")),
         has_updater: conf.pointer("/plugins/updater").is_some(),
+        external_bin: list(conf.pointer("/bundle/externalBin")),
     })
 }
 
@@ -671,6 +1038,7 @@ mod tests {
             bundle_targets: vec!["appimage".into(), "deb".into()],
             icons: vec!["icons/32x32.png".into()],
             has_updater: false,
+            external_bin: vec!["../../target/release/cide-hook".into()],
         }
     }
 
@@ -683,6 +1051,276 @@ mod tests {
         assert_eq!(info.identifier, "dev.cide.ide");
         assert!(info.bundle_targets.contains(&"appimage".to_string()));
         assert!(!info.product_name.is_empty());
+    }
+
+    #[test]
+    fn the_real_config_ships_the_hook() {
+        // The whole of M11's "and it actually works" rests on this one line of
+        // tauri.conf.json. Deleting it produces a bundle that runs and quietly has no hooks,
+        // so it is asserted against the checked-in file, not against a fixture.
+        let root = crate::workspace_root().expect("a workspace root");
+        let info = read_app_info(&root).expect("tauri.conf.json parses");
+        assert!(
+            info.bundles_the_hook(),
+            "bundle.externalBin must name {HOOK_BIN}: {:?}",
+            info.external_bin
+        );
+    }
+
+    #[test]
+    fn the_sidecar_path_matches_the_checked_in_config() {
+        // `externalBin` is resolved relative to the crate holding tauri.conf.json; the plan
+        // writes its copy relative to the workspace root. The two spellings of one path must
+        // meet, and they only do if the config's entry is `../../` plus ours.
+        let root = crate::workspace_root().expect("a workspace root");
+        let info = read_app_info(&root).expect("tauri.conf.json parses");
+        let entry = info
+            .external_bin
+            .iter()
+            .find(|p| p.ends_with(HOOK_BIN))
+            .expect("an externalBin entry for the hook");
+        let from_root = root
+            .join(APP_CRATE)
+            .join(entry)
+            .canonicalize()
+            .or_else(|_| {
+                // The sidecar need not exist yet — the plan builds it — so fall back to
+                // comparing the lexical path against the app crate's parent.
+                Ok::<_, std::io::Error>(root.join(APP_CRATE).join(entry))
+            })
+            .unwrap();
+        let ours = root.join(format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"));
+        assert!(
+            from_root.ends_with(format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"))
+                || from_root == ours.canonicalize().unwrap_or(ours),
+            "externalBin resolves to {}, but the plan writes {HOOK_SIDECAR_DIR}/{HOOK_BIN}",
+            from_root.display()
+        );
+    }
+
+    #[test]
+    fn a_missing_sidecar_entry_is_a_failure_not_a_warning() {
+        let mut info = info();
+        info.external_bin.clear();
+        let checks = preflight(Path::new("/nonexistent"), &info, Targets::ALL);
+        assert!(
+            checks
+                .iter()
+                .any(|c| matches!(c, Verdict::Fail(d) if d.contains(HOOK_BIN))),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_in_another_directory_still_counts() {
+        // The check is on the file name: moving the sidecar must not silently disarm it.
+        let mut info = info();
+        info.external_bin = vec!["sidecars/cide-hook".into()];
+        assert!(info.bundles_the_hook());
+        info.external_bin = vec!["sidecars/cide-hooked".into()];
+        assert!(!info.bundles_the_hook());
+    }
+
+    #[test]
+    fn the_hook_is_built_and_suffixed_before_the_bundler_runs() {
+        // Order is the point: `cargo tauri build` builds only the app crate, and it resolves
+        // externalBin by appending the triple, so both of these must already have happened.
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            Targets::ALL,
+            "x86_64-unknown-linux-gnu",
+        );
+        let build = steps
+            .iter()
+            .position(|s| s.program == "cargo" && s.args.contains(&HOOK_BIN.to_string()))
+            .expect("a step that builds the hook");
+        let copy = steps
+            .iter()
+            .position(|s| s.program == "install")
+            .expect("a step that names the sidecar copy");
+        let bundle = steps
+            .iter()
+            .position(|s| s.args.first().map(String::as_str) == Some("tauri"))
+            .expect("the bundler step");
+        assert!(build < copy && copy < bundle, "{steps:?}");
+        assert!(
+            steps[copy]
+                .args
+                .last()
+                .is_some_and(|a| a.ends_with("cide-hook-x86_64-unknown-linux-gnu")),
+            "the copy must carry the target triple: {:?}",
+            steps[copy]
+        );
+    }
+
+    #[test]
+    fn asking_for_no_tauri_target_does_not_build_the_hook() {
+        let targets = Targets {
+            appimage: false,
+            deb: false,
+            flatpak: true,
+        };
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            targets,
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(steps.iter().all(|s| s.program != "install"), "{steps:?}");
+    }
+
+    #[test]
+    fn the_appimage_runtime_is_prefetched_and_handed_to_the_bundler() {
+        // Without LDAI_RUNTIME_FILE, appimagetool fetches the runtime itself, six layers down,
+        // and a stalled download there hangs the whole build with no timeout and no output.
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            Targets::ALL,
+            "x86_64-unknown-linux-gnu",
+        );
+        let fetch = steps
+            .iter()
+            .position(|s| s.program == "curl")
+            .expect("a step that fetches the runtime");
+        let bundle = steps
+            .iter()
+            .position(|s| s.args.first().map(String::as_str) == Some("tauri"))
+            .expect("the bundler step");
+        assert!(fetch < bundle, "{steps:?}");
+        assert!(
+            steps[fetch]
+                .args
+                .last()
+                .is_some_and(|u| u.ends_with("runtime-x86_64")),
+            "{:?}",
+            steps[fetch]
+        );
+        let handed = &steps[bundle].env;
+        assert_eq!(handed.len(), 1);
+        assert_eq!(handed[0].0, LDAI_RUNTIME_FILE);
+        assert!(
+            handed[0].1.starts_with('/'),
+            "appimagetool runs with its own cwd, so this has to be absolute: {handed:?}"
+        );
+    }
+
+    #[test]
+    fn an_already_fetched_runtime_is_not_fetched_again() {
+        let dir = std::env::temp_dir().join(format!("cide-xtask-{}", std::process::id()));
+        let runtime = dir.join(appimage_runtime_path("x86_64-unknown-linux-gnu"));
+        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        fs::write(&runtime, b"not really a runtime").unwrap();
+
+        let steps = plan(&dir, &info(), Targets::ALL, "x86_64-unknown-linux-gnu");
+        assert!(steps.iter().all(|s| s.program != "curl"), "{steps:?}");
+        // …but it is still handed over, or the bundler downloads its own.
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.env.iter().any(|(k, _)| k == LDAI_RUNTIME_FILE)),
+            "{steps:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn asking_for_deb_alone_needs_no_appimage_runtime() {
+        let targets = Targets {
+            appimage: false,
+            deb: true,
+            flatpak: false,
+        };
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            targets,
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(steps.iter().all(|s| s.program != "curl"), "{steps:?}");
+        assert!(steps.iter().all(|s| s.env.is_empty()), "{steps:?}");
+    }
+
+    #[test]
+    fn the_webkit_helper_check_agrees_with_this_machine() {
+        // Not a fixture: the point of the check is to describe the machine it runs on, and a
+        // mocked filesystem would only assert that the mock was read. It has to be one or the
+        // other, and either way it must name the helpers.
+        let verdict = webkit_helper_check();
+        assert!(
+            matches!(verdict, Verdict::Ok(_) | Verdict::Warn(_)),
+            "never a hard failure: {verdict:?}"
+        );
+        let ok = WEBKIT_SEARCH_DIRS.iter().any(|d| {
+            Path::new(d)
+                .join("webkit2gtk-4.1/WebKitWebProcess")
+                .exists()
+        });
+        assert_eq!(matches!(verdict, Verdict::Ok(_)), ok, "{verdict:?}");
+        if let Verdict::Warn(detail) = &verdict {
+            assert!(detail.contains("WebKitWebProcess"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn the_helper_search_prefers_the_abi_tauri_links() {
+        // On a machine carrying both WebKitGTK ABIs, `/usr/libexec` holds
+        // `libwebkit2gtk-4_1-0` and `libwebkitgtk-6_0-0`, and directory order decides which is
+        // seen first. Naming the 6.0 one points a reader at the GTK 4 build Tauri 2 does not
+        // link. Only assertable where both exist, so it is a conditional rather than a fixture
+        // — the alternative was a temp tree, which would only prove the temp tree was read.
+        let Some(found) = find_webkit_helpers_elsewhere() else {
+            return;
+        };
+        let has_both = Path::new("/usr/libexec/libwebkit2gtk-4_1-0").exists()
+            && Path::new("/usr/libexec/libwebkitgtk-6_0-0").exists();
+        if has_both {
+            assert!(found.contains("4_1"), "picked the wrong ABI: {found}");
+        }
+    }
+
+    #[test]
+    fn the_runtime_is_named_after_the_triples_architecture() {
+        assert_eq!(runtime_arch("x86_64-unknown-linux-gnu"), "x86_64");
+        assert_eq!(runtime_arch("aarch64-unknown-linux-gnu"), "aarch64");
+    }
+
+    #[test]
+    fn a_step_with_environment_is_still_pasteable() {
+        let step = Step {
+            program: "cargo".into(),
+            args: vec!["tauri".into(), "build".into()],
+            cwd: APP_CRATE.into(),
+            env: vec![("LDAI_RUNTIME_FILE".into(), "/tmp/runtime-x86_64".into())],
+        };
+        assert_eq!(
+            step.display(),
+            "cd crates/cide-app && LDAI_RUNTIME_FILE=/tmp/runtime-x86_64 cargo tauri build"
+        );
+    }
+
+    #[test]
+    fn a_v1_cli_is_not_good_enough() {
+        // The check this replaced only asked whether cargo-tauri existed, and a `cargo-tauri
+        // 1.5.12` — what a machine that installed tauri-cli before Tauri 2 has — passed it.
+        assert_eq!(parse_cli_major("tauri-cli 1.5.12\n"), Some(1));
+        assert_eq!(parse_cli_major("tauri-cli 2.11.4\n"), Some(2));
+        assert_eq!(parse_cli_major("cargo-tauri 2.0.0-rc.3"), Some(2));
+        assert_eq!(parse_cli_major("no version here"), None);
+    }
+
+    #[test]
+    fn the_host_triple_comes_from_rustc() {
+        assert_eq!(
+            parse_host_triple("rustc 1.92.0\nbinary: rustc\nhost: x86_64-unknown-linux-gnu\n")
+                .as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(parse_host_triple("rustc 1.92.0\n"), None);
+        // Real output, so a change in rustc's formatting fails here rather than producing a
+        // sidecar named after a triple nothing looks for.
+        assert!(host_triple().expect("rustc -vV").contains('-'));
     }
 
     #[test]
@@ -737,8 +1375,16 @@ mod tests {
 
     #[test]
     fn the_tauri_bundle_list_is_one_command() {
-        let steps = plan(&info(), Targets::ALL);
-        let tauri: Vec<&Step> = steps.iter().filter(|s| s.program == "cargo").collect();
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            Targets::ALL,
+            "x86_64-unknown-linux-gnu",
+        );
+        let tauri: Vec<&Step> = steps
+            .iter()
+            .filter(|s| s.args.first().map(String::as_str) == Some("tauri"))
+            .collect();
         assert_eq!(tauri.len(), 1, "the bundler must not be invoked twice");
         assert!(tauri[0].args.contains(&"appimage,deb".to_string()));
         assert_eq!(tauri[0].cwd, APP_CRATE);
@@ -752,7 +1398,12 @@ mod tests {
             flatpak: true,
         };
         assert_eq!(targets.bundles(), None);
-        let steps = plan(&info(), targets);
+        let steps = plan(
+            Path::new("/nonexistent"),
+            &info(),
+            targets,
+            "x86_64-unknown-linux-gnu",
+        );
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].program, "flatpak-builder");
     }
@@ -828,6 +1479,7 @@ mod tests {
             program: "cargo".into(),
             args: vec!["tauri".into(), "build".into()],
             cwd: APP_CRATE.into(),
+            env: Vec::new(),
         };
         assert_eq!(step.display(), "cd crates/cide-app && cargo tauri build");
     }

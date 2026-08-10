@@ -24,11 +24,53 @@ Three artefacts, with clearly different standing.
 The build users are pointed at, and the only one that can self-update. Produced by
 `cargo tauri build --bundles appimage`.
 
+It needs **`cargo-tauri` 2.x**. The version already installed on the reference machine was
+`1.5.12` — what `cargo install tauri-cli` gave people for years — and it reads this v2
+`tauri.conf.json` against the v1 schema and dies a long way from anything that says "wrong
+version". The preflight's old check only asked whether `cargo-tauri` existed, so it printed
+`ok` for that build; it now runs `cargo-tauri --version` and fails on a major other than 2.
+
 `plugins.updater` is **not yet configured** in `crates/cide-app/tauri.conf.json`: it needs a
 signing key pair and a release endpoint, neither of which exists at M11. `cargo xtask package`
 reports this as a warning rather than a failure — an AppImage without an update endpoint is
 still a working AppImage — but the warning is the reminder that the reason this format was
 chosen is not yet switched on.
+
+### `cide-hook` rides along as a sidecar, because the bundler would otherwise leave it out
+
+`cargo tauri build` bundles the `[[bin]]` targets of the crate that holds `tauri.conf.json`
+and nothing else — `tauri-cli`'s `get_binaries` reads that one `Cargo.toml` plus its
+`src/bin/`. `cide-hook` is a separate workspace crate and has to stay one: it may not link
+tauri, and `crates/cide-app/Cargo.toml` says in as many words that `cide-app` is the only
+crate that may.
+
+Left alone, then, the bundler produces an AppImage containing only `cide`. That package
+installs, launches, looks entirely correct, and every Claude session inside it runs with no
+hooks: no token figures, no fast buffer reload, and a close confirm that cannot tell busy from
+idle. `cmd::session::hook_settings` returns `None`, logs one `warn`, and the session proceeds.
+Nothing fails.
+
+So `bundle.externalBin` in `tauri.conf.json` names `../../target/release/cide-hook`. The
+bundler resolves an `externalBin` entry by appending the target triple, and
+`Settings::copy_binaries` strips the triple back off when it copies the file into the package's
+`usr/bin/` — beside `cide`, which is exactly where `hook_settings` looks
+(`current_exe().parent().join("cide-hook")`). Inside a mounted AppImage `current_exe()` is
+`$APPDIR/usr/bin/cide`, so the two agree.
+
+Producing the triple-suffixed copy is two steps in `cargo xtask package`'s plan, ahead of the
+bundler:
+
+```sh
+cargo build --release --locked -p cide-hook
+install -m755 target/release/cide-hook target/release/cide-hook-x86_64-unknown-linux-gnu
+```
+
+The rejected alternative was `bundle.linux.appimage.files`, which takes a plain dest→src map
+and needs no triple dance. It is AppImage-only: the `.deb` would have gone on shipping without
+the hook, and the failure is invisible, so a mechanism that covers only one of the two formats
+is the wrong one. Three tests guard this — that the checked-in config still names the hook,
+that a config without it is a preflight *failure* rather than a warning, and that the plan
+builds and suffixes the binary before the bundler runs.
 
 ### .deb — a convenience
 
@@ -102,13 +144,19 @@ effect of a command somebody typed to see what it would do is hostile.
 `--run` for the Tauri targets executes:
 
 ```sh
+cargo build --release --locked -p cide-hook
+install -m755 target/release/cide-hook target/release/cide-hook-<host triple>
 cd crates/cide-app && cargo tauri build --bundles appimage,deb
 ```
 
-from the app crate, because `cargo tauri build` finds `tauri.conf.json` by walking up from the
-working directory and this workspace has no `src-tauri`. That config's `beforeBuildCommand`
-already runs `pnpm build` in `ui/`, so the frontend is not a separate step; adding one would
-build it twice. Artefacts land in `target/release/bundle/`.
+The last from the app crate, because `cargo tauri build` finds `tauri.conf.json` by walking up
+from the working directory and this workspace has no `src-tauri`. That config's
+`beforeBuildCommand` already runs `pnpm build` in `ui/`, so the frontend is not a separate
+step; adding one would build it twice. The host triple comes from `rustc -vV` rather than
+`std::env::consts`, which knows the arch and the OS but not the vendor or the libc. Artefacts
+land in `target/release/bundle/`, and the task prints their sizes — a bundle that came out at
+12 MiB has not picked up WebKit's helper processes, and the number is the cheapest way to
+notice.
 
 `--run` for Flatpak executes:
 
@@ -120,13 +168,64 @@ flatpak-builder --force-clean --install --user target/flatpak/dev.cide.ide \
 Installed into the user's own installation rather than published to a repository: publishing
 needs signing keys the task must not go looking for.
 
+### appimagetool fetches a runtime, and when that stalls the build hangs forever
+
+The innermost layer of `cargo tauri build --bundles appimage` is `appimagetool`, four
+processes down (`cargo tauri` → `linuxdeploy` → `linuxdeploy-plugin-appimage` →
+`appimagetool`). Given no runtime file it downloads one from
+`github.com/AppImage/type2-runtime`. On the reference machine that download stalled: the
+socket sat in `CLOSE-WAIT`, the process in `futex_do_wait`, and it stayed there. There is no
+timeout anywhere in that stack and `cargo tauri build` holds the pipes, so the run printed
+`Bundling cide_0.1.0_amd64.AppImage` and then nothing, indefinitely — a last line that reads
+like success.
+
+So the plan fetches the runtime itself, with `curl --retry 3 --max-time 180`, into
+`target/appimage-runtime/`, and hands it down as `LDAI_RUNTIME_FILE` — the environment variable
+`linuxdeploy-plugin-appimage` turns into `appimagetool --runtime-file`. `curl` fails rather
+than hangs, the fetch is skipped when the file is already there, and a second build needs no
+network for this. With it set, the same build that had hung completed in about two minutes.
+
+## What was actually built
+
+`cargo xtask package --appimage --run` on the reference machine (openSUSE, WebKitGTK 2.52.3,
+`cargo-tauri` 2.11.4) produces:
+
+```
+target/release/bundle/appimage/cide_0.1.0_amd64.AppImage    87,615,992 bytes (83.6 MiB)
+```
+
+Its squashfs payload carries `usr/bin/cide` and `usr/bin/cide-hook` side by side, which is what
+`hook_settings` needs, plus 160 bundled shared libraries — GTK 3, WebKitGTK 4.1, JavaScriptCore,
+libsoup 3, GStreamer, and the pixbuf and immodule loaders. Verified with
+`unsquashfs -o 944632 -l`, not by running it.
+
+`cide` links fifteen libraries. Twelve are inside the bundle: `libgtk-3.so.0`,
+`libgdk-3.so.0`, `libgdk_pixbuf-2.0.so.0`, `libcairo.so.2`, `libglib-2.0.so.0`,
+`libgobject-2.0.so.0`, `libgio-2.0.so.0`, `libdbus-1.so.3`, `libsoup-3.0.so.0`,
+`libwebkit2gtk-4.1.so.0`, `libjavascriptcoregtk-4.1.so.0`. Four come from the host:
+`libc.so.6`, `libm.so.6`, `libgcc_s.so.1`, `libz.so.1`. `cide-hook` needs only `libc` and
+`libgcc_s`. libgit2 and OpenSSL appear in neither list because they are vendored.
+
 ## Consequences
 
 - `cargo xtask package --check` belongs in CI next to `codegen --check` and `contract-check`.
-- The acceptance test for this milestone — *a fresh AppImage on a clean VM with only WebKitGTK
-  installed launches and runs Claude* — has **not** been performed. It needs a VM this
-  environment does not have. The preflight verifies everything that can be verified without
-  building; it cannot substitute for that run.
+- **The milestone's acceptance test — *a fresh AppImage on a clean VM with only WebKitGTK
+  installed launches and runs Claude* — has still not been performed,** and there is now a
+  specific reason to expect it to fail rather than merely an absence of evidence. The bundle
+  contains `libwebkit2gtk-4.1.so.0` but **not** `WebKitWebProcess` or `WebKitNetworkProcess`,
+  the two out-of-process helpers a web view cannot render without. `tauri-bundler` tries to
+  bring them along, but it looks only under `<libdir>/webkit2gtk-4.1/` — its own source
+  carries the comment `// TODO: Check if it's the same dir name on all systems` — and on
+  openSUSE they are in `/usr/libexec/libwebkit2gtk-4_1-0/`. It found neither, copied nothing,
+  and said nothing: the loop is `if source.exists()` with no else. Nothing sets
+  `WEBKIT_EXEC_PATH` either (the generated `AppRun` sources one hook, the GTK plugin's), so the
+  bundled library falls back to its compiled-in absolute path. That path exists on a host laid
+  out like the build machine and does not on Debian or Ubuntu, where the helpers live in
+  `/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/`. The expected symptom is a window that never
+  paints. `cargo xtask package --appimage` now warns about exactly this and names where the
+  helpers actually are. Fixing it needs either a build host whose layout matches the search
+  list, or an `AppRun` that exports `WEBKIT_EXEC_PATH` — which `bundle.linux.appimage.files`
+  cannot deliver, because only the `usr/` subtree of those files reaches the AppDir.
 - Anyone enabling the updater needs to add `plugins.updater` with a public key and endpoints,
   and sign releases with `tauri signer`. Until then the warning in the preflight is accurate
   and should stay.
