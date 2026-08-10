@@ -4,11 +4,12 @@
  * Driven by `ui/scripts/check-git-render.mjs`, which asserts on the digest. This is not
  * part of the app: nothing imports it, so it is tree-shaken out of the real bundle.
  *
- * Why it exists: this panel is not mounted by `App.tsx` yet — the sidebar that hosts it is
- * another agent's surface in this milestone — so `pnpm build` succeeding says nothing about
- * whether the panel renders. Rendering it under node with `react-dom/server` is the
- * cheapest honest answer to "does it actually paint", and it covers the multi-repo and
- * guard-bar states that a screenshot of a clean checkout never would.
+ * Why it exists: `pnpm build` succeeding says only that the panel compiles, and the panel was
+ * for a while a thing that compiled, mounted, and drew nothing at all. Rendering it under node
+ * with `react-dom/server` is the cheapest honest answer to "does it actually paint", and it
+ * covers the multi-repo, submodule and guard-bar states that a screenshot of a clean checkout
+ * never would. The stories it renders are real `ChangesTree` payloads through the real
+ * `normalizeStatus`, so a shape mismatch shows up here as zero rows.
  */
 import { renderToStaticMarkup } from 'react-dom/server'
 import { GitPanel } from './GitPanel'

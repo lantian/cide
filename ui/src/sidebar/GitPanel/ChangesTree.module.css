@@ -81,13 +81,9 @@
   color: var(--text-hi);
 }
 
-/* A submodule is a repository inside a changelist; the colour says so before the indent
-   does, which matters because it sits at the same depth as a plain file. */
-.groupName[data-kind='submodule'] {
-  color: var(--purple);
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
+/* There is no `submodule` rule any more, and its absence is the point: a submodule is a
+   repository with its own index and its own changelists, so it is drawn as a nested repo row
+   rather than as a coloured group inside its parent's `Changes`. See `types.ts::RepoView`. */
 
 /* Counters are mono, per the type rules. Right-aligned, as the mock has them. */
 .count {
@@ -108,9 +104,12 @@
 
 /*
  * The explorer's palette, so a file is the same colour in both trees: M blue, A green,
- * D faint and struck through. Renamed is purple because it is a move rather than an edit,
- * and unversioned is yellow — a warning, not an error, since nothing is wrong with a file
- * git has not been told about yet.
+ * D faint and struck through. Renamed is purple because it is a move rather than an edit.
+ *
+ * The selectors are `FileState` values — git's own vocabulary, straight off the wire via
+ * `entryStatus` — rather than a second set of names the frontend invented. A rule whose
+ * selector is a wire value fails visibly (an untinted row) when the enum changes, where a
+ * translated name fails silently in a mapping table nobody reads.
  */
 .fileName[data-status='modified'] {
   color: var(--blue);
@@ -122,10 +121,18 @@
   color: var(--faint);
   text-decoration: line-through;
 }
-.fileName[data-status='renamed'] {
+/* `copied` and `typeChange` share the move colours: both are `FileState`s libgit2 really
+   reports, and an untinted row would read as unchanged. */
+.fileName[data-status='renamed'],
+.fileName[data-status='copied'] {
   color: var(--purple);
 }
-.fileName[data-status='unversioned'] {
+.fileName[data-status='typeChange'] {
+  color: var(--blue);
+}
+/* `untracked` is git's word for what IDEA calls unversioned. Yellow — a warning, not an
+   error, since nothing is wrong with a file git has not been told about yet. */
+.fileName[data-status='untracked'] {
   color: var(--yellow);
 }
 .fileName[data-status='ignored'] {

@@ -1,8 +1,11 @@
 /**
  * The footer: `Amend`, the selection summary, the 104px message box, and the two buttons.
  *
- * Ticking `Amend` prefills HEAD's message when the box is empty — that decision lives in
- * `useGitPanel`, because it needs the repo, and this component stays a render target.
+ * Ticking `Amend` does **not** prefill the message box. It used to say here that it did, from
+ * a `headMessage` field the panel had invented; `cide_ipc::git::RepoChanges` carries no such
+ * thing, and reading it per repo on every refresh would be a round trip for a string only ever
+ * used when one checkbox is ticked. `git commit --amend` keeps HEAD's message when none is
+ * given, so an empty box amends without rewriting the subject. See `useGitPanel::setAmend`.
  *
  * The summary (`2 modified`) is `--accent` in the mock. It is the one place that says what
  * the buttons are about to do, so it is also the element the buttons' accessible

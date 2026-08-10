@@ -46,12 +46,14 @@ export function Toolbar(props: ToolbarProps) {
     { glyph: '↻', label: 'Refresh changes', onClick: props.onRefresh },
     {
       /*
-       * IDEA's ↺ is Rollback — discard the change entirely. This unstages instead, which
-       * is what `git_stage_paths(staged: false)` does and all the agreed command surface
-       * can honestly offer. Rollback destroys uncommitted work, so wiring this glyph to
-       * something that merely resembles it would be the worst possible place to be
-       * approximate; the label says what actually happens. `git_rollback` is in the plan's
-       * §7 command list and this button takes it when it lands.
+       * IDEA's ↺ is Rollback — discard the change entirely. This calls `git_unstage`
+       * instead, and the label says so.
+       *
+       * `git_rollback` does exist, and this button deliberately does not call it: rollback
+       * destroys uncommitted work and the handler will not ask first ("a confirmation the
+       * backend cannot show is not a safeguard" — `cmd/git.rs`). Wiring a one-click toolbar
+       * glyph to it before this panel has a confirmation dialog would make the most
+       * destructive command in the surface the easiest one to hit by accident.
        */
       glyph: '↺',
       label: 'Unstage selected changes',

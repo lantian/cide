@@ -3,89 +3,111 @@
  *
  * # The guard
  *
- * Every call goes through `guarded`. None of the eight `git_*` handlers exists yet, so on
- * this branch *all* of them reject with Tauri's "command not found" — and the panel still
- * has to paint, because it is the thing under review. The rule that follows is worth
- * keeping after the backend lands: a git command can fail for reasons that are nobody's
- * bug (a repo mid-rebase, an index lock held by a `git` in a bash pane, a submodule nobody
- * initialised), and none of those may take the window down. React 19 unmounts the whole
- * tree on an unhandled throw out of a render or an effect, so a bare `await` in here is a
- * blank window rather than a broken panel.
+ * Every call goes through `guarded`. A git command can fail for reasons that are nobody's bug
+ * (a repo mid-rebase, an index lock held by a `git` in a bash pane, a submodule nobody
+ * initialised), and none of those may take the window down. React 19 unmounts the whole tree
+ * on an unhandled throw out of a render or an effect, so a bare `await` in here is a blank
+ * window rather than a broken panel.
  *
- * Failures land in `unavailable` as one dim line under the toolbar, plus a full line on
- * the app's stderr. They are never thrown, never retried in a loop, never silent.
+ * Failures land in `unavailable` as one dim line under the toolbar, plus a full line on the
+ * app's stderr. They are never thrown, never retried in a loop, never silent.
+ *
+ * # Repo ids
+ *
+ * Every command here takes a `RepoId`, which is a uuid derived from the canonical work tree —
+ * **not** a path. `cmd/git.rs::repo_root` resolves it through `cide_git::repo::find`, so a
+ * path passed where an id belongs is a `NoSuchRepo` on every button in the panel. The ids come
+ * out of `RepoChanges.repo.id` and travel through row ids and `CommitUnit`s untouched.
+ *
+ * # The external-staging guard
+ *
+ * `CommitRequest.force` waives the index check in `cide_git::commit`. It defaults to `false`
+ * here and is only ever `true` for a repo where the user pressed **Overwrite** on the guard
+ * bar. That default is the whole point: bash panes inside cide are exactly where someone runs
+ * `git add`, and a panel that always waived the check would silently clobber it.
  *
  * # Freshness
  *
  * M10's acceptance test is "Claude edits a file → the panel updates within 200 ms with no
  * manual refresh". `cide://session-tool` names the touched paths and arrives ahead of any
- * filesystem watcher, so it is the trigger, and the debounce below is well inside that
- * budget. It is not sufficient on its own — a `sed -i` in a bash pane goes through no tool
- * — so when the Rust side emits a watcher event it belongs on this same coalescer, not on
- * a polling timer somewhere else.
+ * filesystem watcher, so it is one trigger; `cide://git-status` is the other, and carries the
+ * new tree rather than asking for it. Both land on the same coalescer.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   diag,
   events,
   git as gitApi,
+  type FileDiff,
   type PathSelection,
   type ProjectId,
+  type RepoId,
 } from '@/ipc/client'
 import {
-
   allFiles,
   allGroups,
+  allRepos,
+  arrivals,
   buildRows,
   commitUnits,
   defaultExpanded,
   defaultSelection,
+  flatFiles,
   inRepo,
+  isIgnoredGroupRow,
   normalizeStatus,
   pruneSelection,
+  repoOf,
   selectedFiles,
   toggleRow,
+  viewOf,
   type Row,
 } from './model'
 import { storyFromQuery, type GitStory } from './fixture'
-import type { ChangeFile, ChangesTree, ShelfEntry } from './types'
+import type { ChangeEntry, ShelfRow, StatusView } from './types'
 
 /**
  * Whole-file selections for a list of paths.
  *
  * The panel ticks files; `cide-git` accepts a `PathSelection` per path so the same commands
  * serve per-hunk and per-line staging. `whole` is what a ticked checkbox means, and `rev:
- * null` means "against the current index" rather than a specific revision. Written as one
- * adapter rather than inline at four call sites so that wiring the hunk gutter later changes
- * one function.
+ * null` skips the staleness check, which is only correct for `Whole` — see `PathSelection`.
+ * Written as one adapter rather than inline at four call sites so that wiring the hunk gutter
+ * later changes one function.
  */
 function wholeFiles(paths: string[]): PathSelection[] {
   return paths.map((path) => ({ path, selection: { kind: 'whole' }, rev: null }))
 }
 
-const EMPTY: ChangesTree = { repos: [] }
+const EMPTY: StatusView = { repos: [] }
 
 /** Coalescing window for refresh bursts. One edit reports several paths. */
 const REFRESH_DEBOUNCE_MS = 60
 
 export interface GitPanelModel {
-  tree: ChangesTree
+  view: StatusView
   rows: Row[]
-  shelf: readonly ShelfEntry[]
+  shelf: readonly ShelfRow[]
   selected: ReadonlySet<string>
   expanded: ReadonlySet<string>
-  /** The `ChangeFile`s behind the ticks, in row order — what the footer counts. */
-  picked: ChangeFile[]
+  /** The `ChangeEntry`s behind the ticks, in row order — what the footer counts. */
+  picked: ChangeEntry[]
   loading: boolean
   /** Set when a git call failed. One dim line, not a dialog. */
   unavailable: string | null
   /** A command is in flight; the commit buttons are disabled while it is. */
   busy: string | null
   /** Repos whose index moved under us and whose bar has not been answered yet. */
-  diverged: string[]
+  diverged: RepoId[]
   message: string
   amend: boolean
-  /** IDEA's "use Git staging area instead" mode — the toolbar's ◉ toggle. */
+  /**
+   * IDEA's "use Git staging area instead" mode — the toolbar's ◉ toggle.
+   *
+   * Read out of the payload, not held locally: it is a per-repo setting written to the
+   * changelists sidecar by `git_set_use_staging_area`, so a local mirror would disagree with
+   * the backend the moment another window flipped it.
+   */
   stagingArea: boolean
   /** True when the panel is showing a fixture rather than a repository. */
   story: boolean
@@ -93,6 +115,8 @@ export interface GitPanelModel {
 
 export interface GitPanelActions {
   refresh: () => void
+  /** Re-read every repo's shelf. Called when the Shelf tab opens, and after it changes. */
+  refreshShelf: () => void
   toggleCheck: (row: Row) => void
   toggleExpand: (row: Row) => void
   setAllExpanded: (open: boolean) => void
@@ -103,21 +127,46 @@ export interface GitPanelActions {
   /** Take the ticked paths out of the index. NOT a rollback — see `Toolbar`. */
   unstage: () => void
   shelve: () => void
-  /** Guard bar, left button: drop our ticks and take git's view of this repo. */
-  reloadIndex: (repo: string) => void
-  /** Guard bar, right button: keep our ticks and let the commit rewrite the index. */
-  overwriteIndex: (repo: string) => void
+  unshelve: (row: ShelfRow) => void
+  /** Guard bar, left button: adopt git's index and drop our ticks for that repo. */
+  reloadIndex: (repo: RepoId) => void
+  /** Guard bar, right button: keep our ticks and let the next commit rewrite the index. */
+  overwriteIndex: (repo: RepoId) => void
+  /** A file row was double-clicked, or Enter was pressed on it. */
   openDiff: (row: Row) => void
+  /**
+   * The toolbar's ◫ — the diff of the first ticked file.
+   *
+   * Reads the tree rather than the rendered rows, because a collapsed group has ticked files
+   * and no rows at all: the button is enabled off `picked`, so searching the rows left it
+   * enabled and inert whenever the user had collapsed the changelist.
+   */
+  showSelectedDiff: () => void
 }
 
-export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanelActions {
+export interface GitPanelOptions {
+  /**
+   * Where a double-clicked file's diff goes.
+   *
+   * The panel fetches the `FileDiff` and hands it over; it does not own a pane and cannot open
+   * one. Absent, the diff is fetched and reported as unavailable rather than silently dropped
+   * — which is what the panel did before, and it made ◫ and double-click look broken.
+   */
+  onOpenDiff?: ((diff: FileDiff, repo: RepoId) => void) | undefined
+}
+
+export function useGitPanel(
+  project: ProjectId | null,
+  options: GitPanelOptions = {},
+): GitPanelModel & GitPanelActions {
+  const { onOpenDiff } = options
   // Read once. A story is a property of how the window was opened; re-reading the URL each
   // render would let a navigation swap the panel's data source mid-session.
   const [story] = useState<GitStory | null>(() => storyFromQuery())
-  const initial = story?.status ?? EMPTY
+  const initial = useMemo(() => (story ? normalizeStatus(story.status) : EMPTY), [story])
 
-  const [tree, setTree] = useState<ChangesTree>(initial)
-  const [shelf] = useState<readonly ShelfEntry[]>(story?.shelf ?? [])
+  const [view, setView] = useState<StatusView>(initial)
+  const [shelf, setShelf] = useState<readonly ShelfRow[]>(() => story?.shelf ?? [])
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => defaultSelection(initial))
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => defaultExpanded(initial))
   const [loading, setLoading] = useState(false)
@@ -125,17 +174,56 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
   const [busy, setBusy] = useState<string | null>(null)
   const [message, setMessage] = useState('')
   const [amend, setAmendFlag] = useState(false)
-  const [stagingArea, setStagingArea] = useState(false)
   /** Repos where the user answered the guard bar. Cleared when the divergence clears. */
-  const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set())
-  /** Repos where the answer was "overwrite": commit without an index expectation. */
-  const overwritten = useRef<Set<string>>(new Set())
+  const [answered, setAnswered] = useState<ReadonlySet<RepoId>>(new Set())
+  /** Repos where the answer was "overwrite": the next commit is sent with `force: true`. */
+  const overwritten = useRef<Set<RepoId>>(new Set())
   /** What the previous payload contained, so genuinely new rows can be treated as new. */
   const seenFiles = useRef<Set<string>>(new Set(allFiles(initial)))
   const seenGroups = useRef<Set<string>>(allGroups(initial))
 
-  const rows = useMemo(() => buildRows(tree, expanded), [tree, expanded])
-  const picked = useMemo(() => selectedFiles(tree, selected), [tree, selected])
+  const rows = useMemo(() => buildRows(view, expanded), [view, expanded])
+  const picked = useMemo(() => selectedFiles(view, selected), [view, selected])
+
+  /**
+   * The current view, for callbacks that must not be rebuilt when it changes.
+   *
+   * `loadShelf` iterates the repositories and is called from an effect keyed on the Shelf tab.
+   * If it closed over `view` it would get a new identity on every payload, the effect would
+   * re-run, `setShelf` would render again, and the panel would spin: a render loop for as long
+   * as the Shelf tab is open. Reading through a ref keeps the callback stable.
+   */
+  const viewRef = useRef(view)
+  viewRef.current = view
+
+  /**
+   * Staging-area mode, as every repository in the workspace reports it.
+   *
+   * `every`, not `some`: the toggle is drawn pressed only when it is true everywhere, because
+   * a half-pressed button over a workspace where one root is in staging-area mode and another
+   * is not would claim something that is false for half the tree.
+   */
+  const stagingArea = useMemo(() => {
+    const repos = allRepos(view)
+    return repos.length > 0 && repos.every((r) => r.useStagingArea)
+  }, [view])
+
+  /**
+   * Whether the next `git_status` should walk ignored files.
+   *
+   * Only once the user has actually opened an Ignored group. `include_ignored` is the
+   * expensive half of a status walk on a checkout with a big `target/`, and asking for it
+   * always would make every refresh — several a second while an agent edits — pay for rows
+   * nobody is looking at.
+   */
+  const includeIgnored = useMemo(
+    () => [...expanded].some((id) => isIgnoredGroupRow(id)),
+    [expanded],
+  )
+  // Read inside `refresh` through a ref so that opening the Ignored group does not rebuild
+  // `refresh`, whose identity drives the mount effect and the event subscription.
+  const includeIgnoredRef = useRef(includeIgnored)
+  includeIgnoredRef.current = includeIgnored
 
   /**
    * Which operation the line under the toolbar is currently about.
@@ -186,42 +274,48 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
    * changelist, which is what makes "Claude edited a file, commit it" one click; groups
    * that are genuinely new open unless they are the ignored group.
    */
-  const adopt = useCallback((next: ChangesTree) => {
+  const adopt = useCallback((next: StatusView) => {
     const live = allFiles(next)
-    const defaults = defaultSelection(next)
+    // What is genuinely new is decided *here*, before the two `seen` refs are replaced, and
+    // never inside a state updater. React runs an updater eagerly only while the fiber has no
+    // other update pending, and `refresh` always leaves one (`setLoading(false)` runs one line
+    // earlier), so an updater that read `seenFiles.current` ran during the following render —
+    // after the assignments below — and found every id already seen. Nothing was ever ticked
+    // and no group was ever opened: the panel painted its rows and then sat there with every
+    // changelist shut and Commit disabled. See `model.ts::arrivals`.
+    const fresh = arrivals(next, seenFiles.current, seenGroups.current)
+    seenFiles.current = new Set(live)
+    seenGroups.current = allGroups(next)
     setSelected((prev) => {
       const kept = pruneSelection(live, prev)
-      for (const id of live) {
-        if (!seenFiles.current.has(id) && defaults.has(id)) kept.add(id)
-      }
+      for (const id of fresh.files) kept.add(id)
       return kept
     })
     setExpanded((prev) => {
+      // Identity is the bailout: this runs on every payload while an agent edits, and a new
+      // Set each time would re-render the whole tree for a refresh that changed nothing.
+      if (fresh.groups.length === 0) return prev
       const merged = new Set(prev)
-      for (const id of defaultExpanded(next)) {
-        if (!seenGroups.current.has(id)) merged.add(id)
-      }
+      for (const id of fresh.groups) merged.add(id)
       return merged
     })
-    seenFiles.current = new Set(live)
-    seenGroups.current = allGroups(next)
-    setTree(next)
+    setView(next)
     // A repo that stopped diverging drops its answer, so the next real divergence raises
     // the bar again instead of being suppressed by an answer to an older one.
     const stillDiverged = new Set(
-      next.repos.flatMap((r) => (r.indexDiverged === true ? [r.root] : [])),
+      allRepos(next).flatMap((r) => (r.indexChangedExternally ? [r.id] : [])),
     )
     // …and it drops its *waiver* with it. `overwritten` used to be cleared only by a
     // successful commit, so "Overwrite" answered at 10:00 and never committed was still
     // armed at 14:00 — by which time the bar had come and gone. The next real `git add` in
     // a bash pane would then raise a fresh bar the user had not answered, and a commit sent
-    // `expectIndex: null` anyway and clobbered it. That is the exact silent clobber this
-    // guard exists to prevent, so the waiver dies with the divergence it answered.
-    for (const root of overwritten.current) {
-      if (!stillDiverged.has(root)) overwritten.current.delete(root)
+    // `force: true` anyway and clobbered it. That is the exact silent clobber this guard
+    // exists to prevent, so the waiver dies with the divergence it answered.
+    for (const id of overwritten.current) {
+      if (!stillDiverged.has(id)) overwritten.current.delete(id)
     }
     setAnswered((prev) => {
-      const still = new Set([...prev].filter((root) => stillDiverged.has(root)))
+      const still = new Set([...prev].filter((id) => stillDiverged.has(id)))
       return still.size === prev.size ? prev : still
     })
   }, [])
@@ -233,15 +327,17 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
       return
     }
     setLoading(true)
-    const raw = await guarded('git status', () => gitApi.status(project))
+    const raw = await guarded('git status', () =>
+      gitApi.status(project, includeIgnoredRef.current),
+    )
     setLoading(false)
     // `undefined` is the guard's failure signal; `{ repos: [] }` is a legitimate answer.
     // Keeping the previous tree after a failure would show changes that may no longer
     // exist, so a failure empties the panel.
-    adopt(raw === undefined ? EMPTY : normalizeStatus(raw))
+    adopt(raw === undefined ? EMPTY : viewOf(raw))
   }, [project, story, guarded, adopt])
 
-  // One timer, shared by the mount refresh and by every tool event.
+  // One timer, shared by the mount refresh and by every event that invalidates the tree.
   const pending = useRef<number | null>(null)
   const schedule = useCallback(() => {
     if (pending.current !== null) window.clearTimeout(pending.current)
@@ -258,6 +354,15 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     }
   }, [refresh])
 
+  // Opening the Ignored group changes the *question*, not just its timing, so it re-asks
+  // immediately rather than waiting for the next edit to trigger a refresh.
+  const askedIgnored = useRef(includeIgnored)
+  useEffect(() => {
+    if (askedIgnored.current === includeIgnored) return
+    askedIgnored.current = includeIgnored
+    if (includeIgnored) schedule()
+  }, [includeIgnored, schedule])
+
   useEffect(() => {
     if (story) return
     // `gone` rather than just holding the unlisten in a variable: `listen` resolves a tick
@@ -265,19 +370,35 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     // back to Files) would never see the handle and would leave a listener firing
     // `git_status` on every tool event for the rest of the session, one more per remount.
     let gone = false
-    let unlisten: (() => void) | null = null
-    void events
-      .onSessionTool(() => schedule())
-      .then((fn) => {
-        if (gone) fn()
-        else unlisten = fn
-      })
-      .catch((e) => diag.log(`git panel: tool events unavailable: ${String(e)}`))
+    const unlisten: Array<() => void> = []
+    const track = (p: Promise<() => void>, what: string) => {
+      void p
+        .then((fn) => {
+          if (gone) fn()
+          else unlisten.push(fn)
+        })
+        .catch((e) => diag.log(`git panel: ${what} events unavailable: ${String(e)}`))
+    }
+    track(events.onSessionTool(() => schedule()), 'tool')
+    // A mutation cide made anywhere — including in another window — arrives with the new
+    // tree already computed, so this costs no round trip.
+    //
+    // `cmd/git.rs::refreshed` always broadcasts with `include_ignored: false`, so an open
+    // Ignored group empties for as long as it takes the mutation's own trailing `refresh()`
+    // to answer. Adopting the broadcast anyway is still right: it is the only signal another
+    // window's commit produces, and briefly missing the ignored rows is a smaller lie than
+    // showing files that were just committed away.
+    track(
+      events.onGitStatus((forProject, tree) => {
+        if (project !== null && forProject === project) adopt(viewOf(tree))
+      }),
+      'git-status',
+    )
     return () => {
       gone = true
-      unlisten?.()
+      for (const fn of unlisten) fn()
     }
-  }, [schedule, story])
+  }, [schedule, story, project, adopt])
 
   const toggleCheck = useCallback((row: Row) => setSelected((prev) => toggleRow(row, prev)), [])
 
@@ -291,34 +412,31 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
   }, [])
 
   const setAllExpanded = useCallback(
-    (open: boolean) => setExpanded(open ? allGroups(tree) : new Set<string>()),
-    [tree],
+    (open: boolean) => setExpanded(open ? allGroups(view) : new Set<string>()),
+    [view],
   )
 
   /**
-   * Ticking `Amend` with an empty box prefills HEAD's message.
+   * Ticking `Amend` does not prefill the message.
    *
-   * Only when empty: replacing something already typed is a way to lose a message that
-   * cannot be got back.
+   * It used to, from a `headMessage` field the panel invented; `RepoChanges` carries no such
+   * thing and inventing one here would mean a second round trip per repo on every refresh for
+   * a string that is only read when a checkbox is ticked. The box is left alone rather than
+   * filled with a guess — `git commit --amend` keeps the old message when none is given, so
+   * an empty box amends without rewriting the subject.
    */
-  const setAmend = useCallback(
-    (on: boolean) => {
-      setAmendFlag(on)
-      if (!on) return
-      const head = tree.repos.find((r) => r.headMessage !== undefined)?.headMessage
-      if (head !== undefined) setMessage((m) => (m.trim() === '' ? head : m))
-    },
-    [tree],
-  )
+  const setAmend = useCallback((on: boolean) => setAmendFlag(on), [])
 
   /** The ticks, split by repo, with the changelist named when they all came from one. */
-  const units = useMemo(() => commitUnits(tree, selected), [tree, selected])
+  const units = useMemo(() => commitUnits(view, selected), [view, selected])
 
   /** Repos whose index moved under us and whose bar has not been answered yet. */
   const diverged = useMemo(
     () =>
-      tree.repos.flatMap((r) => (r.indexDiverged === true && !answered.has(r.root) ? [r.root] : [])),
-    [tree, answered],
+      allRepos(view).flatMap((r) =>
+        r.indexChangedExternally && !answered.has(r.id) ? [r.id] : [],
+      ),
+    [view, answered],
   )
 
   const commit = useCallback(
@@ -328,18 +446,15 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
         setBusy(push ? 'Committing and pushing…' : 'Committing…')
         let allOk = true
         for (const unit of units) {
-          const repo = tree.repos.find((r) => r.root === unit.repo)
           /*
            * An unanswered guard bar stops the commit here rather than at the backend.
            *
-           * `expectIndex: null` means "waive the check and overwrite", and it is *also*
-           * what an absent `indexToken` produces — so a backend that forgets to populate
-           * the token would turn the guard off for every commit rather than for the one
-           * the user waived. Refusing locally makes the outcome the same whether or not
-           * the token is there: while the bar is up and unanswered, no commit is sent.
+           * `cide_git::commit` refuses on its own when the index moved, so this is belt and
+           * braces — but it is the half that can say *which* repo and what to do about it,
+           * and it costs no round trip.
            */
           if (diverged.includes(unit.repo)) {
-            const label = repo?.label ?? unit.repo
+            const label = repoOf(view, unit.repo)?.name ?? unit.repo
             note(
               'git commit',
               `git commit refused — ${label}'s index changed outside cide; `
@@ -348,21 +463,20 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
             allOk = false
             break
           }
-          // `null` waives the index check. Only reached when the user chose "Overwrite" on
-          // the bar, or when this repo never diverged in the first place.
-          const expect = overwritten.current.has(unit.repo) ? null : (repo?.indexToken ?? null)
-          const oid = await guarded('git commit', () =>
+          const outcome = await guarded('git commit', () =>
             gitApi.commit(project, unit.repo, {
               message,
               amend,
               changelist: unit.changelist,
               selections: wholeFiles(unit.paths),
-              // `expect === null` is the waiver: the user chose Overwrite, or this repo
-              // never diverged. `force` is how cide-git spells the same thing.
-              force: expect === null,
+              // `false` unless the user pressed Overwrite on this repo's bar. This is the
+              // waiver for `cide_git::commit`'s `require_index_unchanged`, and defaulting it
+              // to `true` — which is what the panel used to do — turns the guard off for
+              // every commit rather than for the one the user asked to waive.
+              force: overwritten.current.has(unit.repo),
             }),
           )
-          if (oid === undefined) {
+          if (outcome === undefined) {
             allOk = false
             break
           }
@@ -385,7 +499,7 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
         await refresh()
       })()
     },
-    [project, units, tree, diverged, message, amend, guarded, note, refresh],
+    [project, units, view, diverged, message, amend, guarded, note, refresh],
   )
 
   const unstage = useCallback(() => {
@@ -393,12 +507,37 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     void (async () => {
       setBusy('Unstaging…')
       for (const unit of units) {
-        await guarded('git unstage', () => gitApi.unstage(project, unit.repo, wholeFiles(unit.paths)))
+        await guarded('git unstage', () =>
+          gitApi.unstage(project, unit.repo, wholeFiles(unit.paths)),
+        )
       }
       setBusy(null)
       await refresh()
     })()
   }, [project, units, guarded, refresh])
+
+  /**
+   * Read every repo's shelf.
+   *
+   * Called when the Shelf tab opens, after anything shelves, and from the panel's own ↻ —
+   * which cannot know which tab is showing, and whose whole meaning is "re-read everything".
+   * Never on a timer and never from a status refresh, because it is one round trip per
+   * repository and the Shelf tab is its only reader. The panel used to hold a `useState` that
+   * nothing ever wrote to, so the Shelf tab showed the fixture or nothing at all, forever.
+   */
+  const loadShelf = useCallback(async () => {
+    if (story || project === null) return
+    const out: ShelfRow[] = []
+    for (const repo of allRepos(viewRef.current)) {
+      const entries = await guarded('git shelf', () => gitApi.shelf.list(project, repo.id))
+      for (const entry of entries ?? []) {
+        out.push({ repo: repo.id, key: `${repo.id}/${entry.id}`, entry })
+      }
+    }
+    setShelf(out)
+  }, [project, story, guarded])
+
+  const refreshShelf = useCallback(() => void loadShelf(), [loadShelf])
 
   const shelve = useCallback(() => {
     if (project === null || units.length === 0) return
@@ -406,44 +545,131 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
       setBusy('Shelving…')
       const name = message.trim() === '' ? 'Shelved changes' : message.trim()
       for (const unit of units) {
-        await guarded('git shelve', () => gitApi.shelf.shelve(project, unit.repo, name, wholeFiles(unit.paths)))
+        await guarded('git shelve', () =>
+          gitApi.shelf.shelve(project, unit.repo, name, wholeFiles(unit.paths)),
+        )
       }
       setBusy(null)
       await refresh()
+      await loadShelf()
     })()
-  }, [project, units, message, guarded, refresh])
+  }, [project, units, message, guarded, refresh, loadShelf])
+
+  const unshelve = useCallback(
+    (row: ShelfRow) => {
+      if (project === null) return
+      void (async () => {
+        setBusy('Unshelving…')
+        await guarded('git unshelve', () => gitApi.shelf.unshelve(project, row.repo, row.entry.id))
+        setBusy(null)
+        await refresh()
+        await loadShelf()
+      })()
+    },
+    [project, guarded, refresh, loadShelf],
+  )
+
+  /**
+   * IDEA's ◉. Applied to every repository in the workspace, because it is one button.
+   *
+   * The setting lives in each repo's changelists sidecar, so this is a command rather than a
+   * piece of local state — which is also why `stagingArea` above is read back out of the next
+   * payload instead of being set optimistically here.
+   */
+  const setStagingArea = useCallback(
+    (on: boolean) => {
+      if (project === null) return
+      void (async () => {
+        for (const repo of allRepos(view)) {
+          await guarded('git staging mode', () =>
+            gitApi.setUseStagingArea(project, repo.id, on),
+          )
+        }
+        await refresh()
+      })()
+    },
+    [project, view, guarded, refresh],
+  )
 
   const reloadIndex = useCallback(
-    (repo: string) => {
+    (repo: RepoId) => {
       overwritten.current.delete(repo)
       setAnswered((prev) => new Set(prev).add(repo))
       // "Reload" means git's view wins: forget this repo's ticks and let the next payload
       // re-apply its defaults, exactly as if the panel had just opened on it.
       seenFiles.current = new Set([...seenFiles.current].filter((id) => !inRepo(id, repo)))
       setSelected((prev) => new Set([...prev].filter((id) => !inRepo(id, repo))))
-      void refresh()
+      void (async () => {
+        if (project === null) {
+          await refresh()
+          return
+        }
+        // `git_adopt_index` is what actually clears the divergence: it records the index as
+        // it now stands, so the next status stops reporting `indexChangedExternally`. A local
+        // refresh alone — what this used to do — left the bar up forever.
+        const tree = await guarded('git reload index', () => gitApi.adoptIndex(project, repo))
+        if (tree === undefined) await refresh()
+        else adopt(viewOf(tree))
+      })()
     },
-    [refresh],
+    [project, guarded, refresh, adopt],
   )
 
-  const overwriteIndex = useCallback((repo: string) => {
+  const overwriteIndex = useCallback((repo: RepoId) => {
     overwritten.current.add(repo)
     setAnswered((prev) => new Set(prev).add(repo))
   }, [])
 
-  const openDiff = useCallback(
-    (row: Row) => {
-      const file = row.file
-      if (project === null || row.kind !== 'file' || file === undefined) return
-      void guarded('git diff', () =>
-        gitApi.diffFile(project, row.repo, file.path, stagingArea ? 'staged' : 'unstaged'),
-      )
+  /**
+   * Fetch one file's diff and hand it over.
+   *
+   * Takes the repo and the entry rather than a `Row`, because the toolbar's ◫ acts on the
+   * *selection* and the selection outlives the rows: `buildRows` emits no file rows for a
+   * collapsed group, so a search of the row list found nothing whenever the user had collapsed
+   * the changelist — an enabled button that did nothing, which is the class of bug this panel
+   * already had too much of. `flatFiles` reads the tree, exactly as commit does.
+   */
+  const showDiff = useCallback(
+    (repo: RepoId, entry: ChangeEntry) => {
+      if (project === null) return
+      void (async () => {
+        // `combined` is HEAD→working tree, which is what a changelist row *is*. In
+        // staging-area mode the index is the truth, so the staged side is the honest one.
+        const side = stagingArea ? 'staged' : 'combined'
+        const diff = await guarded('git diff', () =>
+          gitApi.diffFile(project, repo, entry.path, side),
+        )
+        if (diff === undefined) return
+        if (onOpenDiff === undefined) {
+          // Nowhere to put it. Said out loud rather than dropped on the floor: the panel used
+          // to fetch this diff and discard it, which made ◫ and double-click look broken.
+          note('git diff', `no diff view is wired up — ${entry.path} was not opened`)
+          void diag.log('git panel: onOpenDiff is not wired; the fetched FileDiff was dropped')
+          return
+        }
+        onOpenDiff(diff, repo)
+      })()
     },
-    [project, guarded, stagingArea],
+    [project, guarded, note, stagingArea, onOpenDiff],
   )
 
+  /** Double-click, or Enter on a file row. */
+  const openDiff = useCallback(
+    (row: Row) => {
+      if (row.kind !== 'file' || row.entry === undefined) return
+      showDiff(row.repo, row.entry)
+    },
+    [showDiff],
+  )
+
+  /** The toolbar's ◫: the first ticked file, whether or not its group is rendered. */
+  const showSelectedDiff = useCallback(() => {
+    const first = flatFiles(view).find((f) => selected.has(f.id))
+    if (first !== undefined) showDiff(first.repo, first.entry)
+  }, [view, selected, showDiff])
+
   return {
-    tree,
+    view,
     rows,
     shelf,
     selected,
@@ -457,7 +683,11 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     amend,
     stagingArea,
     story: story !== null,
-    refresh: () => void refresh(),
+    refresh: () => {
+      void refresh()
+      void loadShelf()
+    },
+    refreshShelf,
     toggleCheck,
     toggleExpand,
     setAllExpanded,
@@ -467,8 +697,10 @@ export function useGitPanel(project: ProjectId | null): GitPanelModel & GitPanel
     commit,
     unstage,
     shelve,
+    unshelve,
     reloadIndex,
     overwriteIndex,
     openDiff,
+    showSelectedDiff,
   }
 }

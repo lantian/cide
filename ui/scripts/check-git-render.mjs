@@ -1,12 +1,17 @@
 /**
  * Renders the git panel under node and checks what came out.
  *
- * The panel is not mounted by `App.tsx` in this milestone — the sidebar that hosts it is a
- * separate surface — so `pnpm build` proves only that it compiles. This bundles
- * `src/sidebar/GitPanel/smokeEntry.tsx` for SSR, runs it, and asserts on the digest it
- * prints: that the repo level really is elided with one repo and present with two, that
- * the guard bar names its repository in a multi-root workspace, and that the mock story's
- * footer reads `2 modified`.
+ * `pnpm build` proves the panel compiles; this proves it paints. It bundles
+ * `src/sidebar/GitPanel/smokeEntry.tsx` for SSR, runs it, and asserts on the digest it prints:
+ * that the repo level really is elided with one repo and present with two, that a submodule
+ * renders as a nested repository four levels deep rather than an opaque row, that the guard bar
+ * names its repository in a multi-root workspace, and that the mock story's footer reads
+ * `2 modified`.
+ *
+ * Every story goes through `normalizeStatus` from a real `cide_ipc::git::ChangesTree`, so this
+ * check now covers the seam that used to be uncovered: the fixtures used to be written in the
+ * panel's own invented shape, which is why they rendered perfectly while the panel was empty
+ * against every real repository.
  *
  * Two globals are stubbed before the bundle loads. `location` is what `storyFromQuery`
  * reads; `window` is touched by `@tauri-apps/api` on import. Neither is faked deeper than
@@ -66,11 +71,20 @@ try {
     }
   }
 
+  // --- one repository ------------------------------------------------------------------
+
   eq(byName.mock.repoRows, 0, 'one repo: no repo rows, so the panel is the mock exactly')
+  eq(
+    byName.mock.rows.length > 0,
+    true,
+    'and it renders rows at all — a fixture that reaches `normalizeStatus` in the wrong '
+      + 'shape produces exactly zero, which is what the empty-panel bug looked like',
+  )
   eq(
     byName.mock.rows.slice(0, 3),
     ['L1:mixed', 'L2:true', 'L2:mixed'],
-    'Changes is partial because one of its two files is: the group must not claim a full tick',
+    'Changes is partial because one of its two files is staged only in part: index and '
+      + 'worktree both dirty. The group must not claim a full tick',
   )
   eq(byName.mock.summary, '2 modified', "the mock's footer, verbatim")
   eq(byName.mock.guard, null, 'no guard bar unless the index actually moved')
@@ -81,6 +95,8 @@ try {
       + 'the index had been rewritten',
   )
 
+  // --- the external-staging guard --------------------------------------------------------
+
   eq(byName.guard.guard, '⚠ Staging changed outside cide Reload Overwrite', 'the guard bar')
   eq(
     byName.guard.rows,
@@ -88,19 +104,33 @@ try {
     'the guard bar changes nothing about the tree below it — it is a warning, not a mode',
   )
 
-  eq(byName.multi.repoRows, 2, 'two repos: a repo row each, above the changelists')
+  // --- two roots and a submodule ----------------------------------------------------------
+
+  eq(
+    byName.multi.repoRows,
+    3,
+    'two roots and a submodule are three repositories: a submodule has its own index and its '
+      + 'own changelists, so it gets a repo row rather than a group inside its parent',
+  )
   eq(byName.multi.rows[0], 'L1:mixed', 'the repo row is the new top level')
   eq(
-    byName.multi.rows.slice(16, 21),
-    ['L2:mixed', 'L3:mixed', 'L4:true', 'L4:mixed', 'L3:true'],
-    'a submodule nests inside its changelist and its files inside it — four levels deep, '
-      + 'not one opaque row',
+    byName.multi.rows.slice(15, 22),
+    ['L1:mixed', 'L2:true', 'L3:true', 'L2:mixed', 'L3:mixed', 'L4:true', 'L4:mixed'],
+    'the second root, its own changelist and file, then the submodule nested inside it with '
+      + 'its changelist and files — four levels deep, not one opaque row',
+  )
+  eq(
+    byName.multi.summary,
+    '5 modified',
+    "the footer counts every root's active changelist, the submodule's included",
   )
   eq(
     byName.multi.guard,
     '⚠ Staging changed outside cide · hub-core Reload Overwrite',
     'with more than one root the bar names the repo whose index moved',
   )
+
+  // --- nothing to commit -------------------------------------------------------------------
 
   eq(byName.empty.rows, [], 'a clean tree renders no rows')
   eq(byName.empty.summary, 'nothing selected', 'and says so in the footer')

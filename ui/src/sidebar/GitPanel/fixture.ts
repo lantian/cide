@@ -10,120 +10,181 @@
  * until it matters, and the first time it renders should not be the first time anyone has
  * looked at it.
  *
- * Every story is plain data fed to the same `GitPanel` the app renders, through the same
- * props. Nothing here is a stand-in for the component: if the panel breaks, the story
- * breaks with it.
+ * # The shape is the wire's, not the panel's
+ *
+ * Every story here is a real `cide_ipc::git::ChangesTree` and goes through `normalizeStatus`
+ * exactly like a payload from Rust. That is deliberate and it is the lesson of the bug this
+ * file is part of the fix for: the fixtures used to be written in the panel's *own* invented
+ * shape, so every story rendered beautifully while the panel was empty against every real
+ * repository. A fixture that does not travel the same road as the data proves nothing.
  *
  * Reach one with `?git-story=<name>` on the window URL — `mock`, `guard`, `multi`, `empty`.
  * No git command runs in story mode, so a story is safe against any working tree.
  */
-import type { ChangesTree, RepoChanges, ShelfEntry } from './types'
+import type {
+  BranchInfo,
+  ChangeEntry,
+  ChangelistView,
+  ChangesTree,
+  FileState,
+  RepoChanges,
+  ShelfRow,
+} from './types'
 
 export type GitStoryName = 'mock' | 'guard' | 'multi' | 'empty'
 
+const CIDE_ID = '3f2a1b00-0000-4000-8000-000000000001'
+const VENDOR_ID = '3f2a1b00-0000-4000-8000-000000000002'
+const ZLIB_ID = '3f2a1b00-0000-4000-8000-000000000003'
+
 const CIDE_ROOT = '/home/dev/work/cide'
 const VENDOR_ROOT = '/home/dev/work/cide/vendor/hub-core'
+const ZLIB_ROOT = '/home/dev/work/cide/vendor/hub-core/third_party/zlib'
 
 /**
- * The design mock's repository, row for row: `Changes`, `fixes`, `Ignore`, `tomaster`,
- * `Unversioned Files`, and a footer that reads `2 modified`.
+ * One changed path.
  *
- * `Changes` is the active changelist and holds exactly two modified files, one of them
- * partially staged — which is what puts a `–` on the group row rather than a `✓`, so the
- * leaf-level tri-state is visible in the default state and not only under interaction.
+ * `index`/`worktree` are the pair the tri-state is a function of, so the helper takes them
+ * both rather than a single collapsed status — writing fixtures in terms of one status is how
+ * the old ones ended up unable to express "half of this file is staged" at all.
  */
-const CIDE_REPO: RepoChanges = {
-  root: CIDE_ROOT,
-  label: 'cide',
-  branch: 'hub-provider-config',
-  headMessage: 'Wire the IDE MCP server into the app',
-  groups: [
-    {
-      id: 'default',
-      name: 'Changes',
-      kind: 'changelist',
-      active: true,
-      files: [
-        { path: 'crates/cide-git/src/lib.rs', status: 'modified' },
-        { path: 'ui/src/sidebar/GitPanel/GitPanel.tsx', status: 'modified', partial: true },
-      ],
-    },
-    {
-      id: 'fixes',
-      name: 'fixes',
-      kind: 'changelist',
-      files: [
-        { path: 'crates/cide-app/src/emit.rs', status: 'modified' },
-        { path: 'crates/cide-pty/src/reader.rs', status: 'modified' },
-        { path: 'contract/events.json', status: 'modified' },
-      ],
-    },
-    {
-      id: 'ignore',
-      name: 'Ignore',
-      kind: 'ignored',
-      files: [
-        { path: 'target/debug/incremental', status: 'ignored' },
-        { path: 'ui/node_modules', status: 'ignored' },
-      ],
-    },
-    {
-      id: 'tomaster',
-      name: 'tomaster',
-      kind: 'changelist',
-      files: [
-        { path: 'docs/adr/0004-changelists-not-index.md', status: 'added' },
-        {
-          path: 'docs/adr/0005-claude-hosting-hybrid.md',
-          status: 'renamed',
-          originalPath: 'docs/adr/0005-hosting.md',
-        },
-      ],
-    },
-    {
-      id: 'unversioned',
-      name: 'Unversioned Files',
-      kind: 'unversioned',
-      files: [
-        { path: 'ui/src/sidebar/GitPanel/fixture.ts', status: 'unversioned' },
-        { path: 'notes.md', status: 'unversioned' },
-      ],
-    },
-  ],
+function entry(
+  path: string,
+  index: FileState,
+  worktree: FileState,
+  changelist: string,
+  extra: Partial<ChangeEntry> = {},
+): ChangeEntry {
+  return {
+    path,
+    origPath: null,
+    index,
+    worktree,
+    staged: index !== 'unmodified',
+    binary: false,
+    submodule: false,
+    changelist,
+    ...extra,
+  }
+}
+
+function changelist(
+  id: string,
+  name: string,
+  active: boolean,
+  changes: ChangeEntry[],
+): ChangelistView {
+  return { id, name, comment: '', active, changes }
+}
+
+function branch(head: string, unborn = false): BranchInfo {
+  return {
+    head,
+    detached: false,
+    upstream: `origin/${head}`,
+    ahead: 1,
+    behind: 0,
+    operation: null,
+    unborn,
+  }
 }
 
 /**
- * A second root whose active changelist contains a submodule with its own changes.
+ * The design mock's repository, row for row: `Changes`, `fixes`, `tomaster`,
+ * `Unversioned Files`, `Ignored Files`, and a footer that reads `2 modified`.
  *
- * The submodule is a nested change group, not one opaque row (§5.3) — a submodule pointer
- * that reads as a single line is exactly the thing that gets committed without being read.
+ * `Changes` is the active changelist and holds exactly two modified files, one of them
+ * partially staged — index *and* worktree both dirty — which is what puts a `–` on the group
+ * row rather than a `✓`, so the leaf-level tri-state is visible in the default state and not
+ * only under interaction.
  */
-const VENDOR_REPO: RepoChanges = {
-  root: VENDOR_ROOT,
-  label: 'hub-core',
-  branch: 'main',
-  headMessage: 'Bump protocol to 3',
-  indexDiverged: true,
-  groups: [
-    {
-      id: 'default',
-      name: 'Changes',
-      kind: 'changelist',
-      active: true,
-      files: [{ path: 'src/protocol.rs', status: 'modified' }],
-      groups: [
-        {
-          id: 'sub:third_party/zlib',
-          name: 'third_party/zlib',
-          kind: 'submodule',
-          files: [
-            { path: 'third_party/zlib/deflate.c', status: 'modified' },
-            { path: 'third_party/zlib/zconf.h', status: 'modified', partial: true },
-          ],
-        },
-      ],
-    },
+const CIDE_REPO: RepoChanges = {
+  repo: {
+    id: CIDE_ID,
+    root: CIDE_ROOT,
+    name: 'cide',
+    parent: null,
+    isSubmodule: false,
+  },
+  branch: branch('hub-provider-config'),
+  changelists: [
+    changelist('default', 'Changes', true, [
+      entry('crates/cide-git/src/lib.rs', 'unmodified', 'modified', 'default'),
+      entry('ui/src/sidebar/GitPanel/GitPanel.tsx', 'modified', 'modified', 'default'),
+    ]),
+    changelist('fixes', 'fixes', false, [
+      entry('contract/events.json', 'unmodified', 'modified', 'fixes'),
+      entry('crates/cide-app/src/emit.rs', 'unmodified', 'modified', 'fixes'),
+      entry('crates/cide-pty/src/reader.rs', 'unmodified', 'modified', 'fixes'),
+    ]),
+    changelist('tomaster', 'tomaster', false, [
+      entry('docs/adr/0004-changelists-not-index.md', 'added', 'unmodified', 'tomaster'),
+      entry('docs/adr/0005-claude-hosting-hybrid.md', 'renamed', 'unmodified', 'tomaster', {
+        origPath: 'docs/adr/0005-hosting.md',
+      }),
+    ]),
   ],
+  unversioned: [
+    entry('notes.md', 'unmodified', 'untracked', 'default'),
+    entry('ui/src/sidebar/GitPanel/fixture.ts', 'unmodified', 'untracked', 'default'),
+  ],
+  ignored: [
+    entry('target/debug/incremental', 'unmodified', 'ignored', 'default'),
+    entry('ui/node_modules', 'unmodified', 'ignored', 'default'),
+  ],
+  conflicts: [],
+  indexChangedExternally: false,
+  useStagingArea: false,
+}
+
+/** A second root, whose own submodule has changes of its own. */
+const VENDOR_REPO: RepoChanges = {
+  repo: {
+    id: VENDOR_ID,
+    root: VENDOR_ROOT,
+    name: 'hub-core',
+    parent: null,
+    isSubmodule: false,
+  },
+  branch: branch('main'),
+  changelists: [
+    changelist('default', 'Changes', true, [
+      entry('src/protocol.rs', 'unmodified', 'modified', 'default'),
+    ]),
+  ],
+  unversioned: [],
+  ignored: [],
+  conflicts: [],
+  indexChangedExternally: true,
+  useStagingArea: false,
+}
+
+/**
+ * The submodule — a repository, arriving flat with `parent` set (§5.3).
+ *
+ * `normalizeStatus` re-nests it under `hub-core`. It is *not* a group inside the parent's
+ * `Changes`: its files live in its own index and no commit of the parent can include them.
+ */
+const ZLIB_REPO: RepoChanges = {
+  repo: {
+    id: ZLIB_ID,
+    root: ZLIB_ROOT,
+    name: 'third_party/zlib',
+    parent: VENDOR_ID,
+    isSubmodule: true,
+  },
+  branch: branch('release'),
+  changelists: [
+    changelist('default', 'Changes', true, [
+      entry('deflate.c', 'unmodified', 'modified', 'default'),
+      entry('zconf.h', 'modified', 'modified', 'default'),
+    ]),
+  ],
+  unversioned: [],
+  ignored: [],
+  conflicts: [],
+  indexChangedExternally: false,
+  useStagingArea: false,
 }
 
 /** One repo, so the repo level is elided and the panel is the mock exactly. */
@@ -136,22 +197,53 @@ export const MOCK_STATUS: ChangesTree = { repos: [CIDE_REPO] }
  * bar costs in vertical space, and that the commit button stays live — the guard is a
  * warning, not a modal.
  */
-export const GUARD_STATUS: ChangesTree = { repos: [{ ...CIDE_REPO, indexDiverged: true }] }
+export const GUARD_STATUS: ChangesTree = {
+  repos: [{ ...CIDE_REPO, indexChangedExternally: true }],
+}
 
-/** Two roots: the only story in which repo rows exist at all. */
-export const MULTI_STATUS: ChangesTree = { repos: [CIDE_REPO, VENDOR_REPO] }
+/** Two roots and a submodule: the only story in which repo rows exist at all. */
+export const MULTI_STATUS: ChangesTree = { repos: [CIDE_REPO, VENDOR_REPO, ZLIB_REPO] }
 
 /** A clean tree. The empty state is a real state and has to say so in words. */
-export const EMPTY_STATUS: ChangesTree = { repos: [{ root: CIDE_ROOT, label: 'cide', groups: [] }] }
+export const EMPTY_STATUS: ChangesTree = {
+  repos: [
+    {
+      ...CIDE_REPO,
+      changelists: [changelist('default', 'Changes', true, [])],
+      unversioned: [],
+      ignored: [],
+    },
+  ],
+}
 
-export const SHELF_FIXTURE: readonly ShelfEntry[] = [
-  { id: 'shelf-1', name: 'wip: statusline parser', createdAt: 1_754_700_000, fileCount: 4 },
-  { id: 'shelf-2', name: 'revert pty coalescing', createdAt: 1_754_100_000, fileCount: 2 },
+export const SHELF_FIXTURE: readonly ShelfRow[] = [
+  {
+    repo: CIDE_ID,
+    key: `${CIDE_ID}/shelf-1`,
+    entry: {
+      id: 'shelf-1',
+      name: 'wip: statusline parser',
+      // `bigint` is what ts-rs spells `i64`; Tauri's JSON delivers a number. The fixture uses
+      // the declared type so the story exercises the same `Number(…)` widening the app does.
+      created: 1_754_700_000n,
+      files: ['ui/src/store/statusFormat.ts', 'ui/src/chrome/StatusBar.tsx'],
+    },
+  },
+  {
+    repo: CIDE_ID,
+    key: `${CIDE_ID}/shelf-2`,
+    entry: {
+      id: 'shelf-2',
+      name: 'revert pty coalescing',
+      created: 1_754_100_000n,
+      files: ['crates/cide-pty/src/reader.rs'],
+    },
+  },
 ]
 
 export interface GitStory {
   status: ChangesTree
-  shelf: readonly ShelfEntry[]
+  shelf: readonly ShelfRow[]
 }
 
 const STORIES: Record<GitStoryName, GitStory> = {
