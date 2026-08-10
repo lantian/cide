@@ -446,6 +446,108 @@ try {
     eq(chipFor('palette.commands'), '⌃⇧P', 'chipFor works detached from its object')
   }
 
+  /* -------------------------------------------------- every bound key reaches a dispatcher */
+
+  /*
+   * A binding whose command nothing dispatches is worse than no binding at all.
+   *
+   * `ctrl+s` was bound to `file.save` in `cide_core::keymap::defaults()` from the day the
+   * table was written, and nothing in the frontend had a case for it. The gate did exactly
+   * what it is supposed to do — resolved the chord, swallowed the keystroke, called the
+   * dispatcher — and the dispatcher logged a line and returned. The effect was that Ctrl+S
+   * did nothing *and* that CodeMirror's own `Mod-s`, which would have saved the file, never
+   * saw the event. Every assertion above passed throughout: they check that a chord resolves
+   * and dispatches, not that anything is listening.
+   *
+   * So this reads the two files that dispatch — `keys/dispatch.ts` and the app's fallback in
+   * `App.tsx` — and asserts that every command in the shipped table reaches one of them.
+   * Source text rather than an import because `App.tsx` cannot be compiled here (it is the
+   * whole application) and because the question is genuinely "is this string written down as
+   * a case", which is what a `switch` is.
+   */
+  {
+    const readSource = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8')
+    const dispatchers = readSource('../src/keys/dispatch.ts') + readSource('../src/App.tsx')
+    const dispatched = new Set()
+    for (const [, id] of dispatchers.matchAll(/case '([a-zA-Z][\w.]*)':/g)) dispatched.add(id)
+    for (const [, id] of dispatchers.matchAll(/command === '([a-zA-Z][\w.]*)'/g)) dispatched.add(id)
+    ok(dispatched.size >= 10, `found ${dispatched.size} dispatched commands — the scan still works`)
+
+    /*
+     * The bindings that are still dead, each with the reason, so that a *new* one cannot be
+     * added without either wiring it or arguing for a line here.
+     *
+     * None of these is in this file's gift: they need the workspace store and `App.tsx`,
+     * which belongs to whoever is merging. They are listed rather than quietly excluded
+     * because the whole point of the assertion is that a dead key is a fact somebody has to
+     * look at.
+     */
+    const KNOWN_DEAD = {
+      'tab.close': 'needs the focused tab and `tab_close`; the × button is the only way today',
+      'theme.toggle': 'the app header has the toggle; no command reaches it',
+      'settings.open': 'the activity rail’s ⚙ is the only gesture that opens Settings',
+      'pane.promoteToTab': 'no dispatcher; `pane_promote` is wired to nothing',
+      'pane.detachToWindow': 'no dispatcher; the pane menu is the only route',
+      'pane.navigate.left': 'no dispatcher for the `pane_navigate` family',
+      'pane.navigate.right': 'no dispatcher for the `pane_navigate` family',
+      'pane.navigate.up': 'no dispatcher for the `pane_navigate` family',
+      'pane.navigate.down': 'no dispatcher for the `pane_navigate` family',
+    }
+
+    for (const { key, command } of rustDefaults()) {
+      if (Object.hasOwn(KNOWN_DEAD, command)) continue
+      ok(
+        dispatched.has(command),
+        `${key} is bound to ${command} and something dispatches it ` +
+          '(a bound key whose command nobody handles swallows the keystroke and does nothing)',
+      )
+    }
+    // And the list cannot rot: wiring one of them without deleting its line here would leave
+    // a note claiming a gap that no longer exists.
+    for (const command of Object.keys(KNOWN_DEAD)) {
+      ok(!dispatched.has(command), `${command} is still undispatched — remove it from KNOWN_DEAD`)
+    }
+
+    /*
+     * A `case` that forwards to `fallback` is not a dispatcher, and the scan above cannot
+     * tell the difference.
+     *
+     * `file.save` shipped for review in exactly that shape: a case existed, so every
+     * assertion above passed, and the body's first branch handed the command straight back
+     * to `deps.fallback` because the host had not supplied a `focusedTab`. Ctrl+S still did
+     * nothing; the only change was that the log line came from a different switch arm. The
+     * assertion has to reach into the body or it certifies the bug it was written for.
+     *
+     * Comments are stripped first. The prose in this file argues about `fallback` at length
+     * and a check that reads its own rationale as code would fail for the wrong reason.
+     */
+    const withoutComments = readSource('../src/keys/dispatch.ts')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+    const marks = [...withoutComments.matchAll(/case '([a-zA-Z][\w.]*)':/g)]
+    for (let i = 0; i < marks.length; i++) {
+      const command = marks[i][1]
+      const from = marks[i].index + marks[i][0].length
+      const next = i + 1 < marks.length ? marks[i + 1].index : withoutComments.indexOf('default:', from)
+      const body = withoutComments.slice(from, next < 0 ? withoutComments.length : next)
+      ok(
+        !body.includes('deps.fallback('),
+        `dispatch.ts handles ${command} rather than forwarding it to fallback ` +
+          '(a case whose body calls `fallback` is the dead command it was meant to fix)',
+      )
+    }
+
+    /*
+     * `file.saveAll` has no default binding, so the loop over `rustDefaults()` never looks at
+     * it — and removing its case leaves every other assertion in this file green. It is in
+     * `cide_core::commands::registry()`, which is what the palette lists, so it is reachable
+     * and has to work. Named here because the palette is not otherwise checked at all: 23 of
+     * the 39 registry commands are undispatched today, and building that list is a job for
+     * whoever owns `App.tsx`.
+     */
+    ok(dispatched.has('file.saveAll'), 'file.saveAll is dispatched (palette-only, no binding)')
+  }
+
   if (failed > 0) {
     console.error(`\ncheck-key-gate: ${failed} failure(s)`)
     process.exit(1)
