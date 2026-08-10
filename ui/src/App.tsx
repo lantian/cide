@@ -31,6 +31,8 @@ import { SplitTree } from '@/layout/SplitTree'
 import { TabContent } from '@/layout/TabContent'
 import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
+import { SearchPanel } from '@/sidebar/SearchPanel'
+import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
@@ -41,6 +43,7 @@ import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
 import { PaneFrame } from '@/layout/PaneTitleBar'
 import { PaneBody } from '@/panes/PaneBody'
+import { GitDiffPane } from '@/panes/GitDiffPane'
 import { liveHosts } from '@/layout/paneHosts'
 import { SettingsTab } from '@/settings/SettingsTab'
 import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
@@ -571,10 +574,14 @@ export function App() {
           />
 
           {/*
-            * The sidebar. `files` and `git` are the two views that have a panel; `search`
-            * and `problems` are M8/M-later surfaces that do not exist yet, and the rail's
-            * `settings` opens a workspace tab rather than a panel, so all three render
-            * nothing here rather than an empty chrome that implies a missing feature.
+            * The sidebar. Four of the rail's five views have a panel; `settings` opens a
+            * workspace tab instead, which is why it is absent here rather than empty.
+            *
+            * `search` and `problems` used to render nothing, on the reasoning that an empty
+            * panel implies a missing feature. That was wrong and a user reported it: the
+            * rail still draws the button and still highlights it on click, so rendering
+            * nothing does not read as "not built" — it reads as broken. A dead control is
+            * worse than either a real panel or an absent one.
             */}
           {view === 'files' && (
             <Explorer
@@ -585,6 +592,18 @@ export function App() {
             />
           )}
           {view === 'git' && <GitPanel project={activeProjectId} />}
+          {view === 'search' && (
+            <SearchPanel
+              project={activeProjectId}
+              onOpenHit={(path) => {
+                // The line number is dropped: `file.open` has no reveal-line seam yet, so
+                // the hit opens its file at the top. Opening the wrong line beats not
+                // opening at all, and the signature already carries it for when it lands.
+                if (activeProjectId) void fileApi.open(activeProjectId, path).then(() => hydrate())
+              }}
+            />
+          )}
+          {view === 'problems' && <ProblemsPanel project={activeProjectId} />}
 
           <div className={styles.content}>
             {/* An open project always has a console tab, so its `activeTab` is always live —
@@ -651,6 +670,15 @@ export function App() {
                         onDetach={() => void detachPane(activeProject.id, tab.id, paneNode.id)}
                         onClose={() => void closePane(activeProject.id, tab.id, paneNode.id)}
                       >
+                        {/*
+                          * A git diff replaces the pane rather than living in one, the way a
+                          * settings tab does. A Claude diff is different and stays in
+                          * `PaneBody`: it is answering a blocked agent turn and belongs
+                          * beside the terminal that is waiting on it.
+                          */}
+                        {tab.kind.kind === 'diff' && tab.kind.spec.origin.kind === 'git' ? (
+                          <GitDiffPane project={activeProject.id} spec={tab.kind.spec} />
+                        ) : (
                         <PaneBody
                           pane={paneNode}
                           cwd={activeProject.roots[0]?.path ?? PROJECT_ROOT}
@@ -667,6 +695,7 @@ export function App() {
                             void bindSession(activeProject.id, tab.id, paneNode.id, session)
                           }
                         />
+                        )}
                       </PaneFrame>
                     )}
                   />
