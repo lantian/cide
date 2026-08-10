@@ -269,7 +269,14 @@ impl Search<'_> {
             // `max_hits` a number rather than an approximation.
             for batch in rx {
                 let room = self.limits.max_hits - outcome.hits as usize;
-                let batch = if batch.len() >= room {
+                // `>` and not `>=`: a batch that exactly fills the remaining room has nothing
+                // left over, so nothing was dropped and the search is not truncated. With
+                // `>=`, a repository containing exactly `max_hits` matches reported itself as
+                // `5,000+` and cancelled a walk that had already finished finding everything.
+                // The cost of the honest answer is that the walk runs on to prove there is no
+                // `max_hits + 1`th hit — which is the only way to know it is complete. The
+                // next batch, if one comes, finds `room == 0` and truncates here.
+                let batch = if batch.len() > room {
                     outcome.truncated = true;
                     // Stops the walkers. Without it the loop would sit here while a walk of
                     // the whole repository produced results that are already over the cap.

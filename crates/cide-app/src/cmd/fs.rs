@@ -30,6 +30,7 @@ use cide_fs::{FsError, ops};
 use cide_ipc::{FsStatus, ProjectId, TreeRow};
 use tauri::{Manager, State};
 
+use crate::cmd::search::SearchRegistry;
 use crate::files::{FsEvents, FsRegistry};
 use crate::workspace_state::WorkspaceState;
 
@@ -107,10 +108,20 @@ pub(crate) async fn index_project(
     }
 }
 
-/// Drop a project's index and stop watching it. Idempotent.
+/// Drop a project's index, stop watching it, and stop any search over it. Idempotent.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_close(
     registry: State<'_, FsRegistry>,
+    searches: State<'_, SearchRegistry>,
+    project: ProjectId,
+) -> Result<bool, FsError> {
+    close_project(&registry, &searches, project).await
+}
+
+/// [`fs_close`] with its Tauri-injected arguments already resolved. See the module note.
+pub(crate) async fn close_project(
+    registry: &FsRegistry,
+    searches: &SearchRegistry,
     project: ProjectId,
 ) -> Result<bool, FsError> {
     // Taken out of the registry here — a map operation — and *dropped* on a worker. The drop
@@ -118,6 +129,12 @@ pub async fn fs_close(
     // and doing that on the async runtime is the same mistake as walking there.
     let taken = registry.remove(project);
     let existed = taken.is_some();
+    // A content search is a walker thread per core reading a tree nobody has open any more,
+    // holding its hits until the flag is set. It used to be cleaned up by the *next* query
+    // against any project, which is a moment that may never come. Cancelling costs one store
+    // and it happens before the drop, so the walkers see the flag while the index is still
+    // being torn down rather than after.
+    searches.cancel(project);
     blocking("fs_close", move || drop(taken)).await?;
     Ok(existed)
 }
@@ -325,8 +342,13 @@ pub async fn fs_delete(
     .await?
 }
 
-/// Stop watching everything. The quit path.
+/// Stop watching everything, and stop every search. The quit path.
 pub fn close_all(app: &tauri::AppHandle) {
+    // Searches first: a walker thread that outlives the registry entry it is searching is what
+    // makes a quit hang, and the flag is what stops it. Same order as `close_project`.
+    if let Some(searches) = app.try_state::<SearchRegistry>() {
+        searches.cancel_all();
+    }
     if let Some(registry) = app.try_state::<FsRegistry>() {
         registry.close_all();
     }
@@ -891,6 +913,55 @@ mod tests {
         assert!(
             !settled.running,
             "`running` outlived the walk, so the overlay would poll for ever"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// The ignore rules handed out by `ProjectFs::filter` are the ones the walk installed.
+    ///
+    /// The accessor exists so `cmd::search` stops rebuilding an identical `Filter` from
+    /// `dir_paths()` at the start of every query — a `stat` per directory in the project. That
+    /// is only a saving if the two really are identical, and the thing that could make them
+    /// differ is *which* filter comes back: the one built in `ProjectFs::new` has been given
+    /// no directories, so it has never read a nested `.gitignore`, and a search running under
+    /// it would report hits the file tree refuses to show.
+    ///
+    /// Asserted on both sides of the walk, because "the nested rule is enforced" would also be
+    /// true of a filter that got it from somewhere else — the pre-walk reading is what shows
+    /// the accessor is following the walk.
+    #[test]
+    fn a_projects_filter_is_the_one_its_walk_built() {
+        let dir = scratch("cmd-filter");
+        std::fs::create_dir_all(dir.path().join("src")).expect("a source directory");
+        // Nested, so only a `Filter` that was told about `src/` can know the rule exists.
+        std::fs::write(dir.path().join("src/.gitignore"), "generated.rs\n").expect("a .gitignore");
+        std::fs::write(dir.path().join("src/generated.rs"), []).expect("a corpus file");
+        std::fs::write(dir.path().join(format!("src/{NEEDLE}.rs")), []).expect("a corpus file");
+
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let generated = dir.path().join("src/generated.rs");
+
+        let claimed = registry
+            .claim(project, vec![dir.path().to_path_buf()])
+            .expect("a project nobody has indexed claims");
+        let fs = registry
+            .get(project)
+            .expect("the claim registered the project");
+        assert!(
+            fs.filter().admits(&generated, false),
+            "the pre-walk filter has read no directory, so it cannot know this rule — if it \
+             did, this test could not tell the two filters apart"
+        );
+
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let status = claimed.run(events, project);
+        assert_eq!(status.files, 1, "the walk itself honours the nested rule");
+        assert!(
+            !fs.filter().admits(&generated, false),
+            "the accessor still returns the filter from before the walk, so a content search \
+             using it would report hits inside directories the tree does not show"
         );
 
         drop(registry.remove(project));

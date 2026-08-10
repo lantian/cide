@@ -354,6 +354,51 @@ fn the_total_cap_truncates_rather_than_growing_without_bound() {
     assert!(outcome.truncated, "the panel has to be able to say so");
 }
 
+/// `truncated` means "there was more", and a result set that exactly fills the cap had no
+/// more.
+///
+/// The panel prints `truncated` as a `+` on the count, so the two halves here are two
+/// different sentences to the user: exactly 25 hits and nothing else in the repository is
+/// `25`, while 25 of at least 26 is `25+`. The cap test above cannot tell them apart — its
+/// corpus has 200 hits, so it is truncated under either reading — and `batch.len() >= room`
+/// gets the boundary case wrong in the direction that lies about a *complete* search.
+#[test]
+fn a_result_set_that_exactly_fills_the_cap_is_complete_and_not_truncated() {
+    let dir = scratch("search-cap-exact");
+    // Five files, five hits each, and no sixth file: the batch carrying the twenty-fifth hit
+    // is the last one there is.
+    for f in 0..5 {
+        write(
+            dir.join(format!("f{f}.txt")),
+            format!("{NEEDLE}\n").repeat(5),
+        );
+    }
+    let root = [SearchRoot::new(dir.path())];
+
+    let limits = Limits {
+        max_hits: 25,
+        ..Limits::default()
+    };
+    let (hits, outcome) = run(&root, &literal(NEEDLE), limits);
+    assert_eq!(hits.len(), 25, "every hit in the corpus");
+    assert_eq!(outcome.hits, 25);
+    assert_eq!(outcome.files, 5);
+    assert!(
+        !outcome.truncated,
+        "a search that found all 25 hits there are reported itself as `25+`"
+    );
+
+    // One below, so the same corpus really does truncate — otherwise the assertion above
+    // would also pass on a build that never sets the flag at all.
+    let limits = Limits {
+        max_hits: 24,
+        ..Limits::default()
+    };
+    let (hits, outcome) = run(&root, &literal(NEEDLE), limits);
+    assert_eq!(hits.len(), 24, "trimmed to the cap exactly");
+    assert!(outcome.truncated, "and the twenty-fifth hit was dropped");
+}
+
 /// Cancellation from inside the sink, which is only possible if the sink runs during the
 /// walk. See the module header for why this is the streaming assertion rather than a clock.
 #[test]
