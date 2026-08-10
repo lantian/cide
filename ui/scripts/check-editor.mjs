@@ -32,8 +32,8 @@
  *     allocating the encoding — the gate is spelled in bytes and was being compared against
  *     UTF-16 code units, which measures a CJK file at a third of its size.
  *  7. **The open-buffer registry.** What `file.save` and *Save and close* both go through:
- *     which tabs can be saved, what happens when one cannot, and that "no editor here" is
- *     distinguishable from "the write failed".
+ *     which tab a save means, which tabs can be saved, what happens when one cannot, and
+ *     that "no editor here" is distinguishable from "the write failed".
  *
  * The fifth found two more quadratics on its first run — the markdown link matcher and the
  * shell `${…}` matcher, both the same unbounded-scan-then-backtrack shape as the YAML key
@@ -1108,22 +1108,34 @@ try {
      * does, on every shape where the two could differ.
      */
     const encoder = new TextEncoder()
+    /*
+     * `[text, units, bytes]`, and the last two are the point of the table.
+     *
+     * Comparing only against `TextEncoder` is a differential test with no fixture: every
+     * sample would still pass after being edited down to `'ab'`, and the row that was there
+     * to exercise four-byte encoding would go on reporting a pass while exercising nothing.
+     * Pinning both lengths is what makes a sample stay its own category — and the pair of
+     * them is exactly what `exceedsBytes` shortcuts on, so a row where they are equal and a
+     * row where they differ by three are testing different code.
+     */
     const samples = {
-      empty: '',
-      ascii: 'const x = 1;\n',
-      'two-byte': 'héllo wörld',
-      'three-byte': '漢字とかな',
-      'four-byte, a surrogate pair': '😀🎉',
-      'a lone high surrogate': '\ud800',
-      'a lone low surrogate': '\udc00',
-      'a surrogate that is not a pair': 'a\ud800b',
-      'a pair split by a stray': '\ud83d😀',
-      mixed: 'a é 漢 😀 z',
+      empty: ['', 0, 0],
+      ascii: ['const x = 1;\n', 13, 13],
+      'two-byte': ['héllo wörld', 11, 13],
+      'three-byte': ['漢字とかな', 5, 15],
+      'four-byte, a surrogate pair': ['😀🎉', 4, 8],
+      'a lone high surrogate': ['\ud800', 1, 3],
+      'a lone low surrogate': ['\udc00', 1, 3],
+      'a surrogate that is not a pair': ['a\ud800b', 3, 5],
+      'a pair split by a stray': ['\ud83d😀', 3, 7],
+      mixed: ['a é 漢 😀 z', 10, 15],
       // The boundary between the two-byte and three-byte forms, from both sides.
-      'U+07FF': '߿',
-      'U+0800': 'ࠀ',
+      'U+07FF': ['߿', 1, 2],
+      'U+0800': ['ࠀ', 1, 3],
     }
-    for (const [what, text] of Object.entries(samples)) {
+    for (const [what, [text, units, expected]] of Object.entries(samples)) {
+      eq(text.length, units, `the ${what} sample is still ${units} UTF-16 units`)
+      eq(encoder.encode(text).length, expected, `the ${what} sample is still ${expected} bytes`)
       eq(utf8ByteLength(text), encoder.encode(text).length, `utf8ByteLength: ${what}`)
       // And the shortcut agrees with the count it is a shortcut for, at limits either side
       // of the answer and at the answer itself.
@@ -1226,6 +1238,43 @@ try {
     buffers.unregisterBuffer('tab-a')
     eq(buffers.saveTab('tab-a'), null, 'unregisterBuffer: the tab is gone')
     eq(buffers.canSaveAll(['tab-a']), false, 'unregisterBuffer: and cannot be saved')
+
+    /*
+     * Which tab `file.save` means.
+     *
+     * `keys/dispatch.ts` cannot be compiled here — it reaches the IPC client, and that
+     * reaches `@tauri-apps/api` — so the decision lives in `openBuffers.ts` and the
+     * dispatcher holds one line that feeds it `useWorkspace.getState().boot`. These fixtures
+     * are the shapes of `Bootstrap.role`, which is a three-variant union.
+     */
+    const shell = (active, projects) => ({ role: { kind: 'shell', active }, workspace: { projects } })
+    eq(buffers.focusedTabOf(null), null, 'focusedTabOf: nothing is bootstrapped yet')
+    eq(buffers.focusedTabOf(shell(null, {})), null, 'focusedTabOf: a shell with no project')
+    eq(
+      buffers.focusedTabOf(shell('p1', { p1: { activeTab: 'tab-7' } })),
+      'tab-7',
+      'focusedTabOf: the active project’s active tab',
+    )
+    eq(
+      buffers.focusedTabOf(shell('gone', { p1: { activeTab: 'tab-7' } })),
+      null,
+      'focusedTabOf: an active project the mirror no longer holds',
+    )
+    /*
+     * The one that a wrong implementation gets wrong silently. A detached window shares the
+     * whole `Workspace` with the shell window, so `projects[…].activeTab` there names the tab
+     * the *shell* is showing — a different file. The role names the right one.
+     */
+    for (const kind of ['detachedPane', 'detachedTab']) {
+      eq(
+        buffers.focusedTabOf({
+          role: { kind, project: 'p1', tab: 'torn-out' },
+          workspace: { projects: { p1: { activeTab: 'tab-7' } } },
+        }),
+        'torn-out',
+        `focusedTabOf: a ${kind} window answers from its role, not the project`,
+      )
+    }
 
     for (const tab of buffers.registeredBuffers()) buffers.unregisterBuffer(tab)
     eq(buffers.registeredBuffers(), [], 'the registry is a module singleton and is left empty')

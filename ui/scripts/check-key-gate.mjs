@@ -507,6 +507,45 @@ try {
     for (const command of Object.keys(KNOWN_DEAD)) {
       ok(!dispatched.has(command), `${command} is still undispatched — remove it from KNOWN_DEAD`)
     }
+
+    /*
+     * A `case` that forwards to `fallback` is not a dispatcher, and the scan above cannot
+     * tell the difference.
+     *
+     * `file.save` shipped for review in exactly that shape: a case existed, so every
+     * assertion above passed, and the body's first branch handed the command straight back
+     * to `deps.fallback` because the host had not supplied a `focusedTab`. Ctrl+S still did
+     * nothing; the only change was that the log line came from a different switch arm. The
+     * assertion has to reach into the body or it certifies the bug it was written for.
+     *
+     * Comments are stripped first. The prose in this file argues about `fallback` at length
+     * and a check that reads its own rationale as code would fail for the wrong reason.
+     */
+    const withoutComments = readSource('../src/keys/dispatch.ts')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+    const marks = [...withoutComments.matchAll(/case '([a-zA-Z][\w.]*)':/g)]
+    for (let i = 0; i < marks.length; i++) {
+      const command = marks[i][1]
+      const from = marks[i].index + marks[i][0].length
+      const next = i + 1 < marks.length ? marks[i + 1].index : withoutComments.indexOf('default:', from)
+      const body = withoutComments.slice(from, next < 0 ? withoutComments.length : next)
+      ok(
+        !body.includes('deps.fallback('),
+        `dispatch.ts handles ${command} rather than forwarding it to fallback ` +
+          '(a case whose body calls `fallback` is the dead command it was meant to fix)',
+      )
+    }
+
+    /*
+     * `file.saveAll` has no default binding, so the loop over `rustDefaults()` never looks at
+     * it — and removing its case leaves every other assertion in this file green. It is in
+     * `cide_core::commands::registry()`, which is what the palette lists, so it is reachable
+     * and has to work. Named here because the palette is not otherwise checked at all: 23 of
+     * the 39 registry commands are undispatched today, and building that list is a job for
+     * whoever owns `App.tsx`.
+     */
+    ok(dispatched.has('file.saveAll'), 'file.saveAll is dispatched (palette-only, no binding)')
   }
 
   if (failed > 0) {
