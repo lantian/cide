@@ -34,6 +34,7 @@ import { GitPanel } from '@/sidebar/GitPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
+import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -45,6 +46,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   app as appApi,
   benchMode,
+  claude as claudeApi,
   file as fileApi,
   windows as windowApi,
   diag,
@@ -381,6 +383,22 @@ export function App() {
   })()
   const focusedSession = focused?.pane.session ?? undefined
 
+  /**
+   * The Claude pane a mention should land in.
+   *
+   * The focused pane when it is a Claude one; otherwise the project's console — its primary
+   * session, which is the conversation the project is *about*. Falling back to the console
+   * rather than to nothing matters because the common gesture is Ctrl+P from an editor,
+   * where no Claude pane is focused by definition, and a mention that silently went nowhere
+   * would look identical to one that worked.
+   */
+  const mentionTarget = (() => {
+    if (focused?.pane.kind === 'claude') return focused.pane.id
+    const console = activeProject?.tabs[0]
+    if (!console) return undefined
+    return Object.values(console.tree.panes).find((p) => p.kind === 'claude')?.id
+  })()
+
   /*
    * Key context: the `when` clauses in the keymap are evaluated against this.
    *
@@ -651,10 +669,13 @@ export function App() {
               },
               mentionFile: (path) => {
                 setOverlay(null)
-                // The IDE server's `at_mentioned` is per-pane and needs the focused Claude
-                // pane's id; that binding is not plumbed to this window yet, so this reports
-                // rather than pretending to have sent it.
-                diag.log(`mention not wired yet: ${path}`)
+                if (!mentionTarget) {
+                  // No Claude anywhere in this project to mention into. Saying so beats a
+                  // silent no-op that looks exactly like success.
+                  diag.log(`no Claude pane to mention ${path} into`)
+                  return
+                }
+                claudeApi.mentionFile(activeProjectId, mentionTarget, path)
               },
               runCommand: (id) => {
                 setOverlay(null)
@@ -675,6 +696,32 @@ export function App() {
             sessions={pendingClose.sessions}
             onCancel={() => useCloseConfirm.getState().dismiss()}
             onDiscard={() => void useCloseConfirm.getState().confirm()}
+            /*
+             * Offered only when every unsaved file has a live editor that can write it.
+             * A Save button that silently skipped a file it could not reach would lose
+             * exactly what the dialog exists to protect, so `CloseConfirm` omits the button
+             * entirely rather than showing one it cannot honour — passing `undefined` is
+             * how that is said.
+             */
+            onSaveAll={
+              canSaveAll(pendingClose.unsaved.map((u) => u.tab))
+                ? () => {
+                    const tabs = pendingClose.unsaved.map((u) => u.tab)
+                    void saveAll(tabs).then(({ failed }) => {
+                      if (failed.length > 0) {
+                        // The close does NOT proceed. A write that did not land leaves the
+                        // tab dirty, and Rust would refuse the close anyway — but stopping
+                        // here is what keeps the user in front of the file rather than
+                        // bouncing them off a second dialog.
+                        void diag.log(`could not save ${failed.length} file(s); close cancelled`)
+                        useCloseConfirm.getState().dismiss()
+                        return
+                      }
+                      void useCloseConfirm.getState().confirm()
+                    })
+                  }
+                : undefined
+            }
           />
         )}
 

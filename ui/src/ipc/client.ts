@@ -346,6 +346,30 @@ export const claude = {
       endLine,
     }).catch(() => {}),
 
+  /**
+   * Put `@path` into one Claude pane's prompt — Ctrl+P's ⌥⏎.
+   *
+   * Addressed, not broadcast: a mention is text the user is about to send in one
+   * conversation, so typing it into every Claude in the project would be wrong. The caller
+   * picks the pane because only it knows which Claude the user was last looking at.
+   *
+   * Lines are 1-based here and 0-based on the wire; omit both to mention the whole file.
+   */
+  mentionFile: (
+    projectId: ProjectId,
+    paneId: PaneId,
+    path: string,
+    lineStart?: number,
+    lineEnd?: number,
+  ) =>
+    invoke<void>('claude_mention_file', {
+      project: projectId,
+      pane: paneId,
+      path,
+      lineStart: lineStart ?? null,
+      lineEnd: lineEnd ?? null,
+    }).catch(() => {}),
+
   /** Answer a diff. `acceptedEdited` carries the buffer the user actually has on screen. */
   answer: (projectId: ProjectId, requestId: string, outcome: DiffAnswer) =>
     invoke<void>('claude_diff_result', { project: projectId, requestId, outcome }),

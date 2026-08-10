@@ -159,3 +159,34 @@ pub fn claude_selection_changed(
         },
     );
 }
+
+/// Put `@path#L1-2` into a Claude pane's prompt.
+///
+/// The pane is chosen by the caller, not here: the frontend knows which Claude the user was
+/// last looking at, and this layer would have to guess. Lines are 1-based from the caller
+/// and 0-based on the wire, converted once at this boundary — the same convention
+/// `claude_selection_changed` uses, for the same reason.
+///
+/// `None` for both lines mentions the whole file, which is what a Ctrl+P pick means.
+#[tauri::command(rename_all = "camelCase")]
+pub fn claude_mention_file(
+    app: tauri::AppHandle,
+    project: cide_ipc::ProjectId,
+    pane: cide_ipc::PaneId,
+    path: String,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+) {
+    let Some(servers) = app.try_state::<crate::ide::IdeServers>() else {
+        return;
+    };
+    servers.at_mentioned(
+        project,
+        pane,
+        cide_ide_mcp::AtMentioned {
+            file_path: path,
+            line_start: line_start.map(|l| l.saturating_sub(1)),
+            line_end: line_end.map(|l| l.saturating_sub(1)),
+        },
+    );
+}

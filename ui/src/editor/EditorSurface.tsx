@@ -112,6 +112,15 @@ export interface EditorSurfaceProps {
   onSelection?:
     | ((selection: { text: string; startLine: number; endLine: number }) => void)
     | undefined
+  /**
+   * Receives an awaitable save for this buffer, and `null` when the editor goes away.
+   *
+   * The buffer lives in a CodeMirror state that nothing above this component can reach, so
+   * *Save and close* would otherwise be a button the dialog could not honour. Handing the
+   * function out is narrower than lifting the text: the caller can write the file and cannot
+   * read it.
+   */
+  onSaveHandle?: ((save: (() => Promise<void>) | null) => void) | undefined
 }
 
 /** The `crates › cide-core › src › lib.rs` trail. */
@@ -141,6 +150,7 @@ export function EditorSurface({
   onSave,
   onFocus,
   onSelection,
+  onSaveHandle,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const readoutRef = useRef<HTMLDivElement | null>(null)
@@ -156,6 +166,8 @@ export function EditorSurface({
   focusCb.current = onFocus
   const selectionCb = useRef(onSelection)
   selectionCb.current = onSelection
+  const saveHandleCb = useRef(onSaveHandle)
+  saveHandleCb.current = onSaveHandle
 
   const segments = useMemo(() => breadcrumbSegments(path, root), [path, root])
   const language = useMemo(() => languageName(path), [path])
@@ -180,6 +192,25 @@ export function EditorSurface({
 
     const languageSlot = new Compartment()
     let baseline: EditorState['doc'] | null = null
+
+    /**
+     * Write the buffer and resolve once it has landed — or reject.
+     *
+     * Separate from the keymap's `save` below because the two callers want opposite things.
+     * A `Mod-s` handler must return a boolean synchronously and swallow the failure (the tab
+     * staying dirty is the report). *Save and close* must await it and must know if it
+     * failed, because closing after a failed write is exactly the loss the confirmation
+     * exists to prevent.
+     */
+    const saveNow = (view: EditorView): Promise<void> => {
+      if (readOnly) return Promise.resolve()
+      const saving = view.state.doc
+      const text = restoreLineEndings(saving.toString(), endingRef.current)
+      return Promise.resolve(saveCb.current?.(text)).then(() => {
+        baseline = saving
+        setDirty(!view.state.doc.eq(saving))
+      })
+    }
 
     const save = (view: EditorView): boolean => {
       if (readOnly) return false
@@ -290,6 +321,10 @@ export function EditorSurface({
     }
     baseline = view.state.doc
     viewRef.current = view
+    // Hand the awaitable save outward, so a close confirmation can offer *Save and close*.
+    // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
+    // that is no longer on screen.
+    saveHandleCb.current?.(() => saveNow(view))
 
     const el = readoutRef.current
     if (el !== null) {
@@ -307,6 +342,7 @@ export function EditorSurface({
 
     return () => {
       viewRef.current = null
+      saveHandleCb.current?.(null)
       view.destroy()
     }
     // Rebuilt only on a different file or an explicit reload. `doc` is intentionally absent:

@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { EditorSurface } from '@/editor/EditorSurface'
 import { claude as claudeApi, diag, events, file as fileApi } from '@/ipc/client'
+import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
 import styles from './EditorPane.module.css'
 
 export interface EditorPaneProps {
@@ -100,6 +101,22 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
       if (selectionTimer.current !== undefined) clearTimeout(selectionTimer.current)
     },
     [],
+  )
+
+  /**
+   * Publish this buffer's save function so `CloseConfirm` can offer *Save and close*.
+   *
+   * Keyed on the tab, not the pane: the dirty flag the confirmation reads is per tab, and a
+   * File tab has exactly one editor (`PaneBody` dispatches on the pane kind for this reason),
+   * so the two agree by construction.
+   */
+  const registerSaveHandle = useCallback(
+    (save: (() => Promise<void>) | null) => {
+      if (tab === undefined) return
+      if (save) registerBuffer(tab, save)
+      else unregisterBuffer(tab)
+    },
+    [tab],
   )
 
   const read = useCallback(
@@ -227,6 +244,7 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           onDirtyChange={reportDirty}
           onSave={onSave}
           onSelection={reportSelection}
+          onSaveHandle={registerSaveHandle}
         />
       </div>
     </div>

@@ -142,6 +142,22 @@ impl IdeServers {
         }
     }
 
+    /// Put a file reference into one pane's `claude` prompt.
+    ///
+    /// Addressed to a single pane, unlike `selection_changed`. A mention is something the
+    /// user aimed at a conversation — it lands in that prompt as text they are about to send
+    /// — so broadcasting it would type into every Claude in the project at once.
+    pub fn at_mentioned(
+        &self,
+        project: ProjectId,
+        pane: PaneId,
+        payload: cide_ide_mcp::AtMentioned,
+    ) {
+        if let Some(entry) = self.servers.get(&project) {
+            entry.server.at_mentioned(&pane.to_string(), payload);
+        }
+    }
+
     /// Stop a project's server, resolving anything it still owes.
     pub fn stop(&self, project: ProjectId) {
         let Some((_, entry)) = self.servers.remove(&project) else {
