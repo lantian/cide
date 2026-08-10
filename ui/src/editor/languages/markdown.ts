@@ -16,6 +16,25 @@ import { atLineStart, grammar, type GrammarState, type HookResult } from '../str
 
 const IN_FENCE = 1
 
+/**
+ * How far past a `[` the link matcher will look for its `](` and `)`.
+ *
+ * The bound is the whole point, not a tidy-up. Unbounded, `\[[^\]]*\]\(` scans to the end of
+ * the line for every `[` that does not open a link and then backtracks over the whole scan
+ * one character at a time — so a line of brackets is quadratic. Measured at 3.8 s for a
+ * 160,000-character line of `[`, against 0.13 s for the same line with this bound; the ratio
+ * across an 8× length step goes from 51× to 8×.
+ *
+ * The alternative that lost was an atomic group, `(?=([^\]]{0,512}))\1`, which is another
+ * 2× faster and which nobody reading this file in a year would recognise. The cost of the
+ * bound is that a link whose text or target runs past 512 characters is drawn as prose
+ * rather than as a link, which is a colour nobody will miss.
+ */
+const LINK_SCAN_LIMIT = 512
+
+/** `[text](url)` and `![alt](url)`, with the trailing `)` optional so a half-typed one colours. */
+const LINK = new RegExp(`^!?\\[[^\\]]{0,${LINK_SCAN_LIMIT}}\\]\\([^)]{0,${LINK_SCAN_LIMIT}}\\)?`)
+
 function hook(stream: StringStream, state: GrammarState): HookResult {
   const first = atLineStart(stream)
 
@@ -43,7 +62,7 @@ function hook(stream: StringStream, state: GrammarState): HookResult {
   if (stream.match(/^`[^`]*`?/)) return 'monospace'
   if (stream.match(/^(?:\*\*|__)(?:[^*_]|\*(?!\*)|_(?!_))*(?:\*\*|__)?/)) return 'strong'
   if (stream.match(/^(?:\*|_)(?:[^*_]+)(?:\*|_)?/)) return 'emphasis'
-  if (stream.match(/^!?\[[^\]]*\]\([^)]*\)?/)) return 'link'
+  if (stream.match(LINK)) return 'link'
   if (stream.match(/^<[^>\s]+>/)) return 'link'
   // Bare URLs, which are common in prose here and read as links everywhere else.
   if (stream.match(/^https?:\/\/\S+/)) return 'link'

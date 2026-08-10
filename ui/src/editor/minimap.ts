@@ -27,41 +27,29 @@
  * invalidate that cache without rebuilding the editor — the app toggles themes live, with
  * terminals running — so the plugin watches `data-theme` on the document element and
  * repaints. That is the whole of the theme story: no remount, no state rebuild.
+ *
+ * # Where the arithmetic lives
+ *
+ * `minimapGeometry.ts`, and it is checked by `scripts/check-editor.mjs`. What is left here
+ * is the part that needs a canvas, a scroller and a parse tree; the row pitch, the bar
+ * extent, the viewport rectangle and the click-to-line mapping are functions of numbers and
+ * are tested as such.
  */
 import { syntaxTree } from '@codemirror/language'
 import { highlightTree } from '@lezer/highlight'
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from '@codemirror/view'
 import { PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } from './highlight'
-
-/** Total width of the minimap column, from the mock. */
-export const MINIMAP_WIDTH = 96
-
-/** Row pitch, and the bar drawn inside it. The mock says 3px bars. */
-const ROW_PITCH = 3
-const BAR_HEIGHT = 2
-
-/** Horizontal padding inside the column, leaving room for the 1px rule on the left. */
-const PAD_LEFT = 5
-const PAD_RIGHT = 5
-
-/**
- * Columns that map to the full drawable width.
- *
- * Not derived from the document's longest line: that would make the scale jump whenever a
- * long line scrolled into the window, and a minimap whose bars change length without the
- * text changing reads as broken. 110 is a little past this project's own line budget, so a
- * typical line uses most of the width and a genuinely long one clips.
- */
-const SCALE_COLUMNS = 110
-
-/**
- * How much of a line is inspected for its colour and its length.
- *
- * A minified bundle is one line of two megabytes; reading it whole, per line, per frame, is
- * the difference between a minimap and a hang. Past this the bar is drawn full width, which
- * is the truth about a line that long anyway.
- */
-const LINE_SCAN_LIMIT = 512
+import {
+  LINE_SCAN_LIMIT,
+  MINIMAP_WIDTH,
+  barRect,
+  firstMapLine,
+  lastMapLine,
+  lineAtOffset,
+  lineMetrics,
+  mapRows,
+  viewportRect,
+} from './minimapGeometry'
 
 interface Palette {
   /** Resolved colour per highlight class, plus `''` for text with no class. */
@@ -208,12 +196,13 @@ class Minimap implements PluginValue {
 
   /** The first document line the map shows, given how far the buffer is scrolled. */
   private firstMapLine(rows: number): number {
-    const total = this.view.state.doc.lines
-    if (total <= rows) return 1
     const scroller = this.view.scrollDOM
-    const range = scroller.scrollHeight - scroller.clientHeight
-    const fraction = range > 0 ? Math.min(1, Math.max(0, scroller.scrollTop / range)) : 0
-    return 1 + Math.round((total - rows) * fraction)
+    return firstMapLine(
+      this.view.state.doc.lines,
+      rows,
+      scroller.scrollTop,
+      scroller.scrollHeight - scroller.clientHeight,
+    )
   }
 
   private draw(): void {
@@ -236,38 +225,35 @@ class Minimap implements PluginValue {
     ctx.clearRect(0, 0, MINIMAP_WIDTH, height)
 
     const state = this.view.state
-    const rows = Math.max(1, Math.floor(height / ROW_PITCH))
+    const rows = mapRows(height)
     const first = this.firstMapLine(rows)
-    const last = Math.min(state.doc.lines, first + rows - 1)
+    const last = lastMapLine(state.doc.lines, rows, first)
     const caretLine = state.doc.lineAt(state.selection.main.head).number
-
-    const usable = MINIMAP_WIDTH - PAD_LEFT - PAD_RIGHT
-    const perColumn = usable / SCALE_COLUMNS
 
     for (let n = first; n <= last; n++) {
       const row = this.rowFor(n)
       if (row.length === 0) continue
-      const y = (n - first) * ROW_PITCH
-      const x = PAD_LEFT + Math.min(usable, row.indent * perColumn)
-      const w = Math.max(1, Math.min(PAD_LEFT + usable - x, row.length * perColumn))
+      const bar = barRect(row.indent, row.length, n - first)
       ctx.fillStyle = n === caretLine ? this.palette.caret : row.colour
-      ctx.fillRect(x, y, w, BAR_HEIGHT)
+      ctx.fillRect(bar.x, bar.y, bar.width, bar.height)
     }
 
     // The viewport rectangle, painted over the bars.
-    const visibleFrom = state.doc.lineAt(this.view.viewport.from).number
-    const visibleTo = state.doc.lineAt(this.view.viewport.to).number
-    const top = (Math.max(first, visibleFrom) - first) * ROW_PITCH
-    const bottom = (Math.min(last, visibleTo) - first + 1) * ROW_PITCH
-    if (bottom > top) {
+    const rect = viewportRect(
+      first,
+      last,
+      state.doc.lineAt(this.view.viewport.from).number,
+      state.doc.lineAt(this.view.viewport.to).number,
+    )
+    if (rect !== null) {
       ctx.globalAlpha = 0.35
       ctx.fillStyle = this.palette.viewportFill
-      ctx.fillRect(0, top, MINIMAP_WIDTH, bottom - top)
+      ctx.fillRect(0, rect.top, MINIMAP_WIDTH, rect.height)
       ctx.globalAlpha = 1
       ctx.strokeStyle = this.palette.viewportStroke
       ctx.lineWidth = 1
       // Half-pixel offsets, or a 1px stroke straddles the boundary and paints 2px of grey.
-      ctx.strokeRect(0.5, top + 0.5, MINIMAP_WIDTH - 1, bottom - top - 1)
+      ctx.strokeRect(0.5, rect.top + 0.5, MINIMAP_WIDTH - 1, rect.height - 1)
     }
   }
 
@@ -281,12 +267,8 @@ class Minimap implements PluginValue {
    */
   private rowFor(number: number): Row {
     const line = this.view.state.doc.line(number)
-    const text = line.length > LINE_SCAN_LIMIT ? line.text.slice(0, LINE_SCAN_LIMIT) : line.text
-
-    let indent = 0
-    while (indent < text.length && (text[indent] === ' ' || text[indent] === '\t')) indent++
-    const trimmed = text.trimEnd().length - indent
-    if (trimmed <= 0) return { indent: 0, length: 0, colour: this.palette.plain }
+    const metrics = lineMetrics(line.text, this.view.state.tabSize)
+    if (metrics.length === 0) return { indent: 0, length: 0, colour: this.palette.plain }
 
     // `syntaxTree` returns whatever has been parsed so far and never blocks. For a large
     // file the parser has not reached most of the document, so most rows come back with no
@@ -319,10 +301,7 @@ class Minimap implements PluginValue {
       )
     }
 
-    // Tabs count for their visual width; a tab-indented file would otherwise look flat.
-    const tabs = text.slice(0, indent).split('\t').length - 1
-    const visualIndent = indent + tabs * (this.view.state.tabSize - 1)
-    return { indent: visualIndent, length: trimmed, colour }
+    return { indent: metrics.indent, length: metrics.length, colour }
   }
 
   // --- dragging ------------------------------------------------------------------------
@@ -360,10 +339,9 @@ class Minimap implements PluginValue {
   private scrollTo(event: PointerEvent): void {
     const rect = this.canvas.getBoundingClientRect()
     if (rect.height <= 0) return
-    const rows = Math.max(1, Math.floor(rect.height / ROW_PITCH))
+    const rows = mapRows(rect.height)
     const first = this.firstMapLine(rows)
-    const offset = Math.floor((event.clientY - rect.top) / ROW_PITCH)
-    const target = Math.min(this.view.state.doc.lines, Math.max(1, first + offset))
+    const target = lineAtOffset(event.clientY - rect.top, first, this.view.state.doc.lines)
     const pos = this.view.state.doc.line(target).from
     this.view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'center' }) })
   }

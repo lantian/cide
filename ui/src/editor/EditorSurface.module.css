@@ -108,9 +108,9 @@
  * CodeMirror measures during construction — the first frame would be laid out at the wrong
  * width and reflow.
  *
- * `--w-minimap` is 96px in `tokens.css` and `MINIMAP_WIDTH` in `minimap.ts` is the same
- * number. They are separate because canvas cannot read a custom property; if one moves the
- * other must.
+ * `--w-minimap` is 96px in `tokens.css` and `MINIMAP_WIDTH` in `minimapGeometry.ts` is the
+ * same number. They are separate because canvas cannot read a custom property; if one moves
+ * the other must, and `scripts/check-editor.mjs` fails the day only one of them does.
  */
 .body :global(.cm-scroller) {
   margin-right: var(--w-minimap);

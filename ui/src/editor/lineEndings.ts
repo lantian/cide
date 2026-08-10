@@ -56,10 +56,16 @@ export type LineEnding = 'LF' | 'CRLF' | 'CR' | 'Mixed'
 /**
  * The ending a document uses, or `Mixed` when it does not use one.
  *
- * "Every break the same, or mixed" is the deliberate test. A file with mixed endings is left
- * exactly as CodeMirror returned it rather than being silently unified in a direction nobody
- * asked for: the user's edit is the change they consented to, and normalising the other 400
- * lines is not.
+ * "Every break the same, or mixed" is the deliberate test.
+ *
+ * `Mixed` is a known loss and not a solved case, so say it plainly: nothing is restored, the
+ * buffer goes out as CodeMirror gave it, and therefore **every break that was not already
+ * `\n` is rewritten on the first save**. That is the same whole-file rewrite this module
+ * exists to prevent, avoided for the three uniform cases and not for this one. Fixing it
+ * needs the *sequence* of breaks carried alongside the document rather than one answer for
+ * the whole file — an array per 5 MB load — and choosing whether to pay that is a decision
+ * for whoever meets a real mixed file, not a detail to settle here. `check-editor.mjs`
+ * asserts the current behaviour so the day it changes is a deliberate day.
  *
  * A file with no line break at all reports `LF`, which is what it will be given one day and
  * what every tool assumes in the meantime. Reporting "none" would be more accurate and would
@@ -79,8 +85,8 @@ export function detectLineEnding(text: string): LineEnding {
  *
  * `ending` is the answer [`detectLineEnding`] gave for the document *as it was loaded*, not
  * for the buffer's current contents — by then every ending is `\n` and the question can no
- * longer be asked. `Mixed` restores nothing, which is the point: there is no single answer
- * to put back, so the buffer goes out as the editor gave it.
+ * longer be asked. `Mixed` restores nothing, and see [`detectLineEnding`] for why that is a
+ * named loss rather than the point.
  */
 export function restoreLineEndings(text: string, ending: LineEnding): string {
   if (ending === 'CRLF') return text.replace(/\n/g, '\r\n')
