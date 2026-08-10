@@ -157,6 +157,11 @@ export function App() {
   const focusPane = useWorkspace((st) => st.focusPane)
   const maximizePane = useWorkspace((st) => st.maximizePane)
   const setRatio = useWorkspace((st) => st.setRatio)
+  // Adding a ROW, as distinct from adding a tile to one. `pane_split` routes Col to `add_row`
+  // in the command layer, so this and `onAddTile` below are the same domain gesture family —
+  // but a row is anchored on the tab's spine rather than on a pane, which is why it has its
+  // own store action and its own control outside any pane's chrome.
+  const addRow = useWorkspace((st) => st.addRow)
   const bindSession = useWorkspace((st) => st.bindSession)
   const newClaudeTab = useWorkspace((st) => st.newClaudeTab)
   const detachPane = useWorkspace((st) => st.detachPane)
@@ -675,6 +680,11 @@ export function App() {
                     onRatioCommit={(split, ratio) =>
                       void setRatio(activeProject.id, tab.id, split, ratio)
                     }
+                    // Anchored on the focused pane, so a new row lands under the row the user
+                    // is working in rather than always at the bottom of the tab.
+                    onAddRow={(intent) =>
+                      void addRow(activeProject.id, tab.id, tab.tree.focused, 'after', intent)
+                    }
                     renderPane={(paneNode, index) => (
                       <PaneFrame
                         pane={paneNode}
@@ -682,6 +692,12 @@ export function App() {
                         focused={tab.tree.focused === paneNode.id}
                         maximized={tab.tree.maximized === paneNode.id}
                         onFocus={() => void focusPane(activeProject.id, tab.id, paneNode.id)}
+                        // `row` is a tile beside this one, in this pane's own row — the axis
+                        // the command layer routes to `add_tile`. The row gesture is on the
+                        // tree, not here, because it is not about any one pane.
+                        onAddTile={() =>
+                          void splitPane(activeProject.id, tab.id, paneNode.id, 'row', 'after')
+                        }
                         onMaximize={() =>
                           void maximizePane(
                             activeProject.id,

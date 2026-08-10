@@ -16,7 +16,7 @@
  * Run: `pnpm --dir ui run check:rows`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 // Under `node_modules/.cache` rather than the system temp dir: the bundle keeps
@@ -181,6 +181,28 @@ try {
       + 'of row one’s. Row two’s is left alone on purpose: it is already inside a member the '
       + 'spine hid, and `visibility` inherits.',
   )
+
+  // --- and that the one host which can supply the handlers actually does --------------------
+  //
+  // Everything above renders `SplitTree` from a fixture, so it proves the controls work when
+  // they are wired — and says nothing about whether anything wires them. Both are withheld
+  // when their callback is absent (the deliberate convention: a control that cannot act is
+  // not drawn), and `App.tsx` is their only caller in the app. So the fixture suite passed
+  // green with the feature completely unreachable, which is how this project has shipped a
+  // dead control more than once — the search button, the project tabs, `installThemeSync`.
+  //
+  // A source assertion, and worth being exact about what that is worth: it proves the props
+  // are passed, not that the values behind them reach Rust. The store actions they call are
+  // covered on the Rust side. Making the props required on the interfaces would be a stronger
+  // guarantee and was rejected — the fixtures above deliberately omit them to exercise the
+  // withheld path, and that coverage is worth more than the compile-time check.
+  const app = readFileSync('src/App.tsx', 'utf8')
+  for (const prop of ['onAddRow', 'onAddTile']) {
+    ok(
+      new RegExp(`\\b${prop}=\\{`).test(app),
+      `App.tsx passes \`${prop}\` — without it the control renders nowhere in the real app`,
+    )
+  }
 
   if (failed === 0) console.log('rows layout: ok')
   else console.error(`\n${failed} failure(s)`)
