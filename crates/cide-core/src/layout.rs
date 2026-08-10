@@ -1938,6 +1938,65 @@ mod tests {
     }
 
     #[test]
+    fn divider_k_separates_members_k_and_k_plus_one_in_a_left_leaning_chain() {
+        // The one contract this module shares with the renderer: divider `k` is the `k`-th
+        // interior split *in in-order*. Every other test here reaches a divider through
+        // `chain_splits` and so agrees with whatever order that function happens to use —
+        // swap it for pre-order and the entire suite still passes while a drag moves the
+        // wrong pair. This test reads the two ids off the tree by what they physically
+        // separate instead, which is the only way to pin it.
+        //
+        // Left-leaning on purpose: `add_row(None, After)` wraps the whole root, so a tab
+        // built by appending rows is `Col(Col(r1, r2), r3)` — the one shape where in-order
+        // and pre-order disagree. `pane.addRow` defaults `after` to null, so that is the
+        // shape the default gesture builds.
+        let first = aux();
+        let r1 = first.id;
+        let mut tree = new_tree(first);
+        let r2 = add_row(&mut tree, None, Side::After, aux()).expect("row 2");
+        add_row(&mut tree, None, Side::After, aux()).expect("row 3");
+
+        let LayoutNode::Split { id: outer, a, .. } = &tree.root else {
+            panic!("appending rows leaves a Col spine at the root");
+        };
+        let LayoutNode::Split { id: inner, .. } = a.as_ref() else {
+            panic!("with the older two rows nested inside it");
+        };
+        // `inner` divides r1 from r2; `outer` divides {r1, r2} from r3.
+        assert_eq!(leaves(a), vec![r1, r2]);
+        let (outer, inner) = (*outer, *inner);
+
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Col, &mut dividers);
+        assert_eq!(
+            dividers,
+            vec![inner, outer],
+            "divider 0 is the one between rows 1 and 2, whichever way the tree leans"
+        );
+
+        // And the behaviour that indexing buys: the *lower* divider leaves row 1 alone.
+        let before = weights(&tree.root, Axis::Col);
+        set_ratio(&mut tree, outer, 0.8).expect("the lower divider moves");
+        let after = weights(&tree.root, Axis::Col);
+        assert!(
+            (after[0] - before[0]).abs() < 1e-6,
+            "row 1 sits above that divider: {before:?} -> {after:?}"
+        );
+        assert!(after[1] > before[1] && after[2] < before[2], "{after:?}");
+
+        // ...and the upper one leaves row 3 alone.
+        let before = weights(&tree.root, Axis::Col);
+        set_ratio(&mut tree, inner, 0.25).expect("the upper divider moves");
+        let after = weights(&tree.root, Axis::Col);
+        assert!(
+            (after[2] - before[2]).abs() < 1e-6,
+            "row 3 sits below it: {before:?} -> {after:?}"
+        );
+        assert!(after[0] < before[0] && after[1] > before[1], "{after:?}");
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
     fn set_ratio_on_a_two_leaf_split_behaves_exactly_as_it_did() {
         // The shipped console's shape. A pair that is the whole chain has `pair share` and
         // `a`'s share meaning the same number, which is why no existing caller changed.
