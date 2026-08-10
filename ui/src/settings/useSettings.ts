@@ -13,7 +13,7 @@
  * eagerly here, before the round trip, because a theme that flips a frame late reads as a
  * broken switch. [`installThemeSync`] is the single place that does the repainting, for the
  * window that made the change and for the windows that only hear about it in a snapshot; it
- * must be installed once per window, from `App`.
+ * is installed once per window from `main.tsx`, before the first render.
  *
  * That exception is also why [`applyTheme`] and [`installThemeSync`] are exported as plain
  * functions rather than living inside `useSettingsActions`. The theme is changed from two
@@ -32,7 +32,7 @@ import {
 import { useWorkspace, type Theme } from '@/store/workspace'
 import { liveHosts } from '@/layout/paneHosts'
 import { retheme } from '@/terminal/xterm'
-import { otherTheme, themeToAdopt } from './theme'
+import { asThemeName, DEFAULT_THEME, otherTheme, themeToAdopt } from './theme'
 
 /** The settings this window currently mirrors, or `null` before bootstrap resolves. */
 export function useSettings(): Settings | null {
@@ -82,11 +82,21 @@ export function useSettingsActions(): SettingsActions {
  * tables are repainted by [`installThemeSync`]'s subscription, synchronously inside this
  * `set`, and a theme that flips a frame late reads as a broken switch. The round trip is
  * what carries it to the *other* windows, where the same subscription picks it out of the
- * snapshot.
+ * snapshot. `themeToAdopt` is what keeps the subscription from undoing the local half
+ * before the snapshot gets back.
+ *
+ * The failure is not swallowed, unlike [`useSettingsActions.patch`]. Every other setting is
+ * shown from the mirror, so a write that never landed simply fails to appear; the theme is
+ * the one setting painted locally first, and a rejected write would otherwise leave this
+ * window wearing a palette no other window has and `workspace.json` does not know about —
+ * the reported bug, arrived at from the other end. Put the mirror's answer back instead.
  */
 export function applyTheme(theme: Theme): void {
   useWorkspace.getState().setTheme(theme)
-  void settingsApi.set({ theme }).catch(() => {})
+  void settingsApi.set({ theme }).catch(() => {
+    const stored = useWorkspace.getState().boot?.workspace.settings.theme
+    if (stored !== undefined) useWorkspace.getState().setTheme(stored)
+  })
 }
 
 /** Flip to the other theme and persist it. What the header's button is for. */
@@ -145,19 +155,37 @@ function paintTheme(theme: Theme): void {
  * A store subscription rather than an effect per component: the store is the thing that
  * changes, there is one of it per window, and this way exactly one place is listening.
  *
- * Returns an unsubscribe function. Idempotent — calling it twice installs one subscription —
- * so a `StrictMode` double-mount cannot end up with two.
+ * Called from `main.tsx`, before `createRoot`, and not from `App`: an effect would run after
+ * the first render, which is after `TerminalPane` can have built a terminal, and this has to
+ * be the thing that settles what palette that terminal reads. `main.tsx` also makes it
+ * unconditional — a component-level call is one refactor away from being dropped, which is
+ * how this function came to be exported, documented and called by nothing.
+ *
+ * Returns an unsubscribe function. Idempotent: a second caller gets a no-op rather than the
+ * installer's disposer, because a component that installed nothing must not be able to tear
+ * down the window's only theme listener when it unmounts.
  */
 export function installThemeSync(): () => void {
-  if (themeSyncInstalled !== null) return themeSyncInstalled
+  if (themeSyncInstalled !== null) return noop
 
   // Before the subscription, because the first paint of the window is not a store change.
-  // `index.html` carries no `data-theme`, so until this runs the document is on whatever
-  // bare `:root` says, and any terminal built in the meantime has read those tokens.
-  paintTheme(useWorkspace.getState().theme)
+  //
+  // The attribute wins over the store's seed when it is there. `public/theme-boot.js` writes
+  // it in <head> from the `?theme=` parameter `windows.rs` bakes in from the saved settings,
+  // so it is the persisted theme, known a whole module graph earlier than `hydrate` can say
+  // it. Painting the seed over it would flash the wrong palette on every launch — and would
+  // hand any terminal built before `hydrate` the wrong resolved colours, which `retheme`
+  // then has to undo.
+  const start = asThemeName(document.documentElement.dataset.theme) ?? DEFAULT_THEME
+  useWorkspace.getState().setTheme(start)
+  paintTheme(start)
 
-  const unsubscribe = useWorkspace.subscribe((state) => {
-    const adopt = themeToAdopt(state.theme, state.boot?.workspace.settings.theme)
+  const unsubscribe = useWorkspace.subscribe((state, previous) => {
+    const adopt = themeToAdopt(
+      state.theme,
+      state.boot?.workspace.settings.theme,
+      previous.boot?.workspace.settings.theme,
+    )
     if (adopt !== null) {
       // Re-enters this listener synchronously with the field moved, and `themeToAdopt`
       // answers `null` there, so the paint happens on the way through and once.
@@ -173,5 +201,7 @@ export function installThemeSync(): () => void {
   }
   return themeSyncInstalled
 }
+
+const noop = (): void => {}
 
 let themeSyncInstalled: (() => void) | null = null

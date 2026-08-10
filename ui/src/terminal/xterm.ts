@@ -223,9 +223,12 @@ export function releaseWebgl(handle: TerminalHandle): void {
  *
  * `liveHosts()` yields hosts sitting in the parking div as well as mounted ones, and they
  * are repainted here rather than on the way back in. xterm carries it: while its
- * IntersectionObserver says the screen is hidden, `RenderService.refreshRows` records
- * `_needsFullRefresh` instead of drawing, and flushes it when the element becomes visible
- * again. A host that skipped this would re-dock wearing the old palette.
+ * IntersectionObserver says the screen is hidden, `RenderService._fullRefresh` records
+ * `_needsFullRefresh` instead of drawing, and `_handleIntersectionChange` flushes it when the
+ * element becomes visible again. A parked host with no measurable size also leaves
+ * `WebglRenderer._isAttached` false, and `renderRows` re-acquires the atlas on the first
+ * frame after it is connected and measurable. A host that skipped this would re-dock wearing
+ * the old palette.
  *
  * A host that was *evicted* has no terminal at all; the one rebuilt in its place reads the
  * tokens in `createTerminal` and is correct without going through here.

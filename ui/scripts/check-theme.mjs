@@ -66,6 +66,7 @@ try {
 
   const {
     DEFAULT_THEME,
+    asThemeName,
     otherTheme,
     themeToAdopt,
     TERMINAL_SLOTS,
@@ -94,20 +95,51 @@ try {
   // dark and a snapshot arrives saying light; without this answer being 'light', B keeps its
   // theme until it is restarted — which is what "doesn't switch all claude/terminal windows"
   // looks like from the outside.
-  eq(themeToAdopt('dark', 'light'), 'light', 'a window adopts the theme another window set')
-  eq(themeToAdopt('light', 'dark'), 'dark', 'and in the other direction')
   eq(
-    themeToAdopt('light', 'light'),
+    themeToAdopt('dark', 'light', 'dark'),
+    'light',
+    'a window adopts the theme another window set',
+  )
+  eq(themeToAdopt('light', 'dark', 'light'), 'dark', 'and in the other direction')
+  eq(
+    themeToAdopt('light', 'light', 'dark'),
     null,
-    'the window that made the change has nothing to adopt — this runs inside a store ' +
-      'subscription, and answering with a value here would write the store on every snapshot',
+    'the window that made the change has nothing to adopt when its own write comes back — ' +
+      'this runs inside a store subscription, and answering with a value here would write ' +
+      'the store on every snapshot',
   )
   eq(
-    themeToAdopt('light', undefined),
+    themeToAdopt('light', undefined, undefined),
     null,
     'a window whose mirror has no settings yet has not been told anything and must not ' +
       'overwrite what it is showing',
   )
+  eq(
+    themeToAdopt('light', 'light', undefined),
+    null,
+    'bootstrap sets the mirror and the shown theme in one `set`, so there is nothing to adopt',
+  )
+  // The regression this argument exists for. Between the click and the snapshot the window
+  // that made the change shows the new theme while the mirror still holds the old one; a
+  // rule that only compared the two would answer 'dark' here and write the user's click
+  // straight back out — leaving the switch to wait on an IPC round trip, or never happen if
+  // it failed.
+  eq(
+    themeToAdopt('light', 'dark', 'dark'),
+    null,
+    'a local change waiting on its round trip is not reverted: the mirror did not move',
+  )
+  eq(
+    themeToAdopt('light', 'dark', undefined),
+    'dark',
+    'but a mirror that has only just appeared and disagrees is still followed',
+  )
+
+  // Read back off `<html data-theme>` at install, ahead of the store's seed.
+  eq(asThemeName('dark'), 'dark', 'the boot script’s attribute is taken at face value')
+  eq(asThemeName('light'), 'light', 'in both directions')
+  eq(asThemeName(undefined), null, 'an unset attribute falls through to the default')
+  eq(asThemeName('beige'), null, 'and so does anything that is not a theme')
 
   // --- the terminal palette ---------------------------------------------------------------
   const slots = TERMINAL_SLOTS.map(([slot]) => slot)
