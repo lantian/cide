@@ -6,8 +6,8 @@
  * `model.ts`. That split is what lets the model be tested under node with no DOM
  * (`ui/scripts/check-git-tree.mjs`) and what keeps this file readable as a layout.
  *
- * The panel takes `project` and nothing else, so the sidebar that hosts it needs to know
- * nothing about git. Mount it as:
+ * The panel takes `project` and an optional place to put a diff, so the sidebar that hosts it
+ * needs to know nothing about git:
  *
  * ```tsx
  * {view === 'git' && <GitPanel project={activeProjectId} />}
@@ -16,14 +16,14 @@
  * With `?git-story=<name>` on the URL it renders a fixture instead of talking to Rust —
  * `mock`, `guard`, `multi`, `empty`. See `fixture.ts` for why that exists.
  */
-import { useMemo, useState } from 'react'
-import type { ProjectId } from '@/ipc/client'
+import { useEffect, useMemo, useState } from 'react'
+import type { FileDiff, ProjectId, RepoId } from '@/ipc/client'
 import { ChangesTree } from './ChangesTree'
 import { CommitBox } from './CommitBox'
 import { GuardBar } from './GuardBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
-import { partialFiles, summarize } from './model'
+import { allRepos, partialFiles, repoOf, summarize } from './model'
 import { useGitPanel } from './useGitPanel'
 import styles from './GitPanel.module.css'
 
@@ -32,21 +32,37 @@ type PanelTab = 'commit' | 'shelf'
 export interface GitPanelProps {
   /** The active project, or `null` before one is open — then the panel is simply empty. */
   project: ProjectId | null
+  /**
+   * Where a double-clicked file's diff goes.
+   *
+   * Optional because the panel cannot open a pane by itself and must not pretend to: without
+   * it the diff is still fetched and the panel says, in its one warning line, that there is
+   * nowhere to show it. Wiring this is the host's job — see the README note in `index.ts`.
+   */
+  onOpenDiff?: ((diff: FileDiff, repo: RepoId) => void) | undefined
 }
 
-export function GitPanel({ project }: GitPanelProps) {
-  const git = useGitPanel(project)
+export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
+  const git = useGitPanel(project, { onOpenDiff })
   const [tab, setTab] = useState<PanelTab>('commit')
 
-  const partial = useMemo(() => partialFiles(git.tree), [git.tree])
+  const partial = useMemo(() => partialFiles(git.view), [git.view])
   const summary = useMemo(() => summarize(git.picked), [git.picked])
   const hasSelection = git.picked.length > 0
-  // Amend needs a commit to amend. On an unborn branch every repo reports no head message,
-  // and the checkbox is disabled rather than removed so its absence is explicable.
-  const canAmend = git.tree.repos.some((r) => r.headMessage !== undefined)
+  const repos = useMemo(() => allRepos(git.view), [git.view])
+  // Amend needs a commit to amend. On an unborn branch there is none, and the checkbox is
+  // disabled rather than removed so its absence is explicable.
+  const canAmend = repos.some((r) => !r.branch.unborn)
 
-  const labelFor = (root: string) =>
-    git.tree.repos.find((r) => r.root === root)?.label ?? (root.split('/').pop() ?? root)
+  // The Shelf tab reads a different command from the Commit tab, so it is loaded when it is
+  // opened rather than kept warm — `git_shelf_list` is one round trip per repository and the
+  // tab is the only thing that reads it.
+  const { refreshShelf } = git
+  useEffect(() => {
+    if (tab === 'shelf') refreshShelf()
+  }, [tab, refreshShelf])
+
+  const labelFor = (repo: RepoId) => repoOf(git.view, repo)?.name ?? repo
 
   return (
     <aside className={styles.panel} data-audit="gitPanel" aria-label="Commit">
@@ -67,8 +83,8 @@ export function GitPanel({ project }: GitPanelProps) {
         </div>
         {/* The branch belongs in the header of a commit window; with several repos it is
             per-repo and the tree's own rows carry it instead. */}
-        {git.tree.repos.length === 1 && git.tree.repos[0]?.branch !== undefined && (
-          <span className={styles.branch}>⑂ {git.tree.repos[0].branch}</span>
+        {repos.length === 1 && repos[0] !== undefined && repos[0].branch.head !== '' && (
+          <span className={styles.branch}>⑂ {repos[0].branch.head}</span>
         )}
       </div>
 
@@ -110,7 +126,12 @@ export function GitPanel({ project }: GitPanelProps) {
             onOpenDiff={git.openDiff}
           />
         ) : (
-          <ShelfList entries={git.shelf} onUnshelve={() => git.refresh()} />
+          <ShelfList
+            entries={git.shelf}
+            showRepo={repos.length > 1}
+            labelFor={labelFor}
+            onUnshelve={git.unshelve}
+          />
         )}
       </div>
 
@@ -118,7 +139,7 @@ export function GitPanel({ project }: GitPanelProps) {
           Shelf tab is showing, and hiding the warning behind a tab is how it gets missed. */}
       <GuardBar
         repos={git.diverged}
-        showRepo={git.tree.repos.length > 1}
+        showRepo={repos.length > 1}
         labelFor={labelFor}
         onReload={git.reloadIndex}
         onOverwrite={git.overwriteIndex}

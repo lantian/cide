@@ -9,12 +9,36 @@
  * {view === 'git' && <GitPanel project={activeProjectId} />}
  * ```
  *
+ * ## Wiring the diff
+ *
+ * Double-clicking a file fetches its `FileDiff` and hands it to `onOpenDiff`. The panel does
+ * not own a pane and cannot open one, so the prop is optional and the un-wired case is
+ * *reported*, not swallowed. A host that has somewhere to put a diff passes:
+ *
+ * ```tsx
+ * <GitPanel project={activeProjectId} onOpenDiff={(diff, repo) => …} />
+ * ```
+ *
  * The hook, the story selector and the wire types come with it, for anyone wiring the
  * stories into a layout audit later. `model.ts` deliberately does *not*: it is imported by
  * file path from `ui/scripts/check-git-tree.mjs`, which compiles that one module with tsc
  * and imports the output, so routing it through a barrel would only drag React in.
  */
 export { GitPanel, type GitPanelProps } from './GitPanel'
-export { useGitPanel, type GitPanelActions, type GitPanelModel } from './useGitPanel'
+export {
+  useGitPanel,
+  type GitPanelActions,
+  type GitPanelModel,
+  type GitPanelOptions,
+} from './useGitPanel'
 export { storyFromQuery, type GitStory, type GitStoryName } from './fixture'
-export type { ChangeFile, ChangeGroup, ChangesTree, FileStatus, RepoChanges } from './types'
+export type {
+  ChangeEntry,
+  ChangesTree,
+  GroupKind,
+  GroupView,
+  RepoChanges,
+  RepoView,
+  ShelfRow,
+  StatusView,
+} from './types'

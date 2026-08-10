@@ -8,10 +8,11 @@
  * `git add`, so the collision is likely rather than theoretical. When the index no longer
  * matches what cide last wrote, the choice belongs to the user:
  *
- * * **Reload** — git's view wins. cide's ticks for that repo are dropped and the panel
- *   re-reads status, so what is on screen is what is really staged.
- * * **Overwrite** — cide's view wins. The next commit is sent without an index
- *   expectation, and the changelist is written over whatever `git add` put there.
+ * * **Reload** — git's view wins. `git_adopt_index` records the index as it now stands, cide's
+ *   ticks for that repo are dropped, and what is on screen is what is really staged.
+ * * **Overwrite** — cide's view wins. The next commit for that repo is sent with
+ *   `CommitRequest.force`, and the changelist is written over whatever `git add` put there.
+ *   Nothing else in the panel ever sets `force`.
  *
  * # Why it is not a dialog
  *
@@ -24,10 +25,11 @@
  * `?git-story=guard` renders it from a fixture. See `fixture.ts`.
  */
 import styles from './GuardBar.module.css'
+import type { RepoId } from './types'
 
 export interface GuardBarProps {
-  /** Absolute roots whose index moved. One bar per repo — they are answered separately. */
-  repos: readonly string[]
+  /** Ids of the repos whose index moved. One bar per repo — they are answered separately. */
+  repos: readonly RepoId[]
   /**
    * Whether to name the repository in the bar.
    *
@@ -36,9 +38,9 @@ export interface GuardBarProps {
    * here would leave exactly that case unlabelled.
    */
   showRepo: boolean
-  labelFor: (repo: string) => string
-  onReload: (repo: string) => void
-  onOverwrite: (repo: string) => void
+  labelFor: (repo: RepoId) => string
+  onReload: (repo: RepoId) => void
+  onOverwrite: (repo: RepoId) => void
 }
 
 export function GuardBar({ repos, showRepo, labelFor, onReload, onOverwrite }: GuardBarProps) {

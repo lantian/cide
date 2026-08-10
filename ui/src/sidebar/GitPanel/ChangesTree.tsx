@@ -21,7 +21,14 @@
  * panel refreshes while the user types.
  */
 import { useCallback, useRef, useState, type KeyboardEvent } from 'react'
-import { checkState, splitPath, type CheckState, type Row } from './model'
+import {
+  checkState,
+  entryStatus,
+  isPartiallyStaged,
+  splitPath,
+  type CheckState,
+  type Row,
+} from './model'
 import { TriCheckbox } from './TriCheckbox'
 import styles from './ChangesTree.module.css'
 
@@ -179,10 +186,12 @@ export function ChangesTree({
 }
 
 /**
- * A changelist, a repo or a submodule: name, then its file count.
+ * A changelist or a repository: name, then its file count.
  *
  * The active changelist is the one a commit defaults to, so it is the one name in this
- * tree that is drawn in `--text` rather than `--dim`.
+ * tree that is drawn in `--text` rather than `--dim`. A repository row carries its absolute
+ * work tree as a tooltip — the row itself shows only the last path component, and in a
+ * workspace with two roots called `core` that is the only way to tell them apart.
  */
 function GroupLabel({ row }: { row: Row }) {
   return (
@@ -191,6 +200,7 @@ function GroupLabel({ row }: { row: Row }) {
         className={styles.groupName}
         data-kind={row.kind}
         data-active={row.active === true ? '' : undefined}
+        {...(row.root === undefined ? {} : { title: row.root })}
       >
         {row.label}
       </span>
@@ -207,22 +217,22 @@ function GroupLabel({ row }: { row: Row }) {
  * two different pieces of information about the same file.
  */
 function FileLabel({ row }: { row: Row }) {
-  const file = row.file
-  if (file === undefined) return null
-  const { name, dir } = splitPath(file.path)
+  const entry = row.entry
+  if (entry === undefined) return null
+  const { name, dir } = splitPath(entry.path)
   return (
     <>
-      <span className={styles.fileName} data-status={file.status} title={file.path}>
+      <span className={styles.fileName} data-status={entryStatus(entry)} title={entry.path}>
         {name}
       </span>
       {dir !== '' && <span className={styles.dir}>{dir}</span>}
-      {file.originalPath !== undefined && (
-        <span className={styles.dir}>← {splitPath(file.originalPath).name}</span>
+      {entry.origPath !== null && (
+        <span className={styles.dir}>← {splitPath(entry.origPath).name}</span>
       )}
-      {file.partial === true && (
+      {isPartiallyStaged(entry) && (
         // Says out loud what the `–` box means for a leaf, which is otherwise the one
         // tri-state in the tree with no second row to compare against.
-        <span className={styles.partialTag} title="Only some hunks of this file are staged">
+        <span className={styles.partialTag} title="Only part of this file is staged">
           partial
         </span>
       )}

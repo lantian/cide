@@ -3,39 +3,84 @@
  *
  * Same shape as `check-status-format.mjs`, and for the same reason: this project has no JS
  * test runner, and adding one for a handful of pure functions would be a larger commitment
- * than the code it tests. What is pinned here is the behaviour that is invisible in a
- * screenshot and expensive to get wrong:
+ * than the code it tests.
  *
- *   * the repo level is elided with one repo and present with two (§5.3),
- *   * a submodule is a nested group whose files roll up into its parent's count,
- *   * tri-state distinguishes "none of these" from "some of the hunks of one of them",
- *   * a collapsed group still commits its ticked files — the one bug in this panel that
- *     would silently produce a wrong commit,
- *   * `normalizeStatus` never throws, whatever the backend sends.
+ * # The failure this exists to prevent
+ *
+ * This check used to pass while the panel was **permanently empty against every real
+ * repository**. It drove `normalizeStatus` with a fixture written in the shape the *panel*
+ * assumed — a top-level `root`, a recursive `groups` tree — and asserted that that shape
+ * survived. `git_status` returns `repos[].repo.{id,root,name}`, `repos[].branch`, and four
+ * sibling lists, so every real repo failed `normalizeRepo`'s first check and was dropped. The
+ * check was green because it was asking the panel to agree with itself.
+ *
+ * So the fixture below is a `cide_ipc::git::ChangesTree`, field for field, derived from
+ * `crates/cide-ipc/src/git.rs` and not from anything in `ui/`. `WIRE_FIELDS` pins the field
+ * names it depends on, so a rename in Rust that `cargo xtask codegen` propagates into
+ * `ui/src/ipc/generated.ts` fails here too rather than silently emptying the panel again.
+ *
+ * What else is pinned: the repo level is elided with one repo and present with two (§5.3), a
+ * submodule is a nested *repository* whose files roll up into its parent, tri-state
+ * distinguishes "none of these" from "some of one of them", a collapsed group still commits
+ * its ticked files, row ids carry `RepoId` rather than a path, and `normalizeStatus` never
+ * throws whatever the backend sends.
  *
  * Run: `pnpm --dir ui run check:git`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
+const UI = resolve(import.meta.dirname, '..')
 const out = mkdtempSync(join(tmpdir(), 'cide-git-'))
 try {
-  execFileSync(
-    'node',
-    [
-      'node_modules/typescript/bin/tsc',
-      'src/sidebar/GitPanel/model.ts',
-      '--outDir', out,
-      '--module', 'esnext',
-      '--target', 'es2022',
-      '--moduleResolution', 'bundler',
-    ],
-    { stdio: 'inherit' },
+  /*
+   * `model.ts` imports its types from `./types.ts`, which imports the generated wire types
+   * through the `@/*` alias. A bare `tsc model.ts` has no `paths`, so the alias would not
+   * resolve; a generated tsconfig carries it. The alternative — a relative `../../ipc/…`
+   * import in one source file — would put a rule in the app's source purely to suit a test
+   * script, and this codebase uses `@/` everywhere else.
+   *
+   * The imports are type-only, so the emitted `model.js` has no imports at all and node can
+   * load it directly. `types.ts` must stay free of runtime values for that to hold; it says
+   * so in a comment at the bottom of the file.
+   */
+  const tsconfig = join(out, 'tsconfig.json')
+  writeFileSync(
+    tsconfig,
+    JSON.stringify({
+      compilerOptions: {
+        target: 'es2022',
+        module: 'esnext',
+        moduleResolution: 'bundler',
+        strict: true,
+        exactOptionalPropertyTypes: true,
+        noUncheckedIndexedAccess: true,
+        verbatimModuleSyntax: true,
+        skipLibCheck: true,
+        // Without this a configuration mistake here — a `rootDir` that does not contain every
+        // source file, say — makes tsc report the error *and* fall back to emitting each
+        // `.js` next to its `.ts`, littering `ui/src` with generated files that look tracked.
+        noEmitOnError: true,
+        outDir: out,
+        // `src`, not the panel's own directory: `types.ts` reaches out to `@/ipc/generated`
+        // through the alias, and tsc requires every source file to sit under `rootDir`. The
+        // output therefore mirrors the source tree under `out`.
+        rootDir: join(UI, 'src'),
+        baseUrl: UI,
+        paths: { '@/*': ['src/*'] },
+        types: [],
+      },
+      files: [join(UI, 'src', 'sidebar', 'GitPanel', 'model.ts')],
+    }),
   )
+  execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', tsconfig], {
+    stdio: 'inherit',
+    cwd: UI,
+  })
 
-  const m = await import(`file://${join(out, 'model.js')}`)
+  const m = await import(`file://${join(out, 'sidebar', 'GitPanel', 'model.js')}`)
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -46,52 +91,154 @@ try {
       failed++
     }
   }
+  const ok = (cond, what) => eq(cond, true, what)
 
-  // Two changelists, one of them holding a submodule group, plus unversioned files.
-  const repo = (root, label) => ({
-    root,
-    label,
-    headMessage: 'previous commit',
-    groups: [
+  // --- the wire shape, pinned against the generated types ------------------------------
+
+  /*
+   * Every field the fixture below leans on, and where it lives. Read out of the generated
+   * types rather than out of Rust directly: `cargo xtask codegen` is the gate that keeps the
+   * two in step, so `generated.ts` is the frontend's copy of `crates/cide-ipc/src/git.rs` and
+   * the one a TypeScript check can read. A rename that lands there and not here is exactly
+   * the drift that emptied the panel.
+   */
+  const generated = readFileSync(join(UI, 'src', 'ipc', 'generated.ts'), 'utf8')
+  const WIRE_FIELDS = {
+    ChangesTree: ['repos'],
+    RepoChanges: [
+      'repo',
+      'branch',
+      'changelists',
+      'unversioned',
+      'ignored',
+      'conflicts',
+      'indexChangedExternally',
+      'useStagingArea',
+    ],
+    RepoInfo: ['id', 'root', 'name', 'parent', 'isSubmodule'],
+    ChangelistView: ['id', 'name', 'comment', 'active', 'changes'],
+    ChangeEntry: ['path', 'origPath', 'index', 'worktree', 'staged', 'binary', 'submodule', 'changelist'],
+  }
+  for (const [type, fields] of Object.entries(WIRE_FIELDS)) {
+    const decl = new RegExp(`export type ${type} = \\{[\\s\\S]*?\\};`).exec(generated)?.[0]
+    ok(decl !== undefined, `the generated types still declare ${type}`)
+    for (const field of fields) {
+      ok(
+        decl !== undefined && new RegExp(`(^|[\\s{,])${field}[?]?:`, 'm').test(decl),
+        `${type}.${field} is still what Rust sends — the panel reads it by that name`,
+      )
+    }
+  }
+
+  // --- a fixture in that shape ---------------------------------------------------------
+
+  const entry = (path, index, worktree, changelist, extra = {}) => ({
+    path,
+    origPath: null,
+    index,
+    worktree,
+    staged: index !== 'unmodified',
+    binary: false,
+    submodule: false,
+    changelist,
+    ...extra,
+  })
+
+  const branch = { head: 'main', detached: false, upstream: null, ahead: 0, behind: 0, operation: null, unborn: false }
+
+  /** One root: two changelists, plus unversioned and ignored files. */
+  const repo = (id, root, name, parent = null) => ({
+    repo: { id, root, name, parent, isSubmodule: parent !== null },
+    branch,
+    changelists: [
       {
         id: 'default',
         name: 'Changes',
-        kind: 'changelist',
+        comment: '',
         active: true,
-        files: [
-          { path: 'a.rs', status: 'modified' },
-          { path: 'src/b.rs', status: 'modified', partial: true },
-        ],
-        groups: [
-          {
-            id: 'sub',
-            name: 'vendor/zlib',
-            kind: 'submodule',
-            files: [{ path: 'vendor/zlib/z.c', status: 'modified' }],
-          },
+        changes: [
+          entry('a.rs', 'unmodified', 'modified', 'default'),
+          // Both sides dirty: partially staged, which is the leaf-level `–`.
+          entry('src/b.rs', 'modified', 'modified', 'default'),
         ],
       },
       {
         id: 'fixes',
         name: 'fixes',
-        kind: 'changelist',
-        files: [{ path: 'c.rs', status: 'added' }],
-      },
-      {
-        id: 'unversioned',
-        name: 'Unversioned Files',
-        kind: 'unversioned',
-        files: [{ path: 'notes.md', status: 'unversioned' }],
+        comment: '',
+        active: false,
+        changes: [entry('c.rs', 'added', 'unmodified', 'fixes')],
       },
     ],
+    unversioned: [entry('notes.md', 'unmodified', 'untracked', 'default')],
+    ignored: [entry('target', 'unmodified', 'ignored', 'default')],
+    conflicts: [],
+    indexChangedExternally: false,
+    useStagingArea: false,
   })
 
-  const one = { repos: [repo('/w/app', 'app')] }
-  const two = { repos: [repo('/w/app', 'app'), repo('/w/lib', 'lib')] }
+  const APP = 'app-0000-0000'
+  const LIB = 'lib-0000-0000'
+  const SUB = 'sub-0000-0000'
+
+  const submodule = {
+    ...repo(SUB, '/w/app/vendor/zlib', 'vendor/zlib', APP),
+    changelists: [
+      {
+        id: 'default',
+        name: 'Changes',
+        comment: '',
+        active: true,
+        changes: [entry('z.c', 'unmodified', 'modified', 'default')],
+      },
+    ],
+    unversioned: [],
+    ignored: [],
+  }
+
+  // The whole point of the rewrite: this is what Rust sends, and repos must survive it.
+  const one = m.normalizeStatus({ repos: [repo(APP, '/w/app', 'app')] })
+  const two = m.normalizeStatus({
+    repos: [repo(APP, '/w/app', 'app'), repo(LIB, '/w/lib', 'lib')],
+  })
+  const nested = m.normalizeStatus({ repos: [repo(APP, '/w/app', 'app'), submodule] })
+
+  eq(
+    one.repos.length,
+    1,
+    'a real `git_status` payload survives normalisation — the bug this whole check exists '
+      + 'for was every repo being dropped here, which showed up as a permanently empty panel',
+  )
+  eq(one.repos[0].id, APP, 'and the repo carries its RepoId, which every git command needs')
+  eq(one.repos[0].root, '/w/app', 'and its work tree, for the tooltip')
+  eq(one.repos[0].name, 'app', 'and its name, which is what the row shows')
+  eq(
+    one.repos[0].groups.map((g) => [g.id, g.kind]),
+    [
+      ['cl:default', 'changelist'],
+      ['cl:fixes', 'changelist'],
+      ['unversioned', 'unversioned'],
+      ['ignored', 'ignored'],
+    ],
+    'the four sibling lists become groups in one order, with empty ones dropped and '
+      + 'changelist ids prefixed so a changelist named `ignored` cannot collide',
+  )
+  eq(
+    m.normalizeStatus({
+      repos: [{ ...repo(APP, '/w/app', 'app'), conflicts: [entry('x', 'conflicted', 'conflicted', 'default')] }],
+    }).repos[0].groups[0].kind,
+    'conflicts',
+    'conflicts come first: they block the commit, and a group that has to be scrolled to is '
+      + 'a group that gets committed around',
+  )
+
+  eq(nested.repos.length, 1, 'a submodule is re-nested under its parent, not left at the top')
+  eq(nested.repos[0].children.map((c) => c.id), [SUB], 'under the repo its `parent` names')
+  eq(nested.repos[0].children[0].isSubmodule, true, 'and it knows it is one')
 
   // --- shape ---------------------------------------------------------------------------
 
-  const openAll = (tree) => m.allGroups(tree)
+  const openAll = (view) => m.allGroups(view)
   const rows1 = m.buildRows(one, openAll(one))
   eq(
     rows1.filter((r) => r.kind === 'repo').length,
@@ -100,52 +247,52 @@ try {
   )
   eq(rows1[0].label, 'Changes', 'the first row is the first changelist')
   eq(rows1[0].depth, 0, 'with one repo, changelists sit flush at depth 0')
-  eq(
-    rows1.find((r) => r.label === 'vendor/zlib').depth,
-    1,
-    'a submodule is a group one level inside its changelist',
-  )
-  eq(
-    rows1.find((r) => r.label === 'vendor/zlib/z.c').depth,
-    2,
-    'and its files are one level inside that — not a single opaque row',
-  )
+  eq(rows1[0].repo, APP, 'and every row carries a RepoId, never a path — see cmd/git.rs')
 
   const rows2 = m.buildRows(two, openAll(two))
   eq(rows2[0].kind, 'repo', 'two repos: a repo row appears above the changelists')
   eq(rows2[0].depth, 0, 'the repo row is the new depth 0')
   eq(rows2[1].depth, 1, 'and every changelist moves one level in')
 
+  const rowsN = m.buildRows(nested, openAll(nested))
+  eq(
+    rowsN.find((r) => r.label === 'vendor/zlib').depth,
+    1,
+    'a submodule is a repository one level inside its parent — not an opaque row, and not a '
+      + "group inside the parent's changelist, whose commit could never include its files",
+  )
+  eq(
+    rowsN.find((r) => r.label === 'z.c').depth,
+    3,
+    "and its files sit under its own changelist: repo → submodule → Changes → file",
+  )
+
   // --- counts --------------------------------------------------------------------------
 
-  eq(
-    rows1.find((r) => r.label === 'Changes').count,
-    3,
-    "a changelist's count includes the files inside its submodule",
-  )
-  eq(rows2[0].count, 5, "a repo's count is every file under it")
+  eq(rows1.find((r) => r.label === 'Changes').count, 2, "a changelist counts its own files")
+  eq(rowsN[0].count, 6, "a repo's count includes its submodule's files")
+  eq(rows2[0].count, 5, "and a plain repo counts every file under it")
 
   // --- tri-state -----------------------------------------------------------------------
 
   const partial = m.partialFiles(one)
+  eq(
+    [...partial],
+    [m.fileRowId(APP, 'src/b.rs')],
+    'partial is derived from the pair `ChangeEntry` carries — staged AND a dirty worktree — '
+      + 'rather than from a flag the backend does not send',
+  )
   const changes = rows1.find((r) => r.label === 'Changes')
   const none = new Set()
   eq(m.checkState(changes, none, (id) => partial.has(id)), 'unchecked', 'nothing ticked')
 
   const all = m.toggleRow(changes, none)
-  eq(all.size, 3, 'ticking a changelist reaches every file below it, submodule included')
+  eq(all.size, 2, 'ticking a changelist reaches every file in it')
   eq(
     m.checkState(changes, all, (id) => partial.has(id)),
     'partial',
     'one half-staged file makes the whole group partial, not checked — the group must not '
       + 'claim to contain more than the commit will',
-  )
-
-  const clean = new Set([...all].filter((id) => !partial.has(id)))
-  eq(
-    m.checkState(changes, clean, (id) => partial.has(id)),
-    'partial',
-    'some files ticked is partial too',
   )
   eq(m.toggleRow(changes, all).size, 0, 'a second click clears rather than completing')
 
@@ -159,61 +306,69 @@ try {
   // --- defaults ------------------------------------------------------------------------
 
   const defaults = m.defaultSelection(one)
-  eq(defaults.size, 3, 'only the active changelist is ticked on open — `fixes` is not')
+  eq(defaults.size, 2, 'only the active changelist is ticked on open — `fixes` is not')
   eq(
-    [...defaults].every((id) => !id.includes('notes.md')),
+    [...defaults].every((id) => !id.includes('notes.md') && !id.includes('target')),
     true,
-    'unversioned files are never ticked by default',
+    'unversioned and ignored files are never ticked by default',
   )
   eq(
     m.summarize(m.selectedFiles(one, defaults)),
-    '3 modified',
+    '2 modified',
     "the footer's summary counts by status and does not pluralise the adjective",
   )
   eq(m.summarize([]), 'nothing selected', 'an empty selection says so in words')
   eq(
     m.summarize([
-      { path: 'a', status: 'modified' },
-      { path: 'b', status: 'added' },
-      { path: 'c', status: 'added' },
+      entry('a', 'unmodified', 'modified', 'd'),
+      entry('b', 'added', 'unmodified', 'd'),
+      entry('c', 'unmodified', 'untracked', 'd'),
+      entry('d', 'unmodified', 'typeChange', 'd'),
     ]),
-    '1 modified · 2 added',
-    'several statuses join in SUMMARY_ORDER, not in the order the files happened to arrive',
+    '1 modified · 1 added · 1 type changed · 1 untracked',
+    'several statuses join in SUMMARY_ORDER, and `typeChange` is spelled out rather than '
+      + 'leaked as an identifier',
   )
 
-  const expanded = m.defaultExpanded({
-    repos: [
-      {
-        root: '/w/app',
-        label: 'app',
-        groups: [
-          { id: 'i', name: 'Ignore', kind: 'ignored', files: [] },
-          { id: 'd', name: 'Changes', kind: 'changelist', files: [] },
-        ],
-      },
-    ],
-  })
-  eq(expanded.size, 2, 'the ignored group starts collapsed; the repo and Changes do not')
+  eq(
+    m.entryStatus(entry('a', 'added', 'modified', 'd')),
+    'added',
+    'a file staged as added and then edited is still an addition: the index side wins',
+  )
+  eq(
+    m.entryStatus(entry('a', 'conflicted', 'conflicted', 'd')),
+    'conflicted',
+    'except a conflict, which outranks both — it is the state that blocks a commit',
+  )
+
+  const expanded = m.defaultExpanded(one)
+  eq(
+    expanded.has(m.groupRowId(APP, 'ignored')),
+    false,
+    'the ignored group starts collapsed, exactly as in IDEA',
+  )
+  eq(expanded.has(m.groupRowId(APP, 'cl:default')), true, 'the changelists do not')
+  eq(
+    m.isIgnoredGroupRow(m.groupRowId(APP, 'ignored')),
+    true,
+    "expanding it is what asks Rust for `includeIgnored`, so the row id has to be recognisable",
+  )
+  eq(m.isIgnoredGroupRow(m.groupRowId(APP, 'cl:default')), false, 'and nothing else is')
 
   // --- commit units --------------------------------------------------------------------
 
   // The bug this exists to prevent: `Changes` collapsed, its files still ticked.
-  const collapsed = new Set([...openAll(one)].filter((id) => !id.includes('default')))
+  const collapsed = new Set([...openAll(one)].filter((id) => !id.includes('cl:default')))
   const rowsCollapsed = m.buildRows(one, collapsed)
   eq(
-    rowsCollapsed.some((r) => r.kind === 'file' && r.file.path === 'a.rs'),
+    rowsCollapsed.some((r) => r.kind === 'file' && r.entry.path === 'a.rs'),
     false,
     'a collapsed changelist renders no file rows',
   )
-  /*
-   * The rollup a review caught: a group's descendant-file set has to come out of the
-   * payload, not out of the rows already emitted. Every assertion above expands everything,
-   * which is exactly the shape in which the rows-derived version looked right.
-   */
   const changesCollapsed = rowsCollapsed.find((r) => r.label === 'Changes')
   eq(
     changesCollapsed.files.length,
-    3,
+    2,
     'a collapsed changelist still owns its files, or its own checkbox reads unchecked over '
       + 'ticked files and a click on it does nothing',
   )
@@ -223,87 +378,114 @@ try {
     'and its tri-state is computed over them',
   )
 
-  // `Changes` open, the submodule inside it shut: the case where reading the emitted rows
-  // back would drop the submodule's file and draw a full tick over an untouched submodule.
-  const subShut = new Set([...openAll(one)].filter((id) => !id.includes('sub')))
-  const changesSubShut = m.buildRows(one, subShut).find((r) => r.label === 'Changes')
-  eq(changesSubShut.files.length, 3, "a collapsed submodule's files still roll up into its changelist")
-  const ownOnly = new Set([m.fileRowId('/w/app', 'a.rs'), m.fileRowId('/w/app', 'src/b.rs')])
-  eq(
-    m.checkState(changesSubShut, ownOnly, () => false),
-    'partial',
-    'a changelist whose submodule is unticked is partial, not checked — the group must not '
-      + 'claim a full tick over a submodule nobody looked at',
-  )
-  eq(
-    m.toggleRow(changesSubShut, new Set()).size,
-    3,
-    'and ticking it reaches inside the collapsed submodule',
-  )
-
   // The repo row has the same rule, and it is the row most likely to be expanded over
   // collapsed children.
-  const reposOpenGroupsShut = new Set([m.repoRowId('/w/app'), m.repoRowId('/w/lib')])
-  const repoRow = m.buildRows(two, reposOpenGroupsShut).find((r) => r.kind === 'repo')
-  eq(repoRow.files.length, 5, 'an expanded repo whose changelists are shut still owns every file')
-  eq(repoRow.count, 5, 'and still counts them')
+  const reposOpenGroupsShut = new Set([m.repoRowId(APP), m.repoRowId(SUB)])
+  const repoRow = m.buildRows(nested, reposOpenGroupsShut).find((r) => r.kind === 'repo')
+  eq(
+    repoRow.files.length,
+    6,
+    'an expanded repo whose changelists are shut still owns every file, submodule included',
+  )
 
   const units = m.commitUnits(one, defaults)
   eq(units.length, 1, 'one repo, one commit')
+  eq(units[0].repo, APP, 'named by RepoId — `repo_root` resolves an id, and a path is NoSuchRepo')
   eq(
     units[0].paths.sort(),
-    ['a.rs', 'src/b.rs', 'vendor/zlib/z.c'],
+    ['a.rs', 'src/b.rs'],
     'commit reads the tree, not the rows: a collapsed group still commits its ticked files',
   )
   eq(units[0].changelist, 'default', 'the changelist is named when every tick came from one')
 
-  const mixed = new Set([...m.allFiles(one)])
   eq(
-    m.commitUnits(one, mixed)[0].changelist,
+    m.commitUnits(one, new Set(m.allFiles(one)))[0].changelist,
     null,
     'a selection spanning changelists names none — the backend commits the paths given',
   )
   eq(
     m.commitUnits(two, m.defaultSelection(two)).map((u) => u.repo),
-    ['/w/app', '/w/lib'],
-    'two repos are two commits, split by root',
+    [APP, LIB],
+    'two repos are two commits, split by repo id',
   )
-
-  eq(m.inRepo(m.fileRowId('/w/app', 'a.rs'), '/w/app'), true, 'a row belongs to its own repo')
   eq(
-    m.inRepo(m.fileRowId('/w/app-ui', 'a.rs'), '/w/app'),
-    false,
-    'and not to a repo whose path is merely a prefix of it',
+    m.commitUnits(nested, m.defaultSelection(nested)).map((u) => u.repo),
+    [APP, SUB],
+    'and a submodule is its own commit: git has no other kind',
   )
 
-  // --- normalisation -------------------------------------------------------------------
+  eq(m.inRepo(m.fileRowId(APP, 'a.rs'), APP), true, 'a row belongs to its own repo')
+  eq(
+    m.inRepo(m.fileRowId(`${APP}x`, 'a.rs'), APP),
+    false,
+    'and not to a repo whose id is merely a prefix of it',
+  )
+
+  // --- normalisation is total ----------------------------------------------------------
 
   eq(m.normalizeStatus(undefined), { repos: [] }, 'no payload is an empty panel, not a throw')
   eq(m.normalizeStatus(null), { repos: [] }, 'null too')
   eq(m.normalizeStatus('nope'), { repos: [] }, 'a string too')
   eq(m.normalizeStatus({ repos: 'nope' }), { repos: [] }, 'a wrongly-typed field too')
   eq(
-    m.normalizeStatus({ repos: [{ label: 'no root' }] }),
+    m.normalizeStatus({
+      repos: [
+        {
+          root: '/w/app',
+          label: 'app',
+          groups: [{ id: 'default', name: 'Changes', files: [{ path: 'a.rs', status: 'modified' }] }],
+        },
+      ],
+    }),
     { repos: [] },
-    'a repo with no root is dropped: every git command needs one',
+    'the shape the panel used to assume is NOT accepted — this assertion is the bug itself, '
+      + 'written down: a fixture in that shape passed every check while the panel was empty '
+      + 'against every real repository',
   )
   eq(
-    m.normalizeStatus({ repos: [{ root: '/w/app', groups: [{ name: 'Changes' }] }] }),
-    { repos: [{ root: '/w/app', label: 'app', groups: [{ id: '0:Changes', name: 'Changes', kind: 'changelist', files: [] }] }] },
-    'missing optionals are filled from what is there, not invented',
+    m.normalizeStatus({ repos: [{ repo: { root: '/w/app' } }] }),
+    { repos: [] },
+    'a repo with no id is dropped: every git command resolves a RepoId, so its rows could '
+      + 'draw but none of its buttons could work',
+  )
+  eq(
+    m.normalizeStatus({ repos: [{ repo: { id: 'x', root: '/w/app' } }] }).repos[0],
+    {
+      id: 'x',
+      root: '/w/app',
+      name: 'app',
+      branch: { head: '', detached: false, upstream: null, ahead: 0, behind: 0, operation: null, unborn: true },
+      isSubmodule: false,
+      indexChangedExternally: false,
+      useStagingArea: false,
+      groups: [],
+      children: [],
+    },
+    'missing optionals are filled from what is there, and a branch we could not read is '
+      + 'unborn — which disables Amend rather than enabling history rewriting on a guess',
   )
   eq(
     m.normalizeStatus({
-      repos: [{ root: '/w/app', groups: [{ name: 'C', files: [{ path: 'a', status: 'exploded' }] }] }],
-    }).repos[0].groups[0].files[0].status,
+      repos: [
+        {
+          repo: { id: 'x', root: '/w/app' },
+          changelists: [{ id: 'd', name: 'C', changes: [{ path: 'a', index: 'exploded' }] }],
+        },
+      ],
+    }).repos[0].groups[0].entries[0].index,
     'modified',
-    'an unknown status shows as modified rather than hiding the file from the commit',
+    'an unknown FileState shows as modified rather than hiding the file from the commit',
   )
   eq(
     m.normalizeStatus({
-      repos: [{ root: '/w/app', groups: [{ name: 'C', files: [{ path: 'a', original_path: 'b' }] }] }],
-    }).repos[0].groups[0].files[0].originalPath,
-    undefined,
+      repos: [
+        {
+          repo: { id: 'x', root: '/w/app' },
+          changelists: [{ id: 'd', name: 'C', changes: [{ path: 'a', orig_path: 'b' }] }],
+        },
+      ],
+    }).repos[0].groups[0].entries[0].origPath,
+    null,
     'snake_case is NOT accepted: a missing rename_all_fields is a Rust bug to fix at source',
   )
 
