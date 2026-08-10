@@ -89,6 +89,8 @@ export function PaneBody({
     )
   }
 
+  // Whether this pane is held at a splash instead of spawning.
+  //
   // A pane that already has a *running* child has nothing to decide: the terminal attaches
   // to it and there is nothing to resume.
   //
@@ -100,10 +102,23 @@ export function PaneBody({
   //
   // `paneSessionId` also survives host eviction, so a pane the user resumed and then left
   // parked in another tab does not come back offering to resume itself a second time.
-  const started = paneSessionId(pane.id) !== undefined
-
-  // Only a plan entry can hold a pane back, and only before it has been started.
-  const held = restore !== undefined && !restore.eager && !started
+  //
+  // Latched on the first render rather than recomputed, and that is load-bearing twice over.
+  // `paneSessionId` flips to defined the moment the child spawns, which is a render or two
+  // after this pane decided to show it — and the two branches below are different element
+  // *types* in the same position, so a `<>banner + terminal</>` becoming a bare
+  // `<TerminalPane/>` makes React unmount the terminal it mounted a moment ago, tear down its
+  // sink and re-attach. It also meant the restored-shell banner was on screen only for the
+  // frame between the spawn resolving and the domain recording the binding, which is not long
+  // enough to read — a line that says "previous output not retained" is the only notice the
+  // user gets that a shell came back empty.
+  //
+  // The alternative that lost was giving both branches the same element shape (always a
+  // fragment, with a `null` where the banner is not wanted). That stops the remount but still
+  // blinks the banner away, because the condition itself is what is unstable.
+  const [held] = useState(
+    () => restore !== undefined && !restore.eager && paneSessionId(pane.id) === undefined,
+  )
   const [resumed, setResumed] = useState(false)
 
   if (held && !resumed) {

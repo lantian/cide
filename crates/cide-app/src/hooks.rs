@@ -103,17 +103,36 @@ impl HookServer {
     /// is what the close confirm asks, and a definition that warned about every running
     /// session would train people to dismiss the dialog.
     pub fn live_sessions(&self) -> Vec<SessionId> {
-        self.states
-            .iter()
-            .filter(|e| e.value().is_live())
-            .map(|e| *e.key())
-            .collect()
+        live_in(&self.states)
     }
 
     /// Forget a session that has gone.
     pub fn forget(&self, session: SessionId) {
-        self.states.remove(&session);
+        forget_in(&self.states, session);
     }
+}
+
+/// The live set of a state map. See [`decide`] for why this is a free function.
+///
+/// `HookServer` cannot be built without an `AppHandle`, and `tauri`'s mock app is behind a
+/// feature this build does not enable — so a test can reach a *method* on the server only by
+/// not testing it. The methods above are each one line so that the part which can be wrong
+/// lives here, where `forgetting_a_session_takes_it_out_of_the_live_set` can call it.
+///
+/// The alternative that lost was leaving both as methods and asserting on a bare `DashMap`
+/// in the test instead. That is what the test did, and it passed with `forget` gutted to a
+/// no-op: asserting that `DashMap::remove` removes says nothing about the code that ships.
+fn live_in(states: &DashMap<SessionId, SessionState>) -> Vec<SessionId> {
+    states
+        .iter()
+        .filter(|e| e.value().is_live())
+        .map(|e| *e.key())
+        .collect()
+}
+
+/// Drop a session from a state map. See [`live_in`] for why this is a free function.
+fn forget_in(states: &DashMap<SessionId, SessionState>, session: SessionId) {
+    states.remove(&session);
 }
 
 impl Drop for HookServer {
@@ -465,19 +484,23 @@ mod tests {
     #[test]
     fn only_a_busy_or_asking_session_blocks_a_close() {
         // What `live_sessions` filters on, asserted against the states `decide` actually
-        // produces rather than against the enum in the abstract.
+        // produces and through the function the server actually calls — `is_live()` on a
+        // literal `SessionState` would assert about the enum rather than about this module.
         let states = States::new();
         let session = SessionId::new();
 
         decide(&frame("SessionStart", &session.to_string()), &states);
         assert_eq!(state_of(&states, session), Some(SessionState::Idle));
-        assert!(!SessionState::Idle.is_live());
+        assert!(
+            live_in(&states).is_empty(),
+            "an idle session must not raise a close confirm"
+        );
 
         decide(&frame("UserPromptSubmit", &session.to_string()), &states);
-        assert!(
-            state_of(&states, session)
-                .expect("the session is tracked")
-                .is_live()
+        assert_eq!(
+            live_in(&states),
+            vec![session],
+            "a turn is worth warning about"
         );
     }
 
@@ -486,15 +509,26 @@ mod tests {
         // `HookServer::forget` was dead code until the exit watcher called it. Without it a
         // `claude` that dies mid-turn is remembered as Busy for the life of the process and
         // the close confirm warns about interrupting a session that is already gone.
+        //
+        // Two sessions, because the claim is not "the map can be emptied" — it is that
+        // forgetting takes out *the one that died* and leaves the other one blocking a close.
         let states = States::new();
-        let session = SessionId::new();
-        decide(&frame("UserPromptSubmit", &session.to_string()), &states);
-        assert!(!states.is_empty());
+        let dying = SessionId::new();
+        let survivor = SessionId::new();
+        decide(&frame("UserPromptSubmit", &dying.to_string()), &states);
+        decide(&frame("UserPromptSubmit", &survivor.to_string()), &states);
+        assert_eq!(live_in(&states).len(), 2);
 
-        states.remove(&session);
+        forget_in(&states, dying);
+
+        assert_eq!(
+            live_in(&states),
+            vec![survivor],
+            "a forgotten session still blocks a close, or forgetting took the wrong one"
+        );
         assert!(
-            states.iter().filter(|e| e.value().is_live()).count() == 0,
-            "a forgotten session still blocks a close"
+            state_of(&states, dying).is_none(),
+            "the dead session is still tracked"
         );
     }
 }

@@ -81,6 +81,25 @@ fn program_is_claude(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this spawn should branch rather than continue.
+///
+/// **`Option<bool>` is a wire requirement, not taste.** Tauri looks each command parameter up
+/// by key and hands the value to serde: a key the frontend did not send reaches an `Option`
+/// as `None` (`CommandItem::deserialize_option` visits none) but reaches a plain `bool`
+/// through `deserialize_json`, which returns `Err("command session_spawn missing required
+/// key fork")`. `TerminalPane`'s `specFor` builds its spec without a `fork` property at all,
+/// only the `forkPrimary` split branch ever assigns one, and `JSON.stringify` drops an absent
+/// key — so with `fork: bool` **every ordinary pane spawn was rejected before it reached
+/// this function**, which is why a restored pane neither resumed nor spawned.
+///
+/// The alternative that lost was giving `session.spawn` a `fork = false` default in
+/// `ui/src/ipc/client.ts`, the way `project.close` and `git.status` do for their flags. It
+/// fixes the same call sites, but only until the next caller forgets, and this side is the
+/// one that has to be right for callers it has not met.
+fn wants_fork(fork: Option<bool>) -> bool {
+    fork.unwrap_or(false)
+}
+
 /// The conversation arguments for a Claude child.
 ///
 /// Order matters and a wrong one fails silently, so this is a function with tests rather
@@ -167,7 +186,8 @@ pub async fn session_spawn(
     geometry: Geometry,
     project: Option<cide_ipc::ProjectId>,
     resume: Option<SessionId>,
-    fork: bool,
+    // Optional on the wire, and it has to be: see [`wants_fork`].
+    fork: Option<bool>,
 ) -> Result<SessionId, SessionError> {
     let mut spec = SpawnSpec::new(program, PathBuf::from(cwd)).geometry(pty_geometry(geometry));
     for a in args {
@@ -185,7 +205,7 @@ pub async fn session_spawn(
     // what lets a restored pane resume with `--resume <id>` and no extra bookkeeping.
     let id = SessionId::new();
     if is_claude {
-        for a in claude_args(id, resume, fork) {
+        for a in claude_args(id, resume, wants_fork(fork)) {
             spec = spec.arg(a);
         }
     }
@@ -337,10 +357,9 @@ fn to_outcome(a: cide_ipc::DiffAnswer) -> cide_ide_mcp::DiffOutcome {
 /// [`AttachmentKey`]. It is optional so a caller that does not name a pane still attaches,
 /// on the old window-wide slot.
 ///
-/// `async` because the resize is an `ioctl` plus a `vt100` reflow of the whole scrollback,
-/// which is not work for the thread that also has to paint.
+/// Synchronous, and the resize deliberately not on the blocking pool: see [`session_resize`].
 #[tauri::command(rename_all = "camelCase")]
-pub async fn session_attach(
+pub fn session_attach(
     registry: State<'_, SessionRegistry>,
     window: tauri::Window,
     session: SessionId,
@@ -349,13 +368,8 @@ pub async fn session_attach(
     geometry: Geometry,
 ) -> Result<(), SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
-    let resized = Arc::clone(&s);
-    blocking(move || {
-        resized
-            .resize(pty_geometry(geometry))
-            .map_err(|e| SessionError::Pty(e.to_string()))
-    })
-    .await?;
+    s.resize(pty_geometry(geometry))
+        .map_err(|e| SessionError::Pty(e.to_string()))?;
 
     let sink: Arc<dyn Sink> =
         Arc::new(move |bytes: &[u8]| sink.send(InvokeResponseBody::Raw(bytes.to_vec())).is_ok());
@@ -471,20 +485,34 @@ pub fn session_write(
 
 /// Push a new size at the child.
 ///
-/// `async` for the same reason as [`session_attach`]: `vt100::Screen::set_size` reflows the
-/// whole scrollback, and this arrives on every frame of a window drag.
+/// **Synchronous on purpose, unlike its neighbours.** `vt100::Screen::set_size` reflows the
+/// whole scrollback, so this is the one blocking body here with a real case for the pool —
+/// and it is the one body that must not go there. `PtySession::resize` takes three locks in
+/// turn (`master`, then `vt`, then `geometry`) and holds none of them across the others, so
+/// it is atomic only while its callers are serialised. Tauri runs synchronous commands one
+/// at a time on the thread that receives the IPC message, which is exactly that guarantee;
+/// `spawn_blocking` hands them to a pool and withdraws it.
+///
+/// Two overlapping resizes on the pool interleave into a state no single call asked for —
+/// the kernel PTY at one size and the screen mirror at another — and nothing corrects it
+/// until the next resize. `session_scrollback` then paints that mismatched mirror into every
+/// pane that re-docks or rehydrates. `syncSize` fires from a `ResizeObserver` on every frame
+/// of a window drag, and the reflow that justifies the pool is precisely what makes one call
+/// still be running when the next arrives, so the race is likeliest where it costs most.
+///
+/// The fix that would earn the pool back belongs in `cide-pty` and is not this change's to
+/// make: one lock across the whole of `resize`, and a coalescing queue per session so the
+/// last size asked for is the one the child ends up at. Until then a stall is the honest
+/// trade — a resize that is late is a frame behind, a resize that is inconsistent is wrong.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn session_resize(
+pub fn session_resize(
     registry: State<'_, SessionRegistry>,
     session: SessionId,
     geometry: Geometry,
 ) -> Result<(), SessionError> {
     let s = registry.get(session).ok_or(SessionError::NoSuchSession)?;
-    blocking(move || {
-        s.resize(pty_geometry(geometry))
-            .map_err(|e| SessionError::Pty(e.to_string()))
-    })
-    .await
+    s.resize(pty_geometry(geometry))
+        .map_err(|e| SessionError::Pty(e.to_string()))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -523,6 +551,25 @@ mod tests {
         assert_eq!(
             claude_args(id, None, false),
             vec!["--session-id".to_string(), id.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_spawn_that_says_nothing_about_forking_does_not_fork() {
+        // The signature is the point of this test as much as the value: `wants_fork` takes an
+        // `Option`, so restoring `fork: bool` on the command stops this compiling. That
+        // matters because the failure it guards is invisible from Rust — a plain `bool`
+        // parameter makes Tauri reject the whole invocation for a missing key, and the
+        // frontend only ever sends `fork` on a `forkPrimary` split.
+        assert!(!wants_fork(None), "an unsent flag must mean 'no'");
+        assert!(!wants_fork(Some(false)));
+        assert!(wants_fork(Some(true)));
+
+        let id = SessionId::new();
+        assert_eq!(
+            claude_args(id, None, wants_fork(None)),
+            vec!["--session-id".to_string(), id.to_string()],
+            "an ordinary pane spawns plain"
         );
     }
 

@@ -794,13 +794,27 @@ mod tests {
             .arg("printf 'printed-before-anyone-was-listening'");
         let session = PtySession::spawn(spec).expect("spawn sh");
 
+        // Waited for on the *mirror*, not on the process.
+        //
+        // The first version polled `has_exited()` and then read the screen once, which is a
+        // race this test lost under load: `exited` is set by the reaper the moment `wait()`
+        // returns, and the reaper is a different thread from the coalescer that feeds the
+        // mirror. The child can be gone while its last bytes are still in the channel. It
+        // passed for months on timing alone.
+        //
+        // Waiting for the content is both correct and stricter: it cannot pass early, and
+        // the deadline now bounds only the failing case.
         let deadline = Instant::now() + DEADLINE;
-        while !session.has_exited() && Instant::now() < deadline {
+        let mut screen = String::new();
+        while Instant::now() < deadline {
+            screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
+            if screen.contains("printed-before-anyone-was-listening") {
+                break;
+            }
             thread::sleep(Duration::from_millis(10));
         }
 
         // Nothing was ever attached; the output still exists.
-        let screen = String::from_utf8_lossy(&session.screen_state()).into_owned();
         assert!(
             screen.contains("printed-before-anyone-was-listening"),
             "the mirror lost output produced with no sink attached: {screen:?}"

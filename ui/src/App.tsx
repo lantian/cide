@@ -32,6 +32,7 @@ import { TabContent } from '@/layout/TabContent'
 import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
+import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
@@ -42,6 +43,7 @@ import { PaneFrame } from '@/layout/PaneTitleBar'
 import { PaneBody } from '@/panes/PaneBody'
 import { liveHosts } from '@/layout/paneHosts'
 import { SettingsTab } from '@/settings/SettingsTab'
+import { toggleTheme as togglePersistedTheme } from '@/settings/useSettings'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   app as appApi,
@@ -57,7 +59,7 @@ import {
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
-import { runBench, formatReport } from '@/bench/ipcBench'
+import { runBench, formatReport, probeIpcOnce } from '@/bench/ipcBench'
 import { retheme } from '@/terminal/xterm'
 import { useWorkspace } from '@/store/workspace'
 import styles from './App.module.css'
@@ -140,7 +142,6 @@ async function pickProject(open: (paths: string[]) => Promise<void>): Promise<vo
 export function App() {
   const boot = useWorkspace((s) => s.boot)
   const theme = useWorkspace((s) => s.theme)
-  const toggleTheme = useWorkspace((s) => s.toggleTheme)
   const hydrate = useWorkspace((s) => s.hydrate)
   const openProject = useWorkspace((s) => s.openProject)
   const closeProject = useWorkspace((s) => s.closeProject)
@@ -158,8 +159,16 @@ export function App() {
   const redockPane = useWorkspace((st) => st.redockPane)
 
   const [view, setView] = useState<ActivityView>('files')
-  /** Which overlay is up, if any. `null` is the ordinary state. */
-  const [overlay, setOverlay] = useState<'files' | 'commands' | null>(null)
+  /**
+   * Which overlay is up, if any. `null` is the ordinary state.
+   *
+   * Read from `@/overlays/store`, which is the only writer. A `useState` here was a second
+   * source of truth for one value, and the two disagreed in the direction that matters: the
+   * key gate dispatches `picker.files` from outside React and writes the *store*, so Ctrl+P
+   * set a flag this component never read and the host below was never mounted. The overlay
+   * was unreachable by the gesture it exists for.
+   */
+  const overlay = useOverlayOpen()
   /*
    * A close that Rust refused because it would discard unsaved work.
    *
@@ -337,6 +346,23 @@ export function App() {
     }
   }, [openProject, newClaudeTab])
 
+  /*
+   * The IPC health probe, on every boot rather than only under `CIDE_BENCH=1`.
+   *
+   * WebKitGTK can fall back from the custom protocol to string `postMessage` with no error
+   * and no Rust-side signal. The only symptom is a terminal that feels inexplicably sluggish,
+   * because every PTY frame is now a JSON array of decimal numbers spelled into a
+   * `webview.eval`. Guarded behind `benchMode()` this ran only during a benchmark — which is
+   * to say, never on the boots that could actually be degraded.
+   *
+   * Cheap, once per window, and it cannot throw: `probeIpcOnce` swallows its own failures
+   * into a `diag.log` line, because a diagnostic that can break a boot is worse than no
+   * diagnostic. Per window on purpose — each webview negotiates its own transport.
+   */
+  useEffect(() => {
+    void probeIpcOnce()
+  }, [])
+
   useEffect(() => {
     if (!benchMode()) return
     void runBench()
@@ -424,9 +450,6 @@ export function App() {
    */
   const runCommand = createDispatcher({
     fallback: (command) => {
-      if (command === 'workbench.showFilePicker') return setOverlay('files')
-      if (command === 'workbench.showCommandPalette') return setOverlay('commands')
-      if (command === 'workbench.closeOverlay') return setOverlay(null)
 
       /*
        * The split family, including the two the project exists for.
@@ -468,6 +491,13 @@ export function App() {
       }
     },
     showSidebar: (next) => setView(next),
+    /*
+     * Which tab `file.save` writes. The buffer lives in a CodeMirror state inside the pane,
+     * reachable only through the saver `editor/openBuffers.ts` holds for its tab — and the
+     * dispatcher has no way to learn a tab id on its own, because the key gate runs outside
+     * React and the palette is a list of strings.
+     */
+    focusedTab: () => focused?.tab.id ?? null,
   })
 
   /*
@@ -520,7 +550,7 @@ export function App() {
           activeProject={activeProjectId}
           onClose={(id) => void closeProject(id)}
           onNew={() => void pickProject(openProject)}
-          onToggleTheme={toggleTheme}
+          onToggleTheme={togglePersistedTheme}
         />
 
         <div className={styles.body}>
@@ -660,15 +690,15 @@ export function App() {
             context={keyContext}
             actions={{
               openFile: (path) => {
-                setOverlay(null)
+                closeOverlay()
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
               },
               openFileInSplit: (path) => {
-                setOverlay(null)
+                closeOverlay()
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
               },
               mentionFile: (path) => {
-                setOverlay(null)
+                closeOverlay()
                 if (!mentionTarget) {
                   // No Claude anywhere in this project to mention into. Saying so beats a
                   // silent no-op that looks exactly like success.
@@ -678,11 +708,11 @@ export function App() {
                 claudeApi.mentionFile(activeProjectId, mentionTarget, path)
               },
               runCommand: (id) => {
-                setOverlay(null)
+                closeOverlay()
                 runCommand(id, null)
               },
               runCommandInNewSession: (id) => {
-                setOverlay(null)
+                closeOverlay()
                 runCommand(id, { newSession: true })
               },
             }}
