@@ -677,6 +677,11 @@ mod tests {
     /// compared against the tree as it stood before the detach. Asserting only that the map
     /// round-trips would pass on an anchor whose `ratio` serialised as a string or whose
     /// `sibling` tag was renamed, because nothing would have tried to *use* it.
+    ///
+    /// It also asserts the direction that costs more if it breaks: a file written *before*
+    /// `dockAnchors` existed still loads. That is every user's file, and the schema version
+    /// was not bumped, so `#[serde(default)]` is the only thing between them and `load`
+    /// quarantining their whole workspace.
     #[test]
     fn a_detached_panes_position_survives_a_quit() {
         let dir = TempDir::new("dock-anchor");
@@ -716,9 +721,10 @@ mod tests {
             "the anchor comes back: sibling, divider id, axis, side and ratio"
         );
         // The bytes, not just the Rust round trip: `dockAnchors` and the nested `sibling` tag
-        // are read by nothing in Rust that would notice a rename, and `DockSibling` is a
-        // tagged enum with struct variants — the shape this project has already shipped a bug
-        // in once, for want of `rename_all_fields`.
+        // are read by nothing in Rust that would notice a rename, and the frontend's
+        // `DockSibling` is generated from this shape. (`rename_all_fields` on that enum is
+        // house style rather than something this can catch: both variants carry a single
+        // already-lowercase field, so removing it changes no byte.)
         let raw = fs::read_to_string(&path).expect("read the file back");
         let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
         let stored = &value["projects"][project_id.to_string()]["dockAnchors"][pane_id.to_string()];
@@ -750,6 +756,32 @@ mod tests {
             "the position did not survive the quit"
         );
         crate::workspace::validate(&loaded).expect("valid");
+
+        // Every `workspace.json` in existence was written before `dockAnchors` did, and this
+        // change did not bump `Workspace::CURRENT_SCHEMA` — so those files are read straight
+        // from the text by `read_workspace` with no migration step to fill the field in.
+        // Without `#[serde(default)]` the whole document fails to deserialise, `load` sees a
+        // `CoreError::Serde` and *quarantines* it: every project, tab and pane the user had
+        // is renamed aside and they are handed an empty workspace. Renaming the key stands in
+        // for the field simply not being there, which is the only state that has ever been on
+        // anyone's disk. The sibling assertion on `detached` in
+        // `a_detached_pane_map_survives_a_round_trip` exists for the same reason.
+        assert!(
+            raw.contains(r#""dockAnchors""#),
+            "the map is written, not skipped"
+        );
+        let older: Workspace =
+            serde_json::from_str(&raw.replace(r#""dockAnchors""#, r#""wasNotAFieldYet""#))
+                .expect("a workspace predating `dockAnchors` still deserialises");
+        assert!(
+            older.projects[&project_id].dock_anchors.is_empty(),
+            "a missing `dockAnchors` defaults to empty rather than failing the whole file"
+        );
+        // And the pane is still re-dockable from such a file — sparse anchors are the
+        // documented state, not a corrupt one.
+        let mut older = older;
+        crate::workspace::redock_pane(&mut older, &label).expect("redocks without an anchor");
+        crate::workspace::validate(&older).expect("valid");
     }
 
     /// `DiffOrigin` has struct variants, and a `serde(tag)` enum with struct variants needs

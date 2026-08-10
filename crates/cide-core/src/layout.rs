@@ -1722,7 +1722,31 @@ mod tests {
             );
             assert_eq!(
                 tree.panes, fixture.panes,
-                "pane {pane}: the side map drifted"
+                "pane {pane}: the side map lost or altered an entry"
+            );
+            // `IndexMap`'s `PartialEq` compares by key, not by position, so the assertion
+            // above says nothing about order — and the order really does change: `take_pane`
+            // shift-removes and `insert_pane_at` appends, so a restored pane comes back last
+            // in `panes` whatever it was before. Pinned rather than left implicit, because
+            // `panes` is serialised in this order — so every detach/re-dock rewrites that
+            // part of `workspace.json` — and because `Object.values(tree.panes)` is how the
+            // frontend picks "the first Claude pane of the console" for an @-mention.
+            //
+            // Not repaired here: repairing it means the anchor carrying the pane's index as
+            // well, a wire field with its own stale-index case, for a property nothing yet
+            // documents a dependency on. This assertion is what makes a later decision to
+            // depend on it visible instead of silent.
+            let restored_order: Vec<_> = tree.panes.keys().copied().collect();
+            let mut expected: Vec<_> = fixture
+                .panes
+                .keys()
+                .copied()
+                .filter(|p| *p != pane)
+                .collect();
+            expected.push(pane);
+            assert_eq!(
+                restored_order, expected,
+                "pane {pane}: `panes` order is the old order with the restored pane appended"
             );
             assert_eq!(tree.focused, pane, "the pane just dropped back takes focus");
             validate(&tree).expect("valid");

@@ -5,10 +5,36 @@
  * a fixture; this is the adapter to the real thing, and it lives outside both for the same
  * reason `appPaneDriver.ts` does.
  */
-import type { WindowAuditDriver, WindowAuditMode, WindowAuditSnapshot } from './windowAudit'
+import type {
+  WindowAuditDriver,
+  WindowAuditMode,
+  WindowAuditNode,
+  WindowAuditSnapshot,
+} from './windowAudit'
+import { renderTree } from './windowAudit'
 import { useWorkspace } from '@/store/workspace'
 import { session as sessionApi, windowLabel } from '@/ipc/client'
-import type { PaneId, ProjectId, TabId, WindowMode } from '@/ipc/client'
+import type { LayoutNode, PaneId, ProjectId, TabId, WindowMode } from '@/ipc/client'
+
+/**
+ * `LayoutNode` off the wire, in the audit's own structural shape.
+ *
+ * A translation rather than a re-export because the audit declines to import wire types at
+ * all — it has to stay drivable from a fixture — and because that is what keeps this
+ * adapter, not the audit, holding the knowledge that a tagged `kind` is how the two variants
+ * are told apart.
+ */
+function auditNode(node: LayoutNode): WindowAuditNode {
+  return node.kind === 'leaf'
+    ? { leaf: node.pane }
+    : {
+        split: node.id,
+        axis: node.axis,
+        ratio: node.ratio,
+        a: auditNode(node.a),
+        b: auditNode(node.b),
+      }
+}
 
 function settle(): Promise<void> {
   return new Promise((resolve) => {
@@ -48,6 +74,9 @@ function snapshot(): WindowAuditSnapshot {
           session: pane.session,
         })),
       ],
+      // The trees alongside the flat pane list, because "which tab is it in" and "where in
+      // that tab" are different questions and the re-dock criterion is the second one.
+      trees: Object.fromEntries(p.tabs.map((t) => [t.id, renderTree(auditNode(t.tree.root))])),
     })),
     windows: Object.entries(boot?.workspace.windows ?? {}).map(([label, role]) => ({
       label,

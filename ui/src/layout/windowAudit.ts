@@ -11,8 +11,10 @@
  * xterm — so nothing in this window can assert on the bytes the new window painted. The
  * check is therefore split. This file asserts what the frontend genuinely observes: that the
  * set of session ids is identical either side of every detach, re-dock and mode flip, that
- * no registered session's child has exited, that the pane comes back into a tab's tree and
- * out of the project's `detached` map, and that a flip moves no project, tab or pane. It
+ * no registered session's child has exited, that the pane comes back out of the project's
+ * `detached` map and into *the split it left* — same nesting, same divider ids, same ratios,
+ * which is the milestone's "restores its tree position" taken literally — and that a flip
+ * moves no project, tab or pane. It
  * then prints every session id it saw, one per line behind a fixed marker, so a shell script
  * can take the other half: a Claude session's id is the value passed to `claude
  * --session-id`, so it appears verbatim in `/proc/<pid>/cmdline`, and the pid either side of
@@ -55,7 +57,57 @@ export interface WindowAuditProject {
   /** Tab ids in strip order; `tabs[0]` is the pinned console. */
   tabs: string[]
   panes: WindowAuditPane[]
+  /**
+   * Each tab's split tree, flattened to one comparable string, keyed by tab id.
+   *
+   * The milestone says *re-dock restores its tree position*, and `panes` cannot answer that:
+   * it is a flat list, so a pane torn out of a 70/30 nested split and put back beside
+   * whatever held focus looks identical to one put back where it was. The string therefore
+   * has to carry what "position" is made of — the nesting, each divider's id and axis, and
+   * its ratio — and it is compared to itself either side of a round trip, never parsed.
+   *
+   * Built with {@link renderTree}, which is exported so the adapter cannot invent its own
+   * notion of "position" and quietly leave the ratio out of it.
+   */
+  trees: Record<string, string>
 }
+
+/**
+ * A pane tree, structurally — the audit's own shape, not `LayoutNode` from `@/ipc`.
+ *
+ * Declared here rather than imported for the same reason the whole file avoids `@/ipc`: the
+ * audit must be drivable from a fixture, and a fixture should not have to construct wire
+ * types to be asserted over.
+ */
+export type WindowAuditNode =
+  | { leaf: string }
+  | { split: string; axis: string; ratio: number; a: WindowAuditNode; b: WindowAuditNode }
+
+/**
+ * One tab's tree as a single string, for comparing a tree against itself over time.
+ *
+ * Every part of what a re-dock has to reinstate is in it and nothing else is: the nesting,
+ * which child is `a`, each divider's id and axis, and the ratio. `focused` and `maximized`
+ * are deliberately absent — a re-dock is *meant* to move focus to the pane it just put back,
+ * so including them would make the exact case fail for doing the right thing.
+ *
+ * The ratio is fixed to four places because it crosses the wire as an `f32` widened to an
+ * `f64`, so `0.73` prints as `0.7300000190734863`; four places still separates any two
+ * divider positions a person could distinguish, and 70/30 coming back 50/50 — the regression
+ * this exists to catch — differs in the first.
+ *
+ * Ids are written in full and shortened only when a failure prints them: an eight-character
+ * prefix is what the rest of this file shows a human, but two dividers are the same divider
+ * or they are not, and an equality test should not be the place that decides.
+ */
+export function renderTree(node: WindowAuditNode): string {
+  if ('leaf' in node) return node.leaf
+  return `${node.split}:${node.axis}@${node.ratio.toFixed(4)}(${renderTree(node.a)},${renderTree(node.b)})`
+}
+
+/** A rendered tree with every uuid cut to the prefix the rest of the report uses. */
+const shortTree = (rendered: string) =>
+  rendered.replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, (id) => short(id))
 
 /** A window as the *workspace* records it. Nothing here says whether it is on screen. */
 export interface WindowAuditWindow {
@@ -248,6 +300,15 @@ function panesOfTab(snapshot: WindowAuditSnapshot, project: string, tab: string)
   const found = findProject(snapshot, project)
   if (!found) return []
   return sorted(found.panes.filter((p) => p.tab === tab).map((p) => p.id))
+}
+
+/** A tab's rendered tree, or `undefined` for a tab the snapshot does not describe. */
+function treeOfTab(
+  snapshot: WindowAuditSnapshot,
+  project: string,
+  tab: string,
+): string | undefined {
+  return findProject(snapshot, project)?.trees[tab]
 }
 
 export async function runWindowAudit(
@@ -480,6 +541,10 @@ export async function runWindowAudit(
       const { project, tab, pane, session } = target
       const where = `detach ${round} (pane ${short(pane)} of tab ${short(tab)})`
       const tabPanesBefore = panesOfTab(driver.snapshot(), project, tab)
+      // The tree, not only the pane list: the milestone's words are "re-dock restores its
+      // tree position", and a pane list is the same list wherever in the tab the pane came
+      // back to. Read before the detach, since the detach is what collapses the split.
+      const tabTreeBefore = treeOfTab(driver.snapshot(), project, tab)
       // Whether this window was ever showing the pane. Hosts are created on first mount and
       // only the active project's tabs are rendered, so a pane belonging to any other project
       // has no host here — and its absence afterwards is the normal state, not a destroyed
@@ -572,9 +637,14 @@ export async function runWindowAudit(
         fail(backWhere, 'the pane came back into no tab at all')
         break
       }
-      // `redock_pane` re-enters the pane beside whatever holds focus in its home tab, so the
-      // exact split it used to share is not recoverable and is not claimed here. What is
-      // claimed is the tab, and that the tab holds the same panes it held before the detach.
+      // `detach_pane` records the split the pane was torn out of — the sibling node, the
+      // axis, the side, the divider id and the ratio — and `redock_pane` rebuilds exactly
+      // that split whenever the sibling is still there. Nothing here closes a pane between
+      // the detach and the re-dock, so "still there" always holds and the tab is owed its
+      // tree back unchanged, divider ids and ratios included. Coming back into a fresh 50/50
+      // is not a rounding error: it resizes the terminal, and a resized `claude` TUI repaints
+      // its whole transcript, which is the failure the milestone's "restores its tree
+      // position" is really about.
       if (home.tab !== tab) {
         const stillThere = findProject(afterRedock, project)?.tabs.includes(tab) ?? false
         if (stillThere) {
@@ -588,6 +658,17 @@ export async function runWindowAudit(
           fail(
             backWhere,
             `tab ${short(tab)} holds ${restored.map(short).join(', ')} where it held ${tabPanesBefore.map(short).join(', ')}`,
+          )
+        }
+        const tabTreeAfter = treeOfTab(afterRedock, project, tab)
+        if (tabTreeBefore === undefined || tabTreeAfter === undefined) {
+          // Reported rather than skipped: a driver that supplies no tree turns the sharpest
+          // assertion in this file into a silent no-op, which is how a check stops checking.
+          fail(backWhere, `the driver described no tree for tab ${short(tab)}, so its position could not be checked`)
+        } else if (tabTreeAfter !== tabTreeBefore) {
+          fail(
+            backWhere,
+            `tab ${short(tab)} came back as ${shortTree(tabTreeAfter)} where it was ${shortTree(tabTreeBefore)}`,
           )
         }
       }

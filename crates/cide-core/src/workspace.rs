@@ -1928,8 +1928,17 @@ mod tests {
         validate(&ws).expect("valid");
     }
 
+    /// Closing a tab takes the windows detached *from* it with it, so the pane it was holding
+    /// is left in `detached` with nothing that can reach it.
+    ///
+    /// This used to guard its body with `if ws.windows.contains_key(&label)`, which is never
+    /// true — `close_tab` retains only windows whose home tab is not the one closing — so the
+    /// test asserted nothing about re-docking and could not fail for its own name. The state
+    /// is stated as an assertion instead, and the re-dock it was reaching for is covered by
+    /// `a_pane_redocks_into_the_console_when_its_home_tab_is_gone` below, which builds the
+    /// one shape that actually gets there.
     #[test]
-    fn a_pane_whose_home_tab_closed_redocks_into_the_console() {
+    fn closing_a_tab_strands_the_pane_that_was_detached_from_it() {
         let mut ws = Workspace::default();
         let id = open(&mut ws, "/home/dev/work/cide");
         let home = open_tab(
@@ -1948,20 +1957,95 @@ mod tests {
             layout::split(&mut t.tree, target, Axis::Row, Side::After, aux_pane()).expect("splits");
         let label = detach_pane(&mut ws, id, home, extra).expect("detaches");
 
-        // Closing the home tab drops windows detached *from* it, but this pane's window is
-        // keyed on the pane, and the pane is still alive in the project.
         close_tab(&mut ws, id, home, false).expect("closes");
-        if ws.windows.contains_key(&label) {
-            redock_pane(&mut ws, &label).expect("redocks into the console");
-            let console = console_tab(&ws, id).expect("exists");
-            assert!(
-                tab(&ws, id, console)
-                    .expect("exists")
-                    .tree
-                    .panes
-                    .contains_key(&extra)
-            );
-        }
+
+        assert!(
+            !ws.windows.contains_key(&label),
+            "the detached window went with the tab it names as home"
+        );
+        assert!(
+            project(&ws, id)
+                .expect("exists")
+                .detached
+                .contains_key(&extra),
+            "the pane itself survives — it holds a live session, so it is not destroyed here"
+        );
+        assert_eq!(
+            redock_pane(&mut ws, &label),
+            Err(CoreError::Invariant(format!(
+                "window {label} is not a detached pane"
+            ))),
+            "with the window gone there is no gesture left that reaches the pane"
+        );
+        validate(&ws).expect("valid");
+    }
+
+    /// The console fallback in [`redock_pane`], and the claim its comment makes about anchors.
+    ///
+    /// No gesture produces this state — `close_tab` prunes the window along with the tab —
+    /// but `ws.windows` is persisted, so a `workspace.json` hand-edited, half-written or
+    /// carried over from a build that pruned differently can name a home tab that is gone.
+    /// The branch exists for exactly that, and reaching it needs the state built directly.
+    ///
+    /// What is being checked is the reasoning the branch relies on: node ids are unique
+    /// across the workspace, so the anchor from the vanished tab matches nothing in the
+    /// console and the fallback is taken *without* a separate check for having landed
+    /// somewhere else. If that ever stopped holding, a re-dock would rebuild a divider from
+    /// another tab inside the console.
+    #[test]
+    fn a_pane_redocks_into_the_console_when_its_home_tab_is_gone() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("exists");
+        let home = open_tab(
+            &mut ws,
+            id,
+            TabKind::ClaudeFull {
+                title: "one".into(),
+            },
+            aux_pane(),
+        )
+        .expect("opens");
+        let t = tab_mut(&mut ws, id, home).expect("exists");
+        let target = t.tree.focused;
+        let extra =
+            layout::split(&mut t.tree, target, Axis::Row, Side::After, aux_pane()).expect("splits");
+        let label = detach_pane(&mut ws, id, home, extra).expect("detaches");
+        let anchor = project(&ws, id).expect("exists").dock_anchors[&extra].clone();
+
+        let console_before = tab(&ws, id, console).expect("exists").tree.clone();
+        // The tab goes away while the window entry stays: the file-shaped state, not one
+        // `close_tab` can produce.
+        let p = project_mut(&mut ws, id).expect("exists");
+        p.tabs.retain(|t| t.id != home);
+        p.active_tab = console;
+
+        redock_pane(&mut ws, &label).expect("redocks into the console");
+
+        let after = &tab(&ws, id, console).expect("exists").tree;
+        assert!(
+            after.panes.contains_key(&extra),
+            "the pane landed in the console rather than being lost with its tab"
+        );
+        assert!(
+            !collect_split_ids_of(&after.root).contains(&anchor.split),
+            "the anchor named a divider in a tab that is gone; it must not be rebuilt here"
+        );
+        // Focus-adjacent, beside the console pane that held focus — the pre-anchor behaviour,
+        // which is the right answer once the recorded position has stopped existing.
+        assert_eq!(
+            layout::leaves(&after.root),
+            {
+                let mut want = layout::leaves(&console_before.root);
+                want.push(extra);
+                want
+            },
+            "the console gained exactly the re-docked pane, at the end"
+        );
+        assert!(
+            project(&ws, id).expect("exists").dock_anchors.is_empty(),
+            "the anchor is spent whether or not it was usable"
+        );
         validate(&ws).expect("valid");
     }
 
