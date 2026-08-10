@@ -221,8 +221,13 @@ pub enum SplitIntent {
     Mirror { session: SessionId },
     /// `$SHELL -l`
     Shell,
-    /// No process; driven by an `openDiff` RPC or the git panel.
-    Diff,
+    // There is deliberately no `Diff`. A diff pane is not something a *split* can produce:
+    // what it renders comes from its tab's `TabKind::Diff { spec }`, and the two gestures
+    // that open one — an `openDiff` RPC and the git panel — both create the tab and the pane
+    // together (`ide::open_diff_tab`, `cmd::file::tab_open_diff`). The variant existed, was
+    // reachable from no code path, and the arm handling it minted a pane titled
+    // "<project> : claude — diff" that would have shown nothing: a `PaneKind::Diff` leaf
+    // inside a Claude tab has no spec to read.
 }
 
 /// Lifecycle of a session, driven by Claude Code hooks with a PTY-quiet fallback.
