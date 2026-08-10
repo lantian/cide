@@ -10,6 +10,7 @@
  */
 import type { ReactNode } from 'react'
 import type {
+  ClaudeCliSupport,
   ClaudeSettings,
   EditorSettings,
   Settings,
@@ -20,7 +21,16 @@ import type {
   Theme,
   WindowMode,
 } from '@/ipc/client'
-import { Group, NumberField, Note, Row, Segmented, ToggleRow } from './controls'
+import {
+  ActionButton,
+  Group,
+  NumberField,
+  Note,
+  PathReadout,
+  Row,
+  Segmented,
+  ToggleRow,
+} from './controls'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
 import { WindowModeCards } from './WindowModeCards'
@@ -60,6 +70,16 @@ export interface SectionProps {
   setWindowMode: (mode: WindowMode) => void
   /** `claude --version`, or null when the binary is not on PATH. */
   claudeVersion: string | null
+  /**
+   * Whether that version is one this build's IDE protocol was verified against, or null
+   * before the answer arrives. Kept out of `claudeVersion` because it is a *verdict* and the
+   * range it is measured against lives in Rust — see `cide_claude::version`.
+   */
+  cliSupport: ClaudeCliSupport | null
+  /** Reveal the log directory. Resolves to the path, whether or not a file manager opened. */
+  openLogDir: () => void
+  /** The log directory once it has been resolved, so it can be shown and copied. */
+  logDir: string | null
 }
 
 const THEMES: readonly { value: Theme; label: string }[] = [
@@ -73,13 +93,16 @@ const RENDERERS: readonly { value: TerminalRenderer; label: string }[] = [
   { value: 'dom', label: 'DOM' },
 ]
 
-function Appearance({ settings, patch, setTheme }: SectionProps) {
+function Appearance({ settings, patch, setTheme, openLogDir, logDir }: SectionProps) {
   return (
     <>
       <Group>
         <Row
           label="Theme"
-          hint="Every colour in the app comes from a token, so live terminals repaint with it — no restart, no reload."
+          // Worth saying out loud now that it is true: the header's toggle and this control
+          // are the same write. They used not to be, and the header's one reached neither
+          // this screen nor a second window nor the next launch.
+          hint="Every colour in the app comes from a token, so live terminals repaint with it — no restart, no reload. The titlebar’s toggle sets the same setting."
           control={
             <Segmented label="Theme" value={settings.theme} options={THEMES} onChange={setTheme} />
           }
@@ -91,6 +114,18 @@ function Appearance({ settings, patch, setTheme }: SectionProps) {
           graphics={settings.graphics}
           onChange={(graphics) => patch({ graphics })}
         />
+      </Group>
+
+      {/* Beside the graphics ladder rather than in a section of its own: somebody walking
+          down that ladder because the app will not paint is exactly who needs the log, and
+          until now there was no way to reach it from inside the app at all. */}
+      <Group title="Diagnostics">
+        <Row
+          label="Log directory"
+          hint="Where the app writes its own log. Opens in your file manager; the path is shown below either way."
+          control={<ActionButton label="Open" onClick={openLogDir} />}
+        />
+        {logDir !== null && <PathReadout path={logDir} />}
       </Group>
     </>
   )
@@ -142,7 +177,7 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
   )
 }
 
-function ClaudeSessionsSection({ settings, patch, claudeVersion }: SectionProps) {
+function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: SectionProps) {
   const claude = settings.claude
   const set = (next: Partial<ClaudeSettings>) => patch({ claude: { ...claude, ...next } })
 
@@ -153,6 +188,18 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion }: SectionProps)
           ? 'Panes will fail to spawn until the CLI is installed and on this app’s PATH.'
           : 'cide never sets ANTHROPIC_API_KEY and never reads ~/.claude/.credentials.json: a key outranks subscription OAuth, so injecting one would bill a Console organisation for a Claude Max user. Children inherit their authentication by inheriting the environment.'}
       </Note>
+
+      {/* Rendered only when there is something to say. A note reading "everything is fine"
+          on every launch is a note nobody reads on the launch it matters — which is the
+          launch after the CLI updated itself out from under this build. The sentence is
+          composed in Rust so the verified range has exactly one home. */}
+      {cliSupport?.warning != null && (
+        <Note title="Untested Claude Code version" tone="warn">
+          {cliSupport.warning}. The IDE integration — inline diffs, @-mentions, the editor
+          selection — is spoken over an undocumented protocol with no version field, so it can
+          only be right or wrong, never negotiated. The terminal itself is unaffected.
+        </Note>
+      )}
 
       <Group title="Environment">
         <ToggleRow

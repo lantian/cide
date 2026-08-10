@@ -180,3 +180,49 @@
   color: var(--text);
   margin-bottom: 4px;
 }
+
+/* Only the rule changes colour. Both themes define --yellow, so this needs no media query:
+   it is a token, and the token is what carries the light/dark difference. */
+.noteWarn {
+  border-left-color: var(--yellow);
+}
+
+/* --- an action row's button --- */
+
+.action {
+  height: 24px;
+  padding: 0 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.action:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.action:disabled {
+  cursor: not-allowed;
+  color: var(--faint);
+}
+
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The resolved path under an action row. Mono because it is a path, and selectable because
+   the point of showing it is that a user with no file manager can copy it. */
+.pathReadout {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+  user-select: text;
+}

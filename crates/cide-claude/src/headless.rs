@@ -171,6 +171,12 @@ pub fn run(program: &Path, run: &Headless) -> Result<HeadlessResult, HeadlessErr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_env(&mut command);
+    // A one-shot outliving a `SIGKILL`ed cide is a `claude` nobody can see, spending money
+    // against a prompt nobody will read the answer to. `arm` requires that the thread doing
+    // the spawn outlives the child, which this function satisfies by construction rather than
+    // by convention: the same thread blocks in `wait_with_deadline` below until the child is
+    // gone. See `crate::orphans`.
+    crate::orphans::arm(&mut command);
 
     let mut child = command.spawn().map_err(|e| HeadlessError::NotInstalled {
         detail: e.to_string(),

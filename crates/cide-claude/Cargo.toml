@@ -7,12 +7,22 @@ license.workspace = true
 
 [dependencies]
 cide-ipc = { workspace = true }
+# Two things, both of which would otherwise be copied rather than shared: the ESRCH-only pid
+# liveness rule (`lockfile::pid_is_alive`) that the hook-socket sweep needs, and
+# `protocol::SUPPORTED_CLI`, the verified CLI range `version::check_once` warns outside of.
+# A second copy of either is a second thing to get wrong on the next CLI release.
+cide-ide-mcp = { workspace = true }
 cide-pty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+# Unix-only, and gated so the crate still compiles for a target with no `prctl` at all.
+# `orphans` needs it for PR_SET_PDEATHSIG; everything else here is portable.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 # The real-CLI test mints a session id to demand back from the hook payload.
