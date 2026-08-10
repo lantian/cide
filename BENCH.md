@@ -3,14 +3,25 @@
 Run it yourself:
 
 ```sh
-cargo build -p cide-app
-CIDE_BENCH=1 ./target/debug/cide
+cargo xtask bench-ipc            # add --release for the honest numbers
+```
+
+That builds `cide-app`, runs it under `CIDE_BENCH=1`, prints the report, writes a copy to
+`target/bench-ipc.out` and exits non-zero on NO-GO. The equivalent by hand is still
+
+```sh
+cargo build -p cide-app && CIDE_BENCH=1 ./target/debug/cide
 ```
 
 The app opens a window, runs the measurement on first paint, prints the report to stdout
 and exits. It is deliberately scriptable rather than a button: on a compositor with
 focus-stealing prevention a shell-launched window may never come to the front to be
 clicked, and this number needs to be reproducible in CI.
+
+**It needs a display.** There is no headless mode and there should not be: what is being
+measured is the cost of a payload crossing into a live WebKitGTK webview. `cargo xtask
+bench-ipc` refuses up front when neither `WAYLAND_DISPLAY` nor `DISPLAY` is set, so that
+absence is reported as itself rather than as a webview crash.
 
 ## Why this gate exists
 
@@ -21,7 +32,25 @@ written on top of the current assumption. Hence: first milestone, before anythin
 
 **Floor: 30 MiB/s on the raw pull path.** Below that, stop and change the transport.
 
-## Result — 2026-08-07
+## Result — 2026-08-07 — STALE, re-run before quoting the p99
+
+> **The `p99 ms` column below is not trustworthy and the table has not been re-recorded.**
+>
+> These rows were produced with 200 pull iterations, which was the default in
+> `ui/src/bench/ipcBench.ts` at the time. At 200 samples the 99th percentile is the
+> *third-worst* measurement in the run, so one scheduler preemption anywhere in those 200
+> round trips is the entire p99 — which is why the column reads 1.000 / 2.000 / 3.000 ms,
+> the shape of a clock quantum rather than of a distribution. The MiB/s and mean columns are
+> averages over 200 samples and are worth roughly what they say; the p99 is noise.
+>
+> `PULL_ITERATIONS` is now **10 000**, where p99 is the hundredth-worst sample. The table
+> has deliberately **not** been regenerated here: the gate needs a window on a real
+> compositor, and inventing numbers for a table headed "Machine: …" would be worse than
+> leaving an honest stale one. Re-run `cargo xtask bench-ipc` on that machine and replace
+> this whole section, `iters` column included.
+>
+> The GO verdict itself does not depend on the p99 — the floor is on MiB/s — so nothing
+> below is retracted except the tail latencies.
 
 Machine: openSUSE Tumbleweed, KDE Plasma on Wayland, WebKitGTK 2.52.3, Tauri 2.11.5,
 `@xterm/xterm` 6.0.0, debug build (`opt-level = 1`, deps at 2).
@@ -82,8 +111,20 @@ buffer that will never fill.
   response arrives as an `ArrayBuffer`, over `postMessage` the same value arrives as a JSON
   array of numbers.
 
+## The boot probe is not this
+
+Every window runs a much smaller check at startup — three 8 KiB round trips — and reports it
+through `diag_report_ipc`, which logs `ipc: DEGRADED to postMessage` when the shape test
+says the fast path is gone. See `probeIpc` in `ui/src/bench/ipcBench.ts`.
+
+That probe answers an operational question ("did *this* machine silently fall back") on
+every boot; this benchmark answers an architectural one ("can the design work at all") when
+someone asks it to. The probe used to be gated behind `benchMode()`, which meant it ran only
+during a benchmark — i.e. never on the boots that could actually be degraded.
+
 ## Re-run this when
 
 - Tauri, WebKitGTK or xterm.js takes a major version bump.
 - `FLUSH_BYTES`, `FLUSH_INTERVAL` or `MAX_FRAME` change.
+- `PULL_ITERATIONS` changes — the `iters` column is part of the result.
 - Anyone proposes removing the coalescer "because it adds latency".

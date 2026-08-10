@@ -16,9 +16,30 @@
 //! * `focused` and `maximized` name live leaves,
 //! * split ids are unique — [`set_ratio`] addresses a divider by id, so a duplicate would
 //!   silently drag two dividers at once,
-//! * every ratio is finite and within `[MIN_RATIO, MAX_RATIO]`.
+//! * every ratio is finite and within `[MIN_RATIO, MAX_RATIO]`,
+//! * at most one leaf is [`PaneRole::Primary`] — "the primary pane" has to name one pane for
+//!   [`primary_of`] and for every refusal message that says "the console's primary pane".
 //!
 //! [`validate`] checks every one of those the type system does not.
+//!
+//! # The primary pane, and why "a Primary leaf exists" is two halves
+//!
+//! M1 states the invariant as *a Primary leaf exists*. That cannot be a check inside
+//! [`validate`], because most trees are supposed to have no Primary at all: only the pinned
+//! console tab is seeded with one, and every ordinary tab — a file, a diff, a shell — is
+//! built from `Auxiliary` panes, so a blanket existence check would reject the majority of
+//! legal trees. The invariant is therefore established by construction and held by
+//! preservation:
+//!
+//! * **existence** is [`new_tree`]'s caller's business, and [`validate_console`] is the
+//!   assertion for the trees that must have one (the console's). It is deliberately a
+//!   separate entry point rather than a flag on [`validate`], so a caller has to know which
+//!   kind of tree it is holding — which is knowledge this module does not have.
+//! * **preservation** is enforced here without exception: [`take_pane`] refuses a `Primary`
+//!   pane outright, so no sequence of splits, closes, detaches or promotions can remove one
+//!   from a tree that has it. Refusing only the *sole*-pane case, which is what this used to
+//!   do, left `split the primary, close the primary` producing a console with no
+//!   conversation in it and no complaint from [`validate`].
 //!
 //! Maximizing is the one operation that is *not* tree surgery: it sets a flag the renderer
 //! honours, which keeps restore exact and costs no terminal reflow.
@@ -149,9 +170,10 @@ pub fn insert_pane_at(tree: &mut PaneTree, anchor: &DockAnchor, pane: Pane) -> R
 
 /// Remove a leaf and collapse its parent split into the surviving sibling.
 ///
-/// Refused when the pane is the only one left: a tab always has at least one pane. The
-/// error distinguishes the two cases so the caller can word the message — [`CoreError::PanePrimary`]
-/// for the pinned console's primary pane, [`CoreError::LastPane`] for anything else.
+/// Refused for a [`PaneRole::Primary`] pane ([`CoreError::PanePrimary`]) and for the only
+/// pane left in the tree ([`CoreError::LastPane`]): the pinned console always shows its
+/// conversation, and a tab always has at least one pane. The two errors are distinct so the
+/// caller can word the message.
 pub fn close(tree: &mut PaneTree, pane: PaneId) -> Result<()> {
     take_pane(tree, pane).map(|_| ())
 }
@@ -160,20 +182,32 @@ pub fn close(tree: &mut PaneTree, pane: PaneId) -> Result<()> {
 ///
 /// Detach and promote both need the pane itself, not merely its disappearance; dropping it
 /// here and reconstructing it at the destination would lose the session binding.
+///
+/// Refuses a `Primary` pane for *any* caller, detach included. Letting detach through was
+/// the alternative and it loses: the console's primary pane is the project's conversation,
+/// and while it sat in a detached window the console tab would hold no `Primary` at all —
+/// the M1 invariant broken for as long as the window is open, and permanently if the
+/// re-dock anchor has gone stale by the time it comes back. One rule with no exception is
+/// also what lets `close` be `take_pane` rather than a second removal path that has to be
+/// kept in agreement with it.
 pub fn take_pane(tree: &mut PaneTree, pane: PaneId) -> Result<Pane> {
     let Some(role) = tree.panes.get(&pane).map(|p| p.role) else {
         return Err(CoreError::NoSuchPane(pane));
     };
+
+    // Checked before the sole-leaf guard so a one-pane console reports the reason that will
+    // still be true after it has company, rather than "last pane" this minute and something
+    // else the next.
+    if role == PaneRole::Primary {
+        return Err(CoreError::PanePrimary);
+    }
 
     // The sole leaf has no sibling to collapse into, so there is nothing this could
     // possibly leave behind.
     if let LayoutNode::Leaf { pane: only } = tree.root
         && only == pane
     {
-        return Err(match role {
-            PaneRole::Primary => CoreError::PanePrimary,
-            PaneRole::Auxiliary => CoreError::LastPane,
-        });
+        return Err(CoreError::LastPane);
     }
 
     let neighbour = match prune(&mut tree.root, pane) {
@@ -333,10 +367,44 @@ pub fn pane_index(tree: &PaneTree, pane: PaneId) -> Option<usize> {
         .map(|i| i + 1)
 }
 
+/// The tree's [`PaneRole::Primary`] leaf, if it has one.
+///
+/// At most one can exist — [`validate`] rejects a second — so this answers with a single id
+/// rather than an iterator. `None` is the normal answer for every tab that is not the pinned
+/// console.
+pub fn primary_of(tree: &PaneTree) -> Option<PaneId> {
+    // Leaf order rather than `panes` order, so the answer is the pane the user can actually
+    // see; `validate` guarantees the two sets agree anyway.
+    leaves(&tree.root).into_iter().find(|id| {
+        tree.panes
+            .get(id)
+            .is_some_and(|p| p.role == PaneRole::Primary)
+    })
+}
+
+/// [`validate`], plus the half it cannot check on its own: **a Primary leaf exists**.
+///
+/// For the trees that are required to have one — today that is the pinned console tab, and
+/// the caller is the only party that knows which those are. See the module docs for why this
+/// is not folded into [`validate`]: an ordinary file or shell tab legitimately has no
+/// `Primary`, so a blanket check there would reject most of the workspace.
+pub fn validate_console(tree: &PaneTree) -> Result<()> {
+    validate(tree)?;
+    if primary_of(tree).is_none() {
+        return Err(CoreError::Invariant(
+            "the console's tree has no Primary leaf".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Check every invariant listed in the module docs, naming the first breach found.
 ///
 /// Cheap enough for tests and debug assertions after each mutation; a tab holds a handful
 /// of panes, not thousands.
+///
+/// Note what is *not* here: "a Primary leaf exists". That is [`validate_console`]; see the
+/// module docs.
 pub fn validate(tree: &PaneTree) -> Result<()> {
     let leaf_ids = leaves(&tree.root);
 
@@ -371,6 +439,33 @@ pub fn validate(tree: &PaneTree) -> Result<()> {
                 pane.id
             )));
         }
+    }
+
+    // Two primaries would make "the console's primary pane" ambiguous: `primary_of` would
+    // answer with whichever came first in leaf order, and `take_pane`'s refusal would then
+    // protect a pane the rest of the app does not think of as the console's. Nothing in this
+    // module can produce the state — a tree gets its Primary at construction and `take_pane`
+    // never removes one — so the ways in are `split`/`insert_pane` handed a caller-built
+    // `Primary`, and a hand-edited or migrated `workspace.json`. Both arrive here.
+    let primaries: Vec<PaneId> = leaf_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            tree.panes
+                .get(id)
+                .is_some_and(|p| p.role == PaneRole::Primary)
+        })
+        .collect();
+    if primaries.len() > 1 {
+        return Err(CoreError::Invariant(format!(
+            "{} leaves are Primary ({}); a tree may hold at most one",
+            primaries.len(),
+            primaries
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
 
     if !seen.contains(&tree.focused) {
@@ -786,8 +881,13 @@ mod tests {
     ///
     /// Deliberately asymmetric: the right column is split one level deeper than the left,
     /// so crossing the middle divider has to descend rather than land on a leaf.
+    ///
+    /// Every pane is `Auxiliary`, including `p1` — this is an ordinary tab, not the console.
+    /// The tests built on it are about *shape* (navigation, anchors, ratios) and several of
+    /// them remove `p1`, which a `Primary` root would now refuse. The primary's own rules get
+    /// purpose-built fixtures instead of riding along on this one.
     fn asymmetric() -> (PaneTree, [PaneId; 5]) {
-        let root = primary();
+        let root = aux();
         let p1 = root.id;
         let mut tree = new_tree(root);
         let p2 = split_at(&mut tree, p1, Axis::Row, Side::After);
@@ -911,16 +1011,65 @@ mod tests {
         validate(&tree).unwrap();
     }
 
+    /// The regression this whole rule exists for.
+    ///
+    /// This test used to assert the opposite — that company makes the primary closable — and
+    /// the shape it blessed is a console tab with no conversation in it, which `validate`
+    /// was happy to accept because it never looked for a `Primary` at all.
     #[test]
-    fn the_primary_pane_can_be_closed_once_it_has_company() {
+    fn the_primary_pane_stays_closed_off_even_once_it_has_company() {
         let first = primary();
         let a = first.id;
         let mut tree = new_tree(first);
         let b = split_at(&mut tree, a, Axis::Row, Side::After);
 
-        close(&mut tree, a).unwrap();
-        assert_eq!(leaves(&tree.root), vec![b]);
+        assert_eq!(close(&mut tree, a), Err(CoreError::PanePrimary));
+        assert_eq!(leaves(&tree.root), vec![a, b], "the tree is untouched");
+        assert_eq!(primary_of(&tree), Some(a));
+        validate_console(&tree).unwrap();
+
+        // Its company, on the other hand, closes normally — the refusal is about the role,
+        // not about the tree having become small.
+        close(&mut tree, b).unwrap();
+        assert_eq!(leaves(&tree.root), vec![a]);
+        validate_console(&tree).unwrap();
+    }
+
+    #[test]
+    fn a_tree_with_no_primary_fails_only_the_console_check() {
+        let first = aux();
+        let a = first.id;
+        let tree = new_tree(first);
+
+        // An ordinary file or shell tab has no Primary and is entirely valid.
         validate(&tree).unwrap();
+        assert_eq!(primary_of(&tree), None);
+        let Err(CoreError::Invariant(msg)) = validate_console(&tree) else {
+            panic!("a console tree with no Primary must be reported");
+        };
+        assert!(msg.contains("Primary"), "{msg}");
+        assert_eq!(a, tree.focused);
+    }
+
+    #[test]
+    fn validate_rejects_a_second_primary_leaf() {
+        let first = primary();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = split_at(&mut tree, a, Axis::Row, Side::After);
+
+        // Only reachable by re-docking a Primary into a tree that already has one, which is
+        // exactly the case the check is for; forge it directly rather than build the pair of
+        // trees it would take to get here honestly.
+        tree.panes[&b].role = PaneRole::Primary;
+
+        let Err(CoreError::Invariant(msg)) = validate(&tree) else {
+            panic!("two Primary leaves must be reported");
+        };
+        assert!(
+            msg.contains(&a.to_string()) && msg.contains(&b.to_string()),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -986,11 +1135,25 @@ mod tests {
 
     #[test]
     fn take_pane_refuses_the_last_pane_like_close_does() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        assert_eq!(take_pane(&mut tree, a).unwrap_err(), CoreError::LastPane);
+        validate(&tree).unwrap();
+    }
+
+    /// Detach goes through `take_pane`, so this is the assertion that the console's
+    /// conversation cannot be moved out into a window of its own either.
+    #[test]
+    fn take_pane_refuses_the_primary_so_it_can_never_be_detached() {
         let first = primary();
         let a = first.id;
         let mut tree = new_tree(first);
+        let b = split_at(&mut tree, a, Axis::Row, Side::After);
+
         assert_eq!(take_pane(&mut tree, a).unwrap_err(), CoreError::PanePrimary);
-        validate(&tree).unwrap();
+        assert_eq!(leaves(&tree.root), vec![a, b]);
+        validate_console(&tree).unwrap();
     }
 
     #[test]
@@ -1480,10 +1643,14 @@ mod tests {
                         .unwrap_or_else(|e| panic!("step {n}: split failed: {e}"));
                 }
                 Close(i) => {
-                    let outcome = close(&mut tree, at(i));
-                    // The script deliberately ends by closing down to the primary pane,
-                    // which must be refused rather than emptying the tab.
-                    if ids.len() == 1 {
+                    let target = at(i);
+                    // Read before the call: a successful close takes the entry with it.
+                    let was_primary = tree.panes[&target].role == PaneRole::Primary;
+                    let outcome = close(&mut tree, target);
+                    // The script deliberately closes down onto the primary pane, which must
+                    // be refused however much company it has — that refusal is the whole
+                    // reason the tab still has a conversation at the end.
+                    if was_primary {
                         assert_eq!(outcome, Err(CoreError::PanePrimary), "step {n}");
                     } else {
                         outcome.unwrap_or_else(|e| panic!("step {n}: close failed: {e}"));
@@ -1515,8 +1682,10 @@ mod tests {
             validate(&tree).unwrap_or_else(|e| panic!("step {n} left the tree broken: {e}"));
         }
 
-        // Whatever the script did, the tab still has its primary pane.
+        // Whatever the script did, the tab still has its primary pane — which is now a
+        // claim about the pane rather than merely about the tree being non-empty.
         assert!(!leaves(&tree.root).is_empty());
+        validate_console(&tree).expect("the primary survived the whole script");
     }
 
     /// A tiny deterministic generator: the fuzz below needs a reproducible shuffle, not
@@ -1613,7 +1782,11 @@ mod tests {
                     }
                 }
 
-                validate(&tree).unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
+                // `validate_console`, not `validate`: this tree was seeded with a primary, so
+                // "a Primary leaf exists" is a live claim about it at every single step —
+                // including after the close and take_pane arms, which is where it used to
+                // stop being true.
+                validate_console(&tree).unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
                 let mut splits = Vec::new();
                 collect_splits(&tree.root, &mut splits);
                 assert_eq!(
