@@ -337,7 +337,12 @@ try {
   }
 
   for (const role of TOKEN_ROLES) {
-    eq(TOKEN_VAR_BY_CLASS.get(role.cls), role.token, `${role.cls} is in the canvas lookup`)
+    // Deliberately *not* `TOKEN_VAR_BY_CLASS.get(cls) === role.token`: that map is built by
+    // mapping over `TOKEN_ROLES` two lines below the table, so such an assertion restates
+    // the constructor and passes whatever the table says. The comparison worth making is the
+    // one across the two paint paths — the canvas's map against the stylesheet the buffer
+    // resolves — with the table itself checked against the stylesheet separately.
+    eq(TOKEN_VAR_BY_CLASS.get(role.cls), cssVarByClass.get(role.cls), `${role.cls}: the canvas and the buffer agree`)
     eq(cssVarByClass.get(role.cls), role.token, `${role.cls} is styled to match in the buffer`)
   }
   eq(cssVarByClass.size, TOKEN_ROLES.length, 'the stylesheet has no token class the table lacks')
@@ -345,23 +350,52 @@ try {
   // Every custom property either table names has to exist in *both* themes, or the canvas
   // silently falls back to `UNRESOLVED` grey while the buffer inherits whatever it inherits.
   const tokensCss = readFileSync('src/styles/tokens.css', 'utf8')
+  /*
+   * Which palette block belongs to which theme.
+   *
+   * The question asked here is deliberately *not* "does this property resolve in the light
+   * theme" — by CSS's own rules it always does, because the palette's selector is
+   * `:root, [data-theme='dark']` and `:root` matches the <html> element whatever its
+   * `data-theme` says. That is exactly what made the previous version of this check unable
+   * to fail: deleting `--purple` from the `[data-theme='light']` block left it green, while
+   * a light-theme buffer painted keywords with the dark palette's `#b48ead` and a light
+   * `--text` of `#d7d7dd` would have been invisible on `#f5f3f0`.
+   *
+   * So the question is the useful one instead: does each theme give the property *its own*
+   * value rather than inheriting the other theme's? A block naming any theme belongs to the
+   * theme it names; a block naming none is theme-independent — the bare `:root` that holds
+   * the fonts and the fixed sizes — and counts for both. Per block and not per selector
+   * part, or the `:root` in front of the comma pulls the dark palette back into the light
+   * theme and we are where we started.
+   *
+   * The quoting is matched literally on purpose: rewritten as `[data-theme="light"]` this
+   * stops matching and the light assertions fail loudly, rather than quietly reverting to
+   * "whatever `:root` said".
+   */
+  const ownedBy = (selector, theme) =>
+    selector.includes('[data-theme=')
+      ? selector.includes(`[data-theme='${theme}']`)
+      : selector.includes(':root')
   const declaredIn = (theme) => {
     const declared = new Set()
     for (const [, selector, body] of tokensCss.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-      // A bare `:root` block applies to both themes; the mock's palette lives in a combined
-      // `:root, [data-theme='dark']` selector and a separate light one.
-      if (!selector.includes(':root') && !selector.includes(`[data-theme='${theme}']`)) continue
+      if (!ownedBy(selector, theme)) continue
       for (const [, name] of body.matchAll(/(--[a-z0-9-]+)\s*:/g)) declared.add(name)
     }
     return declared
   }
   const dark = declaredIn('dark')
   const light = declaredIn('light')
+  // `ownedBy` is the whole reason the loop below can fail, so it is checked itself: hand one
+  // theme's block to the other and every assertion under it goes green regardless.
+  ok(!ownedBy(":root,\n[data-theme='dark']", 'light'), 'the dark palette is not read as light')
+  ok(ownedBy(":root,\n[data-theme='dark']", 'dark'), 'the dark palette is read as dark')
+  ok(ownedBy(':root', 'light') && ownedBy(':root', 'dark'), 'a theme-free :root block feeds both')
   // `--sel`, `--border` and `--accent` are read by `minimap.ts`'s palette, not by a role.
   const needed = [...TOKEN_ROLES.map((r) => r.token), PLAIN_TOKEN, '--accent', '--sel', '--border']
   for (const token of new Set(needed)) {
-    ok(dark.has(token), `tokens.css defines ${token} for the dark theme`)
-    ok(light.has(token), `tokens.css defines ${token} for the light theme`)
+    ok(dark.has(token), `the dark palette gives ${token} its own value`)
+    ok(light.has(token), `the light palette gives ${token} its own value`)
   }
 
   // The stylesheet reserves the minimap's gutter with `--w-minimap`; the canvas is sized by
@@ -741,6 +775,82 @@ try {
     eq(tagOf(grammars.clike, '#include <a.h>', '#include <a.h>'), 'meta', 'clike: a directive')
     eq(tagOf(grammars.python, '@dec', '@dec'), 'meta', 'python: a decorator')
     eq(tagOf(grammars.typescript, '@Dec class A {}', '@Dec'), 'meta', 'typescript: a decorator')
+
+    /*
+     * `atLineStart` exists because `stream.sol()` is false by the time a hook sees an
+     * indented key — the generic path eats the leading whitespace and returns first. Every
+     * key in the corpora above happens to sit in column 0, so replacing the whole function
+     * with `stream.pos === 0` passed the rest of this file. These are the indented cases.
+     */
+    eq(tagOf(grammars.yaml, '  push: 1', 'push'), 'propertyName', 'yaml: an indented key')
+    eq(tagOf(grammars.toml, '  key = 1', 'key'), 'propertyName', 'toml: an indented bare key')
+    eq(tagOf(grammars.markdown, '  ## H', '## H'), 'heading', 'markdown: an indented heading')
+
+    // The two lookup tables, checked where the fallbacks cannot answer for them: `u64` is
+    // lowercase so `capitalisedIsType` cannot make it a type, and `len` has no `(` after it
+    // so `callSyntax` cannot make it a call.
+    eq(tagOf(grammars.rust, 'let n: u64 = 1;', 'u64'), 'typeName', 'rust: a type from the table')
+    eq(tagOf(grammars.python, 'f = len', 'len'), 'variableName.function', 'python: a builtin')
+
+    // `bracket` and `punctuation` share the `--dim` role, so nothing about a colour says
+    // which one a `(` got; lezer's `t.bracket` is a different tag all the same.
+    eq(tagOf(grammars.rust, 'f(x)', '('), 'bracket', 'rust: a paren is a bracket')
+    eq(
+      tagOf(grammars.typescript, 'const n = 1_000.5e-3;', '1_000.5e-3'),
+      'number',
+      'a numeric literal keeps its separators, fraction and exponent in one token',
+    )
+  }
+  {
+    /*
+     * Three shapes where a state that fails to close swallows the rest of the file. All
+     * three are what their modules' comments say they are for, and all three survived being
+     * broken until these assertions existed: what the corpora asserted was that *some* token
+     * came out, and a document tokenized entirely as one string satisfies that.
+     */
+    const apostrophe = tokenize(grammars.python, "it's fine\nx = 1\n", 'python apostrophe')
+    ok(
+      apostrophe.some((t) => t.tag === 'number' && t.text === '1'),
+      "python: an apostrophe in prose does not open a string that eats the next line",
+    )
+
+    const nested = tokenize(grammars.rust, '/* a /* b */ still */ let x = 1;\n', 'rust nesting')
+    eq(
+      nested.filter((t) => t.tag === 'comment').map((t) => t.text),
+      ['/* a /* b */ still */'],
+      'rust: a nested block comment closes on its outer terminator, not its inner one',
+    )
+    ok(
+      nested.some((t) => t.tag === 'keyword' && t.text === 'let'),
+      'rust: and the code after it is code again',
+    )
+
+    /*
+     * A fence is a toggle, and the closing one has to turn it off. Written as a set rather
+     * than a toggle, every line after the first code block in a README is painted as code —
+     * and the corpus above could not see it, because it ends inside the same document and
+     * `monospace` is emitted by the inline-code span either way.
+     */
+    const fenced = tokenize(grammars.markdown, '```rust\nfn x() {}\n```\n# after\n', 'md fences')
+    ok(
+      fenced.some((t) => t.tag === 'monospace' && t.text === 'fn x() {}'),
+      'markdown: a fenced line is code rather than prose',
+    )
+    ok(
+      fenced.some((t) => t.tag === 'heading' && t.text === '# after'),
+      'markdown: and the closing fence ends the block instead of reopening it',
+    )
+
+    // The hash count decides the terminator: `"` inside `r#"…"#` is content, not the end.
+    const raw = tokenize(grammars.rust, 'let s = r#"a "quoted" thing"#;\n', 'rust raw strings')
+    eq(
+      raw
+        .filter((t) => t.tag === 'string')
+        .map((t) => t.text)
+        .join(''),
+      'r#"a "quoted" thing"#',
+      'rust: a raw string closes on `"#` and not on the quote inside it',
+    )
   }
   {
     /*
@@ -784,10 +894,14 @@ try {
    * Two assertions, because neither is sound alone.
    *
    * The ceiling is absolute: no shape may take a quarter of a second for 100,000 characters.
-   * The slowest *linear* case measured here is 13 ms and the three quadratics were 1.5 s,
-   * 1.8 s and 5.7 s, so the threshold sits about twenty times above honest work and a
-   * hundred times below the failure — wide enough to survive a slow CI box, which an
-   * absolute figure otherwise would not be.
+   * The slowest *honest* shapes are the two bounded scans themselves — a line of `[` under
+   * markdown and a line of `${` under shell each pay their 512-character bound at every
+   * position — and they measure 48 ms and 45 ms here, against 1.5 s for the same shapes with
+   * the bound taken off. 250 ms is therefore not twenty times above honest work; it is about
+   * five times above it and six times below the failure, which is as central as it can be
+   * placed and is roughly the geometric mean of the two. That is the honest margin, and it
+   * is why the ratio below rather than this line is the real instrument: a box three times
+   * slower than this one moves both numbers together and the ratio does not move at all.
    *
    * The ratio is the sharper instrument: an eightfold length step should cost about eight
    * times as much, and 20 sits between a linear 8 and a quadratic 64. It is skipped when the
