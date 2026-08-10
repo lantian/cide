@@ -67,6 +67,11 @@ export function PaneFrame({
         focused={focused}
         maximized={maximized}
         closable={pane.role !== 'primary'}
+        // Same role, same answer. `layout::take_pane` refuses the primary for detach exactly
+        // as it does for close, so offering a live detach button here would be one gesture
+        // in the frame that is guaranteed to fail — and it fails into an error toast, which
+        // reads as a bug rather than as a rule.
+        detachable={pane.role !== 'primary'}
         onMaximize={onMaximize}
         onDetach={onDetach}
         onClose={onClose}
@@ -86,6 +91,11 @@ export interface PaneTitleBarProps {
    * user, not the enforcement — Rust answers `PanePrimary` whether or not we offer it.
    */
   closable?: boolean | undefined
+  /**
+   * False for the project console's pane, for the same reason as `closable`: detaching goes
+   * through the same `take_pane` refusal, so the button would never once succeed.
+   */
+  detachable?: boolean | undefined
   onMaximize?: (() => void) | undefined
   onDetach?: (() => void) | undefined
   onClose?: (() => void) | undefined
@@ -97,6 +107,7 @@ export function PaneTitleBar({
   focused,
   maximized = false,
   closable = true,
+  detachable = true,
   onMaximize,
   onDetach,
   onClose,
@@ -118,12 +129,20 @@ export function PaneTitleBar({
         >
           ⛶
         </button>
+        {/* `aria-disabled`, not `disabled`, for the reason spelled out on the close button. */}
         <button
           type="button"
-          className={styles.action}
-          title="Detach into a window"
-          aria-label="Detach pane into a window"
-          onClick={onDetach}
+          className={detachable ? styles.action : `${styles.action} ${styles.actionDisabled}`}
+          title={
+            detachable ? 'Detach into a window' : 'The project console pane cannot be detached'
+          }
+          aria-label={
+            detachable
+              ? 'Detach pane into a window'
+              : 'The project console pane cannot be detached'
+          }
+          aria-disabled={!detachable}
+          onClick={detachable ? onDetach : undefined}
         >
           ⧉
         </button>

@@ -19,7 +19,7 @@
  * comes back. That is a fact about the transport rather than a guess from a timing
  * threshold.
  */
-import { diag, type IpcHealth } from '@/ipc/client'
+import { benchMode, diag, type IpcHealth } from '@/ipc/client'
 
 export interface BenchRow {
   label: string
@@ -164,10 +164,20 @@ export async function probeIpc(): Promise<IpcHealth> {
  * whose caller must not have to think about ordering or error handling: a diagnostic that
  * can break a boot is worse than no diagnostic. Returns the in-flight promise so a test — or
  * a future caller that does care — can await it.
+ *
+ * Skipped entirely under `CIDE_BENCH=1`, and that is not merely to save 24 KiB. The bench
+ * window is the one window where something else is already measuring this transport and
+ * reporting the answer: [`runBench`] ends with its own `diag.reportIpc`, and `cargo xtask
+ * bench-ipc` parses what that run prints. Two overlapping measurements would interleave
+ * their round trips into each other's samples, and the two `reportIpc` calls would race to
+ * decide which `mib_per_sec` the log ends up holding — an 8 KiB single round trip, or the
+ * peak across four payload sizes. Returning `null` here leaves exactly one answer per
+ * window.
  */
 let probeInFlight: Promise<IpcHealth | null> | null = null
 
 export function probeIpcOnce(): Promise<IpcHealth | null> {
+  if (benchMode()) return Promise.resolve(null)
   probeInFlight ??= probeIpc().catch(async (e: unknown) => {
     await diag.log(`ipc probe failed: ${String(e)}`).catch(() => {})
     return null

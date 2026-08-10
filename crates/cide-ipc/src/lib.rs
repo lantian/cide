@@ -187,8 +187,9 @@ pub enum PaneKind {
 
 /// Whether a pane may be closed.
 ///
-/// The pinned Claude tab's first pane is `Primary`: closing it while it is the only leaf
-/// returns `Err(PanePrimary)` so the project console can never be emptied by accident.
+/// The pinned Claude tab's first pane is `Primary`: closing *or detaching* it returns
+/// `Err(PanePrimary)` however many panes the tab holds, so the project console can never
+/// lose its conversation — not by accident, and not by splitting first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]

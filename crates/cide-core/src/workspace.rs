@@ -514,8 +514,10 @@ pub fn detach_pane(
     pane: PaneId,
 ) -> Result<WindowLabel> {
     // `take_pane` enforces the same refusals as closing: the console's primary pane cannot
-    // leave while it is alone, and neither can a tab's last pane. Detaching the only pane
-    // of a tab would leave an empty tab behind, which the tree has no way to represent.
+    // leave at all, and neither can a tab's last pane. Detaching the only pane of a tab
+    // would leave an empty tab behind, which the tree has no way to represent; detaching
+    // the primary would leave the console tab with no `Primary` for as long as that window
+    // stayed open, and permanently if its re-dock anchor went stale first.
     let (taken, anchor) = {
         let t = tab_mut(ws, project, tab)?;
         // Read before the surgery, in this order and not the other: `take_pane` collapses the

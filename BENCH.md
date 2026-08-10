@@ -3,7 +3,8 @@
 Run it yourself:
 
 ```sh
-cargo xtask bench-ipc            # add --release for the honest numbers
+cargo xtask bench-ipc --release            # the numbers worth quoting
+pnpm --dir ui dev & cargo xtask bench-ipc  # the debug build, which needs that dev server
 ```
 
 That builds `cide-app`, runs it under `CIDE_BENCH=1`, prints the report, writes a copy to
@@ -12,6 +13,17 @@ That builds `cide-app`, runs it under `CIDE_BENCH=1`, prints the report, writes 
 ```sh
 cargo build -p cide-app && CIDE_BENCH=1 ./target/debug/cide
 ```
+
+**A debug `cide` has no frontend of its own.** `tauri.conf.json` compiles `frontendDist`
+into the binary only for a release build; the debug one opens `devUrl`,
+`http://localhost:1420`, and with nothing listening there it comes up on a connection-error
+page. That page never reaches `runBench`, so the run neither measures nor exits — the gate
+just waits out its 900 s deadline and reports a timeout. `cargo xtask bench-ipc` therefore
+checks the port before it compiles anything and tells you which of the two commands above
+you wanted. `--release` needs no server: the task runs `pnpm --dir ui build` first, because
+`cargo build --release` does *not* run `beforeBuildCommand` and would otherwise embed
+whatever `ui/dist` was last left holding — a confident measurement of stale frontend
+constants, which is the one failure this report cannot show you.
 
 The app opens a window, runs the measurement on first paint, prints the report to stdout
 and exits. It is deliberately scriptable rather than a button: on a compositor with
@@ -113,14 +125,22 @@ buffer that will never fill.
 
 ## The boot probe is not this
 
-Every window runs a much smaller check at startup — three 8 KiB round trips — and reports it
-through `diag_report_ipc`, which logs `ipc: DEGRADED to postMessage` when the shape test
-says the fast path is gone. See `probeIpc` in `ui/src/bench/ipcBench.ts`.
+`probeIpc` in `ui/src/bench/ipcBench.ts` is a much smaller check — three 8 KiB round trips —
+reported through `diag_report_ipc`, which logs `ipc: DEGRADED to postMessage` when the shape
+test says the fast path is gone. It answers an operational question ("did *this* machine
+silently fall back") for an ordinary boot; this benchmark answers an architectural one ("can
+the design work at all") when someone asks it to.
 
-That probe answers an operational question ("did *this* machine silently fall back") on
-every boot; this benchmark answers an architectural one ("can the design work at all") when
-someone asks it to. The probe used to be gated behind `benchMode()`, which meant it ran only
-during a benchmark — i.e. never on the boots that could actually be degraded.
+`probeIpcOnce()` is the caller-facing form: at most one run per window, every failure
+swallowed into a `diag.log` line, and a no-op under `CIDE_BENCH=1` so it cannot interleave
+its round trips into the gate's samples or race the gate's own `diag_report_ipc`.
+
+> **Not yet wired.** `probeIpcOnce()` has no call site: the one line that would run it lives
+> in `ui/src/App.tsx`, which the agent that wrote the probe does not own. Until that line
+> lands the probe is dormant and boots keep behaving exactly as they did — which is the bug
+> it was written for, since gating it behind `benchMode()` meant it ran only during a
+> benchmark, i.e. never on the boots that could actually be degraded. Delete this note when
+> `App.tsx` calls it.
 
 ## Re-run this when
 

@@ -10,7 +10,9 @@
 //!   three-file change that a reviewer can see.
 //! * `bench-ipc`          — measure the PTY transport: build `cide-app`, run it under
 //!   `CIDE_BENCH=1`, print the report and exit non-zero on NO-GO. This is the M0 GO/NO-GO
-//!   gate, and it needs a display — see `BENCH.md`.
+//!   gate. It needs a display, and it needs a frontend for the binary to load — a Vite dev
+//!   server on :1420 for the debug profile, a built `ui/dist` for `--release`. See
+//!   `BENCH.md`.
 //! * `package`            — preflight the Linux packaging and print the plan; `--write`
 //!   regenerates the Flatpak files and `--check` gates them. It builds nothing unless asked
 //!   with `--run`. See `package.rs` and `docs/adr/0007`.
@@ -39,7 +41,9 @@ Tasks:
   contract-check [--write] diff the live command/event surface against contract/*.json
   bench-ipc [--release]    measure IPC throughput (M0 GO/NO-GO gate). Builds cide-app,
             [--no-build]     runs it under CIDE_BENCH=1, prints the report and fails on
-                             NO-GO. Needs a display; see BENCH.md.
+                             NO-GO. Needs a display. The debug profile also needs the Vite
+                             dev server on :1420 (`pnpm --dir ui dev`); --release builds
+                             ui/dist and embeds it instead. See BENCH.md.
   package [targets] [...]  preflight the Linux packaging and print the plan
                              targets: --appimage --deb --flatpak (default: all)
                              --write  regenerate packaging/flatpak/*
@@ -588,6 +592,34 @@ const BENCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 /// How often the deadline is checked while the app runs.
 const BENCH_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The port `tauri.conf.json` names as `devUrl`.
+///
+/// A *debug* `cide` does not embed a frontend: `frontendDist` is only compiled in for a
+/// release build, and the debug binary opens `http://localhost:1420` instead. With nothing
+/// listening there the window comes up on WebKitGTK's "could not connect" page, which
+/// never reaches `runBench`, never calls `diag_bench_report` and never exits — so the gate
+/// would sit out the whole [`BENCH_TIMEOUT`] and then report a timeout. Fifteen minutes to
+/// say "you forgot the dev server" is not a gate. `run.sh` starts Vite for this same reason.
+const DEV_SERVER_PORT: u16 = 1420;
+
+/// How long to wait for the loopback connect that answers "is the dev server up".
+///
+/// Loopback either accepts immediately or refuses immediately; the timeout is only so a
+/// pathological firewall rule that black-holes the SYN cannot hang the gate before it has
+/// even started.
+const DEV_SERVER_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Is something accepting connections on `port` on the loopback interface?
+///
+/// A bare connect rather than an HTTP request: the question is only whether the debug
+/// binary will find *a* server where it is about to look, and Vite accepts on the same
+/// socket it serves on. Asking for a document instead would mean deciding what a valid
+/// answer looks like, which is the webview's job and not this one's.
+fn port_listening(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, DEV_SERVER_PROBE).is_ok()
+}
+
 /// The GO/NO-GO answer parsed out of a report.
 #[derive(Debug, PartialEq, Eq)]
 struct Verdict {
@@ -597,9 +629,11 @@ struct Verdict {
 
 /// Read the verdict line out of a benchmark report.
 ///
-/// `NO-GO` is tested before `GO` for the obvious reason, which is also why this is a named
-/// function with tests rather than a `contains("GO")` inline: getting that order wrong turns
-/// the gate into one that passes exactly when it should fail.
+/// Anchored with `starts_with` rather than `contains`, which is the whole reason this is a
+/// named function with tests: `"NO-GO — …"` contains `"GO"`, so the obvious inline check is
+/// a gate that passes exactly when it should fail. With the anchor the two arms are
+/// mutually exclusive and their order does not matter — the anchor is doing the work, not
+/// the ordering, and `a_no_go_report_is_not_mistaken_for_a_pass` is what keeps it that way.
 fn bench_verdict(report: &str) -> Option<Verdict> {
     report.lines().find_map(|line| {
         let line = line.trim();
@@ -630,6 +664,19 @@ fn bench_verdict(report: &str) -> Option<Verdict> {
 /// of a payload crossing into a live WebKitGTK webview, and a mocked one would measure
 /// nothing anyone cares about. The display check up front is so that absence is reported as
 /// itself rather than as a webview crash.
+///
+/// **And it needs a frontend**, which is not the same thing in both profiles and is the one
+/// way this task can look like it works and quietly not:
+///
+/// * debug — the binary loads `devUrl`, so a Vite dev server has to be listening on
+///   [`DEV_SERVER_PORT`]. Without one the window opens on a connection-error page, `runBench`
+///   never runs, and the only symptom is the full [`BENCH_TIMEOUT`] elapsing.
+/// * `--release` — the binary embeds `ui/dist`, which `cargo build --release -p cide-app`
+///   does *not* produce: `beforeBuildCommand` belongs to `cargo tauri build`. So the frontend
+///   is built here, first, explicitly.
+///
+/// Both are checked before anything is compiled, so the refusal costs a second rather than a
+/// full build.
 fn bench_ipc(release: bool, build: bool) -> anyhow::Result<()> {
     let root = workspace_root()?;
 
@@ -640,7 +687,37 @@ fn bench_ipc(release: bool, build: bool) -> anyhow::Result<()> {
         );
     }
 
+    if !release && !port_listening(DEV_SERVER_PORT) {
+        bail!(
+            "nothing is listening on 127.0.0.1:{DEV_SERVER_PORT}, and a debug `cide` loads its \
+             UI from there rather than from ui/dist. It would open a connection-error page, \
+             never reach the benchmark, and time out after {}s.\n\n\
+             Start one:   pnpm --dir ui dev\n\
+             Or measure the build worth quoting, which embeds its own frontend:\n\
+             \x20            cargo xtask bench-ipc --release",
+            BENCH_TIMEOUT.as_secs()
+        );
+    }
+
     if build {
+        // The frontend first, and only for `--release`. A release `cide` embeds `ui/dist` at
+        // compile time and `cargo build` does not run `tauri.conf.json`'s
+        // `beforeBuildCommand` — only `cargo tauri build` does — so skipping this measures
+        // whatever `ui/dist` was last left holding. That is not a harmless staleness here:
+        // what this gate measures is decided by frontend constants (`PULL_ITERATIONS`,
+        // `SIZES`), so an old `ui/dist` produces a confident report of the wrong code that
+        // is indistinguishable from a report of the right one.
+        if release {
+            let status = Command::new("pnpm")
+                .current_dir(&root)
+                .args(["--dir", "ui", "build"])
+                .status()
+                .context("running pnpm --dir ui build (needed: --release embeds ui/dist)")?;
+            if !status.success() {
+                bail!("pnpm --dir ui build failed");
+            }
+        }
+
         let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         cargo.current_dir(&root).args(["build", "-p", "cide-app"]);
         if release {
@@ -739,6 +816,28 @@ mod tests {
              \n\
              {verdict}\n"
         )
+    }
+
+    /// The dev-server probe has to answer "yes" to a real listener, or the release-less gate
+    /// refuses a run that would have worked.
+    #[test]
+    fn a_listening_socket_is_seen() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("bound").port();
+        assert!(port_listening(port));
+    }
+
+    /// And "no" to a closed one, which is the direction that saves the fifteen minutes.
+    ///
+    /// The port is obtained by binding and dropping rather than hardcoded: a fixed number
+    /// would make this test depend on nothing else on the machine having chosen it, and the
+    /// one it would fail on is a developer who happens to be running Vite.
+    #[test]
+    fn a_closed_port_is_not_a_dev_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("bound").port();
+        drop(listener);
+        assert!(!port_listening(port));
     }
 
     #[test]
