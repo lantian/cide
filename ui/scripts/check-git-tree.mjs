@@ -335,10 +335,32 @@ try {
     'added',
     'a file staged as added and then edited is still an addition: the index side wins',
   )
+  /*
+   * The conflict rule needs a fixture that can tell it apart from the fallback.
+   *
+   * This assertion used to pass `('conflicted', 'conflicted')`, where the `index` side is
+   * already `conflicted` and the ordinary "index wins" branch returns `conflicted` on its own:
+   * deleting the conflict rule outright left the check green. Only a pair whose *other* side
+   * would otherwise win discriminates. Both are asserted, because the mixed pair is what makes
+   * the rule testable and the doubled pair is what `cide_git::status` actually sends — libgit2
+   * sets `is_conflicted()` for the whole entry, so `index_side` and `worktree_side` both report
+   * `Conflicted`.
+   */
+  eq(
+    m.entryStatus(entry('a', 'added', 'conflicted', 'd')),
+    'conflicted',
+    'a conflict outranks both sides — it is the state that blocks a commit, and a row drawn '
+      + 'as `added` would invite a click on a checkbox that cannot commit',
+  )
+  eq(
+    m.entryStatus(entry('a', 'conflicted', 'added', 'd')),
+    'conflicted',
+    'from either side',
+  )
   eq(
     m.entryStatus(entry('a', 'conflicted', 'conflicted', 'd')),
     'conflicted',
-    'except a conflict, which outranks both — it is the state that blocks a commit',
+    'including the doubled pair `cide_git::status` really sends',
   )
 
   const expanded = m.defaultExpanded(one)
@@ -354,6 +376,56 @@ try {
     "expanding it is what asks Rust for `includeIgnored`, so the row id has to be recognisable",
   )
   eq(m.isIgnoredGroupRow(m.groupRowId(APP, 'cl:default')), false, 'and nothing else is')
+
+  // --- what a refresh carries over -----------------------------------------------------
+
+  /*
+   * `arrivals` is the whole of `useGitPanel::adopt`'s "is this row new" rule, and it is here
+   * rather than in the hook because it was *wrong* in the hook in a way nothing could see: it
+   * read the `seenFiles`/`seenGroups` refs from inside a `setSelected`/`setExpanded` updater
+   * that React runs during the following render — after `adopt` has already replaced both refs
+   * with the payload being adopted. Every id therefore tested as already-seen, nothing was ever
+   * ticked, no group was ever opened, and the panel painted its rows and then sat there with
+   * every changelist shut and Commit disabled. A pure function is testable; a ref read at a
+   * moment React chooses is not.
+   */
+  const firstLoad = m.arrivals(one, new Set(), new Set())
+  eq(
+    firstLoad.files.sort(),
+    [m.fileRowId(APP, 'a.rs'), m.fileRowId(APP, 'src/b.rs')].sort(),
+    'a first payload arrives with the active changelist ticked — this is the assertion that '
+      + 'fails when the panel opens with nothing selected and a dead Commit button',
+  )
+  eq(
+    firstLoad.groups.sort(),
+    [...m.defaultExpanded(one)].sort(),
+    'and with its groups open, the ignored one excepted',
+  )
+  eq(
+    m.arrivals(one, new Set(m.allFiles(one)), m.allGroups(one)),
+    { files: [], groups: [] },
+    'a payload that brings nothing new adds nothing: a refresh must not re-tick what the user '
+      + 'unticked nor re-open what they shut, and this repaints several times a second',
+  )
+  eq(
+    m.arrivals(one, new Set([m.fileRowId(APP, 'a.rs')]), m.allGroups(one)).files,
+    [m.fileRowId(APP, 'src/b.rs')],
+    'only the genuinely new file — "Claude edited a file, commit it" is one click',
+  )
+  eq(
+    m.arrivals(one, new Set(), new Set()).files.some((id) => id.includes('notes.md')),
+    false,
+    'and never an unversioned one, however new it is',
+  )
+
+  // Ticks whose file is gone must not survive: a selection set that only ever grows ends up
+  // naming paths from a repo that has been closed, and commit reads the selection.
+  const stale = new Set([m.fileRowId(APP, 'a.rs'), m.fileRowId(APP, 'deleted.rs')])
+  eq(
+    [...m.pruneSelection(m.allFiles(one), stale)],
+    [m.fileRowId(APP, 'a.rs')],
+    'pruneSelection drops a tick whose file the refresh no longer reports, and keeps the rest',
+  )
 
   // --- commit units --------------------------------------------------------------------
 

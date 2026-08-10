@@ -47,10 +47,12 @@ import {
   allFiles,
   allGroups,
   allRepos,
+  arrivals,
   buildRows,
   commitUnits,
   defaultExpanded,
   defaultSelection,
+  flatFiles,
   inRepo,
   isIgnoredGroupRow,
   normalizeStatus,
@@ -130,7 +132,16 @@ export interface GitPanelActions {
   reloadIndex: (repo: RepoId) => void
   /** Guard bar, right button: keep our ticks and let the next commit rewrite the index. */
   overwriteIndex: (repo: RepoId) => void
+  /** A file row was double-clicked, or Enter was pressed on it. */
   openDiff: (row: Row) => void
+  /**
+   * The toolbar's ◫ — the diff of the first ticked file.
+   *
+   * Reads the tree rather than the rendered rows, because a collapsed group has ticked files
+   * and no rows at all: the button is enabled off `picked`, so searching the rows left it
+   * enabled and inert whenever the user had collapsed the changelist.
+   */
+  showSelectedDiff: () => void
 }
 
 export interface GitPanelOptions {
@@ -265,23 +276,29 @@ export function useGitPanel(
    */
   const adopt = useCallback((next: StatusView) => {
     const live = allFiles(next)
-    const defaults = defaultSelection(next)
+    // What is genuinely new is decided *here*, before the two `seen` refs are replaced, and
+    // never inside a state updater. React runs an updater eagerly only while the fiber has no
+    // other update pending, and `refresh` always leaves one (`setLoading(false)` runs one line
+    // earlier), so an updater that read `seenFiles.current` ran during the following render —
+    // after the assignments below — and found every id already seen. Nothing was ever ticked
+    // and no group was ever opened: the panel painted its rows and then sat there with every
+    // changelist shut and Commit disabled. See `model.ts::arrivals`.
+    const fresh = arrivals(next, seenFiles.current, seenGroups.current)
+    seenFiles.current = new Set(live)
+    seenGroups.current = allGroups(next)
     setSelected((prev) => {
       const kept = pruneSelection(live, prev)
-      for (const id of live) {
-        if (!seenFiles.current.has(id) && defaults.has(id)) kept.add(id)
-      }
+      for (const id of fresh.files) kept.add(id)
       return kept
     })
     setExpanded((prev) => {
+      // Identity is the bailout: this runs on every payload while an agent edits, and a new
+      // Set each time would re-render the whole tree for a refresh that changed nothing.
+      if (fresh.groups.length === 0) return prev
       const merged = new Set(prev)
-      for (const id of defaultExpanded(next)) {
-        if (!seenGroups.current.has(id)) merged.add(id)
-      }
+      for (const id of fresh.groups) merged.add(id)
       return merged
     })
-    seenFiles.current = new Set(live)
-    seenGroups.current = allGroups(next)
     setView(next)
     // A repo that stopped diverging drops its answer, so the next real divergence raises
     // the bar again instead of being suppressed by an answer to an older one.
@@ -502,10 +519,11 @@ export function useGitPanel(
   /**
    * Read every repo's shelf.
    *
-   * Called when the Shelf tab opens and after anything shelves — never on a timer and never
-   * from the commit tab, because it is one round trip per repository and the tab is its only
-   * reader. The panel used to hold a `useState` that nothing ever wrote to, so the Shelf tab
-   * showed the fixture or nothing at all, forever.
+   * Called when the Shelf tab opens, after anything shelves, and from the panel's own ↻ —
+   * which cannot know which tab is showing, and whose whole meaning is "re-read everything".
+   * Never on a timer and never from a status refresh, because it is one round trip per
+   * repository and the Shelf tab is its only reader. The panel used to hold a `useState` that
+   * nothing ever wrote to, so the Shelf tab showed the fixture or nothing at all, forever.
    */
   const loadShelf = useCallback(async () => {
     if (story || project === null) return
@@ -602,16 +620,24 @@ export function useGitPanel(
     setAnswered((prev) => new Set(prev).add(repo))
   }, [])
 
-  const openDiff = useCallback(
-    (row: Row) => {
-      const entry = row.entry
-      if (project === null || row.kind !== 'file' || entry === undefined) return
+  /**
+   * Fetch one file's diff and hand it over.
+   *
+   * Takes the repo and the entry rather than a `Row`, because the toolbar's ◫ acts on the
+   * *selection* and the selection outlives the rows: `buildRows` emits no file rows for a
+   * collapsed group, so a search of the row list found nothing whenever the user had collapsed
+   * the changelist — an enabled button that did nothing, which is the class of bug this panel
+   * already had too much of. `flatFiles` reads the tree, exactly as commit does.
+   */
+  const showDiff = useCallback(
+    (repo: RepoId, entry: ChangeEntry) => {
+      if (project === null) return
       void (async () => {
         // `combined` is HEAD→working tree, which is what a changelist row *is*. In
         // staging-area mode the index is the truth, so the staged side is the honest one.
         const side = stagingArea ? 'staged' : 'combined'
         const diff = await guarded('git diff', () =>
-          gitApi.diffFile(project, row.repo, entry.path, side),
+          gitApi.diffFile(project, repo, entry.path, side),
         )
         if (diff === undefined) return
         if (onOpenDiff === undefined) {
@@ -621,11 +647,26 @@ export function useGitPanel(
           void diag.log('git panel: onOpenDiff is not wired; the fetched FileDiff was dropped')
           return
         }
-        onOpenDiff(diff, row.repo)
+        onOpenDiff(diff, repo)
       })()
     },
     [project, guarded, note, stagingArea, onOpenDiff],
   )
+
+  /** Double-click, or Enter on a file row. */
+  const openDiff = useCallback(
+    (row: Row) => {
+      if (row.kind !== 'file' || row.entry === undefined) return
+      showDiff(row.repo, row.entry)
+    },
+    [showDiff],
+  )
+
+  /** The toolbar's ◫: the first ticked file, whether or not its group is rendered. */
+  const showSelectedDiff = useCallback(() => {
+    const first = flatFiles(view).find((f) => selected.has(f.id))
+    if (first !== undefined) showDiff(first.repo, first.entry)
+  }, [view, selected, showDiff])
 
   return {
     view,
@@ -660,5 +701,6 @@ export function useGitPanel(
     reloadIndex,
     overwriteIndex,
     openDiff,
+    showSelectedDiff,
   }
 }

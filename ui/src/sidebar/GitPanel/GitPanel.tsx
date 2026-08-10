@@ -94,10 +94,7 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
         onRefresh={git.refresh}
         onUnstage={git.unstage}
         onShelve={git.shelve}
-        onShowDiff={() => {
-          const first = git.rows.find((r) => r.kind === 'file' && git.selected.has(r.id))
-          if (first) git.openDiff(first)
-        }}
+        onShowDiff={git.showSelectedDiff}
         onStagingArea={git.setStagingArea}
         onCollapseAll={() => git.setAllExpanded(false)}
         onExpandAll={() => git.setAllExpanded(true)}

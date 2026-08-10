@@ -392,6 +392,46 @@ export function defaultSelection(view: StatusView): Set<string> {
   return out
 }
 
+/**
+ * What a freshly arrived payload adds to the ticks and to the open groups.
+ *
+ * A refresh must not re-tick what the user unticked or re-open what they shut, so "new" means
+ * *absent from the previous payload* — which is why both `seen` sets are parameters rather
+ * than something derived from `next`.
+ *
+ * # Why this is a named function and not two loops inside `adopt`
+ *
+ * It used to be two loops inside the `setSelected`/`setExpanded` updaters in `useGitPanel`,
+ * reading the `seenFiles`/`seenGroups` refs that the very same function overwrote a few lines
+ * later. React evaluates a state updater eagerly only while the fiber has no other update
+ * pending (`dispatchSetStateInternal`, and `enqueueUpdate` marks the fiber synchronously); the
+ * panel always has one, because `refresh` calls `setLoading(false)` immediately before
+ * `adopt`. So the updaters ran during the *next render* instead — by which time both refs held
+ * this payload, every id tested as already-seen, and nothing was ever ticked or expanded. The
+ * panel opened with every group collapsed, an empty selection and a dead Commit button.
+ *
+ * Computed here, from values read at call time, the answer depends on the data rather than on
+ * when React decides to run an updater.
+ */
+export interface Arrivals {
+  /** Ids of files that are new *and* belong in the default ticks. */
+  files: string[]
+  /** Ids of collapsible rows that are new *and* start open. */
+  groups: string[]
+}
+
+export function arrivals(
+  next: StatusView,
+  seenFiles: ReadonlySet<string>,
+  seenGroups: ReadonlySet<string>,
+): Arrivals {
+  const defaults = defaultSelection(next)
+  return {
+    files: allFiles(next).filter((id) => !seenFiles.has(id) && defaults.has(id)),
+    groups: [...defaultExpanded(next)].filter((id) => !seenGroups.has(id)),
+  }
+}
+
 /** Groups that start open. Ignored files are noise until asked for, exactly as in IDEA. */
 export function defaultExpanded(view: StatusView): Set<string> {
   const out = new Set<string>()
