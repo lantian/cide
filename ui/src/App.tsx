@@ -36,6 +36,7 @@ import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
+import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
@@ -836,6 +837,16 @@ export function App() {
           claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
           cursor={`rev ${boot?.workspace.rev ?? 0}`}
         />
+
+        {/*
+          * Says so when the IPC transport has silently degraded. WebKitGTK's custom-protocol
+          * path can fail at boot, after which `ipc-protocol.js` sets `customProtocolIpcFailed`
+          * permanently, logs one `console.warn` nobody sees on Wayland, and falls back to
+          * string `postMessage` — throughput collapses with no crash and no Rust-side signal.
+          * That is indistinguishable from "the app is just slow", which is exactly the report
+          * this came out of. All state lives in `transportWatch`; this takes no props.
+          */}
+        <TransportNotice />
 
         {benchMode() && (
           <button className={styles.benchButton} onClick={onBench} disabled={benchRunning}>
