@@ -47,12 +47,16 @@ fn default_intent(kind: &TabKind, axis: Axis) -> SplitIntent {
 }
 
 /// The pane a given intent describes, before any process exists.
+///
+/// Every arm here produces a pane a user can then use. There is deliberately no arm making a
+/// `PaneKind::Diff`: what a diff pane renders lives on its *tab* (`TabKind::Diff { spec }`),
+/// so one split out beside a Claude console would have nothing to show. `SplitIntent::Diff`
+/// was removed for that reason — see the enum in `cide-ipc`.
 fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
     let (kind, suffix) = match intent {
         SplitIntent::NewClaude | SplitIntent::ForkPrimary => (PaneKind::Claude, "claude"),
         SplitIntent::Mirror { .. } => (PaneKind::Claude, "claude"),
         SplitIntent::Shell => (PaneKind::Shell, "bash"),
-        SplitIntent::Diff => (PaneKind::Diff, "claude — diff"),
     };
     Pane {
         id: PaneId::new(),

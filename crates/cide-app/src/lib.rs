@@ -326,6 +326,22 @@ pub fn run() {
                 }
             }
 
+            // One IDE server per restored project, for the same ordering reason as the hook
+            // socket above and with the same consequence for getting it wrong: a pane spawns
+            // with `CLAUDE_CODE_SSE_PORT` read out of the environment at exec, and a `claude`
+            // that starts without it never finds this project's server at all.
+            //
+            // `ensure` is otherwise called only from `project_open`, which a restoring launch
+            // never reaches — the projects arrive from `workspace.json` — so without this the
+            // headline feature was missing on every launch but the first.
+            if let Some(servers) = app.try_state::<ide::IdeServers>() {
+                // The snapshot is taken and dropped before any server starts: `ensure` blocks
+                // on a runtime, and holding the workspace lock across that would stall every
+                // command behind a port bind.
+                let ws = app.state::<WorkspaceState>().snapshot();
+                servers.ensure_all(app.handle(), &ws);
+            }
+
             restore_windows(app.handle())?;
             Ok(())
         })
