@@ -53,6 +53,7 @@ import {
   benchMode,
   claude as claudeApi,
   file as fileApi,
+  project as projectApi,
   windows as windowApi,
   diag,
   events,
@@ -551,9 +552,30 @@ export function App() {
         <AppHeader
           projects={projects}
           activeProject={activeProjectId}
+          /*
+           * Clicking a project tab did nothing until now. `activate_project` has been in the
+           * domain since projects went multi-window and no command exposed it, so with two
+           * projects open there was no way to switch between them — the same dead control
+           * the sidebar's search button was.
+           */
+          onActivate={(id) => void projectApi.activate(id as ProjectId).then(() => hydrate())}
           onClose={(id) => void closeProject(id)}
           onNew={() => void pickProject(openProject)}
           onToggleTheme={togglePersistedTheme}
+          /*
+           * The header's ⊞ and ⧉ aim at the focused pane. Omitting them renders the buttons
+           * disabled rather than inert, which is the contract `AppHeaderProps` documents —
+           * so with no project open they are visibly unavailable instead of silently doing
+           * nothing.
+           */
+          {...(activeProject && focused
+            ? {
+                onSplit: () =>
+                  void splitPane(activeProject.id, focused.tab.id, focused.pane.id, 'row', 'after'),
+                onDetach: () =>
+                  void detachPane(activeProject.id, focused.tab.id, focused.pane.id),
+              }
+            : {})}
         />
 
         <div className={styles.body}>
@@ -789,7 +811,7 @@ export function App() {
           cursor={`rev ${boot?.workspace.rev ?? 0}`}
         />
 
-        {!auditMode() && (
+        {benchMode() && (
           <button className={styles.benchButton} onClick={onBench} disabled={benchRunning}>
             {benchRunning ? 'benchmarking…' : 'Run IPC bench (M0 gate)'}
           </button>

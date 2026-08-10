@@ -143,6 +143,8 @@ export const project = {
    */
   close: (id: ProjectId, force = false) =>
     invoke<{ rev: number }>('project_close', { project: id, force }),
+  /** Bring a project to the front. What the header's project tabs do. */
+  activate: (id: ProjectId) => invoke<{ rev: number }>('project_activate', { project: id }),
   reorder: (from: number, to: number) => invoke<{ rev: number }>('project_reorder', { from, to }),
 }
 

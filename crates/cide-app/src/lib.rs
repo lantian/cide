@@ -228,6 +228,7 @@ pub fn run() {
             cmd::pane::pane_swap,
             cmd::pane::pane_bind_session,
             cmd::project::project_open,
+            cmd::project::project_activate,
             cmd::project::project_close,
             cmd::project::project_reorder,
             cmd::project::tab_new_claude,

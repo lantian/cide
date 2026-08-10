@@ -71,6 +71,7 @@
   "pane_swap",
   "picker_query",
   "picker_rank",
+  "project_activate",
   "project_close",
   "project_open",
   "project_reorder",

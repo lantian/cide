@@ -89,6 +89,29 @@ pub fn project_close(
     Ok(out)
 }
 
+/// Bring a project to the front of the window that holds it.
+///
+/// The header draws a tab per open project and its `onActivate` had nowhere to go: the
+/// domain has had `activate_project` since projects were multi-window, and no command ever
+/// exposed it. So with two projects open, clicking the other one did nothing — the same
+/// dead-control failure the sidebar's search button had.
+///
+/// Idempotent, and cheap: activating the project that is already active still bumps `rev`
+/// through `update`, which is what makes a second window follow along.
+#[tauri::command(rename_all = "camelCase")]
+pub fn project_activate(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Mutated, CoreError> {
+    state.update(|ws| {
+        // Resolved first so an unknown id is an error rather than a silent no-op — the
+        // frontend passes an id it read from the tree, so a miss means they have diverged.
+        workspace::project(ws, project)?;
+        workspace::activate_project(ws, project);
+        Ok(Mutated { rev: ws.rev })
+    })
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn project_reorder(
     state: State<'_, WorkspaceState>,
