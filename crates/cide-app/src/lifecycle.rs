@@ -79,6 +79,19 @@ pub fn shutdown(app: &AppHandle) {
         servers.stop_all();
     }
 
+    // A store per project, and the only thing on this path that reaches a content search: the
+    // ladder below blocks the main thread for as long as the slowest child takes, and a walker
+    // thread per core reading a repository nobody will see the results of is disk the dying
+    // children are competing for. `cmd::fs::close_all` also cancels, but nothing calls it —
+    // this is the quit path.
+    //
+    // Deliberately not `cmd::fs::close_all`, which would drop every project's index here:
+    // that is the teardown `fs_close` hands to a blocking worker precisely because it is too
+    // slow for a shared thread, and the memory is about to go back to the kernel anyway.
+    if let Some(searches) = app.try_state::<crate::cmd::search::SearchRegistry>() {
+        searches.cancel_all();
+    }
+
     let Some(registry) = app.try_state::<SessionRegistry>() else {
         tracing::error!("no session registry during shutdown; children may outlive the app");
         return;

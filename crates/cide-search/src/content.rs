@@ -263,13 +263,24 @@ impl Search<'_> {
             };
             scope.spawn(move || walker.visit(&mut factory));
 
-            // The receiver is where the caps are enforced exactly. The visitors also stop
-            // themselves once the total is reached, but they do it from a racing count on N
-            // threads and can overshoot by a file each; trimming here is what makes
-            // `max_hits` a number rather than an approximation.
+            // The receiver is the *only* place the total cap is enforced. The visitors count
+            // nothing across files — they apply `max_hits_per_file` and consult `cancel`, and
+            // that is all — so a walker only learns the budget is spent when this loop sets
+            // the flag below. That is deliberate: a shared running total would be an atomic
+            // per hit on N threads that could still overshoot by a file each between the load
+            // and the send, and it would leave the trim here anyway. Enforcing it once, on the
+            // single-threaded side of the channel, is what makes `max_hits` an exact number
+            // rather than an approximation.
             for batch in rx {
                 let room = self.limits.max_hits - outcome.hits as usize;
-                let batch = if batch.len() >= room {
+                // `>` and not `>=`: a batch that exactly fills the remaining room has nothing
+                // left over, so nothing was dropped and the search is not truncated. With
+                // `>=`, a repository containing exactly `max_hits` matches reported itself as
+                // `5,000+` and cancelled a walk that had already finished finding everything.
+                // The cost of the honest answer is that the walk runs on to prove there is no
+                // `max_hits + 1`th hit — which is the only way to know it is complete. The
+                // next batch, if one comes, finds `room == 0` and truncates here.
+                let batch = if batch.len() > room {
                     outcome.truncated = true;
                     // Stops the walkers. Without it the loop would sit here while a walk of
                     // the whole repository produced results that are already over the cap.

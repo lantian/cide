@@ -19,7 +19,7 @@
 //! and the alternative — a job per window — would let a background window keep a walk of a
 //! 100k-file repository running for a panel nobody is looking at.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -83,17 +83,10 @@ impl SearchRegistry {
         }
     }
 
-    /// Forget searches whose project has since closed.
-    ///
-    /// `fs_close` is where this would ideally happen, but `cmd::fs` knows nothing about this
-    /// registry and a file-index command should not have to reason about a search job.
-    /// Sweeping on the next query instead is a map scan over the open projects —
-    /// nanoseconds — and it bounds the leak at one finished job's hits per closed project.
-    fn sweep(&self, fs: &FsRegistry) {
-        self.jobs.retain(|project, job| {
-            if fs.get(*project).is_some() {
-                return true;
-            }
+    /// Drop every search. [`crate::lifecycle::shutdown`] — the quit path — and
+    /// [`crate::cmd::fs::close_all`], which currently has no caller of its own.
+    pub fn cancel_all(&self) {
+        self.jobs.retain(|_, job| {
             job.cancel();
             false
         });
@@ -162,29 +155,23 @@ impl Job {
         first
     }
 
-    /// The blocking half: build the shared ignore rules, then walk.
+    /// The blocking half: walk the roots under the project's own ignore rules.
     ///
     /// **Blocking**, for as long as the tree takes. `spawn_blocking` is the only caller.
-    fn walk(&self, roots: Vec<SearchRoot>, dirs: Vec<PathBuf>, regex: Regex) {
-        // The same type the file tree and the watcher consult, rebuilt from the directories
-        // this project's walk actually visited, and handed to the search as its final say.
+    fn walk(&self, roots: Vec<SearchRoot>, filter: Arc<Filter>, regex: Regex) {
+        // The very object the file tree and the watcher consult — `ProjectFs::filter` — and
+        // not a second one built from the same `dir_paths()`. Rebuilding it here cost a `stat`
+        // per directory in the project, a few thousand on a large one, at the start of every
+        // single search; worse, it was a second place where the ignore decision got made, and
+        // the two could only agree for as long as nobody edited one of them.
         //
-        // Belt and braces, and worth being precise about: today it excludes nothing that
-        // `content`'s own `WalkBuilder` has not already excluded, because both are driven by
-        // the same `.gitignore` files and the same `hidden`/`git_*` settings — a review
-        // replaced this with `admits: None` and every test still passed. What it buys is that
-        // the search follows the *tree* rather than a second copy of the tree's rules: the
+        // Belt and braces on top of `content`'s own `WalkBuilder`, and worth being precise
+        // about: today it excludes nothing the walker has not already excluded, because both
+        // are driven by the same `.gitignore` files and the same `hidden`/`git_*` settings — a
+        // review replaced this with `admits: None` and every test still passed. What it buys
+        // is that the search follows the *tree* rather than a copy of the tree's rules: the
         // day `Filter` grows a rule the walker has no setting for, the search inherits it
         // instead of quietly disagreeing about which files exist.
-        //
-        // Rebuilt rather than borrowed because `ProjectFs` keeps its `Filter` private and
-        // `crates/cide-app/src/files.rs` is not this milestone's file to change; the inputs
-        // are identical, so the two agree by construction. It is a few thousand `stat`s on a
-        // large project, which is why it happens here on the blocking worker rather than in
-        // the handler — and it is the reason to hand this a real accessor when `files.rs` is
-        // next open.
-        let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
-        let filter = Filter::build(&root_paths, dirs.iter().map(|p| p.as_path()));
         let admits = |path: &Path, is_dir: bool| filter.admits(path, is_dir);
 
         let outcome = Search {
@@ -255,7 +242,6 @@ pub async fn search_query(
     // cide has not walked would have to invent both, so it says so instead — the same
     // `NoIndex` the picker answers with, which the frontend already knows how to read.
     let project_fs = fs.get(project).ok_or(FsError::NoIndex)?;
-    searches.sweep(&fs);
 
     let job = searches.job_for(project, &query);
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
@@ -278,15 +264,17 @@ pub async fn search_query(
                             label: r.label.clone(),
                         })
                         .collect();
-                    // Read here rather than inside the worker: it takes the index's lock, and
-                    // the worker outlives this call — it must not hold a reference to a
-                    // project that can be closed while the walk runs.
-                    let dirs = project_fs.with_index(|index| index.dir_paths());
+                    // Taken here rather than inside the worker: it is one `RwLock` read and an
+                    // `Arc` bump, and the worker outlives this call — it must not hold a
+                    // reference to a project that can be closed while the walk runs. The
+                    // `Arc` is what lets the walk keep using the rules of a project that
+                    // closes under it, which is also exactly why closing cancels it.
+                    let filter = project_fs.filter();
 
                     let job = Arc::clone(&job);
                     // Not awaited. The frame below is the empty first one, and the panel
                     // polls for the rest.
-                    tauri::async_runtime::spawn_blocking(move || job.walk(roots, dirs, regex));
+                    tauri::async_runtime::spawn_blocking(move || job.walk(roots, filter, regex));
                 }
                 Err(error) => {
                     // Half of every regex is unparsable while it is being typed. The frame
@@ -449,16 +437,113 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_project_does_not_keep_its_results_for_ever() {
-        let fs = FsRegistry::default();
+    fn cancelling_a_project_stops_its_walk_and_forgets_its_hits() {
         let registry = SearchRegistry::default();
         let project = ProjectId::new();
         let job = registry.job_for(project, &query("alpha"));
 
-        // The project was never in the file registry, which is what a closed one looks like.
-        registry.sweep(&fs);
-        assert!(registry.jobs.is_empty());
+        assert!(registry.cancel(project));
+        assert!(registry.jobs.is_empty(), "the hits go with the job");
         assert!(job.stop.load(Ordering::Acquire));
+        assert!(!registry.cancel(project), "and it is idempotent");
+    }
+
+    /// Closing a project stops its search there and then.
+    ///
+    /// The seam is `cmd::fs`'s, but the observable is this module's — and the version this
+    /// replaced left the walk running until the *next* query against any project happened to
+    /// sweep it, which for a user who closes a project and stops searching is never.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_project_cancels_the_search_over_it() {
+        let dir = cide_fs::testing::scratch("cmd-search-close");
+        let fs = FsRegistry::default();
+        let project = ProjectId::new();
+        // An entry in the registry is what "open" means here; the walk itself is beside the
+        // point, so the claim is dropped un-run rather than walked.
+        drop(
+            fs.claim(project, vec![dir.to_path_buf()])
+                .expect("a project nobody has indexed claims"),
+        );
+
+        let searches = SearchRegistry::default();
+        let job = searches.job_for(project, &query("alpha"));
+        assert!(!job.stop.load(Ordering::Acquire), "it starts running");
+
+        let existed = crate::cmd::fs::close_project(&fs, &searches, project)
+            .await
+            .expect("closing a project is not an error");
+        assert!(existed, "the project was open");
+        assert!(
+            job.stop.load(Ordering::Acquire),
+            "closing left the walk running — a walker thread per core reading a tree nobody \
+             has open, holding its hits, until some later query swept it"
+        );
+        assert!(searches.jobs.is_empty(), "and the hits go with it");
+    }
+
+    /// The quit path: every project's walk, not just the focused one's.
+    #[test]
+    fn cancel_all_stops_every_project() {
+        let registry = SearchRegistry::default();
+        let jobs: Vec<Arc<Job>> = (0..3)
+            .map(|_| registry.job_for(ProjectId::new(), &query("alpha")))
+            .collect();
+
+        registry.cancel_all();
+        assert!(registry.jobs.is_empty());
+        assert!(jobs.iter().all(|job| job.stop.load(Ordering::Acquire)));
+    }
+
+    /// Two windows polling one new query at the same instant must dispatch one walk.
+    ///
+    /// The single-threaded test above cannot see this: `claim` written as a load and a store
+    /// passes it, because nothing there ever interleaves the two. Here every thread is parked
+    /// on the same barrier and released together, so a load-then-store loses the race within a
+    /// few hundred rounds — and each loser would have run a second walk of the same tree,
+    /// appending into one buffer, showing the user every hit twice.
+    #[test]
+    fn exactly_one_of_many_racing_pollers_claims_the_walk() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicU32;
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 500;
+
+        for round in 0..ROUNDS {
+            let job = Arc::new(Job::new(query("alpha")));
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let winners = Arc::new(AtomicU32::new(0));
+
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let job = Arc::clone(&job);
+                    let barrier = Arc::clone(&barrier);
+                    let winners = Arc::clone(&winners);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if job.claim() {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().expect("a claiming thread");
+            }
+
+            assert_eq!(
+                winners.load(Ordering::Acquire),
+                1,
+                "round {round}: {THREADS} pollers raced and {} started a walk; every extra one \
+                 walks the whole tree again into the same buffer",
+                winners.load(Ordering::Acquire)
+            );
+            assert!(
+                job.frame(0, 1).running,
+                "round {round}: the winner must leave the job running, or a losing poller \
+                 reads `started, not running, no hits` as a finished search"
+            );
+        }
     }
 
     /// The glue this module exists for, end to end minus Tauri's argument extraction: a real
@@ -482,10 +567,16 @@ mod tests {
         let job = Job::new(query("zqneedle"));
         assert!(job.claim(), "which is also what marks it running");
         let roots = vec![SearchRoot::new(dir.path())];
-        let dirs = vec![dir.to_path_buf(), dir.join("src")];
+        let dirs = [dir.to_path_buf(), dir.join("src")];
+        // Built the way `ProjectFs` builds it, which is what `ProjectFs::filter` now hands the
+        // walk — the accessor itself needs an indexed project and is covered in `cmd::fs`.
+        let filter = Arc::new(Filter::build(
+            &[dir.to_path_buf()],
+            dirs.iter().map(|p| p.as_path()),
+        ));
         job.walk(
             roots,
-            dirs.clone(),
+            Arc::clone(&filter),
             cide_search::content::compile(&job.query).unwrap(),
         );
 
@@ -515,8 +606,7 @@ mod tests {
         // this test, and the file-level filter call has its own test in
         // `cide-search/tests/content_walk.rs`, where a closure can be made to disagree.
         assert!(
-            !cide_fs::Filter::build(&[dir.to_path_buf()], dirs.iter().map(|p| p.as_path()))
-                .admits(&dir.join("target/out.log"), false),
+            !filter.admits(&dir.join("target/out.log"), false),
             "and the shared filter agrees with it, which is the invariant that has to hold"
         );
     }

@@ -283,6 +283,21 @@ impl ProjectFs {
         &self.matcher
     }
 
+    /// The ignore rules this project's tree and watcher consult.
+    ///
+    /// Shared as an `Arc` rather than cloned: [`Filter::build`] costs a `stat` per visited
+    /// directory — a few thousand on a large repository — and the content search was paying
+    /// that on every query, rebuilding an identical `Filter` from the same `dir_paths()` this
+    /// one was built from. Cloning the matchers instead would have kept both the second copy
+    /// and the cost; the point of the accessor is that the ignore decision is made once.
+    ///
+    /// A caller that takes this mid-walk gets the pre-walk filter, which is the one the tree
+    /// and the watcher are using at that moment: [`Indexing::run`] installs the finished one
+    /// before it starts watching, so the two can never disagree about which files exist.
+    pub fn filter(&self) -> Arc<Filter> {
+        Arc::clone(&self.filter.read())
+    }
+
     /// Is a walk running? One atomic — [`Self::status`] answers the same question but locks
     /// the index and the watch status to do it, and `picker_query` asks this per keystroke.
     pub fn is_indexing(&self) -> bool {
