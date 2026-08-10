@@ -70,6 +70,40 @@ export function Explorer({ project, onOpenFile }: ExplorerProps) {
   }, [project])
 
   /*
+   * The walk finishing is news, and nothing else carries it.
+   *
+   * `attach` reads `fs_tree_count` the instant a project becomes active, which is while
+   * `store/workspace.ts`'s `fs.index` is still walking — so the honest answer then is zero
+   * rows, and it stays zero until something asks again. `cide://fs-changed` does not fire for
+   * the walk (it is the *watcher*, and the watcher only starts once the walk is done), so
+   * without this a freshly opened project shows an empty explorer until the user happens to
+   * touch a file.
+   *
+   * Every status for this project triggers a re-read, not only the one with
+   * `indexing: false`. The event is emitted at the start of a walk, at its end, and when the
+   * watcher degrades to polling — three events per project, not a stream — and treating the
+   * start as an invalidation is right anyway: a re-index throws the old flattening away.
+   */
+  useEffect(() => {
+    if (project === null) return
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    void events
+      .onFsStatus((changed) => {
+        if (changed !== project) return
+        void useFileTree.getState().refresh()
+      })
+      .then((fn) => {
+        if (cancelled) fn()
+        else unlisten = fn
+      })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [project])
+
+  /*
    * Keeping the tags true as things change, without polling.
    *
    * Three things move a path's status and none of them is a scroll: a commit or a stage cide

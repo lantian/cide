@@ -14,10 +14,13 @@ import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import type { CloseScope } from '@/chrome/closeConfirm'
+import { planFileIndex, type IndexTarget } from './fileIndex'
 import {
   app as appApi,
   events,
+  fs as fsApi,
   pane as paneApi,
+  pendingCommand,
   session as sessionApi,
   unsavedChanges,
   windows as windowApi,
@@ -122,6 +125,69 @@ async function tabCloseRisk(
   }
 }
 
+/**
+ * Which projects this window has asked Rust to index, and over which roots.
+ *
+ * Module scope rather than store state, for the reason `treeStore`'s `inFlight` is: nothing
+ * renders from it, and putting it in the store would make every `fs.index` a state update
+ * and so a re-render of the whole shell.
+ */
+let indexedProjects = new Map<string, string>()
+
+/**
+ * Point the Rust-side file index at whatever projects the snapshot says are open.
+ *
+ * This is the call nothing was making. `fs.index` is what fills the tree and the picker, and
+ * every `fs_*` and `picker_query` handler answers `NoIndex` until it has run — so before
+ * this existed, the explorer showed zero rows and Ctrl+P showed an empty list, for ever, in
+ * a build where all fourteen handlers were registered and working.
+ *
+ * Driven from the snapshot rather than from `openProject`, and the difference is not
+ * cosmetic. `project.open` is only one of the ways a project comes to be open in this
+ * window: a workspace restored from disk at launch has projects nobody opened this session,
+ * and a project opened in a *second* window arrives here only as `cide://workspace-changed`.
+ * Hanging the call off `openProject` would have left both of those cases exactly as broken
+ * as they were.
+ *
+ * `Explorer.tsx` was the alternative and it loses on the same argument: it is handed one
+ * project — this window's active one — so a second project in the same window would go
+ * unindexed until the user switched to it, a detached-pane window would index nothing, and
+ * the picker would depend on the sidebar being mounted.
+ *
+ * Every window runs this against the same workspace, so `fs.index` is called once per window
+ * per project. That is deliberate and handled on the Rust side rather than here: `fs.index`
+ * over roots that have already been walked is a no-op that answers with the existing index's
+ * status, whether the first walk is still running or finished long ago (`FsRegistry::claim`),
+ * and `fs.close` is idempotent. Suppressing it here instead would mean deciding which window
+ * "owns" a project, which nothing else in this app has to decide.
+ *
+ * The *finished* half of that guarantee is the one this window depends on and the one that
+ * was missing: `indexedProjects` is module state in one webview, so a second window — and a
+ * detached pane is a window — starts with an empty map and asks for every open project long
+ * after the first window's walk is done. A re-walk there is not merely wasted work; the walk
+ * begins by clearing the matcher and dropping the watcher, so it would empty the *first*
+ * window's Ctrl+P and stop its file events. `cmd::fs::tests` pins both halves.
+ */
+function syncFileIndex(workspace: Workspace): void {
+  const open: IndexTarget[] = Object.values(workspace.projects).map((project) => ({
+    project: project.id,
+    roots: project.roots.map((root) => root.path),
+  }))
+  const plan = planFileIndex(indexedProjects, open)
+  indexedProjects = plan.known
+
+  // Not awaited: the walk is seconds of work on a large repository and the whole design is
+  // that the window keeps painting while it runs. `pendingCommand` is what keeps a build
+  // without these handlers — or a project whose roots have gone — from raising an unhandled
+  // rejection out of a snapshot handler.
+  for (const project of plan.index) {
+    void pendingCommand('fs_index', () => fsApi.index(project), null)
+  }
+  for (const project of plan.close) {
+    void pendingCommand('fs_close', () => fsApi.close(project), false)
+  }
+}
+
 interface WorkspaceStore {
   /** Null until the first `app.getBootstrap` resolves. */
   boot: Bootstrap | null
@@ -200,6 +266,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   hydrate: async () => {
     const boot = await appApi.getBootstrap()
     set({ boot, theme: boot.workspace.settings.theme })
+    // After the state is set, not before: the explorer and the picker read the project from
+    // the store, and an index that started against a project the window has not adopted yet
+    // would race the components that are about to ask it questions.
+    syncFileIndex(boot.workspace)
   },
 
   /**
@@ -392,6 +462,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // dropped rather than winding the UI backwards.
     if (workspace.rev < current.workspace.rev) return
     set({ boot: { ...current, workspace } })
+    // A project opened or closed in *another* window reaches this one only here. Without
+    // this line the second window's tree and picker stay empty until something in it happens
+    // to call `hydrate`.
+    syncFileIndex(workspace)
   },
 
   setTheme: (theme) => set({ theme }),

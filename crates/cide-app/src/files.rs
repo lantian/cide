@@ -22,11 +22,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use cide_fs::{BuildOptions, Filter, Index, Root, WalkItem, WatchConfig, WatchEvent, Watcher};
-use cide_ipc::{FsStatus, ProjectId, WatchBackend, WatchStatus};
+use cide_ipc::{FsChange, FsStatus, ProjectId, WatchBackend, WatchStatus};
 use cide_search::{Candidate, Matcher as _, NucleoMatcher};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use tauri::AppHandle;
+
+/// Where a project's `cide://fs-*` events go.
+///
+/// In the running app this is the `AppHandle`, and the impl below is three lines of
+/// forwarding to [`crate::emit`]. It is a trait for one reason: a walk driven by an
+/// `AppHandle` can only be started from inside a Tauri app, and the property that matters
+/// here — the picker answering while the walk is still running — has no test at the command
+/// layer unless the walk can be started from an ordinary `#[test]`.
+///
+/// The alternative was tauri's `test` feature and `mock_app()`. It loses twice: the feature
+/// is a dev-dependency line in `crates/cide-app/Cargo.toml`, and `fs_index` also needs a
+/// managed [`crate::workspace_state::WorkspaceState`], which loads *and saves* the user's
+/// real workspace file. A vtable call per emitted event is the cheaper half of that trade.
+pub trait FsEvents: Send + Sync + 'static {
+    fn status(&self, project: ProjectId, status: &FsStatus);
+    fn changed(&self, project: ProjectId, change: &FsChange);
+}
+
+impl FsEvents for AppHandle {
+    fn status(&self, project: ProjectId, status: &FsStatus) {
+        crate::emit::fs_status(self, project, status);
+    }
+
+    fn changed(&self, project: ProjectId, change: &FsChange) {
+        crate::emit::fs_changed(self, project, change);
+    }
+}
 
 /// Every open project's file state.
 #[derive(Default)]
@@ -39,22 +66,51 @@ impl FsRegistry {
         self.projects.get(&project).map(|e| Arc::clone(e.value()))
     }
 
-    /// Take a project's file state out of the registry, stopping its watcher.
-    pub fn remove(&self, project: ProjectId) -> bool {
-        self.projects.remove(&project).is_some()
+    /// Take a project's file state out of the registry.
+    ///
+    /// Returns the entry rather than a bool so the caller decides *where* it is dropped:
+    /// the drop stops the watcher thread and frees a 100k-entry matcher, which is work, and
+    /// `fs_close` hands it to a blocking worker rather than doing it on the async runtime.
+    #[must_use = "dropping the entry here does the watcher teardown on this thread"]
+    pub fn remove(&self, project: ProjectId) -> Option<Arc<ProjectFs>> {
+        self.projects.remove(&project).map(|(_, fs)| fs)
     }
 
     pub fn close_all(&self) {
         self.projects.clear();
     }
 
-    /// Index a project: walk its roots, fill the picker as the walk runs, then watch.
+    /// Claim a project for indexing, creating its entry if it has none.
     ///
-    /// Runs on the calling thread, which for a Tauri command is one of its worker threads,
-    /// so a two-second walk on a large repository blocks nothing the user can see. The
-    /// picker is answerable throughout — that is the whole reason the entry is registered
-    /// before the walk starts rather than after it finishes.
-    pub fn index(&self, app: &AppHandle, project: ProjectId, roots: Vec<PathBuf>) -> FsStatus {
+    /// Cheap: map bookkeeping, two atomics, and — when the entry is new — the handful of
+    /// `stat`s [`Filter::build`] spends on the global gitignore and each root's
+    /// `info/exclude`. Bounded by the number of roots rather than by the size of the tree,
+    /// which is what lets it stay on the caller's thread while the walk it hands back goes to
+    /// a blocking one. That split is what lets `fs_index` be an async command: the entry is
+    /// in the registry, and so answerable by the picker, before the walk has read a single
+    /// inode of the project.
+    ///
+    /// # `Err(status)` — there is nothing to do
+    ///
+    /// Two cases, and the caller wants the same thing from both: the status of the index that
+    /// already exists, not a second walk of the same tree.
+    ///
+    /// * A walk is **running**. The honest answer is that walk's `indexing: true` and its
+    ///   live picker.
+    /// * A walk has already **finished** over exactly these roots. This is the every-day
+    ///   case, not the rare one: `store/workspace.ts` remembers what it has indexed, but that
+    ///   memory is module state in one webview, so a second window, a detached pane, or a
+    ///   reloaded webview asks again for every open project — with the first walk long since
+    ///   done. `ui/src/ipc/client.ts` documents the command as "safe to call twice; the
+    ///   second is a no-op", and this is where that becomes true. Re-walking instead is worse
+    ///   than wasteful: [`Indexing::run`] opens by dropping the watcher and clearing the
+    ///   matcher, so the second window's request would empty the *first* window's Ctrl+P and
+    ///   stop its file events for the length of a fresh walk.
+    ///
+    /// A project whose **roots changed** is not either case — its entry is dropped below and
+    /// it is walked again. That distinction is the whole reason this is keyed on the root
+    /// list rather than on the project id.
+    pub fn claim(&self, project: ProjectId, roots: Vec<PathBuf>) -> Result<Indexing, FsStatus> {
         // A project can gain or lose a root between two indexings. Reusing the old entry
         // would then walk the old set for ever, with no error anywhere to say so — the tree
         // would simply be missing a root the user added.
@@ -78,19 +134,44 @@ impl FsRegistry {
         let fs = Arc::clone(entry.value());
         drop(entry);
 
+        // Checked before the flag is taken, so a repeat call neither walks nor disturbs the
+        // flag a concurrent walk owns. `walked` is only ever set by a walk that ran to
+        // completion, which is what keeps the panic-retry property the guard below exists
+        // for: a walk that unwound leaves `walked` false, so the retry still walks.
+        if fs.walked.load(Ordering::Acquire) {
+            return Err(fs.status());
+        }
         if fs.indexing.swap(true, Ordering::AcqRel) {
-            // A second `fs.index` for the same project while the first is still walking.
-            // Answering with the current status is right: the caller gets a live picker and
-            // an `indexing: true` it can watch, rather than a second walk of the same tree.
-            return fs.status();
+            let status = fs.status();
+            return Err(status);
         }
         // The flag is cleared by a guard rather than by a `store` at the end of the happy
         // path. A panic anywhere in the walk would otherwise leave it set for ever, and the
         // consequence is silent and total: every later `fs.index` takes the branch above and
         // returns immediately, so the project keeps an empty tree, an empty picker and no
         // watcher, with nothing anywhere saying why. Tauri catches the panic and the user
-        // sees one failed command; a retry has to be able to work.
-        let indexing_guard = IndexingGuard(Arc::clone(&fs));
+        // sees one failed command; a retry has to be able to work. The guard now also covers
+        // the walk being dropped mid-flight with the blocking worker it runs on.
+        let guard = IndexingGuard(Arc::clone(&fs));
+        Ok(Indexing { fs, guard })
+    }
+}
+
+/// A claimed walk, waiting to be run.
+///
+/// Holding one is what `indexing: true` means; running it or dropping it clears the flag.
+pub struct Indexing {
+    fs: Arc<ProjectFs>,
+    guard: IndexingGuard,
+}
+
+impl Indexing {
+    /// Walk the roots, filling the picker as the walk runs, then start watching.
+    ///
+    /// **Blocking**, and unapologetically so: seconds on a large repository. Call it from
+    /// `spawn_blocking`; `cmd::fs::fs_index` is the only caller in the app and does.
+    pub fn run(self, events: Arc<dyn FsEvents>, project: ProjectId) -> FsStatus {
+        let Indexing { fs, guard } = self;
 
         // A re-index of an already-indexed project starts from an empty picker, or the old
         // paths would be offered alongside the new ones for ever. The old watcher goes with
@@ -98,7 +179,7 @@ impl FsRegistry {
         // to be thrown away, and its watch list is the one the previous walk produced.
         *fs.watcher.lock() = None;
         fs.matcher.clear();
-        crate::emit::fs_status(app, project, &fs.status());
+        events.status(project, &fs.status());
 
         let matcher = Arc::clone(&fs.matcher);
         let index = Index::build(
@@ -120,7 +201,7 @@ impl FsRegistry {
 
         *fs.index.write() = index;
         *fs.filter.write() = Arc::clone(&filter);
-        drop(indexing_guard);
+        drop(guard);
 
         let config = WatchConfig {
             roots: root_paths,
@@ -128,14 +209,20 @@ impl FsRegistry {
             ..WatchConfig::default()
         };
         let watcher = Watcher::start(config, filter, {
-            let app = app.clone();
+            let events = Arc::clone(&events);
             let weak = Arc::downgrade(&fs);
-            move |event| on_watch_event(&app, project, &weak, event)
+            move |event| on_watch_event(&events, project, &weak, event)
         });
         *fs.watcher.lock() = Some(watcher);
 
+        // Last, and only on this path. `FsRegistry::claim` reads it to turn a repeat
+        // `fs.index` into a no-op, so it must mean "this tree has been walked and is being
+        // watched" and nothing weaker — set it before `Watcher::start` and a walk that failed
+        // to start a watcher would be permanently unwatchable with no way to ask again.
+        fs.walked.store(true, Ordering::Release);
+
         let status = fs.status();
-        crate::emit::fs_status(app, project, &status);
+        events.status(project, &status);
         status
     }
 }
@@ -160,6 +247,11 @@ pub struct ProjectFs {
     watcher: Mutex<Option<Watcher>>,
     watch_status: Mutex<WatchStatus>,
     indexing: AtomicBool,
+    /// A walk has run to completion over [`Self::roots`] and a watcher is installed.
+    ///
+    /// Distinct from `!indexing`, which is also true *before* the first walk. This is what
+    /// makes a repeat `fs.index` a no-op; see [`FsRegistry::claim`].
+    walked: AtomicBool,
 }
 
 impl ProjectFs {
@@ -179,6 +271,7 @@ impl ProjectFs {
                 watched_dirs: 0,
             }),
             indexing: AtomicBool::new(false),
+            walked: AtomicBool::new(false),
         }
     }
 
@@ -188,6 +281,12 @@ impl ProjectFs {
 
     pub fn matcher(&self) -> &NucleoMatcher {
         &self.matcher
+    }
+
+    /// Is a walk running? One atomic — [`Self::status`] answers the same question but locks
+    /// the index and the watch status to do it, and `picker_query` asks this per keystroke.
+    pub fn is_indexing(&self) -> bool {
+        self.indexing.load(Ordering::Acquire)
     }
 
     /// Read the tree. Held only for the length of one window request.
@@ -212,7 +311,12 @@ impl ProjectFs {
 }
 
 /// Fold one watcher event back into the index, the picker and the UI.
-fn on_watch_event(app: &AppHandle, project: ProjectId, weak: &Weak<ProjectFs>, event: WatchEvent) {
+fn on_watch_event(
+    events: &Arc<dyn FsEvents>,
+    project: ProjectId,
+    weak: &Weak<ProjectFs>,
+    event: WatchEvent,
+) {
     let Some(fs) = weak.upgrade() else {
         // The project closed while this event was in flight.
         return;
@@ -227,11 +331,11 @@ fn on_watch_event(app: &AppHandle, project: ProjectId, weak: &Weak<ProjectFs>, e
                     item.path.to_string_lossy().into_owned(),
                 ));
             }
-            crate::emit::fs_changed(app, project, &change);
+            events.changed(project, &change);
         }
         WatchEvent::Status(status) => {
             *fs.watch_status.lock() = status;
-            crate::emit::fs_status(app, project, &fs.status());
+            events.status(project, &fs.status());
         }
     }
 }

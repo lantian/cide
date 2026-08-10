@@ -1,6 +1,7 @@
 /**
  * The pure logic behind the overlays and the file tree: palette ranking, list navigation,
- * the counter's digit grouping, and the row-window chunk arithmetic.
+ * the counter's digit grouping, the row-window chunk arithmetic, and the plan that decides
+ * which projects get walked.
  *
  * The ranking half exists because `overlays/score.ts` is a *port* of
  * `cide_core::commands::score`, and a port with no test is a copy that drifts. The
@@ -43,6 +44,7 @@ try {
       'src/overlays/format.ts',
       'src/overlays/listKeys.ts',
       'src/sidebar/rowWindow.ts',
+      'src/store/fileIndex.ts',
       '--outDir', out,
       '--rootDir', 'src',
       '--module', 'commonjs',
@@ -52,7 +54,7 @@ try {
       '--exactOptionalPropertyTypes',
       '--noUncheckedIndexedAccess',
       '--lib', 'es2023',
-      // These four modules need no DOM, but `@types/react-dom` is auto-included from
+      // These five modules need no DOM, but `@types/react-dom` is auto-included from
       // `node_modules/@types` and does not compile without it. Matches the project tsconfig.
       '--skipLibCheck',
     ],
@@ -68,6 +70,7 @@ try {
   const { chunkOf, chunkRequest, chunksFor, chunksToEvict } = require(
     join(out, 'sidebar/rowWindow.js'),
   )
+  const { planFileIndex, isNoIndex } = require(join(out, 'store/fileIndex.js'))
 
   /* ----------------------------------------------------------------- palette ranking */
 
@@ -214,6 +217,85 @@ try {
     [],
     'the cap yields rather than evict what is on screen',
   )
+
+  /* ------------------------------------------------------------------- the index plan */
+
+  // The shape `store/workspace.ts` passes in, and the map it carries between snapshots.
+  const target = (project, ...roots) => ({ project, roots })
+  const known = (...entries) => new Map(entries)
+  const plan = (map, open) => {
+    const answer = planFileIndex(map, open)
+    return { index: answer.index, close: answer.close, known: [...answer.known] }
+  }
+
+  eq(
+    plan(known(), [target('p1', '/a')]),
+    { index: ['p1'], close: [], known: [['p1', '/a']] },
+    'a project nobody has indexed is indexed',
+  )
+  eq(
+    plan(known(['p1', '/a']), [target('p1', '/a')]),
+    { index: [], close: [], known: [['p1', '/a']] },
+    'the same project over the same roots is not walked again',
+  )
+  // The whole point of the snapshot-driven design: `applySnapshot` runs on every mutation in
+  // any window, so a plan that re-indexed here would walk the repository on every keystroke
+  // that marks a buffer dirty.
+  eq(
+    plan(known(['p1', '/a']), [target('p1', '/a')]).index,
+    [],
+    'a snapshot that changed nothing about the roots asks for no walk',
+  )
+  eq(
+    plan(known(['p1', '/a']), [target('p1', '/a', '/b')]),
+    { index: ['p1'], close: [], known: [['p1', '/a\u0000/b']] },
+    'a project that gained a root is re-indexed',
+  )
+  eq(
+    plan(known(['p1', '/a\u0000/b']), [target('p1', '/b', '/a')]).index,
+    ['p1'],
+    'root order is part of the identity, as it is in Rust',
+  )
+  eq(
+    plan(known(['p1', '/a']), []),
+    { index: [], close: ['p1'], known: [] },
+    'a project that left the workspace is closed',
+  )
+  eq(
+    plan(known(['p1', '/a']), [target('p2', '/b')]),
+    { index: ['p2'], close: ['p1'], known: [['p2', '/b']] },
+    'one project replacing another is both halves at once',
+  )
+  eq(
+    plan(known(), [target('p1'), target('p2', '/b')]),
+    { index: ['p2'], close: [], known: [['p2', '/b']] },
+    'a project with no roots is skipped, not indexed',
+  )
+  eq(
+    plan(known(['p1', '/a']), [target('p1')]),
+    { index: [], close: [], known: [['p1', '/a']] },
+    'a rootless project that was indexed before is left alone, not closed',
+  )
+  eq(
+    plan(known(), [target('p1', '/a'), target('p2', '/b')]).index,
+    ['p1', 'p2'],
+    'workspace order is kept',
+  )
+  // Two roots whose concatenation is ambiguous under a naive separator. `/a` + `/bc` and
+  // `/a/b` + `/c` both read as `/a/bc` if the join is `''`, and as `/a /bc` under a space —
+  // which is a legal character in a path.
+  eq(
+    plan(known(), [target('p1', '/a', '/bc')]).known[0][1] ===
+      plan(known(), [target('p2', '/a/b', '/c')]).known[0][1],
+    false,
+    'the roots digest cannot collide',
+  )
+
+  eq(isNoIndex({ kind: 'noIndex' }), true, 'the tagged NoIndex rejection is recognised')
+  eq(isNoIndex({ kind: 'io', detail: {} }), false, 'a different FsError is not NoIndex')
+  eq(isNoIndex('no file index for this project'), false, 'the prose alone is not the tag')
+  eq(isNoIndex(null), false, 'null is not NoIndex')
+  eq(isNoIndex(undefined), false, 'undefined is not NoIndex')
 
   if (failed > 0) {
     console.error(`\ncheck-picker: ${failed} failure(s)`)
