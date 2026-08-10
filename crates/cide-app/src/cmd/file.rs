@@ -13,7 +13,11 @@ use std::path::PathBuf;
 use cide_core::document;
 use cide_core::workspace;
 use cide_core::{CoreError, Result};
-use cide_ipc::{FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId, TabId, TabKind};
+use cide_ipc::git::DiffSide;
+use cide_ipc::{
+    DiffOrigin, DiffSpec, FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId, RepoId, TabId,
+    TabKind,
+};
 use tauri::{Manager, State};
 
 use crate::cmd::project::Mutated;
@@ -57,6 +61,104 @@ pub fn tab_open_file(
                 // tab and closing one of the halves must not be refused, and closing the
                 // last one closes the tab.
                 role: PaneRole::Auxiliary,
+                session: None,
+                title,
+            },
+        )
+    })
+}
+
+/// The tab a git diff opens as, given its fetch key.
+///
+/// Split out of the command so it can be tested without a `WorkspaceState`, and because it
+/// is the one place that decides what a diff tab is *called*: the basename plus a marker, so
+/// a `main.rs` diff and a `main.rs` editor are two distinguishable rows in the tab strip
+/// rather than two identical ones.
+///
+/// `old_path` is git's pre-image path — set for a rename, absent otherwise — and the pair is
+/// display only. Both sides stay **repo-relative**, matching the fetch key; see `DiffSpec`.
+fn git_diff_spec(repo: RepoId, path: &str, side: DiffSide, old_path: Option<String>) -> DiffSpec {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    DiffSpec {
+        title: format!("{name} — diff"),
+        old_path: PathBuf::from(old_path.unwrap_or_else(|| path.to_owned())),
+        new_path: PathBuf::from(path),
+        origin: DiffOrigin::Git {
+            repo,
+            path: path.to_owned(),
+            side,
+        },
+    }
+}
+
+/// Whether an open tab is already showing this file's git diff.
+///
+/// Keyed on the repository and the path and **not** on the side. The pane switches sides in
+/// place — the same file's staged and unstaged diffs are two views of one thing, and the
+/// selection is cleared when it switches — so keying on the side as well would answer a
+/// second double-click with a second tab over the same file, which is exactly the
+/// duplicate-tab problem `tab_open_file` exists to avoid.
+fn shows_git_diff(kind: &TabKind, repo: RepoId, path: &str) -> bool {
+    matches!(
+        kind,
+        TabKind::Diff { spec } if matches!(
+            &spec.origin,
+            DiffOrigin::Git { repo: r, path: p, .. } if *r == repo && p == path
+        )
+    )
+}
+
+/// Open a diff tab for one file in one repository, or activate the one already showing it.
+///
+/// # Why the diff text is not an argument
+///
+/// The caller — the git panel — is holding a `FileDiff` when it calls this, and handing that
+/// over would save the pane a round trip. It is deliberately not accepted. `DiffSpec` is
+/// persisted inside `Workspace`, which `cide-core::persist` debounces to `workspace.json`,
+/// so a diff passed in here would be a diff written to disk; and a saved diff is a *stale*
+/// diff the moment anything writes to the file, which on this code path is constantly (an
+/// agent is editing, a build is running, a bash pane is committing). The pane calls
+/// `git_diff_file` with the key in [`DiffOrigin::Git`] instead, exactly as a Claude diff
+/// calls `claude_diff_content` with its `request_id`.
+///
+/// It is also what makes the tab survive a restart: a key still resolves tomorrow.
+///
+/// Nothing here touches the disk — it is a workspace mutation, like `tab_open_file` — so it
+/// is deliberately *not* `async`. The blocking git read happens in `git_diff_file`, which
+/// already goes through `spawn_blocking`.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_open_diff(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    side: DiffSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    state.update(|ws| {
+        let existing = workspace::project(ws, project)?
+            .tabs
+            .iter()
+            .find(|t| shows_git_diff(&t.kind, repo, &path))
+            .map(|t| t.id);
+        if let Some(id) = existing {
+            workspace::activate_tab(ws, project, id)?;
+            return Ok(id);
+        }
+
+        let spec = git_diff_spec(repo, &path, side, old_path);
+        let title = spec.title.clone();
+        workspace::open_tab(
+            ws,
+            project,
+            TabKind::Diff { spec },
+            Pane {
+                id: PaneId::new(),
+                kind: PaneKind::Diff,
+                // Auxiliary like every pane a tab is opened with: a diff holds no
+                // conversation, so there is nothing about it that must not be closed.
+                role: PaneRole::Auxiliary,
+                // No process, ever. A diff is a document.
                 session: None,
                 title,
             },
@@ -189,4 +291,90 @@ pub fn claude_mention_file(
             line_end: line_end.map(|l| l.saturating_sub(1)),
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(path: &str, old: Option<&str>) -> DiffSpec {
+        git_diff_spec(
+            RepoId::new(),
+            path,
+            DiffSide::Combined,
+            old.map(str::to_owned),
+        )
+    }
+
+    #[test]
+    fn a_git_diff_tab_is_titled_by_its_basename() {
+        assert_eq!(
+            spec("crates/cide-git/src/patch.rs", None).title,
+            "patch.rs — diff"
+        );
+        // A path with no separator is its own basename. `rsplit` always yields at least one
+        // item, which is why the fallback in `git_diff_spec` can never actually fire — it is
+        // there so the reader does not have to prove that.
+        assert_eq!(spec("README.md", None).title, "README.md — diff");
+    }
+
+    /// The fetch key is what `git_diff_file` is called with, so it must stay repo-relative
+    /// and must not pick up the display paths' shape.
+    #[test]
+    fn the_origin_carries_the_repo_relative_path_and_no_content() {
+        let repo = RepoId::new();
+        let s = git_diff_spec(repo, "src/main.rs", DiffSide::Unstaged, None);
+        let DiffOrigin::Git {
+            repo: r,
+            path,
+            side,
+        } = s.origin
+        else {
+            panic!("a git diff must carry a git origin");
+        };
+        assert_eq!(r, repo);
+        assert_eq!(path, "src/main.rs");
+        assert_eq!(side, DiffSide::Unstaged);
+    }
+
+    /// A rename shows both names; everything else shows one path twice, which is what
+    /// `DiffPane`'s path label collapses to a single label.
+    #[test]
+    fn a_rename_keeps_both_sides() {
+        let renamed = spec("src/new.rs", Some("src/old.rs"));
+        assert_eq!(renamed.old_path, PathBuf::from("src/old.rs"));
+        assert_eq!(renamed.new_path, PathBuf::from("src/new.rs"));
+
+        let plain = spec("src/main.rs", None);
+        assert_eq!(plain.old_path, plain.new_path);
+    }
+
+    /// Reuse ignores the side and the display paths, and never matches another repository's
+    /// file of the same name — the case a path-keyed lookup gets wrong in a monorepo.
+    #[test]
+    fn reuse_is_keyed_on_the_repository_and_the_path_alone() {
+        let repo = RepoId::new();
+        let other = RepoId::new();
+        let tab = TabKind::Diff {
+            spec: git_diff_spec(repo, "src/main.rs", DiffSide::Combined, None),
+        };
+
+        assert!(shows_git_diff(&tab, repo, "src/main.rs"));
+        assert!(!shows_git_diff(&tab, other, "src/main.rs"));
+        assert!(!shows_git_diff(&tab, repo, "src/other.rs"));
+
+        // A Claude diff over the same file is a different tab: it is holding an agent turn
+        // open, and answering it is not the same act as staging.
+        let claude = TabKind::Diff {
+            spec: DiffSpec {
+                title: "main.rs".into(),
+                old_path: PathBuf::from("src/main.rs"),
+                new_path: PathBuf::from("src/main.rs"),
+                origin: DiffOrigin::ClaudeMcp {
+                    request_id: "r1".into(),
+                },
+            },
+        };
+        assert!(!shows_git_diff(&claude, repo, "src/main.rs"));
+    }
 }

@@ -214,11 +214,30 @@ impl TabKind {
     }
 }
 
+/// What a diff tab is *about*. Never what it contains.
+///
+/// This struct is persisted: it lives in `TabKind::Diff`, inside `Workspace`, which
+/// `cide-core::persist` debounces to `workspace.json`. So it carries identity and nothing
+/// else — no original text, no proposal, no patch. That is the same rule that keeps
+/// `new_file_contents` out of a Claude diff (the pane calls `claude_diff_content` when it
+/// mounts) and it is why [`DiffOrigin::Git`] carries a *fetch key* rather than a diff: the
+/// pane calls `git_diff_file` when it mounts.
+///
+/// Two reasons, and the second is the one that bites. A saved layout would hold megabytes of
+/// file text that nobody reads back; and, worse, it would hold a *stale* copy — the working
+/// tree moves while the tab is open, so a diff written to disk at 10:00 and restored at
+/// 14:00 describes a file that no longer exists in that form. A key re-reads; a copy lies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct DiffSpec {
     pub title: String,
+    /// The left-hand side's path.
+    ///
+    /// Absolute for a `ClaudeMcp` diff, which names files on disk. **Repo-relative** for a
+    /// `Git` one, because that is how git spells a path and how the fetch key in
+    /// [`DiffOrigin::Git`] spells it — a `PathBuf` here is the display label for a pair of
+    /// paths, not a handle anything opens.
     #[ts(type = "string")]
     pub old_path: PathBuf,
     #[ts(type = "string")]
@@ -236,7 +255,35 @@ pub struct DiffSpec {
 #[ts(export)]
 pub enum DiffOrigin {
     /// Opened from the git panel. Closing it is just closing a tab.
-    Git,
+    ///
+    /// The three fields are the **fetch key** the pane re-reads the diff with, and they are
+    /// exactly the arguments of `git_diff_file`. Same shape as `ClaudeMcp`'s `request_id`,
+    /// for the same reason: see [`DiffSpec`] for why no diff text may live in here.
+    ///
+    /// They arrived after the variant did, and adding them is *not* a schema break in
+    /// practice: until `tab_open_diff` there was no command that could produce a `Git` origin
+    /// at all — the only constructors were two fixtures in `cide-core`'s tests — so no
+    /// `workspace.json` in existence carries the old field-less form for the new one to fail
+    /// on. Had one existed, `CURRENT_SCHEMA` would have had to move and `persist::migrate`
+    /// would have needed an arm; both are cheaper to note here than to discover from a
+    /// quarantined workspace.
+    Git {
+        /// Which repository the path belongs to. A `RepoId` is a uuid derived from the
+        /// canonical work tree, **not** a path — `cmd/git.rs::repo_root` resolves it, and a
+        /// path passed where an id belongs is a `NoSuchRepo` on every button in the panel.
+        repo: RepoId,
+        /// Repo-relative and slash-separated, the way `cide_ipc::git` spells every path.
+        path: String,
+        /// Which pair of trees the tab was opened on.
+        ///
+        /// Load-bearing rather than decorative: `cide_git::stage::stage` re-derives the diff
+        /// with `Unstaged`, `unstage` with `Staged`, and `commit` with `Combined`. A
+        /// [`crate::git::Selection`] names *positions in a diff*, so one made against the
+        /// wrong side is refused by the `rev` check — and would name different lines if the
+        /// check were skipped. The pane may switch sides while it is open; this is where it
+        /// starts, which is all a saved layout has any business remembering.
+        side: crate::git::DiffSide,
+    },
     /// Opened by Claude Code's `openDiff` RPC.
     ///
     /// This one **blocks an agent turn**: the CLI will not proceed until the request is

@@ -1101,3 +1101,42 @@ export const search = {
    */
   cancel: (projectId: ProjectId) => invoke<boolean>('search_cancel', { project: projectId }),
 }
+
+/* ------------------------------------------------------------------------------------
+ * The git diff tab. (M11)
+ *
+ * Appended as one block per the house rule about this file. It is separate from the `git`
+ * namespace above because it is not a git command at all: `tab_open_diff` mutates the
+ * workspace, the way `file.open` does, and the diff itself still comes from `git.diffFile`.
+ * ------------------------------------------------------------------------------------ */
+export const gitDiff = {
+  /**
+   * Open a diff tab for one file, or activate the one already showing it.
+   *
+   * Takes a *key*, not a diff. The caller usually has a `FileDiff` in hand and it is
+   * deliberately not accepted: `DiffSpec` is persisted to `workspace.json`, so a diff passed
+   * here would be a diff written to disk and stale by the time anything read it back. The
+   * pane re-reads through `git.diffFile` with this key — the same arrangement as a Claude
+   * diff and `claude.diffContent`.
+   *
+   * `side` is the side the tab *opens* on; the pane can switch afterwards. It matters
+   * because a selection is only valid for the operation whose side it was made against —
+   * `git.stage` re-derives with `unstaged`, `git.unstage` with `staged`, `git.commit` with
+   * `combined`.
+   *
+   * `oldPath` is git's pre-image path, for a rename. Display only.
+   *
+   * No `hydrate()` afterwards, unlike `file.open`'s call sites. `tab_open_diff` goes through
+   * `WorkspaceState::update`, which broadcasts `cide://workspace-changed` with the new
+   * snapshot to every window, and `store/workspace` applies it — so the tab appears on its
+   * own. Calling `hydrate()` as well would only add a round trip that answers with what has
+   * already arrived.
+   */
+  openTab: (
+    project: ProjectId,
+    repo: RepoId,
+    path: string,
+    side: DiffSide,
+    oldPath: string | null = null,
+  ) => invoke<TabId>('tab_open_diff', { project, repo, path, side, oldPath }),
+}

@@ -6,6 +6,8 @@
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "check:close": "node scripts/check-close-confirm.mjs",
+    "check:diff": "node scripts/check-diff-selection.mjs",
+    "check:diff-render": "node scripts/check-diff-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",
     "check:exit": "node scripts/check-exit-marker.mjs",
     "check:format": "node scripts/check-status-format.mjs",

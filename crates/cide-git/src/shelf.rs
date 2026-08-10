@@ -85,6 +85,14 @@ pub fn shelve(root: &Path, name: &str, selections: &[PathSelection]) -> Result<S
                 path: selection.path.clone(),
             });
         };
+        // Before a byte is synthesized, not after. `rollback` at the end of this function
+        // checks the same thing, and relying on that was wrong twice over: the patch file and
+        // the catalogue entry are already written and fsynced by then, so a moved file left a
+        // shelf entry full of lines the user never picked sitting behind a failed shelve. The
+        // positional selections that make this reachable arrive from the diff pane, which
+        // holds only `Combined` selections — the same side this diff is taken on, so the revs
+        // are comparable.
+        diff::check_rev(selection, &file)?;
         text.extend_from_slice(&render(&file, selection)?);
         files.push(file.path.clone());
     }

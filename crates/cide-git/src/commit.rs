@@ -172,7 +172,7 @@ fn rebuild_index(
                 path: selection.path.clone(),
             });
         };
-        check_rev(selection, &file)?;
+        diff::check_rev(selection, &file)?;
         if whole(&file, &selection.selection)? {
             plans.push((file.path.clone(), None));
             continue;
@@ -224,17 +224,6 @@ fn rebuild_index(
         }
     }
     index.write().wrap()
-}
-
-fn check_rev(selection: &PathSelection, file: &RawFile) -> Result<()> {
-    if let Some(expected) = &selection.rev
-        && &file.rev() != expected
-    {
-        return Err(GitError::StaleSelection {
-            path: selection.path.clone(),
-        });
-    }
-    Ok(())
 }
 
 fn whole(file: &RawFile, selection: &Selection) -> Result<bool> {

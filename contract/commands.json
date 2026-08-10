@@ -92,6 +92,7 @@
   "tab_activate",
   "tab_close",
   "tab_new_claude",
+  "tab_open_diff",
   "tab_open_file",
   "tab_open_settings",
   "tab_set_dirty",

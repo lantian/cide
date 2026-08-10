@@ -24,7 +24,8 @@
 use std::path::Path;
 
 use cide_ipc::git::{
-    DiffHunkView, DiffLineView, DiffSide, FileDiff, FileState, GitError, LineOrigin, PartialRefusal,
+    DiffHunkView, DiffLineView, DiffSide, FileDiff, FileState, GitError, LineOrigin,
+    PartialRefusal, PathSelection,
 };
 use git2::{Delta, Diff, DiffLineType, DiffOptions, Oid, Patch, Repository};
 
@@ -169,6 +170,33 @@ impl RawFile {
             .filter(|l| l.is_change())
             .count()
     }
+}
+
+/// Refuse a selection whose diff has moved since it was made.
+///
+/// Every operation that turns a [`PathSelection`] into positions has to ask this first: a
+/// `Hunks` or `Lines` selection is *nothing but* positions in one particular diff, so applying
+/// it to a diff taken later names different lines — silently, and with no later step that
+/// would notice.
+///
+/// It lives here, beside [`RawFile::rev`], because it was previously written out three times
+/// and one of the three was missing: `stage::resolve` had it, `commit::rebuild_index` had it,
+/// and `shelf::shelve` had none — so a stale selection got as far as a patch file on disk and
+/// a catalogue entry before `stage::rollback` refused it at the end, leaving a shelf entry
+/// full of lines the user never picked behind a failed operation. A shared function is the
+/// fix that also stops the *next* caller forgetting by omission.
+///
+/// `rev: None` skips the check, which is only correct for [`Selection::Whole`] — it names no
+/// positions, so there is nothing for the file to have moved out from under.
+pub fn check_rev(selection: &PathSelection, file: &RawFile) -> Result<()> {
+    if let Some(expected) = &selection.rev
+        && &file.rev() != expected
+    {
+        return Err(GitError::StaleSelection {
+            path: selection.path.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Which pair of trees to diff, and how much content to include.

@@ -1,0 +1,161 @@
+/**
+ * Partial selections the commit is to use, shared between the diff pane and the panel.
+ *
+ * # Why a module-level store and not props
+ *
+ * The two ends are in different subtrees of one window: the diff pane lives inside a workspace
+ * tab, the Commit button lives in the sidebar, and the nearest common React ancestor is the
+ * shell itself. Routing it through the Rust workspace instead would put a half-made gesture
+ * into `workspace.json`.
+ *
+ * **One window, though — this does not span them.** Each Tauri window is its own webview and
+ * its own JavaScript realm (`windows/DetachedPaneWindow.tsx` says the same thing about xterm),
+ * so a second shell window has a second copy of this map. That is a limit and not a bug: the
+ * panel that commits and the pane that made the selection are then two different panels, each
+ * consistent with itself, and the one that never saw a selection falls back to whole files —
+ * coarser, never wrong. Making it span windows would mean a Rust-side store, which is exactly
+ * what the paragraph below says must not exist.
+ *
+ * It is deliberately **not** in the Rust domain for the same reason `DiffSpec` carries no
+ * diff text: a selection is a set of positions in one particular diff, it is meaningless the
+ * moment that diff moves, and persisting it would mean restoring tomorrow a claim about
+ * lines that no longer exist. It dies with the window, which is the honest lifetime.
+ *
+ * # The rule that makes this safe
+ *
+ * `cide_git` resolves selections against a *side* that depends on the operation:
+ * `stage` against `Unstaged`, `unstage` against `Staged`, `commit` and `shelve` against
+ * `Combined`. A selection is a set of positions in one diff, so one made against the wrong
+ * side names different lines. Entries here therefore record the side they were made on, and
+ * {@link commitSelections} only honours `combined` ones — anything else falls back to the
+ * whole file, which is what the panel did before per-hunk staging existed and is never
+ * wrong, only coarser.
+ *
+ * Every entry also carries the `rev` of the diff it came from, so a file that moved
+ * underneath is refused by `cide_git::commit::check_rev` rather than committed at the old
+ * positions. Refusal is the correct outcome here: the alternative is a commit that contains
+ * lines the user never saw.
+ */
+import type { DiffSide, PathSelection, RepoId, Selection } from '@/ipc/generated'
+
+export interface PartialEntry {
+  repo: RepoId
+  /** Repo-relative, as everything git-facing is. */
+  path: string
+  /** Which pair of trees the selection was made against. */
+  side: DiffSide
+  /** `FileDiff.rev` of that diff. */
+  rev: string
+  selection: Selection
+  /** How many lines it covers — what the panel's warning counts. */
+  lines: number
+}
+
+/**
+ * `repo` and `path` are both needed: two repos in a monorepo have the same `src/main.rs`.
+ *
+ * `\u0000` as the separator because it is the one character a path cannot contain, so no pair
+ * of distinct keys can collide. Written as the escape and not as a literal NUL in the source:
+ * a raw one makes git call this file binary and print `Bin 0 -> 5601 bytes` instead of a diff,
+ * which is how it reached review unread.
+ */
+function key(repo: RepoId, path: string): string {
+  return `${repo}\u0000${path}`
+}
+
+const entries = new Map<string, PartialEntry>()
+const listeners = new Set<() => void>()
+
+/**
+ * A cached array, rebuilt only when something changes.
+ *
+ * `useSyncExternalStore` calls `getSnapshot` on every render and re-renders whenever the
+ * value is not `Object.is`-equal to the last one, so a fresh array per call is an infinite
+ * loop rather than a small waste.
+ */
+let snapshot: readonly PartialEntry[] = []
+
+function changed(): void {
+  snapshot = [...entries.values()]
+  for (const listener of listeners) listener()
+}
+
+export function subscribe(listener: () => void): () => void {
+  listeners.add(listener)
+  return () => listeners.delete(listener)
+}
+
+export function getSnapshot(): readonly PartialEntry[] {
+  return snapshot
+}
+
+/**
+ * The same value, for `useSyncExternalStore`'s third argument.
+ *
+ * React refuses to render a store-reading component on the server without one, which is not
+ * a hypothetical here: `ui/scripts/check-git-render.mjs` renders the whole panel under node.
+ * Nothing can have made a selection at that point, so the server's answer is the module's
+ * initial one — the honest snapshot rather than a fabricated empty array, which would also
+ * be a second identity for React to notice.
+ */
+export const getServerSnapshot = getSnapshot
+
+export function setPartial(entry: PartialEntry): void {
+  entries.set(key(entry.repo, entry.path), entry)
+  changed()
+}
+
+export function clearPartial(repo: RepoId, path: string): void {
+  if (entries.delete(key(repo, path))) changed()
+}
+
+export function clearAllPartials(): void {
+  if (entries.size === 0) return
+  entries.clear()
+  changed()
+}
+
+export function getPartial(repo: RepoId, path: string): PartialEntry | undefined {
+  return entries.get(key(repo, path))
+}
+
+/**
+ * Drop entries for files that are no longer in the tree.
+ *
+ * Called from the panel's `adopt`. A file that was committed, reverted or stashed elsewhere
+ * has no diff left for its positions to mean anything against, and an entry that outlived
+ * its file would silently apply to the *next* change to that path.
+ */
+export function pruneTo(live: ReadonlySet<string>): void {
+  let dropped = false
+  for (const [id, entry] of entries) {
+    if (!live.has(key(entry.repo, entry.path))) {
+      entries.delete(id)
+      dropped = true
+    }
+  }
+  if (dropped) changed()
+}
+
+/** The key form `pruneTo` compares against, so callers do not have to know the separator. */
+export function liveKey(repo: RepoId, path: string): string {
+  return key(repo, path)
+}
+
+/**
+ * What to send for a repo's ticked paths: the stored partial where there is one, the whole
+ * file everywhere else.
+ *
+ * `Whole` carries `rev: null` because it names no positions and so cannot go stale — the
+ * same reasoning as `diffSelection.pathSelection`, and the behaviour the panel has always
+ * had for a ticked checkbox.
+ */
+export function commitSelections(repo: RepoId, paths: readonly string[]): PathSelection[] {
+  return paths.map((path) => {
+    const partial = getPartial(repo, path)
+    if (partial === undefined || partial.side !== 'combined') {
+      return { path, selection: { kind: 'whole' }, rev: null }
+    }
+    return { path, selection: partial.selection, rev: partial.rev }
+  })
+}

@@ -103,3 +103,18 @@
 .noteWarn {
   color: var(--yellow);
 }
+
+/*
+ * The way out of a note that changes what a button does — today, the partial-selection line.
+ * A link rather than a button shape because the note is one line and must stay one line; see
+ * `.note`'s `white-space: nowrap`.
+ */
+.noteAction {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}

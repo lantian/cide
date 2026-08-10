@@ -33,16 +33,29 @@
  * filesystem watcher, so it is one trigger; `cide://git-status` is the other, and carries the
  * new tree rather than asking for it. Both land on the same coalescer.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
   diag,
   events,
   git as gitApi,
+  gitDiff as gitDiffApi,
+  type DiffSide,
   type FileDiff,
   type PathSelection,
   type ProjectId,
   type RepoId,
 } from '@/ipc/client'
+import { diffPaneAvailable } from './diffHost'
+import {
+  clearAllPartials,
+  commitSelections,
+  getServerSnapshot as partialServerSnapshot,
+  getSnapshot as partialSnapshot,
+  liveKey,
+  pruneTo,
+  subscribe as subscribePartials,
+  type PartialEntry,
+} from './partialStore'
 import {
   allFiles,
   allGroups,
@@ -72,8 +85,12 @@ import type { ChangeEntry, ShelfRow, StatusView } from './types'
  * The panel ticks files; `cide-git` accepts a `PathSelection` per path so the same commands
  * serve per-hunk and per-line staging. `whole` is what a ticked checkbox means, and `rev:
  * null` skips the staleness check, which is only correct for `Whole` — see `PathSelection`.
- * Written as one adapter rather than inline at four call sites so that wiring the hunk gutter
- * later changes one function.
+ *
+ * Still here, and still the right answer for `unstage`. That command resolves its selections
+ * against `DiffSide::Staged`, and the diff pane's stored selections are made against
+ * `Combined` (see `partialStore`), so honouring one here would send positions in one diff as
+ * positions in another. `commit` and `shelve` do resolve against `Combined` and go through
+ * `commitSelections` instead — that is the seam where the hunk gutter reaches the commit.
  */
 function wholeFiles(paths: string[]): PathSelection[] {
   return paths.map((path) => ({ path, selection: { kind: 'whole' }, rev: null }))
@@ -109,6 +126,15 @@ export interface GitPanelModel {
    * the backend the moment another window flipped it.
    */
   stagingArea: boolean
+  /**
+   * Files the diff pane has held part of for the next commit.
+   *
+   * Surfaced because it changes what Commit does without anything in this panel showing it:
+   * a ticked row whose file has a stored selection commits some of its lines and leaves the
+   * rest. A hidden modifier on the button that writes history is not acceptable, so the
+   * panel draws a line naming the count with a way to drop it.
+   */
+  partials: readonly PartialEntry[]
   /** True when the panel is showing a fixture rather than a repository. */
   story: boolean
 }
@@ -132,6 +158,8 @@ export interface GitPanelActions {
   reloadIndex: (repo: RepoId) => void
   /** Guard bar, right button: keep our ticks and let the next commit rewrite the index. */
   overwriteIndex: (repo: RepoId) => void
+  /** Forget every held partial selection: the next commit takes whole files again. */
+  clearPartials: () => void
   /** A file row was double-clicked, or Enter was pressed on it. */
   openDiff: (row: Row) => void
   /**
@@ -184,6 +212,18 @@ export function useGitPanel(
 
   const rows = useMemo(() => buildRows(view, expanded), [view, expanded])
   const picked = useMemo(() => selectedFiles(view, selected), [view, selected])
+
+  // Written by the diff pane, which is in another subtree of this same window — a module
+  // store rather than a prop because the nearest common ancestor is the shell. It reaches no
+  // *further* than this window; see `partialStore`'s header for why that is a limit and not a
+  // bug. `getSnapshot` returns a cached array; a fresh one per call would re-render forever.
+  const partials = useSyncExternalStore(
+    subscribePartials,
+    partialSnapshot,
+    // The panel is server-rendered by `check:render`; React refuses a store read there
+    // without this third argument.
+    partialServerSnapshot,
+  )
 
   /**
    * The current view, for callbacks that must not be rebuilt when it changes.
@@ -273,9 +313,29 @@ export function useGitPanel(
    * be unusable. Rows that are genuinely new are ticked if they landed in the active
    * changelist, which is what makes "Claude edited a file, commit it" one click; groups
    * that are genuinely new open unless they are the ignored group.
+   *
+   * `authoritative` says whether `next` is git's answer or a placeholder. The panel empties
+   * itself on a failed `git status` and when there is no project, and those emptyings are not
+   * evidence about anything — see the `pruneTo` call below, which is the one thing here that
+   * destroys state the user cannot get back by waiting.
    */
-  const adopt = useCallback((next: StatusView) => {
+  const adopt = useCallback((next: StatusView, authoritative = true) => {
     const live = allFiles(next)
+    // A partial selection outlives the panel that made it (it lives in a module store shared
+    // with the diff pane), so the payload that says a file is gone is also the only signal
+    // that its stored positions are meaningless. Left behind, they would silently apply to
+    // the *next* change to that path — a set of line numbers from a file that was committed
+    // an hour ago.
+    //
+    // Only against a real answer, though. `refresh` adopts `EMPTY` when `git status` fails —
+    // an index.lock held by a bash pane is enough — and pruning against that reads the
+    // failure as "every file is gone" and drops every held selection. The panel's warning
+    // line would go with it, so the next Commit would quietly write whole files where the
+    // user had held lines back: the same silent wrong answer the rev check exists to stop,
+    // arrived at from the other end.
+    if (authoritative) {
+      pruneTo(new Set(flatFiles(next).map((f) => liveKey(f.repo, f.entry.path))))
+    }
     // What is genuinely new is decided *here*, before the two `seen` refs are replaced, and
     // never inside a state updater. React runs an updater eagerly only while the fiber has no
     // other update pending, and `refresh` always leaves one (`setLoading(false)` runs one line
@@ -323,7 +383,7 @@ export function useGitPanel(
   const refresh = useCallback(async () => {
     if (story) return
     if (project === null) {
-      adopt(EMPTY)
+      adopt(EMPTY, false)
       return
     }
     setLoading(true)
@@ -334,7 +394,8 @@ export function useGitPanel(
     // `undefined` is the guard's failure signal; `{ repos: [] }` is a legitimate answer.
     // Keeping the previous tree after a failure would show changes that may no longer
     // exist, so a failure empties the panel.
-    adopt(raw === undefined ? EMPTY : viewOf(raw))
+    if (raw === undefined) adopt(EMPTY, false)
+    else adopt(viewOf(raw))
   }, [project, story, guarded, adopt])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
@@ -468,7 +529,11 @@ export function useGitPanel(
               message,
               amend,
               changelist: unit.changelist,
-              selections: wholeFiles(unit.paths),
+              // The whole file, unless the diff pane left a partial selection for it. This
+              // is the one line that makes per-hunk staging reach a commit; `commitSelections`
+              // is where the rule lives that only a `combined` selection may be honoured,
+              // because that is the side `cide_git::commit` re-derives.
+              selections: commitSelections(unit.repo, unit.paths),
               // `false` unless the user pressed Overwrite on this repo's bar. This is the
               // waiver for `cide_git::commit`'s `require_index_unchanged`, and defaulting it
               // to `true` — which is what the panel used to do — turns the guard off for
@@ -545,8 +610,11 @@ export function useGitPanel(
       setBusy('Shelving…')
       const name = message.trim() === '' ? 'Shelved changes' : message.trim()
       for (const unit of units) {
+        // `shelf::shelve` resolves against `Combined`, the same side as commit, so a stored
+        // partial selection is meaningful here too: shelving half a file is exactly what the
+        // shelf is for.
         await guarded('git shelve', () =>
-          gitApi.shelf.shelve(project, unit.repo, name, wholeFiles(unit.paths)),
+          gitApi.shelf.shelve(project, unit.repo, name, commitSelections(unit.repo, unit.paths)),
         )
       }
       setBusy(null)
@@ -621,33 +689,59 @@ export function useGitPanel(
   }, [])
 
   /**
-   * Fetch one file's diff and hand it over.
+   * Open one file's diff.
    *
    * Takes the repo and the entry rather than a `Row`, because the toolbar's ◫ acts on the
    * *selection* and the selection outlives the rows: `buildRows` emits no file rows for a
    * collapsed group, so a search of the row list found nothing whenever the user had collapsed
    * the changelist — an enabled button that did nothing, which is the class of bug this panel
    * already had too much of. `flatFiles` reads the tree, exactly as commit does.
+   *
+   * # Why this no longer fetches
+   *
+   * It used to call `git_diff_file` and hand the `FileDiff` to `onOpenDiff` — and with no
+   * host wired, which was every build, the diff was fetched and dropped. Now it opens a
+   * *tab*: `tab_open_diff` records the key (repo, path, side) and `GitDiffPane` fetches when
+   * it mounts. That is one round trip instead of two, it survives a restart, and it is what
+   * makes the diff reachable without the sidebar's host knowing anything about git.
+   *
+   * `onOpenDiff` is kept for a host that wants the payload itself — the layout audit, or a
+   * future preview strip. When it is set it takes precedence and no tab is opened, so a host
+   * cannot end up with both.
    */
   const showDiff = useCallback(
     (repo: RepoId, entry: ChangeEntry) => {
       if (project === null) return
+      // `combined` is HEAD→working tree, which is what a changelist row *is*, and the side a
+      // commit selects from. In staging-area mode the index is the truth, so the staged side
+      // is the honest one. Either way the pane can switch, and switching clears the selection
+      // because positions do not transfer between sides.
+      const side: DiffSide = stagingArea ? 'staged' : 'combined'
       void (async () => {
-        // `combined` is HEAD→working tree, which is what a changelist row *is*. In
-        // staging-area mode the index is the truth, so the staged side is the honest one.
-        const side = stagingArea ? 'staged' : 'combined'
-        const diff = await guarded('git diff', () =>
-          gitApi.diffFile(project, repo, entry.path, side),
-        )
-        if (diff === undefined) return
-        if (onOpenDiff === undefined) {
-          // Nowhere to put it. Said out loud rather than dropped on the floor: the panel used
-          // to fetch this diff and discard it, which made ◫ and double-click look broken.
-          note('git diff', `no diff view is wired up — ${entry.path} was not opened`)
-          void diag.log('git panel: onOpenDiff is not wired; the fetched FileDiff was dropped')
+        if (onOpenDiff !== undefined) {
+          const diff = await guarded('git diff', () =>
+            gitApi.diffFile(project, repo, entry.path, side),
+          )
+          if (diff !== undefined) onOpenDiff(diff, repo)
           return
         }
-        onOpenDiff(diff, repo)
+        if (!diffPaneAvailable()) {
+          // Nothing in this build can draw a diff tab, so opening one would leave the user
+          // with a blank pane and no explanation. Said out loud instead — the same refusal
+          // the panel used to give when `onOpenDiff` was absent, for the same reason.
+          note('git diff', `no diff view is wired up — ${entry.path} was not opened`)
+          void diag.log('git panel: GitDiffPane is not linked; no diff tab was opened')
+          return
+        }
+        // No `hydrate()` afterwards, and no import of the workspace store: `tab_open_diff`
+        // goes through `WorkspaceState::update`, which broadcasts `cide://workspace-changed`
+        // to every window, and the store's own subscription applies it. Reaching for the
+        // store here would also drag the terminal stack into this module's import graph —
+        // `store/workspace` → `layout/paneHosts` → xterm, which touches `self` at import
+        // time and breaks `check:render`'s server-side render of this very panel.
+        await guarded('git diff', () =>
+          gitDiffApi.openTab(project, repo, entry.path, side, entry.origPath),
+        )
       })()
     },
     [project, guarded, note, stagingArea, onOpenDiff],
@@ -682,6 +776,7 @@ export function useGitPanel(
     message,
     amend,
     stagingArea,
+    partials,
     story: story !== null,
     refresh: () => {
       void refresh()
@@ -700,6 +795,7 @@ export function useGitPanel(
     unshelve,
     reloadIndex,
     overwriteIndex,
+    clearPartials: clearAllPartials,
     openDiff,
     showSelectedDiff,
   }
