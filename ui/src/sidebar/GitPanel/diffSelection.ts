@@ -188,22 +188,27 @@ export function toSelection(marks: Marks, diff: FileDiff): Selection | null {
 /**
  * The `PathSelection` for a diff, or `null` when nothing is selected.
  *
- * `rev` is where the staleness check lives, and it is attached to exactly the selections that
- * need it. A `Whole` selection names no positions, so it stays correct however the file moved
- * and carries `null` — the same thing the panel's whole-file checkboxes send. A `Hunks` or
- * `Lines` selection is nothing *but* positions, so it carries the rev of the diff it was made
- * against and `cide_git::stage::resolve` refuses it if the file moved underneath. Sending
- * `null` there would apply yesterday's line numbers to today's diff and stage different
- * lines, silently.
+ * **Always carries the rev**, including for `whole`, and that is the difference between this
+ * function and the panel's checkbox.
+ *
+ * The panel's checkbox means "this file", so `wholeFiles()` sends `rev: null` and whatever is
+ * in the working tree at the moment Stage is pressed is what the user asked for. Here the
+ * user pointed at *rows*: `whole` is only how {@link toSelection} encodes "every change I can
+ * see", chosen because the index API is exact where a synthesized patch is not. It still
+ * denotes a set of positions in one particular diff.
+ *
+ * So dropping the rev here is not a simplification, it is the silent wrong answer this module
+ * exists to prevent: tick every row, have an agent add a line while the pointer is moving,
+ * press Stage, and `git add` puts the agent's line in the index too — a line the user never
+ * saw, staged by a gesture that named six others. Ticking every row but one, by contrast, was
+ * always refused. `Selection::Whole` with a rev is well defined on the Rust side —
+ * `stage::resolve` checks the rev *before* `is_whole` normalises anything — so the cost of
+ * being consistent is a refusal in exactly the case that used to be wrong.
  */
 export function pathSelection(marks: Marks, diff: FileDiff): PathSelection | null {
   const selection = toSelection(marks, diff)
   if (selection === null) return null
-  return {
-    path: diff.path,
-    selection,
-    rev: selection.kind === 'whole' ? null : diff.rev,
-  }
+  return { path: diff.path, selection, rev: diff.rev }
 }
 
 /**

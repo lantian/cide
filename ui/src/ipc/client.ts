@@ -1082,9 +1082,11 @@ export const gitDiff = {
    *
    * `oldPath` is git's pre-image path, for a rename. Display only.
    *
-   * The workspace mirror does not refresh itself: follow this with `hydrate()`, exactly as
-   * every `file.open` call site does, or the new tab will not appear until some other
-   * snapshot arrives.
+   * No `hydrate()` afterwards, unlike `file.open`'s call sites. `tab_open_diff` goes through
+   * `WorkspaceState::update`, which broadcasts `cide://workspace-changed` with the new
+   * snapshot to every window, and `store/workspace` applies it — so the tab appears on its
+   * own. Calling `hydrate()` as well would only add a round trip that answers with what has
+   * already arrived.
    */
   openTab: (
     project: ProjectId,

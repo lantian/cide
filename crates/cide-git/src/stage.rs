@@ -45,16 +45,11 @@ fn resolve(repo: &Repository, selection: &PathSelection, side: DiffSide) -> Resu
         diff::file_diff(repo, &selection.path, request)?.ok_or_else(|| GitError::NoSuchChange {
             path: selection.path.clone(),
         })?;
-    if let Some(expected) = &selection.rev
-        && &file.rev() != expected
-    {
-        // The panel checked boxes against a diff that no longer exists — Claude edited the
-        // file mid-gesture, say. Applying the old positions to the new diff stages
-        // *different* lines, which is a silent wrong answer, so it is refused instead.
-        return Err(GitError::StaleSelection {
-            path: selection.path.clone(),
-        });
-    }
+    // The panel checked boxes against a diff that no longer exists — Claude edited the file
+    // mid-gesture, say. Applying the old positions to the new diff stages *different* lines,
+    // which is a silent wrong answer, so it is refused instead. Shared with `commit` and
+    // `shelve` rather than written out here; see `diff::check_rev`.
+    diff::check_rev(selection, &file)?;
     Ok(file)
 }
 

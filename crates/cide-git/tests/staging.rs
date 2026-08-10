@@ -877,3 +877,202 @@ fn the_sidecar_lives_under_the_state_directory_keyed_by_the_root() {
             .any(|l| l.name == "Fixes")
     );
 }
+
+// --- the frontend's indices are the indices `choose` resolves --------------------------------
+
+/// The one bridge between what the diff pane paints and what staging acts on.
+///
+/// The pane renders `FileDiff` rows and sends `LineRef`s that index *those* rows; `choose`
+/// resolves them against a `RawFile` it re-derives itself, and `diff::view` is the only thing
+/// that makes the two the same indices. Nothing pinned that. A change on either side — folding
+/// the `\ No newline` marker back out into a row of its own is the one the type's own doc
+/// comment warns about — would stage a line the user never ticked, with every existing test
+/// still green because every existing test picks its positions out of the `RawFile`.
+///
+/// So this one picks them the way the pane does: out of the rendered view, through the exact
+/// request `cmd/git.rs::git_diff_file` makes, carrying the `rev` the pane would send back.
+#[test]
+fn a_line_ref_taken_from_the_rendered_view_stages_the_row_the_user_ticked() {
+    let repo = TempRepo::new("view-indices");
+    repo.write("f.txt", BASE_15);
+    repo.commit_all("base");
+    repo.write("f.txt", EDITED_15);
+
+    // Exactly what the pane fetches: `git_diff_file` asks for renames, staging does not.
+    let git_repo = git2::Repository::open(&repo.root).expect("open");
+    let raw_file = diff::file_diff(
+        &git_repo,
+        "f.txt",
+        DiffRequest::new(DiffSide::Unstaged).renames(true),
+    )
+    .expect("diff")
+    .expect("f.txt is modified");
+    let view = diff::view(&raw_file, DiffSide::Unstaged);
+
+    // The view is the raw file, row for row. Stated as an assertion and not as a comment
+    // because it is the whole reason a `LineRef` means the same thing at both ends.
+    assert_eq!(view.hunks.len(), raw_file.hunks.len());
+    for (shown, raw_hunk) in view.hunks.iter().zip(&raw_file.hunks) {
+        assert_eq!(shown.lines.len(), raw_hunk.lines.len(), "row counts differ");
+        for (row, raw_line) in shown.lines.iter().zip(&raw_hunk.lines) {
+            let expected = match raw_line.origin {
+                b'+' => cide_ipc::git::LineOrigin::Addition,
+                b'-' => cide_ipc::git::LineOrigin::Deletion,
+                _ => cide_ipc::git::LineOrigin::Context,
+            };
+            assert_eq!(row.origin, expected, "row origins differ");
+        }
+    }
+
+    // Two hunks, and the second one's change rows sit *after* three context rows — so a
+    // position counted in change lines rather than in view rows would name a different row
+    // and this test would catch it.
+    assert_eq!(view.hunks.len(), 2, "{:?}", view.hunks);
+    let second = &view.hunks[1];
+    let picked: Vec<LineRef> = second
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.origin != cide_ipc::git::LineOrigin::Context)
+        .map(|(line, _)| LineRef {
+            hunk: 1,
+            line: line as u32,
+        })
+        .collect();
+    assert_eq!(picked.len(), 2, "one deletion and one addition");
+    assert!(
+        picked.iter().all(|r| r.line >= 3),
+        "the change rows must not be at the front, or the test proves nothing: {picked:?}"
+    );
+
+    // And the rev the pane holds is the rev staging re-derives, `renames(true)` or not. If it
+    // were not, every partial stage from the pane would come back `StaleSelection`.
+    stage::stage(
+        &repo.root,
+        &[PathSelection {
+            path: "f.txt".into(),
+            selection: Selection::Lines { lines: picked },
+            rev: Some(view.rev.clone()),
+        }],
+    )
+    .expect("stage the second hunk by view indices");
+
+    assert_eq!(
+        repo.git(&["show", ":f.txt"]).into_bytes(),
+        FIRST_HUNK_UNSTAGED.to_vec(),
+        "the row the user ticked is the row that was staged"
+    );
+}
+
+/// A shelve whose selection has gone stale must leave nothing behind.
+///
+/// `shelve` writes the patch file and the catalogue entry and *then* calls `rollback`, which
+/// is the only thing that used to check `rev`. So a held per-line selection whose file moved
+/// underneath produced: a patch synthesized from the *new* diff at the *old* positions, on
+/// disk; a shelf entry naming it; and only then a `StaleSelection` error. The user saw a
+/// failure and got a shelf entry full of lines they never picked — which unshelving would
+/// later apply on top of the change that is still in the working tree.
+///
+/// Reachable since the diff pane started handing stored selections to `shelve`; before that
+/// every selection the panel sent carried `rev: None`.
+#[test]
+fn a_stale_selection_is_refused_before_the_shelf_is_written() {
+    let repo = TempRepo::new("shelve-stale");
+    repo.write("f.txt", BASE_15);
+    repo.commit_all("base");
+    repo.write("f.txt", EDITED_15);
+
+    let file = raw(&repo, "f.txt", DiffSide::Combined);
+    let stale = file.rev();
+    let picked: Vec<LineRef> = file.hunks[1]
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.is_change())
+        .map(|(line, _)| LineRef {
+            hunk: 1,
+            line: line as u32,
+        })
+        .collect();
+    assert_eq!(picked.len(), 2);
+
+    // The file moves under the held selection.
+    let moved = b"A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\nO\nEXTRA\n";
+    repo.write("f.txt", moved);
+
+    let outcome = shelf::shelve(
+        &repo.root,
+        "held",
+        &[PathSelection {
+            path: "f.txt".into(),
+            selection: Selection::Lines { lines: picked },
+            rev: Some(stale),
+        }],
+    );
+    assert!(
+        matches!(outcome, Err(GitError::StaleSelection { .. })),
+        "expected a refusal, got {outcome:?}"
+    );
+    assert!(
+        shelf::list(&repo.root).is_empty(),
+        "a refused shelve must not leave an entry behind"
+    );
+    assert_eq!(
+        repo.read("f.txt"),
+        moved.to_vec(),
+        "and must not touch the tree"
+    );
+}
+
+/// `Selection::Whole` carrying a rev is checked, not waved through.
+///
+/// The diff pane needs this. Ticking *every* row of a diff encodes as `Whole` — the index API
+/// is exact where a synthesized patch is not — but the user still pointed at rows they could
+/// see, so the pane sends the rev and expects a moved file to be refused. Whole-file staging
+/// from the panel's checkbox keeps sending `rev: None` and is unaffected.
+#[test]
+fn a_whole_selection_with_a_rev_is_still_refused_when_the_file_moved() {
+    let repo = TempRepo::new("whole-rev");
+    repo.write("f.txt", BASE_15);
+    repo.commit_all("base");
+    repo.write("f.txt", EDITED_15);
+
+    let stale = raw(&repo, "f.txt", DiffSide::Unstaged).rev();
+    repo.write(
+        "f.txt",
+        b"A\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\nO\nLATER\n",
+    );
+
+    let outcome = stage::stage(
+        &repo.root,
+        &[PathSelection {
+            path: "f.txt".into(),
+            selection: Selection::Whole,
+            rev: Some(stale),
+        }],
+    );
+    assert!(
+        matches!(outcome, Err(GitError::StaleSelection { .. })),
+        "expected a refusal, got {outcome:?}"
+    );
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]).trim(),
+        "",
+        "nothing may reach the index"
+    );
+
+    // And the same selection without a rev is the panel's checkbox, which still works.
+    stage::stage(
+        &repo.root,
+        &[PathSelection {
+            path: "f.txt".into(),
+            selection: Selection::Whole,
+            rev: None,
+        }],
+    )
+    .expect("a checkbox stage takes the working tree as it is");
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]).trim(),
+        "f.txt"
+    );
+}

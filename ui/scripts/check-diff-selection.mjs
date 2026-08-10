@@ -59,7 +59,10 @@ try {
         paths: { '@/*': ['src/*'] },
         types: [],
       },
-      files: [join(UI, 'src', 'sidebar', 'GitPanel', 'diffSelection.ts')],
+      files: [
+        join(UI, 'src', 'sidebar', 'GitPanel', 'diffSelection.ts'),
+        join(UI, 'src', 'sidebar', 'GitPanel', 'partialStore.ts'),
+      ],
     }),
   )
   execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', tsconfig], {
@@ -68,6 +71,7 @@ try {
   })
 
   const s = await import(`file://${join(out, 'sidebar', 'GitPanel', 'diffSelection.js')}`)
+  const store = await import(`file://${join(out, 'sidebar', 'GitPanel', 'partialStore.js')}`)
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -237,14 +241,23 @@ try {
 
   eq(
     s.pathSelection(new Set(every), diff),
-    { path: 'src/main.rs', selection: { kind: 'whole' }, rev: null },
-    '`whole` names no positions, so it carries no rev and cannot go stale',
+    { path: 'src/main.rs', selection: { kind: 'whole' }, rev: 'cafef00dcafef00d' },
+    'every row ticked still carries the rev — `whole` is only how the encoding spells "all of '
+      + 'these positions", and without it `git add` would stage lines added after the tick',
   )
   eq(
     s.pathSelection(new Set(['2:0']), diff).rev,
     'cafef00dcafef00d',
     'a positional selection carries the rev of the diff it was made against',
   )
+  /*
+   * The panel's own checkbox is the other case and keeps `rev: null` — it means "this file",
+   * not "these rows". `wholeFiles` lives in `useGitPanel`, so what is pinned here is that this
+   * function is not it: no selection it builds may skip the staleness check.
+   */
+  for (const marks of [new Set(every), new Set(['2:0']), new Set(s.hunkMarks(diff, 1))]) {
+    ok(s.pathSelection(marks, diff).rev === diff.rev, 'no selection from the pane skips the check')
+  }
   eq(s.pathSelection(new Set(), diff), null, 'nothing selected produces no PathSelection')
 
   // --- the toggles ------------------------------------------------------------------------
@@ -298,6 +311,102 @@ try {
     null,
     'and produces no selection, so no button can send one that would be refused',
   )
+
+  // --- what the commit is actually sent ------------------------------------------------------
+
+  /*
+   * `commitSelections` is the last function between a held selection and `git commit`, and it
+   * was the only one on this path with no coverage at all. Everything it can get wrong is
+   * silent: honour a selection made against the wrong side and the commit contains lines from
+   * a different diff; drop the rev and a moved file is committed at stale positions; fail to
+   * fall back and a file the user ticked is left out of the commit entirely.
+   */
+  const REPO = 'repo-a'
+  const OTHER = 'repo-b'
+  const entry = (over) => ({
+    repo: REPO,
+    path: 'src/main.rs',
+    side: 'combined',
+    rev: 'cafef00dcafef00d',
+    selection: { kind: 'lines', lines: [{ hunk: 2, line: 0 }] },
+    lines: 1,
+    ...over,
+  })
+  const whole = (path) => ({ path, selection: { kind: 'whole' }, rev: null })
+
+  store.clearAllPartials()
+  eq(
+    store.commitSelections(REPO, ['src/main.rs', 'README.md']),
+    [whole('src/main.rs'), whole('README.md')],
+    'with nothing held, every ticked path is the whole file — what the panel always did',
+  )
+
+  store.setPartial(entry())
+  eq(
+    store.commitSelections(REPO, ['src/main.rs', 'README.md']),
+    [
+      {
+        path: 'src/main.rs',
+        selection: { kind: 'lines', lines: [{ hunk: 2, line: 0 }] },
+        rev: 'cafef00dcafef00d',
+      },
+      whole('README.md'),
+    ],
+    'a held selection travels with its rev, and only for its own path',
+  )
+  eq(
+    store.commitSelections(OTHER, ['src/main.rs']),
+    [whole('src/main.rs')],
+    'another repository’s file of the same name is not the same file',
+  )
+
+  /*
+   * The side is the rule that keeps this honest. `commit` and `shelve` re-derive against
+   * `Combined`; a selection made on `unstaged` or `staged` names positions in a different
+   * diff, so it must be ignored rather than sent — the fallback is coarser, never wrong.
+   */
+  for (const side of ['unstaged', 'staged']) {
+    store.clearAllPartials()
+    store.setPartial(entry({ side }))
+    eq(
+      store.commitSelections(REPO, ['src/main.rs']),
+      [whole('src/main.rs')],
+      `a selection made on \`${side}\` is not honoured by a commit, which resolves \`combined\``,
+    )
+  }
+
+  store.clearAllPartials()
+  store.setPartial(entry())
+  ok(store.getSnapshot().length === 1, 'the snapshot follows the store')
+  store.pruneTo(new Set([store.liveKey(REPO, 'other.rs')]))
+  eq(
+    store.commitSelections(REPO, ['src/main.rs']),
+    [whole('src/main.rs')],
+    'a file that left the tree takes its held positions with it',
+  )
+  ok(store.getSnapshot().length === 0, 'and the snapshot with them')
+
+  store.setPartial(entry())
+  store.setPartial(entry({ path: 'README.md' }))
+  ok(store.getSnapshot().length === 2, 'two files can be held at once')
+  store.clearPartial(REPO, 'src/main.rs')
+  eq(
+    store.getSnapshot().map((e) => e.path),
+    ['README.md'],
+    'clearing one leaves the other',
+  )
+  store.clearAllPartials()
+  ok(store.getSnapshot().length === 0, '“Use whole files” drops every one of them')
+
+  /*
+   * The snapshot must be reference-stable between changes: `useSyncExternalStore` compares
+   * with `Object.is` on every render, so a fresh array per call is an infinite render loop and
+   * not a small waste. Cheap to state, and impossible to notice by reading.
+   */
+  store.setPartial(entry())
+  ok(store.getSnapshot() === store.getSnapshot(), 'the snapshot is stable between changes')
+  ok(store.getServerSnapshot() === store.getSnapshot(), 'and SSR sees the same identity')
+  store.clearAllPartials()
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
