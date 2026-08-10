@@ -17,6 +17,7 @@
     "check:problems": "node scripts/check-problems.mjs",
     "check:render": "node scripts/check-git-render.mjs",
     "check:search": "node scripts/check-search.mjs",
+    "check:theme": "node scripts/check-theme.mjs",
     "check:tree-status": "node scripts/check-tree-status.mjs",
     "dev": "vite",
     "preview": "vite preview",

@@ -11,7 +11,9 @@
  * is driven by a plain field in the workspace store, and xterm terminals hold a *resolved*
  * colour table rather than CSS variables, so they need repainting explicitly. Both are done
  * eagerly here, before the round trip, because a theme that flips a frame late reads as a
- * broken switch.
+ * broken switch. [`installThemeSync`] is the single place that does the repainting, for the
+ * window that made the change and for the windows that only hear about it in a snapshot; it
+ * must be installed once per window, from `App`.
  *
  * That exception is also why [`applyTheme`] and [`installThemeSync`] are exported as plain
  * functions rather than living inside `useSettingsActions`. The theme is changed from two
@@ -28,6 +30,9 @@ import {
   type WindowMode,
 } from '@/ipc/client'
 import { useWorkspace, type Theme } from '@/store/workspace'
+import { liveHosts } from '@/layout/paneHosts'
+import { retheme } from '@/terminal/xterm'
+import { otherTheme, themeToAdopt } from './theme'
 
 /** The settings this window currently mirrors, or `null` before bootstrap resolves. */
 export function useSettings(): Settings | null {
@@ -74,8 +79,10 @@ export function useSettingsActions(): SettingsActions {
  * this is it.
  *
  * Local first, then the round trip: the DOM attribute and the terminals' resolved colour
- * tables are repainted by `App`'s effect on the store's `theme` field, and a theme that
- * flips a frame late reads as a broken switch.
+ * tables are repainted by [`installThemeSync`]'s subscription, synchronously inside this
+ * `set`, and a theme that flips a frame late reads as a broken switch. The round trip is
+ * what carries it to the *other* windows, where the same subscription picks it out of the
+ * snapshot.
  */
 export function applyTheme(theme: Theme): void {
   useWorkspace.getState().setTheme(theme)
@@ -84,18 +91,58 @@ export function applyTheme(theme: Theme): void {
 
 /** Flip to the other theme and persist it. What the header's button is for. */
 export function toggleTheme(): void {
-  applyTheme(useWorkspace.getState().theme === 'dark' ? 'light' : 'dark')
+  applyTheme(otherTheme(useWorkspace.getState().theme))
 }
 
 /**
- * Follow the theme in the workspace mirror, so a change made in *another* window lands here.
+ * Paint the theme onto everything in this window that does not follow a CSS variable.
  *
- * The second half of the same bug. `hydrate` seeds `theme` from the bootstrap and nothing
- * updates it afterwards: `applySnapshot` replaces `boot` — settings included — but the field
- * that drives `document.documentElement.dataset.theme` is separate from it and stayed put. A
- * window that did not make the change kept its old theme until it was restarted.
+ * Two surfaces, and only two, once the tokens are in place:
  *
- * A store subscription rather than an effect in each component: the store is the thing that
+ * - `<html data-theme>`, which is what selects the palette for all the CSS. Writing it also
+ *   ticks the `MutationObserver` in `editor/minimap.ts`, which repaints the canvas — a
+ *   canvas cannot read a custom property, so that is the minimap's whole theme story.
+ *   `editor/highlight.ts` needs nothing: it emits classes and `EditorSurface.module.css`
+ *   resolves them through `var(--purple)` and friends at paint time, so the buffer follows
+ *   for free. That was checked before writing this, not assumed — a `HighlightStyle` built
+ *   with literal colours would have been baked in at construction and would need the
+ *   extension reconfigured instead.
+ * - Live xterm terminals, which hold a *resolved* colour table. See [`retheme`].
+ *
+ * Guarded on the attribute rather than on a remembered value, so it is idempotent and
+ * costs one string compare on the store changes that are not theme changes — which is
+ * almost all of them, since the subscription below sees every snapshot.
+ */
+function paintTheme(theme: Theme): void {
+  const root = document.documentElement
+  if (root.dataset.theme === theme) return
+  root.dataset.theme = theme
+  // After the attribute, never before: `retheme` reads the tokens back off `<html>` with
+  // `getComputedStyle`, which resolves against the palette that is selected *now*.
+  retheme([...liveHosts()].flatMap((h) => (h.terminal ? [h.terminal] : [])))
+}
+
+/**
+ * Follow the theme in the workspace mirror, and repaint this window whenever it moves.
+ *
+ * The other half of the same bug, and the one the user is reporting: "switching theme isn't
+ * working correctly - it doesn't switch all claude/terminal windows". `hydrate` seeds
+ * `theme` from the bootstrap and nothing updated it afterwards — `applySnapshot` replaces
+ * `boot`, settings included, but the field that drives `data-theme` is separate from it and
+ * stayed put. A window that did not make the change kept its old theme until it was
+ * restarted, and every terminal in it with it. This function existed for that and **nothing
+ * called it**, so none of it ran.
+ *
+ * It also owns the painting, rather than leaving that to an effect in `App`. Two reasons.
+ * The store is where a theme change actually happens, from either of the two routes into
+ * `applyTheme` and now from a snapshot as well, so a subscription sees all three and runs
+ * synchronously inside the `set` — no frame of the old palette on the way through. And it
+ * puts the DOM write and the terminal repaint in the same file as the mirror-following
+ * rule, which is what stops the next window-level surface being repainted in one path and
+ * not the other. `App`'s own theme effect becomes redundant, and harmless if kept:
+ * [`paintTheme`] is idempotent and `retheme` skips terminals already wearing the colours.
+ *
+ * A store subscription rather than an effect per component: the store is the thing that
  * changes, there is one of it per window, and this way exactly one place is listening.
  *
  * Returns an unsubscribe function. Idempotent — calling it twice installs one subscription —
@@ -104,12 +151,20 @@ export function toggleTheme(): void {
 export function installThemeSync(): () => void {
   if (themeSyncInstalled !== null) return themeSyncInstalled
 
+  // Before the subscription, because the first paint of the window is not a store change.
+  // `index.html` carries no `data-theme`, so until this runs the document is on whatever
+  // bare `:root` says, and any terminal built in the meantime has read those tokens.
+  paintTheme(useWorkspace.getState().theme)
+
   const unsubscribe = useWorkspace.subscribe((state) => {
-    const stored = state.boot?.workspace.settings.theme
-    // `stored === state.theme` is the steady state and covers the window that made the
-    // change: `applyTheme` moved the local field before the snapshot arrived carrying the
-    // same value, so there is nothing to do and no second render to cause.
-    if (stored !== undefined && stored !== state.theme) state.setTheme(stored)
+    const adopt = themeToAdopt(state.theme, state.boot?.workspace.settings.theme)
+    if (adopt !== null) {
+      // Re-enters this listener synchronously with the field moved, and `themeToAdopt`
+      // answers `null` there, so the paint happens on the way through and once.
+      state.setTheme(adopt)
+      return
+    }
+    paintTheme(state.theme)
   })
 
   themeSyncInstalled = () => {
