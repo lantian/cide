@@ -1309,8 +1309,57 @@ try {
       return { seen, receive }
     }
 
+    /*
+     * A mount is only committed once the stack it was made on has emptied.
+     *
+     * `registerReveal` holds a claimed request until the next microtask, because React
+     * `StrictMode` — which `main.tsx` keeps on deliberately — mounts every effect twice in
+     * development: setup, cleanup, setup, synchronously inside one commit. Everything in this
+     * file runs on one stack, so without this the whole section would look like one enormous
+     * StrictMode remount and no disposer here would be a real tab close.
+     */
+    const settle = () => new Promise((resolve) => queueMicrotask(resolve))
+
     eq(reveal.pendingReveals(), [], 'the queue starts empty')
     eq(reveal.revealReceivers(), [], 'and so does the registry')
+
+    // 0. StrictMode's throwaway mount. This is not a hypothetical: the first version of this
+    //    module spent the request on the discarded view, and the caret did not move in `pnpm
+    //    dev` for the exact case the user reported — a hit in a file that was not open.
+    {
+      reveal.requestReveal('/w/strict.rs', at(7, 3, 8))
+      const thrownAway = editor()
+      const live = editor()
+      const stopThrownAway = reveal.registerReveal('/w/strict.rs', thrownAway.receive) // setup
+      stopThrownAway() //                                                                cleanup
+      const stopLive = reveal.registerReveal('/w/strict.rs', live.receive) //             setup
+      eq(live.seen, ['7:3-8'], 'a mount discarded by StrictMode does not swallow the request')
+      await settle()
+      eq(reveal.pendingReveals(), [], 'and the surviving mount spends it for good')
+      stopLive()
+      eq(reveal.pendingReveals(), [], 'closing that editor afterwards does not resurrect it')
+      eq(reveal.revealReceivers(), [], 'and the registry is clear')
+    }
+
+    // 0b. The same remount, but the deadline. A re-parked request keeps the timestamp of the
+    //     click; refreshing it would let a request whose file never opens live one TTL longer
+    //     for every discarded mount, which is the drift `REVEAL_TTL_MS` exists to forbid. The
+    //     real delay is what makes an unrefreshed stamp distinguishable from a refreshed one.
+    {
+      reveal.requestReveal('/w/stamp.rs', at(5, 1, 2))
+      const clickedAt = Date.now()
+      await new Promise((resolve) => setTimeout(resolve, 6))
+      const thrownAway = editor()
+      const stopThrownAway = reveal.registerReveal('/w/stamp.rs', thrownAway.receive)
+      stopThrownAway() // Before any microtask, so this is the StrictMode cleanup.
+      eq(reveal.pendingReveals(), ['/w/stamp.rs'], 'the discarded mount puts the request back')
+      eq(
+        reveal.pendingReveals(clickedAt + reveal.REVEAL_TTL_MS + 1),
+        [],
+        'and its deadline still runs from the click, not from the remount',
+      )
+      reveal.claimReveal('/w/stamp.rs')
+    }
 
     // 1. A hit in a file that is not open: requested first, mounted second.
     {
@@ -1320,6 +1369,7 @@ try {
       const stop = reveal.registerReveal('/w/a.rs', pane.receive)
       eq(pane.seen, ['12:5-9'], 'and the editor that mounts for that path is handed it')
       eq(reveal.pendingReveals(), [], 'the request is spent')
+      await settle()
 
       // Spent, not broadcast: a second pane opened on the same file later is not scrolled to
       // a search the user has moved on from.
@@ -1329,6 +1379,10 @@ try {
       stopLater()
       stop()
       eq(reveal.revealReceivers(), [], 'and both unregistered themselves')
+      // The hold is one turn, not a timer: a tab closed long after the reveal was shown must
+      // not put it back, or reopening the file by hand would replay a search the user has
+      // finished with — which is the whole point of `REVEAL_TTL_MS`.
+      eq(reveal.pendingReveals(), [], 'and a real close does not re-park what was already shown')
     }
 
     // 2. A file that is already open. No mount will follow, so parking would drop it.
@@ -1349,6 +1403,7 @@ try {
       const pane = editor()
       const stop = reveal.registerReveal('/w/c.rs', pane.receive)
       eq(pane.seen, ['40:7-11'], 'and it supersedes the first rather than queueing behind it')
+      await settle()
       stop()
     }
     {
@@ -1371,8 +1426,10 @@ try {
       const stopE = reveal.registerReveal('/w/e.rs', e.receive)
       const stopF = reveal.registerReveal('/w/f.rs', f.receive)
       eq([e.seen, f.seen], [['2:1-2'], ['3:1-2']], 'and each mount takes its own')
+      await settle()
       stopE()
       stopF()
+      eq(reveal.pendingReveals(), [], 'and neither leaves anything behind when it closes')
     }
 
     // 4. A split: one file, two panes, one gesture. Neither pane is more right than the other

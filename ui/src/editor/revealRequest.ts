@@ -109,16 +109,30 @@ export function requestReveal(path: string, target: RevealTarget): void {
     for (const receive of [...live]) receive(target)
     return
   }
+  park(path, { target, at: Date.now() })
+}
+
+/** Park one request, newest last, and hold the queue at `PENDING_LIMIT`. */
+function park(path: string, entry: Parked): void {
   // Deleted and re-set rather than overwritten. `Map` iterates in insertion order and the
   // eviction below takes the oldest, so an in-place update would leave a freshly requested
   // path first in line to be thrown away.
   parked.delete(path)
-  parked.set(path, { target, at: Date.now() })
+  parked.set(path, entry)
   while (parked.size > PENDING_LIMIT) {
     const oldest = parked.keys().next().value
     if (oldest === undefined) break
     parked.delete(oldest)
   }
+}
+
+/** The whole parked record, timestamp included, so a re-park cannot refresh the deadline. */
+function takeParked(path: string, now: number): Parked | null {
+  const queued = parked.get(path)
+  if (queued === undefined) return null
+  parked.delete(path)
+  if (now - queued.at > REVEAL_TTL_MS) return null
+  return queued
 }
 
 /**
@@ -129,11 +143,7 @@ export function requestReveal(path: string, target: RevealTarget): void {
  * checked without a fake clock.
  */
 export function claimReveal(path: string, now: number = Date.now()): RevealTarget | null {
-  const queued = parked.get(path)
-  if (queued === undefined) return null
-  parked.delete(path)
-  if (now - queued.at > REVEAL_TTL_MS) return null
-  return queued.target
+  return takeParked(path, now)?.target ?? null
 }
 
 /**
@@ -145,6 +155,27 @@ export function claimReveal(path: string, now: number = Date.now()): RevealTarge
  *
  * Any parked request for the path is spent immediately — this is the mount the caller was
  * waiting for.
+ *
+ * # Why the handoff is provisional for one turn
+ *
+ * `main.tsx` keeps `StrictMode` on deliberately, and in development it mounts every effect
+ * *twice*: setup, cleanup, setup, all synchronously inside one React commit. So the first
+ * `EditorSurface` to register for a path is a throwaway whose view is destroyed a few
+ * statements later, and handing it the parked request and calling the request spent left the
+ * live second view with nothing. The caret did not move — in the only build a human runs
+ * before shipping, for exactly the case the user reported (a hit in a file that is not open).
+ * That was measured against this module, not guessed.
+ *
+ * So a claimed request is held rather than dropped, and put back — with its original
+ * timestamp, so `REVEAL_TTL_MS` still runs from the click and not from the remount — if this
+ * receiver goes away leaving no editor on that path. A microtask releases the hold: React's
+ * setup/cleanup/setup runs to completion before the stack empties, so anything still held
+ * when the microtask fires was handed to a view that outlived the commit.
+ *
+ * Re-parking *unconditionally* on the last disposer was the alternative, and it loses on the
+ * module's own rule: it would replay the reveal when the user closes the tab and reopens the
+ * same file by hand within the TTL, which is the surprise `REVEAL_TTL_MS` exists to prevent.
+ * Both alternatives fix development; only this one leaves production behaviour alone.
  */
 export function registerReveal(path: string, receive: RevealReceiver): () => void {
   const existing = receivers.get(path)
@@ -152,14 +183,28 @@ export function registerReveal(path: string, receive: RevealReceiver): () => voi
   if (existing === undefined) receivers.set(path, live)
   live.add(receive)
 
-  const queued = claimReveal(path)
-  if (queued !== null) receive(queued)
+  let provisional = takeParked(path, Date.now())
+  if (provisional !== null) {
+    const target = provisional.target
+    // Released on the next microtask, never on a timer: a timer would keep the request
+    // recoverable across real user gestures, which is the unconditional re-park above.
+    queueMicrotask(() => {
+      provisional = null
+    })
+    receive(target)
+  }
 
   return () => {
     live.delete(receive)
     // Guarded, so a disposer called twice — or after the path was re-registered into a fresh
     // set — cannot delete somebody else's registry entry.
     if (live.size === 0 && receivers.get(path) === live) receivers.delete(path)
+    // Nothing is watching this path any more, and the view that was handed the request never
+    // outlived the commit that made it. The request was never shown to anyone; put it back.
+    if (provisional !== null && !receivers.has(path)) {
+      park(path, provisional)
+      provisional = null
+    }
   }
 }
 
