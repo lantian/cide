@@ -560,6 +560,127 @@ fn committing_an_empty_changelist_leaves_the_index_alone() {
     );
 }
 
+/// A changelist is a **sidecar**, not git state: `changelists.json` names paths, and nothing
+/// stops a bash pane inside cide from committing one of them. This pins the answer to what
+/// happens to the entry left behind — it converges on the next status walk rather than
+/// accumulating, which is the whole reason `Sidecar::reconcile` runs from `repo_changes` and
+/// not from the mutations.
+///
+/// The second walk is half the test. `reconcile` returns whether it dropped anything so the
+/// caller can skip the write, and a version that always reported "changed" would rewrite the
+/// file on every status refresh — several a second while an agent edits.
+#[test]
+fn a_changelist_entry_whose_file_was_committed_elsewhere_converges() {
+    let repo = TempRepo::new("changelist-ghosts");
+    repo.write("a.txt", b"one\n");
+    repo.write("b.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a.txt", b"changed a\n");
+    repo.write("b.txt", b"changed b\n");
+
+    let fixes = changelist::update(&repo.root, |data| data.create("Fixes", "")).unwrap();
+    changelist::update(&repo.root, |data| {
+        data.move_paths(&fixes, &["a.txt".to_string(), "b.txt".to_string()])
+    })
+    .unwrap();
+
+    // A bash pane commits one of the two. Nothing tells the sidecar.
+    repo.git(&["add", "b.txt"]);
+    repo.git(&["commit", "-q", "-m", "committed outside cide"]);
+
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    let only_a = BTreeSet::from(["a.txt".to_string()]);
+    for pass in 1..=2 {
+        status::repo_changes(&info, status::StatusRequest::default()).expect("status");
+        assert_eq!(
+            changelist::load(&repo.root).get(&fixes).unwrap().paths,
+            only_a,
+            "pass {pass}: the committed path is still filed under Fixes"
+        );
+    }
+}
+
+/// Filing an *untracked* path into a changelist does not stick, and the panel's menu is built
+/// on that: `repo_changes` computes its `live` set from paths that are neither `Untracked` nor
+/// `Ignored`, so an assignment for one is dropped by the very next status walk.
+///
+/// Pinned as a test rather than left as a comment because the git panel disables *Move to
+/// Changelist…* on unversioned and ignored rows on the strength of it — the alternative was a
+/// menu item that appeared to work and silently undid itself a moment later.
+#[test]
+fn filing_an_untracked_path_into_a_changelist_does_not_stick() {
+    let repo = TempRepo::new("changelist-untracked");
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("new.txt", b"fresh\n");
+
+    let fixes = changelist::update(&repo.root, |data| data.create("Fixes", "")).unwrap();
+    changelist::update(&repo.root, |data| {
+        data.move_paths(&fixes, &["new.txt".to_string()])
+    })
+    .unwrap();
+
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    let changes = status::repo_changes(&info, status::StatusRequest::default()).expect("status");
+    assert_eq!(
+        changes.unversioned.len(),
+        1,
+        "it is still an unversioned row"
+    );
+    assert!(
+        changelist::load(&repo.root)
+            .get(&fixes)
+            .unwrap()
+            .paths
+            .is_empty()
+    );
+}
+
+/// The composition the git panel's *Revert Changelist* performs: `git_rollback` over exactly
+/// the paths in one list. The point is the second assertion — the other changelist is not
+/// touched, which is the same guarantee `committing_one_changelist_leaves_the_other_untouched`
+/// makes for commit and the reason changelists exist here at all.
+#[test]
+fn reverting_one_changelist_leaves_the_other_alone() {
+    let repo = TempRepo::new("revert-changelist");
+    repo.write("a.txt", b"one\n");
+    repo.write("b.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a.txt", b"changed a\n");
+    repo.write("b.txt", b"changed b\n");
+
+    let fixes = changelist::update(&repo.root, |data| data.create("Fixes", "")).unwrap();
+    changelist::update(&repo.root, |data| {
+        data.move_paths(&fixes, &["b.txt".to_string()])
+    })
+    .unwrap();
+
+    stage::rollback(&repo.root, &[selection("b.txt", Selection::Whole)]).expect("rollback");
+
+    assert_eq!(repo.read("b.txt"), b"one\n", "Fixes went back to HEAD");
+    assert_eq!(
+        repo.read("a.txt"),
+        b"changed a\n",
+        "the default changelist was not in the gesture and must not have moved"
+    );
+}
+
+/// Why the group menu says **Delete** rather than **Revert** over the unversioned list.
+///
+/// HEAD has no pre-image for an untracked file, so `stage::rollback`'s "restore" is a delete.
+/// The panel's confirmation is worded from this fact; a dialog promising to "revert" a file
+/// that is about to be erased would be the most expensive kind of wrong.
+#[test]
+fn reverting_an_untracked_file_deletes_it() {
+    let repo = TempRepo::new("revert-untracked");
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("new.txt", b"never committed\n");
+
+    stage::rollback(&repo.root, &[selection("new.txt", Selection::Whole)]).expect("rollback");
+    assert!(!repo.root.join("new.txt").exists());
+}
+
 #[test]
 fn unstaging_selected_lines_puts_back_exactly_those() {
     let repo = TempRepo::new("unstage");

@@ -19,7 +19,10 @@
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
-  width: 100%;
+  /* `flex: 1; min-width: 0` rather than `width: 100%`: the row is a flex line now, and a
+     100%-wide child would push the three action buttons out of the panel. */
+  flex: 1;
+  min-width: 0;
   padding: 5px 10px;
   border: 0;
   background: transparent;
@@ -37,6 +40,74 @@
 .entry:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
+}
+
+/*
+ * The row is the entry plus its three verbs.
+ *
+ * The verbs are words rather than glyphs: `⤒` for unshelve and `⤒` with something for
+ * unshelve-and-keep would be two icons nobody can tell apart, and this list is read rarely
+ * enough that a legible label beats a compact one.
+ */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 8px;
+}
+
+.row:hover {
+  background: var(--chrome-hi);
+}
+
+.row:hover .entry,
+.row:focus-within .entry {
+  background: transparent;
+}
+
+/*
+ * Revealed on hover or keyboard focus, so a shelf of twenty entries is a list of names rather
+ * than sixty buttons. `visibility` rather than `display: none`: the buttons keep their space,
+ * so a row does not reflow under the pointer, and they stay reachable by Tab because
+ * `:focus-within` brings them back before focus can land on something invisible.
+ */
+.actions {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  visibility: hidden;
+}
+
+.row:hover .actions,
+.row:focus-within .actions {
+  visibility: visible;
+}
+
+.action {
+  padding: 3px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: default;
+}
+
+.action:hover {
+  border-color: var(--border);
+  color: var(--text-hi);
+}
+
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+}
+
+/* `--red` on the one that cannot be undone, the same as every other destructive control. */
+.danger:hover {
+  border-color: var(--red);
+  color: var(--red);
 }
 
 .name {

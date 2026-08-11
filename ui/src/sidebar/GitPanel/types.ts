@@ -131,6 +131,67 @@ export interface ShelfRow {
  */
 export type DiffOpenMode = 'open' | 'retarget'
 
+/**
+ * One changelist as the chooser offers it.
+ *
+ * Deliberately not `ChangelistView`: that carries every `ChangeEntry` in the list, and the
+ * chooser needs a name, an id and a count. Passing the wire type would put a few hundred
+ * entries into dialog state that is re-rendered on every keystroke in the name field.
+ *
+ * `id` is the **raw** changelist id Rust knows (`default`, `fixes`), not the `cl:`-prefixed
+ * group id `normalizeStatus` mints — see `changelistIdOf`. Sending a group id to
+ * `git_changelist_move_paths` is a `NoSuchChangelist` on every row of the dialog.
+ */
+export interface ChangelistTarget {
+  id: string
+  name: string
+  active: boolean
+  count: number
+}
+
+/** Which of the three things the one chooser dialog is doing. */
+export type ChangelistDialogMode = 'create' | 'rename' | 'move'
+
+/**
+ * The chooser, as `useGitPanel` holds it.
+ *
+ * One state and one component for create, rename and move, because the move dialog has to be
+ * able to create a list inline — *"that inline-create is the part people actually use; a
+ * dialog that only picks is half the feature"* — and once it can, a separate create dialog
+ * would be the same field and the same duplicate-name rule written twice.
+ */
+export interface ChangelistDialogState {
+  mode: ChangelistDialogMode
+  /** Every changelist command is per repository; a list cannot span two. */
+  repo: RepoId
+  /** Shown for the workspace where more than one repository is open. */
+  repoName: string
+  /** What `move` picks from, and what a new name is checked against. */
+  lists: readonly ChangelistTarget[]
+  /** `rename`: the list being renamed. `move`: the list the paths are in now, if they share one. */
+  id: string | null
+  /** `rename`: the current name, so the field opens with it rather than empty. */
+  name: string
+  /** `move`: the repo-relative paths that will be moved. Named in the dialog, not counted. */
+  paths: readonly string[]
+}
+
+/**
+ * A confirmation for something that cannot be undone.
+ *
+ * `files` is every path at stake and the dialog names all of them. A count is not enough:
+ * the user is about to lose *specific* files, and "12 files" is not something anyone can
+ * check before clicking. Same rule `CloseConfirm` follows, for the same reason.
+ */
+export interface ConfirmState {
+  title: string
+  body: string
+  files: readonly string[]
+  /** The word on the destructive button, e.g. `Revert 4 files`. */
+  confirmLabel: string
+  run: () => void
+}
+
 /*
  * Nothing in this module has a runtime value, deliberately.
  *

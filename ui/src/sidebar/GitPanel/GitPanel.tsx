@@ -32,8 +32,10 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { ProjectId, RepoId } from '@/ipc/client'
 import type { IconTheme } from '@/icons/iconFor'
+import { ChangelistDialog } from './ChangelistDialog'
 import { ChangesTree } from './ChangesTree'
 import { CommitBox } from './CommitBox'
+import { ConfirmDestructive } from './ConfirmDestructive'
 import { GuardBar } from './GuardBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
@@ -131,6 +133,14 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
         onStagingArea={git.setStagingArea}
         onCollapseAll={() => git.setAllExpanded(false)}
         onExpandAll={() => git.setAllExpanded(true)}
+        {...(repos.length === 1
+          ? { onNewChangelist: () => git.newChangelist() }
+          : // With several repositories the toolbar cannot know which one a new changelist
+            // belongs to, and a changelist lives in exactly one repo's sidecar. The button
+            // disables itself and says where the gesture does know — a repository row's menu
+            // — rather than guessing the first root.
+            {})}
+        repoCount={repos.length}
       />
 
       {git.story && (
@@ -183,6 +193,8 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
             showRepo={repos.length > 1}
             labelFor={labelFor}
             onUnshelve={git.unshelve}
+            onUnshelveKeep={git.unshelveKeep}
+            onDrop={git.dropShelf}
           />
         )}
       </div>
@@ -209,6 +221,28 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
           onAmend={git.setAmend}
           onCommit={() => git.commit(false)}
           onCommitAndPush={() => git.commit(true)}
+        />
+      )}
+
+      {/*
+        * Both overlays are mounted by the panel rather than by `App.tsx`, and they portal
+        * nothing: `OverlayCard` renders its own scrim in place. That is what makes every
+        * gesture in this feature reachable with no line in a file this session does not own —
+        * see the note at the foot of `GitPanelHost`.
+        */}
+      {git.dialog !== null && (
+        <ChangelistDialog
+          state={git.dialog}
+          onCancel={git.dismissDialog}
+          onPick={git.pickChangelist}
+          onSubmitName={git.submitChangelistName}
+        />
+      )}
+      {git.confirm !== null && (
+        <ConfirmDestructive
+          state={git.confirm}
+          onCancel={git.dismissConfirm}
+          onConfirm={git.runConfirm}
         />
       )}
     </aside>

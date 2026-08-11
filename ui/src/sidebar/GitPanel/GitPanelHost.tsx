@@ -38,7 +38,7 @@ import { useContextMenu, type MenuEntry } from '@/menus'
 import { copyText } from '../copyText'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
-import type { Row } from './model'
+import { DEFAULT_CHANGELIST, actOn, changelistIdOf, type Row } from './model'
 
 export interface GitPanelProps {
   /** The active project, or `null` before one is open — then the panel is simply empty. */
@@ -76,12 +76,12 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
       if (row === null) return []
 
       const entry = row.entry
-      if (entry === undefined) {
-        // A repository or changelist row. It has no file verbs at all, and the one thing it
-        // does have — fold — is already what a click on it does. `[]` declines to open.
-        return []
-      }
+      if (entry === undefined) return groupMenu(row, git)
+
       const path = entry.path
+      // Which files this gesture is about — the row alone, or the ticks in the same repo when
+      // the row is one of them. The count goes in the label; see `model.ts::actOn`.
+      const scope = actOn(git.view, git.selected, row)
       const staged = entry.index !== 'unmodified'
       const unstaged = entry.worktree !== 'unmodified'
       const conflicted = entry.index === 'conflicted' || entry.worktree === 'conflicted'
@@ -122,6 +122,34 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
             : { disabledReason: 'This file has no changes to roll back' }),
         },
         { kind: 'separator' },
+        {
+          id: 'move',
+          /*
+           * The count is the safeguard. `actOn` widens to the ticked files when the clicked
+           * row is one of them — IDEA's behaviour, and the only multi-row gesture this panel
+           * has — and *Move 4 Files to Changelist…* is a different sentence from *Move to
+           * Changelist…*. The dialog then names every path before anything happens, so there
+           * is no step at which the set being moved is invisible.
+           */
+          label:
+            scope.paths.length > 1
+              ? `Move ${scope.paths.length} Files to Changelist…`
+              : 'Move to Changelist…',
+          ...(row.groupKind === 'changelist'
+            ? { run: () => git.moveToChangelist(scope.repo, scope.paths) }
+            : {
+                // Filing an untracked, ignored or conflicted path is a write nothing can see:
+                // `cide_git::status` builds its `live` set from paths that are neither
+                // `Untracked` nor `Ignored`, so `reconcile` drops the assignment on the next
+                // status walk, and a conflicted path is drawn in the conflicts list whatever
+                // it is filed under.
+                disabledReason:
+                  row.groupKind === 'conflicts'
+                    ? 'Resolve the conflict first — conflicts are listed apart from changelists'
+                    : 'Only tracked changes belong to a changelist',
+              }),
+        },
+        { kind: 'separator' },
         { id: 'diff', label: 'Show Diff', run: () => git.openDiff(row) },
         { id: 'copyPath', label: 'Copy Path', run: () => void copyText(path) },
       ]
@@ -137,4 +165,106 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
       treeMenu={{ onContextMenu, menu }}
     />
   )
+}
+
+/**
+ * The menu for a repository row or a group row — the one the user asked for.
+ *
+ * > *"git changes tree - need also an context menu for group, i should be able to revert the
+ * > group."*
+ *
+ * These rows used to return `[]`, which declined to open at all: every changelist operation the
+ * backend has had since M8 (`git_changelist_create` / `_rename` / `_delete` / `_move_paths` /
+ * `_set_active`, `git_shelve`) was wired end to end and reachable from nothing.
+ *
+ * Every branch here ends in at least one *enabled* item, `New Changelist…`, so no right-click
+ * on a group opens a box of grey lines. That matters most on the ignored and conflicts groups,
+ * where nothing else applies — an inert menu reads as a broken surface.
+ *
+ * Taken as a parameter rather than closed over, and pure apart from the calls it schedules, so
+ * that the shape of the menu is visible in one screen instead of nested three deep inside
+ * `useContextMenu`.
+ */
+function groupMenu(
+  row: Row,
+  git: ReturnType<typeof useGitPanel>,
+): MenuEntry[] {
+  const repo = row.repo
+  const newList: MenuEntry = {
+    id: 'newChangelist',
+    label: 'New Changelist…',
+    run: () => git.newChangelist(repo),
+  }
+
+  // A repository row. Its groups are what the rest of this menu is about, and it has none of
+  // their verbs — but it is the only row that says *which* repository, which is exactly what a
+  // new changelist in a monorepo needs.
+  if (row.kind === 'repo') return [newList]
+
+  const id = changelistIdOf(row.group)
+  const count = row.files.length
+  const empty = count === 0
+
+  if (id === null) {
+    // Conflicts, unversioned, ignored: the three sibling lists. They are not changelists, so
+    // they cannot be renamed, deleted or made active, and only the unversioned one has an
+    // operation at all — one that deletes files rather than restoring them, which is why it is
+    // worded as a delete. See `useGitPanel::revertGroup`.
+    const deletable = row.groupKind === 'unversioned' && !empty
+    return [
+      newList,
+      { kind: 'separator' },
+      {
+        id: 'revertGroup',
+        label: `Delete ${count} Unversioned File${count === 1 ? '' : 's'}`,
+        danger: true,
+        ...(deletable
+          ? { run: () => git.revertGroup(repo, row.group ?? '') }
+          : {
+              disabledReason:
+                row.groupKind === 'unversioned'
+                  ? 'Nothing in this group'
+                  : 'This is not a changelist — nothing here to revert as a group',
+            }),
+      },
+    ]
+  }
+
+  return [
+    {
+      id: 'setActive',
+      label: 'Set Active Changelist',
+      ...(row.active === true
+        ? { disabledReason: 'New changes already land in this changelist' }
+        : { run: () => git.setActiveChangelist(repo, id) }),
+    },
+    newList,
+    { id: 'rename', label: 'Rename Changelist…', run: () => git.renameChangelist(repo, id) },
+    {
+      id: 'delete',
+      label: 'Delete Changelist',
+      // Not `danger`: `Sidecar::delete` moves the list's paths into the default one, so no
+      // work is lost and there is nothing to confirm. Painting it red would spend the colour
+      // that means "cannot be undone" on something that can.
+      ...(id === DEFAULT_CHANGELIST
+        ? { disabledReason: 'The default changelist cannot be deleted' }
+        : { run: () => git.deleteChangelist(repo, id) }),
+    },
+    { kind: 'separator' },
+    {
+      id: 'shelve',
+      label: 'Shelve Changelist',
+      ...(empty
+        ? { disabledReason: 'Nothing in this changelist to shelve' }
+        : { run: () => git.shelveGroup(repo, row.group ?? '') }),
+    },
+    {
+      id: 'revertGroup',
+      label: `Revert Changelist`,
+      danger: true,
+      ...(empty
+        ? { disabledReason: 'Nothing in this changelist to revert' }
+        : { run: () => git.revertGroup(repo, row.group ?? '') }),
+    },
+  ]
 }

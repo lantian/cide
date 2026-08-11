@@ -21,13 +21,27 @@ export interface ShelfListProps {
   showRepo: boolean
   labelFor: (repo: RepoId) => string
   onUnshelve: (row: ShelfRow) => void
+  /** IDEA's *Unshelve and keep*: apply the patch and leave it on the shelf. */
+  onUnshelveKeep: (row: ShelfRow) => void
+  /** Throw the patch away. The panel confirms first — it is the only copy. */
+  onDrop: (row: ShelfRow) => void
 }
 
-export function ShelfList({ entries, showRepo, labelFor, onUnshelve }: ShelfListProps) {
+export function ShelfList({
+  entries,
+  showRepo,
+  labelFor,
+  onUnshelve,
+  onUnshelveKeep,
+  onDrop,
+}: ShelfListProps) {
   if (entries.length === 0) {
     return (
       <div className={styles.list}>
-        <p className={styles.empty}>Nothing shelved. Use ⤓ in the toolbar to shelve changes.</p>
+        <p className={styles.empty}>
+          Nothing shelved. Use ⤓ in the toolbar to shelve the ticked files, or right-click a
+          changelist and shelve the whole group.
+        </p>
       </div>
     )
   }
@@ -36,7 +50,13 @@ export function ShelfList({ entries, showRepo, labelFor, onUnshelve }: ShelfList
       {entries.map((row) => {
         const files = row.entry.files.length
         return (
-          <li key={row.key}>
+          <li key={row.key} className={styles.row}>
+            {/*
+              * The row stays double-clickable, because that is what it did before and the
+              * muscle memory is worth keeping. It is no longer the *only* way in: a
+              * double-click on a list with no other affordance is an operation nobody
+              * discovers, and `unshelve and keep` and `delete` had no gesture at all.
+              */}
             <button type="button" className={styles.entry} onDoubleClick={() => onUnshelve(row)}>
               <span className={styles.name}>{row.entry.name}</span>
               <span className={styles.meta}>
@@ -45,6 +65,32 @@ export function ShelfList({ entries, showRepo, labelFor, onUnshelve }: ShelfList
                 {showRepo && ` · ${labelFor(row.repo)}`}
               </span>
             </button>
+            <div className={styles.actions}>
+              <button
+                type="button"
+                className={styles.action}
+                title="Unshelve — apply the patch and take it off the shelf"
+                onClick={() => onUnshelve(row)}
+              >
+                Unshelve
+              </button>
+              <button
+                type="button"
+                className={styles.action}
+                title="Apply the patch and leave it on the shelf"
+                onClick={() => onUnshelveKeep(row)}
+              >
+                Keep
+              </button>
+              <button
+                type="button"
+                className={`${styles.action} ${styles.danger}`}
+                title="Delete this patch without applying it"
+                onClick={() => onDrop(row)}
+              >
+                Delete
+              </button>
+            </div>
           </li>
         )
       })}
