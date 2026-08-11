@@ -6,12 +6,20 @@
  * whereas the pin is a property of the tab. Withholding the button is a courtesy to the
  * user, not the enforcement — the Rust side stays the authority that refuses the close.
  *
- * The component is deliberately store-free so a detached-tab window, which mirrors a
- * different workspace slice, can render the same strip from props.
+ * The component takes its whole *layout* from props, so a detached-tab window mirroring a
+ * different workspace slice can render the same strip. It is no longer store-free, and the
+ * note that used to claim so needs its exception stated: the awaiting marker below reads a
+ * module-level table keyed by session id. That is not a workspace slice — what a strip shows
+ * is still decided entirely by the tabs it is handed — and it cannot be a prop, for the
+ * reason `PaneTitleBar` gives at length: the state is a *history* of `cide://session-state`
+ * that no caller holds, and threading it through would need a line in `App.tsx`, which is how
+ * three features in this app have shipped wired to nothing.
  */
 import type { ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
+import { useAwaitingInTab } from '@/panes/awaiting'
+import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { tabMenuEntries } from './menuModel'
 import styles from './TabStrip.module.css'
 
@@ -117,6 +125,12 @@ function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
   const shell = active ? `${styles.tab} ${styles.tabActive}` : styles.tab
   const label = view.closable ? styles.label : `${styles.label} ${styles.labelPinned}`
 
+  // The whole reason this exists: a pane in a background tab is unmounted, so the marker in
+  // its title bar does not exist and the `Awaiting: 1` in the OS title names nobody.
+  const waiting = useAwaitingInTab(tab)
+  const badge = awaitingBadge(waiting)
+  const hint = awaitingHint(waiting, 'tab')
+
   return (
     // `presentation` so the row does not sit between the tablist and its tabs: an
     // intervening generic element breaks the ownership the tabs pattern requires.
@@ -128,17 +142,42 @@ function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
       // and reads it back off the DOM rather than one hook per tab.
       data-tab-id={tab.id}
       data-active={active ? 'true' : 'false'}
+      data-awaiting={waiting > 0 ? String(waiting) : 'false'}
     >
       <button
         type="button"
         className={label}
         role="tab"
         aria-selected={active}
-        title={view.hint}
+        // The marker cannot carry its own tooltip — it is `pointer-events: none` so the tab
+        // stays one box the pointer can hit anywhere — so the tab's own tooltip carries the
+        // sentence, and the exact count that `9+` stops spelling out.
+        title={hint ? `${view.hint} — ${hint}` : view.hint}
         onClick={() => onActivate?.(tab.id)}
       >
         {view.body}
       </button>
+      {/*
+       * Always rendered, filled only when it means something — the same contract, and for the
+       * same reason, as the marker in the pane title bar. A box that appeared and cleared
+       * would change this tab's width, shove every tab after it sideways and reflow the strip
+       * *under the pointer*; the strip is 30px with 12-13px paddings, so a tab that moves
+       * while being aimed at is a tab that gets missed. Reserving 13px permanently is the
+       * price, and it is the only version of this that cannot be got wrong later.
+       */}
+      <span
+        className={badge ? `${styles.awaiting} ${styles.awaitingOn}` : styles.awaiting}
+        // `role` is on the empty box too, unlike the pane bar's marker, and the difference is
+        // deliberate: a live region that comes into existence at the same moment as its
+        // content is not reliably announced, because there was nothing there to be watching.
+        // The region exists from mount; `aria-hidden` is what flips, which is the ordinary
+        // hide-then-reveal an announcement does follow.
+        role="status"
+        aria-label={hint}
+        aria-hidden={badge ? undefined : true}
+      >
+        {badge}
+      </span>
       {view.closable && (
         <button
           type="button"
