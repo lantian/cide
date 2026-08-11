@@ -47,9 +47,16 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { UNSEEN, onState, onAcknowledge, mergeAuthoritative, adopt } = await import(
-    `file://${join(out, 'awaitingRule.js')}`
-  )
+  const {
+    UNSEEN,
+    onState,
+    onAcknowledge,
+    mergeAuthoritative,
+    adopt,
+    awaitingIn,
+    awaitingBadge,
+    awaitingHint,
+  } = await import(`file://${join(out, 'awaitingRule.js')}`)
 
   /** Replay a sequence of transitions from nothing. */
   const replay = (...phases) => phases.reduce((track, phase) => onState(track, phase), UNSEEN)
@@ -165,6 +172,111 @@ try {
     adopt(new Map([['a', onState(UNSEEN, 'busy')]]), ['a']).get('a').ranATurn,
     true,
     'per-window history survives the catch-up too',
+  )
+
+  // --- the count a background tab shows -----------------------------------------------------
+  //
+  // A pane in a background tab is mounted but `visibility: hidden`, so its own marker is
+  // painted nowhere and is unreachable to pointer and to focus. Hiding a tab is never an
+  // unmount — that would destroy the terminals — which is exactly why this can be computed
+  // for a tab nobody is looking at.
+  // This is the arithmetic that puts the answer on the tab instead, and it is worth pinning
+  // for the same reason as the rest of the file: nothing else in the chain can catch it. A
+  // count that never reached zero would leave a permanent "come back here" on a tab where
+  // everything has been dealt with, and the user would learn to ignore the strip.
+  const waiting = () => replay('spawning', 'idle', 'busy', 'idle')
+  const busy = () => onState(UNSEEN, 'busy')
+
+  const table = new Map([
+    ['s1', waiting()],
+    ['s2', waiting()],
+    ['s3', busy()],
+  ])
+
+  eq(awaitingIn(table, ['s1']), 1, 'a tab holding one waiting pane counts it')
+  eq(awaitingIn(table, ['s1', 's2', 's3']), 2, 'a tab counts each of its waiting sessions')
+  eq(awaitingIn(table, ['s3']), 0, 'a tab whose panes are all busy shows nothing')
+  eq(awaitingIn(table, []), 0, 'a tab with no panes at all counts nothing')
+  eq(
+    awaitingIn(table, ['s1', 's1']),
+    1,
+    'a mirrored pane is two panes showing ONE conversation; counting it twice would be ' +
+      'counting windows onto a thing rather than the thing',
+  )
+  eq(
+    awaitingIn(table, [null, undefined, 's1']),
+    1,
+    'a diff pane, an editor pane and a splash have no session and cannot be waiting',
+  )
+  eq(
+    awaitingIn(table, ['from-a-previous-process']),
+    0,
+    '`pane.session` survives a restart, so a launched app is full of pane records naming ' +
+      'dead children — no news must never read as "come back to this one"',
+  )
+  eq(
+    awaitingIn(new Map([['s1', onState(waiting(), 'exited')]]), ['s1']),
+    0,
+    'a session that has exited waits for nobody, whatever its pane record still says',
+  )
+
+  // The transition that clears it, which is the half a "does it light up" check would miss.
+  // Acknowledging is per session — a click or a keystroke into ONE pane — so a tab holding
+  // two waiting panes must go 2 → 1 → 0 rather than clearing wholesale. Activating the tab
+  // is not one of these steps on purpose: a tab can hold four panes with one waiting, and
+  // clearing on activation destroys the only pointer to that one at the moment the user
+  // could finally act on it.
+  const dealtWithOne = new Map(table).set('s1', onAcknowledge(table.get('s1')))
+  eq(
+    awaitingIn(dealtWithOne, ['s1', 's2']),
+    1,
+    'looking at one of two waiting panes decrements the tab rather than clearing it — the ' +
+      'other one is still waiting and the tab is the only thing that can still say so',
+  )
+  const dealtWithBoth = dealtWithOne.set('s2', onAcknowledge(dealtWithOne.get('s2')))
+  eq(awaitingIn(dealtWithBoth, ['s1', 's2']), 0, 'the marker clears once the last one is seen')
+  eq(
+    awaitingIn(new Map(dealtWithBoth).set('s1', onState(dealtWithBoth.get('s1'), 'idle')), [
+      's1',
+      's2',
+    ]),
+    1,
+    'and the NEXT turn ending raises the tab again, or a tab announces itself exactly once',
+  )
+  eq(
+    awaitingIn(mergeAuthoritative(table, []), ['s1', 's2']),
+    0,
+    'another window acknowledging both clears this window s tab marker too, through the ' +
+      'same broadcast the pane markers follow — one source of truth, so they cannot drift',
+  )
+
+  // --- what the marker actually says ----------------------------------------------------------
+  eq(awaitingBadge(0), '', 'nothing waiting draws an empty box, never a zero')
+  eq(awaitingBadge(1), '1', 'a count, not a dot: how many decides whether the user goes now')
+  eq(awaitingBadge(9), '9', 'nine still fits the 13px box')
+  eq(
+    awaitingBadge(10),
+    '9+',
+    'capped, because the box is fixed width — a marker that widened its tab would shove ' +
+      'every tab after it sideways under the pointer, which is the one thing it may not do',
+  )
+  eq(awaitingHint(0, 'tab'), undefined, 'no sentence when there is nothing to say')
+  eq(
+    awaitingHint(1, 'tab'),
+    '1 session in this tab is waiting for you',
+    'singular, because "1 sessions" is exactly the kind of thing that ships',
+  )
+  eq(awaitingHint(3, 'tab'), '3 sessions in this tab are waiting for you', 'plural')
+  eq(
+    awaitingHint(11, 'tab'),
+    '11 sessions in this tab are waiting for you',
+    'the tooltip is uncapped — it is the only place a user learns that `9+` means eleven',
+  )
+  eq(
+    awaitingHint(2, 'project'),
+    '2 sessions in this project are waiting for you',
+    'the container is a parameter so the header s project tabs need no second copy of the ' +
+      'wording when they adopt this',
   )
 
   if (failed > 0) {

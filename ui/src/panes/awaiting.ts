@@ -39,13 +39,17 @@ import {
   events,
   onSessionAwaiting,
   type SessionState,
+  type Tab,
 } from '@/ipc/client'
+import { paneSessionId } from '@/layout/paneHosts'
 import {
   UNSEEN,
   adopt,
+  awaitingIn,
   mergeAuthoritative,
   onAcknowledge,
   onState,
+  type PaneSession,
   type SessionPhase,
   type Track,
 } from './awaitingRule'
@@ -184,6 +188,55 @@ export function useAwaiting(session: string | null | undefined): boolean {
     subscribe,
     () => (key === '' ? false : trackOf(key).awaiting),
     () => false,
+  )
+}
+
+/**
+ * Every session held by a tab's panes, as the pane markers themselves resolve them.
+ *
+ * `paneSessionId ?? pane.session`, in that order, is `PaneFrame`'s rule verbatim and is
+ * copied rather than approximated on purpose: if the tab's count and the pane's marker
+ * disagreed about which child a pane holds, the failure is a tab that says `1` over a tab
+ * full of panes with no marker — worse than no tab marker at all. The host registry answers
+ * for a child that started in this process and whose id the domain records one round trip
+ * later; `pane.session` answers before any host has claimed the pane, which is the first
+ * paint after boot and the whole of a window that has been handed tabs it has not rendered.
+ *
+ * Note which branch does the work for a *background* tab: the host registry, not the
+ * fallback. `TabContent` mounts every tab and hides the inactive ones with `visibility:
+ * hidden` — `paneHosts` rule 2 forbids anything else — so a background pane has a live host
+ * with a live session id. The fallback is about time, not about visibility.
+ */
+function sessionsInTab(tab: Tab): PaneSession[] {
+  return Object.values(tab.tree.panes).map((pane) => paneSessionId(pane.id) ?? pane.session)
+}
+
+/**
+ * How many of one tab's sessions are waiting on the user.
+ *
+ * Subscribing per tab rather than handing the strip one map: the snapshot is a number, so
+ * `Object.is` lets a tab re-render only when *its own* count moves — six tabs and one
+ * transition is one re-render, not six.
+ *
+ * There is deliberately **no separate acknowledgement for a tab**. Activating a tab is not
+ * "I have dealt with these": a tab can hold four panes with one of them waiting, and
+ * clearing on activation destroys the only pointer to that one at the moment the user could
+ * finally act on it. The count is derived from the same per-session acknowledgements the
+ * pane markers use — a click or a keystroke into a pane — so it falls to zero exactly when
+ * the last waiting pane has actually been seen, and it cannot drift from the pane markers
+ * because there is no second piece of state to drift.
+ *
+ * That holds because `visibility: hidden` also removes a panel from hit-testing and drops
+ * the focus inside it, so a background pane cannot be pointed at or focused and cannot
+ * acknowledge itself; and nothing in this app programmatically refocuses a pane when its tab
+ * is activated. If either ever changes, activating a tab starts silently decrementing this
+ * count for panes the user has not read, which is the failure the paragraph above is about.
+ */
+export function useAwaitingInTab(tab: Tab): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => awaitingIn(tracks, sessionsInTab(tab)),
+    () => 0,
   )
 }
 

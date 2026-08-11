@@ -28,6 +28,10 @@
  * computed style; the buttons reach back over the padding rather than owning it.
  */
 .tab {
+  /* The awaiting marker's reserved box. Named here rather than in `.awaiting` because
+     `.labelPinned` has to reach over it too, and two literals that must agree is one too
+     many. */
+  --awaiting-w: 13px;
   display: flex;
   align-items: center;
   gap: var(--tab-gap);
@@ -98,10 +102,86 @@
   white-space: nowrap;
 }
 
-/* The pinned console has no close button, so its label reaches over both sides. */
+/*
+ * The pinned console has no close button, so its label reaches over both sides — and past
+ * the awaiting marker too, which is a `span` and not a control. Without the `--awaiting-w`
+ * and `--tab-gap` terms the right-hand 22px of the console tab would light up on hover and
+ * do nothing, which is the same dead strip the left padding was before `.label` reached over
+ * it. The marker is `pointer-events: none`, so the click lands on the label underneath.
+ */
 .labelPinned {
-  margin-right: calc(-1 * var(--tab-pad));
-  padding-right: var(--tab-pad);
+  margin-right: calc(-1 * (var(--tab-pad) + var(--tab-gap) + var(--awaiting-w)));
+  padding-right: calc(var(--tab-pad) + var(--tab-gap) + var(--awaiting-w));
+}
+
+/*
+ * "Sessions behind this tab are waiting for you."
+ *
+ * The box is reserved on every tab, always, and that is the requirement rather than tidiness:
+ * a marker that took its space on appearing would widen its tab and slide every tab after it
+ * sideways. The strip is 30px tall with 12-13px paddings and it reflows *under the pointer* —
+ * a tab that moves as it is being aimed at is a tab that gets clicked wrong. The pane title
+ * bar reserves its 7px for the same reason and pays the same price.
+ *
+ * The price is not free and is worth stating, because nothing measures it: every tab is now
+ * `--tab-gap + 13px` = 21-22px wider, `.tabs` has `overflow: hidden` and the tabs do not
+ * shrink or scroll, so roughly two fewer tabs fit before the last one is cut off. The
+ * alternative that lost was `position: absolute` inside a `position: relative` tab, which
+ * meets the no-reflow requirement at zero width. It lost because there is nowhere free to
+ * put it: the tab is swatch/badge, title, close, and an absolute chip lands on top of one of
+ * them — over the close button it eats the click target, over the title it hides the text a
+ * clipped tab most needs. A reserved box is 22px of strip; an overlay is a control the user
+ * cannot hit.
+ *
+ * Fixed `width` with `flex: none`, and the mono family and `tabular-nums` regardless of which
+ * shape class the tab wears: a digit's advance otherwise depends on the tab kind, the user's
+ * font and the theme, and the one thing this box may not do is be a different size in a
+ * different tab. 13px holds `9+` at 9.5px mono with room to spare; `awaitingBadge` caps the
+ * count there so nothing can ever overflow it.
+ *
+ * `pointer-events: none` keeps the tab one box the pointer can hit anywhere — the tooltip
+ * lives on the tab's own button, which is also where the uncapped count is spelled out.
+ */
+.awaiting {
+  flex: none;
+  width: var(--awaiting-w);
+  height: 13px;
+  /* Clip rather than `min-width`. If a fallback font ever makes `9+` wider than the box, a
+     clipped `+` is a cosmetic loss; `min-width` would let the box grow, which moves the tab
+     and every tab after it — the one thing this marker may not do. */
+  overflow: hidden;
+  border-radius: 3px;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 13px;
+  text-align: center;
+  letter-spacing: 0;
+}
+
+/*
+ * Filled amber, with the *background* colour as the ink.
+ *
+ * `--yellow` rather than `--accent` for the reason the pane marker gives: the accent is this
+ * app's "here you are" — the active tab's own 2px rule is drawn in it, two pixels below this
+ * chip — and a marker meaning "come back to a tab you are *not* in" has to read as different
+ * from that at a glance.
+ *
+ * Inverting it is what makes one rule carry both themes. `--yellow` is pitched per theme as a
+ * *text* colour against the app's surfaces — a dark amber (#8a5a00) on the white default, a
+ * light amber (#dfae68) on dark — so amber-on-surface is legible by construction in both, and
+ * so is the reverse: white ink (`--panel`) on dark amber in the light theme is 5.93:1, and
+ * near-black `--panel` on light amber in the dark one is 9.02:1. Both clear AA for normal
+ * text, which is the bar 9.5px has to clear; there is no `--on-yellow` token, and `--panel`
+ * is the right stand-in precisely because `--yellow` was measured against it. A solid chip
+ * rather than a bare digit because a lone numeral 9px from a tab's title reads as part of the
+ * title.
+ */
+.awaitingOn {
+  background: var(--yellow);
+  color: var(--panel);
+  font-weight: 600;
 }
 
 .close {

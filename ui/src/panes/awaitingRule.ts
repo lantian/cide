@@ -166,3 +166,85 @@ export function adopt(
   }
   return next
 }
+
+// --- the aggregate a *tab* shows ----------------------------------------------------------
+//
+// A pane in a background tab is still mounted — hiding a tab is `visibility: hidden`, never an
+// unmount — but nothing it draws is painted, so its marker is invisible: the OS title says one
+// session wants you and nothing on screen says which. The tab strip is the one part of a
+// background tab that stays visible, and it can carry the answer because the table above is
+// keyed by session and lives outside React's tree — the same property that lets a detached
+// window paint a marker for a pane it has never mounted.
+
+/**
+ * A pane's session as its tab knows it. `null`/`undefined` for a pane with no child — a diff
+ * or an editor, or a Claude pane still showing its resume splash.
+ */
+export type PaneSession = string | null | undefined
+
+/**
+ * How many distinct sessions in one group of panes are waiting on the user.
+ *
+ * **Distinct** is not a detail. A mirrored pane is two panes showing one child, and the pane
+ * markers deliberately light up in both — that is one conversation waiting, and a tab that
+ * said `2` about it would be counting windows onto a thing rather than the thing.
+ *
+ * Sessions this window has never heard of contribute nothing rather than defaulting to
+ * waiting: `pane.session` survives a restart, so a freshly launched app is full of pane
+ * records naming children from a previous process. Absent from the table means "no news",
+ * and no news must never read as "come back to this one".
+ */
+export function awaitingIn(
+  tracks: ReadonlyMap<string, Track>,
+  sessions: readonly PaneSession[],
+): number {
+  const counted = new Set<string>()
+  for (const session of sessions) {
+    if (!session) continue
+    // `gone` tracks are never `awaiting`, so an exited session drops out here without a
+    // second condition — and the caller has usually deleted the entry already.
+    if (tracks.get(session)?.awaiting === true) counted.add(session)
+  }
+  return counted.size
+}
+
+/**
+ * The most this marker will spell out. Past it the number stops being a thing you act on and
+ * starts being a thing you read, and the box it has to fit in is 13px.
+ */
+const BADGE_CAP = 9
+
+/**
+ * The glyph for a tab's count, or `''` when nothing is waiting.
+ *
+ * A **count, not a dot**, and the reason is that a tab is an aggregate where a pane is not.
+ * A dot says "something behind here"; the user then activates the tab and hunts. A number
+ * says how many, which is what decides whether they go now — and it *decrements* as each pane
+ * is acknowledged, which is the only progress signal available while the panes are hidden and
+ * their own markers are painted nowhere. A dot would sit there unchanged until the last one
+ * and then vanish, which is indistinguishable from a stuck dot.
+ *
+ * Capped rather than allowed to grow, because the box is fixed width and a marker that
+ * widened the tab it sits on would reflow the strip under the pointer — see the CSS.
+ */
+export function awaitingBadge(count: number): string {
+  if (count <= 0) return ''
+  return count > BADGE_CAP ? `${BADGE_CAP}+` : String(count)
+}
+
+/**
+ * The sentence behind the marker, for the tooltip and the accessible name, or `undefined`
+ * when there is nothing to say.
+ *
+ * Here rather than in the component because it is the one part of the marker a check script
+ * can pin: the count is capped at `9+` on screen, so the tooltip is the only place a user
+ * with eleven waiting sessions learns there are eleven, and "1 sessions" is the kind of thing
+ * that ships. `where` names the container — the header's project tabs have exactly this
+ * problem one level up and would otherwise need a second copy of the wording.
+ */
+export function awaitingHint(count: number, where: string): string | undefined {
+  if (count <= 0) return undefined
+  return count === 1
+    ? `1 session in this ${where} is waiting for you`
+    : `${count} sessions in this ${where} are waiting for you`
+}
