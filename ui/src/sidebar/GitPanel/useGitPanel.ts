@@ -154,6 +154,17 @@ export interface GitPanelActions {
   commit: (push: boolean) => void
   /** Take the ticked paths out of the index. NOT a rollback — see `Toolbar`. */
   unstage: () => void
+  /**
+   * One file into the index, out of it, or back to HEAD — the context menu's three verbs.
+   *
+   * They act on the file they are given and on nothing else. The toolbar's `unstage` above
+   * acts on the *ticks*, which is a different set and usually a larger one; a menu item that
+   * quietly took the ticks with it would rewrite the index for files the user never pointed
+   * at. `rollbackFile` destroys uncommitted work — see `git.rollback`.
+   */
+  stageFile: (repo: RepoId, path: string) => void
+  unstageFile: (repo: RepoId, path: string) => void
+  rollbackFile: (repo: RepoId, path: string) => void
   shelve: () => void
   unshelve: (row: ShelfRow) => void
   /** Guard bar, left button: adopt git's index and drop our ticks for that repo. */
@@ -602,6 +613,52 @@ export function useGitPanel(
   }, [project, units, guarded, refresh])
 
   /**
+   * One file, staged / unstaged / rolled back — the context menu's three verbs.
+   *
+   * Deliberately **not** routed through `units`, which is the ticked selection. The menu acts
+   * on the row that was right-clicked, and that row is very often not ticked: a menu whose
+   * *Stage* silently staged four other files because they happened to have ticks would be the
+   * worst kind of surprise in a panel that writes to the index.
+   *
+   * One helper for all three because the three differ only in the command and the word on the
+   * busy line. `wholeFiles` is right for each of them: these are whole-file verbs, and a held
+   * partial selection belongs to the diff pane and to `commit`, which resolves it against
+   * `Combined` — see the note on `wholeFiles`.
+   */
+  const fileVerb = useCallback(
+    (
+      what: string,
+      busyLabel: string,
+      call: (
+        project: ProjectId,
+        repo: RepoId,
+        selections: PathSelection[],
+      ) => Promise<ChangesTree>,
+    ) =>
+      (repo: RepoId, path: string) => {
+        if (project === null) return
+        void (async () => {
+          setBusy(busyLabel)
+          await guarded(what, () => call(project, repo, wholeFiles([path])))
+          setBusy(null)
+          await refresh()
+        })()
+      },
+    [project, guarded, refresh],
+  )
+
+  const stageFile = useMemo(() => fileVerb('git stage', 'Staging…', gitApi.stage), [fileVerb])
+  const unstageFile = useMemo(
+    () => fileVerb('git unstage', 'Unstaging…', gitApi.unstage),
+    [fileVerb],
+  )
+  /** **Destroys uncommitted work.** The menu marks it `danger` and names the file. */
+  const rollbackFile = useMemo(
+    () => fileVerb('git rollback', 'Rolling back…', gitApi.rollback),
+    [fileVerb],
+  )
+
+  /**
    * Read every repo's shelf.
    *
    * Called when the Shelf tab opens, after anything shelves, and from the panel's own ↻ —
@@ -811,6 +868,9 @@ export function useGitPanel(
     setStagingArea,
     commit,
     unstage,
+    stageFile,
+    unstageFile,
+    rollbackFile,
     shelve,
     unshelve,
     reloadIndex,

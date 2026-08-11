@@ -12,6 +12,19 @@
  * One focusable thing per row: a nested `<input>` would make Tab walk two stops per file
  * and leave Space ambiguous between "tick this row" and "tick this box".
  *
+ * # Two different things called selection
+ *
+ * `selected` in this file is the **tick** — the set of files a commit would take. The
+ * *current row*, which is what a click moves and what the arrows walk, is `current`, and it
+ * is deliberately a different thing: ticking a file is a statement about a commit, and
+ * pointing at one is a statement about what you are looking at. Conflating them would mean a
+ * click that silently changed what the Commit button does.
+ *
+ * `current` is a row **id**, not an index. Row ids are stable across refreshes (`fileRowId`
+ * is repo plus path) and this panel refreshes constantly — on every `cide://git-status`, on
+ * every watcher burst, while Claude is editing. An index would point at a different file
+ * every time a group above it gained or lost one.
+ *
  * # Focus
  *
  * Roving tabindex — the tree is one tab stop and the arrows move within it, which is what
@@ -20,7 +33,7 @@
  * refresh changes its rows would steal the caret out of the commit message box, and this
  * panel refreshes while the user types.
  */
-import { useCallback, useRef, useState, type KeyboardEvent } from 'react'
+import { useCallback, useRef, type KeyboardEvent, type ReactNode } from 'react'
 import {
   checkState,
   entryStatus,
@@ -30,6 +43,17 @@ import {
   type Row,
 } from './model'
 import { TriCheckbox } from './TriCheckbox'
+import { gestureOf, gitTreeClick } from '../clickSemantics'
+/*
+ * Reached by file rather than through the `@/icons` barrel, which is what every other caller
+ * uses. The barrel also exports `useIconTheme`, which reads `@/store/workspace`, which touches
+ * `document` at import time — and `check-git-render.mjs` renders this tree under node. Nothing
+ * here calls that hook (the theme arrives as a prop, see `GitPanel.tsx`), but a barrel import
+ * pulls it in anyway, and the failure is a `ReferenceError` in the check rather than anything
+ * a reader of this file would connect to an import.
+ */
+import { FileIcon } from '@/icons/FileIcon'
+import type { IconTheme } from '@/icons/iconFor'
 import styles from './ChangesTree.module.css'
 
 export interface ChangesTreeProps {
@@ -38,9 +62,25 @@ export interface ChangesTreeProps {
   expanded: ReadonlySet<string>
   /** Ids whose file is only partly staged — what turns a `✓` into a `–`. */
   partial: ReadonlySet<string>
+  /** The row the user is pointing at, by id. Not the tick; see the module header. */
+  current: string | null
+  onCurrent: (id: string) => void
+  /**
+   * A git diff tab is open in this project.
+   *
+   * The one piece of state outside this tree that changes what a *single* click does. Read
+   * from the workspace, not from what this panel last opened — see `openDiffTabs.ts`.
+   */
+  diffOpen: boolean
+  /** Threaded from the panel, never subscribed to per row. Same argument as `FileTree`. */
+  iconTheme: IconTheme
   onToggleCheck: (row: Row) => void
   onToggleExpand: (row: Row) => void
   onOpenDiff: (row: Row) => void
+  /** From the host's `useContextMenu`. Absent in a render with no window to open one in. */
+  onContextMenu?: ((e: React.MouseEvent) => void) | undefined
+  /** The portalled menu itself. It must be rendered or nothing appears. */
+  menu?: ReactNode
 }
 
 const ARIA_CHECKED: Record<CheckState, 'true' | 'false' | 'mixed'> = {
@@ -54,21 +94,37 @@ export function ChangesTree({
   selected,
   expanded,
   partial,
+  current,
+  onCurrent,
+  diffOpen,
+  iconTheme,
   onToggleCheck,
   onToggleExpand,
   onOpenDiff,
+  onContextMenu,
+  menu,
 }: ChangesTreeProps) {
   const container = useRef<HTMLDivElement>(null)
-  const [cursor, setCursor] = useState(0)
-  // Rows come and go under a live refresh, so the stored cursor is advisory and every read
-  // clamps it. Storing a row id instead would have to answer what happens when that row is
-  // the one that disappeared, which is the same clamp with more state.
-  const at = rows.length === 0 ? 0 : Math.min(cursor, rows.length - 1)
+  /*
+   * Where the current row sits *now*.
+   *
+   * Derived on every render rather than stored, because the rows underneath it move: a
+   * refresh can insert a file above the current one, and a group folding away can remove it
+   * entirely. `-1` (not found) clamps to 0, so a tree whose current row has just been
+   * committed away puts the tab stop back on the top row rather than nowhere.
+   */
+  const found = current === null ? -1 : rows.findIndex((row) => row.id === current)
+  const at = rows.length === 0 ? 0 : Math.max(0, Math.min(found, rows.length - 1))
 
-  const move = useCallback((next: number) => {
-    setCursor(next)
-    container.current?.querySelector<HTMLElement>(`[data-index="${next}"]`)?.focus()
-  }, [])
+  const move = useCallback(
+    (next: number) => {
+      const row = rows[next]
+      if (row === undefined) return
+      onCurrent(row.id)
+      container.current?.querySelector<HTMLElement>(`[data-index="${next}"]`)?.focus()
+    },
+    [rows, onCurrent],
+  )
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent, row: Row, index: number) => {
@@ -98,6 +154,8 @@ export function ChangesTree({
           onToggleCheck(row)
           break
         case 'Enter':
+          // The keyboard has no second click to wait for, so Enter opens a leaf whether or
+          // not a diff is already on screen. See `enterOn` in `clickSemantics.ts`.
           if (row.expandable) onToggleExpand(row)
           else onOpenDiff(row)
           break
@@ -114,8 +172,9 @@ export function ChangesTree({
 
   if (rows.length === 0) {
     return (
-      <div className={styles.tree} data-audit="gitTree">
+      <div className={styles.tree} data-audit="gitTree" onContextMenu={onContextMenu}>
         <p className={styles.empty}>No changes.</p>
+        {menu}
       </div>
     )
   }
@@ -128,32 +187,49 @@ export function ChangesTree({
       aria-label="Changes"
       aria-multiselectable="true"
       data-audit="gitTree"
+      onContextMenu={onContextMenu}
     >
       {rows.map((row, index) => {
         const state = checkState(row, selected, (id) => partial.has(id))
         const open = expanded.has(row.id)
+        const isCurrent = index === found
         return (
           <div
             key={row.id}
             data-index={index}
+            /* Read back by the host's context menu at open time. It sits here rather than
+               between `data-audit` and the aria pair, whose adjacency `check-git-render.mjs`
+               matches on. */
+            data-row-id={row.id}
             data-audit="gitRow"
             data-kind={row.kind}
             role="treeitem"
             aria-level={row.depth + 1}
             aria-checked={ARIA_CHECKED[state]}
+            aria-selected={isCurrent}
             {...(row.expandable ? { 'aria-expanded': open } : {})}
             tabIndex={index === at ? 0 : -1}
-            className={row.kind === 'file' ? styles.row : `${styles.row} ${styles.groupRow}`}
+            className={rowClass(row, isCurrent)}
             // Indent is a padding rather than a spacer element so the whole 23px row stays
             // one hit target, including the empty space to the left of a deep file.
             style={{ paddingLeft: `${8 + row.depth * 14}px` }}
-            onFocus={() => setCursor(index)}
-            onClick={() => {
-              setCursor(index)
-              if (row.expandable) onToggleExpand(row)
-            }}
-            onDoubleClick={() => {
-              if (!row.expandable) onOpenDiff(row)
+            onFocus={() => onCurrent(row.id)}
+            /*
+             * One handler for both halves of a double-click, told apart by `detail` rather
+             * than by a timer — see `clickSemantics.ts`. The old pair of `onClick` and
+             * `onDoubleClick` could not express the rule this now obeys, because whether a
+             * single click opens depends on `diffOpen`.
+             */
+            onMouseDown={(e) => {
+              if (e.button !== 0) return
+              const action = gitTreeClick({
+                gesture: gestureOf(e.detail),
+                expandable: row.expandable,
+                diffOpen,
+              })
+              if (action.select) onCurrent(row.id)
+              if (action.toggle) onToggleExpand(row)
+              if (action.open) onOpenDiff(row)
             }}
             onKeyDown={(e) => onKeyDown(e, row, index)}
           >
@@ -162,27 +238,42 @@ export function ChangesTree({
             </span>
 
             {/*
-              A click on the box must tick, not expand: a group's own row toggles open on
-              click, and without stopping propagation every tick would also collapse the
-              group it was in.
+              A press on the box must tick, not expand and not open: a group's own row folds
+              on mousedown and a file row may open a diff, so without stopping the press here
+              every tick would also fold the group it was in.
             */}
             <span
               className={styles.checkHit}
+              onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation()
-                setCursor(index)
+                onCurrent(row.id)
                 onToggleCheck(row)
               }}
             >
               <TriCheckbox state={state} />
             </span>
 
-            {row.kind === 'file' ? <FileLabel row={row} /> : <GroupLabel row={row} />}
+            {row.kind === 'file' ? (
+              <FileLabel row={row} iconTheme={iconTheme} />
+            ) : (
+              <GroupLabel row={row} />
+            )}
           </div>
         )
       })}
+      {/* Portals out of this box; where it sits in the caller's tree does not move it. */}
+      {menu}
     </div>
   )
+}
+
+/** Three orthogonal facts about a row, so the ternary chain does not have to nest. */
+function rowClass(row: Row, isCurrent: boolean): string {
+  const parts = [styles.row]
+  if (row.kind !== 'file') parts.push(styles.groupRow)
+  if (isCurrent) parts.push(styles.rowCurrent)
+  return parts.join(' ')
 }
 
 /**
@@ -215,13 +306,18 @@ function GroupLabel({ row }: { row: Row }) {
  * The colours are the explorer's, deliberately: `M` blue, `A` green, `D` faint and struck
  * through. A file that is blue in the file tree and some other colour here would read as
  * two different pieces of information about the same file.
+ *
+ * The icon is the explorer's too, and for the same reason. This row used to draw none at
+ * all, which made the changed-files list the one place in the app where a `.rs` and a
+ * `Cargo.lock` looked identical.
  */
-function FileLabel({ row }: { row: Row }) {
+function FileLabel({ row, iconTheme }: { row: Row; iconTheme: IconTheme }) {
   const entry = row.entry
   if (entry === undefined) return null
   const { name, dir } = splitPath(entry.path)
   return (
     <>
+      <FileIcon row={{ name, kind: 'file' }} theme={iconTheme} className={styles.icon} />
       <span className={styles.fileName} data-status={entryStatus(entry)} title={entry.path}>
         {name}
       </span>

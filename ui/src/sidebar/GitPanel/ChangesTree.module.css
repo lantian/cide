@@ -42,6 +42,32 @@
   background: var(--chrome-hi);
 }
 
+/*
+ * The current row — what a click points at, which is *not* what the ticks say will be
+ * committed. It has to survive focus leaving the tree (a context menu takes focus, and so
+ * does the commit message box), so it cannot be `:focus` alone.
+ *
+ * The same band and the same 2px leading rule the explorer and the search results use, so
+ * one selection means one thing in all three sidebars. Both themes define `--sel` and
+ * `--accent`; the rule is an inset shadow rather than a border so nothing shifts sideways
+ * when a row becomes current.
+ *
+ * It sits *after* `.groupRow` deliberately: these are single-class selectors of equal
+ * specificity, so source order is what decides, and a group row that stayed `--panel-2`
+ * while current would be the one row kind with no visible cursor.
+ */
+.rowCurrent,
+.rowCurrent:hover {
+  background: var(--sel);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* The file icon, in the 6px flex gap the row already has. Fixed so a row with a long path
+   cannot squeeze it. */
+.icon {
+  flex: none;
+}
+
 .twisty {
   width: 9px;
   flex: none;

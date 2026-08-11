@@ -95,9 +95,49 @@
   background: var(--chrome-hi);
 }
 
+/*
+ * The selected row.
+ *
+ * Selection is now distinct from "what is open", so it has to be legible against the hover
+ * band that sits one shade away from it — `--sel` alone reads as a slightly warmer hover in
+ * the light theme, which is exactly the state a user cannot tell apart at a glance. The 2px
+ * accent rule down the leading edge is what makes it unambiguous, and it works in both themes
+ * without a second rule because both define `--sel` and `--accent`.
+ *
+ * `inset` box-shadow rather than a `border-left`: a border would shift every child 2px to the
+ * right on selection, and a 21px mono row that jogs sideways when you click it looks broken.
+ */
 .rowSelected,
 .rowSelected:hover {
   background: var(--sel);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* The tree keeps its selection when focus leaves it — a context menu takes focus, and a
+   selection that vanished while its own menu was open would be pointing at nothing. The
+   focus ring goes on the scroll container instead, which is the thing that is focused. */
+.scroll:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* The inline rename box, in place of `.name`. Same font and size as the row it replaces, so
+   the text does not jump when the input appears under the caret. */
+.rename {
+  flex: 1;
+  min-width: 0;
+  height: 17px;
+  padding: 0 3px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.rename:focus {
+  outline: none;
 }
 
 /*

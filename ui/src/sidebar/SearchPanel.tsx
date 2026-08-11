@@ -12,29 +12,68 @@
  * 5 000 hits, and neither the DOM nor a repaint should ever see more than a screen of them.
  *
  * Everything that can be got wrong quietly — the grouping, the byte-offset highlight, the
- * state machine, the readout — lives in `SearchModel.ts` and is tested by
- * `ui/scripts/check-search.mjs`. What is left here is markup and event wiring.
+ * state machine, the readout, the caret position a hit resolves to — lives in
+ * `SearchModel.ts` and is tested by `ui/scripts/check-search.mjs`. What is left here is
+ * markup and event wiring.
+ *
+ * # A result is a place, so clicking one goes there
+ *
+ * > *"search result click doesn't point me to found place (should open file and select the
+ * > line)"*
+ *
+ * A single click opens, unlike the two trees where a single click only selects — and that is
+ * not an inconsistency; see `clickSemantics.ts`. What a click hands the host is the file
+ * *and* the caret: `onOpenHit(path, line, column, endColumn)`. The host may still ignore the
+ * last three, and today's shell does, which is why the file opening is not conditional on
+ * anything: opening at the top of the file beats not opening at all, and it is what this
+ * panel already did before it could say where to look.
  */
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useSearch } from './SearchStore'
-import { groupHits, panelState, splitHighlight, summarize, trimIndent } from './SearchModel'
+import {
+  groupHits,
+  hitPosition,
+  panelState,
+  rowKey,
+  splitHighlight,
+  summarize,
+  trimIndent,
+} from './SearchModel'
 import type { SearchRow } from './SearchModel'
+import { gestureOf, moveIndex, searchClick } from './clickSemantics'
+import { copyText } from './copyText'
 import { groupDigits } from '@/overlays/format'
 import type { ProjectId } from '@/ipc/client'
+import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
+import { useContextMenu, type MenuEntry } from '@/menus'
 import styles from './SearchPanel.module.css'
 
 /** 21px rows, from the mock — the same as the file tree's. */
 const ROW_HEIGHT = 21
 
+/**
+ * Where a hit is, and what opening it means.
+ *
+ * Four positional arguments rather than an object, deliberately: the shell already passes
+ * `(path) => open(path)` for this prop, and a host that only knows how to open a file must
+ * keep compiling. Widening the *object* would have broken that call site — in `App.tsx`,
+ * which this package may not edit — and the whole point of the extra arguments is that they
+ * are ignorable.
+ */
+export type OpenHit = (path: string, line: number, column: number, endColumn: number) => void
+
 export interface SearchPanelProps {
   /** The active project, or `null` when none is open. */
   project: ProjectId | null
   /**
-   * Open a hit. The line is 1-based and may be ignored by a host that cannot scroll to one;
-   * the file still opens, which is the part the user asked for.
+   * Open a hit at its match.
+   *
+   * `line` is 1-based, and so are `column`/`endColumn`, which are UTF-16 columns rather than
+   * the wire's byte offsets — see `hitPosition`. A host that cannot place a caret may use the
+   * path alone; the file still opens, which is the part the user asked for.
    */
-  onOpenHit?: ((path: string, line: number) => void) | undefined
+  onOpenHit?: OpenHit | undefined
 }
 
 export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
@@ -48,6 +87,10 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
   const error = useSearch((s) => s.error)
   const degraded = useSearch((s) => s.degraded)
   const collapsed = useSearch((s) => s.collapsed)
+  // One subscription for the panel, not one per visible row — the same argument `FileTree`
+  // makes about the icon theme, and for the same reason: rows are remounted on every scroll
+  // tick, so a hook inside a row is a store listener churned per frame.
+  const iconTheme = useIconTheme()
 
   useEffect(() => {
     useSearch.getState().attach(project)
@@ -121,6 +164,7 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
           rows={rows}
           error={error}
           scanned={scanned}
+          iconTheme={iconTheme}
           onOpenHit={onOpenHit}
         />
       )}
@@ -133,7 +177,8 @@ interface BodyProps {
   rows: SearchRow[]
   error: string | null
   scanned: number
-  onOpenHit: ((path: string, line: number) => void) | undefined
+  iconTheme: IconTheme
+  onOpenHit: OpenHit | undefined
 }
 
 /**
@@ -145,7 +190,7 @@ interface BodyProps {
  * in the second state, and a panel that showed "No results" there would be lying for exactly
  * as long as it takes the user to believe it.
  */
-function Body({ state, rows, error, scanned, onOpenHit }: BodyProps) {
+function Body({ state, rows, error, scanned, iconTheme, onOpenHit }: BodyProps) {
   if (state === 'empty') {
     return <div className={styles.hint}>Type to search this project&rsquo;s files.</div>
   }
@@ -171,17 +216,27 @@ function Body({ state, rows, error, scanned, onOpenHit }: BodyProps) {
       </div>
     )
   }
-  return <Results rows={rows} onOpenHit={onOpenHit} />
+  return <Results rows={rows} iconTheme={iconTheme} onOpenHit={onOpenHit} />
 }
 
 function Results({
   rows,
+  iconTheme,
   onOpenHit,
 }: {
   rows: SearchRow[]
-  onOpenHit: ((path: string, line: number) => void) | undefined
+  iconTheme: IconTheme
+  onOpenHit: OpenHit | undefined
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  /**
+   * The selected row, by key rather than by position.
+   *
+   * Results stream in while the user reads them and folding a group renumbers everything
+   * below it, so a stored index would point at a different line every few hundred
+   * milliseconds. See `rowKey`.
+   */
+  const [selected, setSelected] = useState<string | null>(null)
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
@@ -189,8 +244,111 @@ function Results({
     overscan: 12,
   })
 
+  const open = useCallback(
+    (row: SearchRow) => {
+      if (row.kind === 'file') {
+        useSearch.getState().toggleGroup(row.path)
+        return
+      }
+      const at = hitPosition(row.hit)
+      onOpenHit?.(row.hit.path, at.line, at.column, at.endColumn)
+    },
+    [onOpenHit],
+  )
+
+  const act = useCallback(
+    (row: SearchRow, gesture: 'single' | 'double') => {
+      const action = searchClick({ gesture, kind: row.kind })
+      if (action.select) setSelected(rowKey(row))
+      // A file heading has nothing to open and a hit has nothing to fold, so one call covers
+      // both — `open` branches on the row it is given rather than the caller branching twice.
+      if (action.toggle || action.open) open(row)
+    },
+    [open],
+  )
+
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      const at = selected === null ? -1 : rows.findIndex((row) => rowKey(row) === selected)
+      const next = moveIndex(e.key, at < 0 ? 0 : at, rows.length)
+      if (next !== null) {
+        // From nothing, any navigation key means the top: `moveIndex` from a notional -1
+        // would answer 1 for ArrowDown, which skips the first result.
+        const to = at < 0 ? 0 : next
+        const row = rows[to]
+        if (row !== undefined) setSelected(rowKey(row))
+        virtualizer.scrollToIndex(to, { align: 'auto' })
+        e.preventDefault()
+        return
+      }
+      const row = at < 0 ? undefined : rows[at]
+      if (row === undefined) return
+      if (e.key === 'Enter') {
+        open(row)
+        e.preventDefault()
+      } else if (e.key === 'ArrowLeft' && row.kind === 'file' && !row.collapsed) {
+        useSearch.getState().toggleGroup(row.path)
+        e.preventDefault()
+      } else if (e.key === 'ArrowRight' && row.kind === 'file' && row.collapsed) {
+        useSearch.getState().toggleGroup(row.path)
+        e.preventDefault()
+      }
+    },
+    [open, rows, selected, virtualizer],
+  )
+
+  const { onContextMenu, menu } = useContextMenu({
+    label: 'Search results',
+    items: ({ target }) => {
+      const el = target?.closest<HTMLElement>('[data-row-key]')
+      const key = el?.dataset['rowKey']
+      const row = key === undefined ? undefined : rows.find((r) => rowKey(r) === key)
+      // The empty space under the last result opens nothing rather than an empty box.
+      if (row === undefined || key === undefined) return []
+      setSelected(key)
+
+      const path = row.kind === 'file' ? row.path : row.hit.path
+      const entries: MenuEntry[] = [
+        {
+          id: 'open',
+          label: row.kind === 'file' ? (row.collapsed ? 'Expand' : 'Collapse') : 'Open',
+          run: () => open(row),
+        },
+        { kind: 'separator' },
+        {
+          id: 'copyMatch',
+          label: 'Copy Match',
+          ...(row.kind === 'file'
+            ? // A heading is a file, not a match. Disabled with the reason rather than hidden,
+              // so the menu is the same shape on both row kinds and nothing appears to move.
+              { disabledReason: 'A file heading has no matched text' }
+            : {
+                run: () => {
+                  // The *untrimmed* hit: `trimIndent` is a display decision for a 252px panel
+                  // and copying the panel's rendering rather than the file's bytes is how a
+                  // paste comes out subtly different from what was searched for.
+                  const parts = splitHighlight(row.hit.text, row.hit.start, row.hit.end)
+                  void copyText(parts.match)
+                },
+              }),
+        },
+        { id: 'copyPath', label: 'Copy Path', run: () => void copyText(path) },
+      ]
+      return entries
+    },
+  })
+
   return (
-    <div className={styles.scroll} ref={scrollRef} data-audit="searchScroll">
+    <div
+      className={styles.scroll}
+      ref={scrollRef}
+      data-audit="searchScroll"
+      role="tree"
+      aria-label="Search results"
+      tabIndex={0}
+      onKeyDown={onKeyDown}
+      onContextMenu={onContextMenu}
+    >
       <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index]
@@ -199,72 +357,122 @@ function Results({
             height: `${item.size}px`,
             transform: `translateY(${item.start}px)`,
           }
+          const key = rowKey(row)
           return row.kind === 'file' ? (
-            <FileHeading key={row.path} row={row} style={style} />
+            <FileHeading
+              key={key}
+              row={row}
+              rowKey={key}
+              style={style}
+              iconTheme={iconTheme}
+              selected={key === selected}
+              onAct={act}
+            />
           ) : (
-            <HitLine key={`${row.hit.path}:${row.index}`} row={row} style={style} onOpen={onOpenHit} />
+            <HitLine
+              key={key}
+              row={row}
+              rowKey={key}
+              style={style}
+              selected={key === selected}
+              onAct={act}
+            />
           )
         })}
       </div>
+      {/* `{menu}` must be rendered or nothing appears; it portals out of this scroll box. */}
+      {menu}
     </div>
   )
 }
 
+/**
+ * The gesture handler both row kinds share.
+ *
+ * `onMouseDown` rather than `onClick`, and `detail` rather than a timer — the same decision
+ * the file tree makes, for the same reason. See `clickSemantics.ts`.
+ */
+function pressHandler(row: SearchRow, onAct: (row: SearchRow, gesture: 'single' | 'double') => void) {
+  return (e: React.MouseEvent) => {
+    if (e.button !== 0) return
+    onAct(row, gestureOf(e.detail))
+  }
+}
+
 function FileHeading({
   row,
+  rowKey: key,
   style,
+  iconTheme,
+  selected,
+  onAct,
 }: {
   row: Extract<SearchRow, { kind: 'file' }>
+  rowKey: string
   style: React.CSSProperties
+  iconTheme: IconTheme
+  selected: boolean
+  onAct: (row: SearchRow, gesture: 'single' | 'double') => void
 }) {
   return (
-    <button
-      type="button"
-      className={styles.fileRow}
+    <div
+      className={selected ? `${styles.fileRow} ${styles.rowSelected}` : styles.fileRow}
       data-audit="searchFileRow"
+      data-row-key={key}
+      role="treeitem"
+      aria-level={1}
+      aria-selected={selected}
+      aria-expanded={!row.collapsed}
       style={style}
       title={row.path}
-      aria-expanded={!row.collapsed}
-      onClick={() => useSearch.getState().toggleGroup(row.path)}
+      onMouseDown={pressHandler(row, onAct)}
     >
       <span className={styles.twisty} aria-hidden="true">
         {row.collapsed ? '▸' : '▾'}
       </span>
-      {/* A literal `▫`, still. The file tree now draws the vendored Material icon for the
-          file's type instead; matching that here means threading the icon theme through
-          `Body` → `Results` and taking a basename off `row.rel`, which is a change to this
-          panel and not to the icon set. Until then the two sidebars deliberately differ. */}
-      <span className={styles.glyph} aria-hidden="true">
-        ▫
-      </span>
+      {/*
+       * The same vendored Material icon the file tree draws, keyed off the basename of the
+       * *relative* path. This used to be a literal `▫`, which meant the two sidebars named the
+       * same file two different ways — and a search over a repository is exactly where a
+       * glance at the icon tells you whether the hit is in Rust, in CSS or in a lockfile.
+       */}
+      <FileIcon row={{ name: basename(row.rel), kind: 'file' }} theme={iconTheme} />
       <span className={styles.fileName}>{row.rel}</span>
       {/* Tabular so a growing count does not shift the name beside it. */}
       <span className={styles.fileCount}>{row.hits}</span>
-    </button>
+    </div>
   )
 }
 
 function HitLine({
   row,
+  rowKey: key,
   style,
-  onOpen,
+  selected,
+  onAct,
 }: {
   row: Extract<SearchRow, { kind: 'hit' }>
+  rowKey: string
   style: React.CSSProperties
-  onOpen: ((path: string, line: number) => void) | undefined
+  selected: boolean
+  onAct: (row: SearchRow, gesture: 'single' | 'double') => void
 }) {
   // Trimmed first, then split: the offsets move with the indentation, and a hit inside a
-  // nested block would otherwise draw as an empty row in a 252px panel.
+  // nested block would otherwise draw as an empty row in a 252px panel. Only the *drawing*
+  // is trimmed — `hitPosition` reads the untrimmed hit, so the caret lands on the real column.
   const hit = trimIndent(row.hit)
   const parts = splitHighlight(hit.text, hit.start, hit.end)
   return (
-    <button
-      type="button"
-      className={styles.hitRow}
+    <div
+      className={selected ? `${styles.hitRow} ${styles.rowSelected}` : styles.hitRow}
       data-audit="searchHitRow"
+      data-row-key={key}
+      role="treeitem"
+      aria-level={2}
+      aria-selected={selected}
       style={style}
       title={`${hit.path}:${hit.line}`}
-      onClick={() => onOpen?.(hit.path, hit.line)}
+      onMouseDown={pressHandler(row, onAct)}
     >
       <span className={styles.lineNo}>{hit.line}</span>
       <span className={styles.lineText}>
@@ -272,8 +480,20 @@ function HitLine({
         <mark className={styles.match}>{parts.match}</mark>
         {parts.after}
       </span>
-    </button>
+    </div>
   )
+}
+
+/**
+ * The last path component of a relative path.
+ *
+ * `rel` is what the backend drew the heading with, and in a multi-root project it is prefixed
+ * with the root label — so it is not a filesystem path and is not handed to anything that
+ * treats it as one. Only the icon needs it, and only the part after the last separator.
+ */
+function basename(rel: string): string {
+  const cut = rel.lastIndexOf('/')
+  return cut < 0 ? rel : rel.slice(cut + 1)
 }
 
 function Toggle({
