@@ -43,6 +43,7 @@ import {
   rectangularSelection,
 } from '@codemirror/view'
 import { cideHighlightStyle } from './highlight'
+import { useCodeMenu } from './codeMenu'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
 import { languageName, loadLanguage } from './languages'
@@ -173,6 +174,17 @@ export function EditorSurface({
   selectionCb.current = onSelection
   const saveHandleCb = useRef(onSaveHandle)
   saveHandleCb.current = onSaveHandle
+
+  /*
+   * The right-click menu. Reads the view through a getter rather than being handed it, because
+   * `items` runs at open time and the view alive then is the one to act on — a captured
+   * `viewRef.current` from render time is a destroyed editor after a reload.
+   */
+  const { onContextMenu, menu } = useCodeMenu({
+    view: () => viewRef.current,
+    path,
+    readOnly,
+  })
 
   const segments = useMemo(() => breadcrumbSegments(path, root), [path, root])
   const language = useMemo(() => languageName(path), [path])
@@ -373,7 +385,22 @@ export function EditorSurface({
         </div>
       </div>
 
-      <div className={styles.body} ref={hostRef} />
+      {/*
+        * `data-native-menu="false"` even though the surface would already be suppressed: the
+        * host is a `contenteditable`, which is the one shape `wantsNativeMenu` treats as a text
+        * entry by default, and this pane now has its own Cut/Copy/Paste. Stating it means the
+        * answer does not change if someone flips `nativeInTextInputs` from `App.tsx`.
+        *
+        * `{menu}` has to be rendered or nothing appears; it portals out of this
+        * `overflow: hidden` pane on its own.
+        */}
+      <div
+        className={styles.body}
+        ref={hostRef}
+        onContextMenu={onContextMenu}
+        data-native-menu="false"
+      />
+      {menu}
     </div>
   )
 }

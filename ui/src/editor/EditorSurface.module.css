@@ -138,6 +138,31 @@
  * Selection. CodeMirror draws it as absolutely positioned `.cm-selectionBackground` layers
  * when `drawSelection` is on, and as a native `::selection` when the editor is unfocused,
  * so both have to be told.
+ *
+ * # Why the selection is at the BOTTOM of the paint order, and what that costs
+ *
+ * `drawSelection` renders through `layer({above: false, …})` (`@codemirror/view/dist/index.js`
+ * L9575-9600), and a layer's z-index is `(above ? 150 : -1) - pos` — L9445. So
+ * `.cm-selectionLayer` is z-index **-1**, inside `.cm-scroller`, which is
+ * `position: relative; zIndex: 0` (L6820-6829) and therefore a stacking context. Within it
+ * the paint order is: negative-z positioned descendants first, then the *backgrounds of
+ * in-flow block descendants*, then inline content. `.cm-content` and `.cm-line` are plain
+ * blocks (L6830-6857), so **every `.cm-line` background paints on top of the selection**, and
+ * every inline mark decoration's background on top of that.
+ *
+ * That is the whole of the bug the user reported ("selecting in code same as current row
+ * caret text — i doesn't see the selection"). The `.cm-activeLine` rule below used to be
+ * `background: var(--sel)` — the *same opaque token* as the selection — painted over it. Two
+ * separate reasons the selection vanished on the caret's row, and either alone was enough:
+ * an opaque cover, and, where it did show, an identical colour. And the caret's row is always
+ * involved, because `highlightActiveLine` decorates `lineBlockAt(r.head)` for every range
+ * whether or not it is empty (L10024-10041) — it does not skip non-empty selections.
+ *
+ * The fix has to run in that direction: nothing painted above the selection may be opaque.
+ * Raising `.cm-selectionLayer` instead was tried and is worse — the rectangles are opaque and
+ * would cover the text, and making *them* translucent enough to see through wrecks the
+ * contrast the token below is chosen for. CodeMirror's own base theme reaches the same
+ * conclusion with `#cceeff44` (L6934).
  */
 .body :global(.cm-selectionBackground),
 .body :global(.cm-editor .cm-selectionBackground) {
@@ -148,9 +173,23 @@
   background: var(--sel);
 }
 
-/* The caret's line, `--sel` per the mock. */
+/*
+ * The caret's line. `--sel` per the mock, but at 40% and therefore translucent.
+ *
+ * The alpha is what makes the selection visible again, and the *choice of token* is what
+ * keeps it undamaged: 40% of `--sel` composited over `--sel` is `--sel` exactly, so a
+ * selection crossing the active line is one uniform colour and the worst-case syntax contrast
+ * on it is still the 4.45:1 `tokens.css` picked the token for. A neutral wash was the other
+ * candidate and loses on precisely that — any non-`--sel` tint over the selection shifts it,
+ * and at an alpha heavy enough to read as an active line it took `--green` on a selected line
+ * down to about 4.0:1.
+ *
+ * Off the selection it composites over `--panel` instead and reads as the pale row tint it is
+ * meant to be. So the two states differ by 60% of the selection's own strength, which is a
+ * step, not a hairline.
+ */
 .body :global(.cm-activeLine) {
-  background: var(--sel);
+  background: color-mix(in srgb, var(--sel) 40%, transparent);
 }
 
 /* --- gutter, 56px and right-aligned ---------------------------------------------------- */
@@ -170,6 +209,13 @@
   text-align: right;
 }
 
+/*
+ * The gutter half of the active line keeps the token at full strength. `.cm-gutters` is
+ * z-index 200 (`@codemirror/view` L6938-6943) and sits outside `.cm-content` entirely, so no
+ * selection is ever drawn under it and there is nothing here to obscure. It is also what
+ * makes the lighter line tint above affordable: the caret's row is still marked unambiguously,
+ * in the one column where marking it costs nothing.
+ */
 .body :global(.cm-activeLineGutter) {
   background: var(--sel);
   color: var(--dim);
@@ -230,8 +276,25 @@
   color: var(--red);
 }
 
-.body :global(.cm-selectionMatch) {
-  background: var(--accent-dim);
+/*
+ * Other occurrences of the selected text.
+ *
+ * Translucent for the same reason as `.cm-activeLine`: this is a `Decoration.mark`
+ * (`@codemirror/search/dist/index.js` L391), so it becomes an inline span inside `.cm-line`
+ * and paints above the z-index -1 selection layer.
+ *
+ * It is worth being exact about what that does and does not cost here, because the answer is
+ * *less* than it looks: `matchHighlighter.getDeco` (L403-461) returns `Decoration.none` for a
+ * multi-range selection, and for a single range it only emits a mark where
+ * `from >= range.to || to <= range.from` — never over the selected range itself. So this class
+ * cannot cover the main selection; the alpha is here for the *other* overlap, which is real —
+ * `.cm-searchMatch` below can sit under it, and the base theme's own
+ * `.cm-searchMatch .cm-selectionMatch { background: transparent }` (L465) exists to stop the
+ * two fills stacking. Ours no longer needs that trick: 45% over 45% is still lighter than the
+ * search hit alone.
+ */
+.body :global(.cm-editor .cm-selectionMatch) {
+  background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
 }
 
 /*
@@ -265,13 +328,22 @@
  *
  * `outline-offset: -1px` so a match that wraps across lines does not have consecutive
  * rings touching.
+ *
+ * **Translucent, and this one is not theoretical.** `findNext` *selects* the match it moves
+ * to, so the current hit always has the selection under it — and `searchHighlighter` is a
+ * mark decoration registered `Prec.low` (`@codemirror/search/dist/index.js` L1226), which
+ * still puts its inline span above the z-index -1 selection layer. With an opaque fill the
+ * selection under the current hit was invisible in every search, in both themes; the ring was
+ * the only thing saying which hit was current, and the reason a ring was needed at all was
+ * half this bug. At 45% the hit reads as a hit and the selection under it reads as a
+ * selection.
  */
 .body :global(.cm-editor .cm-searchMatch) {
-  background: var(--accent-dim);
+  background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
 }
 
 .body :global(.cm-editor .cm-searchMatch.cm-searchMatch-selected) {
-  background: var(--accent-dim);
+  background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }

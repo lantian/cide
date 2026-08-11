@@ -150,6 +150,28 @@ impl SidebarSettings {
     }
 }
 
+/// Unified rows, or the two sides beside each other.
+///
+/// Stored rather than held in the pane, because a diff pane is opened and closed constantly
+/// — every file in the git panel is a new tab — and a mode that resets with the pane is a
+/// mode nobody can stay in. It lives under `editor` rather than `git` because both diff
+/// surfaces read it: the git pane and Claude's `openDiff` proposal are the same question
+/// asked about different documents.
+///
+/// **Unified is the default and that is deliberate.** It is what the pane has always shown,
+/// it is the shape the per-line staging selection is expressed in (one row is one
+/// `hunk:line`), and it is the only one that survives a narrow pane — see `DIFF_SPLIT_MIN_PX`
+/// in `ui/src/panes/GitDiffPane.tsx`, which falls back to it rather than offering a split
+/// nobody can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DiffView {
+    #[default]
+    Unified,
+    Split,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
@@ -160,6 +182,8 @@ pub struct EditorSettings {
     pub show_minimap: bool,
     pub word_wrap: bool,
     pub trim_trailing_whitespace_on_save: bool,
+    /// How a diff is laid out. See [`DiffView`].
+    pub diff_view: DiffView,
 }
 
 impl Default for EditorSettings {
@@ -171,6 +195,7 @@ impl Default for EditorSettings {
             show_minimap: true,
             word_wrap: false,
             trim_trailing_whitespace_on_save: false,
+            diff_view: DiffView::Unified,
         }
     }
 }

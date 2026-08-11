@@ -62,6 +62,44 @@
   color: var(--faint);
 }
 
+/* Same treatment, and the same reason for the auto margin. */
+.layout {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  padding-left: 8px;
+  align-self: center;
+}
+
+.mode {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.mode:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+.mode:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.modeOn {
+  border-color: var(--border);
+  background: var(--panel-2);
+  color: var(--text-hi);
+}
+
 .body {
   flex: 1;
   min-height: 0;
@@ -160,56 +198,96 @@
  * `height: auto !important` on both editors' scrollers so the two sides can be aligned row
  * for row; without a bounded, scrollable `.cm-mergeView` the pane grows to the height of
  * the file and the pane's own layout is destroyed.
+ *
+ * **Only in the split layout.** The unified layout is a plain `EditorView` with
+ * `unifiedMergeView` on it — there is no `.cm-mergeView` element, the `height: auto` override
+ * never applies, and CodeMirror's own scroller does the scrolling. So the rules below are split
+ * in two: layout rules that name `.cm-mergeView`, and paint rules that name
+ * `.cm-editor.cm-merge-a` / `.cm-merge-b`, which `unifiedMergeView` also sets
+ * (`EditorView.editorAttributes.of({class: "cm-merge-b"})`, `@codemirror/merge` L1485) and
+ * which therefore cover both layouts from one copy. Scoping the paint rules to `.cm-mergeView`
+ * — as they were — would have left the unified view painted in the base theme's literals:
+ * `rgba(160,128,100,.08)`, `#f3f3f3`, `#2a2`, `#d43`, all of which survive a theme switch.
  */
 .body :global(.cm-mergeView) {
   height: 100%;
   overflow: auto;
 }
 
-.body :global(.cm-mergeView .cm-editor) {
+.body :global(.cm-editor) {
+  height: 100%;
   background: var(--panel);
   color: var(--dim);
 }
 
-.body :global(.cm-mergeView .cm-editor.cm-focused) {
+/* Undone for the split layout, where the merge view is the thing with the height. */
+.body :global(.cm-mergeView .cm-editor) {
+  height: auto;
+}
+
+.body :global(.cm-editor.cm-focused) {
   /* The default is a dotted near-black outline, invisible on the dark palette. */
   outline: none;
 }
 
-.body :global(.cm-mergeView .cm-scroller) {
+.body :global(.cm-editor .cm-scroller) {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.55;
 }
 
-.body :global(.cm-mergeView .cm-content) {
+.body :global(.cm-editor .cm-content) {
   caret-color: var(--accent);
 }
 
-.body :global(.cm-mergeView) ::selection {
+/*
+ * Native selection, and it is enough here.
+ *
+ * Neither layout adds `drawSelection`, so the selection is the browser's own highlight, which
+ * is painted *over* an element's background rather than in a z-index -1 layer. That is the one
+ * reason nothing in this file needs the alpha that `editor/EditorSurface.module.css` does: a
+ * selection dragged across an added or removed row shows as `--sel` on top of the row tint,
+ * with no precedence question to answer. The row tints are `--diff-*-bg`, which are translucent
+ * anyway.
+ */
+.body :global(.cm-editor) ::selection {
   background: var(--sel);
 }
 
-.body :global(.cm-mergeView .cm-gutters) {
+.body :global(.cm-editor .cm-gutters) {
   background: var(--panel-2);
   color: var(--faint);
   border-right: 1px solid var(--border-soft);
 }
 
-.body :global(.cm-mergeView .cm-activeLineGutter) {
+.body :global(.cm-editor .cm-activeLineGutter) {
   background: transparent;
 }
 
 /* Removed: the original side's changed lines. */
-.body :global(.cm-mergeView .cm-editor.cm-merge-a .cm-changedLine) {
+.body :global(.cm-editor.cm-merge-a .cm-changedLine) {
   background-color: var(--diff-del-bg);
   color: var(--red);
 }
 
 /* Added: the proposed side's changed lines. */
-.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-changedLine) {
+.body :global(.cm-editor.cm-merge-b .cm-changedLine) {
   background-color: var(--diff-add-bg);
   color: var(--green);
+}
+
+/*
+ * Unified only: the block of original lines shown above the lines that replaced them, and the
+ * inline-diff variant of a changed line. Both are the base theme's own class names and both
+ * ship a literal `rgba()` that ignores the palette.
+ */
+.body :global(.cm-editor .cm-deletedChunk) {
+  background-color: var(--diff-del-bg);
+  color: var(--red);
+}
+
+.body :global(.cm-editor .cm-inlineChangedLine) {
+  background-color: var(--diff-add-bg);
 }
 
 /*
@@ -217,41 +295,80 @@
  * fill, matching the base theme's shape, so the line background still reads as the row's
  * add/remove state.
  */
-.body :global(.cm-mergeView .cm-editor.cm-merge-a .cm-changedText) {
+.body :global(.cm-editor.cm-merge-a .cm-changedText),
+.body :global(.cm-editor .cm-deletedChunk .cm-deletedText) {
   background: linear-gradient(var(--red), var(--red)) bottom / 100% 2px no-repeat;
 }
 
-.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-changedText) {
+.body :global(.cm-editor.cm-merge-b .cm-changedText) {
   background: linear-gradient(var(--green), var(--green)) bottom / 100% 2px no-repeat;
 }
 
+/* The split layout's inline deletion fill, which the base theme paints `#ff000033`. */
 .body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-deletedText) {
   background: var(--diff-del-bg);
 }
 
 /* The 3px change ribbon beside the line numbers. */
-.body :global(.cm-mergeView .cm-editor.cm-merge-a .cm-changedLineGutter) {
+.body :global(.cm-editor.cm-merge-a .cm-changedLineGutter) {
   background: var(--red);
 }
 
-.body :global(.cm-mergeView .cm-editor.cm-merge-b .cm-changedLineGutter) {
+.body :global(.cm-editor.cm-merge-b .cm-changedLineGutter) {
   background: var(--green);
 }
 
-.body :global(.cm-mergeView .cm-editor .cm-deletedLineGutter) {
+.body :global(.cm-editor .cm-deletedLineGutter) {
   background: var(--red);
 }
 
+.body :global(.cm-editor .cm-inlineChangedLineGutter) {
+  background: var(--accent);
+}
+
 /* Collapsed runs of unchanged context; clicking one expands it. */
-.body :global(.cm-mergeView .cm-editor .cm-collapsedLines) {
+.body :global(.cm-editor .cm-collapsedLines) {
   color: var(--faint);
   background: var(--panel-2);
   border-top: 1px solid var(--border-soft);
   border-bottom: 1px solid var(--border-soft);
 }
 
-.body :global(.cm-mergeView .cm-editor .cm-collapsedLines:hover) {
+.body :global(.cm-editor .cm-collapsedLines:hover) {
   color: var(--text);
+}
+
+/*
+ * The unified layout's per-chunk controls.
+ *
+ * The base theme paints these `#2a2` and `#d43` with white text and keys them off
+ * `button[name=accept]` / `[name=reject]`. Ours are built by `renderRevertControl`'s unified
+ * counterpart in `DiffPane.tsx` — relabelled *Keep original* / *Keep change* so they cannot be
+ * confused with the footer's Accept and Reject, which answer the agent — and they carry
+ * `.chunkButton`, a class of this module's own. Styling on our own class rather than on
+ * `[name=…]` is what stops the base theme's colour rule reaching them at all.
+ */
+.body :global(.cm-editor .cm-chunkButtons) {
+  display: flex;
+  gap: 4px;
+}
+
+.chunkButton {
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--chrome);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.chunkButton:hover {
+  border-color: var(--accent-dim);
+  background: var(--chrome-hi);
+  color: var(--text-hi);
 }
 
 /* The per-chunk revert column between the two editors. */

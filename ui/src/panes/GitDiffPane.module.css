@@ -67,12 +67,24 @@
   color: var(--faint);
 }
 
-/* Pushed right so a long path clips against the switcher rather than shifting it. */
+/*
+ * Both switchers, pushed right so a long path clips against them rather than shifting them.
+ *
+ * One wrapper carries `margin-left: auto`, not each group: two auto-margined flex siblings
+ * split the free space between them and end up floating apart in the middle of the bar.
+ */
+.controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  padding-left: 8px;
+}
+
 .sides {
   flex: none;
   display: flex;
-  margin-left: auto;
-  padding-left: 8px;
   gap: 2px;
 }
 
@@ -88,9 +100,26 @@
   cursor: pointer;
 }
 
-.side:hover {
+.side:hover:not(:disabled) {
   background: var(--chrome-hi);
   color: var(--text);
+}
+
+.side:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/*
+ * The preference is stored, but the pane is too narrow to honour it.
+ *
+ * Struck through rather than un-pressed: the button still reflects what is saved — it is what
+ * this pane will draw the moment it is wide enough — and un-pressing it would say the setting
+ * had been lost. The `title` carries the sentence.
+ */
+.side[data-overruled='true'] {
+  text-decoration: line-through;
+  text-decoration-color: var(--faint);
 }
 
 .sideOn {
@@ -231,6 +260,51 @@
   padding-right: 8px;
 }
 
+/*
+ * Side by side. One grid row, two halves, one scroller — see `splitHunk` in the `.tsx` for
+ * why that is the design rather than two editors kept in step by a scroll listener.
+ *
+ * `minmax(0, 1fr)` twice, not `1fr 1fr`: a grid track's default minimum is `auto`, which is
+ * the content's min-content width, so one long unbreakable line — a minified bundle, a base64
+ * blob — would push its column past half the pane and shove the other side off screen. With a
+ * zero minimum the halves stay even and the line wraps inside its own cell.
+ */
+.splitRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.half {
+  display: grid;
+  grid-template-columns: 16px 5ch 2ch minmax(0, 1fr);
+  align-items: start;
+  padding-right: 8px;
+  min-width: 0;
+}
+
+/* The seam. On the left cell only, so it does not double up at the pane's right edge. */
+.splitRow > .half:first-child {
+  border-right: 1px solid var(--border-soft);
+}
+
+/*
+ * A row where only one side has a line: the other half is blank.
+ *
+ * Faintly hatched rather than left empty, because an empty cell next to an addition reads as
+ * "the old file had a blank line here", which is a different fact from "the old file had
+ * nothing here". The stripes are `--border-soft` on the panel, so they are visible without
+ * competing with the add/remove tint opposite them.
+ */
+.filler {
+  background: repeating-linear-gradient(
+    135deg,
+    transparent 0 6px,
+    var(--border-soft) 6px 7px
+  );
+  opacity: 0.6;
+}
+
 .context {
   background: transparent;
 }
@@ -244,11 +318,38 @@
 }
 
 /*
- * Selection wins over the row tint, because "will this be staged" is the question the pane
- * is for and the add/delete colour is only context for it. Last in source order and equally
- * specific, so it applies on top.
+ * A row ticked for staging.
+ *
+ * **Not `var(--sel)` any more, and that is the same bug the editor's active line had.** `--sel`
+ * is the text-selection colour, which this pane also uses (see `::selection` below) — a diff is
+ * text people copy out of. Painting the staging mark in the selection colour meant the two
+ * questions "is this line going into the index" and "is this text selected" produced the same
+ * pixels, so dragging a selection across ticked rows told you nothing and neither did the tick.
+ *
+ * The accent wash is a `background-image` layered over the origin tint rather than a
+ * `background` replacing it, so a ticked addition still reads as an addition — the old rule
+ * threw the green away and left "staged" and "staged addition" identical. The 2px accent rail
+ * is what makes the tick scannable down a long hunk at a glance; the wash alone is too quiet
+ * once it has to stay light enough to sit under a text selection.
  */
-.row[data-selected='true'] {
+.row[data-selected='true'],
+.half[data-selected='true'] {
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--accent) 14%, transparent) 0 100%
+  );
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/*
+ * Text selection, which until now this pane never styled at all — it fell through to
+ * WebKitGTK's own highlight, the one colour in the window that ignores the theme.
+ *
+ * Opaque `--sel`, and it wins over everything above because a native selection highlight is
+ * painted over the element's background rather than under it. That is the property the editor
+ * cannot rely on (`drawSelection` puts its rectangles in a z-index -1 layer instead — see
+ * `editor/EditorSurface.module.css`), and it is why nothing here needs an alpha.
+ */
+.body ::selection {
   background: var(--sel);
 }
 
@@ -269,7 +370,8 @@
   cursor: pointer;
 }
 
-.row[data-selected='true'] .lineBox {
+.row[data-selected='true'] .lineBox,
+.half[data-selected='true'] .lineBox {
   border-color: var(--accent);
   background: var(--accent-dim);
 }

@@ -50,6 +50,12 @@ import {
   type ReactNode,
 } from 'react'
 import {
+  getDiffView,
+  getServerDiffView,
+  setDiffView,
+  subscribeDiffView,
+} from '@/editor/diffViewMode'
+import {
   countLines,
   hunkMarks,
   hunkState,
@@ -73,8 +79,11 @@ import {
   diag,
   events,
   git as gitApi,
+  type DiffHunkView,
+  type DiffLineView,
   type DiffSide,
   type DiffSpec,
+  type DiffView,
   type FileDiff,
   type LineOrigin,
   type ProjectId,
@@ -133,6 +142,95 @@ function rowClass(origin: LineOrigin): string {
   }
 }
 
+/**
+ * Below this pane width, side-by-side is refused and the pane draws unified instead.
+ *
+ * A split diff needs two code columns and two gutters. The gutters are fixed
+ * (`16px + 5ch + 2ch` per side, about 74px at this font), so at 860px each side has roughly
+ * 45 monospace characters — already tight for real code and the point at which wrapping turns
+ * every line into three. Below it the pane stops showing a diff and starts showing a column of
+ * confetti.
+ *
+ * The alternative was horizontal scrolling, and it lost for a specific reason rather than a
+ * general one: this pane's gesture is *ticking lines*, and the tick boxes live in the gutters.
+ * A horizontally scrolled split puts the right side's boxes off-screen, so staging a line
+ * would mean scrolling to find its checkbox and scrolling back to read what it says. Unified
+ * keeps every box in view and loses only the side-by-side arrangement, which is the thing that
+ * did not fit anyway.
+ *
+ * The fallback is announced, not silent — see `cramped` in {@link GitDiffView}. A toggle that
+ * appears not to work is worse than one that says why.
+ */
+export const DIFF_SPLIT_MIN_PX = 860
+
+/**
+ * One row of a side-by-side hunk: what is on the left, what is on the right, either may be
+ * absent.
+ *
+ * `at` is the index into `hunk.lines` — the second half of a `hunk:line` mark — and it is
+ * `null` on the mirrored half of a context row. A context line is one entry in the unified
+ * diff and is drawn twice here, so exactly one of the two cells carries the position; without
+ * that rule the same mark would appear twice in the DOM and "the rows drawn as selected" would
+ * no longer be a set of positions.
+ */
+export interface SplitCell {
+  line: DiffLineView
+  at: number | null
+}
+
+export interface SplitRow {
+  left: SplitCell | null
+  right: SplitCell | null
+}
+
+/**
+ * Pair a hunk's unified rows into two columns.
+ *
+ * A run of deletions immediately followed by a run of additions is one edit, so the two runs
+ * are zipped: the first deletion faces the first addition, and whichever run is shorter leaves
+ * blanks at the bottom. That is what makes a side-by-side diff readable — the changed line and
+ * what it became are on the same row — and it is the whole content of "side by side"; anything
+ * finer (matching by similarity rather than by position) is a diff algorithm, and the diff has
+ * already been computed by libgit2.
+ *
+ * A deletion *after* an addition starts a new pair group rather than joining the one before
+ * it. `git` emits `-` before `+` within an edit, so `+` then `-` means two separate edits that
+ * happen to be adjacent, and zipping across the boundary would face a line against a line from
+ * a different change.
+ *
+ * Pure and exported so it can be reasoned about on its own; it is also what
+ * `ui/scripts/check-diff-render.mjs` would assert against if the split view ever grows
+ * fixtures of its own.
+ */
+export function splitHunk(hunk: DiffHunkView): SplitRow[] {
+  const out: SplitRow[] = []
+  let dels: SplitCell[] = []
+  let adds: SplitCell[] = []
+
+  const flush = (): void => {
+    for (let i = 0; i < Math.max(dels.length, adds.length); i++) {
+      out.push({ left: dels[i] ?? null, right: adds[i] ?? null })
+    }
+    dels = []
+    adds = []
+  }
+
+  hunk.lines.forEach((line, at) => {
+    if (line.origin === 'deletion') {
+      if (adds.length > 0) flush()
+      dels.push({ line, at })
+    } else if (line.origin === 'addition') {
+      adds.push({ line, at })
+    } else {
+      flush()
+      // The position rides on the left cell; the right one is the same text, unnumbered.
+      out.push({ left: { line, at }, right: { line, at: null } })
+    }
+  })
+  flush()
+  return out
+}
+
 const SIDES: ReadonlyArray<{ side: DiffSide; label: string; title: string }> = [
   { side: 'unstaged', label: 'Unstaged', title: 'index → working tree. Staging acts on this.' },
   { side: 'staged', label: 'Staged', title: 'HEAD → index. Unstaging acts on this.' },
@@ -156,6 +254,16 @@ export interface GitDiffViewProps {
   reason: string | null
   /** Lines of this file already held for the next commit, if any. */
   held: number | null
+  /**
+   * Unified rows or two columns. The *stored preference*, not necessarily what is drawn — a
+   * pane narrower than {@link DIFF_SPLIT_MIN_PX} draws unified whatever this says.
+   *
+   * Optional, and defaults to `'unified'`, so a fixture that predates the split view renders
+   * exactly what it always did. `ui/src/panes/gitDiffSmoke.tsx` is that fixture.
+   */
+  view?: DiffView | undefined
+  /** Absent ⇒ the layout toggle is disabled, with a reason. */
+  onView?: ((view: DiffView) => void) | undefined
   onSide: (side: DiffSide) => void
   onMarks: (marks: Marks) => void
   onCollapse: (hunk: number) => void
@@ -183,6 +291,8 @@ export function GitDiffView({
   note,
   reason,
   held,
+  view = 'unified',
+  onView,
   onSide,
   onMarks,
   onCollapse,
@@ -191,6 +301,68 @@ export function GitDiffView({
 }: GitDiffViewProps): ReactNode {
   const op = opFor(side)
   const painted = diff === null ? new Set<string>() : highlightedKeys(marks, diff)
+
+  /*
+   * How wide the pane is, so side-by-side can refuse to draw itself in a sliver.
+   *
+   * Measured here rather than passed in, and that does not make this component impure in the
+   * sense the module comment means: it still talks to no store and no IPC, and
+   * `renderToStaticMarkup` runs no effects, so under node this is the initial state and
+   * nothing else. The alternative — a `width` prop — would put the measurement in the wiring
+   * component, which does not render the element being measured; a `ResizeObserver` needs the
+   * node, and the node is here.
+   *
+   * A callback ref rather than `useRef`, because the two returns below mount different roots:
+   * the "nothing to show" branch and the diff branch are separate elements, and a plain ref
+   * with an empty dependency list would observe whichever existed at mount and never notice
+   * the swap.
+   *
+   * Starts wide. A pane that is in fact narrow shows one split frame and settles; starting
+   * narrow would make every *wide* pane flash unified first, which is the commoner case and
+   * the more visible flicker.
+   */
+  const [root, setRoot] = useState<HTMLElement | null>(null)
+  const [wide, setWide] = useState(true)
+  useEffect(() => {
+    if (root === null || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? root.clientWidth
+      setWide(width >= DIFF_SPLIT_MIN_PX)
+    })
+    observer.observe(root)
+    return () => observer.disconnect()
+  }, [root])
+
+  /** What is actually drawn, and whether the preference had to be overruled to get there. */
+  const layout: DiffView = view === 'split' && wide ? 'split' : 'unified'
+  const cramped = view === 'split' && !wide
+
+  const layoutSwitcher = (
+    <div className={styles.sides} role="group" aria-label="Diff layout">
+      {(['unified', 'split'] as const).map((mode) => (
+        <button
+          key={mode}
+          type="button"
+          title={
+            mode === 'unified'
+              ? 'One column, deletions and additions interleaved.'
+              : cramped
+                ? `This pane is under ${DIFF_SPLIT_MIN_PX}px wide, so it is drawn unified.` +
+                  ' Widen it, or detach the tab, to get the two sides.'
+                : 'The two sides beside each other, in one scroller.'
+          }
+          aria-pressed={view === mode}
+          data-audit="gitDiffLayout"
+          data-overruled={mode === 'split' && cramped ? 'true' : 'false'}
+          disabled={onView === undefined}
+          className={view === mode ? `${styles.side} ${styles.sideOn}` : styles.side}
+          onClick={() => onView?.(mode)}
+        >
+          {mode === 'split' ? 'Split' : 'Unified'}
+        </button>
+      ))}
+    </div>
+  )
 
   /*
    * The header is drawn whether or not there is a diff, and the side switcher with it.
@@ -210,26 +382,31 @@ export function GitDiffView({
         </>
       )}
       {diff !== null && <span className={styles.status}>{diff.status}</span>}
-      <div className={styles.sides} role="group" aria-label="Diff side">
-        {SIDES.map((entry) => (
-          <button
-            key={entry.side}
-            type="button"
-            title={entry.title}
-            aria-pressed={side === entry.side}
-            className={side === entry.side ? `${styles.side} ${styles.sideOn}` : styles.side}
-            onClick={() => onSide(entry.side)}
-          >
-            {entry.label}
-          </button>
-        ))}
+      {/* One right-aligned group, so a long path clips against both switchers rather than
+          having the free space split between two `margin-left: auto` siblings. */}
+      <div className={styles.controls}>
+        {layoutSwitcher}
+        <div className={styles.sides} role="group" aria-label="Diff side">
+          {SIDES.map((entry) => (
+            <button
+              key={entry.side}
+              type="button"
+              title={entry.title}
+              aria-pressed={side === entry.side}
+              className={side === entry.side ? `${styles.side} ${styles.sideOn}` : styles.side}
+              onClick={() => onSide(entry.side)}
+            >
+              {entry.label}
+            </button>
+          ))}
+        </div>
       </div>
     </header>
   )
 
   if (diff === null) {
     return (
-      <div className={styles.pane} data-audit="gitDiffPane">
+      <div className={styles.pane} data-audit="gitDiffPane" ref={setRoot}>
         {header}
         <div className={styles.notice}>
           {reason === null ? (
@@ -254,8 +431,80 @@ export function GitDiffView({
   const actionLabel =
     op === 'stage' ? 'Stage selection' : op === 'unstage' ? 'Unstage selection' : 'Use for commit'
 
+  /**
+   * One line of one side.
+   *
+   * Shared by both layouts, which is what keeps the rule this pane exists for true in the new
+   * one: the `data-at` / `data-selected` pair is written in exactly one place, from the same
+   * `painted` set, so the split view cannot drift into painting a row the unified view would
+   * not — and `check-diff-render.mjs`'s regex over `data-audit="gitDiffRow"` reads either.
+   *
+   * `at === null` is the mirrored half of a context row: same text, no position, no box. It
+   * carries no `data-at`, so a mark is never in the document twice.
+   */
+  const cell = (
+    key: string,
+    hunkIndex: number,
+    entry: SplitCell | null,
+    which: 'old' | 'new' | 'both',
+    className: string,
+  ): ReactNode => {
+    if (entry === null) {
+      // The other side has a line here and this one does not. Kept in the flow rather than
+      // omitted so the two columns stay in step row for row — an absent cell would slide
+      // everything below it up by one and face the wrong lines against each other.
+      return <div key={key} className={`${className} ${styles.filler ?? ''}`} aria-hidden="true" />
+    }
+    const { line, at } = entry
+    const change = line.origin !== 'context'
+    const on = at !== null && painted.has(mark(hunkIndex, at))
+    const numbered = which === 'new' ? line.newLineno : line.oldLineno
+    return (
+      <div
+        key={key}
+        className={`${className} ${rowClass(line.origin)}`}
+        {...(at === null
+          ? {}
+          : {
+              'data-audit': 'gitDiffRow',
+              'data-at': `${hunkIndex}:${at}`,
+              'data-selected': on ? 'true' : 'false',
+            })}
+      >
+        {selectable && (
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={on}
+            aria-label={`Select line ${numbered ?? line.newLineno ?? line.oldLineno ?? ''}`}
+            className={styles.lineBox}
+            disabled={!change || at === null}
+            onClick={() => at !== null && onMarks(toggleLine(marks, diff, hunkIndex, at))}
+          >
+            {on ? '✓' : ''}
+          </button>
+        )}
+        {which === 'both' ? (
+          <>
+            <span className={styles.lineno}>{line.oldLineno ?? ''}</span>
+            <span className={styles.lineno}>{line.newLineno ?? ''}</span>
+          </>
+        ) : (
+          <span className={styles.lineno}>{numbered ?? ''}</span>
+        )}
+        <span className={styles.sign}>
+          {line.origin === 'addition' ? '+' : line.origin === 'deletion' ? '-' : ' '}
+        </span>
+        <span className={styles.text}>
+          {line.content}
+          {line.noNewline && <span className={styles.noNewline}> ⏎ no newline at end of file</span>}
+        </span>
+      </div>
+    )
+  }
+
   return (
-    <div className={styles.pane} data-audit="gitDiffPane">
+    <div className={styles.pane} data-audit="gitDiffPane" ref={setRoot}>
       {header}
 
       {note !== null && (
@@ -325,46 +574,39 @@ export function GitDiffView({
                 )}
               </div>
 
-              {!shut && (
+              {!shut && layout === 'unified' && (
                 <div className={styles.lines}>
-                  {hunk.lines.map((line, index) => {
-                    const change = line.origin !== 'context'
-                    const on = painted.has(mark(hunk.index, index))
-                    return (
-                      <div
-                        key={index}
-                        className={`${styles.row} ${rowClass(line.origin)}`}
-                        data-audit="gitDiffRow"
-                        data-at={`${hunk.index}:${index}`}
-                        data-selected={on ? 'true' : 'false'}
-                      >
-                        {selectable && (
-                          <button
-                            type="button"
-                            role="checkbox"
-                            aria-checked={on}
-                            aria-label={`Select line ${line.newLineno ?? line.oldLineno ?? ''}`}
-                            className={styles.lineBox}
-                            disabled={!change}
-                            onClick={() => onMarks(toggleLine(marks, diff, hunk.index, index))}
-                          >
-                            {on ? '✓' : ''}
-                          </button>
-                        )}
-                        <span className={styles.lineno}>{line.oldLineno ?? ''}</span>
-                        <span className={styles.lineno}>{line.newLineno ?? ''}</span>
-                        <span className={styles.sign}>
-                          {line.origin === 'addition' ? '+' : line.origin === 'deletion' ? '-' : ' '}
-                        </span>
-                        <span className={styles.text}>
-                          {line.content}
-                          {line.noNewline && (
-                            <span className={styles.noNewline}> ⏎ no newline at end of file</span>
-                          )}
-                        </span>
-                      </div>
-                    )
-                  })}
+                  {hunk.lines.map((line, index) =>
+                    cell(`${index}`, hunk.index, { line, at: index }, 'both', styles.row ?? ''),
+                  )}
+                </div>
+              )}
+
+              {/*
+                * Side by side. **One scroller, two columns** — the two sides are cells of the
+                * same grid row, so they are aligned by layout and scroll together because
+                * there is only one thing scrolling. That is the whole reason this is not two
+                * synchronized editors and not `@codemirror/merge`'s `MergeView`: a scroll
+                * listener writing the other pane's `scrollTop` writes a scroll event back, and
+                * the guard flag that stops the loop is the bug people spend an afternoon on.
+                * Here there is no loop to guard.
+                *
+                * `MergeView` lost for a second, harder reason. It diffs two whole *documents*,
+                * and `git_diff_file` hands this pane a patch: hunks with a few lines of context
+                * and nothing between them. The documents it would need do not exist here, and
+                * its chunks are its own — mapping a `MergeView` chunk back onto a `hunk:line`
+                * position is exactly the index arithmetic that stages the line next to the one
+                * the user ticked. `DiffPane` uses `MergeView` and is right to: it has both
+                * documents in full.
+                */}
+              {!shut && layout === 'split' && (
+                <div className={styles.lines}>
+                  {splitHunk(hunk).map((row, index) => (
+                    <div key={index} className={styles.splitRow}>
+                      {cell('l', hunk.index, row.left, 'old', styles.half ?? '')}
+                      {cell('r', hunk.index, row.right, 'new', styles.half ?? '')}
+                    </div>
+                  ))}
                 </div>
               )}
             </section>
@@ -493,6 +735,16 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
   // and rebuilt every time the user switches tabs, so visibility reaches them through a ref.
   const visibleRef = useRef(visible)
   visibleRef.current = visible
+
+  /*
+   * Unified or split, from `Settings.editor.diffView`.
+   *
+   * Read through `@/editor/diffViewMode` rather than `@/settings/useSettings` — that hook
+   * reaches `@/store/workspace`, which reaches xterm, and this pane is SSR-rendered under node
+   * by `check-diff-render.mjs`. Same trade as the `onWorkspaceChanged` subscription below, and
+   * the module says so at length.
+   */
+  const diffView = useSyncExternalStore(subscribeDiffView, getDiffView, getServerDiffView)
 
   const partials = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
   const held = useMemo(
@@ -735,6 +987,11 @@ function GitDiff({ project, repo, path, from, visible: told }: GitDiffProps): Re
       note={note}
       reason={reason}
       held={held}
+      view={diffView.view}
+      // Disabled until the first `settings.get` lands: a patch built before the real
+      // `EditorSettings` are known would send this module's guesses for `fontSize` and the
+      // rest. It is one round trip at window start.
+      {...(diffView.writable ? { onView: setDiffView } : {})}
       onSide={switchSide}
       onMarks={setMarks}
       onCollapse={(hunk) =>

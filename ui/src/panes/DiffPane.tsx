@@ -12,10 +12,17 @@
  * render it, and so the broker id it echoes back is the caller's concern rather than this
  * component's.
  */
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { MergeView } from '@codemirror/merge'
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { MergeView, unifiedMergeView } from '@codemirror/merge'
 import { EditorState } from '@codemirror/state'
 import { EditorView, lineNumbers } from '@codemirror/view'
+import {
+  getDiffView,
+  getServerDiffView,
+  setDiffView,
+  subscribeDiffView,
+} from '@/editor/diffViewMode'
+import type { DiffView } from '@/ipc/client'
 import styles from './DiffPane.module.css'
 
 export interface DiffPaneProps {
@@ -157,7 +164,23 @@ export function DiffPane({
   onReject,
 }: DiffPaneProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
-  const viewRef = useRef<MergeView | null>(null)
+  /**
+   * The editor whose buffer Accept sends.
+   *
+   * Two shapes now — `MergeView.b` in the split layout, a plain `EditorView` in the unified
+   * one — and this holds the *editable* one either way. That is deliberately the narrowest
+   * thing the rest of the component needs: `currentBuffer()` wants a document, not a merge
+   * view, and keeping the union out of it is what stops the two layouts diverging in what
+   * Accept means.
+   */
+  const bufferRef = useRef<EditorView | null>(null)
+  const destroyRef = useRef<(() => void) | null>(null)
+
+  /*
+   * Split or unified, from `Settings.editor.diffView` — the same stored preference the git
+   * diff pane reads, because a user who chose a layout chose it for diffs, not for one pane.
+   */
+  const diffView = useSyncExternalStore(subscribeDiffView, getDiffView, getServerDiffView)
 
   // Callbacks held in refs so a parent that re-creates its handlers on every render cannot
   // reach the effect below and tear down the editor — which would discard whatever the user
@@ -192,30 +215,78 @@ export function DiffPane({
     if (host === null) return
 
     const shared = [lineNumbers(), EditorView.lineWrapping]
+    // Long unchanged stretches collapse to a clickable band. Without this a one-line change in
+    // a thousand-line file opens on a screen of identical context.
+    const collapseUnchanged = { margin: 3, minSize: 4 }
 
-    let view: MergeView
     try {
-      view = new MergeView({
-        // A: the file as it stands. Read-only in both senses — `readOnly` stops commands and
-        // `editable` stops the DOM being contenteditable at all, so a click does not place a
-        // caret in a document that cannot be changed.
-        a: {
-          doc: docs.original,
-          extensions: [...shared, EditorState.readOnly.of(true), EditorView.editable.of(false)],
-        },
-        b: { doc: docs.proposed, extensions: shared },
-        parent: host,
-        // The per-chunk control copies a chunk from A into B: "put the original back here".
-        // There is no per-chunk accept in a side-by-side view, because B already holds the
-        // proposal — accepting a chunk would be a no-op, and rejecting one is the gesture the
-        // user actually needs.
-        revertControls: 'a-to-b',
-        highlightChanges: true,
-        gutter: true,
-        // Long unchanged stretches collapse to a clickable band. Without this a one-line
-        // change in a thousand-line file opens on a screen of identical context.
-        collapseUnchanged: { margin: 3, minSize: 4 },
-      })
+      if (diffView.view === 'unified') {
+        /*
+         * One editor holding the proposal, with the original shown as deleted blocks above the
+         * lines that replaced them.
+         *
+         * The per-chunk gesture survives the change of layout, which is the whole condition on
+         * offering this at all. `unifiedMergeView`'s "reject" reverts the chunk to the original
+         * — exactly what `revertControls: 'a-to-b'` does in the split layout — and its "accept"
+         * drops the chunk's markers without touching the text.
+         *
+         * They are **relabelled**, and that is not cosmetic. This pane's footer already has
+         * buttons called Accept and Reject, and those answer the agent: they end the tool call
+         * and unblock the conversation. A per-chunk control with the same two words would be
+         * two very different gestures spelled identically, on the one screen where getting it
+         * wrong writes a file. "Keep original" and "Keep change" say what the chunk buttons do
+         * and cannot be read as an answer.
+         */
+        const view = new EditorView({
+          doc: docs.proposed,
+          parent: host,
+          extensions: [
+            ...shared,
+            unifiedMergeView({
+              original: docs.original,
+              highlightChanges: true,
+              gutter: true,
+              collapseUnchanged,
+              mergeControls: (type, action) => {
+                const el = document.createElement('button')
+                el.type = 'button'
+                el.className = styles.chunkButton ?? ''
+                el.textContent = type === 'reject' ? 'Keep original' : 'Keep change'
+                el.title =
+                  type === 'reject'
+                    ? 'Put the original text back in this chunk'
+                    : 'Leave this chunk as proposed and stop marking it'
+                el.addEventListener('click', action)
+                return el
+              },
+            }),
+          ],
+        })
+        bufferRef.current = view
+        destroyRef.current = () => view.destroy()
+      } else {
+        const view = new MergeView({
+          // A: the file as it stands. Read-only in both senses — `readOnly` stops commands and
+          // `editable` stops the DOM being contenteditable at all, so a click does not place a
+          // caret in a document that cannot be changed.
+          a: {
+            doc: docs.original,
+            extensions: [...shared, EditorState.readOnly.of(true), EditorView.editable.of(false)],
+          },
+          b: { doc: docs.proposed, extensions: shared },
+          parent: host,
+          // The per-chunk control copies a chunk from A into B: "put the original back here".
+          // There is no per-chunk accept in a side-by-side view, because B already holds the
+          // proposal — accepting a chunk would be a no-op, and rejecting one is the gesture the
+          // user actually needs.
+          revertControls: 'a-to-b',
+          highlightChanges: true,
+          gutter: true,
+          collapseUnchanged,
+        })
+        bufferRef.current = view.b
+        destroyRef.current = () => view.destroy()
+      }
     } catch (e) {
       // A third-party constructor run over arbitrary file contents, in an app with no error
       // boundary: an exception escaping here unmounts the whole React root, which blanks the
@@ -226,16 +297,24 @@ export function DiffPane({
       setFailed(true)
       return
     }
-    viewRef.current = view
 
     return () => {
-      viewRef.current = null
-      view.destroy()
+      bufferRef.current = null
+      destroyRef.current?.()
+      destroyRef.current = null
     }
-    // Keyed on the request alone. `docs` is re-derived from `requestId` above and the
-    // callbacks live in refs, so nothing else can legitimately rebuild the editor.
+    /*
+     * Keyed on the request *and the layout*. `docs` is re-derived from `requestId` above and
+     * the callbacks live in refs, so nothing else can legitimately rebuild the editor.
+     *
+     * Rebuilding on a layout change costs whatever the user has typed into the proposal, which
+     * is a real cost and is why it is not done for anything else. It is accepted here because
+     * the two layouts are different extensions over different editors — there is no
+     * `reconfigure` from one to the other — and because switching layout is a deliberate act on
+     * a pane the user is looking at, unlike the prop churn the freeze above exists to ignore.
+     */
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [requestId])
+  }, [requestId, diffView.view])
 
   /**
    * What Accept sends.
@@ -245,9 +324,9 @@ export function DiffPane({
    * both paths with no editor — oversize and failed — where there are no edits to have made.
    */
   const currentBuffer = (): string => {
-    const view = viewRef.current
+    const view = bufferRef.current
     if (view === null) return docs.proposed
-    const text = view.b.state.doc.toString()
+    const text = view.state.doc.toString()
     // Undo CodeMirror's line-ending normalisation, never impose one; see `crlfThroughout`.
     return docs.crlf ? text.replace(/\n/g, '\r\n') : text
   }
@@ -259,7 +338,37 @@ export function DiffPane({
     <div className={styles.pane}>
       <header className={styles.header}>
         {pathLabel(oldPath, newPath)}
-        {plain ? <span className={styles.headerNote}>not shown inline</span> : null}
+        {plain ? (
+          <span className={styles.headerNote}>not shown inline</span>
+        ) : (
+          /*
+           * The layout toggle is hidden on the plain path rather than disabled: there is no
+           * diff on screen for it to rearrange, and an inert control beside a sentence
+           * explaining that the file is too large to diff is noise, not information.
+           */
+          <div className={styles.layout} role="group" aria-label="Diff layout">
+            {(['unified', 'split'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={diffView.view === mode}
+                data-audit="claudeDiffLayout"
+                disabled={!diffView.writable}
+                title={
+                  mode === 'split'
+                    ? 'The file and the proposal beside each other.'
+                    : 'One column, with the replaced lines shown above their replacements.'
+                }
+                className={
+                  diffView.view === mode ? `${styles.mode} ${styles.modeOn}` : styles.mode
+                }
+                onClick={() => setDiffView(mode satisfies DiffView)}
+              >
+                {mode === 'split' ? 'Split' : 'Unified'}
+              </button>
+            ))}
+          </div>
+        )}
       </header>
 
       <div className={styles.body} ref={hostRef}>

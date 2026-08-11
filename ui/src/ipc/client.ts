@@ -1274,3 +1274,35 @@ function ackFailed(error: unknown): void {
   console.error(`[cide] ${line}`)
   void diag.log(line).catch(() => {})
 }
+
+/**
+ * The system clipboard, for the code pane's Cut / Copy / Paste.
+ *
+ * These are **not cide commands** — they are `tauri-plugin-clipboard-manager`'s, invoked
+ * directly rather than through `@tauri-apps/plugin-clipboard-manager`. The plugin is already
+ * a dependency of `cide-app` and registered in `lib.rs`; its JS package is not a dependency
+ * of `ui`, and its whole content is the two `invoke` lines below. Adding a package to fetch
+ * a wrapper this thin, in a repo that pins every version exactly, lost to writing it out —
+ * and writing it out is also what keeps the rule at the top of this file true, that this is
+ * the only file reaching for `@tauri-apps`.
+ *
+ * They do not appear in `contract/commands.json` for the same reason: `contract-check`
+ * reflects over the commands *this workspace* registers, and a plugin's are not ours to pin.
+ * What does have to be granted is the permission — `clipboard-manager:default` deliberately
+ * enables nothing at all ("we believe the clipboard can be inherently dangerous"), so
+ * `clipboard-manager:allow-read-text` and `allow-write-text` are named explicitly in both
+ * files under `crates/cide-app/capabilities/`. Without them these two reject, which is why
+ * `editor/clipboard.ts` probes rather than assuming.
+ *
+ * `read_text` **rejects** on an empty or non-text clipboard rather than answering `null`, so
+ * every caller has to handle a rejection anyway; none of this is wrapped in a swallowing
+ * `.catch` here, because a Paste that silently does nothing is precisely the dead control
+ * this feature exists to avoid.
+ */
+export const clipboard = {
+  /** The clipboard's text. Rejects when it holds none, and when the permission is missing. */
+  readText: () => invoke<string>('plugin:clipboard-manager|read_text'),
+  /** Replace the clipboard's text. `label` is a Linux-only clipboard selector; we want the default. */
+  writeText: (text: string) =>
+    invoke<void>('plugin:clipboard-manager|write_text', { text, label: null }),
+}
