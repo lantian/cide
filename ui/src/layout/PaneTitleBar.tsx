@@ -110,7 +110,26 @@ export function PaneFrame({
    * Not folded into `raise` above: that one is withheld once the pane is already focused,
    * and clicking into the pane you are already in is the commonest way of all to say "yes, I
    * have seen this".
+   *
+   * Two gestures land inside this frame and are emphatically *not* that, so both handlers
+   * screen for them:
+   *
+   * * a **window control**. The bar of a detached window now draws minimize, and minimizing
+   *   is the user putting the window away *to come back to it* — clearing the marker there
+   *   destroys the one thing that would bring them back, and the `Awaiting: 1` in the task
+   *   bar with it, which is the exact case the feature exists for. Close and maximize sit in
+   *   the same span and read the same way. Screened in the focus handler too, not only in
+   *   pointer-down: clicking a button focuses it, so guarding one and not the other guards
+   *   nothing.
+   * * a **secondary button**. A right-click opens this bar's menu rather than reading a
+   *   conversation — and that menu is where `Minimize window` is chosen from.
+   *
+   * `raise` stays outside both screens: focus should follow the pointer either way, and a
+   * right-click has to act on the pane it landed in.
    */
+  const onWindowControl = (target: EventTarget | null): boolean =>
+    target instanceof Element && target.closest('[data-window-button]') !== null
+
   const seen = () => acknowledge(session)
 
   return (
@@ -125,12 +144,12 @@ export function PaneFrame({
       data-audit="pane"
       data-pane-id={pane.id}
       data-focused={focused ? 'true' : 'false'}
-      onPointerDownCapture={() => {
-        seen()
+      onPointerDownCapture={(event) => {
+        if (event.button === 0 && !onWindowControl(event.target)) seen()
         raise?.()
       }}
-      onFocusCapture={() => {
-        seen()
+      onFocusCapture={(event) => {
+        if (!onWindowControl(event.target)) seen()
         raise?.()
       }}
     >

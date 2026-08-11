@@ -4,7 +4,8 @@
  * `awaitingRule.ts` owns the *decision* and is compiled on its own by a check script. This
  * file owns the *plumbing*, which is the part that needs a webview: one listener on
  * `cide://session-state`, one report up to Rust when a session's answer changes, one
- * listener on `cide://session-awaiting` so every window converges on Rust's set, and a
+ * listener on `cide://session-awaiting` so every window converges on Rust's set, one ask for
+ * that set at install time because the event only reports *changes*, and a
  * `useSyncExternalStore` subscription for the pane title bar's marker.
  *
  * # Why the frontend decides and Rust aggregates
@@ -41,6 +42,7 @@ import {
 } from '@/ipc/client'
 import {
   UNSEEN,
+  adopt,
   mergeAuthoritative,
   onAcknowledge,
   onState,
@@ -139,7 +141,26 @@ function install(): void {
   })
     .catch(() => {
       /* Without the broadcast this window still tracks what it hears itself; it just will not
-       * learn about a session that was already waiting before it opened. */
+       * follow another window acknowledging a session both of them are showing. */
+    })
+
+  // The catch-up, and it is the other half of the broadcast rather than a nicety: that event
+  // fires when the set *moves*, so a window that opens between two moves has heard nothing —
+  // and a window built by a detach is precisely that. Rust has already written `Awaiting: 1`
+  // into its OS title by now; without this ask the pane inside it would show no marker.
+  //
+  // `adopt`, not `mergeAuthoritative`: the reply describes the set as it was when the question
+  // landed, so a session that started waiting during the round trip is in this window's table
+  // and not in the answer. Replacing would discard it, and for a session that has just
+  // finished its turn there is no later transition to raise it again.
+  void awaitingApi
+    .current()
+    .then((sessions) => {
+      tracks = adopt(tracks, sessions)
+      changed()
+    })
+    .catch(() => {
+      /* A window that cannot ask still tracks everything it hears from here on. */
     })
 }
 

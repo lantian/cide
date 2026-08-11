@@ -47,7 +47,7 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { UNSEEN, onState, onAcknowledge, mergeAuthoritative } = await import(
+  const { UNSEEN, onState, onAcknowledge, mergeAuthoritative, adopt } = await import(
     `file://${join(out, 'awaitingRule.js')}`
   )
 
@@ -139,6 +139,32 @@ try {
     mergeAuthoritative(new Map([['d', onState(UNSEEN, 'exited')]]), []).has('d'),
     false,
     'a dead session is dropped by the merge rather than carried for the life of the window',
+  )
+
+  // --- the catch-up a freshly opened window asks for ----------------------------------------
+  //
+  // `cide://session-awaiting` reports *changes*, so a window built by a detach — which Rust has
+  // already titled `Awaiting: 1` — hears nothing and asks instead. The answer describes the set
+  // as it was when the question landed, which is why this is a union and the broadcast is not.
+  const fresh = adopt(new Map(), ['a'])
+  eq(
+    fresh.get('a'),
+    { ranATurn: true, awaiting: true, gone: false },
+    'a window that has heard nothing takes the whole answer, or a detached pane shows no ' +
+      'marker under a title bar that says it is waiting',
+  )
+  const raced = adopt(new Map([['b', replay('spawning', 'idle', 'busy', 'idle')]]), ['a'])
+  eq(
+    raced.get('b').awaiting,
+    true,
+    'the answer was taken before the question landed, so a session that started waiting ' +
+      'during the round trip must survive it — `mergeAuthoritative` would clear it, and a ' +
+      'finished turn produces no later transition to raise it again',
+  )
+  eq(
+    adopt(new Map([['a', onState(UNSEEN, 'busy')]]), ['a']).get('a').ranATurn,
+    true,
+    'per-window history survives the catch-up too',
   )
 
   if (failed > 0) {

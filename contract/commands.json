@@ -99,6 +99,7 @@
   "tab_open_file",
   "tab_open_settings",
   "tab_set_dirty",
+  "window_awaiting_sessions",
   "window_close",
   "window_detach_pane",
   "window_list",

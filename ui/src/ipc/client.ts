@@ -1303,6 +1303,17 @@ export const awaiting = {
    */
   set: (session: SessionId, isAwaiting: boolean) =>
     invoke<void>('window_set_awaiting', { session, awaiting: isAwaiting }),
+
+  /**
+   * The set as Rust currently holds it, asked once per window.
+   *
+   * `cide://session-awaiting` below is a *change* notification, so a window that opens
+   * between two changes hears nothing — and a window built by a detach is exactly that. Rust
+   * has already put `Awaiting: 1` in its OS title by the time its pane renders, so without
+   * this ask the title bar and the pane's own marker disagree in the window the user tore out
+   * *because* it was waiting.
+   */
+  current: () => invoke<SessionId[]>('window_awaiting_sessions'),
 }
 
 /**

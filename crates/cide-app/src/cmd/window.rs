@@ -187,6 +187,11 @@ pub fn window_close(
         WindowRole::DetachedPane { .. } => {
             let closing = state.update(|ws| workspace::redock_pane(ws, &label))?;
             windows::destroy(&app, &closing);
+            // The pane changed windows, so both counts moved even though the waiting set did
+            // not: the window that was announcing it is gone and the shell now shows it.
+            // `window_redock_pane` retitles for exactly this reason and these two must not
+            // diverge — that is the whole claim of route 3 above.
+            retitle(&app, &state.snapshot());
         }
 
         WindowRole::DetachedTab { .. } => {
@@ -276,6 +281,28 @@ pub fn window_set_awaiting(
     retitle(&app, &state.snapshot());
     crate::emit::session_awaiting(&app, windows::awaiting_sessions());
     Ok(())
+}
+
+/// The sessions this process currently believes are waiting for the user.
+///
+/// A **pull**, and it is what makes the claim on [`crate::emit::session_awaiting`] true.
+/// That event is a *change* notification — it is emitted when the set moves — so a window
+/// that opened after the last move has heard nothing at all and cannot derive the answer
+/// either, because deriving it needs a history of `cide://session-state` transitions that
+/// happened before it existed.
+///
+/// That window is not hypothetical and it is the worst possible one to get wrong:
+/// [`window_detach_pane`] builds it, [`retitle`] has already put `Awaiting: 1` in its OS
+/// title before its first pane renders, and the pane the user tore out *because* it was
+/// waiting would show no marker. The task bar and the pane would disagree, in the one window
+/// where the disagreement is most visible.
+///
+/// Called once per window, from the first `useAwaiting`. Not `async`/`spawn_blocking`: it
+/// takes one uncontended mutex and copies a handful of ids, exactly as [`window_list`]
+/// beside it copies the window map.
+#[tauri::command(rename_all = "camelCase")]
+pub fn window_awaiting_sessions() -> Vec<SessionId> {
+    windows::awaiting_sessions()
 }
 
 /// Recompute every window's title from the workspace and the waiting set.
@@ -446,7 +473,16 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
             return;
         };
         match state.update(|ws| workspace::redock_pane(ws, &label)) {
-            Ok(closing) => windows::destroy(&app, &closing),
+            Ok(closing) => {
+                windows::destroy(&app, &closing);
+                // Routes 1 and 2 — the close control this window now draws, and Alt+F4 — end
+                // here rather than in `window_close`, so the retitle has to be here too. A
+                // waiting pane put back by either of them would otherwise leave its shell
+                // wearing the title it had while the pane was somebody else's: no badge, for
+                // a session that is still waiting and is now in one of its tabs. Nothing
+                // else would correct it until the next report moved the set.
+                retitle(&app, &state.snapshot());
+            }
             Err(error) => {
                 // The pane is no longer re-dockable — its project or its home tab has gone,
                 // and the entry naming this window went with them. Nothing is stranded by

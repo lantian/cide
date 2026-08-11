@@ -135,3 +135,34 @@ export function mergeAuthoritative(
   }
   return next
 }
+
+/**
+ * Adopt Rust's set into a window that has only just opened.
+ *
+ * A **union**, and that is the whole difference from [`mergeAuthoritative`]: this answers a
+ * question the window asked, and the answer was taken before the question landed. A session
+ * that started waiting in the round trip is in this window's own table and is *not* in the
+ * reply, so replacing would throw away the first thing the window learned for itself — and
+ * the marker would only come back on the next transition, which for a session that has
+ * finished its turn is never.
+ *
+ * The catch-up is needed at all because `cide://session-awaiting` is a change notification.
+ * A window built by a detach is opened *between* changes: Rust has already written
+ * `Awaiting: 1` into its OS title, and without this the pane inside it would show nothing.
+ */
+export function adopt(
+  tracks: ReadonlyMap<string, Track>,
+  awaiting: readonly string[],
+): Map<string, Track> {
+  const next = new Map(tracks)
+  for (const session of awaiting) {
+    const track = next.get(session)
+    next.set(
+      session,
+      track === undefined
+        ? { ranATurn: true, awaiting: true, gone: false }
+        : { ...track, awaiting: true },
+    )
+  }
+  return next
+}

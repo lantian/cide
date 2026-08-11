@@ -308,6 +308,7 @@ pub fn run() {
             cmd::window::window_close,
             cmd::window::window_list,
             cmd::window::window_set_awaiting,
+            cmd::window::window_awaiting_sessions,
             cmd::fs::fs_index,
             cmd::fs::fs_close,
             cmd::fs::fs_status,

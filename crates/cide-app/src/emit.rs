@@ -124,6 +124,10 @@ pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value)
 ///   the only thing that can paint its markers correctly is the complete set; and
 /// * the set is tiny. It is the number of Claude panes that are waiting, which is a handful.
 ///
+/// It is still only a *change* notification, which is the half this cannot do on its own: a
+/// window that opens between two changes hears nothing, and a freshly detached window is
+/// exactly that. It asks instead, once, through `window_awaiting_sessions`.
+///
 /// The decision about membership is *not* made here. "Finished a turn and is waiting" needs a
 /// bit of history that `SessionState` does not carry (see `ui/src/panes/awaitingRule.ts`), so
 /// the frontend reports it and `windows.rs` aggregates. This event is Rust telling every
