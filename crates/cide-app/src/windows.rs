@@ -149,6 +149,17 @@ pub fn create(
     } else {
         ""
     };
+    // `CIDE_CONSOLE_BRIDGE=1` forwards the webview's `console.error`/`warn` into the Rust log.
+    //
+    // There is otherwise no way to read this app's console: a WebKitGTK webview on Wayland has
+    // no terminal attached, and opening devtools needs a GUI window on the machine being
+    // debugged. Opt-in rather than always on for the reason written on the input probe above —
+    // `diag_log` is synchronous, so each forwarded line is a main-thread round trip.
+    let console_bridge = if std::env::var_os("CIDE_CONSOLE_BRIDGE").is_some() {
+        "&console=1"
+    } else {
+        ""
+    };
     // `CIDE_AUDIT_WINDOWS=1` runs M5's acceptance check: detach and re-dock round trips and
     // window-mode flips, asserting no session is lost to any of them.
     let wins = if std::env::var_os("CIDE_AUDIT_WINDOWS").is_some() {
@@ -167,7 +178,7 @@ pub fn create(
     };
     let url = WebviewUrl::App(
         format!(
-            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}",
+            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}{console_bridge}",
             label.as_str()
         )
         .into(),

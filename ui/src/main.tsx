@@ -6,10 +6,15 @@ import { App } from './App'
 // a beat. Both are bundled locally — the CSP names no external font host.
 import './styles/fonts.css'
 import './styles/tokens.css'
+import { installConsoleBridge } from './ipc/consoleBridge'
 import { installThemeSync } from './settings/useSettings'
 
 const root = document.getElementById('root')
 if (!root) throw new Error('#root is missing from index.html')
+
+// First of the two, so anything the rest of the boot throws is written down rather than lost
+// in a console nothing can read. A no-op unless `CIDE_CONSOLE_BRIDGE=1` asked for it.
+installConsoleBridge()
 
 // Make this window follow a theme change made in a *different* window.
 //

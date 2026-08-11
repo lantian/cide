@@ -51,14 +51,25 @@ pub fn diag_push_bytes(len: usize, count: usize, sink: Channel<InvokeResponseBod
     });
 }
 
-/// Forward a frontend diagnostic to the app's stderr.
+/// Forward a frontend diagnostic into the app's log.
 ///
 /// The webview's own console is not reachable from a shell, and on Wayland the devtools
-/// window is as hard to raise as the app window itself. A one-line command that puts
-/// frontend state next to the Rust log is worth more than either.
+/// window is as hard to raise as the app window itself. A one-line command that puts frontend
+/// state next to the Rust log is worth more than either.
+///
+/// **Through `tracing`, not `eprintln!`, and that was a real defect rather than a tidy-up.**
+/// This is documented as the one way a message gets out of the webview, and the instruction
+/// that goes with it is "read the log file" — but stderr does not go to the log file. It goes
+/// to whatever the process was launched from, which for a desktop launcher is nowhere and for
+/// `run.sh` is a terminal nobody is reading. Every frontend diagnostic this app has ever
+/// emitted — the input probe's per-keystroke trace, the console bridge, write failures —
+/// landed somewhere the person who asked for it was not looking.
+///
+/// `target:` names the frontend explicitly, so a filter can raise or silence the webview's
+/// output without touching the Rust modules' own levels.
 #[tauri::command]
 pub fn diag_log(message: String) {
-    eprintln!("[cide/ui] {message}");
+    tracing::info!(target: "cide::ui", "{message}");
 }
 
 /// Print a finished benchmark report to stdout and exit if this was a headless bench run.

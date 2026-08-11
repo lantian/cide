@@ -55,6 +55,10 @@ for arg in "$@"; do
     # throughput on a flood of output — an upstream defect makes it permanently repaint the
     # whole screen every frame once its glyph atlas fills. See `crates/cide-app/src/windows.rs`.
     --webgl-renderer) env_flags+=(CIDE_RENDERER=webgl) ;;
+    # Everything needed to see inside the webview: the console forwarded into the Rust log,
+    # and WebKitGTK's remote inspector on 127.0.0.1:9222. Both off by default — the bridge
+    # costs a synchronous IPC round trip per line, and the inspector opens a listening port.
+    --inspect)        env_flags+=(CIDE_CONSOLE_BRIDGE=1 WEBKIT_INSPECTOR_SERVER=127.0.0.1:9222) ;;
     --on-top)         env_flags+=(CIDE_ON_TOP=1) ;;
     --fresh)          fresh=1 ;;
     *) echo "unknown option: $arg" >&2; sed -n '20,29p' "$0" >&2; exit 2 ;;
