@@ -308,13 +308,124 @@ try {
     )
   }
 
+  // --- typography: never ask the engine for a face this app did not bundle ----------------
+  //
+  // Same class of bug as the palette above, and the same reason it lives in a script: it
+  // fails *silently*. A stylesheet asking for a weight or a style with no bundled face does
+  // not error — the engine picks the nearest real face and, unless `font-synthesis` says
+  // otherwise, emboldens or shears it. That is the "fonts are ugly" report: `<h3>`, `<b>` and
+  // `<strong>` were being fake-bolded out of the 600 face because the UA sheet asks for 700
+  // and IBM Plex Sans ships 400/500/600, and five surfaces asking `font-style: italic` were
+  // getting an obliqued upright because no italic was imported at all.
+  //
+  // What this proves: the imports in `fonts.css`, the declarations in the modules, and the
+  // one rule that normalises the UA's 700 agree with each other. What it cannot prove is what
+  // reaches a screen — there is no engine in this process. `font-synthesis: none` is asserted
+  // because it is the backstop that turns any future disagreement into a visibly wrong weight
+  // rather than an invisible smear.
+  const fontsCss = readFileSync('src/styles/fonts.css', 'utf8')
+  const bundled = new Map()
+  for (const m of fontsCss.matchAll(/@import '@fontsource\/([\w-]+)\/(\d+)(-italic)?\.css'/g)) {
+    const faces = bundled.get(m[1]) ?? { weights: new Set(), italics: new Set() }
+    ;(m[3] ? faces.italics : faces.weights).add(Number(m[2]))
+    bundled.set(m[1], faces)
+  }
+  ok(bundled.size === 2, '`fonts.css` still imports exactly two families from @fontsource')
+
+  // The map from a package name to the family a stylesheet names. Asserted rather than
+  // assumed: everything below reads `--font-ui`/`--font-mono` as "the IBM Plex Sans stack"
+  // and "the JetBrains Mono stack", and a swapped stack would make every check here vacuous.
+  const stacks = resolveTheme(docRules, 'light', ['--font-ui', '--font-mono'])
+  ok(
+    (stacks['--font-ui'] ?? '').startsWith("'IBM Plex Sans'"),
+    '`--font-ui` still leads with the family `fonts.css` imports as `ibm-plex-sans`',
+  )
+  ok(
+    (stacks['--font-mono'] ?? '').startsWith("'JetBrains Mono'"),
+    '`--font-mono` still leads with the family `fonts.css` imports as `jetbrains-mono`',
+  )
+
+  // Both families are asked for an italic — `ContextMenu` and `ProxySection` in the UI face,
+  // the editor's comment token and every terminal that receives SGR 3 in the mono one — so
+  // both must ship one. Without a face here the engine shears the upright, which is the
+  // single most visible synthesis artefact in an editor because it is every comment.
+  for (const [pkg, faces] of bundled) {
+    ok(faces.italics.size > 0, `\`${pkg}\` bundles a real italic rather than leaving it synthesised`)
+  }
+
+  // A keyword is the trap, not a number: `bold` means 700, no stylesheet that writes it is
+  // thinking about which faces ship, and the UI family has no 700. Numbers are checked against
+  // the union of both families because a rule's family is not decidable from its text — this
+  // catches `800`, not a mono-only 700 written into a UI stylesheet.
+  const everyWeight = [...bundled.values()].flatMap((f) => [...f.weights, ...f.italics])
+  const badWeights = []
+  for (const file of [...cssModules('src'), 'src/styles/tokens.css']) {
+    const body = readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+    for (const m of body.matchAll(/font-weight:\s*([^;}]+)/g)) {
+      const value = m[1].trim()
+      if (/^var\(/.test(value) || value === 'inherit' || value === 'normal') continue
+      const weight = Number(value)
+      if (!Number.isFinite(weight) || !everyWeight.includes(weight)) {
+        badWeights.push(`${file}: font-weight: ${value}`)
+      }
+    }
+  }
+  eq(badWeights, [], 'every `font-weight` in the stylesheets is a weight `fonts.css` imports')
+
+  // The specific elements that were muddy. The UA sheet bolds them to 700 and no stylesheet
+  // says otherwise, so the normalisation has to be here or it is nowhere.
+  const uaBold = leafRules(readFileSync('src/styles/tokens.css', 'utf8')).find((r) =>
+    /(^|,\s*)strong$/.test(r.selector),
+  )
+  ok(uaBold !== undefined, 'tokens.css still normalises the elements the UA stylesheet bolds')
+  const uaParts = parts(uaBold?.selector ?? '')
+  eq(
+    ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'b', 'strong'].filter((el) => !uaParts.includes(el)),
+    [],
+    'and it covers every one of them — a heading level left out is fake-bolded again',
+  )
+  const uiWeights = bundled.get('ibm-plex-sans')?.weights ?? new Set()
+  const boldToken = resolveTheme(docRules, 'light', ['--w-bold'])['--w-bold']
+  ok(
+    /var\(--w-bold\)/.test(uaBold?.body ?? '') && uiWeights.has(Number(boldToken)),
+    `\`--w-bold\` (${boldToken}) is a weight the UI family actually ships`,
+  )
+
+  // The backstop, and the line it replaced. `-webkit-font-smoothing` is implemented against
+  // CoreGraphics on macOS only; on WebKitGTK it is parsed and dropped, so it was a rule that
+  // could never have an effect sitting exactly where the next reader looks for one.
+  const rootCss = readFileSync('src/styles/tokens.css', 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+  ok(/font-synthesis:\s*none/.test(rootCss), '`font-synthesis: none` still forbids a faked face')
+  ok(
+    !/-webkit-font-smoothing/.test(rootCss),
+    '`-webkit-font-smoothing` has not come back — it does nothing on this engine',
+  )
+
+  // Every token in the mono scale has a reader. `--lh-code` shipped without one: declared,
+  // documented as "what CSS uses", and read by no rule, while the editor restated `21px`.
+  const moduleText = cssModules('src')
+    .map((f) => readFileSync(f, 'utf8'))
+    .join('\n')
+  const xtermText = readFileSync('src/terminal/xterm.ts', 'utf8')
+  for (const token of ['--fs-code', '--lh-code']) {
+    ok(
+      moduleText.includes(`var(${token})`),
+      `\`${token}\` is read by a stylesheet rather than restated as a literal beside it`,
+    )
+  }
+  ok(
+    xtermText.includes('--fs-code') && xtermText.includes('--term-line-height'),
+    'the terminal derives its cell from the same scale rather than its own numbers',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
   }
   console.log(
     `theme: ok (${themeRules.length} palette rules, ${TERMINAL_TOKENS.length} terminal tokens, ` +
-      `${referenced.size} referenced by stylesheets)`,
+      `${referenced.size} referenced by stylesheets, ` +
+      `${[...bundled.values()].reduce((n, f) => n + f.weights.size + f.italics.size, 0)} faces)`,
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

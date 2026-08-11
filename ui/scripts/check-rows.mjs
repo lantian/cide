@@ -238,8 +238,13 @@ try {
   )
   const headerCss = readFileSync('src/chrome/AppHeader.module.css', 'utf8')
   const tabsRule = /\.tabs \{[^}]*\}/.exec(headerCss)?.[0] ?? ''
+  // `flex-grow` read out of the shorthand rather than "the text is not `flex: 1;`": the whole
+  // point is that this box must not take the header's slack, and `flex: 1 1 auto` takes it
+  // just as `flex: 1` does while reading nothing like it. Shrink is deliberately not pinned —
+  // it may shrink, it may not grow.
+  const grow = /flex:\s*([\d.]+)/.exec(tabsRule)?.[1]
   ok(
-    /overflow:\s*hidden/.test(tabsRule) && !/flex:\s*1\s*;/.test(tabsRule),
+    /overflow:\s*hidden/.test(tabsRule) && grow === '0',
     '`.tabs` still clips, and no longer claims the header’s slack — `.filler` does',
   )
 

@@ -212,11 +212,13 @@
   /*
    * The mono type scale, shared by every surface that shows code.
    *
-   * `editor/EditorSurface.module.css` states these two literally on `.cm-scroller`, and
-   * `terminal/xterm.ts` reads them off this block. They are a token rather than two copies of
-   * `12.5px` because the terminal and the editor sit side by side in the same tab: a half-pixel
+   * `editor/EditorSurface.module.css` reads both off this block and `terminal/xterm.ts` reads
+   * `--fs-code` and `--term-line-height`. They are a token rather than two copies of `12.5px`
+   * because the terminal and the editor sit side by side in the same tab: a half-pixel
    * difference between them reads as two different fonts, which is what shipped — the terminal
-   * was at 12px while the editor was at the mock's 12.5px.
+   * was at 12px while the editor was at the mock's 12.5px. `check-theme.mjs` fails the day one
+   * of the three has no reader, which is the state `--lh-code` was left in: declared, described
+   * as "what CSS uses", and read by nothing.
    *
    * `--lh-code` is what CSS uses. `--term-line-height` is the same leading expressed the only
    * way xterm.js accepts it: its `lineHeight` option is a **multiplier on the measured glyph

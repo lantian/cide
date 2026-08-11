@@ -112,11 +112,21 @@
  * same number. They are separate because canvas cannot read a custom property; if one moves
  * the other must, and `scripts/check-editor.mjs` fails the day only one of them does.
  */
+/*
+ * The mono scale is `tokens.css`'s, not this file's.
+ *
+ * These were the literals `12.5px` and `21px`, and `terminal/xterm.ts` was the literals `12`
+ * and `1.35` — a terminal beside an editor in the same tab drew the same typeface half a
+ * pixel smaller, which reads as two typefaces rather than two sizes. The terminal now derives
+ * its cell from `--fs-code`, so this rule stating the number a second time would put the two
+ * back on separate copies that agree only until somebody edits one. `check-theme.mjs` fails
+ * the day either token has no reader.
+ */
 .body :global(.cm-scroller) {
   margin-right: var(--w-minimap);
   font-family: var(--font-mono);
-  font-size: 12.5px;
-  line-height: 21px;
+  font-size: var(--fs-code);
+  line-height: var(--lh-code);
 }
 
 .body :global(.cm-content) {
