@@ -3,6 +3,8 @@
 //! Field names and defaults track the design mock's Settings screen exactly, including the
 //! toggles' default states, so the UI has nothing to invent.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -55,6 +57,7 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub graphics: GraphicsSettings,
     pub claude: ClaudeSettings,
+    pub proxy: ProxySettings,
 }
 
 impl Default for Settings {
@@ -70,6 +73,7 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             graphics: GraphicsSettings::default(),
             claude: ClaudeSettings::default(),
+            proxy: ProxySettings::default(),
         }
     }
 }
@@ -165,4 +169,236 @@ pub struct ClaudeSettings {
     pub alt_screen_full_repaint: bool,
     /// `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`.
     pub disable_alternate_screen: bool,
+}
+
+/// What cide does about the proxy variables in a child's environment.
+///
+/// Three states rather than a bool, because "do not proxy" and "do not interfere" are
+/// different answers and a corporate laptop needs both. A single on/off switch would have to
+/// pick one of them to be its off position: off-as-inherit leaves a user whose profile
+/// exports `HTTP_PROXY` with no way to run a pane without it, and off-as-direct silently
+/// breaks every pane the moment the app ships to somebody who does export one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ProxyMode {
+    /// Whatever the environment already says. cide sets nothing and scrubs nothing.
+    ///
+    /// The default, and the only mode in which a child's proxy environment is not entirely
+    /// cide's doing. One exception, and it is not a proxy setting: if the inherited
+    /// environment *does* name a proxy, the loopback exemption is still merged into
+    /// `NO_PROXY` — see [`ProxySettings::no_proxy`].
+    #[default]
+    Inherit,
+    /// The URLs below, overriding anything inherited. A blank field means the variable is
+    /// **removed**, not left alone: a mode that says "this is the proxy" must not let a
+    /// forgotten profile export supply the half the user left empty.
+    Manual,
+    /// No proxy for anything cide spawns. Every spelling is scrubbed from the child.
+    Direct,
+}
+
+/// Proxy configuration, applied to every child cide spawns — `$SHELL` panes and `claude`
+/// alike.
+///
+/// # This is where a password can end up
+///
+/// `http://user:hunter2@proxy.corp:3128` is a legal and common value, and this struct is
+/// serialized into `workspace.json` in plain text, which is the only way a proxy that needs
+/// credentials can work at all without a keyring cide does not have. What is *not* acceptable
+/// is that value leaking sideways into a log the user then pastes into a bug report, so
+/// [`Debug`] is implemented by hand and redacts the userinfo. That is deliberately at the
+/// type level rather than at each call site: `tracing::debug!(?settings)` anywhere in the app
+/// would otherwise print the password, and there is no way to review every future call site.
+///
+/// The alternative that lost was storing the credentials separately in the OS keyring. It is
+/// the right answer and it is a milestone of its own — Secret Service over zbus, a fallback
+/// for machines with no keyring daemon, and a migration for the value already on disk.
+/// Redacted `Debug` is what makes the plain-text version defensible in the meantime.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ProxySettings {
+    pub mode: ProxyMode,
+    /// `HTTP_PROXY`/`http_proxy`. Empty means the variable is not set.
+    pub http: String,
+    /// `HTTPS_PROXY`/`https_proxy`. Empty **falls back to [`Self::http`]**, because one
+    /// CONNECT proxy for both schemes is the overwhelmingly common shape and asking for it
+    /// twice is how one of the two ends up stale.
+    pub https: String,
+    /// `ALL_PROXY`/`all_proxy`, usually a SOCKS URL.
+    ///
+    /// No fallback from [`Self::http`], unlike `https`: `ALL_PROXY` covers protocols beyond
+    /// HTTP, and quietly pointing them at an HTTP CONNECT proxy the user only meant for web
+    /// traffic changes behaviour they did not ask for.
+    pub all: String,
+    /// Extra `NO_PROXY` entries, comma separated — the corporate intranet, a registry mirror.
+    ///
+    /// `localhost`, `127.0.0.1` and `::1` are always prepended and cannot be removed. cide's
+    /// IDE integration is an MCP server on loopback (`CLAUDE_CODE_SSE_PORT`), and a proxy
+    /// that swallows loopback turns the headline feature — inline diffs, @-mentions, the
+    /// editor selection — off with no error anywhere. Users do not think to exempt a port
+    /// they were never told about.
+    pub no_proxy: String,
+}
+
+impl ProxySettings {
+    /// The `HTTPS_PROXY` value, after the fallback described on [`Self::https`].
+    pub fn https_url(&self) -> Option<String> {
+        normalize_proxy_url(&self.https).or_else(|| normalize_proxy_url(&self.http))
+    }
+}
+
+impl fmt::Debug for ProxySettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxySettings")
+            .field("mode", &self.mode)
+            .field("http", &redact_proxy_url(&self.http))
+            .field("https", &redact_proxy_url(&self.https))
+            .field("all", &redact_proxy_url(&self.all))
+            // Not a URL and cannot carry userinfo, so it is printed as it stands.
+            .field("no_proxy", &self.no_proxy)
+            .finish()
+    }
+}
+
+/// A proxy URL as a child process should see it, or `None` for "not set".
+///
+/// Blank-is-unset rather than `Option<String>` on the struct: the UI binds text inputs to
+/// these fields, and a control that has to distinguish "" from `None` grows a second piece of
+/// state that disagrees with the first one.
+///
+/// A scheme is added when there is none. `proxy.corp:3128` is what people type and what curl
+/// accepts (defaulting to HTTP), but `new URL()` in Node throws on it and the Claude CLI is
+/// Node — so the same string would proxy a `curl` in a shell pane and fail in the pane next to
+/// it. Normalising here means every consumer is handed the same unambiguous answer.
+pub fn normalize_proxy_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("http://{trimmed}"))
+    }
+}
+
+/// A proxy URL with any credentials removed, safe to put in a log line or an error message.
+///
+/// The host survives, because a redaction that hides the host too makes the log line useless
+/// for the one question it is there to answer — which proxy did this child get. Only the
+/// userinfo before `@` is a secret.
+///
+/// A string walk rather than a URL crate: this must never fail, and a parser that rejects a
+/// malformed value would leave the caller holding the raw string with the password in it.
+/// Anything this cannot make sense of is redacted whole.
+pub fn redact_proxy_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // Nothing to anchor on, so nothing can be shown to be safe.
+        return if url.contains('@') {
+            "***".to_string()
+        } else {
+            url.to_string()
+        };
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    // `rsplit_once`, not `split_once`: a password may itself contain an `@`, and splitting on
+    // the first one would print the tail of it.
+    match rest[..authority_end].rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{}", &rest[authority_end..]),
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The password must not survive `{:?}`, however the settings are printed.
+    ///
+    /// The whole struct, not the field: this is the leak that a future
+    /// `tracing::debug!(?settings)` would cause, and the point of the manual `Debug` is that
+    /// such a call site does not have to know about proxies to be safe.
+    #[test]
+    fn a_password_does_not_survive_debug() {
+        let proxy = ProxySettings {
+            mode: ProxyMode::Manual,
+            http: "http://alice:hunter2@proxy.corp:3128".into(),
+            https: "http://alice:hunter2@proxy.corp:3128".into(),
+            all: "socks5://alice:hunter2@socks.corp:1080".into(),
+            no_proxy: "corp.internal".into(),
+        };
+        let settings = Settings {
+            proxy: proxy.clone(),
+            ..Settings::default()
+        };
+
+        for printed in [format!("{proxy:?}"), format!("{settings:?}")] {
+            assert!(!printed.contains("hunter2"), "password leaked: {printed}");
+            assert!(!printed.contains("alice"), "username leaked: {printed}");
+            // The host is what makes the line worth logging at all.
+            assert!(printed.contains("proxy.corp:3128"), "host lost: {printed}");
+        }
+    }
+
+    #[test]
+    fn redaction_keeps_the_host_and_drops_the_userinfo() {
+        assert_eq!(
+            redact_proxy_url("http://u:p@proxy.corp:3128"),
+            "http://***@proxy.corp:3128"
+        );
+        // An `@` inside the password must not put part of it on screen.
+        assert_eq!(
+            redact_proxy_url("http://u:p@ss@proxy.corp:3128"),
+            "http://***@proxy.corp:3128"
+        );
+        // Nothing to hide: printed as it stands.
+        assert_eq!(
+            redact_proxy_url("http://proxy.corp:3128"),
+            "http://proxy.corp:3128"
+        );
+        assert_eq!(redact_proxy_url(""), "");
+        // Unparseable *and* carrying an `@`: redacted whole rather than guessed at.
+        assert_eq!(redact_proxy_url("u:p@proxy.corp:3128"), "***");
+    }
+
+    #[test]
+    fn a_bare_host_and_port_gains_the_scheme_node_insists_on() {
+        assert_eq!(
+            normalize_proxy_url(" proxy.corp:3128 ").as_deref(),
+            Some("http://proxy.corp:3128")
+        );
+        assert_eq!(
+            normalize_proxy_url("socks5h://localhost:9050").as_deref(),
+            Some("socks5h://localhost:9050")
+        );
+        assert_eq!(normalize_proxy_url("   "), None);
+    }
+
+    /// The one-proxy-for-both case, which is what most corporate setups are.
+    #[test]
+    fn https_falls_back_to_http_but_never_the_other_way() {
+        let proxy = ProxySettings {
+            mode: ProxyMode::Manual,
+            http: "http://proxy.corp:3128".into(),
+            ..ProxySettings::default()
+        };
+        assert_eq!(proxy.https_url().as_deref(), Some("http://proxy.corp:3128"));
+
+        let https_only = ProxySettings {
+            mode: ProxyMode::Manual,
+            https: "http://tls.corp:3129".into(),
+            ..ProxySettings::default()
+        };
+        assert_eq!(
+            https_only.https_url().as_deref(),
+            Some("http://tls.corp:3129")
+        );
+        assert_eq!(
+            normalize_proxy_url(&https_only.http),
+            None,
+            "http stays unset"
+        );
+    }
 }

@@ -2,6 +2,7 @@
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
+import type { ProxySettings } from "./ProxySettings";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
 
@@ -21,4 +22,12 @@ import type { Theme } from "./Theme";
  * with the workspace only when the user happened to use the right one. The radio cards call
  * `window.set_mode`.
  */
-export type SettingsPatch = { theme?: Theme, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, };
+export type SettingsPatch = { theme?: Theme, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
+/**
+ * Proxy configuration. Sent whole like every other group, which for this one also means
+ * the URLs — credentials included — cross the IPC boundary on every keystroke-debounced
+ * save. That is the same trip `settings.get` already makes in the other direction, and
+ * the boundary is in-process; see [`crate::settings::ProxySettings`] for what is done
+ * about the value once it is at rest.
+ */
+proxy?: ProxySettings, };

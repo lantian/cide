@@ -1,0 +1,141 @@
+/*
+ * The proxy section's own layout: a stacked full-width field, and the environment readout.
+ *
+ * Everything is a token from `styles/tokens.css`, so both themes follow without a media
+ * query. Light is the default palette and it is white — `--panel-2` is #f6f6f9 there and
+ * #0e0e10 in the dark, which is why the input's background is that token rather than a
+ * literal.
+ */
+
+/* --- the mode choice --- */
+
+.modeRow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0 11px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.modeHint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+  /* The three hints differ in length; a fixed floor stops the section below jumping when the
+     user tries each mode in turn. Three lines at 12px/1.45. */
+  min-height: 52px;
+}
+
+/* --- a stacked text field --- */
+
+.field {
+  display: block;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.field:last-child {
+  border-bottom: 0;
+}
+
+.fieldLabel {
+  display: block;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  /* A URL is a machine string: mono, like every path and counter in this app. */
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.fieldHint {
+  display: block;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 5px;
+}
+
+/* --- the environment readout --- */
+
+.readout {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  padding: 8px 10px;
+  /* A long proxy URL must scroll inside the box rather than widening the settings pane. */
+  overflow-x: auto;
+}
+
+.readoutRow {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  white-space: nowrap;
+}
+
+.readoutName {
+  flex: none;
+  width: 108px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.readoutValue {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  user-select: text;
+}
+
+/* A removed variable is not a value, so it does not get a value's weight. */
+.readoutUnset {
+  margin: 0;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--faint);
+}
+
+.readoutEmpty,
+.readoutFoot {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.readoutEmpty {
+  margin-top: 0;
+}
+
+.readoutEmpty code,
+.readoutFoot code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+}
