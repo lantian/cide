@@ -28,6 +28,7 @@
 import type {
   ChangeEntry,
   ChangesTree,
+  DiffOpenMode,
   FileState,
   GroupKind,
   GroupView,
@@ -95,6 +96,25 @@ const SEP = '\u0000'
 
 /** The group id the ignored list always has, so a row id can be recognised without a lookup. */
 export const IGNORED_GROUP = 'ignored'
+
+/**
+ * Which command a gesture that opens should route to.
+ *
+ * `gitTreeClick` returns `open` for two different reasons — a double-click, or a single click
+ * while a diff is already up — and routing both to `tab_open_diff` is what produced thirty
+ * tabs for one walk down a changelist. This is the second half of that decision, and it lives
+ * here rather than inline in `ChangesTree` for one reason: `ChangesTree` is a React component
+ * with a DOM, so nothing in this repo can execute it, and the mapping was the last unexecuted
+ * link between the click rule and the Rust that fixes the bug. `check-git-tree.mjs` imports
+ * this under node and runs it.
+ *
+ * Not folded into `clickSemantics.ts`: that module is shared with the file tree and the search
+ * results, and neither of them has a diff to retarget. Not a fourth field on `RowAction` for
+ * the same reason.
+ */
+export function diffOpenMode(gesture: 'single' | 'double'): DiffOpenMode {
+  return gesture === 'single' ? 'retarget' : 'open'
+}
 
 export function repoRowId(repo: RepoId): string {
   return `${repo}${SEP}repo`

@@ -512,6 +512,10 @@ pub fn retarget_diff(
     }
 
     let title = spec.title.clone();
+    // Collected before the mutable borrow below, because `ws.windows` is the only record of
+    // which tab a torn-out pane belongs to and `project_mut` wants the whole workspace.
+    let torn_out = detached_panes_of(ws, project, tab);
+
     let t = tab_mut(ws, project, tab)?;
     let TabKind::Diff { spec: slot, .. } = &mut t.kind else {
         unreachable!("checked above under an immutable borrow")
@@ -522,8 +526,43 @@ pub fn retarget_diff(
             pane.title = title.clone();
         }
     }
+
+    // A detached pane is *not* in its tab's tree — [`detach_pane`] moved it into
+    // `project.detached` to keep the leaf set and the key set equal — so the loop above
+    // cannot reach one, and the `pane:<uuid>` window draws its header straight from
+    // `project.detached[pane].title`. Without this a diff torn into its own window would go
+    // on naming the file it was torn out on while showing every file clicked since.
+    let p = project_mut(ws, project)?;
+    for id in torn_out {
+        if let Some(pane) = p.detached.get_mut(&id)
+            && pane.kind == PaneKind::Diff
+        {
+            pane.title = title.clone();
+        }
+    }
+
     bump(ws);
     Ok(())
+}
+
+/// The panes torn out of one tab, as recorded by the windows showing them.
+///
+/// `project.detached` is keyed by [`PaneId`] alone and does not say which tab a pane came
+/// from; [`WindowRole::DetachedPane`] does, so the window map is the index. Scanned rather
+/// than cached — a project holds a handful of windows at most, and a second map keyed by tab
+/// would be a third thing to keep in step with `detached` and `dock_anchors`.
+fn detached_panes_of(ws: &Workspace, project: ProjectId, tab: TabId) -> Vec<PaneId> {
+    ws.windows
+        .values()
+        .filter_map(|role| match role {
+            WindowRole::DetachedPane {
+                project: p,
+                tab: t,
+                pane,
+            } if *p == project && *t == tab => Some(*pane),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Promote a preview diff tab to a kept one — the double-click half of the pair.
@@ -2978,6 +3017,56 @@ mod tests {
             t.tree.panes.keys().collect::<Vec<_>>(),
             tree_before.panes.keys().collect::<Vec<_>>(),
             "the pane ids are the addresses every later command uses; they do not move"
+        );
+    }
+
+    /// A diff pane torn into its own window is renamed too.
+    ///
+    /// `detach_pane` takes the pane *out* of the tab's tree and parks it in
+    /// `project.detached`, so the rename loop over `tree.panes` cannot see it — and
+    /// `DetachedPaneWindow` draws its header from exactly that parked copy. A diff pulled out
+    /// into a window and then clicked past would otherwise keep the title it was torn out on
+    /// for ever, which is the same stale header the in-tree rename exists to prevent.
+    ///
+    /// A diff pane is `PaneRole::Auxiliary`, and `PaneTitleBar` offers Detach on every pane
+    /// that is not `Primary` — so this is a gesture the product actually has, not a state
+    /// reachable only from a test.
+    #[test]
+    fn retargeting_renames_a_diff_pane_that_was_torn_into_its_own_window() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (id, _) = open_diff(&mut ws, project, "src/a.rs", true);
+
+        // A second pane, because `take_pane` refuses to detach a tab's last one.
+        let torn = {
+            let t = tab_mut(&mut ws, project, id).expect("exists");
+            let target = t.tree.focused;
+            layout::split(
+                &mut t.tree,
+                target,
+                Axis::Row,
+                Side::After,
+                demo_pane(PaneKind::Diff, "src/a.rs — diff", false),
+            )
+            .expect("splits")
+        };
+        detach_pane(&mut ws, project, id, torn).expect("detaches");
+
+        retarget_diff(&mut ws, project, id, git_spec("src/b.rs")).expect("retargets");
+
+        assert_eq!(
+            super::project(&ws, project).expect("exists").detached[&torn].title,
+            "src/b.rs — diff",
+            "the window torn out of this tab names the file the tab now shows",
+        );
+        assert!(
+            tab(&ws, project, id)
+                .expect("exists")
+                .tree
+                .panes
+                .values()
+                .all(|p| p.kind != PaneKind::Diff || p.title == "src/b.rs — diff"),
+            "and the panes still in the tree are renamed as before",
         );
     }
 

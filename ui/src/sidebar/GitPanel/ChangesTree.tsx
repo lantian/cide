@@ -36,6 +36,7 @@
 import { useCallback, useRef, type KeyboardEvent, type ReactNode } from 'react'
 import {
   checkState,
+  diffOpenMode,
   entryStatus,
   isPartiallyStaged,
   splitPath,
@@ -246,14 +247,18 @@ export function ChangesTree({
                * already up — and until now both went to `tab_open_diff`, which reuses a tab
                * only when the path matches. That is where the thirty tabs came from.
                *
-               * Recomputing `gesture === 'single'` here rather than adding a fourth boolean
-               * to `RowAction`: `clickSemantics.ts` is shared with the file tree and the
-               * search results, neither of which has anything to retarget, and the caller
-               * already holds the gesture that produced the action. A single click that
-               * opens is *only* reachable through `diffOpen`, so this needs no second look
-               * at that flag — see `gitTreeClick`.
+               * Derived from the gesture this handler already holds rather than from a fourth
+               * boolean on `RowAction`: `clickSemantics.ts` is shared with the file tree and
+               * the search results, neither of which has anything to retarget. A single click
+               * that opens is *only* reachable through `diffOpen`, so this needs no second
+               * look at that flag — see `gitTreeClick`.
+               *
+               * Through `diffOpenMode` rather than inline, because this component cannot be
+               * executed by anything in the repo — it needs a DOM — and an inline ternary here
+               * was the one link in the chain from the click rule to `tab_retarget_diff` that
+               * no test could reach. `check-git-tree.mjs` runs that function under node.
                */
-              if (action.open) onOpenDiff(row, gesture === 'single' ? 'retarget' : 'open')
+              if (action.open) onOpenDiff(row, diffOpenMode(gesture))
             }}
             onKeyDown={(e) => onKeyDown(e, row, index)}
           >

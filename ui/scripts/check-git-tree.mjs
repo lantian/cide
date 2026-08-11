@@ -621,6 +621,61 @@ try {
       + 'folding on both halves would open the group and shut it again in one gesture',
   )
 
+  // --- and WHICH command an opening gesture routes to ------------------------------------
+
+  /*
+   * `gitTreeClick` above says *whether* a gesture opens. It returns `open` for two different
+   * reasons, and until the retarget landed both went to `tab_open_diff`, whose reuse is keyed
+   * on (repo, path) — so a single click down a 30-file changelist produced 30 tabs, which is
+   * the bug the user reported. The second half of the decision is therefore load-bearing and
+   * is checked here rather than left as an inline ternary in `ChangesTree`, which needs a DOM
+   * and so cannot be executed by anything in this repo.
+   */
+  eq(
+    m.diffOpenMode('single'),
+    'retarget',
+    'a single click that opens RETARGETS — one tab follows the pointer down the changelist',
+  )
+  eq(
+    m.diffOpenMode('double'),
+    'open',
+    'and a double click opens a tab of its own, which is what marks it kept in Rust',
+  )
+
+  /*
+   * The mapping being right is worth nothing if nothing calls it, and this project has shipped
+   * a feature that was correct and unreachable more than once — see the note at the end of
+   * `check-rows.mjs`. Everything from here down is a source assertion, and worth being exact
+   * about what that buys: it proves the chain is spelled out, not that a click travels it.
+   * The behaviour at the far end is covered by `cmd::file::tests` in Rust.
+   */
+  const tree = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangesTree.tsx'), 'utf8')
+  ok(
+    /onOpenDiff\(row,\s*diffOpenMode\(gesture\)\)/.test(tree),
+    'the mousedown handler routes through `diffOpenMode` — an inline ternary here is exactly '
+      + 'the link no test can reach',
+  )
+
+  const hook = readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8')
+  ok(
+    /mode === 'retarget'/.test(hook) && /gitDiffApi\.retargetTab\(/.test(hook),
+    '`showDiff` branches on the mode and calls `retargetTab` — without the branch every '
+      + 'gesture falls back to `openTab` and the thirty tabs come back',
+  )
+
+  const client = readFileSync(join(UI, 'src/ipc/client.ts'), 'utf8')
+  ok(
+    /retargetTab:[\s\S]{0,400}?invoke<TabId>\('tab_retarget_diff'/.test(client),
+    '`gitDiff.retargetTab` invokes `tab_retarget_diff`',
+  )
+  // One `gitDiff` namespace, not two. Two agents last round both appended a `clipboard`
+  // namespace to this file and the merge was a redeclaration; this is that rule, held.
+  eq(
+    (client.match(/^export const gitDiff = \{/gm) ?? []).length,
+    1,
+    'client.ts declares the `gitDiff` namespace exactly once',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)
