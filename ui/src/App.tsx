@@ -179,7 +179,15 @@ export function App() {
   const detachPane = useWorkspace((st) => st.detachPane)
   const redockPane = useWorkspace((st) => st.redockPane)
 
-  const [view, setView] = useState<ActivityView>('files')
+  /**
+   * Which sidebar view the rail has lit, or `null` for none — the sidebar hidden.
+   *
+   * `null` is a real state rather than an oversight: clicking the lit rail button hides its
+   * panel, so the workspace can have the full window width without dragging the splitter to
+   * the edge. `ActivityRail` has always typed `active` as nullable; nothing produced the
+   * value until now.
+   */
+  const [view, setView] = useState<ActivityView | null>('files')
   /**
    * Which overlay is up, if any. `null` is the ordinary state.
    *
@@ -606,13 +614,21 @@ export function App() {
             active={view}
             gitDirty={auditMode()}
             onSelect={(next) => {
-              setView(next)
               // The rail's ⚙ is the only gesture that reaches Settings until the command
               // palette lands, and Settings is a workspace tab rather than a sidebar view —
-              // so this one entry opens (or re-activates) the project's tab.
-              if (next === 'settings' && activeProjectId) {
-                void settingsApi.openTab(activeProjectId).then(() => hydrate())
+              // so this one entry opens (or re-activates) the project's tab. It is also the
+              // one entry the toggle below skips: it has no panel to hide, and a second
+              // click on it is the user asking for that tab back, not asking for nothing.
+              if (next === 'settings') {
+                setView('settings')
+                if (activeProjectId) {
+                  void settingsApi.openTab(activeProjectId).then(() => hydrate())
+                }
+                return
               }
+              // Clicking the lit button hides its panel; clicking any other one switches to
+              // it, whether or not the sidebar is currently hidden.
+              setView((current) => (current === next ? null : next))
             }}
           />
 
@@ -657,8 +673,12 @@ export function App() {
           {view === 'problems' && <ProblemsPanel project={activeProjectId} />}
           {/* The sidebar's drag edge — one handle for all four panels, because there are only
               two widths: `--w-sidebar-files` sizes the explorer, search and problems, and
-              `--w-sidebar-git` sizes git. Absent under `settings`, which has no panel. */}
-          {view !== 'settings' && <SidebarSplitter panel={view === 'git' ? 'git' : 'files'} />}
+              `--w-sidebar-git` sizes git. Absent under `settings`, which has no panel, and
+              while the sidebar is hidden: a handle with nothing to its left is a grab that
+              resizes something the user cannot see. */}
+          {view !== null && view !== 'settings' && (
+            <SidebarSplitter panel={view === 'git' ? 'git' : 'files'} />
+          )}
 
           <div className={styles.content}>
             {/* An open project always has a console tab, so its `activeTab` is always live —
