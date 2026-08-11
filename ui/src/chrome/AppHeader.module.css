@@ -49,11 +49,22 @@
   background: #7fb069;
 }
 
+/*
+ * The project strip, and *only* the project strip.
+ *
+ * `flex: 0 1 auto` rather than `flex: 1`, which is the fix for the control that could not be
+ * reached. This box clips (`overflow: hidden`) and every tab in it is `flex: none`, so anything
+ * placed inside after the last tab is pushed out of the window once the tabs are wider than the
+ * strip — which is what happened to the `+` and the recents caret at seven or eight projects.
+ * They are siblings now, and `.filler` beside them takes the slack this box used to claim, so
+ * the strip is only as wide as its tabs need until the header runs out of room and it starts
+ * clipping them.
+ */
 .tabs {
   display: flex;
   align-items: flex-end;
   gap: 1px;
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
 }
@@ -148,50 +159,85 @@
   font-weight: 400;
 }
 
+/*
+ * Open a project, and reopen a recent one: one split button, two obvious halves.
+ *
+ * The report was "project dropdown in header is almost on button open project — bad styling",
+ * and it was exactly right. Both halves used to be bare full-height buttons in the tab strip,
+ * and the caret carried `margin-left: -4px` so that its glyph sat *inside* the `+`'s padding
+ * box — an attempt to make them read as one control that instead made them read as one control
+ * someone had knocked out of alignment. There was no rule between them, no outline around them,
+ * and their hover highlights were two different shapes butted together.
+ *
+ * So the grouping is drawn rather than implied: a bordered 22px pill, the height of `.rowButton`
+ * and `.action` so the header's three control clusters share one silhouette, with a hairline
+ * between the halves. The alternative that lost was folding the recents list into a long-press
+ * or a right-click on `+` and deleting the caret — that removes the crowding by removing the
+ * affordance, and the request was for something visible that says a list exists.
+ */
+.projectMenu {
+  display: flex;
+  align-self: center;
+  flex: none;
+  height: 22px;
+  margin: 0 10px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  /* So the two halves' hover fills are clipped to the pill rather than squaring off its
+     rounded corners. */
+  overflow: hidden;
+}
+
+.projectMenu:hover {
+  border-color: var(--dim);
+}
+
 .add {
   display: flex;
   align-items: center;
-  height: 100%;
+  justify-content: center;
+  width: 26px;
   flex: none;
-  padding: 0 11px;
+  padding: 0;
   background: transparent;
+  /* The hairline that separates the two halves. On the `+` rather than on the caret so the
+     pill's own right border is never doubled. */
   border: 0;
-  color: var(--faint);
+  border-right: 1px solid var(--border);
+  color: var(--dim);
   font-family: inherit;
   font-size: 14px;
+  line-height: 1;
   cursor: pointer;
 }
 
 .add:hover {
   background: var(--chrome-hi);
-  color: var(--text);
+  color: var(--text-hi);
 }
 
-/*
- * The recent-projects caret, hard against the `+`.
- *
- * Narrower than `.add` and with no left padding, so the pair reads as one split control rather
- * than as two unrelated buttons that happen to be adjacent — which is what a symmetric 11px
- * gutter on both looked like.
- */
+/* The recent-projects caret: the narrower half, because it opens a menu rather than doing a
+   thing, and because `+` is the gesture that should be easiest to hit. */
 .recent {
   display: flex;
   align-items: center;
-  height: 100%;
+  justify-content: center;
+  width: 20px;
   flex: none;
-  padding: 0 8px 0 0;
-  margin-left: -4px;
+  padding: 0;
   background: transparent;
   border: 0;
   color: var(--faint);
   font-family: inherit;
-  font-size: 10px;
+  font-size: 9px;
+  line-height: 1;
   cursor: pointer;
 }
 
 .recent:hover,
 .recent[aria-expanded='true'] {
-  color: var(--text);
+  background: var(--chrome-hi);
+  color: var(--text-hi);
 }
 
 /*

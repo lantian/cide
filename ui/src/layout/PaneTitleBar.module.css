@@ -129,6 +129,33 @@
   color: var(--text-hi);
 }
 
+/*
+ * The one action that opens a menu instead of doing a thing.
+ *
+ * `⊞` alone said "add a pane" and the user had no way to know which kind they were about to
+ * get; the caret is the only affordance in this bar that says "there is a choice behind this".
+ * `inline-flex` with a 2px gap rather than a space character between the glyphs, because the
+ * bar is set in `--font-mono` and a literal space there is a full cell wide — which at 26px is
+ * enough to push the title's ellipsis.
+ */
+.actionMenu {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Smaller and dimmer than the glyph it hangs off: it is a hint about the control, not a
+   second control. It brightens with its parent because it is inside the button. */
+.caret {
+  font-size: 8px;
+  color: var(--faint);
+}
+
+.action:hover .caret,
+.action[aria-expanded='true'] .caret {
+  color: inherit;
+}
+
 .actionOn {
   color: var(--accent);
 }

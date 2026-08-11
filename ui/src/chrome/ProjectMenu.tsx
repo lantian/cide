@@ -39,7 +39,15 @@ export function ProjectMenu() {
    * every open, so there is no stale copy for a missing re-render to leave on screen.
    */
   const recents = useRef<readonly RecentEntry[]>([])
-  const button = useRef<HTMLButtonElement>(null)
+  /*
+   * The popup hangs off the whole split button, not off the caret that opened it.
+   *
+   * `openFor` anchors a menu at its target's left/bottom corner. Anchored on the caret — the
+   * right-hand half — the list dropped from a point a few pixels wide and stretched away to the
+   * right, reading as a menu belonging to nothing. Anchored here it drops flush with the `+`,
+   * under the control it came from, which is where every other dropdown in this app appears.
+   */
+  const anchor = useRef<HTMLDivElement>(null)
 
   const browse = useCallback(() => {
     void (async () => {
@@ -81,13 +89,21 @@ export function ProjectMenu() {
   const openRecents = useCallback(() => {
     void (async () => {
       recents.current = await projectMenu.recent()
-      const anchor = button.current
-      if (anchor) openFor(anchor)
+      const under = anchor.current
+      if (under) openFor(under)
     })()
   }, [openFor])
 
   return (
-    <>
+    /*
+     * One bordered pill holding both halves.
+     *
+     * The wrapper is not decoration for its own sake: it is what takes this control out of the
+     * header's `.tabs` box — see `AppHeader.tsx` — and it is what the popup anchors to. It also
+     * draws the separation the two buttons were faking with a negative margin, which is the
+     * "bad styling" in the report.
+     */
+    <div className={styles.projectMenu} ref={anchor}>
       <button type="button" className={styles.add} title="Open project" onClick={browse}>
         +
       </button>
@@ -97,7 +113,6 @@ export function ProjectMenu() {
        * says a list exists.
        */}
       <button
-        ref={button}
         type="button"
         className={styles.recent}
         title="Recent projects"
@@ -109,6 +124,6 @@ export function ProjectMenu() {
         ▾
       </button>
       {menu}
-    </>
+    </div>
   )
 }
