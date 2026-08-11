@@ -14,6 +14,9 @@ use crate::state::{AttachmentKey, SessionRegistry};
 pub enum SessionError {
     #[error("no such session")]
     NoSuchSession,
+    /// A plain resume naming a conversation this app already has open. See `session_spawn`.
+    #[error("session {0} is already open in this window; a conversation cannot be resumed twice")]
+    AlreadyOpen(SessionId),
     #[error("{0}")]
     Pty(String),
 }
@@ -23,6 +26,7 @@ impl serde::Serialize for SessionError {
         // Tagged, so the frontend branches on a variant rather than matching on prose.
         let (kind, message) = match self {
             Self::NoSuchSession => ("noSuchSession", self.to_string()),
+            Self::AlreadyOpen(_) => ("alreadyOpen", self.to_string()),
             Self::Pty(_) => ("pty", self.to_string()),
         };
         use serde::ser::SerializeStruct;
@@ -264,32 +268,12 @@ fn wants_fork(fork: Option<bool>) -> bool {
     fork.unwrap_or(false)
 }
 
-/// The conversation arguments for a Claude child.
-///
-/// Order matters and a wrong one fails silently, so this is a function with tests rather
-/// than a run of `.arg()` calls inline in a Tauri command.
-///
-/// `--fork-session` composing with `--session-id` was an open question in the plan, with a
-/// fallback designed around it possibly not working. It was checked against 2.1.226: the
-/// combination is accepted, the id we pass **is** honoured, the fork inherits the parent's
-/// history, and the parent's transcript survives untouched beside the fork's. Both remain
-/// independently resumable. So the id stays ours and no hook-learned correction is needed.
-///
-/// `fork` without `resume` is meaningless — there is nothing to branch from — and is treated
-/// as a plain new session rather than passed through to be rejected by the CLI.
-fn claude_args(id: SessionId, resume: Option<SessionId>, fork: bool) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(parent) = resume {
-        args.push("--resume".into());
-        args.push(parent.to_string());
-        if fork {
-            args.push("--fork-session".into());
-        }
-    }
-    args.push("--session-id".into());
-    args.push(id.to_string());
-    args
-}
+// The conversation arguments for a Claude child — and the id that child will report — used to
+// be built here, as `claude_args`. They now live in `cide_claude::session`, with the shapes,
+// the reason a plain resume names no `--session-id`, and the unit tests. They moved because
+// they are a fact about the CLI rather than about the Tauri command layer, and because
+// `cide-claude` is where an `#[ignore]`d test can put those exact argv shapes in front of the
+// installed binary — the check that would have caught 2.1.227 retracting the old ones.
 
 /// The inline `--settings` JSON, or `None` when `cide-hook` cannot be located.
 ///
@@ -375,16 +359,38 @@ pub async fn session_spawn(
     // handing it a `--settings` argument would simply be a bad argv.
     let is_claude = program_is_claude(&spec.program);
 
-    // Minted before the spawn, not after, because for a Claude pane this id *is* the value
-    // passed to `--session-id`. That equality is what makes everything downstream work: a
-    // hook reports the CLI's `session_id`, and unless the CLI was told to use ours, every
-    // frame it sends names a uuid this process has never heard of and is dropped. It is also
-    // what lets a restored pane resume with `--resume <id>` and no extra bookkeeping.
-    let id = SessionId::new();
+    // Minted before the spawn, not after, because for a Claude pane this id is *usually* the
+    // value passed to `--session-id`. That equality is what makes everything downstream work:
+    // a hook reports the CLI's `session_id`, and unless the CLI is using ours, every frame it
+    // sends names a uuid this process has never heard of and is dropped. It is also what lets
+    // a restored pane resume with `--resume <id>` and no extra bookkeeping.
+    //
+    // **"Usually", because a plain resume is the exception and it is not ours to choose.**
+    // The CLI keeps the parent's id when it is not forking, so `cide_claude::conversation`
+    // answers with the id the child will report, and everything below — the exit watcher,
+    // the registry key, the value returned to the frontend and therefore
+    // `pane_bind_session`'s `workspace.json` entry — uses that instead of the minted one.
+    let minted = SessionId::new();
+    let mut id = minted;
     if is_claude {
-        for a in claude_args(id, resume, wants_fork(fork)) {
+        let (effective, args) = cide_claude::conversation(minted, resume, wants_fork(fork));
+        id = effective;
+        for a in args {
             spec = spec.arg(a);
         }
+    }
+
+    // A plain resume adopts an id the registry may already hold, which no other spawn can do:
+    // every other shape mints a fresh uuid. Inserting over a live entry would replace the
+    // `Arc<PtySession>` that is the only handle to a running child — nothing could then write
+    // to it, kill it, or reap it, and quitting the app would leave it behind. Two panes
+    // resuming one conversation is also not a thing the CLI supports; the honest answer is to
+    // refuse the second, with a message that says which session and why.
+    if id != minted
+        && let Some(existing) = registry.get(id)
+        && !existing.has_exited()
+    {
+        return Err(SessionError::AlreadyOpen(id));
     }
 
     // `CLAUDE_CODE_SSE_PORT` is load-bearing, not a hint. It makes a port match alone mark our
@@ -423,9 +429,30 @@ pub async fn session_spawn(
         }
     }
 
-    let session =
-        blocking(move || PtySession::spawn(spec).map_err(|e| SessionError::Pty(e.to_string())))
-            .await?;
+    // What a restored *shell* gets instead of a resume. `resume` on a non-Claude program has
+    // never meant `--resume` — `bash` has no such flag and the argument was silently dropped —
+    // so it carries the one thing it can honestly carry: "this pane is continuing session X".
+    // For a shell that means replaying X's parting screen into the new child's mirror, plus a
+    // line saying the text is dead. See `lifecycle::shell_preload`.
+    //
+    // Naming it `resume` rather than adding a parameter is deliberate. The alternative was a
+    // second optional `replay` argument, which would have meant editing `session.spawn`'s
+    // options object in the middle of `ui/src/ipc/client.ts` — a file whose house rule is
+    // append-only because it has conflicted three rounds running. The field already exists,
+    // already means "this pane continues session X", and the two readings differ only in what
+    // a program can do with it.
+    let replay_for = (!is_claude).then_some(resume).flatten();
+
+    let session = blocking(move || {
+        // Inside the blocking closure, not outside it: the first call reads `screens.json`
+        // off disk, and every Tauri command that touches a filesystem in this app does it
+        // here rather than on the webview's thread.
+        if let Some(prior) = replay_for {
+            spec = spec.preload(crate::lifecycle::shell_preload(prior));
+        }
+        PtySession::spawn(spec).map_err(|e| SessionError::Pty(e.to_string()))
+    })
+    .await?;
 
     // The pid→pane binding is not done here: a session exists before it belongs to a pane,
     // and `pane_bind_session` is the one place that knows both. Binding early would have to
@@ -882,15 +909,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_session_only_names_itself() {
-        let id = SessionId::new();
-        assert_eq!(
-            claude_args(id, None, false),
-            vec!["--session-id".to_string(), id.to_string()]
-        );
-    }
-
-    #[test]
     fn a_spawn_that_says_nothing_about_forking_does_not_fork() {
         // The signature is the point of this test as much as the value: `wants_fork` takes an
         // `Option`, so restoring `fork: bool` on the command stops this compiling. That
@@ -903,54 +921,34 @@ mod tests {
 
         let id = SessionId::new();
         assert_eq!(
-            claude_args(id, None, wants_fork(None)),
-            vec!["--session-id".to_string(), id.to_string()],
+            cide_claude::conversation(id, None, wants_fork(None)),
+            (id, vec!["--session-id".to_string(), id.to_string()]),
             "an ordinary pane spawns plain"
         );
     }
 
     #[test]
-    fn resuming_names_the_parent_before_naming_the_new_session() {
-        // `--resume <parent>` and `--session-id <ours>` both take a uuid, so a swapped order
-        // is still a valid command line that resumes the wrong conversation.
-        let id = SessionId::new();
+    fn the_id_this_command_registers_is_the_one_the_child_will_report() {
+        // The wiring, which is this file's half of the fix — the argument shapes and their
+        // reasoning are `cide_claude::session`'s, and tested there.
+        //
+        // `session_spawn` keys the registry, the exit watcher and its own return value (and so
+        // `pane_bind_session`, and so `workspace.json`) on the *effective* id rather than the
+        // minted one. On a plain resume those differ, and using the minted one gives a session
+        // that exists and nothing can find: hook frames name the parent, so no status, no
+        // token figures, no busy-vs-idle close confirm — and a saved workspace entry with no
+        // transcript behind it, so the next launch has nothing to resume either.
+        let minted = SessionId::new();
         let parent = SessionId::new();
         assert_eq!(
-            claude_args(id, Some(parent), false),
-            vec![
-                "--resume".to_string(),
-                parent.to_string(),
-                "--session-id".to_string(),
-                id.to_string(),
-            ]
+            cide_claude::conversation(minted, Some(parent), wants_fork(None)).0,
+            parent,
+            "a plain resume runs under the parent's id"
         );
-    }
-
-    #[test]
-    fn forking_branches_from_the_parent_and_keeps_our_id() {
-        let id = SessionId::new();
-        let parent = SessionId::new();
         assert_eq!(
-            claude_args(id, Some(parent), true),
-            vec![
-                "--resume".to_string(),
-                parent.to_string(),
-                "--fork-session".to_string(),
-                "--session-id".to_string(),
-                id.to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn forking_with_nothing_to_fork_from_is_an_ordinary_new_session() {
-        // Rather than passing `--fork-session` alone for the CLI to reject. A split that
-        // asked to branch a project with no primary session should still give the user a
-        // working pane.
-        let id = SessionId::new();
-        assert_eq!(
-            claude_args(id, None, true),
-            vec!["--session-id".to_string(), id.to_string()]
+            cide_claude::conversation(minted, Some(parent), wants_fork(Some(true))).0,
+            minted,
+            "a fork runs under the id we minted, because `--session-id` is passed"
         );
     }
 

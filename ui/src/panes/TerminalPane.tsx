@@ -32,7 +32,15 @@ export interface TerminalSpec {
   cwd: string
   /** Decides which IDE server this child is told about. See `session.spawn`. */
   project?: string | undefined
-  /** Continue an existing conversation; with `fork`, branch from it instead. */
+  /**
+   * This pane is continuing session X.
+   *
+   * For `claude` that is `--resume X` — with `fork`, `--fork-session` beside it. **For
+   * anything else it is a screen replay**, because a shell has no such flag: `session_spawn`
+   * seeds the new child's screen mirror with the screen X left behind at the last quit, and
+   * writes a line under it saying the text is dead. The two readings are the same sentence;
+   * only what a program can do about it differs. See `cmd/session.rs`.
+   */
   resume?: string | undefined
   fork?: boolean | undefined
 }
@@ -109,8 +117,16 @@ function plausible(cols: number, rows: number): boolean {
  * id under this cwd, so `Resumable` is a claim about the filesystem and not a guess; a
  * `Fresh` entry — a shell, or a Claude pane whose transcript is gone — spawns as usual.
  *
- * A shell never resumes. `--resume` means nothing to bash, and its scrollback died with its
- * process.
+ * A shell never resumes a *conversation* — `--resume` means nothing to bash — but a restored
+ * one does name the session it is continuing, and Rust replays that session's parting screen
+ * into the new child's mirror. See `TerminalSpec.resume`, and the decision in
+ * `lifecycle::restore_notice`: what comes back is the visible screen, it is dead text, and the
+ * line printed under it says so.
+ *
+ * `pane.session` rather than anything in `restore`, because `SessionRestore` deliberately
+ * answers `Fresh` for every shell — `plan_restore` is about *conversations*, and a shell has
+ * none. Guarded on `restore` being present at all, which is the only thing that says this
+ * pane's `session` names a child from a previous process rather than a live one.
  */
 function specFor(
   pane: Pane,
@@ -123,8 +139,10 @@ function specFor(
       const resume = restore?.restore.kind === 'resumable' ? restore.restore.session : undefined
       return { program: 'claude', args: [], cwd, project, resume }
     }
-    case 'shell':
-      return { program: DEFAULT_SHELL, args: ['-l'], cwd, project }
+    case 'shell': {
+      const prior = restore !== undefined ? (pane.session ?? undefined) : undefined
+      return { program: DEFAULT_SHELL, args: ['-l'], cwd, project, resume: prior }
+    }
     default:
       return null
   }

@@ -20,6 +20,27 @@
 //! a feature that mostly keeps working across releases. The rule from `protocol` holds: a
 //! protocol change degrades the diff view and never breaks the terminal. So the strongest
 //! thing here is a warning, and the strongest thing a *user* sees is a note in Settings.
+//!
+//! # What else in this codebase a patch release can retract
+//!
+//! Worth listing in one place, because 2.1.227 proved the list is not theoretical: it removed
+//! `--session-id`'s compatibility with a plain `--resume`, a combination that had been checked
+//! against 2.1.226 and recorded in a comment, and the result was that every Resume click in
+//! the app failed. A comment cannot be re-run; a test can. Each assertion below therefore
+//! names the `#[ignore]`d test that puts the real binary behind it — run them all with
+//! `cargo test --workspace -- --ignored` when something that used to work stops.
+//!
+//! | Assertion | Where | Real-CLI check | If it breaks |
+//! |---|---|---|---|
+//! | argv shapes for resume and fork | [`crate::session`] | `cide-claude/tests/real_session_args.rs` | a pane refuses to start |
+//! | hook events and `--settings` schema | [`crate::hook`], [`crate::settings`] | `cide-claude/tests/real_hooks.rs` | silent: no token figures, no busy-vs-idle |
+//! | `--print --output-format json` envelope | [`crate::headless`] | `cide-claude/tests/real_headless.rs` | commit messages and explanations fail |
+//! | IDE tool names, lockfile shape | `cide_ide_mcp::protocol`, `::lockfile` | `cide-ide-mcp/tests/real_cli.rs` | silent: diffs stop appearing |
+//! | transcript path `<projects>/<encoded cwd>/<id>.jsonl` | `cide_app::lifecycle` | none — see below | a resumable pane offers no resume |
+//!
+//! The last row is the one with no test and deliberately so: it is a *filesystem* detail, it
+//! is read-only, and `transcript_exists` is written so that every way of being wrong answers
+//! `false`. Its own doc says why a wrong `false` is the failure mode worth choosing.
 
 use std::path::Path;
 use std::sync::OnceLock;

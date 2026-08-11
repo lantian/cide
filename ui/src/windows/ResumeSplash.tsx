@@ -174,23 +174,19 @@ export function ResumeSplash({
   )
 }
 
-const bannerStyle: CSSProperties = {
-  margin: 0,
-  padding: '6px 10px',
-  textAlign: 'center',
-  color: 'var(--faint)',
-  fontFamily: 'var(--font-mono)',
-  fontSize: 12,
-  lineHeight: '19px',
-}
-
-/**
- * The line a restored *shell* pane shows above its terminal.
+/*
+ * `RestoredShellBanner` was here, and it is deliberately gone rather than merely unused.
  *
- * A shell's scrollback genuinely does not survive a restart — the child is gone and the
- * screen mirror went with it — and saying so is better than presenting an empty terminal as
- * though nothing had happened, which reads as the app having lost the output.
+ * It rendered `— session restored (previous output not retained) —` as a `<p>` above a
+ * restored shell's terminal, and it broke the pane it was explaining: `PaneTitleBar`'s
+ * `.body` has a definite height and `PaneSlot` claims `height: 100%` of it, so a ~31px
+ * sibling pushed the terminal that far past the bottom of the frame. The terminal's own
+ * background — white, on the default theme — then painted over the title bar of the row
+ * below, which is exactly what was reported.
+ *
+ * Its replacement is `cide_app::lifecycle::restore_notice`: the same sentence, written into
+ * the terminal as a dim line at the top of the transcript. It cannot overflow anything, it
+ * scrolls away with the text it is about, it survives a re-dock like every other byte in the
+ * pane, and it now says which of two things happened — because the visible screen *is*
+ * retained across a restart.
  */
-export function RestoredShellBanner(): ReactNode {
-  return <p style={bannerStyle}>— session restored (previous output not retained) —</p>
-}

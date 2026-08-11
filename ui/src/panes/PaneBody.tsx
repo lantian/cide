@@ -7,8 +7,10 @@
  * * a Claude pane whose conversation is resumable but which has not been asked to resume —
  *   it shows a splash instead of spawning, because reopening a six-pane project must not
  *   silently start six agents at once;
- * * a shell that came back with nothing, which says so rather than presenting an empty
- *   terminal as though nothing were missing.
+ * * a restored shell, which respawns at once and says in its own transcript what it did or
+ *   did not get back. That notice is written by Rust into the terminal, not rendered here:
+ *   as a DOM sibling above the terminal it pushed the terminal out of the pane frame and
+ *   painted over the next row's title bar.
  *
  * Deciding this here rather than inside `TerminalPane` keeps that component about wiring a
  * PTY to a terminal, with no opinion about whether one should exist yet.
@@ -17,7 +19,7 @@ import { useState, type ReactNode } from 'react'
 import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
-import { ResumeSplash, RestoredShellBanner } from '@/windows/ResumeSplash'
+import { ResumeSplash } from '@/windows/ResumeSplash'
 import { paneSessionId } from '@/layout/paneHosts'
 import type { DiffSpec, Pane, PaneRestore } from '@/ipc/client'
 
@@ -92,19 +94,18 @@ export function PaneBody({
   // `paneSessionId` also survives host eviction, so a pane the user resumed and then left
   // parked in another tab does not come back offering to resume itself a second time.
   //
-  // Latched on the first render rather than recomputed, and that is load-bearing twice over.
-  // `paneSessionId` flips to defined the moment the child spawns, which is a render or two
-  // after this pane decided to show it — and the two branches below are different element
-  // *types* in the same position, so a `<>banner + terminal</>` becoming a bare
-  // `<TerminalPane/>` makes React unmount the terminal it mounted a moment ago, tear down its
-  // sink and re-attach. It also meant the restored-shell banner was on screen only for the
-  // frame between the spawn resolving and the domain recording the binding, which is not long
-  // enough to read — a line that says "previous output not retained" is the only notice the
-  // user gets that a shell came back empty.
+  // Latched on the first render rather than recomputed. `paneSessionId` flips to defined the
+  // moment the child spawns, which is a render or two after this pane decided what to show —
+  // and the splash and the terminal are different element *types* in the same position, so a
+  // `<ResumeSplash/>` becoming a `<TerminalPane/>` on its own would unmount and re-mount
+  // whatever React had just put there.
   //
-  // The alternative that lost was giving both branches the same element shape (always a
-  // fragment, with a `null` where the banner is not wanted). That stops the remount but still
-  // blinks the banner away, because the condition itself is what is unstable.
+  // This used to matter for shells too, when a restored one rendered as `<>banner +
+  // terminal</>`: the fragment collapsing to a bare `<TerminalPane/>` tore down a terminal
+  // that had only just attached, and the banner was on screen for one frame — not long enough
+  // to read the only notice the user got. Both problems went away with the banner, which is
+  // now a line inside the transcript rather than a DOM sibling; the latch stays for the
+  // splash, which genuinely does swap element types.
   const [held] = useState(
     () => restore !== undefined && !restore.eager && paneSessionId(pane.id) === undefined,
   )
@@ -136,26 +137,19 @@ export function PaneBody({
     )
   }
 
-  if (held && !resumed) {
-    // A shell has no conversation to resume. Its scrollback is genuinely gone, so it
-    // respawns immediately with a line saying as much rather than offering a choice that
-    // would restore nothing.
-    if (pane.kind === 'shell') {
-      return (
-        <>
-          <RestoredShellBanner />
-          <TerminalPane
-            pane={pane}
-            cwd={cwd}
-            project={project}
-            primarySession={primarySession}
-            restore={restore}
-            onSessionBound={onSessionBound}
-          />
-        </>
-      )
-    }
-
+  if (held && !resumed && pane.kind !== 'shell') {
+    // A shell has no conversation to resume, so it is never held: it falls through to the
+    // terminal below and respawns immediately, and its notice — "restored, and here is or is
+    // not the output from last time" — is written **into the terminal** by Rust, at the top of
+    // the transcript, the way `— exited —` is written at the bottom.
+    //
+    // It used to be a `<RestoredShellBanner/>` rendered as a sibling above `<TerminalPane/>`,
+    // and that is what broke the pane. `PaneTitleBar.module.css` gives `.body` a definite
+    // height and `PaneSlot` claims `height: 100%` of it, so a sibling ~31px tall pushed the
+    // terminal 31px past the bottom of the frame — and the terminal's own background (white,
+    // on the default theme) painted over the title bar of the row below. The reported symptom
+    // was exactly that. A line inside the transcript cannot do it, scrolls away with the text
+    // it describes, and survives a re-dock like every other byte in the pane.
     return (
       <ResumeSplash
         title={pane.title}

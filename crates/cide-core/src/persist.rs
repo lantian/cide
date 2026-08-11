@@ -210,7 +210,13 @@ pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<()> {
 /// before the rename, the directory `fsync` after it, the 0600 mode, and removing the temp on
 /// each failure path. A second copy would have started identical and drifted on whichever of
 /// those a later edit forgot.
-fn write_atomic(path: &Path, json: &[u8]) -> Result<()> {
+///
+/// `pub` because that drift happened: `cide_app::lifecycle` wrote its `screens.json` sidecar
+/// with a plain `fs::write`, reasoning only about atomicity — which it was entitled to trade
+/// away — and silently gave up the 0600 with it, publishing a screenful of the user's shell
+/// output at 0644. The mode is the part of this function nobody should be re-deciding, so the
+/// function itself is the thing to reach for rather than the parts of it worth copying.
+pub fn write_atomic(path: &Path, json: &[u8]) -> Result<()> {
     let dir = parent_dir(path);
     fs::create_dir_all(dir)?;
 

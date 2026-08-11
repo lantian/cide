@@ -97,9 +97,19 @@ try {
   // end of whatever half-line the child died mid-way through.
   const ESC = String.fromCharCode(27)
   const bytes = exitMarkerBytes(137)
-  ok(bytes.startsWith(`\r\n${ESC}[2m`), 'the marker starts a fresh line and opens dim')
+  ok(
+    bytes.startsWith(`\r\n${ESC}[0m${ESC}[2m`),
+    'the marker starts a fresh line, resets, then opens dim — SGR 2 adds dim to whatever is ' +
+      'already active, so without the reset a child that died inside a coloured prompt has ' +
+      'this line drawn on its background, full width, up against the edge of the pane',
+  )
   ok(bytes.endsWith(`${ESC}[0m\r\n`), 'the marker closes SGR so later output is not left dim')
   ok(bytes.includes('— exited (137) —'), 'the framing wraps the text rather than replacing it')
+  eq(
+    bytes.split(`${ESC}[`).length - 1,
+    3,
+    'reset, dim, reset — every SGR this line opens is one it closes',
+  )
 
   // --- the second path in, the one that used to lose the number -------------------------
   //

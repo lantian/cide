@@ -243,6 +243,23 @@ pub struct SpawnSpec {
     /// Flow-control thresholds. Overridden in tests, which cannot wait five seconds to
     /// watch a watchdog fire.
     pub credit: CreditPolicy,
+    /// Bytes fed to the screen mirror before the child produces anything.
+    ///
+    /// **Into the mirror only — never into the child, and never into the pty.** This is how
+    /// a restored shell gets its previous screen back: the caller hands over the bytes
+    /// `screen_state()` produced in the last run, and the new session's `vt100::Parser`
+    /// starts already holding them, so the first `attach_with_snapshot` replays them exactly
+    /// the way it replays a re-dock.
+    ///
+    /// The alternative that lost was replaying in the frontend — one `term.write` before
+    /// hydration. It puts the text in xterm and nowhere else, so the moment that host is
+    /// evicted and rehydrated (which re-reads the mirror, by design) the replayed screen
+    /// vanishes and the pane silently loses history it had a second ago. Seeding the mirror
+    /// keeps one source of truth for what a pane shows.
+    ///
+    /// Whatever is in here is *dead text*: it was produced by a process that no longer
+    /// exists. Saying so is the caller's job — see `cide_app::lifecycle::restore_notice`.
+    pub preload: Vec<u8>,
 }
 
 impl SpawnSpec {
@@ -255,6 +272,7 @@ impl SpawnSpec {
             env_remove: Vec::new(),
             geometry: Geometry::default(),
             credit: CreditPolicy::default(),
+            preload: Vec::new(),
         }
     }
 
@@ -280,6 +298,12 @@ impl SpawnSpec {
 
     pub fn credit(mut self, c: CreditPolicy) -> Self {
         self.credit = c;
+        self
+    }
+
+    /// Seed the screen mirror with bytes from a previous run. See [`SpawnSpec::preload`].
+    pub fn preload(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.preload = bytes.into();
         self
     }
 }
@@ -423,6 +447,13 @@ impl PtySession {
             spec.geometry.cols,
             SCROLLBACK,
         )));
+        // Before any sink can exist and before the coalescer thread starts, so the preload
+        // cannot interleave with the child's own first bytes. It is fed to the parser rather
+        // than delivered to sinks because there are none yet — every consumer picks it up
+        // through `attach_with_snapshot`, on the ordinary re-dock path.
+        if !spec.preload.is_empty() {
+            vt.lock().process(&spec.preload);
+        }
         let sinks: Arc<Mutex<Vec<Registered>>> = Arc::new(Mutex::new(Vec::new()));
         let exited = Arc::new(AtomicBool::new(false));
 
@@ -1926,6 +1957,88 @@ mod tests {
             started.elapsed(),
             delivered.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn a_preload_is_in_the_mirror_before_the_child_says_anything() {
+        // The restored-shell path: the previous run's screen is handed to `spawn` and has to
+        // be in the snapshot the first attaching pane receives, ahead of anything the new
+        // child prints. `sleep` prints nothing at all, so what comes back is the preload.
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 5")
+            .preload("PREVIOUS-RUN".as_bytes().to_vec());
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let (_, screen) = session.attach_with_snapshot(Arc::new(|_: &[u8]| true));
+        let text = String::from_utf8_lossy(&screen).into_owned();
+        assert!(
+            text.contains("PREVIOUS-RUN"),
+            "the preload never reached the screen mirror: {text:?}"
+        );
+        session.kill();
+    }
+
+    #[test]
+    fn a_preload_is_never_typed_at_the_child() {
+        // The failure this pins is the one that would be catastrophic rather than merely
+        // wrong: preloaded bytes going down the *pty* would be executed by the shell. `cat`
+        // echoes its stdin, so if the preload had reached the child it would come back out
+        // and land on the screen twice.
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("cat")
+            .preload("ZZMARKERZZ\r\n".as_bytes().to_vec());
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        thread::sleep(Duration::from_millis(200));
+
+        let text = String::from_utf8_lossy(&session.screen_state()).into_owned();
+        assert_eq!(
+            text.matches("ZZMARKERZZ").count(),
+            1,
+            "the preload was written to the child, not only to the mirror: {text:?}"
+        );
+        session.kill();
+    }
+
+    /// A preload is not only pixels: its DEC private modes stick to the new session.
+    ///
+    /// This is the hazard `cide_app::lifecycle::NEUTRAL_MODES` exists to answer, pinned here
+    /// because here is where it is true. `screen_state()` ends with the screen's *input* modes,
+    /// so a screen saved while a TUI held mouse tracking and a hidden cursor carries both — and
+    /// a preload feeds them straight into the mirror of a child that never asked for either and
+    /// will never turn them off. Every pane that attaches then gets them, because the snapshot
+    /// is generated from this same mirror.
+    ///
+    /// If this ever stops being true the neutralising tail is dead weight and can go; until
+    /// then, deleting it puts a restored shell in mouse-reporting mode with no cursor.
+    ///
+    /// One `#[test]`, deliberately, and one child. The tests around here are timing-sensitive —
+    /// `small_writes_are_coalesced_into_few_frames` measures a 4 ms coalescing window — and
+    /// every extra test in this module is another pty, another four threads and another process
+    /// competing with it under `cargo test`'s parallelism. A second spawn saying the mirrored
+    /// half of this was enough to make that test flake once in three runs on this machine.
+    /// That the DECRSTs then clear these modes is `vt100`'s own contract and is asserted
+    /// bytewise, without a process, in `cide_app::lifecycle`'s
+    /// `a_replay_turns_off_the_modes_the_old_screen_turned_on`.
+    #[test]
+    fn a_preload_carries_the_old_childs_input_modes_into_the_mirror() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 5")
+            .preload("\x1b[?25l\x1b[?1002h\x1b[?1006h".as_bytes().to_vec());
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let text = String::from_utf8_lossy(&session.screen_state()).into_owned();
+        assert!(
+            text.contains("\u{1b}[?25l"),
+            "a hidden cursor in the preload survives into the new session: {text:?}"
+        );
+        assert!(
+            text.contains("\u{1b}[?1002h"),
+            "mouse tracking in the preload survives into the new session: {text:?}"
+        );
+        session.kill();
     }
 
     #[test]
