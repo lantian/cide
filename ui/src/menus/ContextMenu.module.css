@@ -1,0 +1,135 @@
+/*
+ * The context menu box.
+ *
+ * Tokens only — every colour here is defined in both `:root` (light, white) and
+ * `[data-theme='dark']`, so the menu is checked against the *default* theme first. The two
+ * places a menu can go wrong on white specifically are the ground and the hover: `--panel`
+ * on `--bg` is only a hair of contrast, so the box needs its border and its shadow to read
+ * as floating, and a hover built from `--accent` would be a saturated red bar on white.
+ * `--chrome-hi` is the hover in both themes and is a step *away* from the panel in each.
+ *
+ * Dimensions follow the mock's overlay family: 1px `--border`, `--shadow`, a 9px card radius
+ * on the box and square rows inside it (same reason as `Overlay.module.css` — square rows
+ * paint over a rounded corner unless the box clips them).
+ */
+
+.menu {
+  position: fixed;
+  /*
+   * Above the overlay scrim (60) and the failure toasts (40): a menu is always the most
+   * recent thing the user did, and it is dismissed by the next click anywhere.
+   */
+  z-index: 80;
+  min-width: 180px;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+  /* `placeMenu` computes the budget; the box scrolls inside it rather than off the window. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  user-select: none;
+  outline: none;
+}
+
+/*
+ * The first paint, before `getBoundingClientRect` has been read.
+ *
+ * `visibility: hidden` rather than `display: none`: the box has to be laid out to be
+ * measured, and it must not be seen at 0,0 for the frame that takes. One layout pass, in a
+ * `useLayoutEffect`, so nothing is committed to the screen in between.
+ */
+.measuring {
+  visibility: hidden;
+  top: 0;
+  left: 0;
+}
+
+.item {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px 0 8px;
+  height: 26px;
+  flex: 0 0 auto;
+  color: var(--text);
+  font: inherit;
+  cursor: default;
+}
+
+.item:hover:not(.disabled),
+.item:focus-visible,
+.item.active {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+  outline: none;
+}
+
+.danger {
+  color: var(--red);
+}
+
+.disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* The check gutter. Always present on a menu that has any toggle in it, so labels align. */
+.check {
+  flex: 0 0 auto;
+  width: 12px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--accent);
+  text-align: center;
+}
+
+.label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * The right-hand slot: a keychip when the item is live, the reason when it is not. The two
+ * never collide — an item is one or the other — so one column serves both, and a disabled
+ * item explains itself on the line the user is already reading.
+ */
+.hint {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+  letter-spacing: 0.02em;
+}
+
+.reason {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--faint);
+}
+
+.separator {
+  height: 1px;
+  flex: 0 0 auto;
+  margin: 4px 0;
+  background: var(--border-soft);
+}
