@@ -19,6 +19,7 @@
     "check:render": "node scripts/check-git-render.mjs",
     "check:rows": "node scripts/check-rows.mjs",
     "check:search": "node scripts/check-search.mjs",
+    "check:sidebar": "node scripts/check-sidebar.mjs",
     "check:theme": "node scripts/check-theme.mjs",
     "check:tree-status": "node scripts/check-tree-status.mjs",
     "dev": "vite",

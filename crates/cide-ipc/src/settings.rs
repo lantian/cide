@@ -55,6 +55,7 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub graphics: GraphicsSettings,
     pub claude: ClaudeSettings,
+    pub sidebar: SidebarSettings,
 }
 
 impl Default for Settings {
@@ -70,6 +71,77 @@ impl Default for Settings {
             terminal: TerminalSettings::default(),
             graphics: GraphicsSettings::default(),
             claude: ClaudeSettings::default(),
+            sidebar: SidebarSettings::default(),
+        }
+    }
+}
+
+/// The narrowest a sidebar panel may be left, in CSS pixels.
+///
+/// 180 rather than something smaller because both panels stop being *usable* below it
+/// rather than merely tight: the explorer indents 12px per depth and draws 21px mono rows,
+/// so a file three levels down has about 12 characters left at 180 and none at 140; the git
+/// panel's header carries a segmented Commit/Shelf control plus its counts on one 30px line.
+/// A panel that can be dragged to a sliver is a panel a user can lose by accident, and there
+/// is no "reset width" gesture to get it back with.
+pub const SIDEBAR_MIN_WIDTH: u16 = 180;
+
+/// The widest, in CSS pixels. Roughly 1.5x the mock's 420px git panel.
+///
+/// This is the *stored* ceiling and it is deliberately generous — it exists to keep a
+/// corrupt or hand-edited `workspace.json` from producing a panel wider than any monitor,
+/// not to decide what fits. What fits depends on the window, which Rust cannot see, so the
+/// frontend applies a second ceiling against the live viewport (`clampSidebarWidth` in
+/// `ui/src/chrome/sidebarWidth.ts`) before it paints anything. Restoring a 640px panel into
+/// a 720px window is therefore safe: it is clamped on the way to the DOM, and the stored
+/// value survives for the next time the window is wide enough to honour it.
+pub const SIDEBAR_MAX_WIDTH: u16 = 640;
+
+/// How wide the user left each sidebar panel.
+///
+/// **Two widths, not one.** The mock gives the explorer 252px and the git panel 420px, and
+/// that difference is a property of the content, not a stylistic accident: the explorer
+/// draws one truncatable name per row, while the git panel draws a path *and* an
+/// added/removed figure *and* a stage checkbox on the same line. Sharing a single number
+/// would mean every switch between the two views resized the workspace under the user, and
+/// whichever panel they had not tuned would be the wrong width — so the resize would feel
+/// like it had been forgotten rather than remembered.
+///
+/// Only these two, because only these two are tokens: `--w-sidebar-files` also sizes the
+/// search and problems panels (they are the explorer's column with different rows in it),
+/// which is a decision `tokens.css` already made and this type follows rather than reopens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct SidebarSettings {
+    /// `--w-sidebar-files`: the explorer, and with it search and problems.
+    pub files_width: u16,
+    /// `--w-sidebar-git`.
+    pub git_width: u16,
+}
+
+impl Default for SidebarSettings {
+    /// The mock's two widths, which are also the two literals `tokens.css` ships as the
+    /// token values — a fresh workspace and a workspace whose settings failed to load look
+    /// identical, which is the point.
+    fn default() -> Self {
+        Self {
+            files_width: 252,
+            git_width: 420,
+        }
+    }
+}
+
+impl SidebarSettings {
+    /// Both widths brought inside [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`].
+    ///
+    /// Applied where a patch lands rather than where the workspace is read, so the stored
+    /// file converges on a legal value instead of being re-clamped forever on every load.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            files_width: self.files_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
+            git_width: self.git_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
         }
     }
 }
@@ -165,4 +237,89 @@ pub struct ClaudeSettings {
     pub alt_screen_full_repaint: bool,
     /// `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`.
     pub disable_alternate_screen: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The round trip a resize has to survive to still be there after a restart: struct →
+    /// the JSON `workspace.json` actually stores → struct.
+    ///
+    /// Asserted on the *camelCase wire names* rather than only on equality, because equality
+    /// would pass just as well if both directions agreed on `files_width` — and the
+    /// frontend, which reads this type through `generated.ts`, would then see `undefined`
+    /// for both widths and fall back to the mock's defaults on every launch. That is exactly
+    /// the bug this feature exists to fix, arriving through the serializer instead.
+    #[test]
+    fn a_sidebar_width_survives_the_json_round_trip_under_its_wire_name() {
+        let settings = Settings {
+            sidebar: SidebarSettings {
+                files_width: 300,
+                git_width: 500,
+            },
+            ..Settings::default()
+        };
+
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(
+            json.contains("\"filesWidth\":300"),
+            "wire name changed: {json}"
+        );
+        assert!(
+            json.contains("\"gitWidth\":500"),
+            "wire name changed: {json}"
+        );
+
+        let back: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.sidebar, settings.sidebar);
+    }
+
+    /// A `workspace.json` written before this field existed — i.e. every install that
+    /// upgrades into this build.
+    ///
+    /// It must load, and it must load as the mock's widths rather than as zero. That is what
+    /// the container's `#[serde(default)]` buys; an `Option<SidebarSettings>` would have
+    /// pushed the same decision onto the frontend, in a place with no default to reach for.
+    #[test]
+    fn settings_saved_before_the_sidebar_field_existed_still_load() {
+        let legacy = r#"{"theme":"dark","reopenLastProject":false}"#;
+        let settings: Settings = serde_json::from_str(legacy).expect("legacy settings");
+        assert_eq!(settings.sidebar, SidebarSettings::default());
+        assert_eq!(settings.sidebar.files_width, 252);
+        assert_eq!(settings.sidebar.git_width, 420);
+        // And the rest of the file still parsed: the new field did not become required.
+        assert!(!settings.reopen_last_project);
+    }
+
+    /// Half a `sidebar` object, which is what a hand-edited file tends to look like.
+    #[test]
+    fn one_named_width_leaves_the_other_at_its_default() {
+        let partial = r#"{"sidebar":{"gitWidth":500}}"#;
+        let settings: Settings = serde_json::from_str(partial).expect("partial sidebar");
+        assert_eq!(settings.sidebar.git_width, 500);
+        assert_eq!(settings.sidebar.files_width, 252);
+    }
+
+    #[test]
+    fn clamping_pulls_both_widths_inside_the_band_and_leaves_legal_ones_alone() {
+        let clamped = SidebarSettings {
+            files_width: 4,
+            git_width: 9_000,
+        }
+        .clamped();
+        assert_eq!(clamped.files_width, SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamped.git_width, SIDEBAR_MAX_WIDTH);
+
+        let legal = SidebarSettings {
+            files_width: 300,
+            git_width: 500,
+        };
+        assert_eq!(legal.clamped(), legal);
+        // The defaults are inside the band, or a first launch would move the panel itself.
+        assert_eq!(
+            SidebarSettings::default().clamped(),
+            SidebarSettings::default()
+        );
+    }
 }

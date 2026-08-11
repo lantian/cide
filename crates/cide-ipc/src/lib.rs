@@ -19,7 +19,8 @@ pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
 pub use settings::{
-    ClaudeSettings, EditorSettings, GraphicsSettings, Settings, TerminalRenderer, TerminalSettings,
+    ClaudeSettings, EditorSettings, GraphicsSettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    Settings, SidebarSettings, TerminalRenderer, TerminalSettings,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,

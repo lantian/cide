@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::Theme;
-use crate::settings::{ClaudeSettings, EditorSettings, GraphicsSettings, TerminalSettings};
+use crate::settings::{
+    ClaudeSettings, EditorSettings, GraphicsSettings, SidebarSettings, TerminalSettings,
+};
 
 /// A partial update to [`crate::Settings`]. `None` means "leave this alone".
 ///
@@ -55,6 +57,15 @@ pub struct SettingsPatch {
     pub graphics: Option<GraphicsSettings>,
     #[ts(optional)]
     pub claude: Option<ClaudeSettings>,
+    /// Both sidebar widths, sent together.
+    ///
+    /// Per the rule above: a patch is per top-level field, so the splitter that just moved
+    /// the explorer sends the git width it currently holds alongside it. That is not a
+    /// theoretical loss of the other panel's value — the splitter reads both out of the same
+    /// settings snapshot it renders from, so "currently holds" is the mirror's value and not
+    /// a stale local copy.
+    #[ts(optional)]
+    pub sidebar: Option<SidebarSettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

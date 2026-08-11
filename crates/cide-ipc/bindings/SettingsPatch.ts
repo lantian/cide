@@ -2,6 +2,7 @@
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
+import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
 
@@ -21,4 +22,14 @@ import type { Theme } from "./Theme";
  * with the workspace only when the user happened to use the right one. The radio cards call
  * `window.set_mode`.
  */
-export type SettingsPatch = { theme?: Theme, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, };
+export type SettingsPatch = { theme?: Theme, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
+/**
+ * Both sidebar widths, sent together.
+ *
+ * Per the rule above: a patch is per top-level field, so the splitter that just moved
+ * the explorer sends the git width it currently holds alongside it. That is not a
+ * theoretical loss of the other panel's value — the splitter reads both out of the same
+ * settings snapshot it renders from, so "currently holds" is the mirror's value and not
+ * a stale local copy.
+ */
+sidebar?: SidebarSettings, };

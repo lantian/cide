@@ -91,6 +91,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         terminal,
         graphics,
         claude,
+        sidebar,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -122,6 +123,17 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     }
     if let Some(v) = claude {
         settings.claude = v;
+    }
+    // The one patched field that is clamped rather than taken at face value.
+    //
+    // Every other field here is a toggle or an enum, where the wire type already excludes
+    // the illegal values; a width is a number, and the caller is a pointer gesture. The
+    // frontend clamps too — it has to, because it is the only side that knows how wide the
+    // window is — but a clamp that lives only there is one `invoke` away from being
+    // bypassed, and the value being written is the one every future launch restores. Clamp
+    // where it lands, so `workspace.json` cannot hold a width no window can honour.
+    if let Some(v) = sidebar {
+        settings.sidebar = v.clamped();
     }
 }
 
@@ -745,7 +757,7 @@ pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cide_ipc::{Theme, WindowMode};
+    use cide_ipc::{SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
 
     #[test]
     fn a_patch_touches_only_the_fields_it_names() {
@@ -787,6 +799,45 @@ mod tests {
             },
         );
         assert!(!settings.reopen_last_project);
+    }
+
+    /// The full trip a drag makes: patch in, clamped, stored, and the *other* panel's width
+    /// still there afterwards.
+    #[test]
+    fn a_sidebar_patch_is_clamped_and_does_not_disturb_the_other_panel() {
+        let mut settings = Settings::default();
+        settings.terminal.font_size = 17;
+
+        // What a drag past the right-hand limit sends. The frontend would have clamped it
+        // against the viewport already; this asserts the store does not depend on that.
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                sidebar: Some(SidebarSettings {
+                    files_width: 5_000,
+                    git_width: 500,
+                }),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(settings.sidebar.files_width, SIDEBAR_MAX_WIDTH);
+        assert_eq!(
+            settings.sidebar.git_width, 500,
+            "the git width was rewritten"
+        );
+        assert_eq!(settings.terminal.font_size, 17, "an untouched group moved");
+
+        // And a patch that names nothing leaves the widths where the drag left them —
+        // the case where flipping an unrelated toggle would reset the panel.
+        apply_patch(
+            &mut settings,
+            SettingsPatch {
+                theme: Some(Theme::Dark),
+                ..SettingsPatch::default()
+            },
+        );
+        assert_eq!(settings.sidebar.files_width, SIDEBAR_MAX_WIDTH);
+        assert_eq!(settings.sidebar.git_width, 500);
     }
 
     #[test]
