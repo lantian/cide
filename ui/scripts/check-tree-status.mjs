@@ -35,6 +35,10 @@ try {
       // The file tree's click rules, pinned at the foot of this file. They live in a module of
       // their own so a check script can hold them; see `clickSemantics.ts`.
       'src/sidebar/clickSemantics.ts',
+      // Root/relative resolution for the context menu. Also its own module, and for a sharper
+      // reason: the inline version of it read `TreeRow.root` — an *index* — as a path, which
+      // type-checks and silently disables nothing and relativizes nothing. See `rowPaths.ts`.
+      'src/sidebar/rowPaths.ts',
       '--outDir', out,
       // Pinned so the emitted layout is `<out>/sidebar/treeStatus.js` whether or not the
       // type-only import of `../ipc/generated` widens the inferred common root.
@@ -231,6 +235,49 @@ try {
   eq(m2(c, 'ArrowDown', 0, 0), null, 'an empty tree has nowhere to move')
   eq(m2(c, 'ArrowDown', 99, 10), 9, 'a stale index — the rows moved under the selection — is '
     + 'clamped rather than trusted')
+
+  // --- which root a row belongs to, and what "relative" means ----------------------------
+
+  /*
+   * The context menu's *Copy Relative Path*, *Rename…* and *Move to Trash* all hang off this.
+   *
+   * It shipped reading `TreeRow.root`, which is an index into `Project::roots` and not a path,
+   * out of a `data-row-root` attribute — so the comparison was against the string `"0"`. Both
+   * failures are invisible: *Copy Relative Path* produced the absolute path, which is exactly
+   * what *Copy Path* one line above it produces, and the two root-refusing verbs stayed
+   * enabled for Rust to reject. Pinned here so neither can come back quietly.
+   */
+  const rp = await import(`file://${join(out, 'sidebar', 'rowPaths.js')}`)
+  const ROOTS = ['/home/u/work/cide', '/home/u/work/cide/ui']
+
+  eq(rp.relativeTo('/home/u/work/cide/src/main.rs', ROOTS), 'src/main.rs',
+    'a path under a root is copied relative to it, not absolute — an index read as a path '
+      + 'made this item a duplicate of Copy Path')
+  eq(
+    rp.relativeTo('/home/u/work/cide/ui/src/App.tsx', ROOTS),
+    'src/App.tsx',
+    'the LONGEST root wins: with the first match, a nested root would name one file two '
+      + 'different ways depending on the order the roots happen to be in',
+  )
+  eq(rp.relativeTo('/home/u/work/cide-old/x.rs', ROOTS), '/home/u/work/cide-old/x.rs',
+    'a sibling directory whose name merely starts with a root is NOT inside it — a bare '
+      + 'startsWith would slice it at the wrong offset and produce `ld/x.rs`')
+  eq(rp.relativeTo('/elsewhere/x.rs', ROOTS), '/elsewhere/x.rs',
+    'a path under no root keeps its absolute form rather than being relativized to nothing')
+  eq(rp.relativeTo('/home/u/work/cide', ROOTS), '/home/u/work/cide',
+    'a root itself is absolute too: relative to itself it is the empty string, and an empty '
+      + 'clipboard is indistinguishable from a menu item that did nothing')
+  eq(rp.relativeTo('/home/u/work/cide/src/main.rs', []), '/home/u/work/cide/src/main.rs',
+    'and with no roots at all — the panel before the bootstrap lands')
+
+  eq(rp.isRootPath('/home/u/work/cide', ROOTS), true,
+    'a project root is a root: Rename and Move to Trash are disabled with a reason, because '
+      + '`check_not_root` refuses them and a refusal nobody sees looks like a dead control')
+  eq(rp.isRootPath('/home/u/work/cide/ui', ROOTS), true, 'so is a second, nested one')
+  eq(rp.isRootPath('/home/u/work/cide/ui/src', ROOTS), false, 'a directory inside one is not')
+  eq(rp.isRootPath('/home/u/work/cide/src/main.rs', ROOTS), false, 'nor is a file')
+  eq(rp.rootOf('/home/u/work/cide/src/main.rs', ROOTS), '/home/u/work/cide',
+    'and the root a row resolves to is a path, which is the whole point')
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

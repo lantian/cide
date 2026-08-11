@@ -40,6 +40,7 @@ import { useGitStatus } from './gitStatusStore'
 import { letterFor, statusAt } from './treeStatus'
 import { enterOn, fileTreeClick, gestureOf, moveIndex, type RowAction } from './clickSemantics'
 import { copyText } from './copyText'
+import { isRootPath, relativeTo } from './rowPaths'
 import {
   diag,
   fs as fsApi,
@@ -75,26 +76,6 @@ const JUMP_MARGIN = 12
 
 /** A stable empty list, so a project-less panel does not hand `useShallow` a new array. */
 const NO_ROOTS: readonly string[] = []
-
-/**
- * The root a path lives under, or `null` when none of them holds it.
- *
- * The longest match wins, because a project may be opened over both `~/work/cide` and
- * `~/work/cide/ui` — with the shortest match, the second root's files would be copied as
- * `ui/src/…` from one row and `src/…` from another, which is the kind of inconsistency that
- * makes people stop trusting *Copy Relative Path*.
- *
- * Segment-aware: `~/work/cide-old` is not under `~/work/cide`, and a plain `startsWith`
- * says it is.
- */
-function rootOf(path: string, roots: readonly string[]): string | null {
-  let best: string | null = null
-  for (const root of roots) {
-    if (path !== root && !path.startsWith(`${root}/`)) continue
-    if (best === null || root.length > best.length) best = root
-  }
-  return best
-}
 
 /**
  * Which colour class a status paints the name and the letter with.
@@ -349,18 +330,14 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       const el = target?.closest<HTMLElement>('[data-row-path]')
       const path = el?.dataset['rowPath']
       if (el === null || el === undefined || path === undefined) return null
-      const root = rootOf(path, roots)
       return {
         path,
         isDir: el.dataset['rowKind'] === 'dir',
         expanded: el.dataset['rowExpanded'] === 'true',
         /** A project root: `fs_rename` and `fs_delete` both refuse one, so the menu does too. */
-        isRoot: root === path,
-        /**
-         * What *Copy Relative Path* copies. The absolute path when no root claims this row,
-         * which is the honest answer rather than a relative path against nothing.
-         */
-        rel: root === null || root === path ? path : path.slice(root.length + 1),
+        isRoot: isRootPath(path, roots),
+        /** What *Copy Relative Path* copies. See `rowPaths.ts` for why it is not inline. */
+        rel: relativeTo(path, roots),
       }
     },
     [roots],
