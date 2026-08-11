@@ -211,31 +211,31 @@ export function createTerminal(): TerminalHandle {
  * Call after `term.open()` — the addon needs a rendered element.
  */
 /**
- * Whether this window was launched with WebGL turned off.
+ * Whether this window asked for the WebGL renderer. **It is off unless asked for.**
  *
  * Read from the URL, the same channel every other launch instrument uses, because the choice
  * has to be known before the first `term.open()` and a webview cannot ask Rust anything that
- * early. Set by `CIDE_RENDERER=dom` — see `crates/cide-app/src/windows.rs`, where the upstream
- * defect this escapes is written down in full.
+ * early. Set by `CIDE_RENDERER=webgl` — see `crates/cide-app/src/windows.rs`, where the
+ * upstream defect that made DOM the default is written down in full.
  *
  * Computed once. It cannot change without a relaunch, and reading `location` per pane promotion
  * would put a URL parse on the path this function exists to keep cheap.
  */
-const domRendererForced: boolean = (() => {
+const webglRequested: boolean = (() => {
   try {
-    return new URLSearchParams(window.location.search).get('renderer') === 'dom'
+    return new URLSearchParams(window.location.search).get('renderer') === 'webgl'
   } catch {
-    // No `location` at all — an SSR bundle under a check script. Not forced, then.
+    // No `location` at all — an SSR bundle under a check script. Not requested, then.
     return false
   }
 })()
 
 export function promoteWebgl(handle: TerminalHandle): void {
-  // The escape hatch, checked before the pool so a forced-DOM window never takes a context it
-  // would only have to give back. Returning here leaves the terminal on the DOM renderer,
-  // which is what xterm falls back to when no renderer addon is loaded — the same state
-  // `releaseWebgl` and the `catch` below leave it in, so this adds no new code path.
-  if (domRendererForced) return
+  // Checked before the pool, so a DOM window never takes a context it would only have to give
+  // back. Returning here leaves the terminal on the DOM renderer, which is what xterm falls
+  // back to when no renderer addon is loaded — the same state `releaseWebgl` and the `catch`
+  // below leave it in, so this adds no new code path.
+  if (!webglRequested) return
 
   if (webglAddons.has(handle.term)) {
     // Already promoted; just refresh its recency.

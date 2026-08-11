@@ -121,23 +121,31 @@ pub fn create(
     } else {
         ""
     };
-    // `CIDE_RENDERER=dom` makes every terminal use xterm's DOM renderer instead of WebGL.
+    // `CIDE_RENDERER=webgl` opts back in to the pooled WebGL renderer. **The DOM renderer is
+    // the default, and that is a measurement rather than a preference.**
     //
-    // Not a preference — an escape hatch from a confirmed upstream defect. In
-    // `@xterm/addon-webgl` 0.19.0, `TextureAtlas._requestClearModel` is set to `true` in two
-    // places (an atlas page merge, and an oversized-glyph overflow) and is **never set back to
-    // `false` anywhere**; `beginFrame()` reads it without consuming it. `WebglRenderer.ts:346`
-    // branches on that read, so from the first page merge onward *every frame* runs
-    // `_clearModel(true)` and rebuilds all rows rather than the changed ones — permanently, for
-    // the life of that terminal. A long session is guaranteed to trip it eventually.
+    // `@xterm/addon-webgl` 0.19.0 sets `TextureAtlas._requestClearModel` to `true` in two
+    // places — an atlas page merge, and an oversized-glyph overflow — and **never sets it back
+    // to `false` anywhere**; `clearTexture()` does not reset it and `beginFrame()` reads it
+    // without consuming it. `WebglRenderer.ts:346` branches on that read, so from the first
+    // page merge onward every frame runs `_clearModel(true)` and rebuilds all rows instead of
+    // the changed ones, permanently, for the life of that terminal. Any session long enough to
+    // fill one atlas page trips it, and nothing untrips it.
     //
-    // WebKitGTK makes it worse and undiagnosable: `WEBGL_debug_renderer_info` is masked, so a
-    // software rasterizer is indistinguishable from a real GPU, and a full per-frame texture
-    // upload on a software path is exactly the "typing is very slow" report this came from.
+    // Confirmed against the running app, not inferred: typing was reported as "very very slow",
+    // and with `CIDE_RENDERER=dom` the same build was reported fast. WebKitGTK is what makes it
+    // undiagnosable from inside — `WEBGL_debug_renderer_info` is masked, so a software
+    // rasterizer is indistinguishable from a GPU, and a full per-frame texture upload on a
+    // software path is precisely that symptom.
     //
-    // `dom` is the only value that changes anything; anything else keeps the pooled WebGL path.
-    let renderer = if std::env::var("CIDE_RENDERER").is_ok_and(|v| v == "dom") {
-        "&renderer=dom"
+    // What the default costs: WebGL's advantage is throughput on a flood of output, which is
+    // M2's `cat` a 1 GiB file criterion. That number was measured on the WebGL path and has not
+    // been re-measured on this one. Latency on every keystroke of every session is worth more
+    // than peak throughput on a case that is rare and already flow-controlled, so the default
+    // goes to the renderer that is correct all the time — and the flag is how the other is
+    // measured rather than argued about.
+    let renderer = if std::env::var("CIDE_RENDERER").is_ok_and(|v| v == "webgl") {
+        "&renderer=webgl"
     } else {
         ""
     };
