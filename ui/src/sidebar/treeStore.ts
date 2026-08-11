@@ -38,7 +38,14 @@
  * was missing its file commands.
  */
 import { create } from 'zustand'
-import { fs as fsApi, isDegraded, pendingCommand, type ProjectId, type TreeRow } from '@/ipc/client'
+import {
+  fs as fsApi,
+  fsCreate,
+  isDegraded,
+  pendingCommand,
+  type ProjectId,
+  type TreeRow,
+} from '@/ipc/client'
 import { isNoIndex } from '@/store/fileIndex'
 import { CHUNK_CAP, CHUNK_ROWS, chunkOf, chunkRequest, chunksFor, chunksToEvict } from './rowWindow'
 
@@ -110,6 +117,43 @@ interface FileTreeStore {
    * or inside a collapsed folder — where the honest answer is "about here".
    */
   selectedIndex: number
+  /**
+   * The unnamed row the user is typing a new file or folder into, or `null`.
+   *
+   * **An inline editor row, not a dialog**, and the choice is worth stating because the
+   * virtualized list is what makes it work rather than what makes it hard. A modal would be
+   * the smaller change — one `<input>`, no row arithmetic — and it would cover the very list
+   * that gives the name its context: the panel is 252px wide, the thing being named is one
+   * word, and the question the user is actually answering is *"beside what?"*. Every editor
+   * puts the box in the tree for that reason, and this tree already has the machinery from
+   * the rename box.
+   *
+   * The row does not exist in Rust. It is drawn *between* two real rows by `FileTree`, which
+   * renders `count + 1` rows and shifts every index at or past `index` by one — which is also
+   * why this is a flattened index rather than a parent-plus-offset: the virtualizer addresses
+   * positions, and a position is the only thing the draft and the real rows have in common.
+   */
+  draft: {
+    /** The directory the entry will be created in. Absolute. */
+    parent: string
+    /** Folder rather than file. Chooses the icon, the placeholder and the command argument. */
+    directory: boolean
+    /** The flattened row the editor occupies. Rows from here on are shifted down by one. */
+    index: number
+    /**
+     * How far to indent it: the parent's depth plus one.
+     *
+     * Carried here rather than re-derived from the row above at render time. That row is not
+     * resident at the moment the draft opens — `beginDraft` has just re-flattened the tree and
+     * emptied the cache — so the renderer's first frame would indent the box at depth 0 and
+     * jog it sideways when the chunk landed. Counting separators in `parent` is not the
+     * alternative either: that is depth in the *filesystem*, which a multi-root project makes
+     * a different number from depth in the flattening.
+     */
+    depth: number
+    /** Names already in `parent`, for the "already exists" check while typing. */
+    siblings: string[]
+  } | null
 
   /** Point the tree at a project, or at nothing. Reads the row count. */
   attach: (project: ProjectId | null) => Promise<void>
@@ -140,6 +184,42 @@ interface FileTreeStore {
    * `cide://fs-changed` and `cide://fs-status` handler; see the module header.
    */
   refresh: () => Promise<void>
+
+  /**
+   * Open the inline editor for a new entry inside `parent`, and scroll it into view.
+   *
+   * `atTop` is the single-root project's hidden root — see `newEntry.ts`. Everything else is
+   * anchored under the parent's own row, which means the parent has to be *expanded* and its
+   * row index has to be known, in that order:
+   *
+   * 1. `fs_reveal` expands every ancestor and answers the parent's row. Reveal first, because
+   *    expanding an ancestor is what moves the parent's own row number.
+   * 2. `fs_expand` on the parent itself. Expansion only adds rows *below* the parent, so the
+   *    index from step 1 survives it — which is why it is not re-read.
+   *
+   * The draft then sits at `parent + 1`: the parent's first child position. Two round trips
+   * for one menu click, which is the right trade — the alternative is drawing the editor
+   * somewhere the user is not looking.
+   *
+   * `false` when there is nowhere to draw it: the parent has no row, because it is gitignored
+   * or because it was deleted between the right-click and now. The caller says so — a menu
+   * item that opens no box and reports nothing is the dead control this codebase keeps
+   * shipping.
+   */
+  beginDraft: (parent: string, directory: boolean, atTop: boolean) => Promise<boolean>
+  /** Abandon the draft. Escape, blur with nothing typed, and every project switch. */
+  cancelDraft: () => void
+  /**
+   * Create what the draft describes and select the new row. Rejects on refusal.
+   *
+   * Resolves to the created path when the tree ended up with a row for it, and to `null` when
+   * it did not — a name the project's ignore rules hide is genuinely created and genuinely has
+   * no row, and the caller has to be able to say so rather than leave the user looking for it.
+   *
+   * The new row is **selected and not opened**. Creating a file is not opening it; that is the
+   * rule the single-click change established, applied to creation.
+   */
+  commitDraft: (name: string) => Promise<string | null>
 }
 
 /**
@@ -230,13 +310,26 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   revealTo: null,
   selected: null,
   selectedIndex: 0,
+  draft: null,
 
   async attach(project) {
     resetCache()
     // The selection goes with the project. A path from the old one names nothing in the new
     // tree, and keeping it would leave a highlight the user cannot see and the arrows
     // starting from a row that does not exist.
-    set({ project, count: 0, chunks: new Map(), revealTo: null, selected: null, selectedIndex: 0 })
+    //
+    // So does the draft, and for a sharper reason: its `parent` is an absolute path in the
+    // project being left, so a draft that survived the switch would create a file in a
+    // project the user is no longer looking at.
+    set({
+      project,
+      count: 0,
+      chunks: new Map(),
+      revealTo: null,
+      selected: null,
+      selectedIndex: 0,
+      draft: null,
+    })
     if (project === null) return
 
     const mine = generation
@@ -387,7 +480,119 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     touched = [...wanted]
     set({ count, chunks: fresh })
   },
+
+  async beginDraft(parent, directory, atTop) {
+    const { project } = get()
+    if (project === null) return false
+
+    if (atTop) {
+      // The hidden root of a single-root project. There is no row to anchor under, so the
+      // draft is row 0 and the whole tree shifts down by one. Depth 0 for the same reason:
+      // the top-level rows of a single-root project are the root's children at depth 0.
+      const siblings = await readSiblings(project, 0, -1)
+      if (get().project !== project) return false
+      set({ draft: { parent, directory, index: 0, depth: 0, siblings }, revealTo: 0 })
+      return true
+    }
+
+    const mine = generation
+    const at = await tree('fs_reveal', () => fsApi.reveal(project, parent), null)
+    if (generation !== mine || get().project !== project) return false
+    // The parent has no row: gitignored, or deleted between the right-click and now. Rust
+    // would refuse the create anyway; declining to open a box that cannot lead anywhere is
+    // the earlier and quieter version of the same answer, and the caller reports it.
+    if (at === null || at < 0) return false
+
+    const count = await tree('fs_expand', () => fsApi.expand(project, parent), get().count)
+    if (generation !== mine || get().project !== project) return false
+
+    // Expanding re-flattened everything below the parent, so every cached chunk past it is
+    // wrong. The two reads below therefore go through `fsApi` rather than the cache.
+    resetCache()
+    const parentRow = await tree(
+      'fs_tree_rows',
+      () => fsApi.treeRows(project, at, 1),
+      [] as TreeRow[],
+    )
+    const depth = parentRow[0]?.depth ?? 0
+    const siblings = await readSiblings(project, at + 1, depth)
+    if (get().project !== project) return false
+
+    set({
+      count,
+      chunks: new Map(),
+      revealTo: at,
+      draft: { parent, directory, index: at + 1, depth: depth + 1, siblings },
+    })
+    return true
+  },
+
+  cancelDraft() {
+    if (get().draft === null) return
+    set({ draft: null })
+  },
+
+  async commitDraft(name) {
+    const { project, draft } = get()
+    if (project === null || draft === null) return null
+
+    // Not wrapped in `tree()`: a rejection here is the user's to see. `pendingCommand` would
+    // swallow it into a fallback and latch `degraded`, which is right for a tree read that
+    // can be answered with an empty window and exactly wrong for a write the user asked for.
+    const created = await fsCreate.entry(project, draft.parent, name, draft.directory)
+
+    // The editor goes before the refresh, not after: the row it was standing in for now
+    // exists, and leaving both on screen for the length of a round trip draws the file twice.
+    set({ draft: null })
+    await get().refresh()
+    if (get().project !== project) return null
+
+    const at = get().indexOf(created)
+    if (at === null) {
+      // Created, but no row — the project's ignore rules hide it. `.gitignore`d dot-files are
+      // the ordinary case. Reported rather than papered over: a selection pointing at a path
+      // with no row is a highlight nobody can see.
+      return null
+    }
+    // Selected, **not** opened. Creating a file is not opening it — the same rule a single
+    // click follows. `reveal` would scroll as well, and `refresh` has already kept the
+    // viewport where the draft was, which is where this row is.
+    set({ selected: created, selectedIndex: at })
+    return created
+  },
 }))
+
+/**
+ * How many rows one sibling scan reads.
+ *
+ * A directory with more children than this gets a partial list, so the "already exists" check
+ * can miss and the user finds out from Rust's refusal instead — later, but never wrong.
+ * Reading the whole of a `node_modules` to warn about a name nobody is typing is the trade
+ * going the other way.
+ */
+const SIBLING_SCAN = 512
+
+/**
+ * The names of the rows at `depth + 1` starting at `from`, i.e. one directory's children.
+ *
+ * Read from Rust rather than from the row cache, because every caller has just re-flattened
+ * the tree and the cache is empty by construction. The scan stops at the first row that is
+ * *not* deeper than the parent, which is the parent's next sibling — everything between is
+ * its subtree, and only the shallowest level of that subtree is a sibling of the new entry.
+ */
+async function readSiblings(project: ProjectId, from: number, depth: number): Promise<string[]> {
+  const rows = await tree(
+    'fs_tree_rows',
+    () => fsApi.treeRows(project, from, SIBLING_SCAN),
+    [] as TreeRow[],
+  )
+  const names: string[] = []
+  for (const row of rows) {
+    if (row.depth <= depth) break
+    if (row.depth === depth + 1) names.push(row.name)
+  }
+  return names
+}
 
 /** Fetch one chunk and merge it in, evicting whatever the cap no longer allows. */
 async function loadChunk(

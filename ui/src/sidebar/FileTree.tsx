@@ -41,6 +41,7 @@ import { letterFor, statusAt } from './treeStatus'
 import { enterOn, fileTreeClick, gestureOf, moveIndex, type RowAction } from './clickSemantics'
 import { copyText } from './copyText'
 import { isRootPath, relativeTo } from './rowPaths'
+import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
 import {
   diag,
   fs as fsApi,
@@ -127,6 +128,11 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   const degraded = useFileTree((s) => s.degraded)
   const revealTo = useFileTree((s) => s.revealTo)
   const selected = useFileTree((s) => s.selected)
+  /**
+   * The unnamed row being typed into, or `null`. See `treeStore`'s field for why it is a row
+   * in the list rather than a dialog over it.
+   */
+  const draft = useFileTree((s) => s.draft)
   /*
    * Subscribed at the panel and threaded down rather than read inside `Row`. Two reasons:
    * the rows are not memoized, so a per-row subscription would be one zustand listener per
@@ -183,6 +189,14 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    * to nothing, which is the failure this codebase has already shipped twice.
    */
   const [problem, setProblem] = useState<string | null>(null)
+  /**
+   * What the draft row is currently saying about the name in it.
+   *
+   * Lifted out of the input so it can be drawn at the foot of the panel: the row is 21px of a
+   * 252px column and there is no room in it for a sentence, and a refusal the user only meets
+   * *after* pressing Enter is the thing this whole module is trying not to be.
+   */
+  const [draftName, setDraftName] = useState('')
 
   /** Report a rejected file command, in the panel and in the log. */
   const fail = useCallback(
@@ -195,8 +209,26 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   )
 
   const scrollRef = useRef<HTMLDivElement>(null)
+  /**
+   * The draft occupies a row that Rust does not know about, so the list is one longer than the
+   * tree while it is open and every index from `draft.index` on is shifted down by one.
+   *
+   * `-1` rather than `null` for "no draft" so the two comparisons below are plain numeric ones
+   * — `virtual > -1` is never true for the first row, which is the only case that matters.
+   */
+  const draftAt = draft?.index ?? -1
+  // `max` rather than a plain `+ 1`: a watcher burst can shrink the tree under an open draft
+  // — a `git checkout` that removed the folder above it — and a virtualizer sized shorter
+  // than the row it is being asked to place would put the box past the bottom of the panel.
+  const rowCount = Math.max(count + (draft === null ? 0 : 1), draftAt + 1)
+  /** A virtual row index translated back to the flattened index Rust uses. */
+  const toReal = useCallback(
+    (virtual: number) => (draftAt >= 0 && virtual > draftAt ? virtual - 1 : virtual),
+    [draftAt],
+  )
+
   const virtualizer = useVirtualizer({
-    count,
+    count: rowCount,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_HEIGHT,
     overscan: 12,
@@ -210,9 +242,13 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   // into `set`, and a store write triggered from inside a render is the React warning about
   // updating one component while rendering another — here it would be the tree updating
   // itself mid-commit.
+  //
+  // The range is translated out of virtual space first. Asking for the *virtual* range would
+  // request one row past the end of the tree while a draft is open, which is harmless, and
+  // would be off by one for every row below the draft, which is not.
   useEffect(() => {
-    if (count > 0) useFileTree.getState().ensure(first, last + 1)
-  }, [count, first, last, chunks])
+    if (count > 0) useFileTree.getState().ensure(toReal(first), toReal(last) + 1)
+  }, [count, first, last, chunks, toReal])
 
   useEffect(() => {
     if (revealTo === null) return
@@ -264,9 +300,11 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // While a row is being renamed the `<input>` owns every key, including Enter and
-      // Escape. Handling them here as well would rename the file and move the selection.
-      if (renaming !== null) return
+      // While a row is being renamed — or a new one is being named — the `<input>` owns every
+      // key, including Enter and Escape. Handling them here as well would rename the file and
+      // move the selection, and would answer Escape by cancelling the draft *and* jumping the
+      // cursor to whatever row the arrows were last on.
+      if (renaming !== null || draft !== null) return
       const store = useFileTree.getState()
       const at = cursor()
 
@@ -314,8 +352,98 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       }
       e.preventDefault()
     },
-    [apply, count, cursor, moveTo, renaming],
+    [apply, count, cursor, draft, moveTo, renaming],
   )
+
+  /**
+   * Open the inline editor for a new file or folder.
+   *
+   * The target is decided by `newEntry.ts` — a file row means its *parent*, a folder row means
+   * itself, no row means the project's first root — and everything about placing the editor
+   * (expanding the folder, finding the anchor row, scrolling to it) is `beginDraft`'s.
+   */
+  const startDraft = useCallback((target: NewEntryTarget, directory: boolean) => {
+    setDraftName('')
+    setProblem(null)
+    void useFileTree
+      .getState()
+      .beginDraft(target.parent, directory, target.atTop)
+      .then((opened) => {
+        if (opened) return
+        // No row to anchor the editor to, so nothing opened. Said out loud: a menu item that
+        // draws no box and reports nothing is exactly the dead control this panel has already
+        // shipped twice.
+        setProblem(`${target.label} is not in the tree any more, so nothing can be created in it.`)
+      })
+      .catch(() => {
+        // `beginDraft` only reads the tree, and every read inside it already falls back rather
+        // than rejecting. Caught anyway so a future one cannot become an unhandled rejection
+        // in a panel with no error surface of its own.
+      })
+  }, [])
+
+  /**
+   * Commit the draft, or refuse it and leave the box open.
+   *
+   * Refusing *without closing the box* is the point: the name is still there to be fixed. The
+   * alternative — close, then complain — throws away the typing that caused the complaint.
+   */
+  const commitDraft = useCallback(
+    (raw: string) => {
+      const current = useFileTree.getState().draft
+      if (current === null) return
+      const name = nameToSend(raw, current.siblings, current.directory)
+      // Refused locally. The note strip is already showing why — it is driven by the same
+      // `checkName` over the same text — so there is nothing to do but decline to close.
+      if (name === null) return
+      const what = current.directory ? 'New Folder' : 'New File'
+      void useFileTree
+        .getState()
+        .commitDraft(name)
+        .then((created) => {
+          if (created !== null) return
+          // Created, and no row for it. Almost always a dot-file the project's ignore rules
+          // hide. Said out loud rather than left as a menu item that appeared to do nothing.
+          setProblem(
+            `Created “${name}”, but this project’s ignore rules keep it out of the tree.`,
+          )
+        })
+        .catch((error: unknown) => {
+          // The box stays open on a rejection for the same reason it stays open on a local
+          // refusal: `already exists` and `is no longer a directory` are both fixable from
+          // here, and closing would make the user start the gesture again to find out how.
+          fail(what)(error)
+        })
+    },
+    [fail],
+  )
+
+  const cancelDraft = useCallback(() => {
+    useFileTree.getState().cancelDraft()
+    setDraftName('')
+  }, [])
+
+  /**
+   * The line under the draft box: where the entry is going, or why the name will not do.
+   *
+   * The **empty** box is deliberately not an error. It is empty the moment it opens, and a red
+   * "Type a file name." on an untouched field reads as a failure before anything was
+   * attempted — so an untouched box says where the file is going instead, which is the thing
+   * the user cannot otherwise check. `checkName` still refuses the empty name on Enter; this
+   * only decides how it is drawn.
+   */
+  const draftMessage: { text: string; bad: boolean } = (() => {
+    if (draft === null) return { text: '', bad: false }
+    const where = isRootPath(draft.parent, roots)
+      ? basenameOf(draft.parent)
+      : relativeTo(draft.parent, roots)
+    const destination = `New ${draft.directory ? 'folder' : 'file'} in ${where}`
+    if (draftName.trim() === '') return { text: destination, bad: false }
+    const verdict = checkName(draftName, draft.siblings, draft.directory)
+    if (verdict.error !== null) return { text: verdict.error, bad: true }
+    if (verdict.note !== null) return { text: verdict.note, bad: false }
+    return { text: destination, bad: false }
+  })()
 
   /**
    * The row a menu gesture landed on, read back out of the DOM.
@@ -347,9 +475,47 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     label: 'File tree',
     items: ({ target }) => {
       const row = rowFacts(target)
-      // Right-clicking the empty space under the last row opens nothing. An empty box at the
-      // pointer says "this surface is broken"; `useContextMenu` declines on `[]`.
-      if (row === null || project === null) return []
+      if (project === null) return []
+
+      /*
+       * *New File…* and *New Folder…*, which are the two items this menu was missing.
+       *
+       * Built before the early return below, because the empty space under the last row is
+       * the one place they are the *whole* menu: every other item needs a row and these two
+       * need only a project. Right-clicking there used to open nothing at all, which was the
+       * right answer when there was nothing to offer and is the wrong one now.
+       *
+       * The destination is named in the label whenever it is not obvious from what was
+       * clicked — the empty-space case, and the multi-root case where "the project root" is
+       * several different directories. `targetFor` decides which root; this only says so.
+       */
+      const target_ = targetFor(row === null ? null : { path: row.path, isDir: row.isDir }, roots)
+      // Name the destination whenever it is not the thing that was clicked. A **file** row is
+      // the case that matters: *New File* on `src/main.rs` creates a sibling in `src`, not
+      // something "inside" a file, and the label is where the user finds that out — before the
+      // gesture rather than by looking for the row afterwards.
+      const named = row === null || !row.isDir
+      const create: MenuEntry[] =
+        target_ === null
+          ? []
+          : [
+              {
+                id: 'newFile',
+                label: named ? `New File in ${target_.label}…` : 'New File…',
+                run: () => startDraft(target_, false),
+              },
+              {
+                id: 'newFolder',
+                label: named ? `New Folder in ${target_.label}…` : 'New Folder…',
+                run: () => startDraft(target_, true),
+              },
+            ]
+
+      // Right-clicking the empty space under the last row now offers the two items above and
+      // nothing else. An empty box at the pointer says "this surface is broken";
+      // `useContextMenu` declines on `[]`, which is still the answer for a project-less panel.
+      if (row === null) return create
+
       const store = useFileTree.getState()
       const at = store.indexOf(row.path)
       // Right-click selects too. The menu reads the DOM and does not need it, but a menu that
@@ -359,6 +525,11 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
 
       const openLabel = row.isDir ? (row.expanded ? 'Collapse' : 'Expand') : 'Open'
       const entries: MenuEntry[] = [
+        // First, as every editor puts them. They are the only items here that make something
+        // rather than acting on what is already there, which is also why they take the
+        // separator below rather than sharing a group with Open.
+        ...create,
+        { kind: 'separator' },
         {
           id: 'open',
           label: openLabel,
@@ -464,7 +635,10 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
             * path of the row that replaced it are two different children at one position.
             */}
           {items.map((item) => {
-            const row = useFileTree.getState().rowAt(item.index)
+            // The draft's slot is left empty here and filled below, outside the window. See
+            // the note on the `<DraftRow>` element for why it is not drawn from this map.
+            if (item.index === draftAt) return null
+            const row = useFileTree.getState().rowAt(toReal(item.index))
             if (!row) {
               // The chunk is still in flight. The box keeps its height so the scrollbar does
               // not resize under the user's thumb as rows arrive.
@@ -480,7 +654,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
               <Row
                 key={item.key}
                 row={row}
-                index={item.index}
+                index={toReal(item.index)}
                 statuses={statuses}
                 iconTheme={iconTheme}
                 top={item.start}
@@ -494,11 +668,59 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
               />
             )
           })}
+          {/*
+            * The one row in this list that is not in the tree, drawn *outside* the virtual
+            * window rather than from the map above.
+            *
+            * Every row size here is `ROW_HEIGHT`, so its offset is arithmetic and needs no
+            * virtual item — and being outside the window is the whole point: the virtualizer
+            * unmounts what scrolls past its overscan, and unmounting a focused `<input>`
+            * fires `blur`, which cancels the draft. A user who scrolled the tree while
+            * choosing a name would have watched their half-typed filename disappear.
+            *
+            * It is positioned at the parent's first-child slot with the parent's depth plus
+            * one, so it lines up with the siblings it is about to join.
+            */}
+          {draft !== null && (
+            <DraftRow
+              directory={draft.directory}
+              depth={draft.depth}
+              iconTheme={iconTheme}
+              top={draftAt * ROW_HEIGHT}
+              height={ROW_HEIGHT}
+              value={draftName}
+              onChange={setDraftName}
+              onCommit={commitDraft}
+              onCancel={cancelDraft}
+            />
+          )}
         </div>
         {/* `{menu}` must be rendered or nothing appears. It portals to a sibling of `#root`, so
             this scroll container's `overflow: hidden` cannot clip it. */}
         {menu}
       </div>
+      {/*
+        * What the draft row is about to do, and what is wrong with the name in it.
+        *
+        * At the foot of the panel rather than in the row, because the row is 21px of a 252px
+        * column and every one of these sentences is longer than that. It also has to say
+        * *where* — a new file's destination is the whole thing the user cannot check by
+        * looking at a name box, and in a multi-root project "the project root" is several
+        * different directories.
+        *
+        * A separate strip from `.problem` below on purpose: this one is live and disappears
+        * with the draft, that one is a failure that stays until it is dismissed. Sharing an
+        * element would mean a rejected `fs_create_in` was wiped by the next keystroke.
+        */}
+      {draft !== null && (
+        <div
+          className={draftMessage.bad ? styles.draftError : styles.draftNote}
+          data-audit="fileTreeDraftNote"
+          role="status"
+        >
+          {draftMessage.text}
+        </div>
+      )}
       {/*
         * A rejected file command, at the foot of the panel until it is dismissed.
         *
@@ -522,6 +744,102 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         </div>
       )}
     </>
+  )
+}
+
+/**
+ * The unnamed row a new file or folder is typed into.
+ *
+ * A sibling of [`RenameInput`] and deliberately not the same component. They look alike and
+ * they are not the same thing: rename edits a row that exists — Escape leaves the file alone
+ * and blur commits, because typing the user has walked away from must resolve — while this
+ * stands in for a row that does *not* exist yet, so blur has to **cancel**. Committing on blur
+ * here would mean clicking anywhere in the app created a file, which is the shape of accident
+ * a file tree cannot afford. `Enter` is the only thing that creates anything.
+ *
+ * It draws no git tag. There is no status for a path that is not on disk, and an empty 9px
+ * column keeps the input the same width it will be once the row is real, so nothing jumps when
+ * the draft is replaced by the file it made.
+ */
+function DraftRow({
+  directory,
+  depth,
+  iconTheme,
+  top,
+  height,
+  value,
+  onChange,
+  onCommit,
+  onCancel,
+}: {
+  directory: boolean
+  depth: number
+  iconTheme: IconTheme
+  top: number
+  height: number
+  value: string
+  onChange: (value: string) => void
+  onCommit: (value: string) => void
+  onCancel: () => void
+}) {
+  /**
+   * Focus once, on the first element this ref sees.
+   *
+   * The input is *controlled* — the panel owns the text so it can validate it as it is typed
+   * — so this component re-renders on every keystroke, and an unguarded `el?.focus()` in an
+   * inline ref would run on each of them. Harmless today and a trap tomorrow: it is one
+   * mis-ordered render away from stealing focus back from whatever the user moved to.
+   */
+  const focused = useRef(false)
+
+  return (
+    <div
+      className={`${styles.row} ${styles.rowSelected}`}
+      data-audit="fileTreeDraftRow"
+      data-depth={depth}
+      role="treeitem"
+      aria-level={depth + 1}
+      aria-selected={true}
+      style={{ height: `${height}px`, transform: `translateY(${top}px)` }}
+    >
+      {/* No twisty glyph even for a folder: it has no children to disclose and drawing one
+          would invite a click that folds nothing. The span is still here because it is the
+          indentation. */}
+      <span className={styles.twisty} style={{ marginLeft: `${depth * INDENT}px` }} aria-hidden="true" />
+      {/* The icon follows the *name being typed*, so `main.rs` turns into the Rust icon as it
+          is spelled. `iconFor` reads only these three fields, which is why a literal works
+          where the real rows pass a whole `TreeRow`. */}
+      <FileIcon
+        row={{ name: value, kind: directory ? 'dir' : 'file', expanded: false }}
+        theme={iconTheme}
+      />
+      <input
+        className={styles.rename}
+        value={value}
+        spellCheck={false}
+        autoComplete="off"
+        placeholder={directory ? 'folder name' : 'file name'}
+        aria-label={directory ? 'Name for the new folder' : 'Name for the new file'}
+        ref={(el) => {
+          if (el === null || focused.current) return
+          focused.current = true
+          el.focus()
+        }}
+        onChange={(e) => onChange(e.target.value)}
+        onMouseDown={(e) => e.stopPropagation()}
+        // Cancel, not commit — see the component's own note. A file created by looking away
+        // is a file nobody meant to make.
+        onBlur={onCancel}
+        onKeyDown={(e) => {
+          // Every key belongs to the box. Without this, typing `e` in a filename is also an
+          // End key on its way past the tree's own handler.
+          e.stopPropagation()
+          if (e.key === 'Enter') onCommit(e.currentTarget.value)
+          else if (e.key === 'Escape') onCancel()
+        }}
+      />
+      <span className={styles.tag} />
+    </div>
   )
 }
 

@@ -327,6 +327,7 @@ pub fn run() {
             cmd::fs::fs_read_file,
             cmd::fs::fs_write_file,
             cmd::fs::fs_create,
+            cmd::fs::fs_create_in,
             cmd::fs::fs_rename,
             cmd::fs::fs_delete,
             cmd::picker::picker_query,

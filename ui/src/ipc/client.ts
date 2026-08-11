@@ -1457,3 +1457,39 @@ export const awaiting = {
  */
 export const onSessionAwaiting = (handler: (sessions: SessionId[]) => void) =>
   listen<{ sessions: SessionId[] }>('cide://session-awaiting', (e) => handler(e.payload.sessions))
+
+/* --------------------------------------------------------------------------------------
+ * Creating a file or a folder from the file tree's context menu.
+ *
+ * One contiguous block, appended rather than folded into `fs` above, per the house rule for
+ * this file.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * *New File…* and *New Folder…*, as the tree's context menu means them.
+ *
+ * Deliberately **not** `fs.create` with a joined path, and the difference is three behaviours
+ * the tree depends on:
+ *
+ * * `fs.create` reaches `ops::create`, which calls `create_dir_all` on the way to the path it
+ *   was given. The row this gesture starts from was drawn some time ago, so the folder it
+ *   names may have been deleted since — and a *New File* that silently puts a deleted folder
+ *   back is worse than one that refuses. This command requires the parent to already be a
+ *   directory.
+ * * The name is checked *as a name*. `src/main.rs` typed into the box is refused with a
+ *   reason rather than obeyed as two components or mangled into `src_main.rs`. The same rules
+ *   run in `sidebar/newEntry.ts` so the user is told while typing; this is the copy that is
+ *   load-bearing.
+ * * The path is folded into the file index before the command returns, so the tree can show
+ *   the row **now** instead of waiting out the watcher's debounce.
+ *
+ * Answers with the absolute path it created, so the caller selects that row rather than
+ * re-deriving the same string a second time in a second language.
+ *
+ * Note what this does **not** do: open the file. Creating is not opening — that is the
+ * single-click rule the tree already follows, applied to creation.
+ */
+export const fsCreate = {
+  entry: (projectId: ProjectId, parent: string, name: string, directory: boolean) =>
+    invoke<string>('fs_create_in', { project: projectId, parent, name, directory }),
+}

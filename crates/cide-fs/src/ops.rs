@@ -97,6 +97,86 @@ pub fn write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check a name the user typed for a new entry, before it is joined to anything.
+///
+/// Spelled out here rather than left to the OS. "The OS will reject it" is not an answer a
+/// file tree can give: `open(2)` fails with `EISDIR` or `ENOENT` or nothing at all depending
+/// on which rule was broken, and the user finds out *after* the gesture, from a message about
+/// a syscall. The frontend runs the same rules in `ui/src/sidebar/newEntry.ts` so it can say
+/// so while the name is still being typed; this copy is the load-bearing one, because a name
+/// arriving here has crossed the IPC boundary and nothing about it can be assumed.
+///
+/// The reason travels inside [`FsError::InvalidPath`] rather than in a variant of its own. A
+/// new variant would be the tidier shape and it would also be a change to the error enum every
+/// other surface in the app matches on, for a message only this one gesture can produce.
+pub fn check_name(name: &str) -> Result<()> {
+    let reason = if name.is_empty() {
+        "a name cannot be empty"
+    } else if name.trim().is_empty() {
+        "a name cannot be only whitespace"
+    } else if name != name.trim() {
+        // A trailing space is legal on Linux and invisible in a 21px row, so a file called
+        // "main.rs " reads as one that is simply missing from every command that names it.
+        // The frontend trims before it sends, so this only ever fires on a caller that did not.
+        "a name cannot start or end with whitespace"
+    } else if name.contains('/') || name.contains(std::path::MAIN_SEPARATOR) {
+        // Not silently replaced with `_` the way the rename box does it — rename is editing a
+        // name in place, where a stray `/` is a typo, and this is *choosing* a location, where
+        // `src/foo.rs` is a thing the user plainly meant and would not get.
+        "a name cannot contain a path separator — create the folder first, then the file in it"
+    } else if name.contains('\0') {
+        "a name cannot contain a NUL byte"
+    } else if name == "." || name == ".." {
+        "\".\" and \"..\" already name this directory and its parent"
+    } else {
+        return Ok(());
+    };
+    Err(FsError::InvalidPath(format!("{name:?}: {reason}")))
+}
+
+/// Create `name` inside `parent`, and answer with the path that now exists.
+///
+/// Distinct from [`create`], which takes a whole path and calls `create_dir_all` on its way
+/// there. That is right for a caller that has computed a path it knows should exist, and wrong
+/// for this one: the gesture starts from a row in a tree that was drawn some time ago, so the
+/// directory it names may have been deleted since — and `create_dir_all` would put it back.
+/// A *New File* that silently resurrects a folder the user deleted is worse than one that
+/// refuses, so the parent has to already be a directory.
+pub fn create_in(roots: &[PathBuf], parent: &Path, name: &str, directory: bool) -> Result<PathBuf> {
+    check_within(roots, parent)?;
+    check_name(name)?;
+    if !parent.is_dir() {
+        return Err(FsError::Io {
+            path: parent.display().to_string(),
+            message: "is no longer a directory — it may have been deleted or renamed".to_string(),
+        });
+    }
+
+    let target = parent.join(name);
+    // The containment check again, on the joined path. `check_name` already refuses every
+    // component that could climb out, so this can only fire on a bug in the two lines above
+    // it — which is exactly the bug worth a string comparison.
+    check_within(roots, &target)?;
+
+    // `symlink_metadata` as well as `exists`: a *broken* symlink is a real directory entry
+    // that `exists()` reports as absent, and reporting "already exists" beats `create_new`'s
+    // raw `EEXIST` for something the user can see in their tree.
+    if target.exists() || target.symlink_metadata().is_ok() {
+        return Err(FsError::Exists(target.display().to_string()));
+    }
+
+    if directory {
+        std::fs::create_dir(&target).map_err(|e| FsError::io(&target, e))?;
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| FsError::io(&target, e))?;
+    }
+    Ok(target)
+}
+
 /// Create an empty file, or a directory. Never clobbers.
 pub fn create(path: &Path, directory: bool) -> Result<()> {
     if path.exists() {
@@ -226,6 +306,149 @@ mod tests {
         rename(&dir.join("a.rs"), &dir.join("c.rs")).unwrap();
         assert!(dir.join("c.rs").exists());
         assert!(!dir.join("a.rs").exists());
+    }
+
+    /// Every name rule the tree's *New File…* box promises, held where the promise is kept.
+    ///
+    /// The frontend has the same list in `newEntry.ts` and `check-new-entry.mjs` pins it
+    /// there. Two copies on purpose: that one exists to tell the user *while they type*, this
+    /// one exists because a name reaching this function has been over IPC.
+    #[test]
+    fn a_name_is_refused_with_a_reason_rather_than_left_to_the_os() {
+        let bad = [
+            ("", "empty"),
+            ("   ", "only whitespace"),
+            (" main.rs", "a leading space"),
+            ("main.rs ", "a trailing space"),
+            ("src/main.rs", "a path separator"),
+            ("..", "the parent directory"),
+            (".", "this directory"),
+            ("a\0b", "a NUL byte"),
+        ];
+        for (name, what) in bad {
+            let err = check_name(name);
+            assert!(
+                matches!(err, Err(FsError::InvalidPath(_))),
+                "{what}: {err:?}"
+            );
+            // The reason has to be *in* the error. A tagged variant with no prose would leave
+            // the panel showing "not a valid path", which is the message this rule replaced.
+            let Err(FsError::InvalidPath(message)) = err else {
+                unreachable!()
+            };
+            assert!(message.len() > name.len() + 4, "{what}: {message}");
+        }
+
+        // A leading dot is a legitimate filename and is NOT refused. `.gitignore` is the
+        // single most likely thing anybody creates from this menu.
+        assert!(check_name(".gitignore").is_ok());
+        assert!(
+            check_name("...").is_ok(),
+            "three dots is a legal name, unlike one or two"
+        );
+        assert!(check_name("main.rs").is_ok());
+        // A backslash is an ordinary character on Unix, and refusing it here would refuse a
+        // name the platform accepts. `MAIN_SEPARATOR` covers the platform where it is not.
+        #[cfg(unix)]
+        assert!(check_name("a\\b").is_ok());
+    }
+
+    #[test]
+    fn creating_in_a_directory_that_vanished_is_refused_rather_than_recreating_it() {
+        let dir = scratch("ops-create-in-gone");
+        let roots = vec![dir.path().to_path_buf()];
+        let parent = dir.join("sub");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+
+        // The distinction that matters: `create` would have called `create_dir_all` and put
+        // `sub` back, so the user's deleted folder would reappear holding one new file.
+        assert!(matches!(
+            create_in(&roots, &parent, "a.rs", false),
+            Err(FsError::Io { .. })
+        ));
+        assert!(
+            !parent.exists(),
+            "the vanished directory must stay vanished"
+        );
+    }
+
+    #[test]
+    fn creating_a_name_that_exists_is_refused_and_leaves_the_file_alone() {
+        let dir = scratch("ops-create-in-exists");
+        let roots = vec![dir.path().to_path_buf()];
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+
+        assert!(matches!(
+            create_in(&roots, dir.path(), "a.rs", false),
+            Err(FsError::Exists(_))
+        ));
+        assert_eq!(read_to_string(&dir.join("a.rs")).unwrap(), "fn main() {}");
+
+        // A directory over an existing file, and a file over an existing directory, are the
+        // same refusal — `create_dir` and `create_new` fail differently and the tree does not
+        // care which.
+        std::fs::create_dir(dir.join("d")).unwrap();
+        assert!(matches!(
+            create_in(&roots, dir.path(), "d", true),
+            Err(FsError::Exists(_))
+        ));
+        assert!(matches!(
+            create_in(&roots, dir.path(), "d", false),
+            Err(FsError::Exists(_))
+        ));
+    }
+
+    #[test]
+    fn creating_outside_the_project_root_is_refused_rather_than_obeyed() {
+        let dir = scratch("ops-create-in-outside");
+        let outside = scratch("ops-create-in-elsewhere");
+        let roots = vec![dir.path().to_path_buf()];
+
+        assert!(matches!(
+            create_in(&roots, outside.path(), "a.rs", false),
+            Err(FsError::OutsideProject(_))
+        ));
+        assert!(!outside.join("a.rs").exists());
+
+        // And the climb, which is the version a frontend bug would actually produce: a parent
+        // assembled from a row's path and a `..` somebody typed into a name box.
+        assert!(matches!(
+            create_in(&roots, &dir.join(".."), "a.rs", false),
+            Err(FsError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            create_in(&roots, dir.path(), "../escaped.rs", false),
+            Err(FsError::InvalidPath(_))
+        ));
+        assert!(
+            !dir.path().parent().unwrap().join("escaped.rs").exists(),
+            "a `..` in the name must not write beside the project"
+        );
+    }
+
+    #[test]
+    fn creating_answers_with_the_path_it_made() {
+        let dir = scratch("ops-create-in-ok");
+        let roots = vec![dir.path().to_path_buf()];
+
+        let file = create_in(&roots, dir.path(), "a.rs", false).unwrap();
+        assert_eq!(file, dir.join("a.rs"));
+        assert!(file.is_file());
+        assert_eq!(
+            read_to_string(&file).unwrap(),
+            "",
+            "a new file starts empty"
+        );
+
+        let folder = create_in(&roots, dir.path(), "sub", true).unwrap();
+        assert_eq!(folder, dir.join("sub"));
+        assert!(folder.is_dir());
+
+        // The path comes back so the caller can select the new row. Deriving it by re-joining
+        // in the frontend is the same string twice, and the two drift.
+        let nested = create_in(&roots, &folder, ".gitignore", false).unwrap();
+        assert_eq!(nested, dir.join("sub/.gitignore"));
     }
 
     #[test]

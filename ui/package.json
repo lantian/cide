@@ -18,6 +18,7 @@
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:menu-model": "node scripts/check-menu-model.mjs",
     "check:menus": "node scripts/check-menus.mjs",
+    "check:new-entry": "node scripts/check-new-entry.mjs",
     "check:picker": "node scripts/check-picker.mjs",
     "check:problems": "node scripts/check-problems.mjs",
     "check:proxy": "node scripts/check-proxy.mjs",

@@ -22,6 +22,7 @@
   "fs_close",
   "fs_collapse",
   "fs_create",
+  "fs_create_in",
   "fs_delete",
   "fs_expand",
   "fs_index",
