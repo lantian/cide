@@ -44,6 +44,10 @@ impl serde::Serialize for SessionError {
 /// credential precedence order, so injecting one would silently bill a Console org for a
 /// user on Claude Max. The child inherits its auth by inheriting the environment; cide
 /// never reads `~/.claude/.credentials.json`.
+///
+/// The proxy variables are **not** here: they are the user's configuration rather than a
+/// constant of the terminal, so they are a second pass — [`proxy_env`] — applied on top of
+/// this one. Nothing about proxying changes the rule in the paragraph above.
 fn base_env(spec: SpawnSpec) -> SpawnSpec {
     spec.env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
@@ -59,6 +63,166 @@ fn base_env(spec: SpawnSpec) -> SpawnSpec {
         .env_remove("COLUMNS")
         .env_remove("LINES")
         .env_remove("CI")
+}
+
+/// The three proxy variables, in the spelling the tooling on this platform expects.
+///
+/// **Both cases are always written, and it is not belt-and-braces.** curl documents
+/// `http_proxy` as lower case *only* — the upper-case form is deliberately ignored because a
+/// CGI environment turns an incoming `Proxy:` header into `HTTP_PROXY` — while Go's
+/// `httpproxy.FromEnvironment` prefers the upper-case one and much of the Node ecosystem
+/// (`proxy-from-env`, which is what axios and friends use) reads lower first and upper
+/// second. A pane that sets one spelling proxies half the commands the user types in it, and
+/// the other half fail as a connection timeout with nothing anywhere saying why. So each of
+/// these names is set — or removed — in both cases, always to the same value.
+const PROXY_URL_VARS: [&str; 3] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+
+/// Hosts that must never go through a proxy, whatever the user configured.
+///
+/// This is not a nicety. cide's IDE integration is an MCP server bound to loopback and found
+/// through `CLAUDE_CODE_SSE_PORT`; a proxy that accepts `127.0.0.1:<port>` and forwards it
+/// somewhere else takes inline diffs, @-mentions and the editor selection with it, silently,
+/// and the user has no reason to connect the two. `cide-hook` talks over a unix socket and is
+/// unaffected — this covers the one loopback TCP thing we own.
+const LOOPBACK_EXEMPT: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// Put a name in the child's environment under both spellings.
+fn env_both_cases(spec: SpawnSpec, name: &str, value: &str) -> SpawnSpec {
+    spec.env(name, value).env(name.to_lowercase(), value)
+}
+
+/// Take a name out of the child's environment under both spellings.
+fn env_remove_both_cases(spec: SpawnSpec, name: &str) -> SpawnSpec {
+    spec.env_remove(name).env_remove(name.to_lowercase())
+}
+
+/// The `NO_PROXY` value: the loopback exemption, then whatever else was asked for.
+///
+/// Deduplicated case-insensitively so that a user who types `localhost` themselves does not
+/// get it twice, and loopback-first so the non-negotiable part is the part you read.
+fn no_proxy_value(extra: &str) -> String {
+    let mut entries: Vec<String> = LOOPBACK_EXEMPT.iter().map(|s| (*s).to_string()).collect();
+    for entry in extra.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if !entries.iter().any(|e| e.eq_ignore_ascii_case(entry)) {
+            entries.push(entry.to_string());
+        }
+    }
+    entries.join(",")
+}
+
+/// Apply the user's proxy configuration to a child's environment.
+///
+/// Pure over `spec` and over `inherited`, which is why the tests below can prove every branch
+/// without spawning anything or touching the process environment. `inherited` answers what
+/// *this* process has, which is what a child would otherwise get — production passes
+/// `std::env::var`.
+///
+/// # Inherit vs override
+///
+/// [`ProxyMode::Manual`] wins outright: every one of the six URL variables is set from these
+/// settings or removed, so a `HTTP_PROXY` in the user's `.bashrc` cannot supply the half they
+/// left blank. A setting that says "this is the proxy" and then silently loses to something
+/// invisible in a shell profile is worse than no setting, because the user has no way to see
+/// which one won.
+///
+/// [`ProxyMode::Inherit`] is the default and defers completely — with one exception that is
+/// about loopback rather than about proxying. If the inherited environment already names a
+/// proxy, `NO_PROXY` is rewritten to include [`LOOPBACK_EXEMPT`] on top of whatever it
+/// already said. Without that, the common case — a corporate laptop with `HTTP_PROXY` in the
+/// profile and no `NO_PROXY` — is one where cide's headline feature has never worked and
+/// nothing reports it. When nothing is inherited, nothing is touched at all.
+///
+/// # What this does not reach, and the UI says so too
+///
+/// Panes only. cide's own network children are spawned elsewhere and do not read this
+/// setting: `cide_git::push` runs `git` with [`std::process::Command`], so a push goes
+/// through whatever proxy the *app's* environment names, not this one. Plumbing settings
+/// into `cide-git` is a change to that crate's shape — it takes no configuration today —
+/// and is deliberately not smuggled in here. `ProxySection`'s closing note names the same
+/// limit on screen, because a corporate user who fixes their panes with this and then
+/// watches `git push` hang deserves to have been told.
+fn proxy_env(
+    spec: SpawnSpec,
+    proxy: &cide_ipc::ProxySettings,
+    inherited: impl Fn(&str) -> Option<String>,
+) -> SpawnSpec {
+    use cide_ipc::{ProxyMode, normalize_proxy_url};
+
+    /// Set from `value`, or remove the variable entirely when there is nothing to set.
+    fn set_or_clear(spec: SpawnSpec, name: &str, value: Option<String>) -> SpawnSpec {
+        match value {
+            Some(v) => env_both_cases(spec, name, &v),
+            None => env_remove_both_cases(spec, name),
+        }
+    }
+
+    match proxy.mode {
+        ProxyMode::Inherit => {
+            // Each spelling is tested for a *usable* value before the other is consulted,
+            // rather than filtering once after the fallback. `HTTP_PROXY=` — set but empty,
+            // which is how a profile turns a proxy off without unsetting it, and what
+            // `env -u` leaves behind in a few launchers — would otherwise count as present
+            // and mask a real `http_proxy` beside it. Both consequences are silent: the
+            // loopback exemption is skipped on a machine that does have a proxy, and the
+            // `no_proxy` list the user does have is overwritten with one that dropped its
+            // entries, since `env_both_cases` writes over both spellings.
+            let named = |name: &str| {
+                let usable = |v: String| (!v.trim().is_empty()).then_some(v);
+                inherited(name)
+                    .and_then(usable)
+                    .or_else(|| inherited(&name.to_lowercase()).and_then(usable))
+            };
+            if !PROXY_URL_VARS.iter().any(|v| named(v).is_some()) {
+                // The overwhelmingly common case, and the one where doing anything at all
+                // would be meddling: no proxy anywhere, so no variable is added or removed.
+                return spec;
+            }
+            let existing = named("NO_PROXY").unwrap_or_default();
+            env_both_cases(spec, "NO_PROXY", &no_proxy_value(&existing))
+        }
+        ProxyMode::Manual => {
+            let spec = set_or_clear(spec, "HTTP_PROXY", normalize_proxy_url(&proxy.http));
+            let spec = set_or_clear(spec, "HTTPS_PROXY", proxy.https_url());
+            let spec = set_or_clear(spec, "ALL_PROXY", normalize_proxy_url(&proxy.all));
+            env_both_cases(spec, "NO_PROXY", &no_proxy_value(&proxy.no_proxy))
+        }
+        ProxyMode::Direct => {
+            // `NO_PROXY` goes too. Leaving an inherited one behind would be harmless but
+            // confusing: a child with no proxy and a long exemption list reads as though
+            // something is still routing.
+            let spec = PROXY_URL_VARS
+                .iter()
+                .fold(spec, |spec, name| env_remove_both_cases(spec, name));
+            env_remove_both_cases(spec, "NO_PROXY")
+        }
+    }
+}
+
+/// One line for the log, with any credentials removed.
+///
+/// A proxy URL is the single most useful thing to have in a log when a pane cannot reach the
+/// network, and `http://user:pass@proxy.corp:3128` is a perfectly ordinary value for it. So
+/// the line exists, and it goes through [`cide_ipc::redact_proxy_url`] — the host survives,
+/// the userinfo does not. `ProxySettings` also redacts in its own `Debug`, so the two ways of
+/// getting this wrong are both closed rather than one of them being a convention.
+fn proxy_log_line(proxy: &cide_ipc::ProxySettings) -> String {
+    use cide_ipc::{ProxyMode, redact_proxy_url};
+    match proxy.mode {
+        ProxyMode::Inherit => "proxy: inherited from the environment".to_string(),
+        ProxyMode::Direct => "proxy: none — scrubbed from this child".to_string(),
+        ProxyMode::Manual => format!(
+            "proxy: http={} https={} all={}",
+            redact_proxy_url(&proxy.http),
+            proxy
+                .https_url()
+                .map_or_else(String::new, |u| redact_proxy_url(&u)),
+            redact_proxy_url(&proxy.all),
+        ),
+    }
 }
 
 /// Whether this program is the Claude Code CLI, and so has hooks worth registering.
@@ -193,7 +357,20 @@ pub async fn session_spawn(
     for a in args {
         spec = spec.arg(a);
     }
-    let mut spec = base_env(spec);
+    // Read once, here, rather than inside `proxy_env`: this is the only place that knows both
+    // the app handle and that a child is about to exist, and `WorkspaceState::with` runs under
+    // a non-reentrant lock that nothing further down should be holding. `try_state` because a
+    // test harness may have no workspace, in which case the default — inherit, touch nothing —
+    // is the right answer anyway.
+    let proxy = app
+        .try_state::<crate::workspace_state::WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.proxy.clone()))
+        .unwrap_or_default();
+    let mut spec = proxy_env(base_env(spec), &proxy, |name| std::env::var(name).ok());
+    // Redacted, and at debug level: one line per spawn is worth it when a pane cannot reach
+    // the network, but it is not worth it on every launch of a machine with no proxy at all.
+    tracing::debug!("{}", proxy_log_line(&proxy));
+
     // Only Claude children get the settings payload. A shell has no hooks to register, and
     // handing it a `--settings` argument would simply be a bad argv.
     let is_claude = program_is_claude(&spec.program);
@@ -784,6 +961,276 @@ mod tests {
         assert!(program_is_claude("/usr/local/bin/claude"));
         assert!(!program_is_claude("/bin/bash"));
         assert!(!program_is_claude("claude-hook"));
+    }
+
+    // --- proxy environment ---------------------------------------------------------------
+
+    use cide_ipc::{ProxyMode, ProxySettings};
+
+    /// A bare spec, so a test asserts on exactly what the proxy pass added.
+    ///
+    /// `base_env` is deliberately not applied: mixing its dozen entries in would make every
+    /// assertion below a search through noise, and the two passes compose by construction —
+    /// `proxy_env` only ever appends.
+    fn proxy_spec(proxy: &ProxySettings, inherited: &[(&str, &str)]) -> SpawnSpec {
+        let inherited: Vec<(String, String)> = inherited
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        proxy_env(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir()),
+            proxy,
+            move |name| {
+                inherited
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+            },
+        )
+    }
+
+    fn value_of<'a>(spec: &'a SpawnSpec, name: &str) -> Option<&'a str> {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn manual(http: &str, https: &str, all: &str, no_proxy: &str) -> ProxySettings {
+        ProxySettings {
+            mode: ProxyMode::Manual,
+            http: http.into(),
+            https: https.into(),
+            all: all.into(),
+            no_proxy: no_proxy.into(),
+        }
+    }
+
+    /// The default is inherit-and-do-nothing, and "nothing" has to mean *nothing*.
+    ///
+    /// A single spurious `NO_PROXY` here would be a behaviour change for every user who has
+    /// never opened this screen, which is almost all of them.
+    #[test]
+    fn the_no_proxy_default_touches_nothing() {
+        let spec = proxy_spec(&ProxySettings::default(), &[]);
+        assert!(spec.env.is_empty(), "set {:?}", spec.env);
+        assert!(spec.env_remove.is_empty(), "removed {:?}", spec.env_remove);
+    }
+
+    /// Every variable, in both spellings, from one configuration.
+    #[test]
+    fn a_manual_proxy_sets_each_variable_in_both_cases() {
+        let spec = proxy_spec(
+            &manual(
+                "http://proxy.corp:3128",
+                "http://tls.corp:3129",
+                "socks5://socks.corp:1080",
+                "",
+            ),
+            &[],
+        );
+
+        for (upper, expected) in [
+            ("HTTP_PROXY", "http://proxy.corp:3128"),
+            ("HTTPS_PROXY", "http://tls.corp:3129"),
+            ("ALL_PROXY", "socks5://socks.corp:1080"),
+        ] {
+            assert_eq!(value_of(&spec, upper), Some(expected), "{upper}");
+            assert_eq!(
+                value_of(&spec, &upper.to_lowercase()),
+                Some(expected),
+                "{upper} lower case — curl reads only this spelling of http_proxy"
+            );
+        }
+    }
+
+    /// One proxy typed once reaches both HTTP and HTTPS.
+    #[test]
+    fn https_defaults_to_the_http_proxy_and_all_proxy_does_not() {
+        let spec = proxy_spec(&manual("proxy.corp:3128", "", "", ""), &[]);
+        assert_eq!(
+            value_of(&spec, "HTTPS_PROXY"),
+            Some("http://proxy.corp:3128")
+        );
+        // ALL_PROXY covers protocols the user never said anything about, so a blank field
+        // stays blank — and, in Manual mode, is actively removed.
+        assert_eq!(value_of(&spec, "ALL_PROXY"), None);
+        assert!(spec.env_remove.iter().any(|k| k == "ALL_PROXY"));
+        assert!(spec.env_remove.iter().any(|k| k == "all_proxy"));
+    }
+
+    /// A blank field in Manual mode removes the variable rather than deferring to the profile.
+    ///
+    /// This is the inherit-vs-override decision, written as a test: a user who configured a
+    /// proxy here and left `ALL_PROXY` empty must not silently get the one their `.bashrc`
+    /// exported, because nothing on screen would ever say so.
+    #[test]
+    fn manual_mode_overrides_an_inherited_proxy_rather_than_merging_with_it() {
+        let spec = proxy_spec(
+            &manual("http://proxy.corp:3128", "", "", ""),
+            &[("ALL_PROXY", "socks5://legacy:1080")],
+        );
+        assert_eq!(value_of(&spec, "ALL_PROXY"), None, "not carried over");
+        assert!(
+            spec.env_remove.iter().any(|k| k == "ALL_PROXY"),
+            "and scrubbed, so the inherited one cannot reach the child"
+        );
+    }
+
+    /// Loopback is exempt in Manual mode, ahead of anything the user added.
+    #[test]
+    fn loopback_is_exempt_and_cannot_be_configured_away() {
+        let spec = proxy_spec(
+            &manual(
+                "http://proxy.corp:3128",
+                "",
+                "",
+                "corp.internal, .example.com",
+            ),
+            &[],
+        );
+        assert_eq!(
+            value_of(&spec, "NO_PROXY"),
+            Some("localhost,127.0.0.1,::1,corp.internal,.example.com")
+        );
+        assert_eq!(
+            value_of(&spec, "no_proxy"),
+            Some("localhost,127.0.0.1,::1,corp.internal,.example.com")
+        );
+    }
+
+    /// A user who lists loopback themselves gets it once, not twice.
+    #[test]
+    fn the_exemption_list_does_not_repeat_what_the_user_already_wrote() {
+        let spec = proxy_spec(&manual("http://p:3128", "", "", "LocalHost,corp"), &[]);
+        assert_eq!(
+            value_of(&spec, "NO_PROXY"),
+            Some("localhost,127.0.0.1,::1,corp")
+        );
+    }
+
+    /// The case this exists for: a proxy in the shell profile, no `NO_PROXY`, IDE server on
+    /// loopback. cide defers on the proxy itself and still rescues the loopback.
+    #[test]
+    fn an_inherited_proxy_still_gets_the_loopback_exemption() {
+        let spec = proxy_spec(
+            &ProxySettings::default(),
+            &[("http_proxy", "http://profile.corp:3128")],
+        );
+        assert_eq!(
+            value_of(&spec, "NO_PROXY"),
+            Some("localhost,127.0.0.1,::1"),
+            "the IDE MCP server is on loopback and a proxy that swallows it is silent"
+        );
+        // And nothing else — the inherited proxy is left exactly as the profile set it.
+        assert_eq!(value_of(&spec, "HTTP_PROXY"), None);
+        assert!(spec.env_remove.is_empty());
+    }
+
+    /// An inherited `NO_PROXY` is extended, not replaced.
+    #[test]
+    fn an_inherited_no_proxy_keeps_its_entries() {
+        let spec = proxy_spec(
+            &ProxySettings::default(),
+            &[
+                ("HTTPS_PROXY", "http://profile.corp:3128"),
+                ("NO_PROXY", "corp.internal"),
+            ],
+        );
+        assert_eq!(
+            value_of(&spec, "NO_PROXY"),
+            Some("localhost,127.0.0.1,::1,corp.internal")
+        );
+    }
+
+    /// `HTTP_PROXY=` — set but empty — must not hide the `http_proxy` beside it.
+    ///
+    /// Assigning nothing is how a profile turns a proxy off without unsetting it, and it is
+    /// what a few launchers leave behind. Reading it as "a proxy is present" would be one
+    /// bug; reading it as "no proxy anywhere" is two, both silent. The exemption is skipped
+    /// on a machine that *does* proxy — the IDE server on loopback goes with it — and the
+    /// `no_proxy` the user actually has is overwritten by a value that lost its entries,
+    /// because both spellings are written.
+    #[test]
+    fn a_blank_upper_case_variable_does_not_mask_the_lower_case_one() {
+        let spec = proxy_spec(
+            &ProxySettings::default(),
+            &[
+                ("HTTP_PROXY", ""),
+                ("http_proxy", "http://profile.corp:3128"),
+                ("NO_PROXY", "   "),
+                ("no_proxy", "corp.internal"),
+            ],
+        );
+        assert_eq!(
+            value_of(&spec, "NO_PROXY"),
+            Some("localhost,127.0.0.1,::1,corp.internal"),
+            "the proxy is inherited and the user's own bypass list survives"
+        );
+    }
+
+    /// Direct means direct: every spelling gone, nothing set.
+    #[test]
+    fn direct_scrubs_every_spelling() {
+        let spec = proxy_spec(
+            &ProxySettings {
+                mode: ProxyMode::Direct,
+                ..ProxySettings::default()
+            },
+            &[("HTTP_PROXY", "http://profile.corp:3128")],
+        );
+        assert!(spec.env.is_empty(), "set {:?}", spec.env);
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+            assert!(spec.env_remove.iter().any(|k| k == name), "{name}");
+            assert!(
+                spec.env_remove.iter().any(|k| *k == name.to_lowercase()),
+                "{name} lower case"
+            );
+        }
+    }
+
+    /// A credentialed proxy reaches the child intact and the log line never sees it.
+    #[test]
+    fn a_credentialed_proxy_never_reaches_a_log_line() {
+        let proxy = manual(
+            "http://alice:hunter2@proxy.corp:3128",
+            "",
+            "socks5://alice:hunter2@socks.corp:1080",
+            "",
+        );
+
+        // The child does get the real thing — a redaction that reached the environment would
+        // be a proxy that cannot authenticate.
+        let spec = proxy_spec(&proxy, &[]);
+        assert_eq!(
+            value_of(&spec, "HTTP_PROXY"),
+            Some("http://alice:hunter2@proxy.corp:3128")
+        );
+
+        // Every string this module can put in front of a human.
+        let line = proxy_log_line(&proxy);
+        let debug = format!("{proxy:?}");
+        for text in [&line, &debug] {
+            assert!(!text.contains("hunter2"), "password leaked: {text}");
+            assert!(!text.contains("alice"), "username leaked: {text}");
+        }
+        assert!(
+            line.contains("proxy.corp:3128"),
+            "the host is what makes the line worth having: {line}"
+        );
+    }
+
+    /// The modes that carry no URL say so without inventing one.
+    #[test]
+    fn the_log_line_names_the_mode_when_there_is_no_url() {
+        assert!(proxy_log_line(&ProxySettings::default()).contains("inherited"));
+        assert!(
+            proxy_log_line(&ProxySettings {
+                mode: ProxyMode::Direct,
+                ..ProxySettings::default()
+            })
+            .contains("none")
+        );
     }
 
     #[test]

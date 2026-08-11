@@ -91,6 +91,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         terminal,
         graphics,
         claude,
+        proxy,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -122,6 +123,13 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     }
     if let Some(v) = claude {
         settings.claude = v;
+    }
+    // Stored verbatim, credentials and all: a proxy that needs a password cannot be used
+    // without one, and cide has no keyring yet. What is guarded is where the value can go
+    // afterwards — `ProxySettings` implements `Debug` by hand so that no log line, here or in
+    // any future caller, can print it. Nothing on this path logs the patch either way.
+    if let Some(v) = proxy {
+        settings.proxy = v;
     }
 }
 

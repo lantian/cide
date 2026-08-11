@@ -33,6 +33,7 @@ import {
 } from './controls'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
+import { ProxySection } from './ProxySection'
 import { WindowModeCards } from './WindowModeCards'
 
 /** Nav order and headings. The order is the mock's and is not alphabetical. */
@@ -358,7 +359,19 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
     case 'keymap':
       return <KeymapSection />
     case 'claudeSessions':
-      return <ClaudeSessionsSection {...props} />
+      // The proxy belongs to *every* child, shells included, so on the merits it wants a nav
+      // row of its own — "Network". It cannot have one yet: the nav is keyed by
+      // `SettingsSection`, a Rust enum in `cide-ipc/src/workspace.rs`, and adding a variant
+      // there is not this change's to make. It sits under the section that is already about
+      // the environment children are spawned with, and `ProxySection` says in its own words
+      // that shells get it too. Promoting it later is three lines: the enum variant, a
+      // `SECTIONS` entry, and a `case` here.
+      return (
+        <>
+          <ClaudeSessionsSection {...props} />
+          <ProxySection proxy={props.settings.proxy} patch={props.patch} />
+        </>
+      )
     case 'editor':
       return <Editor {...props} />
     case 'git':

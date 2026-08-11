@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::Theme;
-use crate::settings::{ClaudeSettings, EditorSettings, GraphicsSettings, TerminalSettings};
+use crate::settings::{
+    ClaudeSettings, EditorSettings, GraphicsSettings, ProxySettings, TerminalSettings,
+};
 
 /// A partial update to [`crate::Settings`]. `None` means "leave this alone".
 ///
@@ -55,6 +57,13 @@ pub struct SettingsPatch {
     pub graphics: Option<GraphicsSettings>,
     #[ts(optional)]
     pub claude: Option<ClaudeSettings>,
+    /// Proxy configuration. Sent whole like every other group, which for this one also means
+    /// the URLs — credentials included — cross the IPC boundary on every keystroke-debounced
+    /// save. That is the same trip `settings.get` already makes in the other direction, and
+    /// the boundary is in-process; see [`crate::settings::ProxySettings`] for what is done
+    /// about the value once it is at rest.
+    #[ts(optional)]
+    pub proxy: Option<ProxySettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

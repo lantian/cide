@@ -19,7 +19,8 @@ pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
 pub use settings::{
-    ClaudeSettings, EditorSettings, GraphicsSettings, Settings, TerminalRenderer, TerminalSettings,
+    ClaudeSettings, EditorSettings, GraphicsSettings, ProxyMode, ProxySettings, Settings,
+    TerminalRenderer, TerminalSettings, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,
