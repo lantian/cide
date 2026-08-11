@@ -30,7 +30,7 @@ import {
   indentUnit,
   syntaxHighlighting,
 } from '@codemirror/language'
-import { Compartment, EditorState, type Extension } from '@codemirror/state'
+import { Compartment, EditorSelection, EditorState, type Extension } from '@codemirror/state'
 import {
   EditorView,
   crosshairCursor,
@@ -49,6 +49,7 @@ import { minimap } from './minimap'
 import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import { exceedsBytes } from './byteSize'
+import { registerReveal, revealRange } from './revealRequest'
 import styles from './EditorSurface.module.css'
 
 /**
@@ -348,6 +349,36 @@ export function EditorSurface({
       el.textContent = `${language} · UTF-8 · ${endings.ending} · ${cursorLabel(view.state)}`
     }
 
+    /*
+     * "Open this file at this line", from a click in the search results.
+     *
+     * Registered here rather than in `EditorPane` because the request is answered by a
+     * `dispatch` into *this* view, and the view only exists inside this effect. A request
+     * made while nothing was mounted is parked and spent by this call — see
+     * `revealRequest.ts`, which is where the whole of that reasoning lives.
+     *
+     * The editor is deliberately **not** focused. A single click on a result opens the file
+     * (`clickSemantics.ts`), and pulling focus out of the results list on every click would
+     * end the ArrowDown/Enter walk the panel supports after exactly one hit. The selection
+     * and the active-line tint are both painted while unfocused — see the `.cm-activeLine`
+     * note in `EditorSurface.module.css` — so the place is shown without taking the keyboard.
+     *
+     * The clamp inside `revealRange` is what keeps this from throwing; the guard is for what
+     * it cannot foresee. This runs inside the sidebar's click handler, which has no error
+     * boundary over it, so an exception escaping here unmounts the React root and takes every
+     * terminal in the window with it. Missing the line is recoverable; that is not.
+     */
+    const stopReveal = registerReveal(path, (target) => {
+      try {
+        view.dispatch({
+          selection: EditorSelection.create([revealRange(view.state.doc, target)]),
+          scrollIntoView: true,
+        })
+      } catch (error) {
+        console.error('[cide] the editor could not reveal that position', error)
+      }
+    })
+
     // Fire-and-forget, and guarded on the view still being the live one: a tab closed while
     // its grammar chunk is in flight would otherwise dispatch into a destroyed editor.
     if (!oversize) {
@@ -360,6 +391,8 @@ export function EditorSurface({
     return () => {
       viewRef.current = null
       saveHandleCb.current?.(null)
+      // Before `destroy`, so a request racing the unmount cannot dispatch into a dead view.
+      stopReveal()
       view.destroy()
     }
     // Rebuilt only on a different file or an explicit reload. `doc` is intentionally absent:
