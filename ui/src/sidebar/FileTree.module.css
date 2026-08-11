@@ -222,3 +222,27 @@
   font-family: var(--font-mono);
   color: var(--faint);
 }
+
+/*
+ * A rejected file command, at the foot of the panel.
+ *
+ * A flex sibling of `.scroll` rather than a child of it: the scroller is `role="tree"` and
+ * its viewport is as tall as the whole flattened repository, so a strip inside it would be
+ * both an invalid tree child and 100 000 rows below the fold.
+ *
+ * `--red`, `--panel-2` and `--border` are all defined in the light and the dark palettes;
+ * the light panel is white, so the band needs its own background and a rule above it rather
+ * than relying on contrast with the rows.
+ */
+.problem {
+  flex: none;
+  padding: 5px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--red);
+  font-size: 10.5px;
+  line-height: 1.4;
+  /* Long paths and libgit2 messages both run past 252px; wrapping beats a clipped reason. */
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}

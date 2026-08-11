@@ -41,6 +41,7 @@ import { letterFor, statusAt } from './treeStatus'
 import { enterOn, fileTreeClick, gestureOf, moveIndex, type RowAction } from './clickSemantics'
 import { copyText } from './copyText'
 import {
+  diag,
   fs as fsApi,
   fsReveal,
   isDegraded,
@@ -51,6 +52,7 @@ import {
 } from '@/ipc/client'
 import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+import { useWorkspace } from '@/store/workspace'
 import styles from './FileTree.module.css'
 
 /** 21px rows, from the mock. */
@@ -70,6 +72,29 @@ const INDENT = 12
  * key exists to reach. Half a screen is enough to cover the landing and the next few presses.
  */
 const JUMP_MARGIN = 12
+
+/** A stable empty list, so a project-less panel does not hand `useShallow` a new array. */
+const NO_ROOTS: readonly string[] = []
+
+/**
+ * The root a path lives under, or `null` when none of them holds it.
+ *
+ * The longest match wins, because a project may be opened over both `~/work/cide` and
+ * `~/work/cide/ui` — with the shortest match, the second root's files would be copied as
+ * `ui/src/…` from one row and `src/…` from another, which is the kind of inconsistency that
+ * makes people stop trusting *Copy Relative Path*.
+ *
+ * Segment-aware: `~/work/cide-old` is not under `~/work/cide`, and a plain `startsWith`
+ * says it is.
+ */
+function rootOf(path: string, roots: readonly string[]): string | null {
+  let best: string | null = null
+  for (const root of roots) {
+    if (path !== root && !path.startsWith(`${root}/`)) continue
+    if (best === null || root.length > best.length) best = root
+  }
+  return best
+}
 
 /**
  * Which colour class a status paints the name and the letter with.
@@ -145,8 +170,48 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    * string, so passing it costs nothing.
    */
   const iconTheme = useIconTheme()
+  /*
+   * The project's root *paths*.
+   *
+   * Not `TreeRow.root`, which is an index into `Project::roots` and not a path at all —
+   * reading it as one made *Copy Relative Path* copy the absolute path (identical to *Copy
+   * Path*, so the item looked implemented and was not) and made `isRoot` always false, which left
+   * Rename and Move to Trash enabled on a project root for `fs_rename`/`fs_delete` to refuse.
+   *
+   * From the workspace store rather than resolved through the index, because `Project::roots`
+   * is where the paths are and this module already reaches that store through `useIconTheme`.
+   * `useShallow` over the mapped array: the store hands back a fresh `ProjectRoot[]` on every
+   * accepted mutation in any window, and identity alone would re-render the tree on each one.
+   */
+  const roots = useWorkspace(
+    useShallow((s) =>
+      project === null
+        ? NO_ROOTS
+        : (s.boot?.workspace.projects[project]?.roots.map((r) => r.path) ?? NO_ROOTS),
+    ),
+  )
   /** The path whose name is currently an `<input>`. At most one row at a time. */
   const [renaming, setRenaming] = useState<string | null>(null)
+  /**
+   * The last failed file operation, or `null`.
+   *
+   * Shown rather than only logged. Every verb in the menu below is a Tauri command that can
+   * reject — `fs_delete` refuses a root and reports a `PartialDelete`, `fs_rename` refuses a
+   * name that already exists, `fs_show_in_manager` fails when the desktop has no handler —
+   * and a rejection swallowed by a bare `.then()` is indistinguishable from a menu item wired
+   * to nothing, which is the failure this codebase has already shipped twice.
+   */
+  const [problem, setProblem] = useState<string | null>(null)
+
+  /** Report a rejected file command, in the panel and in the log. */
+  const fail = useCallback(
+    (what: string) => (error: unknown) => {
+      const line = `${what} failed: ${String(error)}`
+      setProblem(line)
+      void diag.log(`[cide] file tree: ${line}`).catch(() => {})
+    },
+    [],
+  )
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -279,21 +344,27 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    * the difference between a menu that acts on what you right-clicked and one that acts on
    * what you clicked before that.
    */
-  const rowFacts = useCallback((target: HTMLElement | null) => {
-    const el = target?.closest<HTMLElement>('[data-row-path]')
-    const path = el?.dataset['rowPath']
-    if (el === null || el === undefined || path === undefined) return null
-    const root = el.dataset['rowRoot'] ?? ''
-    return {
-      path,
-      isDir: el.dataset['rowKind'] === 'dir',
-      expanded: el.dataset['rowExpanded'] === 'true',
-      /** A project root: `fs_rename` and `fs_delete` both refuse one, so the menu does too. */
-      isRoot: path === root,
-      /** What *Copy Relative Path* copies. Falls back to the absolute path with no root. */
-      rel: root !== '' && path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path,
-    }
-  }, [])
+  const rowFacts = useCallback(
+    (target: HTMLElement | null) => {
+      const el = target?.closest<HTMLElement>('[data-row-path]')
+      const path = el?.dataset['rowPath']
+      if (el === null || el === undefined || path === undefined) return null
+      const root = rootOf(path, roots)
+      return {
+        path,
+        isDir: el.dataset['rowKind'] === 'dir',
+        expanded: el.dataset['rowExpanded'] === 'true',
+        /** A project root: `fs_rename` and `fs_delete` both refuse one, so the menu does too. */
+        isRoot: root === path,
+        /**
+         * What *Copy Relative Path* copies. The absolute path when no root claims this row,
+         * which is the honest answer rather than a relative path against nothing.
+         */
+        rel: root === null || root === path ? path : path.slice(root.length + 1),
+      }
+    },
+    [roots],
+  )
 
   const { onContextMenu, menu } = useContextMenu({
     label: 'File tree',
@@ -337,7 +408,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         {
           id: 'reveal',
           label: 'Reveal in File Manager',
-          run: () => void fsReveal.showInManager(project, row.path),
+          run: () => void fsReveal.showInManager(project, row.path).catch(fail('Reveal')),
         },
         { id: 'copyPath', label: 'Copy Path', run: () => void copyText(row.path) },
         { id: 'copyRel', label: 'Copy Relative Path', run: () => void copyText(row.rel) },
@@ -360,7 +431,10 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
                   // No confirmation, deliberately: `fs_delete` moves to the freedesktop trash
                   // and never unlinks, so the desktop's own undo is one keystroke away. A
                   // dialog here would be a second confirmation of a reversible act.
-                  void fsApi.delete(project, [row.path]).then(() => useFileTree.getState().refresh())
+                  void fsApi
+                    .delete(project, [row.path])
+                    .then(() => useFileTree.getState().refresh())
+                    .catch(fail('Move to Trash'))
                 },
               }),
         },
@@ -383,69 +457,94 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   }
 
   return (
-    <div
-      className={styles.scroll}
-      ref={scrollRef}
-      data-audit="fileTreeScroll"
-      /*
-       * One tab stop for the whole tree, with the arrows moving inside it — the ARIA tree
-       * pattern, and what every editor does. Per-row `tabIndex` would make Tab walk 100 000
-       * stops, and a roving one would have to move focus imperatively on every refresh, which
-       * is how a background watcher event steals the caret out of a terminal pane.
-       */
-      role="tree"
-      aria-label="Files"
-      tabIndex={0}
-      onKeyDown={onKeyDown}
-      onContextMenu={onContextMenu}
-    >
-      <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
-        {/*
-          * Keyed by the virtualizer's key — the row *index* — and not by `row.path`.
-          *
-          * A virtualized list's children are positions, not identities: the box at index 42
-          * sits at `42 * ROW_HEIGHT` whatever file happens to be there, so the index is what
-          * two renders have in common. Keying by path meant that a file appearing at the top
-          * of the tree renamed every key below it, and React answered a burst that moved
-          * nothing on screen by unmounting and remounting the visible window instead of
-          * rewriting one row's text. The placeholders shared in that: `pending-42` and the
-          * path of the row that replaced it are two different children at one position.
-          */}
-        {items.map((item) => {
-          const row = useFileTree.getState().rowAt(item.index)
-          if (!row) {
-            // The chunk is still in flight. The box keeps its height so the scrollbar does
-            // not resize under the user's thumb as rows arrive.
+    <>
+      <div
+        className={styles.scroll}
+        ref={scrollRef}
+        data-audit="fileTreeScroll"
+        /*
+         * One tab stop for the whole tree, with the arrows moving inside it — the ARIA tree
+         * pattern, and what every editor does. Per-row `tabIndex` would make Tab walk 100 000
+         * stops, and a roving one would have to move focus imperatively on every refresh, which
+         * is how a background watcher event steals the caret out of a terminal pane.
+         */
+        role="tree"
+        aria-label="Files"
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onContextMenu={onContextMenu}
+      >
+        <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
+          {/*
+            * Keyed by the virtualizer's key — the row *index* — and not by `row.path`.
+            *
+            * A virtualized list's children are positions, not identities: the box at index 42
+            * sits at `42 * ROW_HEIGHT` whatever file happens to be there, so the index is what
+            * two renders have in common. Keying by path meant that a file appearing at the top
+            * of the tree renamed every key below it, and React answered a burst that moved
+            * nothing on screen by unmounting and remounting the visible window instead of
+            * rewriting one row's text. The placeholders shared in that: `pending-42` and the
+            * path of the row that replaced it are two different children at one position.
+            */}
+          {items.map((item) => {
+            const row = useFileTree.getState().rowAt(item.index)
+            if (!row) {
+              // The chunk is still in flight. The box keeps its height so the scrollbar does
+              // not resize under the user's thumb as rows arrive.
+              return (
+                <div
+                  key={item.key}
+                  className={styles.placeholder}
+                  style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
+                />
+              )
+            }
             return (
-              <div
+              <Row
                 key={item.key}
-                className={styles.placeholder}
-                style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
+                row={row}
+                index={item.index}
+                statuses={statuses}
+                iconTheme={iconTheme}
+                top={item.start}
+                height={item.size}
+                selected={row.path === selected}
+                renaming={row.path === renaming}
+                project={project}
+                onAct={apply}
+                onEndRename={() => setRenaming(null)}
+                onFail={fail('Rename')}
               />
             )
-          }
-          return (
-            <Row
-              key={item.key}
-              row={row}
-              index={item.index}
-              statuses={statuses}
-              iconTheme={iconTheme}
-              top={item.start}
-              height={item.size}
-              selected={row.path === selected}
-              renaming={row.path === renaming}
-              project={project}
-              onAct={apply}
-              onEndRename={() => setRenaming(null)}
-            />
-          )
-        })}
+          })}
+        </div>
+        {/* `{menu}` must be rendered or nothing appears. It portals to a sibling of `#root`, so
+            this scroll container's `overflow: hidden` cannot clip it. */}
+        {menu}
       </div>
-      {/* `{menu}` must be rendered or nothing appears. It portals to a sibling of `#root`, so
-          this scroll container's `overflow: hidden` cannot clip it. */}
-      {menu}
-    </div>
+      {/*
+        * A rejected file command, at the foot of the panel until it is dismissed.
+        *
+        * A sibling of the scroller and not a child of it, for two reasons: the scroller is
+        * `role="tree"`, whose children have to be tree items, and its viewport is as tall as
+        * the whole flattened repository — a strip inside it would sit 100 000 rows down.
+        *
+        * Dismissed by clicking, not on a timer. A message that removes itself is a message the
+        * user who looked away never saw, and "the menu item did nothing" is the report this is
+        * here to prevent.
+        */}
+      {problem !== null && (
+        <div
+          className={styles.problem}
+          data-audit="fileTreeProblem"
+          role="status"
+          title="Dismiss"
+          onClick={() => setProblem(null)}
+        >
+          {problem}
+        </div>
+      )}
+    </>
   )
 }
 
@@ -480,6 +579,8 @@ interface RowProps {
   project: ProjectId | null
   onAct: (action: RowAction, row: TreeRow, index: number) => void
   onEndRename: () => void
+  /** Where a rejected `fs_rename` goes. See `problem` in the panel. */
+  onFail: (error: unknown) => void
 }
 
 function Row({
@@ -494,6 +595,7 @@ function Row({
   project,
   onAct,
   onEndRename,
+  onFail,
 }: RowProps) {
   const isDir = row.kind === 'dir'
   const tone = statusAt(statuses, row.path)
@@ -514,9 +616,15 @@ function Row({
       className={selected ? `${styles.row} ${styles.rowSelected}` : styles.row}
       data-audit="fileTreeRow"
       data-depth={row.depth}
-      /* Read back by the context menu at open time; see `rowFacts`. */
+      /*
+       * Read back by the context menu at open time; see `rowFacts`.
+       *
+       * `row.root` is deliberately NOT among these. It is an index into `Project::roots`, not
+       * a path, and publishing it as `data-row-root` invited exactly the misreading that
+       * shipped: the menu treated `"0"` as a directory prefix. The roots come from the
+       * workspace store instead, where they are paths.
+       */
       data-row-path={row.path}
-      data-row-root={row.root}
       data-row-kind={row.kind}
       data-row-expanded={isDir ? String(row.expanded) : undefined}
       role="treeitem"
@@ -563,7 +671,7 @@ function Row({
        */}
       <FileIcon row={row} theme={iconTheme} />
       {renaming && project !== null ? (
-        <RenameInput project={project} row={row} onDone={onEndRename} />
+        <RenameInput project={project} row={row} onDone={onEndRename} onFail={onFail} />
       ) : (
         <span
           className={
@@ -607,10 +715,12 @@ function RenameInput({
   project,
   row,
   onDone,
+  onFail,
 }: {
   project: ProjectId
   row: TreeRow
   onDone: () => void
+  onFail: (error: unknown) => void
 }) {
   const settled = useRef(false)
 
@@ -628,6 +738,9 @@ function RenameInput({
     void fsApi
       .rename(project, row.path, `${dir}${trimmed.replaceAll('/', '_')}`)
       .then(() => useFileTree.getState().refresh())
+      // `fs_rename` refuses a root and refuses an existing name. Swallowing that would leave
+      // the row showing its old name with no hint that anything was attempted.
+      .catch(onFail)
   }
 
   return (
