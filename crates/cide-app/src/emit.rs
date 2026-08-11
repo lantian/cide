@@ -115,6 +115,33 @@ pub fn session_status(app: &AppHandle, session: &str, status: serde_json::Value)
     }
 }
 
+/// Which sessions have finished processing and are waiting for the user.
+///
+/// The whole set, every time, and to every window. Two reasons it is not a per-session delta:
+///
+/// * a window that opened *after* a session started waiting has no history to derive the
+///   answer from — `cide://session-state` carries transitions, and it heard none of them — so
+///   the only thing that can paint its markers correctly is the complete set; and
+/// * the set is tiny. It is the number of Claude panes that are waiting, which is a handful.
+///
+/// The decision about membership is *not* made here. "Finished a turn and is waiting" needs a
+/// bit of history that `SessionState` does not carry (see `ui/src/panes/awaitingRule.ts`), so
+/// the frontend reports it and `windows.rs` aggregates. This event is Rust telling every
+/// window what it now believes, which is what keeps three windows showing one answer.
+pub const SESSION_AWAITING: &str = "cide://session-awaiting";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAwaiting {
+    sessions: Vec<cide_ipc::SessionId>,
+}
+
+pub fn session_awaiting(app: &AppHandle, sessions: Vec<cide_ipc::SessionId>) {
+    if let Err(error) = app.emit(SESSION_AWAITING, SessionAwaiting { sessions }) {
+        tracing::debug!(%error, "session-awaiting reached no window");
+    }
+}
+
 pub fn session_tool(app: &AppHandle, session: &str, paths: Vec<String>) {
     if paths.is_empty() {
         return;

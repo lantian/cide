@@ -1274,3 +1274,69 @@ function ackFailed(error: unknown): void {
   console.error(`[cide] ${line}`)
   void diag.log(line).catch(() => {})
 }
+
+/* --------------------------------------------------------------------------------------
+ * M12 — "Awaiting: X", and the clipboard the terminal's own menu needs.
+ *
+ * One contiguous block, appended rather than folded into the namespaces above, per the
+ * house rule for this file.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Sessions that have finished processing and are waiting for the user.
+ *
+ * The *decision* is `panes/awaitingRule.ts` — it needs one bit of history that `SessionState`
+ * does not carry, so it cannot be made from a single event on either side. The *aggregation*
+ * is Rust's, because only Rust knows which pane is shown in which OS window and only Rust can
+ * rename an OS window: a webview has no access to its own title bar.
+ *
+ * Reports are per session and idempotent. Every window observes the same
+ * `cide://session-state` broadcasts and will report the same answer, which costs a command
+ * and changes nothing; a window that has only just opened has observed nothing and therefore
+ * reports nothing, which is exactly right — a whole-set report from a fresh window would
+ * clear every marker in the app.
+ */
+export const awaiting = {
+  /**
+   * Record whether `session` is waiting on the user. Rust retitles every affected window and
+   * broadcasts the new set on `cide://session-awaiting`.
+   */
+  set: (session: SessionId, isAwaiting: boolean) =>
+    invoke<void>('window_set_awaiting', { session, awaiting: isAwaiting }),
+}
+
+/**
+ * The authoritative waiting set, after any window's report.
+ *
+ * Broadcast rather than answered to the caller so a window that opened *after* a session
+ * started waiting still paints its marker — it has no history of its own to derive that from.
+ *
+ * A standalone listener rather than a member of `events`, matching `onIpcDegraded` above: the
+ * append-only rule for this file means a new event cannot reach inside an existing object
+ * literal.
+ */
+export const onSessionAwaiting = (handler: (sessions: SessionId[]) => void) =>
+  listen<{ sessions: SessionId[] }>('cide://session-awaiting', (e) => handler(e.payload.sessions))
+
+/**
+ * The system clipboard, over the already-registered `tauri-plugin-clipboard-manager`.
+ *
+ * Invoked by plugin command name rather than through `@tauri-apps/plugin-clipboard-manager`,
+ * which is **not** a dependency of `ui` — that package is a thin wrapper over exactly these
+ * two `invoke` calls, and adding it would put a second module in the tree allowed to talk to
+ * Tauri directly. The Rust half has been a dependency of `cide-app` since M0.
+ *
+ * This exists because WebKit refuses `document.execCommand('paste')` from page script, so the
+ * terminal's Paste item has no in-page implementation available to it. `menus/model.ts` says
+ * as much at length, and this is the route it names.
+ *
+ * Note the capability change that makes these reachable: `clipboard-manager:default` grants
+ * **nothing** — the plugin ships with an empty default because it considers clipboard access
+ * application-specific — so `allow-read-text` and `allow-write-text` are named explicitly in
+ * both capability files. Without them these two calls are denied at runtime.
+ */
+export const clipboard = {
+  readText: () => invoke<string>('plugin:clipboard-manager|read_text'),
+  writeText: (text: string) =>
+    invoke<void>('plugin:clipboard-manager|write_text', { text, label: null }),
+}

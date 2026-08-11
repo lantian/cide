@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && vite build",
+    "check:awaiting": "node scripts/check-awaiting.mjs",
     "check:close": "node scripts/check-close-confirm.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",
     "check:diff-render": "node scripts/check-diff-render.mjs",

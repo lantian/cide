@@ -14,9 +14,12 @@
 //! What a window *is* stays here. `cide-core` names windows and says which should exist; it
 //! has no idea that one is a webview.
 
+use std::collections::BTreeSet;
+
 use cide_core::{CoreError, workspace};
 use cide_ipc::{
-    PaneId, ProjectId, TabId, WindowLabel, WindowMode, WindowRole, Workspace, state_key_of,
+    PaneId, ProjectId, SessionId, TabId, WindowLabel, WindowMode, WindowRole, Workspace,
+    state_key_of,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -77,6 +80,10 @@ pub fn window_detach_pane(
             "could not open window {label}: {error}"
         )));
     }
+    // The pane took its `Awaiting:` badge with it. Both titles are now wrong — the shell is
+    // still counting a pane it no longer shows, and the new window was built with the pane's
+    // name and no badge — so they are recomputed together rather than patched apart.
+    retitle(&app, &state.snapshot());
     Ok(label)
 }
 
@@ -92,6 +99,8 @@ pub fn window_redock_pane(
     // running.
     let closing = state.update(|ws| workspace::redock_pane(ws, &label))?;
     windows::destroy(&app, &closing);
+    // The pane is back in a tab, so its shell inherits whatever badge it was carrying.
+    retitle(&app, &state.snapshot());
     Ok(Mutated { rev: state.rev() })
 }
 
@@ -138,6 +147,43 @@ pub fn window_close(
         // Re-dock, never discard. Discarding would strand a live session with no view and
         // no way back: the pane is the only thing bound to that `SessionId`, so dropping it
         // leaves a child running that nothing can reach, show or stop.
+        //
+        // # Every way a detached-pane window can close, and what each one does
+        //
+        // The window now draws minimize / maximize / close in its pane title bar (M12), so
+        // this is no longer reachable only from the re-dock button. All five routes are
+        // written out because the guarantee — **the session survives and the pane ends up
+        // somewhere the user can reach** — has to hold on every one of them, and four of the
+        // five do not come through this function.
+        //
+        // 1. **The close control, or `Close window` in the pane menu.** Both are
+        //    `data-window-button="close"`, which `WindowFrame` turns into `window.close()`;
+        //    that raises `CloseRequested`, and [`intercept_close`] takes it over and re-docks.
+        //    Not this path — but the same `redock_pane`, deliberately, so the two cannot
+        //    diverge.
+        // 2. **Alt+F4, or the compositor's own close.** Identical to (1): the event loop
+        //    delivers `CloseRequested` and [`intercept_close`] answers it. This is why the
+        //    interception exists at all — a detached window has no unsaved-work dialog to
+        //    raise, only a pane to put back.
+        // 3. **This command.** Reachable from `windows.close(label)`; the arm below.
+        // 4. **Its session is busy.** Nothing here consults liveness and nothing should: a
+        //    re-dock interrupts no turn, kills no child and loses no transcript — the pane
+        //    reappears in its tab still streaming. A confirmation on this gesture would be a
+        //    dialog that always says "nothing will be lost", which is how a user learns to
+        //    dismiss the ones that matter.
+        // 5. **Its home tab has been closed.** `redock_pane` falls back to the project's
+        //    console tab, which cannot be closed, so there is always somewhere to land; the
+        //    saved `DockAnchor` is checked with `can_restore` first and simply does not match
+        //    the console's tree, so the pane lands beside its focused pane instead. If the
+        //    whole *project* has gone, `close_project` already pruned this window's role and
+        //    `reconcile` destroyed the window — the early return above is what that reaches,
+        //    and nothing is stranded because there is nothing left to strand it in.
+        //
+        // Quitting with detached windows open is the one case that deliberately does **not**
+        // re-dock: [`quit`] destroys windows rather than closing them, so no `CloseRequested`
+        // is raised, the pane stays in `project.detached`, and `restore_windows` reopens its
+        // window on the next launch with `plan_restore` offering to resume the conversation.
+        // Re-docking on the way out would silently rearrange the layout the user left.
         WindowRole::DetachedPane { .. } => {
             let closing = state.update(|ws| workspace::redock_pane(ws, &label))?;
             windows::destroy(&app, &closing);
@@ -194,6 +240,127 @@ pub fn window_close(
     }
 
     Ok(Mutated { rev: state.rev() })
+}
+
+/// Record whether one session has finished processing and is waiting for the user.
+///
+/// The frontend decides, because the decision needs history that `SessionState` does not
+/// carry: `Idle` is both "started and never asked anything" and "just finished a turn", and
+/// only the sequence of `cide://session-state` events tells the two apart. See
+/// `ui/src/panes/awaitingRule.ts`, which is the whole rule and is unit-tested on its own.
+///
+/// This end owns the two halves the frontend cannot do:
+///
+/// * **the arithmetic**, which needs the workspace — which pane is shown in which OS window;
+/// * **the title**, because a webview cannot rename its own OS window.
+///
+/// Idempotent and per session. Every window observes the same broadcast and will report the
+/// same answer; a window that has only just opened has observed nothing and reports nothing,
+/// which is what stops a fresh window clearing every marker in the app.
+///
+/// Not `async`/`spawn_blocking`: nothing here touches the filesystem or the network. It takes
+/// the workspace lock and calls `set_title`, which is what `window_close` and `window_set_mode`
+/// beside it already do.
+#[tauri::command(rename_all = "camelCase")]
+pub fn window_set_awaiting(
+    state: State<'_, WorkspaceState>,
+    app: AppHandle,
+    session: SessionId,
+    awaiting: bool,
+) -> Result<(), CoreError> {
+    if !windows::set_awaiting(session, awaiting) {
+        // Nothing moved. Retitling every window and re-broadcasting on a repeat report would
+        // put one round trip per window per tool call in front of the user's keystrokes.
+        return Ok(());
+    }
+    retitle(&app, &state.snapshot());
+    crate::emit::session_awaiting(&app, windows::awaiting_sessions());
+    Ok(())
+}
+
+/// Recompute every window's title from the workspace and the waiting set.
+///
+/// Called after a report and after any mutation that moves a pane between windows, because
+/// both change the answer: detaching a waiting pane has to take the `Awaiting: 1` out of the
+/// shell's title and put it in the new window's.
+///
+/// **Which sessions count toward which window** is the question the user's wording leaves
+/// open, and the answer is *the sessions that window is showing*. A title is read in a task
+/// switcher, and a task switcher's whole job is to say which window to go to — so a badge on a
+/// window that cannot show you the session is a badge that sends you to the wrong place. In
+/// practice:
+///
+/// * a **detached pane** window counts its one pane, so its badge is 0 or 1;
+/// * a **shell** counts every pane of every project it holds, across all of that project's
+///   tabs — a background tab is still in that window, and one of the two situations the user
+///   described is precisely a session finishing in a tab they are not looking at;
+/// * a pane that has been torn out is counted by *its* window and **not** by the shell it came
+///   from, so one waiting session is announced by exactly one window and the count over all
+///   windows is the truth rather than a multiple of it.
+pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
+    for (label, role) in &ws.windows {
+        let base = title_for(ws, role);
+        let count = windows::awaiting_among(&sessions_of(ws, role));
+        windows::set_title(app, label, &windows::title_with(&base, count));
+    }
+}
+
+/// The sessions one window is showing.
+///
+/// A set, so two panes mirroring one child — which is a real gesture in this app,
+/// `claude.mirror` — count as the one conversation they are rather than as two.
+fn sessions_of(ws: &Workspace, role: &WindowRole) -> BTreeSet<SessionId> {
+    let mut out = BTreeSet::new();
+    match role {
+        WindowRole::Shell { projects, .. } => {
+            for id in projects {
+                let Ok(project) = workspace::project(ws, *id) else {
+                    continue;
+                };
+                // Tabs only. `project.detached` is deliberately skipped: those panes have
+                // windows of their own, and counting them here would announce one waiting
+                // session from two places.
+                for tab in &project.tabs {
+                    out.extend(tab.tree.panes.values().filter_map(|p| p.session));
+                }
+            }
+        }
+        WindowRole::DetachedPane { project, pane, .. } => {
+            if let Ok(project) = workspace::project(ws, *project)
+                && let Some(session) = project.detached.get(pane).and_then(|p| p.session)
+            {
+                out.insert(session);
+            }
+        }
+        WindowRole::DetachedTab { project, tab } => {
+            if let Ok(tab) = workspace::tab(ws, *project, *tab) {
+                out.extend(tab.tree.panes.values().filter_map(|p| p.session));
+            }
+        }
+    }
+    out
+}
+
+/// What goes in a window's title bar, before the awaiting badge.
+fn title_for(ws: &Workspace, role: &WindowRole) -> String {
+    match role {
+        WindowRole::Shell { projects, .. } => shell_title(ws, projects),
+        // Derived from the workspace on every retitle rather than remembered from the detach.
+        // The pane's title is not immutable — `claude : bash` becomes `claude : claude` when a
+        // pane's kind changes — and a remembered string would go stale with nothing to correct
+        // it.
+        WindowRole::DetachedPane { project, pane, .. } => workspace::project(ws, *project)
+            .ok()
+            .and_then(|p| p.detached.get(pane))
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| "cide".to_string()),
+        // Nothing creates one of these yet (see `window_close`), and a `Tab` carries no title
+        // of its own — the strip labels it from its `kind`. The project name is the honest
+        // answer until there is a gesture that makes one.
+        WindowRole::DetachedTab { project, .. } => workspace::project(ws, *project)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|_| "cide".to_string()),
+    }
 }
 
 /// Every window the workspace names, and what each one shows.
@@ -349,6 +516,11 @@ pub(crate) fn reconcile(app: &AppHandle, state: &WorkspaceState) -> Result<(), C
             tracing::error!(%label, %error, "could not destroy a window the workspace dropped");
         }
     }
+
+    // A mode flip redistributes projects across shells, so every surviving window is now
+    // showing a different set of sessions than the title it is wearing was computed from, and
+    // `create` above gave each new one a base name with no badge.
+    retitle(app, &state.snapshot());
     Ok(())
 }
 
@@ -406,6 +578,117 @@ mod tests {
         assert_eq!(shell_title(&ws, &[id]), "atlas");
         // An empty shell is the frame with a `+` in its header, not an error.
         assert_eq!(shell_title(&ws, &[]), "cide");
+    }
+
+    /// The question the user's wording leaves open: which sessions count toward *this*
+    /// window's `Awaiting: X`.
+    ///
+    /// A shell counts the panes in its tabs, and it stops counting a pane the moment that pane
+    /// is torn out — the detached window announces it instead. Without that, one waiting
+    /// session would be announced twice and the number in the task bar would be a multiple of
+    /// the truth rather than the truth.
+    #[test]
+    fn a_torn_out_pane_is_counted_by_its_own_window_and_no_longer_by_its_shell() {
+        let mut ws = Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec!["/home/dev/work/atlas".into()], None).unwrap();
+
+        // The console pane is the one pane a fresh project has. Bound by hand rather than
+        // through `pane_bind_session`, which is a Tauri command and needs an `AppHandle` this
+        // build cannot make.
+        let tab = workspace::project(&ws, project).unwrap().tabs[0].id;
+        let console = workspace::tab(&ws, project, tab).unwrap().tree.focused;
+        let session = cide_ipc::SessionId::new();
+
+        // A second pane on the same session — what `claude.mirror` builds. One conversation.
+        let mirror = cide_ipc::Pane {
+            id: cide_ipc::PaneId::new(),
+            kind: cide_ipc::PaneKind::Claude,
+            role: cide_ipc::PaneRole::Auxiliary,
+            session: Some(session),
+            title: "atlas : claude — mirror".into(),
+        };
+        let mirror_id = mirror.id;
+        {
+            let t = workspace::tab_mut(&mut ws, project, tab).unwrap();
+            t.tree.panes.get_mut(&console).unwrap().session = Some(session);
+            cide_core::layout::add_tile(&mut t.tree, console, cide_ipc::Side::After, mirror)
+                .unwrap();
+        }
+
+        let shell = ws
+            .windows
+            .iter()
+            .find_map(|(l, r)| matches!(r, WindowRole::Shell { .. }).then(|| l.clone()))
+            .expect("a fresh workspace names a shell");
+        let one: BTreeSet<_> = [session].into_iter().collect();
+        assert_eq!(
+            sessions_of(&ws, &ws.windows[&shell].clone()),
+            one,
+            "two panes mirroring one child are one waiting session, not two"
+        );
+
+        let detached = workspace::detach_pane(&mut ws, project, tab, mirror_id).unwrap();
+        assert_eq!(
+            sessions_of(&ws, &ws.windows[&detached].clone()),
+            one,
+            "the detached window counts the pane it is showing"
+        );
+        assert_eq!(
+            title_for(&ws, &ws.windows[&detached].clone()),
+            "atlas : claude — mirror",
+            "a detached window is named after its pane, read live rather than remembered"
+        );
+    }
+
+    /// The other half of the same claim, with nothing shared between the two panes.
+    ///
+    /// Split out because the mirror case above cannot show it: with one session the shell's
+    /// set is `{s}` before the detach and `{s}` after, so a `sessions_of` that wrongly walked
+    /// `project.detached` would still pass. Here the detached pane's session is its own, and
+    /// counting it in both places would announce one waiting session from two windows.
+    #[test]
+    fn a_shell_does_not_count_the_sessions_of_panes_it_has_torn_out() {
+        let mut ws = Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec!["/home/dev/work/atlas".into()], None).unwrap();
+        let tab = workspace::project(&ws, project).unwrap().tabs[0].id;
+        let console = workspace::tab(&ws, project, tab).unwrap().tree.focused;
+
+        let stays = cide_ipc::SessionId::new();
+        let leaves = cide_ipc::SessionId::new();
+        let second = cide_ipc::Pane {
+            id: cide_ipc::PaneId::new(),
+            kind: cide_ipc::PaneKind::Claude,
+            role: cide_ipc::PaneRole::Auxiliary,
+            session: Some(leaves),
+            title: "atlas : claude".into(),
+        };
+        let second_id = second.id;
+        {
+            let t = workspace::tab_mut(&mut ws, project, tab).unwrap();
+            t.tree.panes.get_mut(&console).unwrap().session = Some(stays);
+            cide_core::layout::add_tile(&mut t.tree, console, cide_ipc::Side::After, second)
+                .unwrap();
+        }
+
+        let shell = ws
+            .windows
+            .iter()
+            .find_map(|(l, r)| matches!(r, WindowRole::Shell { .. }).then(|| l.clone()))
+            .expect("a fresh workspace names a shell");
+        assert_eq!(sessions_of(&ws, &ws.windows[&shell].clone()).len(), 2);
+
+        let detached = workspace::detach_pane(&mut ws, project, tab, second_id).unwrap();
+        assert_eq!(
+            sessions_of(&ws, &ws.windows[&shell].clone()),
+            [stays].into_iter().collect::<BTreeSet<_>>(),
+            "the shell went on counting a session it can no longer show"
+        );
+        assert_eq!(
+            sessions_of(&ws, &ws.windows[&detached].clone()),
+            [leaves].into_iter().collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]
