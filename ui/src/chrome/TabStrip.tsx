@@ -10,7 +10,9 @@
  * different workspace slice, can render the same strip from props.
  */
 import type { ReactNode } from 'react'
+import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
+import { tabMenuEntries } from './menuModel'
 import styles from './TabStrip.module.css'
 
 export interface TabStripProps {
@@ -18,17 +20,74 @@ export interface TabStripProps {
   activeTab: TabId
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
+  /**
+   * Split the **active** tab's focused pane sideways.
+   *
+   * The ⊞ button this used to sit behind is gone. It was not a second capability alongside the
+   * header's ⊞ — the two were the same call, argument for argument: `App.tsx` passed
+   * `splitPane(project, activeTab, activeTab.tree.focused, 'row', 'after')` here and
+   * `splitPane(project, focused.tab.id, focused.pane.id, 'row', 'after')` there, and `focused`
+   * is derived from the active tab, so they resolve identically. Two buttons for one gesture is
+   * one button too many, and the header's is the one the mock draws.
+   *
+   * The handler survives as a **context-menu item**, because the menu is where a per-tab action
+   * belongs. It is offered only on the active tab: this signature has no way to say *which* tab
+   * to split, and silently splitting a different tab than the one under the pointer is worse
+   * than an item that says why it is unavailable.
+   */
   onSplit?: (() => void) | undefined
+  /**
+   * Detach the active tab's focused pane into its own window.
+   *
+   * The ⧉ button is gone too, and this one for a different reason worth recording: it was a
+   * **dead control naming a capability that does not exist**. Its tooltip said "Detach tab",
+   * `App.tsx` never passed a handler, and there is no `window_detach_tab` command anywhere —
+   * `WindowRole::DetachedTab` is a domain variant nothing can produce. So there was nothing to
+   * preserve by renaming it, and hiding a live-looking button that does nothing on click is a
+   * strict improvement.
+   *
+   * What *does* exist is detaching a pane, which the header's ⧉ already does. This prop is the
+   * same gesture offered from the tab menu; absent, the item says it is unavailable rather than
+   * pretending.
+   */
   onDetach?: (() => void) | undefined
 }
 
-export function TabStrip({ tabs, activeTab, onActivate, onClose, onSplit, onDetach }: TabStripProps) {
+export function TabStrip({
+  tabs,
+  activeTab,
+  onActivate,
+  onClose,
+  onSplit,
+  onDetach,
+}: TabStripProps) {
+  const menu = useContextMenu({
+    label: 'Tab',
+    items: ({ target }) => {
+      const id = target?.closest<HTMLElement>('[data-tab-id]')?.dataset.tabId
+      const tab = tabs.find((t) => t.id === id)
+      // A right-click on the strip's empty space, not on a tab. Declining to open beats a menu
+      // whose every item is about a tab the user did not aim at.
+      if (!tab) return []
+      // The clipboard is resolved here rather than in the model, so the model stays DOM-free
+      // and `check:menu-model` can compile it on its own. Absent ⇒ Copy path is disabled with
+      // a reason, never drawn and dead — WebKitGTK does not always expose one.
+      const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
+      return tabMenuEntries(tabs, tab, activeTab, {
+        close: onClose,
+        split: onSplit,
+        detach: onDetach,
+        ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
+      })
+    },
+  })
+
   // The `data-audit` attributes below are how chrome/layoutAudit.ts locates this surface:
   // CSS Module class names are hashed at build time, so nothing outside can select on them.
   return (
-    <div className={styles.strip} data-audit="tabStrip">
-      {/* The tablist holds tabs and nothing else — the split and detach buttons are not
-          tabs, and a tablist that owns them mis-announces the count to a screen reader. */}
+    <div className={styles.strip} data-audit="tabStrip" onContextMenu={menu.onContextMenu}>
+      {/* The tablist holds tabs and nothing else. It used to share the strip with a split and
+          a detach button; both are gone — see `TabStripProps`. */}
       <div className={styles.tabs} role="tablist" aria-label="Open tabs">
         {tabs.map((tab) => (
           <TabItem
@@ -41,14 +100,7 @@ export function TabStrip({ tabs, activeTab, onActivate, onClose, onSplit, onDeta
         ))}
       </div>
       <div className={styles.spacer} />
-      <div className={styles.cluster}>
-        <button type="button" className={styles.clusterButton} title="Split right" onClick={onSplit}>
-          ⊞
-        </button>
-        <button type="button" className={styles.clusterButton} title="Detach tab" onClick={onDetach}>
-          ⧉
-        </button>
-      </div>
+      {menu.menu}
     </div>
   )
 }
@@ -72,6 +124,9 @@ function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
       className={`${shell} ${view.shape}`}
       role="presentation"
       data-audit={view.audit}
+      // How the strip's one context menu finds which tab was hit; `items` runs at open time
+      // and reads it back off the DOM rather than one hook per tab.
+      data-tab-id={tab.id}
       data-active={active ? 'true' : 'false'}
     >
       <button

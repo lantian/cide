@@ -168,6 +168,77 @@
 }
 
 /*
+ * The recent-projects caret, hard against the `+`.
+ *
+ * Narrower than `.add` and with no left padding, so the pair reads as one split control rather
+ * than as two unrelated buttons that happen to be adjacent — which is what a symmetric 11px
+ * gutter on both looked like.
+ */
+.recent {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  flex: none;
+  padding: 0 8px 0 0;
+  margin-left: -4px;
+  background: transparent;
+  border: 0;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.recent:hover,
+.recent[aria-expanded='true'] {
+  color: var(--text);
+}
+
+/*
+ * `⊞ bash row` / `⊞ claude row`.
+ *
+ * `flex: none` and `white-space: nowrap`: these are the controls that were moved here to be
+ * findable, and a header that squeezes them to `⊞ b…` at 900px wide would undo the move. The
+ * project strip beside them shrinks instead — it already clips by design.
+ */
+.rows {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  padding: 0 4px;
+}
+
+.rowButton {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 4px;
+  background: transparent;
+  border: 0;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.rowButton:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+/* Same treatment, and the same argument, as `.action:disabled` below: --faint rather than an
+   opacity, because opacity fades the glyph against the two themes' chrome by different
+   amounts. The tooltip carries the reason, which is why this is a state and not a hide. */
+.rowButton:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+/*
  * The one element that starts a window drag. `data-tauri-drag-region` does not inherit, so
  * it sits here rather than on the header, where it would turn every tab and button into a
  * drag handle instead of a control.

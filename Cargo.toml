@@ -52,6 +52,15 @@ tauri-plugin-os = "2.3.2"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-log = "2.9.0"
+# Only for parenting the folder picker to the app window; see `cmd::project::project_pick`.
+#
+# The same version and features tauri 2.11.5 already pins on Linux, deliberately: `gtk` is
+# 0.x, so a different minor here would fork the graph into two incompatible GTK stacks and
+# `WebviewWindow::gtk_window()` would hand back a window of the *other* crate's type. Named
+# here rather than reached through `tauri::` because tauri does not re-export it. It costs
+# no new compilation — wry already builds it — and it is the reason `docs/adr/0001`'s
+# argument about `wry`/`tao` does not apply: this pin matches rather than competes.
+gtk = { version = "0.18", features = ["v3_24"] }
 
 # --- terminal ---
 portable-pty = "0.9.0"

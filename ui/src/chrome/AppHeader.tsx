@@ -1,13 +1,26 @@
 /**
- * The 34px app header: traffic lights, one tab per open project, and the window actions.
+ * The 34px app header: traffic lights, one tab per open project, the row controls and the
+ * window actions.
  *
  * The window has no WM decorations, so this bar is the whole title bar — it is also the
  * only place a project can be switched, closed or opened.
  *
- * Nothing here reads the store. The layout audit measures this component in isolation
- * against the mock, which it cannot do if the component reaches into global state; App.tsx
- * does the wiring.
+ * Everything the layout audit measures is still pure: its four header measurements (`header`,
+ * `projectTab`, `projectDot`, `projectPath`) are rendered from the props below, all of which
+ * `App.tsx` supplies, so the component can be measured against the mock from a fixture.
+ *
+ * It is no longer store-*free*, and the note that used to claim so was wrong the moment the
+ * context menu landed: `useContextMenu` subscribes to the workspace store for the live keymap
+ * its shortcut chips come from. Two of this file's children — `ProjectMenu` and `RowControls`
+ * — go further and drive the store directly, and each says at length why; neither is measured,
+ * and neither replaces a prop a host was already passing.
  */
+import { useContextMenu } from '@/menus'
+import { projectMenu } from '@/ipc/client'
+import type { SplitIntent } from '@/ipc/generated'
+import { projectTabEntries } from './menuModel'
+import { ProjectMenu } from './ProjectMenu'
+import { RowControls } from './RowControls'
 import styles from './AppHeader.module.css'
 
 /**
@@ -29,6 +42,18 @@ export interface AppHeaderProps {
   activeProject?: string | null | undefined
   onActivate?: ((id: string) => void) | undefined
   onClose?: ((id: string) => void) | undefined
+  /**
+   * **No longer used, and deliberately still accepted.**
+   *
+   * `App.tsx` supplies a handler that opens `@tauri-apps/plugin-dialog`'s folder dialog. That
+   * dialog cannot be parented on Linux — the plugin guards `set_parent` behind
+   * `cfg(windows | macos)` — which is exactly the reported "the project popup opens *behind*
+   * the cide window". The `+` therefore goes to `project_pick` instead, unconditionally: a fix
+   * that took effect only once a second file stopped passing a prop is a fix that ships off.
+   *
+   * The field stays so the existing call site still type-checks, and so this comment sits where
+   * whoever deletes it will read it. Delete the prop and `pickProject` together.
+   */
   onNew?: (() => void) | undefined
   onToggleTheme?: (() => void) | undefined
   /**
@@ -53,6 +78,15 @@ export interface AppHeaderProps {
    * contract as `onSplit`.
    */
   onDetach?: (() => void) | undefined
+  /**
+   * Add a full-width row holding one pane, anchored under the focused one.
+   *
+   * **Optional in the strong sense**: omitted, the controls still work — `RowControls` drives
+   * `useWorkspace.addRow` itself. This exists so a fixture can intercept the gesture, and so a
+   * host that wants a different anchor can supply one. See `RowControls.tsx` for why the
+   * fallback is there rather than a fifth prop nobody remembers to pass.
+   */
+  onAddRow?: ((intent: SplitIntent) => void) | undefined
 }
 
 export function AppHeader({
@@ -62,11 +96,37 @@ export function AppHeader({
   activeProject = null,
   onActivate,
   onClose,
-  onNew,
   onToggleTheme,
   onSplit,
   onDetach,
+  onAddRow,
 }: AppHeaderProps) {
+  /*
+   * The project tab menu.
+   *
+   * `items` is called at open time, so which tab was hit is read off the DOM rather than
+   * captured per tab — one hook for the whole strip instead of one per project, which is what
+   * keeps the cost independent of how many are open.
+   */
+  const tabMenu = useContextMenu({
+    label: 'Project tab',
+    items: ({ target }) => {
+      const id = target?.closest<HTMLElement>('[data-project-id]')?.dataset.projectId
+      const project = projects.find((p) => p.id === id)
+      // A right-click on the drag filler or the `+`, not on a tab. Nothing to offer, so the
+      // hook declines to open rather than showing a box of lines about no project.
+      if (!project) return []
+      const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
+      return projectTabEntries(projects, project, {
+        close: onClose,
+        // Rejects when the root has gone, and `Failures` says so. Better than a file manager
+        // opening on nothing, which is what a blind `open_path` produces.
+        reveal: (projectId) => void projectMenu.reveal(projectId),
+        ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
+      })
+    },
+  })
+
   // The `data-audit` attributes below are how chrome/layoutAudit.ts locates this surface:
   // CSS Module class names are hashed at build time, so nothing outside can select on them.
   return (
@@ -100,7 +160,7 @@ export function AppHeader({
         />
       </div>
 
-      <div className={styles.tabs}>
+      <div className={styles.tabs} onContextMenu={tabMenu.onContextMenu}>
         {projects.map((project) => {
           const active = project.id === activeProject
           return (
@@ -108,6 +168,9 @@ export function AppHeader({
               key={project.id}
               className={active ? `${styles.tab} ${styles.tabActive}` : styles.tab}
               data-audit="projectTab"
+              // How the context menu finds which tab was hit; `items` runs at open time and
+              // reads it back off the DOM rather than one hook closing over each project.
+              data-project-id={project.id}
               data-active={active ? 'true' : 'false'}
             >
               <button
@@ -145,15 +208,23 @@ export function AppHeader({
           )
         })}
 
-        <button type="button" className={styles.add} title="Open project" onClick={onNew}>
-          +
-        </button>
+        {/*
+         * The `+` and the recent-projects caret. A component of its own because the `+` had to
+         * stop going through `@tauri-apps/plugin-dialog` — its dialog cannot be parented on
+         * Linux and so opened behind this window. `onNew` is not forwarded; see its doc above.
+         */}
+        <ProjectMenu />
 
         {/* `data-tauri-drag-region` does not inherit, so the drag surface is this filler
             rather than the header itself. `data-window-drag` is the hook the window-frame
             agent binds double-click-to-maximize to, without depending on this markup. */}
         <div className={styles.filler} data-tauri-drag-region data-window-drag="true" />
       </div>
+
+      {/* The two row gestures, moved up out of `SplitTree`'s bottom strip on request. Outside
+          `.tabs` so an overfull project strip clips its own last tab rather than pushing these
+          off the window edge — the same argument `TabStrip` makes about its own boxes. */}
+      <RowControls onAddRow={onAddRow} />
 
       <div className={styles.actions}>
         <button type="button" className={styles.action} title="Toggle theme" onClick={onToggleTheme}>
@@ -190,6 +261,10 @@ export function AppHeader({
           ⧉
         </button>
       </div>
+
+      {/* Rendered or nothing appears. It portals out of this bar, so the header's own
+          `overflow: hidden` on `.tabs` cannot clip it. */}
+      {tabMenu.menu}
     </div>
   )
 }

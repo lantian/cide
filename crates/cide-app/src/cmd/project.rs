@@ -5,11 +5,14 @@
 //! returns the new revision. The rules about what may be closed or reordered live in the
 //! domain, so a second frontend, or a future headless mode, gets them for free.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cide_core::CoreError;
-use cide_core::workspace;
-use cide_ipc::{Pane, PaneId, PaneKind, PaneRole, ProjectId, TabId, TabKind};
+use cide_core::{persist, workspace};
+use cide_ipc::{
+    Pane, PaneId, PaneKind, PaneRole, ProjectId, RecentEntry, RecentProject, TabId, TabKind,
+};
+use parking_lot::Mutex;
 use tauri::{Manager, State};
 
 use crate::workspace_state::WorkspaceState;
@@ -42,7 +45,375 @@ pub fn project_open(
         });
         servers.ensure(&app, id, roots);
     }
+
+    // Recorded here rather than in `cide_core::workspace::open_project`, because the domain
+    // function is also how a *restore* re-opens everything in `workspace.json` at launch, and
+    // a restore must not reorder the list — every launch would otherwise rewrite the recents
+    // in project order and the word "recent" would stop meaning anything. This is the command,
+    // which is only reached by a user asking for a project.
+    //
+    // Reads the name back out of the domain rather than using the `name` argument: that
+    // argument is `None` for every real open, and the name a user recognises is the one the
+    // header shows.
+    let named = state.with(|ws| {
+        workspace::project(ws, id)
+            .ok()
+            .and_then(|p| p.roots.first().map(|r| (r.path.clone(), p.name.clone())))
+    });
+    if let Some((root, name)) = named {
+        // Off this thread, and not awaited. `project_open` is a *synchronous* command, so Tauri
+        // runs it on the main thread — the GTK one, on Linux — and `remember` is two `fsync`s
+        // and a `rename` behind a lock that `project_recent` can be holding while it stats an
+        // unmounted share. Doing it inline would freeze every window in the process for as long
+        // as that takes, which is the one thing this list is not worth. It is best-effort by
+        // design (see `remember`), so there is no answer to wait for and nothing to report.
+        drop(tauri::async_runtime::spawn_blocking(move || {
+            remember(&root, &name)
+        }));
+    }
     Ok(id)
+}
+
+// --- recent projects ------------------------------------------------------------------------
+
+/// Serialises every read-modify-write of `recent.json`.
+///
+/// A process-wide lock rather than managed Tauri state: this is one small file with no
+/// in-memory mirror, so there is no state to register and nothing for a second window to get a
+/// stale copy of. Without it two windows opening projects at the same moment would each load
+/// the old list, prepend their own entry and publish it — and the second write, being atomic,
+/// would cleanly and completely erase the first.
+static RECENT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Add a project to the recents file. Best-effort by design.
+///
+/// A failure here must never fail the open: the user asked for a project, not for a menu entry,
+/// and refusing to open a directory because a convenience list could not be written would be an
+/// absurd trade. It is logged, because a recents list that silently never grows is otherwise
+/// indistinguishable from one nobody wired up.
+fn remember(root: &Path, name: &str) {
+    let _guard = RECENT_LOCK.lock();
+    let path = persist::recent_path();
+    let mut list = persist::load_recent(&path);
+    persist::remember_recent(&mut list, root, name, persist::now_ms());
+    if let Err(error) = persist::save_recent(&path, &list) {
+        tracing::warn!(path = %path.display(), %error, "could not record the recent project");
+    }
+}
+
+/// Pair each remembered project with whether its directory is still there.
+///
+/// One `is_dir` per entry, capped at [`persist::MAX_RECENT`] — sixteen stats, on the gesture
+/// that opens a menu. `is_dir` rather than `exists`: a file where a project used to be is not
+/// something `open_project` can do anything with, and reporting it as openable would move the
+/// failure to a place with no way to explain itself.
+///
+/// **Call this with [`RECENT_LOCK`] released.** The lock exists to serialise read-modify-write
+/// of one small file, which is microseconds; a `stat` on an unmounted share is an NFS timeout.
+/// Holding the lock across these would turn a menu nobody is watching into a stall on every
+/// other caller of the file, `project_open` included.
+fn with_existence(list: Vec<RecentProject>) -> Vec<RecentEntry> {
+    list.into_iter()
+        .map(|project| RecentEntry {
+            exists: project.path.is_dir(),
+            project,
+        })
+        .collect()
+}
+
+/// The recent-projects list, most recent first.
+///
+/// Async over `spawn_blocking` because it reads a file and stats up to sixteen directories,
+/// and one of those directories can be an unmounted network share — a `stat` that takes the
+/// NFS timeout on the IPC thread would freeze every window, not just the menu that asked.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn project_recent() -> Result<Vec<RecentEntry>, CoreError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        // The lock covers the read and is dropped before the stats — see `with_existence`.
+        let list = {
+            let _guard = RECENT_LOCK.lock();
+            persist::load_recent(&persist::recent_path())
+        };
+        with_existence(list)
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("recent projects: {e}")))
+}
+
+/// Drop one entry, or every entry, and answer with what is left.
+///
+/// `path` of `None` clears the list. One command rather than two because they are one
+/// read-modify-write apart and the frontend renders both answers the same way; splitting them
+/// would mean two chances to forget the lock above.
+///
+/// Answers with the new list rather than a count, so the menu that asked can repaint from the
+/// truth instead of patching its own copy — the same argument the workspace mirror makes.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn project_forget_recent(path: Option<String>) -> Result<Vec<RecentEntry>, CoreError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Read-modify-write under the lock; the stats below it are not — see `with_existence`.
+        let list = {
+            let _guard = RECENT_LOCK.lock();
+            let file = persist::recent_path();
+            let mut list = persist::load_recent(&file);
+            let changed = match &path {
+                Some(path) => persist::forget_recent(&mut list, Path::new(path)),
+                None => {
+                    let had = !list.is_empty();
+                    list.clear();
+                    had
+                }
+            };
+            // Nothing to write when nothing moved: the common case is a menu acting on an entry
+            // that a second window already removed, and rewriting an identical file would churn
+            // the inode for no change anyone can observe.
+            if changed && let Err(error) = persist::save_recent(&file, &list) {
+                tracing::warn!(path = %file.display(), %error, "could not update the recent projects");
+            }
+            list
+        };
+        with_existence(list)
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("recent projects: {e}")))
+}
+
+/// Reopen a remembered project, refusing an entry whose directory has gone.
+///
+/// The refusal is the whole reason this is not just `project_open`. `open_project` will happily
+/// create a project over a path that does not exist — it never touches the filesystem — so a
+/// stale recents entry would open a project with an empty tree, an explorer showing nothing and
+/// a `claude` spawned into a directory that is not there. Every one of those symptoms is
+/// several steps away from the cause. Checked here rather than in `project_open` because that
+/// command is also how a test and a restore open a project, and neither should have to have a
+/// directory on disk.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn project_open_recent(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<ProjectId, CoreError> {
+    let root = PathBuf::from(&path);
+    let exists = tauri::async_runtime::spawn_blocking({
+        let root = root.clone();
+        move || root.is_dir()
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("{path}: {e}")))?;
+
+    if !exists {
+        return Err(CoreError::Io(format!(
+            "{} is no longer a directory — it may have been moved, deleted or unmounted",
+            root.display()
+        )));
+    }
+
+    // Through the command rather than the domain function, so the IDE server and the recents
+    // entry are handled exactly once, here.
+    let state = app.state::<WorkspaceState>();
+    project_open(app.clone(), state, vec![path], None)
+}
+
+/// Show a project's primary root in the desktop's file manager.
+///
+/// From Rust, and for the same reason `app_open_log_dir` is: the `opener` plugin's JS command
+/// is capability-gated per window and a detached window deliberately has none, so doing it here
+/// makes the gesture work from every window without widening what a webview may open to
+/// "any path it can name".
+#[tauri::command(rename_all = "camelCase")]
+pub async fn project_reveal(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<String, CoreError> {
+    let root = state.with(|ws| {
+        workspace::project(ws, project).map(|p| p.roots.first().map(|r| r.path.clone()))
+    })?;
+    let root = root.ok_or(CoreError::NoRoots)?;
+
+    // Both halves off the runtime's worker pool, for the same reason `project_recent` is: the
+    // `stat` can be an NFS timeout on an unmounted root, and `open_path` forks a file manager,
+    // which on a cold desktop is not instant either. The whole answer is one blocking task.
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_opener::OpenerExt;
+
+        // Asking a file manager to open a path that is not there is an error dialog with no
+        // explanation in it — the same trap `app_open_log_dir` sidesteps by creating the
+        // directory. Here it must not be created: a project root that has gone is news, not a
+        // hole to fill.
+        if !root.is_dir() {
+            return Err(CoreError::Io(format!("{} is not there", root.display())));
+        }
+        app.opener()
+            .open_path(root.to_string_lossy(), None::<&str>)
+            .map_err(|e| CoreError::Io(format!("could not open {}: {e}", root.display())))?;
+        Ok(root.display().to_string())
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("reveal: {e}")))?
+}
+
+// --- the folder picker ----------------------------------------------------------------------
+
+/// Ask the user for one or more project folders. Empty means cancelled.
+///
+/// **This exists because of a stacking bug, and the bug is not ours.** The report was that the
+/// picker opens *behind* the cide window on KDE Wayland, where a dialog with no parent is
+/// stacked wherever the compositor likes. Following it back:
+///
+/// * The frontend called `@tauri-apps/plugin-dialog`'s `open()`, which lands on the plugin's
+///   `open` command. That command does `set_parent(&window)` — but inside
+///   `#[cfg(any(windows, target_os = "macos"))]`. On Linux the parent is *never* set, and no
+///   option the JS API accepts can set it.
+/// * Reaching for the plugin's Rust API instead does not help either. It is `rfd` underneath,
+///   and `tauri-plugin-dialog`'s default feature is `gtk3`, so `rfd` builds its GTK3 backend —
+///   in which the word "parent" does not appear at all. `set_parent` compiles, stores a handle
+///   and is then dropped on the floor. (`rfd`'s *portal* backend does honour it, via ashpd's
+///   `WindowIdentifier`; switching to it means `default-features = false, features =
+///   ["xdg-portal"]` on the plugin, which drags in ashpd/zbus and makes the picker depend on a
+///   portal service being installed. That was the alternative, and it lost on both counts.)
+///
+/// So the dialog is built here, against the window's real `GtkApplicationWindow`.
+/// `FileChooserNative` is the same class GTK applications use: with a portal installed it *is*
+/// the desktop's own picker (KDE's, on the reporter's machine), and without one it falls back
+/// to GTK's — and it sets a transient parent in both cases, which is the relation Wayland
+/// needs to keep a dialog above the window that owns it.
+///
+/// **Unverified on screen, and it cannot be verified here**: confirming a stacking order needs
+/// a running GUI, and launching one is forbidden in this environment. What is checked is that
+/// it compiles, that the parent is a real handle rather than `None` when the window has one,
+/// and the mechanism above, which was read out of the two dependencies' sources rather than
+/// assumed.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn project_pick(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Vec<String>, CoreError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+    show_folder_picker(&app, window, tx)?;
+
+    // `spawn_blocking` rather than blocking the command's own task: the answer arrives only
+    // when the user has finished browsing, which is unbounded, and the async runtime's worker
+    // pool is shared with every other command in flight.
+    //
+    // A `recv` error means the sender was dropped without answering — the dialog was destroyed
+    // with the window, say. Cancelled and never-answered both mean "no project", which is why
+    // the empty vector covers them rather than an error the caller would have to invent a
+    // message for.
+    let picked = tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or_default())
+        .await
+        .map_err(|e| CoreError::Io(format!("folder picker: {e}")))?;
+
+    Ok(picked
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Build and show the picker on the GTK main thread, answering through `tx`.
+///
+/// Returns as soon as the dialog is *queued*, not when it is answered: `FileChooserNative::run`
+/// spins a nested main loop, which would freeze every webview in the process — including the
+/// one that asked — for as long as the user browses. The response signal keeps the app alive
+/// behind the dialog.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn show_folder_picker(
+    app: &tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
+) -> Result<(), CoreError> {
+    app.run_on_main_thread(move || {
+        use gtk::prelude::*;
+
+        // `None` is survivable and is not the same as a failure: the dialog still opens, just
+        // unparented — which is the state being fixed, so it is worth a line in the log rather
+        // than a silent regression if `gtk_window` ever starts failing.
+        let parent = match window.gtk_window() {
+            Ok(parent) => Some(parent),
+            Err(error) => {
+                tracing::warn!(%error, "no GTK window to parent the folder picker to");
+                None
+            }
+        };
+
+        let dialog = gtk::FileChooserNative::new(
+            Some("Open project"),
+            parent.as_ref(),
+            gtk::FileChooserAction::SelectFolder,
+            Some("Open"),
+            Some("Cancel"),
+        );
+        // Modal as well as parented. The parent decides *stacking*; modality is what stops the
+        // user reaching the window underneath and opening a second picker on top of this one.
+        dialog.set_modal(true);
+        // A project may span several roots, and `project_open` already takes a list.
+        dialog.set_select_multiple(true);
+
+        /*
+         * One reference, held by the handler and released by it.
+         *
+         * `show()` returns immediately, so nothing on this stack can keep the dialog alive
+         * until the user answers — dropping it here would destroy the window that was just
+         * put on screen. Parking a clone in the handler works because the handler is owned by
+         * the dialog; taking it out again inside the handler is what stops that cycle becoming
+         * a leak of one dialog per pick. Dropping our reference from inside the handler is
+         * safe: GObject holds its own reference for the duration of a signal emission, so the
+         * instance cannot be finalised under the handler's feet.
+         */
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Some(dialog.clone())));
+        dialog.connect_response(move |dialog, response| {
+            let picked = if response == gtk::ResponseType::Accept {
+                dialog.filenames()
+            } else {
+                Vec::new()
+            };
+            dialog.hide();
+            // The receiver is gone if the command's task was cancelled. Nothing to do about
+            // it, and nothing lost: the user's answer had nowhere to go anyway.
+            let _ = tx.send(picked);
+            held.borrow_mut().take();
+        });
+        dialog.show();
+    })
+    .map_err(|e| CoreError::Io(format!("folder picker: {e}")))
+}
+
+/// Windows and macOS, where the plugin parents the dialog itself and `rfd`'s backend honours
+/// it. cide is a Linux app; this arm exists so the crate still compiles elsewhere, and it is
+/// the shape the whole command would have if the Linux gap above were ever closed upstream.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn show_folder_picker(
+    _app: &tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
+) -> Result<(), CoreError> {
+    use tauri_plugin_dialog::DialogExt;
+
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Open project")
+        .pick_folders(move |paths| {
+            let picked = paths
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.into_path().ok())
+                .collect();
+            let _ = tx.send(picked);
+        });
+    Ok(())
 }
 
 /// Close a project, its tabs and its windows.

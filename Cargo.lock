@@ -592,6 +592,7 @@ dependencies = [
  "cide-pty",
  "cide-search",
  "dashmap",
+ "gtk",
  "libc",
  "log",
  "parking_lot",
