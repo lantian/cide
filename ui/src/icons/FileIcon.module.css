@@ -1,0 +1,27 @@
+/*
+ * The icon box.
+ *
+ * 16px in a 21px row, which is the ratio the Material Icon Theme is drawn for; below about
+ * 14px its two-tone folders stop reading as two tones. The vendored SVGs have square viewBoxes
+ * in four different units (16, 24, 32, 3473 …), so the box is fixed and `object-fit` does the
+ * scaling rather than each icon's intrinsic size leaking into the row.
+ *
+ * Nothing here recolours anything: an `<img>` is opaque to this stylesheet, and the light
+ * theme is served a different *file* instead — see `iconFor.ts`. That is also why there is no
+ * `[data-theme]` block below. The one thing worth guarding is `filter`: a well-meant
+ * `drop-shadow` or `brightness` here would apply to all 60 icons at once and undo the
+ * per-icon measurement the light variants are built from.
+ */
+
+.icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+  /* The rows are absolutely positioned and translated; an inline image's baseline gap would
+     push the icon a pixel low against the mono filename beside it. */
+  display: block;
+  /* Dragging a row must not become dragging a picture out of the app. */
+  -webkit-user-drag: none;
+  user-select: none;
+}
