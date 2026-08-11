@@ -112,17 +112,12 @@
   font-size: 9px;
 }
 
-.glyph {
-  flex: none;
-  width: 12px;
-  text-align: center;
-  color: var(--faint);
-  font-size: 10.5px;
-}
-
-.glyphDir {
-  color: var(--dim);
-}
+/*
+ * There is no `.glyph` here any more. The row draws a `<FileIcon>`, which brings its own 16px
+ * box (`icons/FileIcon.module.css`) and is an `<img>` — opaque to this stylesheet, so a colour
+ * rule here would have done nothing while looking like it did something. The 5px flex `gap` on
+ * `.row` still separates it from the name.
+ */
 
 .name {
   flex: 1;

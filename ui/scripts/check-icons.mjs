@@ -185,6 +185,22 @@ try {
   eq(dir('_test'), 'folder-test', 'as does a leading underscore')
   eq(dir('TARGET'), 'folder-target', 'matching is case-insensitive here too')
 
+  // --- 3b. names that collide with Object.prototype ------------------------------------------
+  //
+  // The tables are object literals, so `BY_FILENAME['constructor']` is an inherited *function*
+  // and `${it}` is `function Object() { [native code] }` — a stem with no file, drawn as a blank
+  // row. Step 4 below cannot catch it: the bad stem is never a value in any table. Lower-casing
+  // already saves `toString`; these are the members that survive it, and every one of them is a
+  // legal name on a disk this app is pointed at.
+  for (const evil of ['constructor', '__proto__', '__defineGetter__', '__lookupSetter__']) {
+    eq(typeof file(evil), 'string', `a FILE named \`${evil}\` resolves to a string`)
+    eq(file(evil), m.DEFAULT_FILE_ICON, `and \`${evil}\` falls back like any unknown name`)
+    eq(typeof dir(evil), 'string', `a DIRECTORY named \`${evil}\` resolves to a string`)
+    eq(dir(evil), m.DEFAULT_FOLDER_ICON, `and it falls back too`)
+    eq(dir(evil, true), `${m.DEFAULT_FOLDER_ICON}-open`, `expanded, still the generic folder`)
+    eq(file(`x.${evil}`), m.DEFAULT_FILE_ICON, `and as an EXTENSION, \`.${evil}\``)
+  }
+
   // --- light variants ----------------------------------------------------------------------
 
   eq(
@@ -255,7 +271,15 @@ try {
 
     if (missing === 0) console.log(`icons: ${stems.size} stems, all present in ${ICON_DIR}/`)
 
-    // --- 5. and every one of them is visible on the theme it will be drawn on --------------
+    // --- 5. and every one of them is visible on the ground it is drawn on -------------------
+    //
+    // The ground measured is `--panel`, the panel's own background, and that is the *only*
+    // claim this makes. A row also draws on `--chrome-hi` when hovered and `--sel` when
+    // selected, both of which are darker than white: the darkening pass targets exactly 3.00:1
+    // on #ffffff, so 78 of 126 stems sit at ~2.5:1 on a selected row and 86 at ~2.4:1 on a
+    // hovered one. That is a deliberate trade — re-targeting the pass at #e6e6eb would darken
+    // 45 more icons and cost the set the colour that is the point of using it — and not an
+    // oversight. Change `MIN_CONTRAST_ON_WHITE` in `vendor-icons.mjs` if the trade changes.
     //
     // The set is pitched for a dark editor and this app's light theme is *white*, not VS
     // Code's #f3f3f3: `editorconfig` is four near-whites, 1.21:1 on #ffffff. That is not a

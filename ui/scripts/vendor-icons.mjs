@@ -39,6 +39,19 @@ const OUT_ICONS = join(UI, 'public/icons')
 const OUT_MAP = join(UI, 'src/icons/iconMap.ts')
 
 const UPSTREAM = 'https://github.com/material-extensions/vscode-material-icon-theme.git'
+/**
+ * The revision `iconMap.ts`'s header names, and the one this script fetches.
+ *
+ * Pinned rather than `clone --depth 1` of whatever the default branch happens to be. The
+ * header is a provenance claim — "these associations are upstream's, at this commit" — and a
+ * script that records HEAD *after* cloning cannot reproduce the file it just stamped: the
+ * next run silently re-vendors against a different upstream and rewrites 190 files under a
+ * commit message that says nothing changed. Moving the set forward is a deliberate edit to
+ * this line.
+ *
+ * `--depth 1` is kept, per revision: a shallow fetch of one commit, not of a branch tip.
+ */
+const UPSTREAM_REV = '5bcb461d8f1d3dc9b0f9e733720f776824380338'
 /** Upstream's own default `activeIconPack`, from `src/core/generator/config/defaultConfig.ts`. */
 const ACTIVE_PACK = 'angular'
 
@@ -61,8 +74,15 @@ function mkdtemp(prefix) {
 
 const git = (...args) => execFileSync('git', args, { cwd: MIT, encoding: 'utf8' })
 
-execFileSync('git', ['clone', '--depth', '1', UPSTREAM, MIT], { stdio: 'inherit' })
+git('init', '--quiet')
+git('remote', 'add', 'origin', UPSTREAM)
+// `fetch <sha>` rather than `clone` + `checkout`: it moves one commit's worth of objects and
+// fails loudly if the pin has been garbage-collected or force-pushed away, which is the case
+// where a silent fallback to HEAD would be worst.
+execFileSync('git', ['fetch', '--depth', '1', 'origin', UPSTREAM_REV], { cwd: MIT, stdio: 'inherit' })
+git('checkout', '--quiet', 'FETCH_HEAD')
 const upstreamRev = git('rev-parse', 'HEAD').trim()
+if (upstreamRev !== UPSTREAM_REV) throw new Error(`fetched ${upstreamRev}, wanted ${UPSTREAM_REV}`)
 
 const PATTERN_ENUM = `
 const FileNamePattern = {

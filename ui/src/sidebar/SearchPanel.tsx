@@ -230,8 +230,10 @@ function FileHeading({
       <span className={styles.twisty} aria-hidden="true">
         {row.collapsed ? '▸' : '▾'}
       </span>
-      {/* The same `▫` the file tree draws for a file, so one file looks like one thing in
-          both sidebars. */}
+      {/* A literal `▫`, still. The file tree now draws the vendored Material icon for the
+          file's type instead; matching that here means threading the icon theme through
+          `Body` → `Results` and taking a basename off `row.rel`, which is a change to this
+          panel and not to the icon set. Until then the two sidebars deliberately differ. */}
       <span className={styles.glyph} aria-hidden="true">
         ▫
       </span>

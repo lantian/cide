@@ -46,6 +46,26 @@ export const DEFAULT_FOLDER_ICON = 'folder'
 const LIGHT = new Set(HAS_LIGHT_VARIANT)
 
 /**
+ * A table read that cannot hand back `Object.prototype`.
+ *
+ * The generated tables are object literals, so `BY_FILENAME['constructor']` is the inherited
+ * *function*, not `undefined`, and `${it}` renders as `function Object() { [native code] }` —
+ * a stem with no file, i.e. exactly the silently blank row this module exists to prevent. The
+ * lower-casing above already saves `toString`/`valueOf`/`hasOwnProperty`, which leaves
+ * `constructor`, `__proto__` and the four `__define*__`/`__lookup*__` members reachable. Those
+ * are legal names on disk and a file tree draws whatever the disk holds — `ProblemsPanel`'s
+ * `model.ts` makes the same argument about `in` and severities.
+ *
+ * `Object.hasOwn` rather than rebuilding the tables with `Object.create(null)`: they are
+ * generated literals with ~1,100 entries between them and a null-prototype copy would be a
+ * spread of all of them on every module load, paid by every window whether or not a tree is
+ * ever opened.
+ */
+function lookup(table: Readonly<Record<string, string>>, key: string): string | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined
+}
+
+/**
  * The icon file stem for a row — `'rust'`, `'folder-src-open'`, `'javascript_light'`.
  *
  * A stem, not a URL: this module has to compile and run under bare `tsc` in the check script,
@@ -78,7 +98,7 @@ export function iconFor(row: IconRow, theme: IconTheme): string {
 function fileStem(name: string): string {
   const lower = name.toLowerCase()
 
-  const byName = BY_FILENAME[lower]
+  const byName = lookup(BY_FILENAME, lower)
   if (byName !== undefined) return byName
 
   // Successive suffixes, longest first: `a.b.c` offers `b.c` then `c`. Starting at 1 rather
@@ -86,7 +106,7 @@ function fileStem(name: string): string {
   // and letting it run here would make `tsconfig.json` reachable by two different rules.
   const parts = lower.split('.')
   for (let i = 1; i < parts.length; i++) {
-    const hit = BY_EXTENSION[parts.slice(i).join('.')]
+    const hit = lookup(BY_EXTENSION, parts.slice(i).join('.'))
     if (hit !== undefined) return hit
   }
 
@@ -104,7 +124,8 @@ function fileStem(name: string): string {
  */
 function folderStem(row: IconRow): string {
   const lower = row.name.toLowerCase()
-  const stem = BY_FOLDER[lower] ?? BY_FOLDER[canonicalFolder(lower)] ?? DEFAULT_FOLDER_ICON
+  const stem =
+    lookup(BY_FOLDER, lower) ?? lookup(BY_FOLDER, canonicalFolder(lower)) ?? DEFAULT_FOLDER_ICON
   return row.expanded === true ? `${stem}-open` : stem
 }
 

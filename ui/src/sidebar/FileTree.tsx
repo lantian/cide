@@ -24,6 +24,7 @@ import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { letterFor, statusAt } from './treeStatus'
 import { isDegraded, type TreeRow, type TreeStatus, type TreeStatusMap } from '@/ipc/client'
+import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import styles from './FileTree.module.css'
 
 /** 21px rows, from the mock. */
@@ -90,6 +91,14 @@ export function FileTree({ onOpen }: FileTreeProps) {
    * changed paths, which the backend caps; it is not a walk of the repository.
    */
   const statuses = useGitStatus(useShallow((s) => s.status.statuses))
+  /*
+   * Subscribed here and threaded down for exactly the reason above: the icon set has a second
+   * *file* per icon for the white theme rather than a CSS filter, so every row needs the theme
+   * — and a `useIconTheme()` inside `Row` would be one more store listener per visible row
+   * mounted and torn down on every scroll tick. One listener for the panel; the value is a
+   * string, so passing it costs nothing.
+   */
+  const iconTheme = useIconTheme()
   const [selected, setSelected] = useState<string | null>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -166,6 +175,7 @@ export function FileTree({ onOpen }: FileTreeProps) {
               key={item.key}
               row={row}
               statuses={statuses}
+              iconTheme={iconTheme}
               top={item.start}
               height={item.size}
               selected={row.path === selected}
@@ -182,6 +192,8 @@ export function FileTree({ onOpen }: FileTreeProps) {
 interface RowProps {
   row: TreeRow
   statuses: TreeStatusMap['statuses']
+  /** Threaded from the panel — see the subscription there. */
+  iconTheme: IconTheme
   top: number
   height: number
   selected: boolean
@@ -189,7 +201,7 @@ interface RowProps {
   onOpen: ((path: string) => void) | undefined
 }
 
-function Row({ row, statuses, top, height, selected, onSelect, onOpen }: RowProps) {
+function Row({ row, statuses, iconTheme, top, height, selected, onSelect, onOpen }: RowProps) {
   const isDir = row.kind === 'dir'
   const tone = statusAt(statuses, row.path)
   const letter = letterFor(tone, isDir)
@@ -222,16 +234,15 @@ function Row({ row, statuses, top, height, selected, onSelect, onOpen }: RowProp
         {twisty}
       </span>
       {/*
-       * Literal characters, as everywhere else in this chrome: no icon font or SVG set is
-       * bundled, and `▤` is the same mark the activity rail uses for Files, so the two
-       * surfaces agree about what a directory looks like.
+       * The Material Icon Theme, vendored as local files — the CSP names no external host, so
+       * `@/icons` resolves to something in `public/icons/`. `TreeRow` satisfies `IconRow`
+       * structurally, so the row goes in whole and a field renamed in `cide-fs` breaks here
+       * rather than inside the icon module. `row.expanded` already drives the open folder.
+       *
+       * This replaced the literal `▤`/`▫`. The activity rail still draws `▤` for Files, which
+       * is a different claim — that rail names a *panel*, not a directory.
        */}
-      <span
-        className={isDir ? `${styles.glyph} ${styles.glyphDir}` : styles.glyph}
-        aria-hidden="true"
-      >
-        {isDir ? '▤' : '▫'}
-      </span>
+      <FileIcon row={row} theme={iconTheme} />
       <span
         className={
           status.nameClass === undefined ? styles.name : `${styles.name} ${status.nameClass}`
