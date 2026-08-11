@@ -260,6 +260,7 @@ pub fn run() {
             cmd::file::file_write,
             cmd::file::tab_open_file,
             cmd::file::tab_open_diff,
+            cmd::file::tab_retarget_diff,
             cmd::file::tab_set_dirty,
             cmd::lifecycle::app_restore_plan,
             cmd::pane::pane_split,

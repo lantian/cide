@@ -392,7 +392,14 @@ fn open_diff_tab(app: &AppHandle, project: ProjectId, broker: &DiffBroker, reque
     };
 
     let opened = state.update(|ws| {
-        cide_core::workspace::open_tab(ws, project, TabKind::Diff { spec }, pane)?;
+        // Never a preview tab: this one blocks an agent turn on a promise about one
+        // particular file, and the preview slot is by definition the tab a stray click may
+        // re-point. `retarget_diff` refuses it a second time on the way in.
+        let kind = TabKind::Diff {
+            spec,
+            preview: false,
+        };
+        cide_core::workspace::open_tab(ws, project, kind, pane)?;
         Ok(())
     });
 
@@ -415,7 +422,7 @@ fn close_diff_tab_by_name(app: &AppHandle, project: ProjectId, tab_name: &str) {
     let target: Option<cide_ipc::TabId> = state.with(|ws| {
         let p = cide_core::workspace::project(ws, project).ok()?;
         p.tabs.iter().find_map(|tab| match &tab.kind {
-            TabKind::Diff { spec } => match &spec.origin {
+            TabKind::Diff { spec, .. } => match &spec.origin {
                 DiffOrigin::ClaudeMcp { request_id } if request_id == tab_name => Some(tab.id),
                 _ => None,
             },
@@ -491,7 +498,7 @@ pub fn request_id_for_tab(
             .iter()
             .find(|t| t.id == tab)
             .and_then(|t| match &t.kind {
-                TabKind::Diff { spec } => match &spec.origin {
+                TabKind::Diff { spec, .. } => match &spec.origin {
                     DiffOrigin::ClaudeMcp { request_id } => Some(request_id.clone()),
                     _ => None,
                 },
@@ -510,7 +517,7 @@ pub fn pending_request_ids(state: &WorkspaceState, project: ProjectId) -> Vec<St
                 p.tabs
                     .iter()
                     .filter_map(|tab| match &tab.kind {
-                        TabKind::Diff { spec } => match &spec.origin {
+                        TabKind::Diff { spec, .. } => match &spec.origin {
                             DiffOrigin::ClaudeMcp { request_id } => Some(request_id.clone()),
                             _ => None,
                         },

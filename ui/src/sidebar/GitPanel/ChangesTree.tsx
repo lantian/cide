@@ -43,6 +43,7 @@ import {
   type Row,
 } from './model'
 import { TriCheckbox } from './TriCheckbox'
+import type { DiffOpenMode } from './types'
 import { gestureOf, gitTreeClick } from '../clickSemantics'
 /*
  * Reached by file rather than through the `@/icons` barrel, which is what every other caller
@@ -76,7 +77,13 @@ export interface ChangesTreeProps {
   iconTheme: IconTheme
   onToggleCheck: (row: Row) => void
   onToggleExpand: (row: Row) => void
-  onOpenDiff: (row: Row) => void
+  /**
+   * Activate a file row.
+   *
+   * `mode` is derived here rather than passed in, because it is a property of the *gesture*
+   * and this is the only place that sees one — see the `onMouseDown` below.
+   */
+  onOpenDiff: (row: Row, mode: DiffOpenMode) => void
   /** From the host's `useContextMenu`. Absent in a render with no window to open one in. */
   onContextMenu?: ((e: React.MouseEvent) => void) | undefined
   /** The portalled menu itself. It must be rendered or nothing appears. */
@@ -157,7 +164,10 @@ export function ChangesTree({
           // The keyboard has no second click to wait for, so Enter opens a leaf whether or
           // not a diff is already on screen. See `enterOn` in `clickSemantics.ts`.
           if (row.expandable) onToggleExpand(row)
-          else onOpenDiff(row)
+          // `'open'`, unconditionally. Enter is not a click that might have been a
+          // double-click, so there is no gesture to disambiguate and nothing here means
+          // "just follow along" — the user asked for this file.
+          else onOpenDiff(row, 'open')
           break
         default:
           // Every other key, printable ones included, belongs to the browser.
@@ -222,14 +232,28 @@ export function ChangesTree({
              */
             onMouseDown={(e) => {
               if (e.button !== 0) return
+              const gesture = gestureOf(e.detail)
               const action = gitTreeClick({
-                gesture: gestureOf(e.detail),
+                gesture,
                 expandable: row.expandable,
                 diffOpen,
               })
               if (action.select) onCurrent(row.id)
               if (action.toggle) onToggleExpand(row)
-              if (action.open) onOpenDiff(row)
+              /*
+               * The gesture, not a second rule. `gitTreeClick` returns `open` for two
+               * different reasons — a double-click, or a single click while a diff is
+               * already up — and until now both went to `tab_open_diff`, which reuses a tab
+               * only when the path matches. That is where the thirty tabs came from.
+               *
+               * Recomputing `gesture === 'single'` here rather than adding a fourth boolean
+               * to `RowAction`: `clickSemantics.ts` is shared with the file tree and the
+               * search results, neither of which has anything to retarget, and the caller
+               * already holds the gesture that produced the action. A single click that
+               * opens is *only* reachable through `diffOpen`, so this needs no second look
+               * at that flag — see `gitTreeClick`.
+               */
+              if (action.open) onOpenDiff(row, gesture === 'single' ? 'retarget' : 'open')
             }}
             onKeyDown={(e) => onKeyDown(e, row, index)}
           >

@@ -1207,6 +1207,35 @@ export const gitDiff = {
     side: DiffSide,
     oldPath: string | null = null,
   ) => invoke<TabId>('tab_open_diff', { project, repo, path, side, oldPath }),
+
+  /**
+   * Point the diff the user is reading at another file — a *single* click on a changelist
+   * row while a diff is already open.
+   *
+   * > *"Only when diff is already opened one click should change current diff to selected
+   * > file."*
+   *
+   * Same arguments as {@link openTab} and a different operation, which is the whole point:
+   * `openTab` reuses a tab only when the repo **and** the path match, so routing a single
+   * click there gave a new tab per file and clicking down a 30-file changelist produced 30
+   * tabs. This retargets one tab instead.
+   *
+   * Which tab, and what happens to one the user meant to keep, is decided in Rust —
+   * `cmd::file::tab_retarget_diff` — because it is a workspace question and a second window
+   * asks it too. In short: the tab already showing this file wins, then the preview tab, then
+   * a new preview tab. Double-click (`openTab`) marks a tab kept, and a kept tab is never
+   * retargeted.
+   *
+   * Answers with the tab that ended up showing the file, and needs no `hydrate()` for the
+   * same reason `openTab` does not: the mutation broadcasts `cide://workspace-changed`.
+   */
+  retargetTab: (
+    project: ProjectId,
+    repo: RepoId,
+    path: string,
+    side: DiffSide,
+    oldPath: string | null = null,
+  ) => invoke<TabId>('tab_retarget_diff', { project, repo, path, side, oldPath }),
 }
 
 /* --------------------------------------------------------------------------------------

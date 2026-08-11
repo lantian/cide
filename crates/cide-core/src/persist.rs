@@ -1241,6 +1241,7 @@ mod tests {
                         request_id: "req-42".into(),
                     },
                 },
+                preview: false,
             },
             tree: PaneTree {
                 root: LayoutNode::Leaf { pane: pane.id },
