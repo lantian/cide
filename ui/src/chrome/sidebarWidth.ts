@@ -74,13 +74,23 @@ export const SIDEBAR_MAX = 640
 export const RAIL_WIDTH = 42
 
 /**
+ * The handle's own width: `--w-splitter`, the same token the pane dividers use.
+ *
+ * In the ceiling because the handle is a real flex item in the same row — it takes its 6px
+ * out of the workspace, not out of the panel. Leaving it out made [`MIN_WORKSPACE`] a
+ * promise the arithmetic broke by exactly this much, which is the kind of drift a comment
+ * hides rather than fixes. `check-sidebar.mjs` pins it to the token's value.
+ */
+export const SPLITTER_WIDTH = 6
+
+/**
  * What the workspace keeps for itself, whatever the sidebar asks for.
  *
  * 360px is about 45 columns of the 12px mono terminal — enough for a Claude session to be
  * read rather than merely present. It is the number that makes the ceiling dynamic: with
  * `MIN_WIDTH = 720` in `crates/cide-app/src/windows.rs`, the narrowest legal window leaves
- * `720 - 42 - 360 = 318px` for the sidebar, so the drag stops there rather than at 640 and
- * the workspace cannot be squeezed to nothing on any window the app allows.
+ * `720 - 42 - 6 - 360 = 312px` for the sidebar, so the drag stops there rather than at 640
+ * and the workspace cannot be squeezed to nothing on any window the app allows.
  */
 export const MIN_WORKSPACE = 360
 
@@ -109,7 +119,8 @@ export interface StoredSidebar {
  */
 export function sidebarCeiling(available?: number | undefined): number {
   if (available === undefined || !Number.isFinite(available)) return SIDEBAR_MAX
-  return Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, available - RAIL_WIDTH - MIN_WORKSPACE))
+  const room = available - RAIL_WIDTH - SPLITTER_WIDTH - MIN_WORKSPACE
+  return Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, room))
 }
 
 /**
@@ -154,8 +165,9 @@ export function withPanel(
  * defaults. Clamped on the way in as well as on the way out: `workspace.json` is a file a
  * user can edit, and Rust clamps a *patch* rather than re-clamping every load.
  *
- * Deliberately not clamped against the viewport here — that is [`applyWidths`]' caller's
- * job, and doing it here would quietly narrow the value that then gets written back.
+ * Deliberately not clamped against the viewport here — that is `painted()`'s job over in
+ * `SidebarSplitter.tsx`, and doing it here would quietly narrow the value that then gets
+ * written back to `workspace.json` on the next commit.
  */
 export function widthsFromSettings(sidebar: StoredSidebar | null | undefined): SidebarWidths {
   if (!sidebar) return { ...SIDEBAR_DEFAULT }

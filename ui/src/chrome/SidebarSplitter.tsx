@@ -61,6 +61,16 @@ const KEY_COMMIT_DELAY = 120
 /** What this window has stored for both panels. Not viewport-clamped; see [`painted`]. */
 let held: SidebarWidths = readCache()
 
+/**
+ * True between `pointerdown` and `pointerup`, at module scope rather than in a ref.
+ *
+ * The `resize` listener below is window-lifetime and has no component to ask, and repainting
+ * from `held` mid-gesture would snap the edge back to where the drag started. Rare — a window
+ * manager resizing the window while a button is held — but the failure is a visibly broken
+ * drag, and one boolean is cheaper than reasoning about how rare it is.
+ */
+let gesturing = false
+
 function readCache(): SidebarWidths {
   try {
     return decodeWidths(window.localStorage.getItem(SIDEBAR_CACHE_KEY))
@@ -73,7 +83,14 @@ function readCache(): SidebarWidths {
 
 function writeCache(widths: SidebarWidths): void {
   try {
-    window.localStorage.setItem(SIDEBAR_CACHE_KEY, encodeWidths(widths))
+    const line = encodeWidths(widths)
+    // Read-before-write, because the caller is the adopt effect and that runs on *every*
+    // `cide://workspace-changed` — opening a tab, moving a pane, flipping any setting. The
+    // widths are unchanged in all of those, and `setItem` in a WebKitGTK webview is a
+    // synchronous hop to a SQLite-backed store. Nothing here is per-keystroke, but a disk
+    // write per workspace mutation is a cost this feature has no reason to add.
+    if (window.localStorage.getItem(SIDEBAR_CACHE_KEY) === line) return
+    window.localStorage.setItem(SIDEBAR_CACHE_KEY, line)
   } catch {
     // Same: the width is already stored in `workspace.json`. Losing the cache costs one
     // frame of default width on the next launch, and nothing else.
@@ -123,7 +140,9 @@ paint(held)
  * `installThemeSync` there: this is window-lifetime, StrictMode's double-mount cannot install
  * it twice, and no unmount can tear it down while the window is still open.
  */
-window.addEventListener('resize', () => paint(held))
+window.addEventListener('resize', () => {
+  if (!gesturing) paint(held)
+})
 
 // --- the component --------------------------------------------------------------------
 
@@ -160,7 +179,11 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
   useLayoutEffect(() => {
     if (dragging.current || !stored) return
     held = widthsFromSettings(stored)
-    live.current = held[panel]
+    // The *painted* width, not the held one, for the same reason `pointerdown` takes it: on a
+    // window too narrow to honour the stored value the two differ, and the first arrow key
+    // would then step from a number that is not on screen — moving nothing, and committing
+    // the clamped value over the stored one for no gesture the user made.
+    live.current = painted(held)[panel]
     writeCache(held)
     paint(held)
   }, [stored, panel])
@@ -177,6 +200,7 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
   useEffect(
     () => () => {
       if (dragging.current) {
+        gesturing = false
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
       }
@@ -205,6 +229,7 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     (doCommit: boolean) => {
       if (!dragging.current) return
       dragging.current = false
+      gesturing = false
       setActive(false)
       document.body.style.cursor = ''
       document.body.style.userSelect = ''
@@ -223,6 +248,7 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     origin.current = { x: e.clientX, width: painted(held)[panel] }
     live.current = origin.current.width
     dragging.current = true
+    gesturing = true
     setActive(true)
     // On the body, not on this element: the pointer spends the drag over the panel and the
     // panes, and without these the cursor flickers to a text caret on every crossing.

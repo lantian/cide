@@ -34,7 +34,7 @@
 }
 
 /*
- * The visible track is 6px; a 6px pointer target is a poor one. This widens it to 12px
+ * The visible track is 6px; a 6px pointer target is a poor one. This widens it to 11px
  * without moving anything — the pseudo-element is out of flow, so it costs no layout and
  * cannot change the panel's width.
  *

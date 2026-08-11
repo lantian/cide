@@ -71,6 +71,7 @@ try {
     SIDEBAR_MAX,
     SIDEBAR_CACHE_KEY,
     RAIL_WIDTH,
+    SPLITTER_WIDTH,
     MIN_WORKSPACE,
     sidebarCeiling,
     clampSidebarWidth,
@@ -99,8 +100,10 @@ try {
   // `MIN_WIDTH` in `crates/cide-app/src/windows.rs` — the narrowest window the app allows.
   eq(
     sidebarCeiling(720),
-    720 - RAIL_WIDTH - MIN_WORKSPACE,
-    'at the narrowest legal window the ceiling is what is left after the rail and the workspace',
+    720 - RAIL_WIDTH - SPLITTER_WIDTH - MIN_WORKSPACE,
+    'at the narrowest legal window the ceiling is what is left after the rail, the handle and ' +
+      'the workspace — the handle is a flex item in the same row and its 6px come out of the ' +
+      'workspace, so leaving it out would under-deliver MIN_WORKSPACE by exactly that much',
   )
   ok(
     sidebarCeiling(720) > SIDEBAR_MIN,
@@ -215,9 +218,11 @@ try {
     RAIL_WIDTH,
     'RAIL_WIDTH is the activity rail --h-rail actually reserves, or the ceiling is wrong by its width',
   )
-  ok(
-    /--w-splitter:\s*\d+px/.test(tokens),
-    '--w-splitter exists: SidebarSplitter.module.css sizes the handle off it',
+  eq(
+    Number(/--w-splitter:\s*(\d+)px/.exec(tokens)?.[1] ?? null),
+    SPLITTER_WIDTH,
+    'SPLITTER_WIDTH is what --w-splitter actually reserves — SidebarSplitter.module.css sizes ' +
+      'the handle off the token, and the ceiling subtracts this number for it',
   )
 
   // The panels have to be reading the tokens, or writing them resizes nothing at all.
@@ -252,10 +257,11 @@ try {
   const windowsRs = readFileSync('../crates/cide-app/src/windows.rs', 'utf8')
   const minWidth = Number(/MIN_WIDTH:\s*f64\s*=\s*([\d.]+)/.exec(windowsRs)?.[1] ?? Number.NaN)
   ok(
-    Number.isFinite(minWidth) && minWidth - RAIL_WIDTH - MIN_WORKSPACE >= SIDEBAR_MIN,
+    Number.isFinite(minWidth)
+      && minWidth - RAIL_WIDTH - SPLITTER_WIDTH - MIN_WORKSPACE >= SIDEBAR_MIN,
     `the narrowest window the app allows (${minWidth}px) can still hold the rail, a ` +
-      `${SIDEBAR_MIN}px sidebar and a ${MIN_WORKSPACE}px workspace — otherwise the clamp has ` +
-      `no legal answer there`,
+      `${SIDEBAR_MIN}px sidebar, the handle and a ${MIN_WORKSPACE}px workspace — otherwise ` +
+      `the clamp has no legal answer there`,
   )
 
   if (failed > 0) {
