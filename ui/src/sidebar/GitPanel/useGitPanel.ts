@@ -79,7 +79,7 @@ import {
   type Row,
 } from './model'
 import { storyFromQuery, type GitStory } from './fixture'
-import type { ChangeEntry, ShelfRow, StatusView } from './types'
+import type { ChangeEntry, DiffOpenMode, ShelfRow, StatusView } from './types'
 
 /**
  * Whole-file selections for a list of paths.
@@ -173,8 +173,14 @@ export interface GitPanelActions {
   overwriteIndex: (repo: RepoId) => void
   /** Forget every held partial selection: the next commit takes whole files again. */
   clearPartials: () => void
-  /** A file row was double-clicked, or Enter was pressed on it. */
-  openDiff: (row: Row) => void
+  /**
+   * A file row was activated: double-clicked, Enter, or single-clicked with a diff already up.
+   *
+   * `mode` tells the two apart, because they are two different commands — see
+   * {@link DiffOpenMode}. It is optional so a caller who only ever means "open properly" (the
+   * keyboard, a host wiring the tree itself) says nothing and gets that.
+   */
+  openDiff: (row: Row, mode?: DiffOpenMode) => void
   /**
    * The toolbar's ◫ — the diff of the first ticked file.
    *
@@ -785,9 +791,21 @@ export function useGitPanel(
    * `onOpenDiff` is kept for a host that wants the payload itself — the layout audit, or a
    * future preview strip. When it is set it takes precedence and no tab is opened, so a host
    * cannot end up with both.
+   *
+   * # `mode`, and why the sidebar does not decide which tab
+   *
+   * `'open'` is the double-click (and Enter, and the toolbar's ◫): open a tab and keep it.
+   * `'retarget'` is a single click while a diff is already up — "change current diff to
+   * selected file" — and it re-points one tab instead of adding one.
+   *
+   * The choice between them comes from `gitTreeClick`, which already made it: the click rules
+   * decided `open` was true and *why*, and until now both reasons went to the same command.
+   * They are two commands because they are two operations; picking *which* tab a retarget
+   * lands on is deliberately not done here, because a tab is workspace state that a second
+   * window can also be looking at. See `cmd::file::tab_retarget_diff`.
    */
   const showDiff = useCallback(
-    (repo: RepoId, entry: ChangeEntry) => {
+    (repo: RepoId, entry: ChangeEntry, mode: DiffOpenMode = 'open') => {
       if (project === null) return
       // `combined` is HEAD→working tree, which is what a changelist row *is*, and the side a
       // commit selects from. In staging-area mode the index is the truth, so the staged side
@@ -817,18 +835,27 @@ export function useGitPanel(
         // `store/workspace` → `layout/paneHosts` → xterm, which touches `self` at import
         // time and breaks `check:render`'s server-side render of this very panel.
         await guarded('git diff', () =>
-          gitDiffApi.openTab(project, repo, entry.path, side, entry.origPath),
+          mode === 'retarget'
+            ? gitDiffApi.retargetTab(project, repo, entry.path, side, entry.origPath)
+            : gitDiffApi.openTab(project, repo, entry.path, side, entry.origPath),
         )
       })()
     },
     [project, guarded, note, stagingArea, onOpenDiff],
   )
 
-  /** Double-click, or Enter on a file row. */
+  /**
+   * A file row was activated. `mode` is the gesture's meaning, not the caller's preference —
+   * `ChangesTree` derives it from the same `RowAction` that decided to call this at all.
+   *
+   * Defaulting to `'open'` so a caller that predates the split — Enter, a host wiring the
+   * tree itself — keeps the behaviour it had. The conservative direction: `'open'` at worst
+   * costs a tab, `'retarget'` at worst replaces one the user was reading.
+   */
   const openDiff = useCallback(
-    (row: Row) => {
+    (row: Row, mode: DiffOpenMode = 'open') => {
       if (row.kind !== 'file' || row.entry === undefined) return
-      showDiff(row.repo, row.entry)
+      showDiff(row.repo, row.entry, mode)
     },
     [showDiff],
   )

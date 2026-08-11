@@ -234,6 +234,39 @@ pub enum TabKind {
     },
     Diff {
         spec: DiffSpec,
+        /// A **preview** tab: the one slot a single click in the git panel is allowed to
+        /// re-point at another file. VS Code's preview tab, and taken deliberately.
+        ///
+        /// > *"Only when diff is already opened one click should change current diff to
+        /// > selected file."*
+        ///
+        /// "Change *the* current diff" needs an answer to "which one", and the answer has to
+        /// survive several diff tabs being open at once. Two candidates lost. *The active
+        /// tab* means a diff the user opened on purpose and then walked away from gets
+        /// silently re-pointed the moment they come back to it — the click that was supposed
+        /// to be cheap eats the tab they were comparing against. *The most recently focused
+        /// one* needs a focus history that `Workspace` does not record and that nothing else
+        /// would ever read.
+        ///
+        /// So the slot is marked instead of inferred, and the mark is set by the gesture
+        /// that made the tab: a double-click (`tab_open_diff`) means "open this properly"
+        /// and produces `preview: false`; a single click (`tab_retarget_diff`) reuses the
+        /// preview tab, or creates one when there is none. That is the symmetry the panel
+        /// already had — double-click has meant "open properly" since the click rules landed
+        /// — and it makes the count the user complained about fall from thirty to one.
+        ///
+        /// Always `false` for a [`DiffOrigin::ClaudeMcp`] tab, and
+        /// `cide_core::workspace::retarget_diff` refuses one outright: that tab is holding an
+        /// agent turn open on a promise about *one* file, and re-pointing it would leave the
+        /// CLI blocked on a diff nobody can answer.
+        ///
+        /// `#[serde(default)]` because this variant is older than the field — unlike
+        /// [`DiffOrigin::Git`]'s fetch key, `TabKind::Diff` has been reachable through
+        /// Claude's `openDiff` since M7, so `workspace.json` files carrying the field-less
+        /// form exist. Defaulting to `false` reads them as what they are: tabs nobody
+        /// designated as scratch.
+        #[serde(default)]
+        preview: bool,
     },
     Settings {
         section: SettingsSection,
@@ -255,7 +288,7 @@ impl TabKind {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned()),
-            Self::Diff { spec } => spec.title.clone(),
+            Self::Diff { spec, .. } => spec.title.clone(),
             Self::Settings { .. } => "Settings".into(),
         }
     }
@@ -509,5 +542,37 @@ impl Direction {
     /// True when moving towards the second child of a split.
     pub fn is_forward(self) -> bool {
         matches!(self, Self::Right | Self::Down)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `workspace.json` written before the preview flag existed still loads.
+    ///
+    /// `TabKind::Diff` has been reachable through Claude's `openDiff` since M7, so saved
+    /// layouts carrying the field-less form are real — unlike [`DiffOrigin::Git`]'s fetch
+    /// key, which had no constructor outside tests when it arrived. Without the
+    /// `#[serde(default)]` this pins, `persist::load` would reject those workspaces and the
+    /// user would come back to a window that had forgotten its tabs.
+    #[test]
+    fn a_diff_tab_saved_before_the_preview_flag_still_loads() {
+        let json = r#"{
+            "kind": "diff",
+            "spec": {
+                "title": "main.rs \u2014 diff",
+                "oldPath": "src/main.rs",
+                "newPath": "src/main.rs",
+                "origin": { "kind": "claudeMcp", "requestId": "req-1" }
+            }
+        }"#;
+
+        let kind: TabKind = serde_json::from_str(json).expect("an older diff tab still parses");
+
+        assert!(
+            matches!(kind, TabKind::Diff { preview: false, .. }),
+            "a tab nobody designated as scratch is not one"
+        );
     }
 }

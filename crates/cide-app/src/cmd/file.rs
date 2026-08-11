@@ -101,7 +101,7 @@ fn git_diff_spec(repo: RepoId, path: &str, side: DiffSide, old_path: Option<Stri
 fn shows_git_diff(kind: &TabKind, repo: RepoId, path: &str) -> bool {
     matches!(
         kind,
-        TabKind::Diff { spec } if matches!(
+        TabKind::Diff { spec, .. } if matches!(
             &spec.origin,
             DiffOrigin::Git { repo: r, path: p, .. } if *r == repo && p == path
         )
@@ -126,6 +126,17 @@ fn shows_git_diff(kind: &TabKind, repo: RepoId, path: &str) -> bool {
 /// Nothing here touches the disk — it is a workspace mutation, like `tab_open_file` — so it
 /// is deliberately *not* `async`. The blocking git read happens in `git_diff_file`, which
 /// already goes through `spawn_blocking`.
+///
+/// # This is the *double-click* half
+///
+/// The tab it produces is `preview: false` — kept. Its partner is [`tab_retarget_diff`],
+/// which the panel calls for a single click on a changelist row while a diff is already up,
+/// and which re-points one scratch tab instead of adding another. Double-click has meant
+/// "open properly" since the click rules landed; this is what "properly" now buys you.
+///
+/// Finding the file already open **promotes** it, which is the same rule read backwards: a
+/// double-click on the file currently sitting in the preview slot means the user wants to
+/// keep it, so the next single click must leave it alone and start a new scratch tab.
 #[tauri::command(rename_all = "camelCase")]
 pub fn tab_open_diff(
     state: State<'_, WorkspaceState>,
@@ -135,35 +146,139 @@ pub fn tab_open_diff(
     side: DiffSide,
     old_path: Option<String>,
 ) -> Result<TabId> {
-    state.update(|ws| {
-        let existing = workspace::project(ws, project)?
-            .tabs
-            .iter()
-            .find(|t| shows_git_diff(&t.kind, repo, &path))
-            .map(|t| t.id);
-        if let Some(id) = existing {
-            workspace::activate_tab(ws, project, id)?;
-            return Ok(id);
-        }
+    state.update(|ws| open_git_diff(ws, project, repo, &path, side, old_path))
+}
 
-        let spec = git_diff_spec(repo, &path, side, old_path);
-        let title = spec.title.clone();
-        workspace::open_tab(
-            ws,
-            project,
-            TabKind::Diff { spec },
-            Pane {
-                id: PaneId::new(),
-                kind: PaneKind::Diff,
-                // Auxiliary like every pane a tab is opened with: a diff holds no
-                // conversation, so there is nothing about it that must not be closed.
-                role: PaneRole::Auxiliary,
-                // No process, ever. A diff is a document.
-                session: None,
-                title,
-            },
-        )
-    })
+/// The pane a diff tab opens with. One shape for both gestures, so a preview tab and a kept
+/// one differ in exactly the flag and nothing a renderer could accidentally key off.
+fn diff_pane(title: String) -> Pane {
+    Pane {
+        id: PaneId::new(),
+        kind: PaneKind::Diff,
+        // Auxiliary like every pane a tab is opened with: a diff holds no conversation, so
+        // there is nothing about it that must not be closed.
+        role: PaneRole::Auxiliary,
+        // No process, ever. A diff is a document.
+        session: None,
+        title,
+    }
+}
+
+/// [`tab_open_diff`] without Tauri.
+///
+/// Split out for the tests below, which is not a formality here: what this and
+/// [`retarget_git_diff`] do to a workspace *is* the fix for the thirty-tab report, and a
+/// policy that can only be exercised through a `State<WorkspaceState>` is a policy that gets
+/// tested at the level of `shows_git_diff` and nowhere else — which is exactly how a tab
+/// lookup that was individually correct produced thirty tabs in a row.
+fn open_git_diff(
+    ws: &mut cide_ipc::Workspace,
+    project: ProjectId,
+    repo: RepoId,
+    path: &str,
+    side: DiffSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    let existing = workspace::project(ws, project)?
+        .tabs
+        .iter()
+        .find(|t| shows_git_diff(&t.kind, repo, path))
+        .map(|t| t.id);
+    if let Some(id) = existing {
+        workspace::promote_diff(ws, project, id)?;
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let spec = git_diff_spec(repo, path, side, old_path);
+    let title = spec.title.clone();
+    workspace::open_tab(
+        ws,
+        project,
+        TabKind::Diff {
+            spec,
+            preview: false,
+        },
+        diff_pane(title),
+    )
+}
+
+/// Point the preview diff tab at this file — the *single-click* half.
+///
+/// > *"in git files tree when i do one click on element - we should select it, but not open
+/// > the diff. Only when diff is already opened one click should change current diff to
+/// > selected file."*
+///
+/// The click rule shipped and routed to [`tab_open_diff`], which reuses a tab only when the
+/// repo *and* the path match — so every other file got a new tab and clicking down a 30-file
+/// changelist produced 30 tabs, the exact opposite of what was asked for. "Change the current
+/// diff" is retargeting, a different operation from opening, and this is it.
+///
+/// Three outcomes, in this order, and the order is the whole design:
+///
+/// 1. **A tab already shows this file** — activate it, retarget nothing. Whether it is the
+///    preview tab or a kept one, a second copy of a diff the user can already see is never
+///    the answer, and stealing the scratch slot to duplicate an open tab would cost them the
+///    file that was in it for no gain.
+/// 2. **A preview tab exists** — retarget it. One tab, however far down the list they click.
+/// 3. **Neither** — open one, marked `preview: true`. Reached when every diff tab on screen
+///    was opened by double-click, i.e. deliberately kept; the honest answer there is a new
+///    scratch tab rather than eating one the user asked for. It costs exactly one extra tab,
+///    once, and every click after it lands in that tab. This is VS Code's rule for a
+///    single-click in the explorer when the only open editors are permanent, and it is the
+///    reason the flag exists at all — see [`cide_ipc::TabKind::Diff`].
+///
+/// Not `async`, for the same reason as [`tab_open_diff`]: no disk is touched here. The pane
+/// notices its tab's `spec` changed and refetches through `git_diff_file`, which is where the
+/// blocking read lives and is already on `spawn_blocking`.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_retarget_diff(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    side: DiffSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    state.update(|ws| retarget_git_diff(ws, project, repo, &path, side, old_path))
+}
+
+/// [`tab_retarget_diff`] without Tauri. See [`open_git_diff`] for why it is split out.
+fn retarget_git_diff(
+    ws: &mut cide_ipc::Workspace,
+    project: ProjectId,
+    repo: RepoId,
+    path: &str,
+    side: DiffSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    let showing = workspace::project(ws, project)?
+        .tabs
+        .iter()
+        .find(|t| shows_git_diff(&t.kind, repo, path))
+        .map(|t| t.id);
+    if let Some(id) = showing {
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let spec = git_diff_spec(repo, path, side, old_path);
+    if let Some(id) = workspace::preview_diff_tab(ws, project)? {
+        workspace::retarget_diff(ws, project, id, spec)?;
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let title = spec.title.clone();
+    workspace::open_tab(
+        ws,
+        project,
+        TabKind::Diff {
+            spec,
+            preview: true,
+        },
+        diff_pane(title),
+    )
 }
 
 /// Record whether a file tab has unsaved edits.
@@ -357,6 +472,7 @@ mod tests {
         let other = RepoId::new();
         let tab = TabKind::Diff {
             spec: git_diff_spec(repo, "src/main.rs", DiffSide::Combined, None),
+            preview: false,
         };
 
         assert!(shows_git_diff(&tab, repo, "src/main.rs"));
@@ -374,7 +490,185 @@ mod tests {
                     request_id: "r1".into(),
                 },
             },
+            preview: false,
         };
         assert!(!shows_git_diff(&claude, repo, "src/main.rs"));
+    }
+
+    /// A workspace with one project and nothing but its pinned console.
+    fn bare() -> (cide_ipc::Workspace, ProjectId) {
+        let mut ws = cide_ipc::Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec![PathBuf::from("/repo")], None).expect("opens");
+        (ws, project)
+    }
+
+    /// Every git diff tab in strip order, as (path, preview).
+    fn diff_tabs(ws: &cide_ipc::Workspace, project: ProjectId) -> Vec<(String, bool)> {
+        workspace::project(ws, project)
+            .expect("exists")
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Diff { spec, preview } => match &spec.origin {
+                    DiffOrigin::Git { path, .. } => Some((path.clone(), *preview)),
+                    DiffOrigin::ClaudeMcp { .. } => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bug report, as a loop, because that is how the user hit it.
+    ///
+    /// > *"in git files tree when i do one click on element - we should select it, but not
+    /// > open the diff. Only when diff is already opened one click should change current
+    /// > diff to selected file."*
+    ///
+    /// Thirty single clicks down a changelist used to be thirty calls to `tab_open_diff`,
+    /// whose reuse is keyed on `(repo, path)` — so every row after the first missed and
+    /// opened a tab. One tab now, showing the last file clicked.
+    #[test]
+    fn thirty_single_clicks_leave_one_diff_tab() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+        let before = workspace::project(&ws, project).expect("exists").tabs.len();
+
+        for i in 0..30 {
+            retarget_git_diff(
+                &mut ws,
+                project,
+                repo,
+                &format!("src/file{i}.rs"),
+                DiffSide::Combined,
+                None,
+            )
+            .expect("retargets");
+        }
+
+        assert_eq!(
+            diff_tabs(&ws, project),
+            vec![("src/file29.rs".into(), true)]
+        );
+        assert_eq!(
+            workspace::project(&ws, project).expect("exists").tabs.len(),
+            before + 1,
+            "thirty clicks may add one tab, and only on the first of them"
+        );
+    }
+
+    /// The same loop with a tab the user opened on purpose already up.
+    ///
+    /// The kept tab is untouched — that is what double-click bought — and the thirty clicks
+    /// still share a single scratch tab between them. Two tabs, not thirty-one.
+    #[test]
+    fn a_double_clicked_tab_survives_thirty_single_clicks() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+        open_git_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/keep.rs",
+            DiffSide::Combined,
+            None,
+        )
+        .expect("opens");
+
+        for i in 0..30 {
+            retarget_git_diff(
+                &mut ws,
+                project,
+                repo,
+                &format!("src/file{i}.rs"),
+                DiffSide::Combined,
+                None,
+            )
+            .expect("retargets");
+        }
+
+        assert_eq!(
+            diff_tabs(&ws, project),
+            vec![
+                ("src/keep.rs".into(), false),
+                ("src/file29.rs".into(), true),
+            ]
+        );
+    }
+
+    /// Clicking a file that is already on screen activates its tab instead of dragging the
+    /// scratch slot onto a duplicate — which would cost the user whatever was in it.
+    #[test]
+    fn clicking_a_file_that_is_already_open_activates_it() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+        let kept = open_git_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/keep.rs",
+            DiffSide::Combined,
+            None,
+        )
+        .expect("opens");
+        let preview =
+            retarget_git_diff(&mut ws, project, repo, "src/a.rs", DiffSide::Combined, None)
+                .expect("retargets");
+
+        let again = retarget_git_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/keep.rs",
+            DiffSide::Combined,
+            None,
+        )
+        .expect("retargets");
+
+        assert_eq!(again, kept);
+        assert_eq!(
+            workspace::project(&ws, project).expect("exists").active_tab,
+            kept
+        );
+        assert_eq!(
+            diff_tabs(&ws, project),
+            vec![("src/keep.rs".into(), false), ("src/a.rs".into(), true)],
+            "the preview tab still holds what it held"
+        );
+        assert_eq!(
+            workspace::preview_diff_tab(&ws, project).expect("exists"),
+            Some(preview)
+        );
+    }
+
+    /// Double-clicking the file in the scratch slot keeps it there — VS Code's promotion,
+    /// and the reason the *next* single click has to start a new preview tab rather than
+    /// eating this one.
+    #[test]
+    fn double_clicking_the_preview_promotes_it() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+        let preview =
+            retarget_git_diff(&mut ws, project, repo, "src/a.rs", DiffSide::Combined, None)
+                .expect("retargets");
+
+        let promoted = open_git_diff(&mut ws, project, repo, "src/a.rs", DiffSide::Combined, None)
+            .expect("opens");
+
+        assert_eq!(promoted, preview, "no second tab over the same file");
+        assert_eq!(diff_tabs(&ws, project), vec![("src/a.rs".into(), false)]);
+        assert_eq!(
+            workspace::preview_diff_tab(&ws, project).expect("exists"),
+            None
+        );
+
+        // And now the slot is free again, so the next click opens one rather than stealing
+        // the tab that was just promoted.
+        retarget_git_diff(&mut ws, project, repo, "src/b.rs", DiffSide::Combined, None)
+            .expect("retargets");
+        assert_eq!(
+            diff_tabs(&ws, project),
+            vec![("src/a.rs".into(), false), ("src/b.rs".into(), true)]
+        );
     }
 }

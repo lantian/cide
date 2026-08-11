@@ -113,6 +113,24 @@ export interface ShelfRow {
   entry: ShelfEntry
 }
 
+/**
+ * What activating a file row means — the two operations a `RowAction` with `open` set can be.
+ *
+ * > *"Only when diff is already opened one click should change current diff to selected
+ * > file."*
+ *
+ * `gitTreeClick` decides *whether* a gesture opens; this says *how*, and the two were the
+ * same thing until a single click down a 30-file changelist produced 30 tabs. A double-click
+ * (and Enter, and the toolbar's ◫) is `'open'`: a tab of its own, kept. A single click while
+ * a diff is already up is `'retarget'`: the diff the user is reading follows the pointer, and
+ * no tab is added.
+ *
+ * A string union rather than a boolean `retarget` flag, because `showDiff(repo, entry, true)`
+ * at a call site says nothing about which way round the argument goes and the wrong answer is
+ * silent — it either loses the tab the user was reading or gives them another one.
+ */
+export type DiffOpenMode = 'open' | 'retarget'
+
 /*
  * Nothing in this module has a runtime value, deliberately.
  *

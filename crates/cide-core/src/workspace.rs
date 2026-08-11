@@ -434,6 +434,122 @@ pub fn activate_tab(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Resul
     Ok(())
 }
 
+/// The project's preview diff tab, if it has one.
+///
+/// At most one exists per project by construction: [`retarget_diff`] is the only thing that
+/// ever sets the flag and it reuses the tab this finds. `find_map` over the strip in order
+/// anyway rather than `debug_assert`ing uniqueness — a `workspace.json` hand-edited or
+/// written by a future version is not a reason to panic, and taking the leftmost is a
+/// defined answer.
+pub fn preview_diff_tab(ws: &Workspace, project: ProjectId) -> Result<Option<TabId>> {
+    Ok(self::project(ws, project)?
+        .tabs
+        .iter()
+        .find_map(|t| matches!(&t.kind, TabKind::Diff { preview: true, .. }).then_some(t.id)))
+}
+
+/// Point an existing diff tab at a different diff — the mutation behind "change current diff
+/// to selected file".
+///
+/// # Why this is not `close_tab` + `open_tab`
+///
+/// Closing and re-opening produces a *new* [`TabId`] at the end of the strip, so the row the
+/// user is clicking down walks rightwards under their pointer, any pane detached from that
+/// tab is dropped by [`close_tab`]'s window prune, and the split the user made inside it is
+/// gone. Retargeting is one field: the tab, its position, its id and its pane tree all stay,
+/// and only what the panes are *about* changes.
+///
+/// # Three refusals
+///
+/// * Not a diff tab — [`CoreError::Invariant`]. There is no sensible reading of "retarget a
+///   terminal".
+/// * A [`DiffOrigin::ClaudeMcp`] tab — [`CoreError::Invariant`]. That tab is the visible half
+///   of a blocked agent turn: `cide-ide-mcp`'s broker is holding a future that resolves when
+///   the user answers *this* diff, and re-pointing it at a git file would leave the CLI
+///   waiting on a question that is no longer on screen.
+/// * A tab holding unsaved work — [`CoreError::UnsavedChanges`]. Asked through
+///   [`unsaved_in_tab`], the same query [`close_tab`] uses, and for the same reason: a guard
+///   that decides "unsaved" its own way is a guard that will one day disagree with the dialog
+///   it triggers. Today it can never fire — only a [`TabKind::File`] can be dirty and the git
+///   diff pane is a viewer with staging ticks, not an editor — but retargeting *is* a
+///   discard, so it asks rather than assuming. (The ticks themselves are not workspace state:
+///   they live in the pane and in `partialStore.ts`, keyed by repo and path, so they are
+///   re-found rather than lost when the tab comes back to that file.)
+///
+/// Renaming the panes is part of the operation, not a courtesy. A diff pane's `title` is
+/// what the pane header draws, and it was written at open time from the old spec; leaving it
+/// would put "old.rs — diff" above the diff of `new.rs`. Only [`PaneKind::Diff`] panes are
+/// touched, so a split holding something else keeps its own label.
+pub fn retarget_diff(
+    ws: &mut Workspace,
+    project: ProjectId,
+    tab: TabId,
+    spec: DiffSpec,
+) -> Result<()> {
+    // Every check runs before the first mutation, so a refusal leaves `rev` untouched and a
+    // snapshot the caller holds stays valid.
+    let existing = self::tab(ws, project, tab)?;
+    let TabKind::Diff { spec: current, .. } = &existing.kind else {
+        return Err(CoreError::Invariant(format!(
+            "tab {tab} is not a diff tab and cannot be retargeted"
+        )));
+    };
+    if matches!(current.origin, DiffOrigin::ClaudeMcp { .. }) {
+        return Err(CoreError::Invariant(format!(
+            "tab {tab} answers a Claude diff request and cannot be retargeted"
+        )));
+    }
+    if let Some(unsaved) = unsaved_in_tab(ws, project, tab)? {
+        return Err(CoreError::UnsavedChanges {
+            tabs: vec![unsaved],
+        });
+    }
+    // Clicking the file already on screen is the common case at the top and bottom of a
+    // changelist walk. Bumping for it would broadcast a snapshot per click that changed
+    // nothing — the same reason `tab_set_dirty` guards its no-op.
+    if *current == spec {
+        return Ok(());
+    }
+
+    let title = spec.title.clone();
+    let t = tab_mut(ws, project, tab)?;
+    let TabKind::Diff { spec: slot, .. } = &mut t.kind else {
+        unreachable!("checked above under an immutable borrow")
+    };
+    *slot = spec;
+    for pane in t.tree.panes.values_mut() {
+        if pane.kind == PaneKind::Diff {
+            pane.title = title.clone();
+        }
+    }
+    bump(ws);
+    Ok(())
+}
+
+/// Promote a preview diff tab to a kept one — the double-click half of the pair.
+///
+/// Idempotent, and silent on a tab that was never a preview: `tab_open_diff` calls it on
+/// whatever tab it found for the file, and "the user double-clicked a tab that was already
+/// permanent" is not an error, it is the ordinary case.
+///
+/// Named for what it means rather than `set_preview(false)`: there is no gesture in the
+/// product that turns a kept tab back into a scratch one, so the reverse direction would be
+/// an API with no caller and one plausible misuse.
+pub fn promote_diff(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Result<()> {
+    let t = tab_mut(ws, project, tab)?;
+    let TabKind::Diff { preview, .. } = &mut t.kind else {
+        return Err(CoreError::Invariant(format!(
+            "tab {tab} is not a diff tab and has no preview state"
+        )));
+    };
+    if !*preview {
+        return Ok(());
+    }
+    *preview = false;
+    bump(ws);
+    Ok(())
+}
+
 /// Move a tab within a project's tab strip.
 ///
 /// Index 0 is the pinned console: moving *to* or *from* it is [`CoreError::TabPinned`].
@@ -1191,6 +1307,7 @@ fn build_demo() -> Result<Workspace> {
                     side: cide_ipc::git::DiffSide::Combined,
                 },
             },
+            preview: false,
         },
         demo_pane(PaneKind::Diff, "main.rs — diff", false),
     )?;
@@ -1552,6 +1669,7 @@ mod tests {
                         side: cide_ipc::git::DiffSide::Combined,
                     },
                 },
+                preview: false,
             },
             demo_pane(PaneKind::Diff, "main.rs — diff", false),
         )
@@ -2764,5 +2882,213 @@ mod tests {
         tab_mut(&mut ws, id, full).expect("exists").tree = stolen;
 
         assert!(matches!(validate(&ws), Err(CoreError::Invariant(_))));
+    }
+
+    /// A git diff tab over one repo-relative path, kept or preview.
+    fn open_diff(
+        ws: &mut Workspace,
+        project: ProjectId,
+        path: &str,
+        preview: bool,
+    ) -> (TabId, DiffSpec) {
+        let spec = git_spec(path);
+        let id = open_tab(
+            ws,
+            project,
+            TabKind::Diff {
+                spec: spec.clone(),
+                preview,
+            },
+            demo_pane(PaneKind::Diff, &spec.title, false),
+        )
+        .expect("a diff tab opens");
+        (id, spec)
+    }
+
+    /// The shape `cmd::file::git_diff_spec` produces, without depending on the app crate.
+    fn git_spec(path: &str) -> DiffSpec {
+        DiffSpec {
+            title: format!("{path} — diff"),
+            old_path: PathBuf::from(path),
+            new_path: PathBuf::from(path),
+            origin: DiffOrigin::Git {
+                repo: cide_ipc::RepoId::new(),
+                path: path.to_owned(),
+                side: cide_ipc::git::DiffSide::Combined,
+            },
+        }
+    }
+
+    fn kind_of(ws: &Workspace, project: ProjectId, id: TabId) -> TabKind {
+        tab(ws, project, id).expect("exists").kind.clone()
+    }
+
+    /// The operation the user asked for, at the level that owns it: the tab changes, the
+    /// strip does not grow.
+    #[test]
+    fn retargeting_a_diff_tab_changes_its_spec_and_creates_no_tab() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (id, _) = open_diff(&mut ws, project, "src/a.rs", true);
+        let before = super::project(&ws, project).expect("exists").tabs.len();
+        let rev = ws.rev;
+
+        let wanted = git_spec("src/b.rs");
+        retarget_diff(&mut ws, project, id, wanted.clone()).expect("retargets");
+
+        assert_eq!(
+            super::project(&ws, project).expect("exists").tabs.len(),
+            before,
+            "no new tab"
+        );
+        assert_eq!(
+            kind_of(&ws, project, id),
+            TabKind::Diff {
+                spec: wanted,
+                preview: true,
+            },
+            "same tab, pointed somewhere else, still the scratch slot"
+        );
+        assert!(
+            ws.rev > rev,
+            "a retarget is news; every window has to redraw"
+        );
+    }
+
+    /// The pane header is written from the spec at open time, so a retarget that skipped it
+    /// would leave "a.rs — diff" over the diff of `b.rs`.
+    #[test]
+    fn retargeting_renames_the_diff_panes_and_leaves_the_tree_alone() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (id, _) = open_diff(&mut ws, project, "src/a.rs", true);
+        let tree_before = tab(&ws, project, id).expect("exists").tree.clone();
+
+        retarget_diff(&mut ws, project, id, git_spec("src/b.rs")).expect("retargets");
+
+        let t = tab(&ws, project, id).expect("exists");
+        assert_eq!(t.kind.title(), "src/b.rs — diff");
+        assert!(
+            t.tree
+                .panes
+                .values()
+                .all(|p| p.kind != PaneKind::Diff || p.title == "src/b.rs — diff")
+        );
+        assert_eq!(
+            t.tree.panes.keys().collect::<Vec<_>>(),
+            tree_before.panes.keys().collect::<Vec<_>>(),
+            "the pane ids are the addresses every later command uses; they do not move"
+        );
+    }
+
+    /// Clicking the row whose diff is already up must not cost a broadcast: the panel calls
+    /// this on the first and last click of every walk down a changelist.
+    #[test]
+    fn retargeting_a_tab_onto_what_it_already_shows_is_not_news() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (id, spec) = open_diff(&mut ws, project, "src/a.rs", true);
+        let rev = ws.rev;
+
+        retarget_diff(&mut ws, project, id, spec).expect("retargets");
+
+        assert_eq!(ws.rev, rev);
+    }
+
+    /// A Claude diff tab is the visible half of a blocked agent turn. Re-pointing it would
+    /// leave the CLI waiting on a question nobody can see any more.
+    #[test]
+    fn a_claude_diff_tab_refuses_to_be_retargeted() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let spec = DiffSpec {
+            title: "main.rs".into(),
+            old_path: PathBuf::from("/repo/src/main.rs"),
+            new_path: PathBuf::from("/repo/src/main.rs"),
+            origin: DiffOrigin::ClaudeMcp {
+                request_id: "req-1".into(),
+            },
+        };
+        let id = open_tab(
+            &mut ws,
+            project,
+            TabKind::Diff {
+                spec: spec.clone(),
+                preview: false,
+            },
+            demo_pane(PaneKind::Diff, "main.rs", false),
+        )
+        .expect("opens");
+        let rev = ws.rev;
+
+        let refused = retarget_diff(&mut ws, project, id, git_spec("src/other.rs"));
+
+        assert!(matches!(refused, Err(CoreError::Invariant(_))));
+        assert_eq!(
+            kind_of(&ws, project, id),
+            TabKind::Diff {
+                spec,
+                preview: false
+            }
+        );
+        assert_eq!(ws.rev, rev, "a refusal leaves the revision alone");
+    }
+
+    /// There is nothing to retarget about a terminal.
+    #[test]
+    fn a_tab_that_is_not_a_diff_refuses_both_halves() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let file = open_file(&mut ws, project, "/repo/src/main.rs", false);
+
+        assert!(matches!(
+            retarget_diff(&mut ws, project, file, git_spec("src/a.rs")),
+            Err(CoreError::Invariant(_))
+        ));
+        assert!(matches!(
+            promote_diff(&mut ws, project, file),
+            Err(CoreError::Invariant(_))
+        ));
+    }
+
+    /// A diff tab cannot be dirty today — only a `File` tab can — but retargeting *is* a
+    /// discard, so it asks the same question `close_tab` asks rather than assuming the
+    /// answer. Pinned here so the guard survives a diff pane that one day holds an edit.
+    #[test]
+    fn retargeting_asks_the_same_unsaved_question_close_tab_asks() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (id, _) = open_diff(&mut ws, project, "src/a.rs", true);
+
+        assert!(unsaved_in_tab(&ws, project, id).expect("exists").is_none());
+        retarget_diff(&mut ws, project, id, git_spec("src/b.rs")).expect("nothing to lose");
+    }
+
+    /// At most one scratch slot, and promotion empties it.
+    #[test]
+    fn the_preview_slot_holds_one_tab_and_promotion_frees_it() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        assert_eq!(preview_diff_tab(&ws, project).expect("exists"), None);
+
+        let (kept, _) = open_diff(&mut ws, project, "src/keep.rs", false);
+        assert_eq!(preview_diff_tab(&ws, project).expect("exists"), None);
+
+        let (preview, _) = open_diff(&mut ws, project, "src/scratch.rs", true);
+        assert_eq!(
+            preview_diff_tab(&ws, project).expect("exists"),
+            Some(preview)
+        );
+
+        let rev = ws.rev;
+        promote_diff(&mut ws, project, kept).expect("already kept");
+        assert_eq!(
+            ws.rev, rev,
+            "promoting a kept tab is a no-op, not a broadcast"
+        );
+
+        promote_diff(&mut ws, project, preview).expect("promotes");
+        assert_eq!(preview_diff_tab(&ws, project).expect("exists"), None);
+        assert!(ws.rev > rev);
     }
 }
