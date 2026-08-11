@@ -149,22 +149,35 @@ function resetCache(): void {
   generation += 1
 }
 
+/**
+ * Every field of `TreeRow`, named where the compiler checks the list.
+ *
+ * `sameRows` below is what decides that a burst moved nothing and that the tree therefore
+ * must not re-render. A hand-written chain of `a.path === b.path && …` was the first version
+ * and it is the fragile one: `TreeRow` is generated from Rust, so a field added there is
+ * simply absent from the chain, `sameRows` answers "identical" for two rows that differ, and
+ * the tree keeps drawing the old value with no re-render left to correct it — silent
+ * staleness, which is worse than the flicker this file is about. `Record<keyof TreeRow, true>`
+ * turns that into a compile error the moment `pnpm codegen` adds the field.
+ */
+const ROW_FIELDS: Readonly<Record<keyof TreeRow, true>> = {
+  path: true,
+  name: true,
+  depth: true,
+  kind: true,
+  expanded: true,
+  hasChildren: true,
+  symlink: true,
+  root: true,
+}
+const ROW_KEYS = Object.keys(ROW_FIELDS) as Array<keyof TreeRow>
+
 /** Whether two windows of rows describe the same thing. Field-wise: `TreeRow` is flat. */
 function sameRows(a: readonly TreeRow[] | undefined, b: readonly TreeRow[]): boolean {
   if (a === undefined || a.length !== b.length) return false
   return a.every((row, i) => {
     const other = b[i]
-    return (
-      other !== undefined &&
-      row.path === other.path &&
-      row.name === other.name &&
-      row.depth === other.depth &&
-      row.kind === other.kind &&
-      row.expanded === other.expanded &&
-      row.hasChildren === other.hasChildren &&
-      row.symlink === other.symlink &&
-      row.root === other.root
-    )
+    return other !== undefined && ROW_KEYS.every((key) => row[key] === other[key])
   })
 }
 

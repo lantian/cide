@@ -94,8 +94,11 @@ export function Explorer({ project, onOpenFile }: ExplorerProps) {
    *
    * Every status for this project triggers a re-read, not only the one with
    * `indexing: false`. The event is emitted at the start of a walk, at its end, and when the
-   * watcher degrades to polling — three events per project, not a stream — and treating the
-   * start as an invalidation is right anyway: a re-index throws the old flattening away.
+   * watcher degrades to polling — three events per project, not a stream — so re-reading on
+   * all three costs nothing. Note that `refresh` is a *revalidation*, not the cache drop it
+   * used to be (see `treeStore`'s header): the walk starting no longer blanks the tree, it
+   * re-reads the count and the visible rows and writes only if they moved. A caller that
+   * genuinely needs the cache thrown away — new roots — wants `attach`, not this.
    */
   useEffect(() => {
     if (project === null) return

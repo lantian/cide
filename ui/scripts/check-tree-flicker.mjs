@@ -22,7 +22,7 @@
  * Run: `node scripts/check-tree-flicker.mjs` (from `ui/`)
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 // Under `node_modules/.cache` rather than the system temp dir: the SSR bundle keeps zustand
@@ -125,6 +125,34 @@ try {
     'and scrolling back to it shows the old row rather than a placeholder while it revalidates',
   )
   eq(d.offscreen.revalidatedName, 'renamed.rs', 'which then becomes the new one')
+
+  // --- the two things the driver cannot see --------------------------------------------------
+  //
+  // Everything above drives the *store*, and reverting `treeStore.ts` alone fails 11 of those
+  // assertions. `FileTree.tsx` is not in that number: there is no DOM here, so the driver
+  // models React's bailout rather than observing it, and both of the component's changes could
+  // be reverted with every assertion above still green. Read as source instead, which is ugly
+  // but is the difference between a claim that can fail and one that cannot.
+  const tree = readFileSync('src/sidebar/FileTree.tsx', 'utf8')
+
+  // `gitStatusStore` installs a fresh `statuses` object on every refresh, equal or not, and it
+  // refreshes on the same burst the store now answers with no write. A plain identity selector
+  // re-renders the whole tree for it and puts the flicker straight back.
+  ok(
+    /useGitStatus\(\s*useShallow\(/.test(tree),
+    'FileTree must select the status map with useShallow, or the burst re-renders anyway',
+  )
+
+  // A virtualized list's children are positions. Keying by path renames every key below an
+  // insertion, so a one-row change unmounts and remounts the visible window.
+  ok(
+    !/key=\{`?(?:pending-\$\{item\.index\}|row\.path)`?\}/.test(tree),
+    'FileTree rows must not be keyed by row.path or by a pending-<index> string',
+  )
+  ok(
+    (tree.match(/key=\{item\.key\}/g) ?? []).length === 2,
+    'both the row and its placeholder must be keyed by the virtualizer key',
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }
