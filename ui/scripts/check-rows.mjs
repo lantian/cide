@@ -196,13 +196,26 @@ try {
   // covered on the Rust side. Making the props required on the interfaces would be a stronger
   // guarantee and was rejected — the fixtures above deliberately omit them to exercise the
   // withheld path, and that coverage is worth more than the compile-time check.
+  // The add-TILE gesture is still a pane gesture, so `App.tsx` still supplies it.
   const app = readFileSync('src/App.tsx', 'utf8')
-  for (const prop of ['onAddRow', 'onAddTile']) {
-    ok(
-      new RegExp(`\\b${prop}=\\{`).test(app),
-      `App.tsx passes \`${prop}\` — without it the control renders nowhere in the real app`,
-    )
-  }
+  ok(
+    /\bonAddTile=\{/.test(app),
+    'App.tsx passes `onAddTile` — without it the per-pane control renders nowhere',
+  )
+
+  // The add-ROW gesture moved into the header, because two sets of buttons for one gesture is
+  // what the user reported. So the assertion moves with it rather than being deleted: the
+  // header must MOUNT `RowControls`, and `App.tsx` must NOT re-supply `onAddRow` to the pane
+  // tree, or both sets come back — which is exactly the regression this pair now pins.
+  //
+  // `RowControls` drives the workspace store itself when no handler is passed, so mounting it
+  // is the whole of the wiring; there is no prop to check on the other side.
+  const header = readFileSync('src/chrome/AppHeader.tsx', 'utf8')
+  ok(/<RowControls\b/.test(header), 'the header mounts `RowControls`')
+  ok(
+    !/\bonAddRow=\{/.test(app),
+    'App.tsx no longer feeds `onAddRow` to the pane tree — it would draw a second strip',
+  )
 
   if (failed === 0) console.log('rows layout: ok')
   else console.error(`\n${failed} failure(s)`)

@@ -329,7 +329,7 @@ export function PaneTitleBar({
         // Same treatment. The row strip at the foot of the tab is the gesture that always
         // works, because it belongs to the tree rather than to any one pane.
         run: onAddRow,
-        disabledReason: onAddRow ? undefined : 'Use the + row strip below the tab',
+        disabledReason: onAddRow ? undefined : 'Use the row buttons in the header',
       },
       { kind: 'separator' },
       {

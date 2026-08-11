@@ -173,11 +173,6 @@ export function App() {
   const maximizePane = useWorkspace((st) => st.maximizePane)
   const contextMenuOpen = useContextMenuOpen()
   const setRatio = useWorkspace((st) => st.setRatio)
-  // Adding a ROW, as distinct from adding a tile to one. `pane_split` routes Col to `add_row`
-  // in the command layer, so this and `onAddTile` below are the same domain gesture family —
-  // but a row is anchored on the tab's spine rather than on a pane, which is why it has its
-  // own store action and its own control outside any pane's chrome.
-  const addRow = useWorkspace((st) => st.addRow)
   const bindSession = useWorkspace((st) => st.bindSession)
   const newClaudeTab = useWorkspace((st) => st.newClaudeTab)
   const detachPane = useWorkspace((st) => st.detachPane)
@@ -703,11 +698,6 @@ export function App() {
                     onFocus={(id) => void focusPane(activeProject.id, tab.id, id)}
                     onRatioCommit={(split, ratio) =>
                       void setRatio(activeProject.id, tab.id, split, ratio)
-                    }
-                    // Anchored on the focused pane, so a new row lands under the row the user
-                    // is working in rather than always at the bottom of the tab.
-                    onAddRow={(intent) =>
-                      void addRow(activeProject.id, tab.id, tab.tree.focused, 'after', intent)
                     }
                     renderPane={(paneNode, index) => (
                       <PaneFrame
