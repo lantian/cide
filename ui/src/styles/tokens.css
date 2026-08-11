@@ -199,6 +199,38 @@
   --font-ui: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
 
+  /*
+   * The one bold the UI has.
+   *
+   * `fonts.css` ships IBM Plex Sans at 400/500/600 because the mock's UI scale stops at 600.
+   * Anything asking for 700 therefore gets a *synthesised* bold smeared out of the 600 face.
+   * This token is what a rule uses instead of writing `bold`, so there is one place to look
+   * the day a real 700 is bundled.
+   */
+  --w-bold: 600;
+
+  /*
+   * The mono type scale, shared by every surface that shows code.
+   *
+   * `editor/EditorSurface.module.css` states these two literally on `.cm-scroller`, and
+   * `terminal/xterm.ts` reads them off this block. They are a token rather than two copies of
+   * `12.5px` because the terminal and the editor sit side by side in the same tab: a half-pixel
+   * difference between them reads as two different fonts, which is what shipped — the terminal
+   * was at 12px while the editor was at the mock's 12.5px.
+   *
+   * `--lh-code` is what CSS uses. `--term-line-height` is the same leading expressed the only
+   * way xterm.js accepts it: its `lineHeight` option is a **multiplier on the measured glyph
+   * box**, not on the font size. JetBrains Mono's hhea metrics are 1020/-300 over a 1000 upem
+   * (and OS/2 sets USE_TYPO_METRICS), so the box is 1.32em, and xterm computes
+   * `cell = floor(ceil(fontSize × 1.32 × dpr) × lineHeight)`. At 12.5px and dpr 1 that is
+   * `floor(ceil(16.5) × 1.27) = floor(21.59) = 21` — the editor's leading exactly. Change
+   * `--fs-code` and this number has to be re-derived; it cannot be `calc()`ed, because the
+   * `ceil` happens inside xterm against a measurement no stylesheet can see.
+   */
+  --fs-code: 12.5px;
+  --lh-code: 21px;
+  --term-line-height: 1.27;
+
   /* Fixed chrome heights from the mock. */
   --h-header: 34px;
   --h-rail: 42px;
@@ -247,10 +279,58 @@ body {
   color: var(--text);
   font-family: var(--font-ui);
   font-size: 13px;
-  -webkit-font-smoothing: antialiased;
+  /*
+   * Never fake a face this app did not bundle.
+   *
+   * `-webkit-font-smoothing: antialiased` used to sit here and did **nothing**: WebKit
+   * implements that property against CoreGraphics on macOS only, and this app runs on
+   * WebKitGTK, where rasterisation comes from FreeType and fontconfig and the declaration is
+   * dropped. It was removed rather than kept "just in case" — a line that cannot have an
+   * effect is a line the next person spends an afternoon on.
+   *
+   * `font-synthesis: none` replaces it because that one *does* work here, and it is the fix
+   * for the actual complaint. With it, a weight or style with no bundled face falls back to
+   * the nearest real face instead of being algorithmically emboldened or sheared. The
+   * alternative that lost was leaving synthesis on and bundling every weight and style the
+   * app might one day ask for: that is a guess about the future paid for in bundle size,
+   * whereas this is a guarantee that nothing on screen is a smear.
+   *
+   * `text-rendering: optimizeLegibility` was considered and rejected: all it turns on is
+   * `kern` and `liga`, both of which are already on by default, and both faces carry them
+   * (IBM Plex Sans has `liga`/`ccmp` in GSUB and `kern` in GPOS; JetBrains Mono has
+   * `calt`/`ccmp`). It would have cost layout time to change nothing.
+   */
+  font-synthesis: none;
   /* A desktop chrome that rubber-bands or text-selects on drag reads as a web page. */
   overflow: hidden;
   user-select: none;
+}
+
+/*
+ * The UA stylesheet bolds these to 700, and there is no 700.
+ *
+ * Four live elements were hitting it — `settings/controls.tsx`'s `Group` heading, the
+ * `<strong>` in `settings/KeymapSection.tsx`, the `<b>` in `ProblemsPanel`, and
+ * `CloseConfirm`'s `<h2>` before its module set 600 — so each was drawn by emboldening the
+ * 600 face. That is the "muddy" in the report, and it is invisible in the stylesheets
+ * because none of them says `font-weight` at all.
+ *
+ * Normalised here, once, rather than in five CSS modules: the modules that *do* state a
+ * weight already state 500 or 600, so this only ever changes elements nobody styled. The
+ * alternative that lost was importing `@fontsource/ibm-plex-sans/700.css` — it would make
+ * the UA's default look fine while adding a fourth UI weight the mock never uses.
+ *
+ * Sizes are deliberately left alone: an `<h2>` that wants to be 14px says so in its module.
+ */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+b,
+strong {
+  font-weight: var(--w-bold);
 }
 
 /* Content areas opt back in. */

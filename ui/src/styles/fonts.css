@@ -6,29 +6,58 @@
  * silently and every surface falls back to the system stack — which looks *almost* right,
  * and is therefore worse than an obvious break.
  *
- * Only the weights the design actually uses are imported. The mock's font request asks for
- * IBM Plex Sans 450 as well, but nothing in it renders at 450, and each unused weight is
- * another file in the bundle.
+ * **The faces below do load.** That was checked on the built output rather than assumed:
+ * `dist/assets/` holds the woff2s and `dist/assets/index-*.css` holds 18 `@font-face` blocks
+ * per family (3 upright weights + 2 italics × 6 unicode subsets), all pointing at same-origin
+ * `/assets/…` URLs that `font-src 'self'` allows. So a missing face is *not* why the app
+ * looked wrong; synthesis was — see below.
  *
- *   IBM Plex Sans  400 body · 500 active tabs and labels · 600 settings headings
- *   JetBrains Mono 400 code and paths · 500 emphasis · 700 transcript bold
+ *   IBM Plex Sans  400 body · 500 active tabs and labels · 600 headings and UI bold
+ *                  400 italic — `ContextMenu`'s reason lines, `ProxySection`'s note
+ *   JetBrains Mono 400 code and paths · 500 emphasis · 700 transcript bold and SGR 1
+ *                  400 italic — editor comments, `.cide-tk-emphasis`, terminal SGR 3
+ *                  700 italic — terminal SGR 1;3, which no upright weight can stand in for
+ *
+ * # Why the italics are here now, and why there is no 700 upright
+ *
+ * Before this file listed any italic, five surfaces asked for one — `EditorSurface`'s
+ * `.cide-tk-comment` and `.cide-tk-emphasis`, `ContextMenu`, `ProxySection`, and every
+ * terminal that receives SGR 3 — and every one of them got an *obliqued* upright: WebKit
+ * shears the 400 face, which smears the stems and destroys the true italic's different
+ * letterforms. In an editor that is every comment in every file, which is a lot of the
+ * screen. Real faces cost bundle size; synthesis costs the thing the user actually looks at.
+ *
+ * There is deliberately **no 700 upright for IBM Plex Sans**. The mock's UI scale stops at
+ * 600, so the only things that wanted 700 were elements the UA stylesheet bolds by default
+ * (`h1`–`h6`, `b`, `strong`) — and those were being fake-bolded from the 600 face, which is
+ * exactly the muddiness the report described. `tokens.css` normalises those elements to 600
+ * instead of this file shipping a weight nothing in the design uses. The alternative that
+ * lost was importing `700.css`: it would have made the UA's accident look fine and quietly
+ * added a fourth UI weight the mock never asks for.
  *
  * `@fontsource` ships woff2 alongside a stylesheet with the right `@font-face` blocks and
  * `font-display: swap`; Vite rewrites the relative `files/` URLs at build time, so the
  * fonts end up in `dist/assets` and are served over the app protocol like any other asset.
+ * `swap` is left as fontsource wrote it: its 100ms block period is longer than a local read
+ * over the asset protocol takes, so the fallback stack is never actually painted, and
+ * overriding the descriptor would mean hand-writing all 36 blocks and their unicode-ranges
+ * here to change a value that never comes into play.
  *
  * Each weight brings every Unicode subset — latin, latin-ext, cyrillic, cyrillic-ext,
- * greek, vietnamese — which is 30 files rather than 6. That is deliberate. Each subset is a
- * separate `@font-face` with its own `unicode-range`, so a browser downloads only the ones
- * it actually has to render; the cost is disk in the bundle, not bandwidth or parse time.
- * Trimming to latin would save a little of the former and silently degrade any pane
- * showing Cyrillic to the fallback stack.
+ * greek, vietnamese — which is 30 files per style rather than 6. That is deliberate. Each
+ * subset is a separate `@font-face` with its own `unicode-range`, so a browser downloads
+ * only the ones it actually has to render; the cost is disk in the bundle, not bandwidth or
+ * parse time. Trimming to latin would save a little of the former and silently degrade any
+ * pane showing Cyrillic to the fallback stack.
  */
 
 @import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/400-italic.css';
 @import '@fontsource/ibm-plex-sans/500.css';
 @import '@fontsource/ibm-plex-sans/600.css';
 
 @import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/400-italic.css';
 @import '@fontsource/jetbrains-mono/500.css';
 @import '@fontsource/jetbrains-mono/700.css';
+@import '@fontsource/jetbrains-mono/700-italic.css';

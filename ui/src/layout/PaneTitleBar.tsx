@@ -31,7 +31,19 @@
 import { useMemo, useRef, type ReactNode } from 'react'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import { useWindowChrome } from '@/chrome/WindowFrame'
-import { windows as windowApi, windowLabel, windowRole, type Pane } from '@/ipc/client'
+import { PANE_KINDS } from '@/chrome/RowControls'
+import {
+  windows as windowApi,
+  windowLabel,
+  windowRole,
+  type Bootstrap,
+  type Pane,
+  type PaneId,
+  type ProjectId,
+  type SplitIntent,
+  type TabId,
+} from '@/ipc/client'
+import { useWorkspace } from '@/store/workspace'
 import { paneSessionId } from './paneHosts'
 import { acknowledge, useAwaiting } from '@/panes/awaiting'
 import styles from './PaneTitleBar.module.css'
@@ -46,6 +58,34 @@ import styles from './PaneTitleBar.module.css'
  */
 function inDetachedPaneWindow(): boolean {
   return windowRole() === 'pane'
+}
+
+/**
+ * Which project and tab hold a pane, or `null` when nothing in this window does.
+ *
+ * `pane_split` is addressed by project **and** tab **and** pane, and the bar is handed only the
+ * last of the three — so the two other thirds are looked up rather than threaded down. A walk
+ * of the snapshot rather than a prop for the same reason `RowControls` re-reads `rowTarget` at
+ * click time instead of taking one: the alternative is two more props on this component, on
+ * `PaneFrame`, and at both call sites in `App.tsx` and `DetachedPaneWindow.tsx`, which is the
+ * exact arrangement this file's own header blames for three controls being wired to nothing.
+ *
+ * It is a linear scan and that is fine — it runs once per click, over the tabs of the projects
+ * that are open, and each tab's panes are a keyed map so the inner test is a lookup. `focused`
+ * is deliberately not consulted: the pane the user right-clicked is the pane the split acts on,
+ * whether or not it currently holds focus.
+ */
+function paneLocation(
+  boot: Bootstrap | null,
+  pane: PaneId,
+): { project: ProjectId; tab: TabId } | null {
+  if (boot === null) return null
+  for (const project of Object.values(boot.workspace.projects)) {
+    for (const tab of project.tabs) {
+      if (Object.hasOwn(tab.tree.panes, pane)) return { project: project.id, tab: tab.id }
+    }
+  }
+  return null
 }
 
 export interface PaneFrameProps {
@@ -156,6 +196,9 @@ export function PaneFrame({
       <PaneTitleBar
         index={index}
         title={pane.title}
+        // So the bar's `⊞` can address `pane_split` itself and offer a *kind*. See
+        // `paneLocation` for why the other two thirds of that address are looked up.
+        paneId={pane.id}
         session={session}
         focused={focused}
         maximized={maximized}
@@ -180,6 +223,16 @@ export function PaneFrame({
 export interface PaneTitleBarProps {
   index: number
   title: string
+  /**
+   * The pane this bar belongs to, so `⊞` can ask for a *kind* of pane rather than whatever the
+   * domain defaults to.
+   *
+   * Optional because a caller that only wants a bar drawn — a fixture, a measurement harness —
+   * has no pane id to give, and because the detached-pane window draws window controls here
+   * instead. Absent, `⊞` falls back to calling [`onAddTile`] with no intent, which is what it
+   * did before the choice existed.
+   */
+  paneId?: PaneId | undefined
   /**
    * The session this pane is showing, for the awaiting marker. Absent — a diff or editor
    * pane, or one whose child has not started — means there is nothing that can wait.
@@ -216,6 +269,7 @@ export interface PaneTitleBarProps {
 export function PaneTitleBar({
   index,
   title,
+  paneId,
   session,
   focused,
   maximized = false,
@@ -231,6 +285,7 @@ export function PaneTitleBar({
   const awaiting = useAwaiting(session)
   const detachedWindow = useMemo(inDetachedPaneWindow, [])
   const barRef = useRef<HTMLDivElement>(null)
+  const addTileRef = useRef<HTMLButtonElement>(null)
   /*
    * The *window's* maximized flag, which is a different thing from the pane's.
    *
@@ -273,6 +328,56 @@ export function PaneTitleBar({
       console.error('[cide] could not re-dock this pane', error)
     })
   }
+
+  /*
+   * `⊞` used to add whichever pane the domain felt like.
+   *
+   * The report: "'Add a pane to this row' — should have a dropdown to select — claude or bash".
+   * The header already asks that question with two labelled buttons (`chrome/RowControls.tsx`),
+   * and the two kinds below come from that file so the two surfaces cannot drift.
+   *
+   * **A menu under one button, not two buttons**, and that is the whole of the interaction
+   * decision. The header can afford `⊞ bash row  ⊞ claude row` because it has a whole window's
+   * width; this bar is 26px tall, holds an index, a centred title that already clips, and three
+   * more actions, and a second unlabelled `⊞` beside the first would be two identical glyphs
+   * meaning different things. Two items in the existing right-click menu was the other
+   * candidate and lost on discoverability — the button is the thing the user said they were
+   * looking at, and a right-click menu is where they were not looking. The context menu's
+   * `Split right` is deliberately left as the one-shot, default-kind version, because it is the
+   * line that carries the `pane.split.right` key chip and a keystroke cannot pick a kind.
+   */
+  const addTile = (intent: SplitIntent): void => {
+    const target = paneId === undefined ? null : paneLocation(useWorkspace.getState().boot, paneId)
+    /*
+     * No pane id, or a pane this window's snapshot does not hold: fall back to the host's
+     * intent-less handler rather than doing nothing. `App.tsx` supplies one — it is a plain
+     * `splitPane(…, 'row', 'after')` with no intent — so the worst case here is the behaviour
+     * that shipped, not a dead button.
+     */
+    if (paneId === undefined || target === null) {
+      onAddTile?.()
+      return
+    }
+    void useWorkspace
+      .getState()
+      .splitPane(target.project, target.tab, paneId, 'row', 'after', intent)
+  }
+
+  const tileMenu = useContextMenu({
+    label: 'Add a pane to this row',
+    items: () =>
+      PANE_KINDS.map(({ id, word, intent }) => ({
+        id,
+        // "bash pane" / "claude pane", the header's "bash row" / "claude row" with the one noun
+        // that differs swapped. Both words come from the same record, so they cannot drift apart
+        // into "shell" here and "bash" there.
+        label: `${word} pane`,
+        // No `command`: neither kind has a binding of its own — `pane.split.right` splits with
+        // the domain's default — and a chip naming it here would promise that this line is what
+        // that keystroke does.
+        run: () => addTile(intent),
+      })),
+  })
 
   const items = (): MenuEntry[] => {
     if (detachedWindow) {
@@ -442,14 +547,26 @@ export function PaneTitleBar({
         ) : (
           <>
             {onAddTile && (
+              /*
+               * A menu trigger, not a one-shot. The `▾` is drawn *inside* the same button
+               * rather than beside it as a second control: at 26px there is no room for a
+               * split button's two hit targets, and a caret that opens the same menu the
+               * glyph does would be two ways to do one thing in eleven pixels.
+               */
               <button
+                ref={addTileRef}
                 type="button"
-                className={styles.action}
-                title="Add a pane to this row"
-                aria-label="Add pane to this row"
-                onClick={onAddTile}
+                className={`${styles.action} ${styles.actionMenu}`}
+                title="Add a pane to this row — bash or claude"
+                aria-label="Add a pane to this row"
+                aria-haspopup="menu"
+                aria-expanded={tileMenu.isOpen}
+                onClick={() => {
+                  const anchor = addTileRef.current
+                  if (anchor !== null) tileMenu.openFor(anchor)
+                }}
               >
-                ⊞
+                ⊞<span className={styles.caret} aria-hidden="true">▾</span>
               </button>
             )}
             <button
@@ -500,8 +617,12 @@ export function PaneTitleBar({
           </>
         )}
       </span>
-      {/* Portals to a sibling of `#root`, so the pane's `overflow: hidden` cannot clip it. */}
+      {/* Both portal to a sibling of `#root`, so the pane's `overflow: hidden` cannot clip
+          them. Two hooks rather than one because they answer different gestures — a
+          right-click anywhere in the bar, and a click on one button — and `useContextMenu`
+          holds one open menu each. */}
       {menu}
+      {tileMenu.menu}
     </div>
   )
 }

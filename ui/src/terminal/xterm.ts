@@ -68,6 +68,18 @@ function readTheme(style: CSSStyleDeclaration): Record<string, string> {
   return terminalPalette((name) => style.getPropertyValue(name).trim())
 }
 
+/**
+ * A `:root` token as a number, with the fallback the token file states.
+ *
+ * `getPropertyValue` returns `'12.5px'` or `''` — the latter in a harness that never loaded
+ * `tokens.css` — so the unit is stripped and a bad parse falls back rather than handing
+ * xterm a `NaN`, which it rejects at construction and takes the whole terminal with it.
+ */
+function metric(style: CSSStyleDeclaration, name: string, fallback: number): number {
+  const parsed = Number.parseFloat(style.getPropertyValue(name))
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
 export function createTerminal(): TerminalHandle {
   const style = getComputedStyle(document.documentElement)
   const theme = readTheme(style)
@@ -76,8 +88,21 @@ export function createTerminal(): TerminalHandle {
     // Required by the unicode addon's provider registration.
     allowProposedApi: true,
     fontFamily: style.getPropertyValue('--font-mono').trim() || 'monospace',
-    fontSize: 12,
-    lineHeight: 1.35,
+    /*
+     * The mono scale is `tokens.css`'s, not this file's.
+     *
+     * These were `12` and `1.35`, while `EditorSurface.module.css` set the editor to the
+     * mock's 12.5px — so a terminal beside an editor in the same tab drew the same typeface
+     * half a pixel smaller, which reads as two different fonts rather than as two sizes.
+     *
+     * `lineHeight` is a multiplier on the **measured glyph box**, not on the font size:
+     * xterm computes `cell = floor(ceil(fontSize × boxEm × dpr) × lineHeight)`. So it cannot
+     * be `--lh-code / --fs-code`; the arithmetic that turns 21px of leading into 1.27 is
+     * written out beside the tokens, which is also where it has to be redone if the size
+     * moves.
+     */
+    fontSize: metric(style, '--fs-code', 12.5),
+    lineHeight: metric(style, '--term-line-height', 1.27),
     cursorBlink: true,
     cursorStyle: 'block',
     scrollback: 5000,

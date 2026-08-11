@@ -217,6 +217,54 @@ try {
     'App.tsx no longer feeds `onAddRow` to the pane tree — it would draw a second strip',
   )
 
+  // --- and that the header's own controls are still reachable at eight projects -------------
+  //
+  // `.tabs` is `overflow: hidden` and every tab in it is `flex: none`, so a control placed
+  // *inside* it after the last tab is pushed out of the window once the tabs are wider than
+  // the strip. That is what happened to `ProjectMenu` — the `+` that opens a project, and the
+  // caret that reopens a recent one, both became unreachable at seven or eight projects, which
+  // is the state a user cannot recover from without editing the persisted workspace by hand.
+  //
+  // Asserted on the source because there is no browser here to overfill a header in. What it
+  // pins is the structural fact that caused the bug: `<ProjectMenu />` must be a sibling of the
+  // strip, and the strip must not claim the slack (`flex: 1`) that the filler beside it now
+  // takes. Both halves matter — moving the control out while leaving `.tabs` greedy would park
+  // it against the window's right edge instead.
+  const tabsBlock = /<div className=\{styles\.tabs\}[\s\S]*?\n {6}<\/div>/.exec(header)?.[0] ?? ''
+  ok(tabsBlock !== '', 'the header still has a `.tabs` strip to check')
+  ok(
+    !/<ProjectMenu\b/.test(tabsBlock) && /<ProjectMenu\b/.test(header),
+    'the project `+`/recents control is mounted OUTSIDE the clipping tab strip',
+  )
+  const headerCss = readFileSync('src/chrome/AppHeader.module.css', 'utf8')
+  const tabsRule = /\.tabs \{[^}]*\}/.exec(headerCss)?.[0] ?? ''
+  ok(
+    /overflow:\s*hidden/.test(tabsRule) && !/flex:\s*1\s*;/.test(tabsRule),
+    '`.tabs` still clips, and no longer claims the header’s slack — `.filler` does',
+  )
+
+  // --- the pane bar asks WHICH pane, and asks it in the header's words ----------------------
+  //
+  // "'Add a pane to this row' - should have a dropdown to select - claude or bash". The two
+  // kinds live in exactly one place so the header and the pane bar cannot drift, which is
+  // already how `SplitTree`'s wording drifted from `RowControls`'.
+  const rowControls = readFileSync('src/chrome/RowControls.tsx', 'utf8')
+  ok(
+    /export const PANE_KINDS\b/.test(rowControls)
+      && /kind: 'shell'/.test(rowControls)
+      && /kind: 'newClaude'/.test(rowControls),
+    '`RowControls` exports the one `PANE_KINDS` table, holding both intents',
+  )
+  const titleBar = readFileSync('src/layout/PaneTitleBar.tsx', 'utf8')
+  ok(
+    /import \{ PANE_KINDS \}/.test(titleBar),
+    'the pane title bar takes its two kinds from that table rather than restating them',
+  )
+  ok(
+    /aria-haspopup="menu"/.test(titleBar) && /tileMenu\.openFor/.test(titleBar),
+    'and its `⊞` opens a menu, so the kind is a choice rather than the domain’s default',
+  )
+
   if (failed === 0) console.log('rows layout: ok')
   else console.error(`\n${failed} failure(s)`)
 } finally {

@@ -23,26 +23,42 @@ import { useWorkspace } from '@/store/workspace'
 import { rowGate, rowTarget } from './menuModel'
 import styles from './AppHeader.module.css'
 
+/**
+ * The two things a new pane can be, in the order the header offers them.
+ *
+ * **This is the app's one list of that choice, and it is here on purpose.** The pane title
+ * bar's `⊞` now offers the same two kinds (`layout/PaneTitleBar.tsx`), and the brief for that
+ * change said in as many words that this component is the precedent and its labels and intents
+ * are the ones to match. A second literal there would be two lists that agree until somebody
+ * edits one — which is already the situation with `SplitTree`'s own `ROW_INTENTS`, whose
+ * wording drifted from this file's while both were describing the same gesture.
+ *
+ * `word` is the noun-less half of a label so a caller can say "bash row" or "bash pane" without
+ * this file having to know which surface is asking; `what` is the object of the tooltip's
+ * sentence, so both surfaces describe the same intent in the same words.
+ */
+export const PANE_KINDS: ReadonlyArray<{
+  id: 'bash' | 'claude'
+  word: string
+  what: string
+  intent: SplitIntent
+}> = [
+  { id: 'bash', word: 'bash', what: 'a shell', intent: { kind: 'shell' } },
+  { id: 'claude', word: 'claude', what: 'a new Claude session', intent: { kind: 'newClaude' } },
+]
+
 /** What the two buttons ask for. Exported so a check script can assert on the pair. */
 export const ROW_INTENTS: ReadonlyArray<{
   id: string
   label: string
   title: string
   intent: SplitIntent
-}> = [
-  {
-    id: 'bash',
-    label: 'bash row',
-    title: 'Add a full-width row holding a shell',
-    intent: { kind: 'shell' },
-  },
-  {
-    id: 'claude',
-    label: 'claude row',
-    title: 'Add a full-width row holding a new Claude session',
-    intent: { kind: 'newClaude' },
-  },
-]
+}> = PANE_KINDS.map(({ id, word, what, intent }) => ({
+  id,
+  label: `${word} row`,
+  title: `Add a full-width row holding ${what}`,
+  intent,
+}))
 
 export interface RowControlsProps {
   /** Override. Absent — the ordinary case — the buttons drive the workspace store directly. */

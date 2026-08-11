@@ -113,8 +113,8 @@ export function AppHeader({
     items: ({ target }) => {
       const id = target?.closest<HTMLElement>('[data-project-id]')?.dataset.projectId
       const project = projects.find((p) => p.id === id)
-      // A right-click on the drag filler or the `+`, not on a tab. Nothing to offer, so the
-      // hook declines to open rather than showing a box of lines about no project.
+      // A right-click on the strip's own background rather than on a tab. Nothing to offer, so
+      // the hook declines to open rather than showing a box of lines about no project.
       if (!project) return []
       const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
       return projectTabEntries(projects, project, {
@@ -207,19 +207,28 @@ export function AppHeader({
             </div>
           )
         })}
-
-        {/*
-         * The `+` and the recent-projects caret. A component of its own because the `+` had to
-         * stop going through `@tauri-apps/plugin-dialog` — its dialog cannot be parented on
-         * Linux and so opened behind this window. `onNew` is not forwarded; see its doc above.
-         */}
-        <ProjectMenu />
-
-        {/* `data-tauri-drag-region` does not inherit, so the drag surface is this filler
-            rather than the header itself. `data-window-drag` is the hook the window-frame
-            agent binds double-click-to-maximize to, without depending on this markup. */}
-        <div className={styles.filler} data-tauri-drag-region data-window-drag="true" />
       </div>
+
+      {/*
+       * The `+` and the recent-projects caret. A component of its own because the `+` had to
+       * stop going through `@tauri-apps/plugin-dialog` — its dialog cannot be parented on
+       * Linux and so opened behind this window. `onNew` is not forwarded; see its doc above.
+       *
+       * **A sibling of `.tabs`, not a child of it.** It used to sit inside, after the last
+       * project, and `.tabs` is a clipping box full of `flex: none` tabs — so at seven or eight
+       * open projects the only control that can open a ninth scrolled out of the window and
+       * became unreachable. Outside, it is pinned: the strip shrinks and clips its own last tab
+       * instead, which is the behaviour that stylesheet already documents for tabs and the same
+       * argument `RowControls` below makes for itself.
+       */}
+      <ProjectMenu />
+
+      {/* `data-tauri-drag-region` does not inherit, so the drag surface is this filler rather
+          than the header itself. Also a sibling now: it is what takes the slack `.tabs` gave
+          up when it stopped being `flex: 1`, so the two controls above stay hard against the
+          project strip instead of being pushed to the far right. `data-window-drag` is the hook
+          the window-frame agent binds double-click-to-maximize to. */}
+      <div className={styles.filler} data-tauri-drag-region data-window-drag="true" />
 
       {/* The two row gestures, moved up out of `SplitTree`'s bottom strip on request. Outside
           `.tabs` so an overfull project strip clips its own last tab rather than pushing these
