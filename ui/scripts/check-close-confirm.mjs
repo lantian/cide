@@ -64,6 +64,8 @@ try {
     stateLabel,
     dirname,
     count,
+    parkClose,
+    advanceClose,
   } = await import(`file://${join(out, 'closeConfirm.js')}`)
 
   const file = (title, path) => ({ title, path, projectName: 'cide' })
@@ -149,6 +151,30 @@ try {
     'the button that loses work says so; "OK" would not',
   )
   eq(confirmLabel(busyOnly), 'Close anyway', 'nothing is discarded when only a turn is at stake')
+
+  // --- several refusals from one gesture ----------------------------------------------
+  //
+  // `Close others` in the tab context menu issues one close per tab and they run
+  // concurrently, so two can be refused for unsaved changes in the same tick. The store used
+  // to let the second replace the first: the user answered about one file and the other tab
+  // stayed open with nothing said. These four assertions are that bug.
+  eq(parkClose(null, [], 'a'), { pending: 'a', queued: [] }, 'the first refusal is the dialog')
+  eq(
+    parkClose('a', [], 'b'),
+    { pending: 'a', queued: ['b'] },
+    'a second refusal queues behind the dialog rather than replacing it',
+  )
+  eq(
+    parkClose('a', ['b'], 'c'),
+    { pending: 'a', queued: ['b', 'c'] },
+    'and a third joins the tail, in the order they were refused',
+  )
+  eq(
+    advanceClose(['b', 'c']),
+    { pending: 'b', queued: ['c'] },
+    'answering one promotes the next — one dialog on screen, every file asked about',
+  )
+  eq(advanceClose([]), { pending: null, queued: [] }, 'the last answer leaves no dialog')
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

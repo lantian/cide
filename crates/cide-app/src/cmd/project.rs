@@ -61,7 +61,15 @@ pub fn project_open(
             .and_then(|p| p.roots.first().map(|r| (r.path.clone(), p.name.clone())))
     });
     if let Some((root, name)) = named {
-        remember(&root, &name);
+        // Off this thread, and not awaited. `project_open` is a *synchronous* command, so Tauri
+        // runs it on the main thread — the GTK one, on Linux — and `remember` is two `fsync`s
+        // and a `rename` behind a lock that `project_recent` can be holding while it stats an
+        // unmounted share. Doing it inline would freeze every window in the process for as long
+        // as that takes, which is the one thing this list is not worth. It is best-effort by
+        // design (see `remember`), so there is no answer to wait for and nothing to report.
+        drop(tauri::async_runtime::spawn_blocking(move || {
+            remember(&root, &name)
+        }));
     }
     Ok(id)
 }
@@ -99,6 +107,11 @@ fn remember(root: &Path, name: &str) {
 /// that opens a menu. `is_dir` rather than `exists`: a file where a project used to be is not
 /// something `open_project` can do anything with, and reporting it as openable would move the
 /// failure to a place with no way to explain itself.
+///
+/// **Call this with [`RECENT_LOCK`] released.** The lock exists to serialise read-modify-write
+/// of one small file, which is microseconds; a `stat` on an unmounted share is an NFS timeout.
+/// Holding the lock across these would turn a menu nobody is watching into a stall on every
+/// other caller of the file, `project_open` included.
 fn with_existence(list: Vec<RecentProject>) -> Vec<RecentEntry> {
     list.into_iter()
         .map(|project| RecentEntry {
@@ -116,8 +129,12 @@ fn with_existence(list: Vec<RecentProject>) -> Vec<RecentEntry> {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn project_recent() -> Result<Vec<RecentEntry>, CoreError> {
     tauri::async_runtime::spawn_blocking(|| {
-        let _guard = RECENT_LOCK.lock();
-        with_existence(persist::load_recent(&persist::recent_path()))
+        // The lock covers the read and is dropped before the stats — see `with_existence`.
+        let list = {
+            let _guard = RECENT_LOCK.lock();
+            persist::load_recent(&persist::recent_path())
+        };
+        with_existence(list)
     })
     .await
     .map_err(|e| CoreError::Io(format!("recent projects: {e}")))
@@ -134,23 +151,27 @@ pub async fn project_recent() -> Result<Vec<RecentEntry>, CoreError> {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn project_forget_recent(path: Option<String>) -> Result<Vec<RecentEntry>, CoreError> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = RECENT_LOCK.lock();
-        let file = persist::recent_path();
-        let mut list = persist::load_recent(&file);
-        let changed = match &path {
-            Some(path) => persist::forget_recent(&mut list, Path::new(path)),
-            None => {
-                let had = !list.is_empty();
-                list.clear();
-                had
+        // Read-modify-write under the lock; the stats below it are not — see `with_existence`.
+        let list = {
+            let _guard = RECENT_LOCK.lock();
+            let file = persist::recent_path();
+            let mut list = persist::load_recent(&file);
+            let changed = match &path {
+                Some(path) => persist::forget_recent(&mut list, Path::new(path)),
+                None => {
+                    let had = !list.is_empty();
+                    list.clear();
+                    had
+                }
+            };
+            // Nothing to write when nothing moved: the common case is a menu acting on an entry
+            // that a second window already removed, and rewriting an identical file would churn
+            // the inode for no change anyone can observe.
+            if changed && let Err(error) = persist::save_recent(&file, &list) {
+                tracing::warn!(path = %file.display(), %error, "could not update the recent projects");
             }
+            list
         };
-        // Nothing to write when nothing moved: the common case is a menu acting on an entry
-        // that a second window already removed, and rewriting an identical file would churn
-        // the inode for no change anyone can observe.
-        if changed && let Err(error) = persist::save_recent(&file, &list) {
-            tracing::warn!(path = %file.display(), %error, "could not update the recent projects");
-        }
         with_existence(list)
     })
     .await
@@ -204,24 +225,31 @@ pub async fn project_reveal(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
 ) -> Result<String, CoreError> {
-    use tauri_plugin_opener::OpenerExt;
-
     let root = state.with(|ws| {
         workspace::project(ws, project).map(|p| p.roots.first().map(|r| r.path.clone()))
     })?;
     let root = root.ok_or(CoreError::NoRoots)?;
 
-    // Asking a file manager to open a path that is not there is an error dialog with no
-    // explanation in it — the same trap `app_open_log_dir` sidesteps by creating the directory.
-    // Here it must not be created: a project root that has gone is news, not a hole to fill.
-    if !root.is_dir() {
-        return Err(CoreError::Io(format!("{} is not there", root.display())));
-    }
+    // Both halves off the runtime's worker pool, for the same reason `project_recent` is: the
+    // `stat` can be an NFS timeout on an unmounted root, and `open_path` forks a file manager,
+    // which on a cold desktop is not instant either. The whole answer is one blocking task.
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_opener::OpenerExt;
 
-    app.opener()
-        .open_path(root.to_string_lossy(), None::<&str>)
-        .map_err(|e| CoreError::Io(format!("could not open {}: {e}", root.display())))?;
-    Ok(root.display().to_string())
+        // Asking a file manager to open a path that is not there is an error dialog with no
+        // explanation in it — the same trap `app_open_log_dir` sidesteps by creating the
+        // directory. Here it must not be created: a project root that has gone is news, not a
+        // hole to fill.
+        if !root.is_dir() {
+            return Err(CoreError::Io(format!("{} is not there", root.display())));
+        }
+        app.opener()
+            .open_path(root.to_string_lossy(), None::<&str>)
+            .map_err(|e| CoreError::Io(format!("could not open {}: {e}", root.display())))?;
+        Ok(root.display().to_string())
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("reveal: {e}")))?
 }
 
 // --- the folder picker ----------------------------------------------------------------------

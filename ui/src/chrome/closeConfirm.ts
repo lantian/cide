@@ -138,6 +138,40 @@ export function count(n: number, noun: string): string {
   return n === 1 ? `1 ${noun}` : `${n} ${noun}s`
 }
 
+// --- how several refusals share one dialog ---------------------------------------------
+//
+// Generic over the payload so they stay import-free and the check script can compile this
+// file alone; `closeConfirmStore.ts` instantiates both at `PendingClose`.
+
+/**
+ * Park a refusal: it becomes the dialog if none is up, and joins the tail if one is.
+ *
+ * The rule it replaces was "a second request replaces the first", which was right while
+ * every close was one tab — two requests could only be the same gesture asked twice. The
+ * tab and project context menus broke that: **Close others** issues one close per tab, they
+ * run concurrently, and two of them can be refused for unsaved changes in the same tick.
+ * Replacing meant the user answered about one file and the other tab quietly stayed open
+ * with nothing said — a gesture that half-works, which is the failure this whole surface
+ * exists to remove.
+ *
+ * Still only ever one dialog on screen. Stacking them was the alternative and lost: two
+ * modals over each other is how a user loses track of which Discard belongs to which file.
+ */
+export function parkClose<T>(
+  pending: T | null,
+  queued: readonly T[],
+  next: T,
+): { pending: T | null; queued: T[] } {
+  return pending === null
+    ? { pending: next, queued: [...queued] }
+    : { pending, queued: [...queued, next] }
+}
+
+/** Promote the next refusal once the current one has been answered. */
+export function advanceClose<T>(queued: readonly T[]): { pending: T | null; queued: T[] } {
+  return { pending: queued[0] ?? null, queued: queued.slice(1) }
+}
+
 /** What the sentence is about: the thing being closed. */
 function subject(scope: CloseScope): string {
   switch (scope) {

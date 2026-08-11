@@ -5,11 +5,15 @@
  * The window has no WM decorations, so this bar is the whole title bar — it is also the
  * only place a project can be switched, closed or opened.
  *
- * This file itself still reads no store: every prop below is supplied by `App.tsx` and the
- * layout audit's four header measurements (`header`, `projectTab`, `projectDot`,
- * `projectPath`) are all rendered from them. Two of its children — `ProjectMenu` and
- * `RowControls` — do wire themselves, and each says at length why; neither is measured, and
- * neither replaces a prop a host was already passing.
+ * Everything the layout audit measures is still pure: its four header measurements (`header`,
+ * `projectTab`, `projectDot`, `projectPath`) are rendered from the props below, all of which
+ * `App.tsx` supplies, so the component can be measured against the mock from a fixture.
+ *
+ * It is no longer store-*free*, and the note that used to claim so was wrong the moment the
+ * context menu landed: `useContextMenu` subscribes to the workspace store for the live keymap
+ * its shortcut chips come from. Two of this file's children — `ProjectMenu` and `RowControls`
+ * — go further and drive the store directly, and each says at length why; neither is measured,
+ * and neither replaces a prop a host was already passing.
  */
 import { useContextMenu } from '@/menus'
 import { projectMenu } from '@/ipc/client'
