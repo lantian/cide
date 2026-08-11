@@ -109,6 +109,7 @@ try {
       'src/editor/highlight.ts',
       'src/editor/minimapGeometry.ts',
       'src/editor/streamGrammar.ts',
+      'src/editor/sendToClaude.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -148,6 +149,7 @@ try {
   const { basename, languageName, loadLanguage } = load('languages.js')
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
+  const send = load('sendToClaude.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
   const { tags } = require('@lezer/highlight')
@@ -1613,6 +1615,84 @@ try {
     /onOpenHit=\{\(path, line, column, endColumn\)/.test(appSrc),
     'App.tsx receives all four `onOpenHit` arguments — dropping them is how this shipped dead',
   )
+
+  // ---------------------------------------------------------------------------------------
+  // 9. Send lines to Claude
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * The user's report was "send lines to Claude does nothing from selected text", and the two
+   * halves of that are checked in two different ways because they fail in two different ways.
+   *
+   * The arithmetic and the wording are exercised directly — a caret is not a range, and the
+   * label must never say "lines 12–12". The wiring is a source assertion, the same shape as the
+   * `requestReveal` gate above and for the same reason: this project's most repeated defect is
+   * a module that passes its own tests while nothing calls it, and `useSendToClaude` calling
+   * `claudeSend.lines` is worth exactly as much as `codeMenu` and `EditorSurface` calling
+   * `useSendToClaude`.
+   */
+  {
+    eq(send.rangeOf('', 12, 12), null, 'an empty selection is a caret, not a range')
+    eq(send.rangeOf('', 12, 14), null, 'a zero-width selection across lines is still a caret')
+    eq(send.rangeOf('x', 12, 12), { lineStart: 12, lineEnd: 12 }, 'one line')
+    eq(send.rangeOf('x\ny', 12, 13), { lineStart: 12, lineEnd: 13 }, 'two lines')
+    // A selection dragged upwards hands its head and anchor over in the other order.
+    eq(send.rangeOf('x\ny', 13, 12), { lineStart: 12, lineEnd: 13 }, 'a backwards drag')
+
+    eq(send.sendLabel(null), 'Send this file to Claude', 'no selection sends the file')
+    eq(
+      send.sendLabel({ lineStart: 12, lineEnd: 12 }),
+      'Send line 12 to Claude',
+      'one line is singular — "lines 12–12" is how a user learns not to read the label',
+    )
+    eq(
+      send.sendLabel({ lineStart: 12, lineEnd: 20 }),
+      'Send lines 12–20 to Claude',
+      'a span names both ends',
+    )
+
+    // 1-based in the label, 0-based on the wire, converted once in `cmd::file::claude_send_lines`.
+    // This string is what a user will see in the prompt, so it is what the log has to record.
+    eq(send.mentionLabel('/src/main.rs', null), '@/src/main.rs', 'a whole-file mention')
+    eq(
+      send.mentionLabel('/src/main.rs', { lineStart: 10, lineEnd: 20 }),
+      '@/src/main.rs#L10-20',
+      'the documented mention spelling, 1-based',
+    )
+    eq(
+      send.mentionLabel('/src/main.rs', { lineStart: 10, lineEnd: 10 }),
+      '@/src/main.rs#L10',
+      'a single line carries no range',
+    )
+
+    const hookSrc = readFileSync('src/editor/useSendToClaude.ts', 'utf8')
+    ok(
+      /claudeSend\.lines\(/.test(hookSrc),
+      'useSendToClaude actually invokes the command — the whole report was that it did not',
+    )
+    ok(
+      !/\.catch\(/.test(hookSrc),
+      'the send is deliberately uncaught: `Failures` shows the rejection, and a `.catch` here ' +
+        'restores the silent no-op this change exists to remove',
+    )
+
+    const menuSrc = readFileSync('src/editor/codeMenu.tsx', 'utf8')
+    ok(/toClaude\.send\(/.test(menuSrc), 'the context-menu item is wired to the send')
+    ok(
+      // Anchored to the start of a line, because the file *discusses* the command at length
+      // in a comment and the discussion is the reason it is gone.
+      !/^\s*command: 'claude\.mention\.file'/m.test(menuSrc),
+      'no chip for `claude.mention.file`: App.tsx does not dispatch it, so the chip would ' +
+        'advertise a shortcut that does nothing',
+    )
+
+    const surfaceSrc = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
+    ok(
+      /key: 'Alt-Enter'/.test(surfaceSrc),
+      'EditorSurface binds ⌥⏎ — without it the gesture is mouse-only, which is a gesture most ' +
+        'people never find',
+    )
+  }
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s) out of ${checked} checks`)

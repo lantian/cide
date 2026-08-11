@@ -202,10 +202,18 @@ impl IdeServers {
     }
 
     /// Tell every connected `claude` in a project where the editor selection is.
-    pub fn selection_changed(&self, project: ProjectId, payload: cide_ide_mcp::SelectionChanged) {
-        if let Some(entry) = self.servers.get(&project) {
-            entry.server.selection_changed_all(payload);
-        }
+    ///
+    /// Returns how many CLIs it reached; `None` when the project has no server at all. The
+    /// two are different sentences — "cide could not start an IDE server" and "no `claude`
+    /// has connected to it" — and only the caller can put either one on screen.
+    pub fn selection_changed(
+        &self,
+        project: ProjectId,
+        payload: cide_ide_mcp::SelectionChanged,
+    ) -> Option<usize> {
+        self.servers
+            .get(&project)
+            .map(|entry| entry.server.selection_changed_all(payload))
     }
 
     /// Put a file reference into one pane's `claude` prompt.
@@ -213,15 +221,20 @@ impl IdeServers {
     /// Addressed to a single pane, unlike `selection_changed`. A mention is something the
     /// user aimed at a conversation — it lands in that prompt as text they are about to send
     /// — so broadcasting it would type into every Claude in the project at once.
+    ///
+    /// `None` when the project has no server; otherwise whether the notification actually
+    /// went onto a socket. See [`cide_ide_mcp::Delivery`] — an `@`-mention that reaches
+    /// nobody looks exactly like a menu item wired to nothing, and this is what lets the
+    /// caller say which it was.
     pub fn at_mentioned(
         &self,
         project: ProjectId,
         pane: PaneId,
         payload: cide_ide_mcp::AtMentioned,
-    ) {
-        if let Some(entry) = self.servers.get(&project) {
-            entry.server.at_mentioned(&pane.to_string(), payload);
-        }
+    ) -> Option<cide_ide_mcp::Delivery> {
+        self.servers
+            .get(&project)
+            .map(|entry| entry.server.at_mentioned(&pane.to_string(), payload))
     }
 
     /// Stop a project's server, resolving anything it still owes.

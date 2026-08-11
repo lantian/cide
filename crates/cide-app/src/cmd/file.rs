@@ -408,6 +408,155 @@ pub fn claude_mention_file(
     );
 }
 
+/// Why *Send lines to Claude* could not send.
+///
+/// A dedicated error rather than `CoreError`, for the reason `SessionError` in `cmd::session`
+/// is: neither of these is a domain refusal, and both of them are sentences a user has to
+/// read. Tagged `{kind, message}` like every other error crossing this boundary, so the
+/// frontend branches on the variant and `chrome/Failures.tsx` shows the prose.
+///
+/// **This type existing is the point of the change.** `claude_mention_file` above returns
+/// `()`: every failure it can have — no IDE server, no connected CLI, the wrong pane — leaves
+/// the frontend with a resolved promise and the user with a menu item that did nothing, which
+/// is byte-for-byte how a control wired to nothing behaves.
+#[derive(Debug, thiserror::Error)]
+pub enum ClaudeSendError {
+    /// The project has no IDE server. Either it failed to bind a port at startup, or this
+    /// window is showing a project the app has since closed.
+    #[error(
+        "cide has no IDE server for this project, so nothing can be sent to Claude — see the \
+         log (Help ▸ Open log folder) for why it did not start"
+    )]
+    NoServer,
+
+    /// A server is running and the pane's `claude` is not on it.
+    ///
+    /// The two wordings are deliberately different. Zero connections means the feature has
+    /// never been reachable in this project and the user needs to start or connect a session;
+    /// a non-zero count means the plumbing works and this *particular* pane is the odd one
+    /// out, which is a completely different thing to go looking for.
+    #[error("{}", not_connected(*connections))]
+    NotConnected { connections: usize },
+}
+
+/// The sentence for [`ClaudeSendError::NotConnected`].
+///
+/// A function rather than two `#[error]` attributes because the count decides the wording, and
+/// `thiserror`'s format strings have no room to branch. Named so it is greppable from the
+/// frontend, which shows this text verbatim.
+fn not_connected(connections: usize) -> String {
+    match connections {
+        0 => "No Claude session in this project is connected to cide's IDE server. Start a \
+              Claude pane (or run /ide inside one) and try again."
+            .to_string(),
+        1 => "The Claude in that pane is not connected to cide's IDE server, though one other \
+              session in this project is. Focus that pane, or run /ide in this one."
+            .to_string(),
+        n => format!(
+            "The Claude in that pane is not connected to cide's IDE server, though {n} other \
+             sessions in this project are. Focus one of those panes, or run /ide in this one."
+        ),
+    }
+}
+
+impl serde::Serialize for ClaudeSendError {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let kind = match self {
+            Self::NoServer => "noServer",
+            Self::NotConnected { .. } => "notConnected",
+        };
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("ClaudeSendError", 2)?;
+        st.serialize_field("kind", kind)?;
+        st.serialize_field("message", &self.to_string())?;
+        st.end()
+    }
+}
+
+/// *Send lines to Claude* — the editor's gesture, reported when it cannot land.
+///
+/// # What the gesture does, and why this shape
+///
+/// Two notifications, in this order:
+///
+/// 1. `selection_changed`, broadcast, so every connected `claude` in the project has the range
+///    in its status line and agrees with what is about to be mentioned. Un-debounced, unlike
+///    [`claude_selection_changed`] — this one is a deliberate act, not a drag.
+/// 2. `at_mentioned`, addressed to `pane`, which is what actually puts `@path#L10-20` into
+///    that conversation's prompt.
+///
+/// The alternative that lost was pasting the selected *text* into the prompt. It sounds more
+/// direct and is worse: a mention is what the protocol offers, it costs the agent one read of
+/// a range it can widen at will, and pasting forty lines of source into a prompt box is a
+/// gesture the user cannot undo and Claude cannot see the surroundings of. `claudeTasks
+/// ::explainSelection` already exists for the case where the *text* is the point.
+///
+/// # Line numbers
+///
+/// 1-based in, 0-based on the wire, converted here exactly once — the same boundary
+/// [`claude_mention_file`] and [`claude_selection_changed`] use. `None` for both means the
+/// whole file, so the caret sitting in a buffer mentions the file rather than one arbitrary
+/// line. Verified against `cide_ide_mcp::protocol::AtMentioned`, which documents the wire as
+/// 0-based inclusive and omits an absent bound rather than sending `null` (the CLI validates
+/// against a schema where those fields are optional but not nullable).
+///
+/// # Not `spawn_blocking`
+///
+/// It does no I/O. Both notifications are a `serde_json::to_string` and a push into an
+/// unbounded in-memory channel that a connection task drains; the socket write happens on the
+/// IDE runtime, not here. `file_read` and `file_write` above are the commands that touch a
+/// disk and they are the ones that go through the pool.
+#[tauri::command(rename_all = "camelCase")]
+pub fn claude_send_lines(
+    app: tauri::AppHandle,
+    project: cide_ipc::ProjectId,
+    pane: cide_ipc::PaneId,
+    path: String,
+    text: String,
+    line_start: Option<u32>,
+    line_end: Option<u32>,
+) -> std::result::Result<(), ClaudeSendError> {
+    let servers = app
+        .try_state::<crate::ide::IdeServers>()
+        .ok_or(ClaudeSendError::NoServer)?;
+
+    // The wire's 0-based numbering, applied once, to both notifications from the same source
+    // values — so the range Claude highlights and the range it is told about cannot disagree.
+    let start = line_start.map(|l| l.saturating_sub(1));
+    let end = line_end.map(|l| l.saturating_sub(1));
+
+    if let (Some(start), Some(end)) = (start, end) {
+        // Best-effort and deliberately unchecked: reaching nobody here is reported by the
+        // mention below, and failing the whole gesture because a *status line* did not update
+        // would refuse a mention that was about to work.
+        servers.selection_changed(
+            project,
+            cide_ide_mcp::SelectionChanged {
+                file_path: path.clone(),
+                text,
+                start_line: start,
+                end_line: end,
+            },
+        );
+    }
+
+    match servers.at_mentioned(
+        project,
+        pane,
+        cide_ide_mcp::AtMentioned {
+            file_path: path,
+            line_start: start,
+            line_end: end,
+        },
+    ) {
+        None => Err(ClaudeSendError::NoServer),
+        Some(cide_ide_mcp::Delivery::NoConnection { connections }) => {
+            Err(ClaudeSendError::NotConnected { connections })
+        }
+        Some(cide_ide_mcp::Delivery::Sent) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

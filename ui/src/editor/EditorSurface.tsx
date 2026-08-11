@@ -50,6 +50,7 @@ import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import { exceedsBytes } from './byteSize'
 import { registerReveal, revealRange } from './revealRequest'
+import { useSendToClaude } from './useSendToClaude'
 import styles from './EditorSurface.module.css'
 
 /**
@@ -187,6 +188,21 @@ export function EditorSurface({
     readOnly,
   })
 
+  /*
+   * *Send lines to Claude*, from the keyboard.
+   *
+   * In a ref for the same reason every other callback here is: this one's identity changes
+   * whenever the workspace mirror moves the mention target, and a changed identity reaching the
+   * effect below would tear the editor down and take the user's unsaved edits with it.
+   *
+   * The menu is not enough on its own. A mouse-only gesture is a gesture most people never
+   * find, and Ctrl+P's own footer already advertises ⌥⏎ for "send to Claude" — so the editor
+   * answering the same chord is matching a promise the app makes elsewhere, not inventing one.
+   */
+  const toClaude = useSendToClaude()
+  const sendCb = useRef(toClaude)
+  sendCb.current = toClaude
+
   const segments = useMemo(() => breadcrumbSegments(path, root), [path, root])
   const language = useMemo(() => languageName(path), [path])
   const endings = useMemo(() => captureLineEndings(doc), [doc])
@@ -285,6 +301,24 @@ export function EditorSurface({
       // anything else can look at it.
       keymap.of([
         { key: 'Mod-s', run: save, preventDefault: true },
+        /*
+         * ⌥⏎ — send the selection, or the file when there is none.
+         *
+         * Always `true`, even when there is nothing to send to. Returning `false` would let the
+         * chord fall through to a keymap that does not want it and leave the user with a
+         * keystroke that did nothing, which is the failure being fixed; `send` reports its own
+         * refusal through `Failures`. Unbound in `defaultKeymap`, `historyKeymap` and
+         * `closeBracketsKeymap`, and unbound in the app keymap (`cide-core::keymap`), so
+         * nothing is being taken from anyone — checked, not assumed.
+         */
+        {
+          key: 'Alt-Enter',
+          run: (target) => {
+            sendCb.current.send(target, path)
+            return true
+          },
+          preventDefault: true,
+        },
         ...closeBracketsKeymap,
         ...defaultKeymap,
         ...historyKeymap,

@@ -256,6 +256,7 @@ pub fn run() {
             cmd::git::git_stash_drop,
             cmd::file::claude_mention_file,
             cmd::file::claude_selection_changed,
+            cmd::file::claude_send_lines,
             cmd::file::file_read,
             cmd::file::file_write,
             cmd::file::tab_open_file,

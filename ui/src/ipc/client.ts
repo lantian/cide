@@ -1457,3 +1457,54 @@ export const awaiting = {
  */
 export const onSessionAwaiting = (handler: (sessions: SessionId[]) => void) =>
   listen<{ sessions: SessionId[] }>('cide://session-awaiting', (e) => handler(e.payload.sessions))
+
+/**
+ * *Send lines to Claude* — the one gesture in this app that reports when it cannot send.
+ *
+ * # Why this is a second namespace rather than a member of `claude` above
+ *
+ * Two reasons, and the second is the load-bearing one.
+ *
+ * This file is **append-only** by house rule: it has conflicted in three consecutive rounds, so
+ * a new capability arrives as a block at the end rather than as a field reaching inside an
+ * existing object literal. `onSessionAwaiting` directly above says the same thing about events.
+ *
+ * And `claude.mentionFile` **swallows its result** — `.catch(() => {})`. That is right for what
+ * it is (Ctrl+P's ⌥⏎, fired from an overlay that is already closing) and fatal for what this is.
+ * The point of this call is the rejection: `claude_send_lines` answers `{kind: 'noServer'}` or
+ * `{kind: 'notConnected'}` when nothing is listening, and the call sites deliberately do **not**
+ * catch it, so `chrome/Failures.tsx`'s `unhandledrejection` listener puts the reason on screen.
+ * A silent no-op is indistinguishable from a control wired to nothing, which is precisely how
+ * this feature was reported.
+ */
+export const claudeSend = {
+  /**
+   * Broadcast the selection to the project, then `@`-mention the range into one pane's prompt.
+   *
+   * Both notifications leave Rust in that order and from the same numbers, so the range Claude
+   * highlights and the range it is told about cannot disagree. See `cmd::file::claude_send_lines`
+   * for why this mentions a range rather than pasting the text.
+   *
+   * `lineStart`/`lineEnd` are **1-based**, like everything a user reads, and are converted to
+   * the protocol's 0-based numbering once at the Rust boundary. Omit both to send the whole
+   * file, which is what a caret with no selection means.
+   *
+   * Rejects on purpose. Call it as `void claudeSend.lines(…)` and let `Failures` explain.
+   */
+  lines: (
+    projectId: ProjectId,
+    paneId: PaneId,
+    path: string,
+    text: string,
+    lineStart?: number,
+    lineEnd?: number,
+  ) =>
+    invoke<void>('claude_send_lines', {
+      project: projectId,
+      pane: paneId,
+      path,
+      text,
+      lineStart: lineStart ?? null,
+      lineEnd: lineEnd ?? null,
+    }),
+}
