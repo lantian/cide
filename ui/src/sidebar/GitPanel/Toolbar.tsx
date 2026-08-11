@@ -88,10 +88,12 @@ export function Toolbar(props: ToolbarProps) {
        */
       glyph: '＋',
       label:
-        props.onNewChangelist === undefined
-          ? `New changelist — right-click a repository row to pick which of the `
-            + `${props.repoCount ?? 0} repositories it belongs to`
-          : 'New changelist',
+        props.onNewChangelist !== undefined
+          ? 'New changelist'
+          : (props.repoCount ?? 0) === 0
+            ? 'New changelist — no repository is open'
+            : `New changelist — right-click a repository row to pick which of the `
+              + `${props.repoCount ?? 0} repositories it belongs to`,
       onClick: props.onNewChangelist ?? (() => {}),
       disabled: props.onNewChangelist === undefined,
     },

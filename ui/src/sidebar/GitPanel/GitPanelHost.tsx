@@ -109,13 +109,11 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
           label: 'Roll Back Changes',
           danger: true,
           /*
-           * `git.rollback` destroys uncommitted work and Rust will not ask first. There is no
-           * confirmation here either, and that is a decision rather than an omission: the
-           * sidebar has no dialog primitive of its own, and the honest alternatives were a
-           * `window.confirm` (which blocks the webview's event loop and is intercepted by the
-           * runtime) or a half-built modal. What it gets instead is `danger` styling, a label
-           * that says what happens, and the fact that it acts on one named file rather than on
-           * a selection the user may have forgotten about.
+           * `git_rollback` destroys uncommitted work and Rust will not ask first, so this
+           * opens `ConfirmDestructive` rather than running — `rollbackFile` is
+           * `revertFiles([path])` and the unguarded call is private to `useGitPanel`. This
+           * comment used to say there was no confirmation and defend it; the dialog arrived
+           * with the group menu and the file verb was moved behind it at the same time.
            */
           ...(staged || unstaged
             ? { run: () => git.rollbackFile(row.repo, path) }
@@ -210,21 +208,26 @@ function groupMenu(
     // they cannot be renamed, deleted or made active, and only the unversioned one has an
     // operation at all — one that deletes files rather than restoring them, which is why it is
     // worded as a delete. See `useGitPanel::revertGroup`.
-    const deletable = row.groupKind === 'unversioned' && !empty
+    const unversioned = row.groupKind === 'unversioned'
     return [
       newList,
       { kind: 'separator' },
       {
         id: 'revertGroup',
-        label: `Delete ${count} Unversioned File${count === 1 ? '' : 's'}`,
+        // The label is per kind, not one sentence with a count in it. It read
+        // `Delete N Unversioned Files` on every one of the three, so a right-click on the
+        // *Ignored* group offered to delete files it does not contain — disabled, but a
+        // disabled item still tells the user what the app thinks it is pointing at.
+        label: unversioned
+          ? `Delete ${count} Unversioned File${count === 1 ? '' : 's'}`
+          : 'Revert Group',
         danger: true,
-        ...(deletable
+        ...(unversioned && !empty
           ? { run: () => git.revertGroup(repo, row.group ?? '') }
           : {
-              disabledReason:
-                row.groupKind === 'unversioned'
-                  ? 'Nothing in this group'
-                  : 'This is not a changelist — nothing here to revert as a group',
+              disabledReason: unversioned
+                ? 'Nothing in this group'
+                : 'This is not a changelist — nothing here to revert as a group',
             }),
       },
     ]

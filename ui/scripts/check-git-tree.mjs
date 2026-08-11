@@ -676,6 +676,128 @@ try {
     'client.ts declares the `gitDiff` namespace exactly once',
   )
 
+  // --- changelists: the group menu, the chooser, and the empty list ----------------------
+
+  /*
+   * A changelist the user just made is **empty**, and that is the case the whole create half
+   * of the feature runs through: `git_changelist_create` answers with a tree, the new list is
+   * in it with no files, and the chooser has to find it there. `normalizeRepo` used to drop
+   * every empty group, so the list vanished between Rust and the panel — the row was never
+   * drawn, the move chooser could not offer it, and `findChangelistId` returned `null`, which
+   * made the inline *Create and move* fail with "was created but the files did not move" on
+   * every single use. These assertions are that bug, pinned.
+   */
+  const withEmpty = {
+    repos: [
+      {
+        ...repo(APP, '/w/app', 'app'),
+        changelists: [
+          ...repo(APP, '/w/app', 'app').changelists,
+          { id: 'my-list', name: 'My list', comment: '', active: false, changes: [] },
+        ],
+        conflicts: [],
+      },
+    ],
+  }
+  const withEmptyView = m.normalizeStatus(withEmpty)
+  eq(
+    withEmptyView.repos[0].groups.map((g) => g.id),
+    ['cl:default', 'cl:fixes', 'cl:my-list', 'unversioned', 'ignored'],
+    'an empty CHANGELIST survives normalisation — it is a thing the user made, and a freshly '
+      + 'created one has no files by definition — while the empty `conflicts` sibling list, '
+      + 'which is derived from the walk, is still dropped',
+  )
+  eq(
+    m.findChangelistId(withEmpty, APP, 'My list'),
+    'my-list',
+    'so the id of a just-created list can be read back out of the tree `git_changelist_create` '
+      + 'answers with: the chooser mints no slug of its own, and this is the only step between '
+      + '"create" and "move these files into it"',
+  )
+  eq(m.findChangelistId(withEmpty, APP, 'Nope'), null, 'and an absent name is null, not a guess')
+  eq(
+    m.changelistsOf(withEmptyView, APP).map((l) => [l.id, l.count]),
+    [['default', 2], ['fixes', 1], ['my-list', 0]],
+    'the chooser offers every changelist including the empty one — a list can only be moved '
+      + 'back into if it is offered while it holds nothing — and never the sibling lists',
+  )
+  eq(
+    m.buildRows(m.normalizeStatus({ repos: [{ ...repo(APP, '/w/app', 'app'), changelists: [{ id: 'default', name: 'Changes', comment: '', active: true, changes: [] }], unversioned: [], ignored: [] }] }), new Set()),
+    [],
+    'a clean repository still renders nothing, empty default changelist and all',
+  )
+
+  eq(m.changelistIdOf('cl:fixes'), 'fixes', 'the `cl:` prefix comes off before Rust sees the id')
+  eq(
+    m.changelistIdOf('unversioned'),
+    null,
+    'and a sibling list is not a changelist: sending its group id to git_changelist_* would be '
+      + 'a NoSuchChangelist on a menu item that looked fine',
+  )
+  eq(m.changelistIdOf(undefined), null, 'a row with no group id is not a changelist either')
+  eq(m.groupOf(withEmptyView, APP, 'cl:fixes').name, 'fixes', 'a group is found by its group id')
+  eq(m.groupOf(withEmptyView, APP, 'nope'), undefined, 'and an unknown one is undefined')
+
+  // `actOn`: the count that ends up in the menu label, and the safeguard against a gesture
+  // that quietly sweeps in files the user forgot were ticked.
+  const rowsE = m.buildRows(withEmptyView, openAll(withEmptyView))
+  const rowA = rowsE.find((r) => r.label === 'a.rs')
+  const rowB = rowsE.find((r) => r.label === 'src/b.rs')
+  const rowNotes = rowsE.find((r) => r.label === 'notes.md')
+  eq(
+    m.actOn(withEmptyView, new Set(), rowA).paths,
+    ['a.rs'],
+    'a right-click on an unticked row acts on that row alone',
+  )
+  eq(
+    m.actOn(withEmptyView, new Set([rowA.id, rowB.id]), rowA).paths,
+    ['a.rs', 'src/b.rs'],
+    'and on the ticks when the clicked row is one of them — IDEA\'s multi-file move, and the '
+      + 'reason the count goes in the label',
+  )
+  eq(
+    m.actOn(withEmptyView, new Set([rowA.id, rowNotes.id]), rowA).paths,
+    ['a.rs'],
+    'an unversioned tick is never swept into a changelist gesture: `status::repo_changes` '
+      + 'builds `live` from paths that are neither Untracked nor Ignored, so filing one is a '
+      + 'write the next status walk undoes',
+  )
+  eq(
+    m.actOn(withEmptyView, new Set([rowNotes.id]), rowNotes).paths,
+    ['notes.md'],
+    'and the widening never returns an empty set, whatever is ticked',
+  )
+
+  /*
+   * Reachability. The domain and the IPC for changelists shipped in M8 and were reachable from
+   * nothing for three rounds because `items()` returned `[]` for every group row — the exact
+   * failure `check-rows.mjs` ends with a note about. Source assertions, so they prove the
+   * chain is spelled out rather than that a click travels it.
+   */
+  const host = readFileSync(join(UI, 'src/sidebar/GitPanel/GitPanelHost.tsx'), 'utf8')
+  ok(
+    /if \(entry === undefined\) return groupMenu\(row, git\)/.test(host),
+    'a right-click on a group row opens the group menu rather than nothing',
+  )
+  ok(
+    /git\.revertGroup\(/.test(host) && /git\.moveToChangelist\(/.test(host)
+      && /git\.newChangelist\(/.test(host) && /git\.shelveGroup\(/.test(host),
+    'and that menu reaches revert, move, create and shelve — every verb the brief asked for',
+  )
+  const panel = readFileSync(join(UI, 'src/sidebar/GitPanel/GitPanel.tsx'), 'utf8')
+  ok(
+    /<ChangelistDialog/.test(panel) && /<ConfirmDestructive/.test(panel),
+    'both overlays are mounted by the panel itself — no line in App.tsx, which this feature '
+      + 'does not own, stands between the gesture and the dialog',
+  )
+  const model = readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8')
+  ok(
+    !/rollbackFile = useCallback\(\s*\(repo: RepoId, path: string\) => \{[\s\S]{0,200}gitApi\.rollback/.test(model)
+      && /rollbackFile = useCallback\(\s*\(repo: RepoId, path: string\) => revertFiles/.test(model),
+    'every route to `git_rollback` goes through the confirmation: the unguarded call is '
+      + 'private to the hook, which is what stops the next caller skipping the dialog',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

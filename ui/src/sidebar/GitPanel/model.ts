@@ -784,7 +784,22 @@ function normalizeRepo(raw: unknown): { view: RepoView; parent: RepoId | null } 
     ...changelists,
     sidecarGroup('unversioned', 'Unversioned Files', 'unversioned', raw['unversioned']),
     sidecarGroup(IGNORED_GROUP, 'Ignored Files', 'ignored', raw['ignored']),
-  ].flatMap((g) => (g.entries.length > 0 ? [g] : []))
+    /*
+     * Empty *sibling* lists are dropped; an empty **changelist** is kept.
+     *
+     * The three sibling lists are derived from the walk, so an empty one is a group about
+     * nothing. A changelist is a thing the user made, and dropping it here deleted the whole
+     * create half of this feature: `git_changelist_create` answers with a tree in which the
+     * new list is necessarily empty, so the list vanished before it could be drawn, before
+     * `changelistsOf` could offer it as a move target, and before `findChangelistId` could
+     * read its id back — which made the chooser's inline *Create and move* fail every single
+     * time with "was created but the files did not move". It also meant a list could never be
+     * moved *back* into once its last file left it.
+     *
+     * A clean repository still renders nothing: `walkRepo` emits no rows for a repo with no
+     * files at all, whatever groups it carries.
+     */
+  ].flatMap((g) => (g.entries.length > 0 || g.kind === 'changelist' ? [g] : []))
 
   const view: RepoView = {
     id,

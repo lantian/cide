@@ -655,7 +655,19 @@ fn reverting_one_changelist_leaves_the_other_alone() {
     })
     .unwrap();
 
-    stage::rollback(&repo.root, &[selection("b.txt", Selection::Whole)]).expect("rollback");
+    // The paths come *out of the changelist*, exactly as `useGitPanel::revertGroup` takes them
+    // out of the group it was right-clicked on. Naming `b.txt` literally here would have left
+    // the test green with the sidecar removed entirely — it would no longer have been about
+    // changelists at all.
+    let filed: Vec<_> = changelist::load(&repo.root)
+        .get(&fixes)
+        .unwrap()
+        .paths
+        .iter()
+        .map(|p| selection(p, Selection::Whole))
+        .collect();
+    assert_eq!(filed.len(), 1, "the group menu reverts what the list holds");
+    stage::rollback(&repo.root, &filed).expect("rollback");
 
     assert_eq!(repo.read("b.txt"), b"one\n", "Fixes went back to HEAD");
     assert_eq!(
