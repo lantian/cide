@@ -51,6 +51,10 @@ for arg in "$@"; do
     # thing that can, short of a debugger. Off by default because it logs four synchronous
     # IPC round trips per character; see `ui/src/terminal/inputHost.ts`.
     --input-probe)    env_flags+=(CIDE_INPUT_PROBE=1) ;;
+    # Escape hatch from an upstream WebGL defect that permanently turns every frame into a
+    # full-screen rebuild — see `crates/cide-app/src/windows.rs`. Try this if typing or output
+    # feels slow.
+    --dom-renderer)   env_flags+=(CIDE_RENDERER=dom) ;;
     --on-top)         env_flags+=(CIDE_ON_TOP=1) ;;
     --fresh)          fresh=1 ;;
     *) echo "unknown option: $arg" >&2; sed -n '20,29p' "$0" >&2; exit 2 ;;

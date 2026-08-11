@@ -121,6 +121,26 @@ pub fn create(
     } else {
         ""
     };
+    // `CIDE_RENDERER=dom` makes every terminal use xterm's DOM renderer instead of WebGL.
+    //
+    // Not a preference — an escape hatch from a confirmed upstream defect. In
+    // `@xterm/addon-webgl` 0.19.0, `TextureAtlas._requestClearModel` is set to `true` in two
+    // places (an atlas page merge, and an oversized-glyph overflow) and is **never set back to
+    // `false` anywhere**; `beginFrame()` reads it without consuming it. `WebglRenderer.ts:346`
+    // branches on that read, so from the first page merge onward *every frame* runs
+    // `_clearModel(true)` and rebuilds all rows rather than the changed ones — permanently, for
+    // the life of that terminal. A long session is guaranteed to trip it eventually.
+    //
+    // WebKitGTK makes it worse and undiagnosable: `WEBGL_debug_renderer_info` is masked, so a
+    // software rasterizer is indistinguishable from a real GPU, and a full per-frame texture
+    // upload on a software path is exactly the "typing is very slow" report this came from.
+    //
+    // `dom` is the only value that changes anything; anything else keeps the pooled WebGL path.
+    let renderer = if std::env::var("CIDE_RENDERER").is_ok_and(|v| v == "dom") {
+        "&renderer=dom"
+    } else {
+        ""
+    };
     // `CIDE_AUDIT_WINDOWS=1` runs M5's acceptance check: detach and re-dock round trips and
     // window-mode flips, asserting no session is lost to any of them.
     let wins = if std::env::var_os("CIDE_AUDIT_WINDOWS").is_some() {
@@ -139,7 +159,7 @@ pub fn create(
     };
     let url = WebviewUrl::App(
         format!(
-            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}{input_probe}",
+            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}",
             label.as_str()
         )
         .into(),
