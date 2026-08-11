@@ -4,6 +4,7 @@
   "cide://fs-status",
   "cide://git-status",
   "cide://ipc-degraded",
+  "cide://session-awaiting",
   "cide://session-state",
   "cide://session-status",
   "cide://session-tool",

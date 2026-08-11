@@ -43,6 +43,50 @@
   color: var(--faint);
 }
 
+/*
+ * "This session has finished and is waiting for you."
+ *
+ * Always in the box, filled only when it means something. `visibility` and `opacity` are both
+ * ways of saying that; neither takes the space back, which is the whole requirement — the bar
+ * sits directly above the pane body, so a marker that appeared and pushed one pixel would
+ * change every terminal's row count in the tab and reflow a `claude` that is mid-answer. That
+ * is a notification costing the thing it notifies you about.
+ *
+ * Fixed `width`/`height` with `flex: none` rather than a padded glyph: a text marker's box
+ * depends on the font the user has, and the reserved space has to be the same in every theme
+ * and at every zoom.
+ */
+.marker {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin: 0 6px;
+  border-radius: 50%;
+  background: transparent;
+}
+
+/*
+ * `--yellow` rather than `--accent`, and it carries both themes without a second rule.
+ *
+ * The accent is this app's "here you are" colour — the focus ring, the active tab, the
+ * pressed toggle — and it is already on the frame of the pane the user is looking at. A
+ * marker meaning "come back to *this* one" has to read as different from that at a glance in
+ * a window holding six panes, or it is one more accent dot in a bar full of them.
+ *
+ * `--yellow` is one of the six tokens `tokens.css` pitches per theme *as a text colour*: a
+ * dark amber (#8a5a00) on the light theme's near-white chrome, a light amber (#dfae68) on
+ * dark. Both are legible against their own `--chrome` without this file knowing which theme
+ * it is in, which is exactly what a token is for. The 1px halo in the bar's own colour keeps
+ * the edge crisp on either ground; the soft outer glow is what makes a 7px dot findable
+ * across a wide window without making it large enough to reserve more space.
+ */
+.markerOn {
+  background: var(--yellow);
+  box-shadow:
+    0 0 0 1px var(--chrome),
+    0 0 4px var(--yellow);
+}
+
 .title {
   flex: 1;
   text-align: center;
@@ -96,4 +140,66 @@
 
 .actionDisabled:hover {
   color: inherit;
+}
+
+/*
+ * Window controls, drawn only in a `pane:<uuid>` window.
+ *
+ * The user's report was that a detached window can only be re-docked and "should have same
+ * variants of maximize, close, etc". These are those: minimize, maximize/restore, close, in
+ * the desktop's own order, acting on the OS window rather than on the pane.
+ *
+ * # Why this nesting depth
+ *
+ * `DetachedPaneWindow.module.css` carries
+ *
+ *     .body [data-audit='paneTitle'] button { display: none; }
+ *
+ * written when this bar had no way to withhold its three pane actions — its own comment says
+ * "If that prop is added, delete this rule." The prop now exists (`PaneTitleBar` renders the
+ * window controls *instead of* the pane actions in a detached window), so **that rule should
+ * be deleted**; until it is, it would hide these three too. `.bar .controls .control` is
+ * three classes to its two-classes-plus-an-element, which wins on the class count, so the
+ * controls survive either way. This is a stated overlap, not an accident — delete the other
+ * rule and this selector can lose a level.
+ */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.bar .controls .control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  align-self: stretch;
+  background: transparent;
+  border: 0;
+  color: var(--dim);
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+}
+
+.bar .controls .control:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.bar .controls .control:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * Red on hover only, the way a traffic light behaves everywhere else. Not red at rest: the
+ * gesture re-docks the pane and kills nothing, so a permanently red control in the corner of
+ * every detached window would advertise a danger that is not there.
+ */
+.bar .controls .controlClose:hover {
+  background: var(--red);
+  color: var(--on-accent);
 }

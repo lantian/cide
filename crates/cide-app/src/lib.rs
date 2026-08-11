@@ -102,6 +102,13 @@ fn restore_windows(app: &tauri::AppHandle) -> tauri::Result<()> {
         };
         windows::create(app, &label, &title, None)?;
     }
+
+    // Every window above was built with a placeholder name — "cide" for a shell, whatever the
+    // pane was last called for a detached one — because this runs before anything has read the
+    // workspace for a *title*. `retitle` derives all of them from the tree that was just
+    // loaded, so a `PerProject` shell comes back named after its project instead of after the
+    // application. The awaiting count is zero at this point and adds nothing.
+    crate::cmd::window::retitle(app, &saved);
     Ok(())
 }
 
@@ -305,6 +312,8 @@ pub fn run() {
             cmd::window::window_set_mode,
             cmd::window::window_close,
             cmd::window::window_list,
+            cmd::window::window_set_awaiting,
+            cmd::window::window_awaiting_sessions,
             cmd::fs::fs_index,
             cmd::fs::fs_close,
             cmd::fs::fs_status,

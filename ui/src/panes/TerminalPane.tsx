@@ -12,8 +12,11 @@ import { useEffect, useRef } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
+import { useContextMenu, type MenuEntry } from '@/menus'
 import { exitMarkerBytes, markFor } from './exitMarker'
+import { acknowledge } from './awaiting'
 import {
+  clipboard,
   diag,
   events,
   paneSession,
@@ -279,6 +282,44 @@ async function sessionIsLive(session: string): Promise<boolean> {
   )
 }
 
+/**
+ * Send text to the child as if it had been typed.
+ *
+ * This is the whole of Paste, and it is why the item can exist at all: WebKit refuses
+ * `document.execCommand('paste')` from page script, so the native menu's Paste is the only
+ * one that works on a plain input — see `menus/model.ts`. A terminal is the one surface where
+ * that limitation does not bite, because "paste" here means *write bytes to a pty*, and this
+ * app already writes bytes to a pty on every keystroke.
+ *
+ * Bracketed paste is deliberately not added around it. Whether the child wants
+ * `ESC[200~ … ESC[201~` is the child's own DECSET 2004 state, which lives in the vt100 mirror
+ * on the Rust side and is not on the wire; wrapping unconditionally would make a plain `bash`
+ * print the literal escape codes. The cost of not wrapping is that a multi-line paste into
+ * `claude` submits at the first newline, which is the same thing typing it would do.
+ */
+async function pasteInto(paneId: string): Promise<void> {
+  const id = getHost(paneId).sessionId
+  if (!id) return
+  const text = await clipboard.readText()
+  if (text === '') return
+  await sessionApi.write(id, text)
+}
+
+/**
+ * Put the terminal's selection on the system clipboard.
+ *
+ * Through the Tauri plugin rather than `navigator.clipboard.writeText`. The async Clipboard
+ * API needs a secure context and a user-gesture-adjacent permission decision, and a menu item
+ * activated by keyboard is on the wrong side of that in WebKitGTK — the write silently
+ * resolves against nothing. The plugin writes through the compositor's own selection, which
+ * is what every other application on the desktop reads.
+ */
+async function copySelection(paneId: string): Promise<void> {
+  const text = getHost(paneId).terminal?.term.getSelection() ?? ''
+  if (text === '') return
+  await clipboard.writeText(text)
+}
+
 async function sessionFor(paneId: string, spec: TerminalSpec, geometry: Geometry): Promise<string> {
   const host = getHost(paneId)
   // The host may already know its session: this pane is re-mounting, or it was evicted and
@@ -330,6 +371,113 @@ export function TerminalPane({
   const restoreRef = useRef(restore)
   restoreRef.current = restore
   const domainSession = pane.session
+
+  /*
+   * The terminal body's own menu: copy, paste, clear, select all.
+   *
+   * Built at open time by `useContextMenu`, which is what lets Copy report *why* it is
+   * unavailable — there is no selection — instead of appearing enabled and doing nothing.
+   *
+   * `items` reads the live host rather than closing over anything: this component owns no
+   * part of the terminal (`paneHosts` does), and the host outlives every mount.
+   */
+  const menuItems = (): MenuEntry[] => {
+    const host = getHost(paneId)
+    const term = host.terminal?.term
+    const selection = term?.getSelection() ?? ''
+    return [
+      {
+        id: 'copy',
+        label: 'Copy',
+        // No `command`: there is no `edit.copy` in `cide-core::commands`, and naming one that
+        // does not exist would put an empty chip slot beside the item for ever. Copy in a
+        // terminal is Ctrl+Shift+C by convention and is the terminal's own binding, not the
+        // key gate's.
+        run:
+          selection === ''
+            ? undefined
+            : () => {
+                void copySelection(paneId).catch((error: unknown) => {
+                  console.error('[cide] copy failed', error)
+                })
+              },
+        disabledReason: selection === '' ? 'Nothing is selected in this terminal' : undefined,
+      },
+      {
+        id: 'paste',
+        label: 'Paste',
+        command: 'terminal.paste',
+        run:
+          host.sessionId === undefined
+            ? undefined
+            : () => {
+                void pasteInto(paneId).catch((error: unknown) => {
+                  console.error('[cide] paste failed', error)
+                  void diag
+                    .log(`pane ${paneId}: paste failed — ${String(error)}`)
+                    .catch(() => {})
+                })
+              },
+        disabledReason: host.sessionId === undefined ? 'This pane has no session yet' : undefined,
+      },
+      { kind: 'separator' },
+      {
+        id: 'select-all',
+        label: 'Select all',
+        run: term === undefined ? undefined : () => term.selectAll(),
+      },
+      {
+        id: 'clear',
+        label: 'Clear',
+        command: 'terminal.clear',
+        // xterm's own scrollback, not the child's and not the Rust screen mirror.
+        //
+        // Clearing the mirror would need a command, and that command would be wrong: the
+        // mirror is per *session*, so one pane clearing it would blank the mirrored pane
+        // beside it and the detached window showing the same conversation. What this cannot
+        // promise is that the transcript stays gone if this host is later evicted and
+        // rehydrated — that path re-reads the mirror by design, because it is the only way a
+        // rehydrated pane has any history at all.
+        run: term === undefined ? undefined : () => term.clear(),
+      },
+      { kind: 'separator' },
+      {
+        /*
+         * Interrupt, as a real thing rather than a menu entry for a command nobody wired.
+         *
+         * `claude.restart`, `claude.fork` and `claude.mirror` are the other three the brief
+         * names, and none of them is reachable from here: each needs the project and tab a
+         * pane sits in, which only `App.tsx` holds. They are reported rather than drawn —
+         * an item that logs "command not handled by this window" is the dead control this
+         * project keeps finding.
+         *
+         * This one needs none of that. Interrupting is `ETX` on the pty, which is the same
+         * write every keystroke in this pane already performs.
+         */
+        id: 'interrupt',
+        label: 'Interrupt',
+        run:
+          host.sessionId === undefined
+            ? undefined
+            : () => {
+                const id = host.sessionId
+                if (id === undefined) return
+                acknowledge(id)
+                void sessionApi.write(id, '\x03').catch((error: unknown) => {
+                  reportWriteFailure(paneId, error)
+                })
+              },
+        disabledReason: host.sessionId === undefined ? 'This pane has no session yet' : undefined,
+      },
+    ]
+  }
+
+  const { openAt, menu } = useContextMenu({ label: 'Terminal', items: menuItems })
+  // The effect below binds a *native* listener to a DOM node React does not own, and it is
+  // keyed on the pane rather than on every render — so the handler it captures has to be a
+  // ref, or the menu would be built from the first render's closure for ever.
+  const openMenu = useRef(openAt)
+  openMenu.current = openAt
 
   useEffect(() => {
     let disposed = false
@@ -495,12 +643,44 @@ export function TerminalPane({
     const onData = term.onData((data) => {
       const id = getHost(paneId).sessionId
       if (!id) return
+      // Typing at a session is the clearest possible statement that the user has seen it, so
+      // it clears the awaiting marker and this window's contribution to `Awaiting: X`.
+      acknowledge(id)
       // `void` with no `catch` was swallowing the one failure a user cannot diagnose: a
       // keystroke that never reached the child looks exactly like a keystroke the child
       // ignored. Once per pane, because if writes are failing they are failing on every
       // character and a per-keystroke log is its own outage.
       sessionApi.write(id, data).catch((e) => reportWriteFailure(paneId, e))
     })
+
+    /*
+     * The terminal's own context menu, bound natively.
+     *
+     * React does not own this element — `paneHosts` builds it once and `PaneSlot` moves it
+     * between slots — so there is no JSX node to hang `onContextMenu` on. A wrapper `<div>`
+     * around `PaneSlot` was the alternative and it loses: the host inside resolves
+     * `inset: 0` against the slot, so an extra box in that chain is one more place for a
+     * height to come out zero, which is the failure mode `PaneSlot`'s own comment is about.
+     *
+     * `data-native-menu="false"` opts the whole subtree out of the webview's menu. The global
+     * suppression already covers everything that is not a text entry, and xterm's helper
+     * *is* a `<textarea>` — sitting under the cursor, so a right-click at the caret would
+     * otherwise get WebKit's menu, with "Inspect element" in it, over our own.
+     */
+    const hostEl = getHost(paneId).el
+    hostEl.setAttribute('data-native-menu', 'false')
+    const onMenu = (ev: MouseEvent) => {
+      ev.preventDefault()
+      // The innermost surface's menu wins — `useContextMenu`'s stated rule, enforced here by
+      // hand because this is a native listener rather than a React one. React 19 delegates to
+      // the root container, so stopping the native event is what keeps an outer surface from
+      // also opening one. (The pane title bar's own menu is not among them: its handler is on
+      // the 26px bar, which the terminal is not inside.)
+      ev.stopPropagation()
+      const target = ev.target instanceof HTMLElement ? ev.target : null
+      openMenu.current(ev.clientX, ev.clientY, target)
+    }
+    hostEl.addEventListener('contextmenu', onMenu)
 
     // Exit arrives as an event now. It used to be a `session.hasExited` round trip per pane
     // per second, forever, in every window — twelve panes was twelve IPC calls a second to
@@ -530,6 +710,10 @@ export function TerminalPane({
       disposed = true
       onData.dispose()
       unlistenExit?.()
+      // The host outlives this mount, so the listener has to come off with it — otherwise a
+      // pane remounted by a split would accumulate one right-click handler per mount and open
+      // as many menus.
+      hostEl.removeEventListener('contextmenu', onMenu)
       const id = getHost(paneId).sessionId
       // Detach the sink, never the session: the child keeps running and this pane can be
       // re-attached from another window without the process noticing. By pane, so closing
@@ -542,5 +726,11 @@ export function TerminalPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paneId, domainSession])
 
-  return <PaneSlot paneId={paneId} className={className} onResize={() => syncSize(paneId)} />
+  return (
+    <>
+      <PaneSlot paneId={paneId} className={className} onResize={() => syncSize(paneId)} />
+      {/* Portals out of here entirely; it is in the tree so React owns its lifetime. */}
+      {menu}
+    </>
+  )
 }

@@ -28,6 +28,7 @@ use cide_pty::{Exit, PtySession};
 use tauri::{AppHandle, Manager};
 
 use crate::state::SessionRegistry;
+use crate::windows;
 use crate::workspace_state::WorkspaceState;
 
 /// Set the first time [`shutdown`] runs, because it can be reached twice: the signal thread
@@ -397,6 +398,23 @@ fn report_exit(app: &AppHandle, id: SessionId, exit: &Exit) {
     // by asking which sessions are live must not be told this one still is.
     if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
         hooks.forget(id);
+    }
+
+    // And the waiting set, for the same reason one rung up: a `claude` killed while it was
+    // waiting for the user would otherwise keep an `Awaiting: 1` in a task-bar entry for the
+    // life of the process, with the pane gone and therefore no gesture left that could
+    // acknowledge it. The frontend cannot clear this one either — its own rule drops the
+    // session on `Exited`, but only in a window that was listening at the time.
+    //
+    // Retitling needs the workspace, so it is done here rather than in `windows.rs`: this
+    // runs on `cide-pty`'s reaper thread, and `WorkspaceState` is behind the same lock every
+    // command takes, which is why the snapshot is read and released before the titles are set.
+    if windows::forget_awaiting(id)
+        && let Some(state) = app.try_state::<WorkspaceState>()
+    {
+        let ws = state.snapshot();
+        crate::cmd::window::retitle(app, &ws);
+        crate::emit::session_awaiting(app, windows::awaiting_sessions());
     }
 
     // The session stays in the registry. Its screen mirror is the last thing the child

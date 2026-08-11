@@ -1374,3 +1374,57 @@ export const projectMenu = {
   /** Show a project's primary root in the desktop's file manager. Answers with the path. */
   reveal: (projectId: ProjectId) => invoke<string>('project_reveal', { project: projectId }),
 }
+
+/* --------------------------------------------------------------------------------------
+ * M12 — "Awaiting: X", and the clipboard the terminal's own menu needs.
+ *
+ * One contiguous block, appended rather than folded into the namespaces above, per the
+ * house rule for this file.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Sessions that have finished processing and are waiting for the user.
+ *
+ * The *decision* is `panes/awaitingRule.ts` — it needs one bit of history that `SessionState`
+ * does not carry, so it cannot be made from a single event on either side. The *aggregation*
+ * is Rust's, because only Rust knows which pane is shown in which OS window and only Rust can
+ * rename an OS window: a webview has no access to its own title bar.
+ *
+ * Reports are per session and idempotent. Every window observes the same
+ * `cide://session-state` broadcasts and will report the same answer, which costs a command
+ * and changes nothing; a window that has only just opened has observed nothing and therefore
+ * reports nothing, which is exactly right — a whole-set report from a fresh window would
+ * clear every marker in the app.
+ */
+export const awaiting = {
+  /**
+   * Record whether `session` is waiting on the user. Rust retitles every affected window and
+   * broadcasts the new set on `cide://session-awaiting`.
+   */
+  set: (session: SessionId, isAwaiting: boolean) =>
+    invoke<void>('window_set_awaiting', { session, awaiting: isAwaiting }),
+
+  /**
+   * The set as Rust currently holds it, asked once per window.
+   *
+   * `cide://session-awaiting` below is a *change* notification, so a window that opens
+   * between two changes hears nothing — and a window built by a detach is exactly that. Rust
+   * has already put `Awaiting: 1` in its OS title by the time its pane renders, so without
+   * this ask the title bar and the pane's own marker disagree in the window the user tore out
+   * *because* it was waiting.
+   */
+  current: () => invoke<SessionId[]>('window_awaiting_sessions'),
+}
+
+/**
+ * The authoritative waiting set, after any window's report.
+ *
+ * Broadcast rather than answered to the caller so a window that opened *after* a session
+ * started waiting still paints its marker — it has no history of its own to derive that from.
+ *
+ * A standalone listener rather than a member of `events`, matching `onIpcDegraded` above: the
+ * append-only rule for this file means a new event cannot reach inside an existing object
+ * literal.
+ */
+export const onSessionAwaiting = (handler: (sessions: SessionId[]) => void) =>
+  listen<{ sessions: SessionId[] }>('cide://session-awaiting', (e) => handler(e.payload.sessions))
