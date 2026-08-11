@@ -42,6 +42,7 @@ import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
+import { requestReveal } from '@/editor/revealRequest'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -637,11 +638,19 @@ export function App() {
           {view === 'search' && (
             <SearchPanel
               project={activeProjectId}
-              onOpenHit={(path) => {
-                // The line number is dropped: `file.open` has no reveal-line seam yet, so
-                // the hit opens its file at the top. Opening the wrong line beats not
-                // opening at all, and the signature already carries it for when it lands.
-                if (activeProjectId) void fileApi.open(activeProjectId, path).then(() => hydrate())
+              onOpenHit={(path, line, column, endColumn) => {
+                if (!activeProjectId) return
+                // The caret, which is the half the user reported missing — a search result
+                // that opens the file at the top has not gone to the found place.
+                //
+                // Requested BEFORE the open, and that ordering is the design rather than a
+                // preference: the editor for this path usually does not exist yet, so the
+                // request is parked and spent by the mount the `file.open` below causes. A
+                // file already open is revealed immediately instead. See
+                // `editor/revealRequest.ts` — the parked request expires, so one for a file
+                // that never opens cannot fire when the user opens it by hand an hour later.
+                requestReveal(path, { line, column, endColumn })
+                void fileApi.open(activeProjectId, path).then(() => hydrate())
               }}
             />
           )}

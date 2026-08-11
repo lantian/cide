@@ -1592,6 +1592,28 @@ try {
     }
   }
 
+  // --- and that the one caller which can request a reveal actually does ------------------
+  //
+  // `revealRequest.ts` is a registry: the receiving half lives in `EditorSurface` and the
+  // requesting half is `App.tsx`, which is the only place that knows a search hit was
+  // clicked. Everything above tests the module in isolation, and the module passed its own
+  // tests while nothing in the app ever called it — the file opened at the top and the
+  // user's report stood. That is this project's most repeated defect, so it gets a gate.
+  //
+  // A source assertion. It proves the call is written, not that the caret lands — the clamp
+  // and the queue above cover the landing. Both halves are checked, because either one alone
+  // is a feature that does nothing: a four-argument callback that discards three arguments
+  // reads as correct, and so does a `requestReveal` nobody calls.
+  const appSrc = readFileSync('src/App.tsx', 'utf8')
+  ok(
+    /requestReveal\(/.test(appSrc),
+    'App.tsx calls `requestReveal` — without it a search hit opens the file at the top',
+  )
+  ok(
+    /onOpenHit=\{\(path, line, column, endColumn\)/.test(appSrc),
+    'App.tsx receives all four `onOpenHit` arguments — dropping them is how this shipped dead',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s) out of ${checked} checks`)
   } else {
