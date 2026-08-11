@@ -399,6 +399,63 @@ mod tests {
         ));
     }
 
+    /// A **broken symlink** is a name that is taken, and has to be reported as one.
+    ///
+    /// The `symlink_metadata` half of the existence check exists only for this, and until this
+    /// test it was a line with a comment and nothing holding it: `Path::exists` follows the
+    /// link and answers `false` for a dangling one, so dropping the extra call left every
+    /// assertion in this file passing while the user got `create_new`'s raw `EEXIST` — an
+    /// `Io` about a file the tree is plainly showing them.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_is_a_name_that_is_taken_not_an_eexist_from_the_syscall() {
+        let dir = scratch("ops-create-in-dangling");
+        let roots = vec![dir.path().to_path_buf()];
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("link.rs")).unwrap();
+        assert!(!dir.join("link.rs").exists(), "the link must be dangling");
+
+        assert!(
+            matches!(
+                create_in(&roots, dir.path(), "link.rs", false),
+                Err(FsError::Exists(_))
+            ),
+            "a dangling symlink reported as anything but Exists"
+        );
+        assert!(matches!(
+            create_in(&roots, dir.path(), "link.rs", true),
+            Err(FsError::Exists(_))
+        ));
+        // And the link itself is untouched — nothing was written through it to `nowhere`.
+        assert!(dir.join("link.rs").symlink_metadata().is_ok());
+        assert!(!dir.join("nowhere").exists());
+    }
+
+    /// A parent that is a *file* is refused like one that vanished, not opened as a directory.
+    ///
+    /// Reachable from the frontend the moment `targetFor` is asked about a row that changed
+    /// kind under it — a directory replaced by a file between the right-click and the click.
+    #[test]
+    fn a_parent_that_is_a_file_is_refused() {
+        let dir = scratch("ops-create-in-file-parent");
+        let roots = vec![dir.path().to_path_buf()];
+        std::fs::write(dir.join("notadir"), "x").unwrap();
+
+        // The *message* is the assertion, not the variant. `Err(Io)` also comes out of this
+        // function when nothing checked the parent at all and `open(2)` returned `ENOTDIR` —
+        // the panel then says "Not a directory (os error 20)" about a row the user can see,
+        // which is the syscall-shaped refusal `check_name` and this branch exist to replace.
+        let Err(FsError::Io { message, .. }) =
+            create_in(&roots, &dir.join("notadir"), "a.rs", false)
+        else {
+            panic!("a file was accepted as a parent directory");
+        };
+        assert!(
+            message.contains("no longer a directory"),
+            "the refusal has to say what is wrong with the parent, not quote errno: {message}"
+        );
+        assert_eq!(read_to_string(&dir.join("notadir")).unwrap(), "x");
+    }
+
     #[test]
     fn creating_outside_the_project_root_is_refused_rather_than_obeyed() {
         let dir = scratch("ops-create-in-outside");
@@ -424,6 +481,21 @@ mod tests {
         assert!(
             !dir.path().parent().unwrap().join("escaped.rs").exists(),
             "a `..` in the name must not write beside the project"
+        );
+
+        // A separator in the name with the directory it names **already there**. This is the
+        // case where dropping `check_name` is silent rather than noisy: every other test above
+        // would still fail with an `Io` from `ENOENT`, and this one would quietly succeed —
+        // the user asks for a file called `sub/a.rs` beside `main.rs` and gets one inside a
+        // folder, which is a different place with no message.
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        assert!(matches!(
+            create_in(&roots, dir.path(), "sub/a.rs", false),
+            Err(FsError::InvalidPath(_))
+        ));
+        assert!(
+            !dir.join("sub/a.rs").exists(),
+            "a name with a separator was obeyed as a path"
         );
     }
 

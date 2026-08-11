@@ -197,6 +197,18 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    * *after* pressing Enter is the thing this whole module is trying not to be.
    */
   const [draftName, setDraftName] = useState('')
+  /**
+   * Whether Enter has already been pressed on this draft and refused.
+   *
+   * The empty box deliberately shows its *destination* rather than "Type a file name." — a red
+   * message on a field nobody has touched reads as a failure before anything was attempted.
+   * But that made Enter on an empty box do nothing at all and say nothing at all, which is the
+   * dead control this panel keeps shipping in a new costume. Once Enter has been pressed the
+   * verdict is shown for what it is, empty name included.
+   */
+  const [draftTried, setDraftTried] = useState(false)
+  /** A `fs_create_in` is in flight for the open draft. See `commitDraft`. */
+  const creating = useRef(false)
 
   /** Report a rejected file command, in the panel and in the log. */
   const fail = useCallback(
@@ -364,6 +376,9 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    */
   const startDraft = useCallback((target: NewEntryTarget, directory: boolean) => {
     setDraftName('')
+    setDraftTried(false)
+    // A create still in flight belongs to the draft being replaced, not to this one.
+    creating.current = false
     setProblem(null)
     void useFileTree
       .getState()
@@ -393,13 +408,30 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       const current = useFileTree.getState().draft
       if (current === null) return
       const name = nameToSend(raw, current.siblings, current.directory)
-      // Refused locally. The note strip is already showing why — it is driven by the same
-      // `checkName` over the same text — so there is nothing to do but decline to close.
-      if (name === null) return
+      // Refused locally. The note strip is driven by the same `checkName` over the same text,
+      // so for every *typed* name it is already showing the reason — but the EMPTY box shows
+      // its destination instead, on purpose, and without this flag Enter on an empty box did
+      // nothing and said nothing. `draftTried` makes the strip stop being polite.
+      if (name === null) {
+        setDraftTried(true)
+        return
+      }
+      // One create per draft, however many times Enter is pressed.
+      //
+      // `treeStore.commitDraft` only clears `draft` *after* its round trip, so a second Enter
+      // during it passed this guard's absence and issued a second `fs_create_in` for the same
+      // name. The second one loses the race it started and reports “already exists” about the
+      // file the first one had just made for you — a refusal that is true, useless, and
+      // indistinguishable from the gesture having failed.
+      if (creating.current) return
+      creating.current = true
       const what = current.directory ? 'New Folder' : 'New File'
       void useFileTree
         .getState()
         .commitDraft(name)
+        .finally(() => {
+          creating.current = false
+        })
         .then((created) => {
           if (created !== null) return
           // Created, and no row for it. Almost always a dot-file the project's ignore rules
@@ -421,6 +453,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   const cancelDraft = useCallback(() => {
     useFileTree.getState().cancelDraft()
     setDraftName('')
+    setDraftTried(false)
   }, [])
 
   /**
@@ -428,9 +461,13 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    *
    * The **empty** box is deliberately not an error. It is empty the moment it opens, and a red
    * "Type a file name." on an untouched field reads as a failure before anything was
-   * attempted — so an untouched box says where the file is going instead, which is the thing
-   * the user cannot otherwise check. `checkName` still refuses the empty name on Enter; this
-   * only decides how it is drawn.
+   * attempted — so an *untouched* box says where the file is going instead, which is the thing
+   * the user cannot otherwise check.
+   *
+   * "Untouched" has to include "Enter has not been pressed", or the politeness turns into
+   * silence: `checkName` refuses the empty name, `commitDraft` declines to close the box, and
+   * the strip goes on cheerfully naming a destination — a keypress that does nothing and says
+   * nothing. `draftTried` is set by that refusal and shows the real verdict from then on.
    */
   const draftMessage: { text: string; bad: boolean } = (() => {
     if (draft === null) return { text: '', bad: false }
@@ -438,7 +475,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       ? basenameOf(draft.parent)
       : relativeTo(draft.parent, roots)
     const destination = `New ${draft.directory ? 'folder' : 'file'} in ${where}`
-    if (draftName.trim() === '') return { text: destination, bad: false }
+    if (draftName.trim() === '' && !draftTried) return { text: destination, bad: false }
     const verdict = checkName(draftName, draft.siblings, draft.directory)
     if (verdict.error !== null) return { text: verdict.error, bad: true }
     if (verdict.note !== null) return { text: verdict.note, bad: false }
@@ -791,6 +828,26 @@ function DraftRow({
    * mis-ordered render away from stealing focus back from whatever the user moved to.
    */
   const focused = useRef(false)
+  const input = useRef<HTMLInputElement | null>(null)
+
+  /*
+   * Take focus back when the *window* does.
+   *
+   * Paired with the `document.hasFocus()` guard on `onBlur` below, and pointless without it.
+   * Alt-tabbing to a browser to copy a filename fires `blur` on this input exactly as clicking
+   * off it does, so cancelling on every blur meant coming back to no box and no typing — work
+   * thrown away by a gesture the user did not make. The guard keeps the draft; this puts the
+   * caret back in it, because a mounted box nobody can type into is worse than either.
+   *
+   * Safe to focus unconditionally: this component only exists while a draft is open, and any
+   * in-app click that could have moved focus somewhere the user wanted would have cancelled
+   * the draft and unmounted it.
+   */
+  useEffect(() => {
+    const back = () => input.current?.focus()
+    window.addEventListener('focus', back)
+    return () => window.removeEventListener('focus', back)
+  }, [])
 
   return (
     <div
@@ -821,6 +878,7 @@ function DraftRow({
         placeholder={directory ? 'folder name' : 'file name'}
         aria-label={directory ? 'Name for the new folder' : 'Name for the new file'}
         ref={(el) => {
+          input.current = el
           if (el === null || focused.current) return
           focused.current = true
           el.focus()
@@ -829,7 +887,14 @@ function DraftRow({
         onMouseDown={(e) => e.stopPropagation()}
         // Cancel, not commit — see the component's own note. A file created by looking away
         // is a file nobody meant to make.
-        onBlur={onCancel}
+        //
+        // `document.hasFocus()` separates the two blurs that look identical here: the user
+        // clicking off the box, which is the abandon this is for, and the *window* going away,
+        // which is alt-tab and is not an answer to anything. It is false only in the second
+        // case; the effect above puts the caret back when the window returns.
+        onBlur={() => {
+          if (document.hasFocus()) onCancel()
+        }}
         onKeyDown={(e) => {
           // Every key belongs to the box. Without this, typing `e` in a filename is also an
           // End key on its way past the tree's own handler.

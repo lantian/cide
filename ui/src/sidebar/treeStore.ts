@@ -547,8 +547,21 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     await get().refresh()
     if (get().project !== project) return null
 
-    const at = get().indexOf(created)
-    if (at === null) {
+    // `indexOf` searches the *resident* chunks, so a miss means one of two very different
+    // things: the file genuinely has no row, or the cache does not currently hold the chunk
+    // it is in. `refresh` above can leave the cache untouched — it bails on its generation
+    // guard whenever anything else invalidated the tree while it was in flight, and the
+    // watcher's own event for the file we just created is exactly such a thing. Answering
+    // `null` on a cache miss therefore told the user "your ignore rules keep it out of the
+    // tree" about an ordinary `main.rs`, which is both wrong and unfixable-sounding.
+    //
+    // So the cache miss is re-asked of Rust, which is the only place that knows. `fs_reveal`
+    // answers `null` only when the path is not in the index at all — which is the claim the
+    // message actually wants to make. One extra round trip, on the miss path only.
+    const cached = get().indexOf(created)
+    const at =
+      cached ?? (await tree('fs_reveal', () => fsApi.reveal(project, created), null))
+    if (at === null || at < 0 || get().project !== project) {
       // Created, but no row — the project's ignore rules hide it. `.gitignore`d dot-files are
       // the ordinary case. Reported rather than papered over: a selection pointing at a path
       // with no row is a highlight nobody can see.
