@@ -27,6 +27,7 @@
  */
 import type {
   ChangeEntry,
+  ChangelistTarget,
   ChangesTree,
   DiffOpenMode,
   FileState,
@@ -59,6 +60,24 @@ export interface Row {
   repo: RepoId
   /** Repo rows only: the absolute work tree, for the row's tooltip. */
   root?: string
+  /**
+   * Group rows only: the `GroupView.id` — `cl:fixes`, `unversioned`, `ignored`, `conflicts`.
+   *
+   * Carried on the row rather than parsed back out of `Row.id`, because the row id is built
+   * with a NUL separator that exists precisely so nothing has to be parsed. The context menu
+   * needs the raw changelist id to send to `git_changelist_*`, and `changelistIdOf` is the one
+   * place that strips the `cl:` prefix.
+   */
+  group?: string
+  /**
+   * Which of the four lists this row is in — set on group rows **and on file rows**.
+   *
+   * The file rows need it because filing an untracked or ignored path into a changelist is a
+   * no-op the user cannot see: `cide_git::status` builds its `live` set from paths that are
+   * neither `Untracked` nor `Ignored`, so `reconcile` drops the assignment on the very next
+   * status walk. The menu therefore offers *Move to Changelist…* only where it does something.
+   */
+  groupKind?: GroupKind
   /** File rows only. */
   entry?: ChangeEntry
   /**
@@ -203,6 +222,8 @@ function walkRepo(
       depth: inner,
       label: group.name,
       repo: repo.id,
+      group: group.id,
+      groupKind: group.kind,
       expandable: true,
       count: group.entries.length,
       ...(group.active ? { active: true } : {}),
@@ -216,6 +237,7 @@ function walkRepo(
         depth: inner + 1,
         label: entry.path,
         repo: repo.id,
+        groupKind: group.kind,
         entry,
         changelist: entry.changelist,
         expandable: false,
@@ -594,6 +616,89 @@ export function allRepos(view: StatusView): RepoView[] {
 /** The repository a row belongs to, or `undefined` if the view moved under it. */
 export function repoOf(view: StatusView, id: RepoId): RepoView | undefined {
   return allRepos(view).find((r) => r.id === id)
+}
+
+// --- changelists ---------------------------------------------------------------------------
+
+/**
+ * The prefix `normalizeChangelist` puts on a changelist's group id.
+ *
+ * It exists so a user-created list called `ignored` cannot collide with the ignored sibling
+ * list's row id, and it means every group id that reaches a `git_changelist_*` command has to
+ * come back off. That stripping happens in exactly one place — `changelistIdOf` — because the
+ * failure mode of getting it wrong is a `NoSuchChangelist` on a menu item that looks fine.
+ */
+export const CHANGELIST_PREFIX = 'cl:'
+
+/** The changelist id behind a group id, or `null` when the group is not a changelist. */
+export function changelistIdOf(group: string | undefined): string | null {
+  if (group === undefined || !group.startsWith(CHANGELIST_PREFIX)) return null
+  return group.slice(CHANGELIST_PREFIX.length)
+}
+
+/** The default list. Rust refuses to delete it (`GitError::DefaultChangelist`). */
+export const DEFAULT_CHANGELIST = 'default'
+
+/** Every changelist in one repository, in the order Rust listed them, default first. */
+export function changelistsOf(view: StatusView, repo: RepoId): ChangelistTarget[] {
+  const found = repoOf(view, repo)
+  if (found === undefined) return []
+  return found.groups.flatMap((group) => {
+    const id = changelistIdOf(group.id)
+    return id === null
+      ? []
+      : [{ id, name: group.name, active: group.active, count: group.entries.length }]
+  })
+}
+
+/** One group by its `GroupView.id` — what a revert, a shelve or a group menu acts on. */
+export function groupOf(view: StatusView, repo: RepoId, group: string): GroupView | undefined {
+  return repoOf(view, repo)?.groups.find((g) => g.id === group)
+}
+
+/**
+ * Which files a menu gesture on `row` acts on.
+ *
+ * The right-clicked row alone, **unless** that row is itself ticked — then the ticks in the
+ * same repository, which is the multi-file selection IDEA's *Move to another changelist*
+ * operates on. There is no separate tree selection in this panel; the checkboxes are the only
+ * multi-row gesture there is.
+ *
+ * Same repo only: a changelist lives in one repository's sidecar, so a move that swept in a
+ * submodule's ticks would send paths to a `git_changelist_move_paths` that cannot file them.
+ *
+ * The caller is expected to put `count` in the menu label. That is the whole safeguard against
+ * the surprise `useGitPanel::fileVerb` warns about — *Move 4 Files to Changelist…* is a
+ * different sentence from *Move to Changelist…*, and the user reads it before clicking.
+ */
+export function actOn(
+  view: StatusView,
+  selected: ReadonlySet<string>,
+  row: Row,
+): { repo: RepoId; paths: string[] } {
+  const own = row.entry === undefined ? [] : [row.entry.path]
+  if (!selected.has(row.id)) return { repo: row.repo, paths: own }
+  const ticked = flatFiles(view).flatMap((f) =>
+    f.repo === row.repo && selected.has(f.id) && f.kind === row.groupKind ? [f.entry.path] : [],
+  )
+  return { repo: row.repo, paths: ticked.length > 0 ? ticked : own }
+}
+
+/**
+ * The id of the changelist called `name` in `repo`, from a tree Rust just answered with.
+ *
+ * `git_changelist_create` returns the new `ChangesTree` rather than the id it minted, and the
+ * id is a slug of the name with a collision suffix (`my-list`, `my-list-2`) that the frontend
+ * must not try to reproduce — two windows creating lists in the same repo would guess the same
+ * one. Looking the name up in the answer is exact, and it is the only step between "create"
+ * and "move these files into it" in the chooser's inline-create path.
+ */
+export function findChangelistId(
+  tree: ChangesTree,
+  repo: RepoId,
+  name: string,
+): string | null {
+  return changelistsOf(viewOf(tree), repo).find((l) => l.name === name)?.id ?? null
 }
 
 // --- normalisation ----------------------------------------------------------------------

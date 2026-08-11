@@ -64,10 +64,13 @@ import {
   allRepos,
   arrivals,
   buildRows,
+  changelistsOf,
   commitUnits,
   defaultExpanded,
   defaultSelection,
+  findChangelistId,
   flatFiles,
+  groupOf,
   inRepo,
   isIgnoredGroupRow,
   normalizeStatus,
@@ -79,7 +82,14 @@ import {
   type Row,
 } from './model'
 import { storyFromQuery, type GitStory } from './fixture'
-import type { ChangeEntry, DiffOpenMode, ShelfRow, StatusView } from './types'
+import type {
+  ChangeEntry,
+  ChangelistDialogState,
+  ConfirmState,
+  DiffOpenMode,
+  ShelfRow,
+  StatusView,
+} from './types'
 
 /**
  * Whole-file selections for a list of paths.
@@ -99,6 +109,22 @@ function wholeFiles(paths: string[]): PathSelection[] {
 }
 
 const EMPTY: StatusView = { repos: [] }
+
+/**
+ * The repository's name, or `''` when there is only one and naming it would be noise.
+ *
+ * The dialogs show it because a changelist belongs to exactly one repository's sidecar, and a
+ * monorepo user with four roots open otherwise has to guess which one *New changelist* meant.
+ */
+function repoLabel(view: StatusView, repo: RepoId): string {
+  if (allRepos(view).length < 2) return ''
+  return repoOf(view, repo)?.name ?? repo
+}
+
+/** `1 file` / `4 files`, so the dialogs and the menu labels agree on the wording. */
+function files(n: number): string {
+  return `${n} ${n === 1 ? 'file' : 'files'}`
+}
 
 /** Coalescing window for refresh bursts. One edit reports several paths. */
 const REFRESH_DEBOUNCE_MS = 60
@@ -139,6 +165,16 @@ export interface GitPanelModel {
   partials: readonly PartialEntry[]
   /** True when the panel is showing a fixture rather than a repository. */
   story: boolean
+  /** The changelist chooser, or `null`. Create, rename and move are all this one dialog. */
+  dialog: ChangelistDialogState | null
+  /**
+   * A pending destructive confirmation, or `null`.
+   *
+   * Held here rather than in the view so that the *model* owns the rule that revert never runs
+   * without one: an action that opened a dialog from inside a component could be bypassed by
+   * any other caller of `rollback`.
+   */
+  confirm: ConfirmState | null
 }
 
 export interface GitPanelActions {
@@ -164,9 +200,44 @@ export interface GitPanelActions {
    */
   stageFile: (repo: RepoId, path: string) => void
   unstageFile: (repo: RepoId, path: string) => void
+  /** Opens the confirmation. Nothing is destroyed until it is answered. */
   rollbackFile: (repo: RepoId, path: string) => void
+
+  // --- changelists -------------------------------------------------------------------------
+
+  /**
+   * Open the chooser on `New changelist`. `repo` is optional only because the toolbar button
+   * has no row under it; with more than one repository open the toolbar disables itself and
+   * the gesture comes from a repository row's menu instead, which does know.
+   */
+  newChangelist: (repo?: RepoId) => void
+  renameChangelist: (repo: RepoId, id: string) => void
+  /** Its paths fall back to the default list — no work is lost, so this does not confirm. */
+  deleteChangelist: (repo: RepoId, id: string) => void
+  setActiveChangelist: (repo: RepoId, id: string) => void
+  /** Open the chooser on `Move to changelist` for these repo-relative paths. */
+  moveToChangelist: (repo: RepoId, paths: string[]) => void
+  /** Throw away everything in one group. **Opens the confirmation**, which names every file. */
+  revertGroup: (repo: RepoId, group: string) => void
+  /** Same, for an explicit list of paths. */
+  revertFiles: (repo: RepoId, paths: string[]) => void
+  /** Shelve a whole group under its own name — the group menu's `Shelve Changelist`. */
+  shelveGroup: (repo: RepoId, group: string) => void
+  dismissDialog: () => void
+  /** The chooser's list rows: move the pending paths into an existing changelist. */
+  pickChangelist: (id: string) => void
+  /** The chooser's name field: create (and, in `move`, move), or rename. */
+  submitChangelistName: (name: string) => void
+  dismissConfirm: () => void
+  /** Answer the confirmation with "yes". The only thing that runs a `ConfirmState.run`. */
+  runConfirm: () => void
+
   shelve: () => void
   unshelve: (row: ShelfRow) => void
+  /** IDEA's *Unshelve and keep*: apply the patch and leave it on the shelf. */
+  unshelveKeep: (row: ShelfRow) => void
+  /** Remove a shelf entry without applying it. **Opens the confirmation.** */
+  dropShelf: (row: ShelfRow) => void
   /** Guard bar, left button: adopt git's index and drop our ticks for that repo. */
   reloadIndex: (repo: RepoId) => void
   /** Guard bar, right button: keep our ticks and let the next commit rewrite the index. */
@@ -221,6 +292,8 @@ export function useGitPanel(
   const [busy, setBusy] = useState<string | null>(null)
   const [message, setMessage] = useState('')
   const [amend, setAmendFlag] = useState(false)
+  const [dialog, setDialog] = useState<ChangelistDialogState | null>(null)
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null)
   /** Repos where the user answered the guard bar. Cleared when the divergence clears. */
   const [answered, setAnswered] = useState<ReadonlySet<RepoId>>(new Set())
   /** Repos where the answer was "overwrite": the next commit is sent with `force: true`. */
@@ -658,11 +731,270 @@ export function useGitPanel(
     () => fileVerb('git unstage', 'Unstaging…', gitApi.unstage),
     [fileVerb],
   )
-  /** **Destroys uncommitted work.** The menu marks it `danger` and names the file. */
-  const rollbackFile = useMemo(
-    () => fileVerb('git rollback', 'Rolling back…', gitApi.rollback),
-    [fileVerb],
+  /**
+   * The rollback itself, once the confirmation has been answered.
+   *
+   * Deliberately private. Everything that reaches this panel's most destructive command goes
+   * through `revertFiles`/`revertGroup`, which put a dialog in front of it — `git_rollback`
+   * checks HEAD out over the tracked paths and *deletes* the untracked ones, and `cmd/git.rs`
+   * will not ask ("a confirmation the backend cannot show is not a safeguard"). Keeping the
+   * unguarded version out of `GitPanelActions` is what stops the next caller from skipping it.
+   */
+  const doRollback = useCallback(
+    (repo: RepoId, paths: string[]) => {
+      if (project === null || paths.length === 0) return
+      void (async () => {
+        setBusy('Reverting…')
+        await guarded('git rollback', () => gitApi.rollback(project, repo, wholeFiles(paths)))
+        setBusy(null)
+        await refresh()
+      })()
+    },
+    [project, guarded, refresh],
   )
+
+  // --- changelists ---------------------------------------------------------------------------
+
+  /**
+   * Run a changelist mutation and adopt the tree it answers with.
+   *
+   * Every `git_changelist_*` handler returns the fresh `ChangesTree` rather than an
+   * acknowledgement, precisely so the panel does not have to ask again — see the header of
+   * `cmd/git.rs`. Calling `refresh()` after one would be a second full status walk of every
+   * root, and the frame in between shows a tree that is visibly wrong.
+   */
+  const mutate = useCallback(
+    (what: string, busyLabel: string, call: (p: ProjectId) => Promise<ChangesTree>) => {
+      if (project === null) return
+      void (async () => {
+        setBusy(busyLabel)
+        const tree = await guarded(what, () => call(project))
+        setBusy(null)
+        // A failure has already been reported by `guarded`; re-reading status is how the panel
+        // gets back to something true rather than to whatever it had before the attempt.
+        if (tree === undefined) await refresh()
+        else adopt(absorb(tree))
+      })()
+    },
+    [project, guarded, refresh, adopt, absorb],
+  )
+
+  const newChangelist = useCallback(
+    (repo?: RepoId) => {
+      const target = repo ?? allRepos(view)[0]?.id
+      if (target === undefined) return
+      setDialog({
+        mode: 'create',
+        repo: target,
+        repoName: repoLabel(view, target),
+        lists: changelistsOf(view, target),
+        id: null,
+        name: '',
+        paths: [],
+      })
+    },
+    [view],
+  )
+
+  const renameChangelist = useCallback(
+    (repo: RepoId, id: string) => {
+      const lists = changelistsOf(view, repo)
+      setDialog({
+        mode: 'rename',
+        repo,
+        repoName: repoLabel(view, repo),
+        lists,
+        id,
+        name: lists.find((l) => l.id === id)?.name ?? '',
+        paths: [],
+      })
+    },
+    [view],
+  )
+
+  const moveToChangelist = useCallback(
+    (repo: RepoId, paths: string[]) => {
+      if (paths.length === 0) return
+      // The list the paths are in *now*, when they all share one — the dialog disables that
+      // row, because moving a file to where it already is is a gesture that appears to work
+      // and changes nothing.
+      const here = new Set(
+        flatFiles(view)
+          .filter((f) => f.repo === repo && paths.includes(f.entry.path))
+          .map((f) => f.changelist),
+      )
+      setDialog({
+        mode: 'move',
+        repo,
+        repoName: repoLabel(view, repo),
+        lists: changelistsOf(view, repo),
+        id: here.size === 1 ? ([...here][0] ?? null) : null,
+        name: '',
+        paths,
+      })
+    },
+    [view],
+  )
+
+  const dismissDialog = useCallback(() => setDialog(null), [])
+
+  const deleteChangelist = useCallback(
+    (repo: RepoId, id: string) =>
+      mutate('git changelist delete', 'Deleting changelist…', (p) =>
+        gitApi.changelist.delete(p, repo, id),
+      ),
+    [mutate],
+  )
+
+  const setActiveChangelist = useCallback(
+    (repo: RepoId, id: string) =>
+      mutate('git changelist active', 'Switching changelist…', (p) =>
+        gitApi.changelist.setActive(p, repo, id),
+      ),
+    [mutate],
+  )
+
+  const pickChangelist = useCallback(
+    (id: string) => {
+      if (dialog === null || dialog.mode !== 'move') return
+      const { repo, paths } = dialog
+      setDialog(null)
+      mutate('git changelist move', 'Moving…', (p) =>
+        gitApi.changelist.movePaths(p, repo, id, [...paths]),
+      )
+    },
+    [dialog, mutate],
+  )
+
+  /**
+   * The chooser's name field: create, rename, or create-and-move.
+   *
+   * The last one is two round trips and cannot be one: `git_changelist_create` answers with
+   * the new `ChangesTree`, not with the id it minted, and that id is a slug of the name with a
+   * collision suffix the frontend must not try to reproduce. `findChangelistId` reads the id
+   * back out of the answer, which is exact. A dedicated `create_with_paths` command would make
+   * it atomic; it is not worth a new entry in the IPC contract for a window in which the only
+   * thing that can go wrong is that the list exists and the files did not move — visibly, in
+   * the tree, with the list right there to drop them on.
+   */
+  const submitChangelistName = useCallback(
+    (name: string) => {
+      if (dialog === null || project === null) return
+      const { mode, repo, id, paths } = dialog
+      setDialog(null)
+      if (mode === 'rename') {
+        if (id === null) return
+        mutate('git changelist rename', 'Renaming…', (p) =>
+          gitApi.changelist.rename(p, repo, id, name),
+        )
+        return
+      }
+      void (async () => {
+        setBusy(mode === 'move' ? 'Moving…' : 'Creating changelist…')
+        const created = await guarded('git changelist create', () =>
+          gitApi.changelist.create(project, repo, name),
+        )
+        if (created === undefined) {
+          setBusy(null)
+          await refresh()
+          return
+        }
+        if (mode !== 'move' || paths.length === 0) {
+          setBusy(null)
+          adopt(absorb(created))
+          return
+        }
+        const fresh = findChangelistId(created, repo, name)
+        if (fresh === null) {
+          setBusy(null)
+          // The list was created but cannot be found by name, so the files stayed put. Said
+          // out loud: a silent half-move is the failure this whole path exists to avoid.
+          note(
+            'git changelist move',
+            `“${name}” was created but the files did not move — move them from the menu`,
+          )
+          adopt(absorb(created))
+          return
+        }
+        const moved = await guarded('git changelist move', () =>
+          gitApi.changelist.movePaths(project, repo, fresh, [...paths]),
+        )
+        setBusy(null)
+        if (moved === undefined) await refresh()
+        else adopt(absorb(moved))
+      })()
+    },
+    [dialog, project, mutate, guarded, refresh, adopt, absorb, note],
+  )
+
+  // --- reverting, which is the one thing here with no undo ------------------------------------
+
+  const revertFiles = useCallback(
+    (repo: RepoId, paths: string[]) => {
+      if (paths.length === 0) return
+      setConfirm({
+        title: paths.length === 1 ? 'Revert this file?' : `Revert ${files(paths.length)}?`,
+        body:
+          'These files go back to their last committed state. Uncommitted work in them is '
+          + 'thrown away, and git has no undo for it.',
+        files: paths,
+        confirmLabel: `Revert ${files(paths.length)}`,
+        run: () => doRollback(repo, paths),
+      })
+    },
+    [doRollback],
+  )
+
+  /** **Opens the confirmation.** The menu marks it `danger` and the dialog names the file. */
+  const rollbackFile = useCallback(
+    (repo: RepoId, path: string) => revertFiles(repo, [path]),
+    [revertFiles],
+  )
+
+  /**
+   * *"i should be able to revert the group"*.
+   *
+   * The confirmation names every file rather than counting them, because the user is about to
+   * lose *specific* work — see `ConfirmDestructive`. The wording splits on the group's kind:
+   * an unversioned file has no committed state to go back to, so `stage::rollback` deletes it
+   * from disk, and calling that "revert" would be a lie about what the button does.
+   */
+  const revertGroup = useCallback(
+    (repo: RepoId, group: string) => {
+      const found = groupOf(view, repo, group)
+      if (found === undefined || found.entries.length === 0) return
+      const paths = found.entries.map((e) => e.path)
+      const untracked = found.kind === 'unversioned'
+      setConfirm({
+        title: untracked
+          ? `Delete ${files(paths.length)} in “${found.name}”?`
+          : `Revert “${found.name}”?`,
+        body: untracked
+          ? 'Git is not tracking these files, so there is nothing to restore them from. '
+            + 'They are deleted from disk.'
+          : `Every change in this changelist goes back to its last committed state. `
+            + 'Uncommitted work in these files is thrown away, and git has no undo for it.',
+        files: paths,
+        confirmLabel: untracked
+          ? `Delete ${files(paths.length)}`
+          : `Revert ${files(paths.length)}`,
+        run: () => doRollback(repo, paths),
+      })
+    },
+    [view, doRollback],
+  )
+
+  const dismissConfirm = useCallback(() => setConfirm(null), [])
+
+  const runConfirm = useCallback(() => {
+    // Cleared first, then run — and the run is *outside* the updater on purpose. React calls a
+    // state updater twice under StrictMode and may replay it at will, so a `run()` in there
+    // would roll back two changelists for one click. The same trap `useContextMenu::close`
+    // documents for its focus restore.
+    const pending = confirm
+    setConfirm(null)
+    pending?.run()
+  }, [confirm])
 
   /**
    * Read every repo's shelf.
@@ -706,18 +1038,90 @@ export function useGitPanel(
     })()
   }, [project, units, message, guarded, refresh, loadShelf])
 
-  const unshelve = useCallback(
-    (row: ShelfRow) => {
+  /**
+   * Shelve one whole group under its own name — the group menu's `Shelve Changelist`.
+   *
+   * Not routed through `units`, which is the ticked selection: the menu acts on the group that
+   * was right-clicked, and a changelist is very often not the one that is ticked. The name is
+   * the changelist's own rather than the commit message, because a shelf entry called after
+   * the list it came from is the one a user can find again.
+   *
+   * `commitSelections` rather than `wholeFiles`, so a partial selection held by the diff pane
+   * is honoured here too — shelving half a file is exactly what the shelf is for, and
+   * `shelf::shelve` resolves against `Combined`, the same side those selections were made on.
+   */
+  const shelveGroup = useCallback(
+    (repo: RepoId, group: string) => {
+      if (project === null) return
+      const found = groupOf(view, repo, group)
+      if (found === undefined || found.entries.length === 0) return
+      const paths = found.entries.map((e) => e.path)
+      void (async () => {
+        setBusy('Shelving…')
+        await guarded('git shelve', () =>
+          gitApi.shelf.shelve(project, repo, found.name, commitSelections(repo, paths)),
+        )
+        setBusy(null)
+        await refresh()
+        await loadShelf()
+      })()
+    },
+    [project, view, guarded, refresh, loadShelf],
+  )
+
+  /**
+   * Put a shelf entry back. `keep` is IDEA's *Unshelve and keep* — useful for applying the
+   * same change to two branches, and the reason `git_unshelve` takes the flag at all.
+   */
+  const unshelveWith = useCallback(
+    (row: ShelfRow, keep: boolean) => {
       if (project === null) return
       void (async () => {
-        setBusy('Unshelving…')
-        await guarded('git unshelve', () => gitApi.shelf.unshelve(project, row.repo, row.entry.id))
+        setBusy(keep ? 'Unshelving (keeping)…' : 'Unshelving…')
+        await guarded('git unshelve', () =>
+          gitApi.shelf.unshelve(project, row.repo, row.entry.id, keep),
+        )
         setBusy(null)
         await refresh()
         await loadShelf()
       })()
     },
     [project, guarded, refresh, loadShelf],
+  )
+
+  const unshelve = useCallback((row: ShelfRow) => unshelveWith(row, false), [unshelveWith])
+  const unshelveKeep = useCallback((row: ShelfRow) => unshelveWith(row, true), [unshelveWith])
+
+  /**
+   * Delete a shelf entry without applying it.
+   *
+   * Confirmed, and by the same dialog as a revert: the patch file is the only copy of that
+   * work — `shelve` rolled the working tree back after writing it — so dropping it is exactly
+   * as final as reverting, and the entry's own file list is what is at stake.
+   */
+  const dropShelf = useCallback(
+    (row: ShelfRow) => {
+      if (project === null) return
+      setConfirm({
+        title: `Delete the shelf entry “${row.entry.name}”?`,
+        body:
+          'The patch is the only copy of this work — shelving took it out of the working '
+          + 'tree. Deleting it cannot be undone.',
+        files: row.entry.files,
+        confirmLabel: 'Delete shelf entry',
+        run: () => {
+          void (async () => {
+            setBusy('Deleting shelf entry…')
+            await guarded('git shelf drop', () =>
+              gitApi.shelf.drop(project, row.repo, row.entry.id),
+            )
+            setBusy(null)
+            await loadShelf()
+          })()
+        },
+      })
+    },
+    [project, guarded, loadShelf],
   )
 
   /**
@@ -882,6 +1286,8 @@ export function useGitPanel(
     stagingArea,
     partials,
     story: story !== null,
+    dialog,
+    confirm,
     refresh: () => {
       void refresh()
       void loadShelf()
@@ -898,8 +1304,23 @@ export function useGitPanel(
     stageFile,
     unstageFile,
     rollbackFile,
+    newChangelist,
+    renameChangelist,
+    deleteChangelist,
+    setActiveChangelist,
+    moveToChangelist,
+    revertGroup,
+    revertFiles,
+    shelveGroup,
+    dismissDialog,
+    pickChangelist,
+    submitChangelistName,
+    dismissConfirm,
+    runConfirm,
     shelve,
     unshelve,
+    unshelveKeep,
+    dropShelf,
     reloadIndex,
     overwriteIndex,
     clearPartials: clearAllPartials,

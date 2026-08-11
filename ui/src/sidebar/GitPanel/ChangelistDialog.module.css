@@ -1,0 +1,234 @@
+/*
+ * The changelist chooser's body. The scrim and the 620px card come from `OverlayCard`
+ * (`overlays/Overlay.module.css`), so only what sits inside them is styled here — the same
+ * split `CloseConfirm.module.css` follows, and the reason the two dialogs cannot drift apart.
+ *
+ * Every colour is a token, and both themes come out of the tokens; nothing here hardcodes a
+ * light or a dark value.
+ */
+
+/*
+ * Re-declares the column rather than sitting in the card as a plain block: `OverlayCard` makes
+ * the card a flex column, and an ordinary wrapper would make the head, the lists and the footer
+ * children of *it* — the lists would stop being the only things that scroll and the footer
+ * would slide off the bottom of a tall dialog.
+ */
+.dialog {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.head {
+  flex: none;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+/* The repository, for a workspace with more than one. A changelist belongs to exactly one
+   repo, and a dialog that did not say which would be a guess in a monorepo. */
+.repo {
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.body {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--dim);
+}
+
+/*
+ * The paths being moved, named rather than counted.
+ *
+ * Capped and scrollable: a changelist can hold a hundred files, and a dialog taller than the
+ * window puts its own buttons off screen.
+ */
+.paths {
+  flex: none;
+  max-height: 132px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 8px 0;
+  list-style: none;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.path {
+  padding: 2px 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.nameRow {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text-hi);
+  font-family: inherit;
+  font-size: 12.5px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+.warn {
+  flex: none;
+  margin: 0;
+  padding: 0 18px 10px;
+  font-size: 11.5px;
+  color: var(--yellow);
+}
+
+/* The existing changelists. Scrolls for the same reason `.paths` does. */
+.list {
+  flex: 1;
+  min-height: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  border-top: 1px solid var(--border-soft);
+}
+
+.entry {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 5px 18px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: default;
+}
+
+.entry:hover:not(:disabled) {
+  background: var(--chrome-hi);
+}
+
+.entry:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.entry:disabled {
+  color: var(--faint);
+}
+
+.entryName {
+  flex: none;
+  color: inherit;
+}
+
+.entryMeta {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
+/* In create/rename the lists are context, not targets: nothing to click, so nothing that
+   looks clickable. */
+.existing {
+  padding: 3px 18px;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.button {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1;
+  padding: 7px 13px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--chrome-hi);
+  color: var(--text);
+  cursor: default;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.button:disabled {
+  color: var(--faint);
+  border-color: var(--border-soft);
+}
+
+/* Nothing in this dialog destroys anything, so the accent-filled button is the one that
+   acts — unlike `CloseConfirm`, where the prominent button is the one that backs out. */
+.buttonPrimary:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  /* `--bg`, not a literal: the accent is light in one theme and dark in the other, and a
+     fixed label colour fails contrast in one of the two. */
+  color: var(--bg);
+  font-weight: 500;
+}
+
+.buttonPrimary:hover:not(:disabled) {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+  color: var(--bg);
+}
