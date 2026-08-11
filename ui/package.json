@@ -15,6 +15,7 @@
     "check:icons": "node scripts/check-icons.mjs",
     "check:input": "node scripts/check-input-emitters.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
+    "check:menus": "node scripts/check-menus.mjs",
     "check:picker": "node scripts/check-picker.mjs",
     "check:problems": "node scripts/check-problems.mjs",
     "check:render": "node scripts/check-git-render.mjs",
