@@ -618,10 +618,21 @@ function Row({
           fileTreeClick({
             gesture: gestureOf(e.detail),
             isDir,
-            // The twisty is a control of its own: one click on the arrow folds the folder,
-            // because requiring a double-click on an 11px glyph to do the only thing it does
-            // would be a worse tree than the one this change is fixing.
-            onTwisty: e.target instanceof Element && e.target.closest(`.${styles.twisty}`) !== null,
+            /*
+             * The twisty is a control of its own: one click on the arrow folds the folder,
+             * because requiring a double-click on an 11px glyph to do the only thing it does
+             * would be a worse tree than the one this change is fixing.
+             *
+             * `hasTwisty` guards it, and that guard is load-bearing rather than tidy. The
+             * span is drawn on *every* row — it is the indentation, so a file has one too,
+             * empty and 11px wide — and without the guard those 11px were a strip down the
+             * left of each file where a double-click resolved to "second half of a twisty
+             * gesture", which is `NOTHING`: the file simply refused to open.
+             */
+            onTwisty:
+              hasTwisty &&
+              e.target instanceof Element &&
+              e.target.closest(`.${styles.twisty}`) !== null,
           }),
           row,
           index,
