@@ -433,8 +433,8 @@ pub enum ClaudeSendError {
     ///
     /// The two wordings are deliberately different. Zero connections means the feature has
     /// never been reachable in this project and the user needs to start or connect a session;
-    /// a non-zero count means the plumbing works and this *particular* pane is the odd one
-    /// out, which is a completely different thing to go looking for.
+    /// a non-zero count means the plumbing works and *this* pane is the odd one out, which is
+    /// a completely different thing to go looking for.
     #[error("{}", not_connected(*connections))]
     NotConnected { connections: usize },
 }
@@ -444,17 +444,30 @@ pub enum ClaudeSendError {
 /// A function rather than two `#[error]` attributes because the count decides the wording, and
 /// `thiserror`'s format strings have no room to branch. Named so it is greppable from the
 /// frontend, which shows this text verbatim.
+///
+/// # `connections` is not a count of *other* panes, and the prose must not say it is
+///
+/// [`cide_ide_mcp::Delivery::NoConnection`] carries every connection on this project's server,
+/// including one sitting in the very pane that was addressed whose pid `pane_bind_session`
+/// never bound — and that is the single likeliest way to reach this error, because it is what
+/// happens to a `claude` a user started by hand inside a pane. An earlier wording said "one
+/// other session in this project is [connected] — focus that pane", which sends the user
+/// hunting for a second pane that in that case does not exist. So the count is reported as
+/// what it is (sessions connected to this project) and the advice is the one action that fixes
+/// every variant of the case: `/ide` in the pane they meant.
 fn not_connected(connections: usize) -> String {
     match connections {
         0 => "No Claude session in this project is connected to cide's IDE server. Start a \
               Claude pane (or run /ide inside one) and try again."
             .to_string(),
-        1 => "The Claude in that pane is not connected to cide's IDE server, though one other \
-              session in this project is. Focus that pane, or run /ide in this one."
+        1 => "cide has no Claude bound to that pane. One session in this project is connected \
+              to the IDE server, but nothing identifies it as that pane's — run /ide in the \
+              pane you meant to send to."
             .to_string(),
         n => format!(
-            "The Claude in that pane is not connected to cide's IDE server, though {n} other \
-             sessions in this project are. Focus one of those panes, or run /ide in this one."
+            "cide has no Claude bound to that pane. {n} sessions in this project are connected \
+             to the IDE server, but none of them is identified as that pane's — run /ide in \
+             the pane you meant to send to."
         ),
     }
 }
@@ -819,5 +832,49 @@ mod tests {
             diff_tabs(&ws, project),
             vec![("src/a.rs".into(), false), ("src/b.rs".into(), true)]
         );
+    }
+
+    /// The sentence a user reads when *Send lines to Claude* cannot send.
+    ///
+    /// Tested because it is the entire user-visible half of the feature: the failure path is
+    /// the one being reported ("does nothing"), and its only output is this prose. The
+    /// assertion that matters is the negative one — [`not_connected`] receives *every*
+    /// connection on the project's server, including an unbound one in the pane that was
+    /// addressed, so it must never describe them as being somewhere else. The wording it
+    /// replaced ("one other session in this project is — focus that pane") sent the user
+    /// looking for a second pane that, in the commonest form of this failure, is the one they
+    /// were already in.
+    #[test]
+    fn the_refusal_never_claims_the_connected_session_is_in_another_pane() {
+        let none = not_connected(0);
+        assert!(
+            none.contains("No Claude session in this project"),
+            "zero connections is a different problem and gets its own sentence: {none}"
+        );
+        assert!(
+            none.contains("/ide"),
+            "the one action that fixes it has to be in the sentence: {none}"
+        );
+
+        for (connections, count) in [(1usize, "One session"), (4, "4 sessions")] {
+            let message = not_connected(connections);
+            assert!(
+                message.contains(count),
+                "the count is what separates a missing feature from a mis-aimed one: {message}"
+            );
+            assert!(
+                !message.contains("other session"),
+                "the count includes an unbound connection in the addressed pane, so calling \
+                 them 'other' sends the user hunting for a pane that need not exist: {message}"
+            );
+            assert!(
+                !message.contains("Focus"),
+                "and for the same reason it must not tell them to focus one: {message}"
+            );
+            assert!(
+                message.contains("/ide"),
+                "the one action that fixes every variant has to be in the sentence: {message}"
+            );
+        }
     }
 }

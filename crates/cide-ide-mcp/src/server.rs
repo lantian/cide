@@ -252,17 +252,22 @@ pub enum Delivery {
     Sent,
     /// No connection is bound to that pane.
     NoConnection {
-        /// CLIs attached to this project's server, in any pane. Zero means no `claude`
-        /// anywhere in this project has completed the IDE handshake.
+        /// Every CLI attached to this project's server, in any pane — *including* one in the
+        /// asked-for pane whose pid was never bound, which is the likeliest reason this
+        /// variant is being returned at all. Zero means no `claude` anywhere in this project
+        /// has completed the IDE handshake.
+        ///
+        /// Deliberately not "other connections": distinguishing them would need the count of
+        /// connections whose pid *is* in `pane_of_pid`, and an unbound connection is exactly
+        /// the one this number exists to account for. Callers that turn it into prose must
+        /// not claim these are elsewhere. See `cmd::file::not_connected`.
         connections: usize,
     },
 }
 
-impl Delivery {
-    pub fn is_sent(self) -> bool {
-        matches!(self, Self::Sent)
-    }
-}
+// No `is_sent` helper. One was written and deleted unused: every caller matches the enum
+// exhaustively because the `NoConnection` count is the whole point of returning it, and a
+// boolean accessor invites the one call site that throws that count away.
 
 /// The IDE server for one project.
 pub struct IdeServer {
