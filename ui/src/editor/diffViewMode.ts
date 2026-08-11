@@ -97,8 +97,14 @@ export function subscribeDiffView(onChange: () => void): () => void {
      * diff of a launch paints unified for a round trip and then jumps. The event is what keeps
      * a second window, and the Settings screen, in step afterwards.
      *
-     * Neither is awaited and neither throwing is fatal: the mode falls back to unified, which
-     * is the default anyway, and the toggle still works for this window's lifetime.
+     * Neither is awaited and neither throwing is fatal to the *pane*: the mode falls back to
+     * unified, which is the default anyway, and every diff still renders.
+     *
+     * It is fatal to the toggle, deliberately. If `get` fails, `editor` stays `null`, so
+     * `writable` stays false and both panes draw the control disabled. That is the honest
+     * state: `setDiffView` cannot send a patch without the `EditorSettings` it is amending, and
+     * sending one built from guesses would reset `fontSize`, `tabSize` and the rest to this
+     * file's invented values — a settings-destroying write in exchange for a cosmetic toggle.
      */
     void settingsApi
       .get()

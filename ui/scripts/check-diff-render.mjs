@@ -124,6 +124,73 @@ try {
     'and nothing lingers from the side that had one',
   )
 
+  // --- the same promise in the side-by-side layout -------------------------------------------
+
+  /*
+   * The loop at the top already checks `selected === sent` for these, which is the claim that
+   * matters. What is left is what only the split layout can get wrong: it draws a context line
+   * in both columns, so it has two chances to write a position and must take exactly one, and
+   * it pairs deletions against additions, so it must not lose a change line off the bottom of a
+   * ragged pair.
+   */
+  const splitNames = Object.keys(byName).filter((n) => n.startsWith('split'))
+  eq(splitNames.length, 5, 'the split layout is exercised at all')
+
+  /*
+   * The pairing boundary, in document order. `PAIR_FIXTURE` is `context, +, -, context`: the
+   * `+` closes its edit, so the `-` after it opens a new one and the two must NOT be zipped
+   * onto one row. Zipped, the addition and the deletion swap places in the document, which the
+   * sorted comparisons below are blind to by construction.
+   */
+  eq(
+    byName.pairUnified.positions,
+    ['0:0', '0:1', '0:2', '0:3'],
+    'unified draws a hunk in file order',
+  )
+  eq(
+    byName.pairSplit.positions,
+    ['0:0', '0:1', '0:2', '0:3'],
+    "split keeps file order too: a '+' followed by a '-' is two edits, so the deletion goes on "
+      + 'its own row below rather than being faced against the addition above it',
+  )
+
+  for (const name of splitNames) {
+    const d = byName[name]
+    eq(
+      [...new Set(d.positions)].length,
+      d.positions.length,
+      `${name}: no position is written twice — a context line is drawn in both columns and `
+        + 'numbered in only one',
+    )
+  }
+
+  // Every position the unified layout names, the split layout names too, and no other. Paired
+  // by hand rather than by string surgery so a renamed case fails loudly instead of silently
+  // comparing something against itself.
+  for (const [split, unified] of [
+    ['splitEmpty', 'empty'],
+    ['splitRagged', 'ragged'],
+    ['splitWholeHunk', 'wholeHunk'],
+    ['splitEverything', 'everything'],
+    ['splitJunk', 'junk'],
+  ]) {
+    eq(
+      [...byName[split].positions].sort(),
+      [...byName[unified].positions].sort(),
+      `${split}: names every position ${unified} names, and no other`,
+    )
+    eq(
+      [...byName[split].selected].sort(),
+      [...byName[unified].selected].sort(),
+      `${split}: paints exactly what ${unified} paints`,
+    )
+    eq(
+      byName[split].count,
+      byName[unified].count,
+      `${split}: the footer counts the same lines — the layout is a layout, not a filter`,
+    )
+  }
+
   if (failed === 0) console.log('git diff view render: ok')
   else console.error(`\n${failed} failure(s)`)
 } finally {

@@ -176,9 +176,33 @@ export function DiffPane({
   const bufferRef = useRef<EditorView | null>(null)
   const destroyRef = useRef<(() => void) | null>(null)
 
+  /**
+   * The proposal as it stood when the last editor was torn down, and the request it belongs to.
+   *
+   * Rebuilding the editor for a layout change would otherwise re-seed it from `docs.proposed`
+   * and silently drop whatever the user had typed — on the one pane in the app whose Accept
+   * writes a file, and while `openDiff` is blocking the agent's turn. It is not only the
+   * deliberate toggle that lands here: `diffView` is a *shared, stored* preference, so a second
+   * window or the Settings screen flipping it rebuilds every mounted diff pane, including ones
+   * the user is not looking at.
+   *
+   * Keyed by `requestId` because it must never leak across requests: a stale carry would answer
+   * a new diff with the previous one's text, which is the exact mismatch `freeze` exists to
+   * prevent. A different id falls back to `docs.proposed`.
+   */
+  const carryRef = useRef<{ requestId: string; text: string } | null>(null)
+
   /*
    * Split or unified, from `Settings.editor.diffView` — the same stored preference the git
    * diff pane reads, because a user who chose a layout chose it for diffs, not for one pane.
+   *
+   * **Note what that changed for this pane.** It was unconditionally a `MergeView`, i.e. split;
+   * `EditorSettings::default()` is `DiffView::Unified`, so a user who has never touched the
+   * toggle now opens Claude's diffs unified. That is the deliberate cost of one setting for
+   * both panes rather than two — the git pane's long-standing default is unified and the git
+   * pane is the one that has to survive a 400px detached tab — and the toggle in the header
+   * puts it back permanently in one click. It is written down because the shape of the change
+   * is easy to miss: nothing in this file names a default.
    */
   const diffView = useSyncExternalStore(subscribeDiffView, getDiffView, getServerDiffView)
 
@@ -219,6 +243,18 @@ export function DiffPane({
     // a thousand-line file opens on a screen of identical context.
     const collapseUnchanged = { margin: 3, minSize: 4 }
 
+    /*
+     * The proposal to open with: what the user last had on screen for *this* request, or the
+     * agent's original proposal the first time. See `carryRef`.
+     *
+     * Not cleared here but after the build succeeds: if the constructor throws, the pane
+     * degrades to the plain summary and `currentBuffer()` becomes the only route the text has
+     * back to the agent, so the carry has to survive to be read there.
+     */
+    const carried = carryRef.current
+    const startDoc =
+      carried !== null && carried.requestId === docs.requestId ? carried.text : docs.proposed
+
     try {
       if (diffView.view === 'unified') {
         /*
@@ -238,7 +274,7 @@ export function DiffPane({
          * and cannot be read as an answer.
          */
         const view = new EditorView({
-          doc: docs.proposed,
+          doc: startDoc,
           parent: host,
           extensions: [
             ...shared,
@@ -273,7 +309,7 @@ export function DiffPane({
             doc: docs.original,
             extensions: [...shared, EditorState.readOnly.of(true), EditorView.editable.of(false)],
           },
-          b: { doc: docs.proposed, extensions: shared },
+          b: { doc: startDoc, extensions: shared },
           parent: host,
           // The per-chunk control copies a chunk from A into B: "put the original back here".
           // There is no per-chunk accept in a side-by-side view, because B already holds the
@@ -298,7 +334,15 @@ export function DiffPane({
       return
     }
 
+    // The new editor now holds it, so the carry has done its job.
+    carryRef.current = null
+
     return () => {
+      // Save the proposal before the editor goes, so a layout change is a re-layout and not a
+      // discard. `docs.requestId` is this effect's own — on a request change the new effect
+      // sees a mismatched carry and starts from the new proposal instead.
+      const live = bufferRef.current
+      if (live !== null) carryRef.current = { requestId: docs.requestId, text: live.state.doc.toString() }
       bufferRef.current = null
       destroyRef.current?.()
       destroyRef.current = null
@@ -307,11 +351,12 @@ export function DiffPane({
      * Keyed on the request *and the layout*. `docs` is re-derived from `requestId` above and
      * the callbacks live in refs, so nothing else can legitimately rebuild the editor.
      *
-     * Rebuilding on a layout change costs whatever the user has typed into the proposal, which
-     * is a real cost and is why it is not done for anything else. It is accepted here because
-     * the two layouts are different extensions over different editors — there is no
-     * `reconfigure` from one to the other — and because switching layout is a deliberate act on
-     * a pane the user is looking at, unlike the prop churn the freeze above exists to ignore.
+     * A layout change does rebuild the editor — the two layouts are different extensions over
+     * different editors and there is no `reconfigure` from one to the other — but it does not
+     * cost the user's edits: `carryRef` hands the live document to the replacement. That is not
+     * a nicety. The preference is shared and stored, so the rebuild is also triggered by a
+     * second window or the Settings screen, on panes nobody is looking at, and "the user chose
+     * this so they can live with it" would not be true of those.
      */
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId, diffView.view])
@@ -320,15 +365,26 @@ export function DiffPane({
    * What Accept sends.
    *
    * The proposal is only the starting point: the buffer is what the user has in front of
-   * them, and it is what the protocol writes to disk. Falling back to the proposal covers
-   * both paths with no editor — oversize and failed — where there are no edits to have made.
+   * them, and it is what the protocol writes to disk.
+   *
+   * With no live editor there are two different cases and they do not share an answer.
+   * `oversize` never built one, so there are no edits to have made *and the text never went
+   * through CodeMirror* — it is returned untouched. A *failed rebuild* after a layout change
+   * does have edits, held in `carryRef` because the build leaves it alone when it throws;
+   * answering `docs.proposed` there would quietly send the agent text the user had changed.
    */
+  const fromEditor = (text: string): string =>
+    // Undo CodeMirror's line-ending normalisation, never impose one; see `crlfThroughout`.
+    // Only ever applied to text that came *out* of an editor: `docs.proposed` may already hold
+    // CRLFs, and running it through here would double every `\r`.
+    docs.crlf ? text.replace(/\n/g, '\r\n') : text
+
   const currentBuffer = (): string => {
     const view = bufferRef.current
-    if (view === null) return docs.proposed
-    const text = view.state.doc.toString()
-    // Undo CodeMirror's line-ending normalisation, never impose one; see `crlfThroughout`.
-    return docs.crlf ? text.replace(/\n/g, '\r\n') : text
+    if (view !== null) return fromEditor(view.state.doc.toString())
+    const carried = carryRef.current
+    if (carried !== null && carried.requestId === docs.requestId) return fromEditor(carried.text)
+    return docs.proposed
   }
 
   // Two different reasons to show a sentence instead of a diff, one presentation.
