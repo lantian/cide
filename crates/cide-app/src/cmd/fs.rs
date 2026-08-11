@@ -329,6 +329,75 @@ pub async fn fs_create(
     .await?
 }
 
+/// Create a file or a folder *inside a named directory*, and put it in the tree immediately.
+///
+/// Not `fs_create` with a joined path, for three reasons that are all about the gesture this
+/// serves — the file tree's *New File…* / *New Folder…*:
+///
+/// * **The parent has to already exist.** `fs_create` reaches `ops::create`, which calls
+///   `create_dir_all`; a *New File* in a folder that was deleted since the tree drew it would
+///   put the folder back. See [`ops::create_in`].
+/// * **The name is checked as a name**, not as a path. `src/main.rs` typed into the box is a
+///   thing the user plainly meant and would not get, so it is refused with a reason rather
+///   than obeyed as two path components or mangled into `src_main.rs`.
+/// * **The tree shows the row now.** The watcher will report this create in a few hundred
+///   milliseconds, and "a few hundred milliseconds" is exactly long enough for the user to
+///   decide the menu item did nothing. Folding the path into the index here is the same
+///   `Index::apply` the watcher would run, so the watcher's own event a moment later
+///   reconciles to no change — `rescan_dir` matches by name and reports nothing new, which is
+///   also why the picker cannot end up with the file twice.
+///
+/// Answers with the path it created, so the caller can select that row without re-deriving
+/// the same string a second time in a second language.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_create_in(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    parent: PathBuf,
+    name: String,
+    directory: bool,
+) -> Result<PathBuf, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_create_in", move || {
+        create_entry(&fs, &parent, &name, directory)
+    })
+    .await?
+}
+
+/// [`fs_create_in`] with its Tauri-injected argument already resolved to a value.
+///
+/// A named function for the same reason [`index_project`] is one: the property worth testing
+/// — that the row is in the tree the instant the command returns, with no watcher involved —
+/// is a property of *this* wiring, and a body inline in the `#[tauri::command]` item cannot be
+/// called from a test.
+pub(crate) fn create_entry(
+    fs: &crate::files::ProjectFs,
+    parent: &std::path::Path,
+    name: &str,
+    directory: bool,
+) -> Result<PathBuf, FsError> {
+    let created = ops::create_in(&fs.root_paths(), parent, name, directory)?;
+
+    // The same fold the watcher does, run here so the tree does not have to wait for it.
+    // `admits` is consulted by `Index::apply` itself, so a name the project's ignore rules
+    // hide simply adds no row — the file is still created, and the frontend notices the
+    // missing row and says so rather than pretending the tree is showing it.
+    let filter = fs.filter();
+    let change = cide_ipc::FsChange {
+        paths: vec![created.clone()],
+        truncated: false,
+        git: false,
+    };
+    let added = fs.with_index_mut(|index| index.apply(&change, &filter));
+    for item in added.iter().filter(|i| !i.is_dir) {
+        fs.matcher().push(cide_search::Candidate::new(
+            item.rel.clone(),
+            item.path.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(created)
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_rename(
     registry: State<'_, FsRegistry>,
@@ -1018,6 +1087,149 @@ mod tests {
             !fs.filter().admits(&generated, false),
             "the accessor still returns the filter from before the walk, so a content search \
              using it would report hits inside directories the tree does not show"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// The row is in the tree the instant `fs_create_in` returns — no watcher involved.
+    ///
+    /// This is the claim the file tree's *New File…* rests on, and it is a claim about *this*
+    /// wiring rather than about `cide-fs`: `ops::create_in` writes an inode and knows nothing
+    /// about an index, and `Index::apply` folds a path in and knows nothing about a command.
+    /// Joining them here is what makes the row appear now instead of whenever the watcher's
+    /// debounce elapses — a few hundred milliseconds, which is exactly long enough for the
+    /// user to decide the menu item did nothing and click it again.
+    ///
+    /// The watcher is deliberately not waited for. Its event arrives afterwards and rescans
+    /// the same directory; the second assertion below is that doing so changes nothing, which
+    /// is also why the picker cannot end up holding the file twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_created_file_is_a_row_before_the_watcher_has_said_anything() {
+        let dir = scratch("cmd-create-now");
+        std::fs::create_dir(dir.path().join("src")).expect("a source directory");
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+        // Expanded first, exactly as the panel does before it shows its draft row: a new file
+        // inside a collapsed folder is in the index and contributes no *visible* row, and
+        // asserting on `count()` without this would be asserting about the twisty.
+        fs.with_index_mut(|index| index.expand(&dir.path().join("src")));
+        let before = fs.with_index(|index| index.count());
+
+        let created = create_entry(&fs, &dir.path().join("src"), "main.rs", false)
+            .expect("creating a file in a directory that exists");
+        assert_eq!(created, dir.path().join("src/main.rs"));
+
+        let rows = fs.with_index(|index| index.rows(0, 64));
+        assert_eq!(
+            fs.with_index(|index| index.count()),
+            before + 1,
+            "the tree did not grow, so the user's new file has no row until the watcher fires"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.path == created && r.name == "main.rs"),
+            "the new path is not among the rows the panel would draw: {rows:?}"
+        );
+
+        // The picker too. A file created here and then absent from Ctrl+P until the next full
+        // walk is the quieter half of the same omission. Polled rather than read once:
+        // `nucleo` scores on its own pool, so the first frame after an injection legitimately
+        // reports fewer matches than the matcher holds.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut matched = 0;
+        while matched == 0 && Instant::now() < deadline {
+            matched = query_project(&registry, project, "mainrs".to_string(), Some(50))
+                .await
+                .expect("the picker answers for an indexed project")
+                .matched;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matched > 0,
+            "the created file never reached the picker, so Ctrl+P cannot open the file the \
+             user just made until the project is walked again"
+        );
+
+        // The watcher's own event for this create, replayed. It must reconcile to nothing —
+        // if `apply` added the node a second time the count would climb again.
+        let filter = fs.filter();
+        let change = FsChange {
+            paths: vec![created.clone()],
+            truncated: false,
+            git: false,
+        };
+        let added = fs.with_index_mut(|index| index.apply(&change, &filter));
+        assert!(
+            added.is_empty(),
+            "the watcher's event added the path a second time, so the picker holds it twice"
+        );
+        assert_eq!(fs.with_index(|index| index.count()), before + 1);
+
+        drop(registry.remove(project));
+    }
+
+    /// The three refusals, driven through the command layer rather than through `ops`.
+    ///
+    /// `cide-fs` has its own tests for each rule; what is pinned here is that the handler
+    /// resolves the project's roots and hands them over, because the version of this command
+    /// that forgets to is the one that writes wherever the webview asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_is_refused_for_a_vanished_parent_a_taken_name_and_a_path_outside_the_project()
+    {
+        let dir = scratch("cmd-create-refuse");
+        let outside = scratch("cmd-create-outside");
+        std::fs::write(dir.path().join("taken.rs"), []).expect("an existing file");
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+        let rows = fs.with_index(|index| index.count());
+
+        // A directory the tree still draws a row for, deleted since it was drawn. `ops::create`
+        // would have called `create_dir_all` and put it back.
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).expect("a directory");
+        std::fs::remove_dir(&gone).expect("removed under the tree");
+        assert!(matches!(
+            create_entry(&fs, &gone, "a.rs", false),
+            Err(FsError::Io { .. })
+        ));
+        assert!(!gone.exists(), "a refused create resurrected the folder");
+
+        assert!(matches!(
+            create_entry(&fs, dir.path(), "taken.rs", false),
+            Err(FsError::Exists(_))
+        ));
+
+        assert!(matches!(
+            create_entry(&fs, outside.path(), "a.rs", false),
+            Err(FsError::OutsideProject(_))
+        ));
+        assert!(
+            !outside.path().join("a.rs").exists(),
+            "a path outside every project root was obeyed rather than refused"
+        );
+
+        assert!(matches!(
+            create_entry(&fs, dir.path(), "sub/a.rs", false),
+            Err(FsError::InvalidPath(_))
+        ));
+
+        assert_eq!(
+            fs.with_index(|index| index.count()),
+            rows,
+            "a refused create still moved the tree"
         );
 
         drop(registry.remove(project));

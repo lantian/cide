@@ -141,6 +141,36 @@
 }
 
 /*
+ * The line under the draft row: where a new file is going, or what is wrong with its name.
+ *
+ * Same geometry as `.problem` below and a different colour, because they are different
+ * claims: this one is live commentary on a box that is still open, that one is a command that
+ * failed and is waiting to be dismissed. `--dim` and `--red` are both defined in the light and
+ * the dark palettes, and the light panel is white, so the strip needs `--panel-2` behind it
+ * and a rule above it rather than relying on contrast with the rows.
+ */
+.draftNote,
+.draftError {
+  flex: none;
+  padding: 5px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 10.5px;
+  line-height: 1.4;
+  /* A path relative to the root runs past 252px long before a repository is large. */
+  overflow-wrap: anywhere;
+  user-select: none;
+}
+
+.draftNote {
+  color: var(--dim);
+}
+
+.draftError {
+  color: var(--red);
+}
+
+/*
  * The twisty. A fixed 11px box so the glyph column lines up whether or not a row has one —
  * without it, files sit one glyph-width left of their sibling folders.
  */
