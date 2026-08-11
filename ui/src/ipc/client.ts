@@ -1274,3 +1274,48 @@ function ackFailed(error: unknown): void {
   console.error(`[cide] ${line}`)
   void diag.log(line).catch(() => {})
 }
+
+// -------------------------------------------------------------------------------------------
+// Choosing a project: the parented folder picker, and the projects opened before this one.
+//
+// One contiguous block, appended rather than folded into `project` above, per the house rule.
+// The five commands are grouped by the surfaces that call them — the header's `+`/`▾` menu and
+// the project tab's context menu — which is also why `reveal` sits beside them rather than in
+// `fs`: it names a *project*, not a path a webview chose.
+// -------------------------------------------------------------------------------------------
+
+/**
+ * Imported here, at the bottom, so this block stays contiguous. ES module imports are hoisted,
+ * so its position is a matter of where the diff lands and nothing else.
+ */
+import type { RecentEntry } from './generated'
+
+export const projectMenu = {
+  /**
+   * Ask the user for project folders. `[]` means cancelled.
+   *
+   * **Use this, not `@tauri-apps/plugin-dialog`'s `open()`.** The plugin's JS command sets a
+   * parent window only on Windows and macOS — on Linux it never does, and no option it accepts
+   * can — which is why the picker opened *behind* the app on KDE Wayland. `project_pick` builds
+   * the dialog against the window's real GTK toplevel instead. See `cmd::project::project_pick`.
+   */
+  browse: () => invoke<string[]>('project_pick'),
+
+  /** Projects opened before, most recent first, each tagged with whether it is still there. */
+  recent: () => invoke<RecentEntry[]>('project_recent'),
+
+  /**
+   * Reopen a remembered project. Rejects when the directory has gone.
+   *
+   * Not `project.open`: that one never touches the filesystem, so a stale entry would open a
+   * project over a path that is not there — empty tree, empty picker, a `claude` spawned into
+   * nothing, and no error anywhere near the cause.
+   */
+  reopen: (path: string) => invoke<ProjectId>('project_open_recent', { path }),
+
+  /** Forget one remembered project, or all of them with `null`. Answers with what is left. */
+  forget: (path: string | null) => invoke<RecentEntry[]>('project_forget_recent', { path }),
+
+  /** Show a project's primary root in the desktop's file manager. Answers with the path. */
+  reveal: (projectId: ProjectId) => invoke<string>('project_reveal', { project: projectId }),
+}

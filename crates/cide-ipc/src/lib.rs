@@ -28,8 +28,8 @@ pub use settings_ops::{
 };
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, LayoutNode, MAX_RATIO,
-    MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, SettingsSection, Tab, TabKind, WindowRole,
-    Workspace,
+    MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry, RecentProject, SettingsSection,
+    Tab, TabKind, WindowRole, Workspace,
 };
 
 // --- M8: file tree, watcher, pickers ---

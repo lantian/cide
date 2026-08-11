@@ -52,5 +52,10 @@ uuid = { workspace = true }
 libc = { workspace = true }
 signal-hook = { workspace = true }
 
+# The folder picker's parent window. Linux-only because that is the only platform where the
+# dialog plugin declines to parent it for us — see `cmd::project::project_pick`.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+gtk = { workspace = true }
+
 [build-dependencies]
 tauri-build = { workspace = true }

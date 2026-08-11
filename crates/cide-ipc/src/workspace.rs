@@ -140,6 +140,53 @@ pub struct Project {
     pub primary_session: SessionId,
 }
 
+/// A project the user opened once, remembered after it closed.
+///
+/// **Not part of [`Workspace`]**, and that is the whole point of the type. `workspace.json`
+/// holds what is *open*; closing a project removes it from there, which is exactly the moment
+/// a "recent projects" list has to start knowing about it. So this is persisted on its own, in
+/// `recent.json` beside it — see `cide_core::persist::recent_path`.
+///
+/// Identity is [`Self::path`], the primary root. A project can hold several roots, but the
+/// gesture being remembered is "the folder I opened", and reopening the primary root is what
+/// `open_project` deduplicates against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecentProject {
+    #[ts(type = "string")]
+    pub path: PathBuf,
+    pub name: String,
+    /// Display form of [`Self::path`], e.g. `~/work/cide`.
+    ///
+    /// Recomputed on read rather than trusted from the file, for the same reason
+    /// `refresh_display_paths` exists: the `$HOME` that wrote the entry is not necessarily the
+    /// one reading it.
+    pub display_path: String,
+    /// Milliseconds since the Unix epoch, at the last open. Sorts the list.
+    pub opened_at: u64,
+}
+
+/// A [`RecentProject`] as the frontend sees it: the record, plus whether it is still there.
+///
+/// `exists` is deliberately **not** a field of `RecentProject`, because it is not a property
+/// of the record — it is a fact about the filesystem at the moment the list was asked for, and
+/// a directory can be deleted, renamed or unmounted a second later. Persisting it would write
+/// an answer that is stale before it is read; the alternative that lost was a
+/// `#[serde(skip)] exists` on the record itself, which reads as though the file stored it.
+///
+/// A missing directory is still listed. The user's mental model is "the projects I worked on",
+/// and silently dropping one is indistinguishable from the app forgetting it — so the entry
+/// stays, the UI disables it with the reason, and nothing pretends to open a folder that is
+/// gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RecentEntry {
+    pub project: RecentProject,
+    pub exists: bool,
+}
+
 /// One root directory within a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

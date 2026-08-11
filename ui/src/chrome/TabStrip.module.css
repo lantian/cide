@@ -179,35 +179,16 @@
   color: var(--faint);
 }
 
+/*
+ * The strip's right-hand third, now empty of controls.
+ *
+ * It held a `⊞`/`⧉` cluster until the duplicate-split cleanup: the `⊞` was the same call as the
+ * header's, and the `⧉` was a dead control for a capability (`window_detach_tab`) that does not
+ * exist. Both live on as context-menu items — see `TabStripProps`. The spacer stays because the
+ * tabs still have to be pushed left against the rail rather than centred.
+ */
 .spacer {
   flex: 1;
-}
-
-/* Never shrinks: these two are the only way to split or detach, and the mock keeps them
-   pinned to the right edge however many tabs are open. */
-.cluster {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 12px;
-  flex: none;
-  color: var(--dim);
-  font-size: 12px;
-}
-
-.clusterButton {
-  display: grid;
-  place-items: center;
-  padding: 0;
-  background: transparent;
-  border: 0;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-}
-
-.clusterButton:hover {
-  color: var(--text);
 }
 
 /* Nothing in this strip has a border to hang focus on, and the tabs box clips its overflow,

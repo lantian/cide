@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cide_ipc::Workspace;
+use cide_ipc::{RecentProject, Workspace};
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -48,6 +48,22 @@ pub fn workspace_path() -> PathBuf {
 /// The user's keybinding overrides. Defaults are compiled in; this file holds only diffs.
 pub fn keymap_path() -> PathBuf {
     config_dir().join("keymap.json")
+}
+
+/// Projects the user has opened, most recent first.
+///
+/// A **separate file** from `workspace.json`, and it has to be: `workspace.json` records what
+/// is open, and `close_project` removes a project from it. The entry a recent-projects list
+/// most needs is precisely the one that has just been taken out of there, so storing the list
+/// inside the workspace would forget a project at the instant it became recent. Keeping it in
+/// `Settings` loses for the same reason plus one more — settings are a user's preferences, and
+/// a list the app appends to on every open is not a preference.
+///
+/// Beside `workspace.json` in the state directory, not in config, on the same argument
+/// [`state_dir`] already makes: it is written by the app and nobody would want it in a
+/// dotfiles repository.
+pub fn recent_path() -> PathBuf {
+    state_dir().join("recent.json")
 }
 
 /// Resolve one XDG base directory, appending `cide`.
@@ -184,17 +200,27 @@ pub fn migrate(value: Value) -> Result<Workspace> {
 ///
 /// Creates parent directories as needed.
 pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(ws)?)
+}
+
+/// The publish-by-rename half of [`save_atomic`], over bytes the caller has already encoded.
+///
+/// Split out when `recent.json` arrived rather than copied, because everything below the
+/// encoding is the part that is easy to get subtly wrong — the sibling temp, the `sync_all`
+/// before the rename, the directory `fsync` after it, the 0600 mode, and removing the temp on
+/// each failure path. A second copy would have started identical and drifted on whichever of
+/// those a later edit forgot.
+fn write_atomic(path: &Path, json: &[u8]) -> Result<()> {
     let dir = parent_dir(path);
     fs::create_dir_all(dir)?;
 
-    let json = serde_json::to_vec_pretty(ws)?;
     // The temp file is a sibling of the target: `rename` is only atomic within a single
     // filesystem, and the system temp directory is routinely a different one.
     let tmp = temp_path(path);
 
     let write = (|| -> io::Result<()> {
         let mut file = create_private(&tmp)?;
-        file.write_all(&json)?;
+        file.write_all(json)?;
         // The rename publishes the new name; without this the bytes behind it may not have
         // reached the disk, and the crash leaves an intact name over empty contents.
         file.sync_all()
@@ -213,6 +239,137 @@ pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<()> {
     // The rename is a directory modification of its own, and an unsynced one can be lost in
     // exactly the crash this function exists to survive.
     sync_dir(dir)
+}
+
+// --- recent projects ----------------------------------------------------------------------
+
+/// How many projects `recent.json` remembers.
+///
+/// A cap rather than an unbounded log, because this list is drawn as a menu: past roughly a
+/// screenful the entries stop being "the projects I was working on" and become a history file
+/// nobody reads, and the oldest entry in a long list is overwhelmingly a directory that no
+/// longer exists. Sixteen fits a menu on a short window without scrolling.
+pub const MAX_RECENT: usize = 16;
+
+/// Read `recent.json`, most recent first.
+///
+/// Does not fail, and for a stronger reason than [`load`] does not: a broken recents file is
+/// worth *nothing*. It is a convenience list rebuilt by the next few opens, so a missing,
+/// truncated or unparseable one answers with an empty list and is not even quarantined —
+/// moving it aside would leave the user with a stray file to clean up in exchange for data
+/// they cannot use.
+///
+/// `display_path` is recomputed here and the list is re-sorted, because neither can be trusted
+/// from the file: the `$HOME` that wrote an entry is not necessarily the one reading it (the
+/// same reason `workspace::refresh_display_paths` exists), and hand-editing or a half-finished
+/// write from an older build could leave the order wrong. Sorting on read means every caller
+/// gets the same order without agreeing to one.
+pub fn load_recent(path: &Path) -> Vec<RecentProject> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        // Absent is the first launch, and unreadable is nothing this list can do anything
+        // about. Both are "no recents", which is a correct answer rather than a degraded one.
+        Err(_) => return Vec::new(),
+    };
+    let mut list: Vec<RecentProject> = match serde_json::from_slice(&bytes) {
+        Ok(list) => list,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "recent projects file unusable");
+            return Vec::new();
+        }
+    };
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for entry in &mut list {
+        entry.display_path = abbreviate(&entry.path, home.as_deref());
+    }
+    sort_recent(&mut list);
+    list.truncate(MAX_RECENT);
+    list
+}
+
+/// Write `list` to `path`, atomically and privately, exactly as the workspace is written.
+///
+/// Private (0600) even though a path list is not a secret: the set of directories a person
+/// works in on a shared machine is inference nobody asked to publish, and matching
+/// `workspace.json`'s mode means there is one rule here rather than two.
+pub fn save_recent(path: &Path, list: &[RecentProject]) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(list)?)
+}
+
+/// Move `path` to the front of `list`, as of `opened_at`.
+///
+/// Pure, and takes the clock as an argument, so the ordering rules are testable without
+/// touching the filesystem or waiting a millisecond for two entries to differ.
+///
+/// Matching is on the path alone, so reopening a folder under a different project *name*
+/// updates the existing entry rather than adding a second one — the same identity
+/// `workspace::open_project` uses when it activates an already-open path instead of opening it
+/// twice. The name is refreshed from the new open, because a renamed directory should show its
+/// new name.
+pub fn remember_recent(list: &mut Vec<RecentProject>, path: &Path, name: &str, opened_at: u64) {
+    list.retain(|entry| entry.path != path);
+    list.insert(
+        0,
+        RecentProject {
+            path: path.to_path_buf(),
+            name: name.to_owned(),
+            display_path: abbreviate(path, std::env::var_os("HOME").map(PathBuf::from).as_deref()),
+            opened_at,
+        },
+    );
+    list.truncate(MAX_RECENT);
+}
+
+/// Drop `path` from `list`. Answers whether anything was removed.
+pub fn forget_recent(list: &mut Vec<RecentProject>, path: &Path) -> bool {
+    let before = list.len();
+    list.retain(|entry| entry.path != path);
+    before != list.len()
+}
+
+/// Newest first, ties broken by path so the order is total.
+///
+/// Two entries can genuinely share a timestamp — opening a multi-root project records one
+/// entry per call within the same millisecond — and an unstable order there would make the
+/// menu reshuffle between two identical reads.
+fn sort_recent(list: &mut [RecentProject]) {
+    list.sort_by(|a, b| {
+        b.opened_at
+            .cmp(&a.opened_at)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+/// Milliseconds since the Unix epoch, or 0 on a clock set before it.
+///
+/// Saturating rather than erroring: a wrong timestamp costs this list its order, and refusing
+/// to remember a project because the machine's clock is odd is a worse trade.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+/// `~/work/cide` for a path under `$HOME`, the path itself otherwise.
+///
+/// A private twin of `workspace::abbreviate`, which is private to that module. Widening it to
+/// `pub` was the alternative and lost on ownership: this is eleven lines with one edge case,
+/// and the edge case — an unset or empty `$HOME`, where `strip_prefix("")` succeeds for every
+/// relative path and would spell `work/cide` as `~/work/cide` — is pinned by a test below as
+/// well as by one over there.
+fn abbreviate(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) else {
+        return path.display().to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
 }
 
 /// Create a file only its owner can read.
@@ -1414,6 +1571,135 @@ mod tests {
     fn the_well_known_paths_sit_under_their_base_directories() {
         assert_eq!(workspace_path(), state_dir().join("workspace.json"));
         assert_eq!(keymap_path(), config_dir().join("keymap.json"));
+        // Beside the workspace, not inside it, and not in config. See `recent_path`.
+        assert_eq!(recent_path(), state_dir().join("recent.json"));
+        assert_ne!(recent_path(), workspace_path());
+    }
+
+    // --- recent projects ------------------------------------------------------------------
+
+    fn recents(entries: &[(&str, u64)]) -> Vec<RecentProject> {
+        entries
+            .iter()
+            .map(|(path, opened_at)| RecentProject {
+                path: PathBuf::from(path),
+                name: file_name_or(Path::new(path), "project"),
+                display_path: path.to_string(),
+                opened_at: *opened_at,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remembering_a_project_puts_it_first() {
+        let mut list = recents(&[("/a", 10), ("/b", 20)]);
+        remember_recent(&mut list, Path::new("/c"), "c", 30);
+
+        assert_eq!(
+            list.iter().map(|e| e.path.as_path()).collect::<Vec<_>>(),
+            [Path::new("/c"), Path::new("/a"), Path::new("/b")],
+        );
+    }
+
+    #[test]
+    fn reopening_a_project_moves_it_rather_than_duplicating_it() {
+        // The failure this guards is a menu that lists the same folder four times because the
+        // user opened it four times — the identity is the path, not the open.
+        let mut list = recents(&[("/a", 10), ("/b", 20)]);
+        remember_recent(&mut list, Path::new("/a"), "renamed", 30);
+
+        assert_eq!(list.len(), 2, "the second open added an entry");
+        assert_eq!(list[0].path, PathBuf::from("/a"));
+        assert_eq!(list[0].opened_at, 30);
+        assert_eq!(list[0].name, "renamed", "the name did not follow the open");
+    }
+
+    #[test]
+    fn the_list_is_capped_and_drops_the_oldest() {
+        let mut list = Vec::new();
+        for n in 0..(MAX_RECENT + 5) {
+            remember_recent(&mut list, &PathBuf::from(format!("/p{n}")), "p", n as u64);
+        }
+
+        assert_eq!(list.len(), MAX_RECENT);
+        assert_eq!(list[0].path, PathBuf::from(format!("/p{}", MAX_RECENT + 4)));
+        assert!(
+            !list.iter().any(|e| e.path == Path::new("/p0")),
+            "the cap kept the oldest and dropped a recent one",
+        );
+    }
+
+    #[test]
+    fn forgetting_reports_whether_it_removed_anything() {
+        let mut list = recents(&[("/a", 10)]);
+
+        assert!(forget_recent(&mut list, Path::new("/a")));
+        assert!(list.is_empty());
+        // The UI's "remove from list" needs to be able to tell a removal from a miss, or a
+        // stale menu silently reports success for an entry that was already gone.
+        assert!(!forget_recent(&mut list, Path::new("/a")));
+    }
+
+    #[test]
+    fn recents_round_trip_newest_first_whatever_order_the_file_was_in() {
+        let dir = TempDir::new("recents-round-trip");
+        let path = dir.join("recent.json");
+
+        // Deliberately written oldest-first: `load_recent` sorts, so no writer has to.
+        save_recent(&path, &recents(&[("/a", 10), ("/b", 30), ("/c", 20)])).expect("save");
+        let loaded = load_recent(&path);
+
+        assert_eq!(
+            loaded.iter().map(|e| e.path.as_path()).collect::<Vec<_>>(),
+            [Path::new("/b"), Path::new("/c"), Path::new("/a")],
+        );
+    }
+
+    #[test]
+    fn an_unusable_recents_file_reads_as_no_recents_and_is_left_alone() {
+        let dir = TempDir::new("recents-corrupt");
+        let path = dir.join("recent.json");
+        fs::write(&path, b"{ not a list").expect("write");
+
+        assert!(load_recent(&path).is_empty());
+        // Unlike `workspace.json`, nothing is quarantined: the list is rebuilt by the next
+        // few opens, and a `recent.corrupt-1.json` would be litter the user has to clean up.
+        assert!(path.exists(), "the unusable file was moved aside");
+        assert!(load_recent(&dir.join("absent.json")).is_empty());
+    }
+
+    /// Which directories a person works in is inference nobody asked to publish, and the
+    /// shared `write_atomic` is what makes this true of both files rather than one.
+    #[cfg(unix)]
+    #[test]
+    fn a_recents_file_is_written_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("recents-mode");
+        let path = dir.join("recent.json");
+        save_recent(&path, &recents(&[("/a", 1)])).expect("save");
+
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn a_display_path_only_abbreviates_a_real_home() {
+        let home = Path::new("/home/dev");
+
+        assert_eq!(
+            abbreviate(Path::new("/home/dev/work/cide"), Some(home)),
+            "~/work/cide"
+        );
+        assert_eq!(abbreviate(home, Some(home)), "~");
+        assert_eq!(abbreviate(Path::new("/opt/src"), Some(home)), "/opt/src");
+        // The edge case the function exists to get right: `strip_prefix("")` succeeds for
+        // every relative path, so an empty `$HOME` must not abbreviate at all.
+        assert_eq!(
+            abbreviate(Path::new("work/cide"), Some(Path::new(""))),
+            "work/cide"
+        );
+        assert_eq!(abbreviate(Path::new("work/cide"), None), "work/cide");
     }
 
     #[test]
