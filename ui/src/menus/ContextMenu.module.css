@@ -80,6 +80,22 @@
   color: var(--red);
 }
 
+/*
+ * Repeated for the focused states because `.item:hover:not(.disabled)` is three selectors
+ * wide and `.item.active` two, so both outrank a bare `.danger` and would repaint Delete in
+ * `--text-hi` at exactly the moment the pointer is on it — the one line whose colour is
+ * carrying information loses it in the instant before the click. Ordering the rules
+ * differently does not help; only matching the specificity does.
+ *
+ * `--red` on `--chrome-hi` is 4.5:1 on white and better than that on the dark panel, so the
+ * hover ground does not cost the contrast the colour was chosen for.
+ */
+.item.danger:hover:not(.disabled),
+.item.danger:focus-visible,
+.item.danger.active {
+  color: var(--red);
+}
+
 .disabled {
   color: var(--faint);
   cursor: default;

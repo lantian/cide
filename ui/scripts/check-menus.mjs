@@ -257,9 +257,12 @@ try {
   const short = placeMenu({ x: 100, y: 100 }, { width: 180, height: 200 }, win)
   eq(
     [short.y, short.flippedY, short.maxHeight],
-    [92, false, 192],
+    [92, false, 200],
     'below the pointer there are 192px and above only 92: a 200px box fits in neither, so '
-      + 'it stays down — the common direction — and is clamped up off the bottom margin',
+      + 'it stays down — the common direction — and is clamped up off the bottom margin. Its '
+      + 'budget is then measured from where it *landed* (300 - 8 - 92), not from the pointer: '
+      + 'billing it the 192px below the pointer would put a scrollbar on a box that the clamp '
+      + 'had just made room for.',
   )
   const even = placeMenu({ x: 100, y: 150 }, { width: 180, height: 200 }, win)
   eq(
@@ -286,8 +289,53 @@ try {
   const tall = placeMenu({ x: 100, y: 150 }, { width: 180, height: 900 }, win)
   eq(
     [tall.y, tall.flippedY, tall.maxHeight],
-    [8, false, 142],
-    'a menu taller than the window pins to the top margin and scrolls inside its budget',
+    [8, false, 284],
+    'a menu taller than the window pins to the top margin and scrolls inside the whole '
+      + 'window less both margins — not inside the 142px that were below the pointer it is no '
+      + 'longer next to, which would leave half the window blank under a scrolling box',
+  )
+  /*
+   * The invariant the two cases above are instances of, stated once so a future edit to the
+   * clamp cannot quietly reintroduce either half: a box that opens **downward** budgets from
+   * where it landed to the bottom margin — exactly, in both directions. Under-budgeting is
+   * the bug fixed above (a scrollbar with empty window beneath it); over-budgeting is the
+   * mirror image, a box whose `max-height` lets it run off the bottom edge.
+   *
+   * Only the downward case. A flipped box is budgeted against the room above the pointer, not
+   * the room below its own top — see the assertion under this loop for why.
+   */
+  for (const pointerY of [0, 1, 8, 50, 150, 200, 291, 299]) {
+    for (const height of [40, 120, 200, 284, 285, 900]) {
+      const p = placeMenu({ x: 100, y: pointerY }, { width: 180, height }, win)
+      if (p.flippedY) continue
+      eq(
+        Math.round(p.y + p.maxHeight),
+        win.height - MENU_MARGIN,
+        `a ${height}px box at y=${pointerY} budgets from where it landed to the bottom `
+          + 'margin — no scrollbar while the window still has room under it, and no '
+          + '`max-height` that would let it run past the edge',
+      )
+    }
+  }
+  /*
+   * The flipped branch is the one deliberate exception, asserted rather than left to be
+   * rediscovered: a box that flipped is budgeted by the room *above the pointer*, because the
+   * whole point of the flip is that its bottom edge sits on the pointer, and growing it down
+   * to the bottom margin instead would undo the placement it just asked for.
+   *
+   * That budget is loose when the box is short — a 40px menu flipped at y=291 sits at y=251
+   * and is told it may reach 283px, which would end past the window. It is a ceiling, not a
+   * height, and a 40px box stays 40px, so nothing paints out of bounds; it is recorded here as
+   * known slack rather than tightened, because tightening it to `at.y - y` would set
+   * `max-height` to the measured height on every flipped menu and hand a scrollbar to anything
+   * that rounded up by half a pixel.
+   */
+  const flippedTall = placeMenu({ x: 100, y: 200 }, { width: 180, height: 285 }, win)
+  eq(
+    [flippedTall.flippedY, flippedTall.maxHeight],
+    [true, 192],
+    'a flipped box keeps its bottom edge on the pointer and scrolls inside the 192px above '
+      + 'it, rather than growing down past the thing it was opened on',
   )
   const wide = placeMenu({ x: 100, y: 100 }, { width: 900, height: 120 }, win)
   eq(
@@ -497,10 +545,18 @@ try {
     'and renders through a portal, without which a menu in an `overflow: hidden` pane — '
       + 'which is most panes here — is clipped by it',
   )
+  // `includes("'blur'")` was not enough: deleting the `addEventListener` leaves the matching
+  // `removeEventListener` behind, and the grep passed over a menu that never dismissed on
+  // blur at all. Match the registration, and match the removal beside it so the pair cannot
+  // drift into a leaked listener either.
   for (const listener of ['pointerdown', 'scroll', 'resize', 'blur']) {
     ok(
-      component.includes(`'${listener}'`),
+      component.includes(`addEventListener('${listener}'`),
       `it dismisses on ${listener}`,
+    )
+    ok(
+      component.includes(`removeEventListener('${listener}'`),
+      `and takes the ${listener} listener back off on unmount`,
     )
   }
 
@@ -515,6 +571,18 @@ try {
     [],
     'and names no colour literal at all, so neither theme can be the one it was written for',
   )
+
+  // `.item:hover:not(.disabled)` is three selectors wide and sets `color`, so a bare
+  // `.danger` loses to it and the destructive line goes the same colour as every other line
+  // in the instant the pointer reaches it. The fix is a specificity match, and it is the kind
+  // of thing that is silently deleted by a later tidy-up, so it is pinned here.
+  for (const state of [':hover:not(.disabled)', ':focus-visible', '.active']) {
+    ok(
+      css.includes(`.item.danger${state}`),
+      `a danger item keeps \`--red\` under \`${state}\` — it outranks the hover rule rather `
+        + 'than merely coming after it, which would not have been enough',
+    )
+  }
 
   const tokens = readFileSync('src/styles/tokens.css', 'utf8')
   const blockOf = (selector) => {

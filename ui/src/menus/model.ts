@@ -237,11 +237,26 @@ export function placeMenu(
     viewport.height - margin - size.height,
   )
 
-  // The budget of the side actually chosen, then capped by the window itself: a pointer at
-  // y=0 has a "space below" larger than the box can ever be once the top margin is honoured.
+  /*
+   * The budget is measured from `y` — the position after the clamp — not from the pointer.
+   *
+   * `spaceBelow` is the room below the *pointer*, and when the box did not fit there the
+   * clamp has already moved it up; billing it for the room below the pointer would then cap a
+   * box that had just been given more. A 900px menu at y=150 in a 300px window lands at the
+   * top margin with 284px of room and would have been told it had 142 — half the window blank
+   * underneath and a scrollbar with nothing forcing it. `viewport.height - margin - y` is the
+   * same number as `spaceBelow` whenever the clamp did not fire, so the ordinary case is
+   * unchanged.
+   *
+   * The flipped branch stays on `spaceAbove` deliberately: there the point of the placement is
+   * that the box's *bottom* edge sits on the pointer, so its budget is the room above the
+   * pointer and growing past it would undo the flip.
+   */
   const maxHeight = Math.max(
     0,
-    Math.min(flippedY ? spaceAbove : spaceBelow, viewport.height - margin * 2),
+    flippedY
+      ? Math.min(spaceAbove, viewport.height - margin * 2)
+      : viewport.height - margin - y,
   )
 
   return { x, y, flippedX, flippedY, maxHeight }
