@@ -86,6 +86,30 @@ interface FileTreeStore {
    * two scrolls.
    */
   revealTo: number | null
+  /**
+   * The selected row, by **path**.
+   *
+   * Selection is now a first-class thing, distinct from what is open: a single click selects
+   * and only a double click opens. Which means the selection has to survive the thing that
+   * happens to this tree constantly — a watcher burst re-reading the rows underneath it. A
+   * row *index* does not survive that (a file created above the selection renumbers it), and
+   * a selection that jumps to a different file on every `fs-changed` is worse than none at
+   * all. A path does survive it, and is also what every action a menu offers actually needs.
+   *
+   * It lives in the store rather than in `FileTree`'s own `useState` for the same reason:
+   * the panel unmounts every time the user clicks another icon in the activity rail, and a
+   * selection that is lost by looking at Search is a selection nobody can rely on.
+   */
+  selected: string | null
+  /**
+   * Where the selected row last was. Advisory, and clamped by every reader.
+   *
+   * The arrows need a *position* to move from and the selection is an identity, so one of the
+   * two has to be derived. Deriving the index is cheap and correct when the row is resident
+   * ([`indexOf`]); this is the fallback for when it is not — scrolled far out of the cache,
+   * or inside a collapsed folder — where the honest answer is "about here".
+   */
+  selectedIndex: number
 
   /** Point the tree at a project, or at nothing. Reads the row count. */
   attach: (project: ProjectId | null) => Promise<void>
@@ -96,6 +120,16 @@ interface FileTreeStore {
   ensure: (from: number, to: number) => void
   /** The row at a flattened index, or `undefined` while its chunk is in flight. */
   rowAt: (index: number) => TreeRow | undefined
+  /**
+   * Where a path currently sits, or `null` if no resident chunk holds it.
+   *
+   * Only resident rows are searched — this is a scan of what is already in memory, never a
+   * round trip. `null` therefore means "not on screen and not nearby", which is exactly the
+   * case in which `selectedIndex` is the better answer, not a case worth an IPC call for.
+   */
+  indexOf: (path: string) => number | null
+  /** Select a row. `index` is a hint for the arrows; see `selectedIndex`. */
+  select: (path: string, index: number) => void
   /** Expand or collapse a directory row. */
   toggle: (row: TreeRow) => Promise<void>
   /** Expand ancestors until `path` is visible, then scroll to it. */
@@ -194,10 +228,15 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   chunks: new Map(),
   degraded: false,
   revealTo: null,
+  selected: null,
+  selectedIndex: 0,
 
   async attach(project) {
     resetCache()
-    set({ project, count: 0, chunks: new Map(), revealTo: null })
+    // The selection goes with the project. A path from the old one names nothing in the new
+    // tree, and keeping it would leave a highlight the user cannot see and the arrows
+    // starting from a row that does not exist.
+    set({ project, count: 0, chunks: new Map(), revealTo: null, selected: null, selectedIndex: 0 })
     if (project === null) return
 
     const mine = generation
@@ -232,6 +271,23 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   rowAt(index) {
     const chunk = get().chunks.get(chunkOf(index))
     return chunk?.[index % CHUNK_ROWS]
+  },
+
+  indexOf(path) {
+    for (const [chunk, rows] of get().chunks) {
+      const at = rows.findIndex((row) => row.path === path)
+      if (at >= 0) return chunk * CHUNK_ROWS + at
+    }
+    return null
+  },
+
+  select(path, index) {
+    const { selected, selectedIndex } = get()
+    // Guarded because a click on the already-selected row is the common case (it is the first
+    // half of every double-click), and an unconditional `set` would re-render every visible
+    // row to draw exactly what it is drawing.
+    if (selected === path && selectedIndex === index) return
+    set({ selected: path, selectedIndex: index })
   },
 
   async toggle(row) {
@@ -273,7 +329,10 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // refresh that landed while this count was in flight has already re-flattened the tree, so
     // both the count and the row index below describe a shape that is gone.
     if (generation !== mine) return
-    set({ count, chunks: new Map(), revealTo: index })
+    // A reveal scrolls to a row the user was not looking at, so it also selects it: landing
+    // on a screenful of rows with nothing marked leaves them to find the file again by eye,
+    // which is the whole thing `file.reveal` was supposed to do for them.
+    set({ count, chunks: new Map(), revealTo: index, selected: path, selectedIndex: index })
   },
 
   clearReveal() {

@@ -235,6 +235,56 @@ pub async fn fs_reveal(
     .await
 }
 
+/// Show a path in the desktop file manager. Returns the directory that was opened.
+///
+/// The file tree's context menu offers *Reveal*, and without this that item could only ever
+/// have been a disabled line with an explanation attached to it. Rust does the opening,
+/// exactly as `app_open_log_dir` does and for the same reason: `tauri-plugin-opener`'s JS
+/// command is capability-gated per window and a detached-pane window deliberately has none —
+/// going through it would make the item work in the shell window and silently do nothing in a
+/// torn-out one.
+///
+/// The **containing directory** is what gets opened, not the file. There is no portable way to
+/// ask a Linux file manager to select one entry — `nautilus --select` and `dolphin --select`
+/// are different flags on different binaries, and neither is necessarily the file manager the
+/// user's desktop is running — so this does the thing that behaves the same everywhere rather
+/// than the nicer thing that works on one developer's machine. A directory row opens itself.
+///
+/// Containment is checked first, like every other handler here: the path came back from the
+/// webview, and "open this in the user's file manager" is not something to do to `/etc` on a
+/// frontend bug.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_show_in_manager(
+    app: tauri::AppHandle,
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    path: PathBuf,
+) -> Result<PathBuf, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_show_in_manager", move || {
+        use tauri_plugin_opener::OpenerExt;
+
+        ops::check_within(&fs.root_paths(), &path)?;
+        // `is_dir` follows symlinks, which is what the user means here: revealing a symlinked
+        // directory should open what it points at, not the directory the link sits in.
+        let target = if path.is_dir() {
+            path.clone()
+        } else {
+            path.parent()
+                .map(PathBuf::from)
+                .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))?
+        };
+        app.opener()
+            .open_path(target.to_string_lossy(), None::<&str>)
+            .map_err(|e| FsError::Io {
+                path: target.display().to_string(),
+                message: e.to_string(),
+            })?;
+        Ok(target)
+    })
+    .await?
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_read_file(
     registry: State<'_, FsRegistry>,

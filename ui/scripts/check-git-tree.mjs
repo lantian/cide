@@ -72,7 +72,13 @@ try {
         paths: { '@/*': ['src/*'] },
         types: [],
       },
-      files: [join(UI, 'src', 'sidebar', 'GitPanel', 'model.ts')],
+      files: [
+        join(UI, 'src', 'sidebar', 'GitPanel', 'model.ts'),
+        // The click rules. They are in a module of their own precisely so the three sidebar
+        // check scripts can each hold the rule belonging to their tree; the git tree's is the
+        // conditional one, and it is pinned at the foot of this file.
+        join(UI, 'src', 'sidebar', 'clickSemantics.ts'),
+      ],
     }),
   )
   execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', tsconfig], {
@@ -559,6 +565,60 @@ try {
     }).repos[0].groups[0].entries[0].origPath,
     null,
     'snake_case is NOT accepted: a missing rename_all_fields is a Rust bug to fix at source',
+  )
+
+  // --- the click rule, including the conditional one ------------------------------------
+
+  /*
+   * > *"in git files tree when i do one click on element - we should select it, but not open
+   * > the diff. Only when diff is already opened one click should change current diff to
+   * > selected file. Otherwise diff should be opened only via double click."*
+   *
+   * The third clause is a state dependency and it is the reason `clickSemantics.ts` exists as
+   * a module rather than as three `onMouseDown` handlers. `diffOpen` comes from the Rust-owned
+   * workspace (`openDiffTabs.ts`), so the rule below is the whole of what the tree decides.
+   */
+  const c = await import(`file://${join(out, 'sidebar', 'clickSemantics.js')}`)
+  const click = (gesture, expandable, diffOpen) => c.gitTreeClick({ gesture, expandable, diffOpen })
+  const act = (select, toggle, open) => ({ select, toggle, open })
+
+  eq(
+    click('single', false, false),
+    act(true, false, false),
+    'one click on a file with no diff on screen selects it and opens nothing — the report',
+  )
+  eq(
+    click('single', false, true),
+    act(true, false, true),
+    'one click on a file WHILE a diff is open switches the diff to it, which is the whole of '
+      + 'the conditional clause',
+  )
+  eq(
+    click('double', false, false),
+    act(true, false, true),
+    'a double click opens the diff whether or not one was already there',
+  )
+  eq(click('double', false, true), act(true, false, true), 'and does the same when one was')
+  eq(
+    c.gestureOf(2),
+    'double',
+    'the second click of a double is told apart by `detail`, not by a timer that would make '
+      + 'every single click in the tree feel late',
+  )
+  eq(c.gestureOf(1), 'single', 'and the first click of one is an ordinary single')
+  eq(c.gestureOf(3), 'double', 'a triple click keeps opening rather than falling back to select')
+
+  eq(
+    click('single', true, false),
+    act(true, true, false),
+    'a changelist or repo row folds on a single click — it holds no diff, and there is nothing '
+      + 'else a click on one could mean',
+  )
+  eq(
+    click('double', true, true),
+    act(false, false, false),
+    'and the second half of a double-click on a group does NOTHING: `click` fires twice, so '
+      + 'folding on both halves would open the group and shut it again in one gesture',
   )
 
   if (failed > 0) {

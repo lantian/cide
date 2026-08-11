@@ -50,6 +50,21 @@ export interface HitRow {
 export type SearchRow = FileRow | HitRow
 
 /**
+ * A row's identity, for the panel's selection.
+ *
+ * A key rather than the row's position, because the positions move underneath it: results
+ * stream in for seconds after the first ones paint, and folding a group away renumbers
+ * everything below it. A selection stored as index 12 becomes a different line every time
+ * either happens, which is worse than no selection at all.
+ *
+ * The hit's *index into the flat hit list* is what identifies it, not `path:line` — one line
+ * can hold two matches, and they are two separate rows the user can move between.
+ */
+export function rowKey(row: SearchRow): string {
+  return row.kind === 'file' ? `f:${row.path}` : `h:${row.index}`
+}
+
+/**
  * Flatten hits into the rows the virtualizer draws: one heading per file, then its hits.
  *
  * Grouping is by *consecutive run*, not by a map over the whole list. Rust sends every hit
@@ -160,6 +175,52 @@ export function splitHighlight(text: string, start: number, end: number): Highli
 function clamp(value: number, lo: number, hi: number): number {
   if (!Number.isFinite(value)) return lo
   return Math.min(Math.max(Math.trunc(value), lo), hi)
+}
+
+/** Where a hit is, in the units an editor's caret is placed with. */
+export interface HitPosition {
+  /** 1-based, straight from the wire. */
+  line: number
+  /** 1-based, in UTF-16 units — what a JS string is indexed by, and what CodeMirror counts. */
+  column: number
+  /** 1-based and exclusive: the caret position at the end of the match. */
+  endColumn: number
+}
+
+/**
+ * A hit as a caret position.
+ *
+ * > *"search result click doesn't point me to found place (should open file and select the
+ * > line)"*
+ *
+ * Opening the file is only half of that; the other half is a position, and the position on
+ * the wire is in the wrong units for one. `start`/`end` are **byte** offsets, because that is
+ * what the search engine works in, and an editor's column is a character offset. They agree
+ * for ASCII and diverge for everything else — one emoji before the match puts the caret three
+ * characters past it, one accented word puts it one past — which is a caret that lands
+ * *nearly* right and therefore looks like the editor's fault rather than this conversion's.
+ *
+ * Deliberately computed on the **untrimmed** hit. `trimIndent` exists so a deeply indented
+ * line is readable in a 252px panel; the file on disk still has that indentation, and a caret
+ * placed at the trimmed column would be one whole indent to the left of the match.
+ *
+ * 1-based to match `line`, which is 1-based because every editor and every compiler
+ * diagnostic counts lines that way. Mixing the two bases in one struct is how an off-by-one
+ * gets shipped, so both are 1-based and the host converts once.
+ */
+export function hitPosition(hit: Hit): HitPosition {
+  const bytes = encoder.encode(hit.text)
+  const lo = clamp(hit.start, 0, bytes.length)
+  const hi = clamp(hit.end, lo, bytes.length)
+  if (bytes.length === hit.text.length) {
+    // Pure ASCII: one byte per UTF-16 unit, so the offsets are already columns.
+    return { line: hit.line, column: lo + 1, endColumn: hi + 1 }
+  }
+  return {
+    line: hit.line,
+    column: decoder.decode(bytes.subarray(0, lo)).length + 1,
+    endColumn: decoder.decode(bytes.subarray(0, hi)).length + 1,
+  }
 }
 
 /**

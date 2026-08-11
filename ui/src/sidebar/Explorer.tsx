@@ -20,10 +20,20 @@ import styles from './FileTree.module.css'
 export interface ExplorerProps {
   /** The active project, or `null` when none is open. */
   project: ProjectId | null
+  /** A double-click on a file row, and Enter. A single click only selects — see `FileTree`. */
   onOpenFile?: ((path: string) => void) | undefined
+  /**
+   * The context menu's *Open to the Side*.
+   *
+   * Optional because nothing in the sidebar can split a pane and this panel must not pretend
+   * otherwise: with no host the item is drawn disabled with the reason on it, which is the
+   * house treatment for "why not" beating absence. Wiring it is one line in the shell — see
+   * the note in `FileTree.tsx`.
+   */
+  onOpenFileToSide?: ((path: string) => void) | undefined
 }
 
-export function Explorer({ project, onOpenFile }: ExplorerProps) {
+export function Explorer({ project, onOpenFile, onOpenFileToSide }: ExplorerProps) {
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
 
@@ -180,7 +190,7 @@ export function Explorer({ project, onOpenFile }: ExplorerProps) {
           </span>
         )}
       </div>
-      <FileTree onOpen={onOpenFile} />
+      <FileTree project={project} onOpen={onOpenFile} onOpenToSide={onOpenFileToSide} />
     </div>
   )
 }

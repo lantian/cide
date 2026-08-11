@@ -39,6 +39,9 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/sidebar/SearchModel.ts',
+      // The click rules, pinned at the foot of this file. They live in a module of their own
+      // so a check script can hold them; see `clickSemantics.ts`.
+      'src/sidebar/clickSemantics.ts',
       '--outDir', out,
       '--rootDir', 'src',
       '--module', 'commonjs',
@@ -59,13 +62,16 @@ try {
   const {
     EMPTY_QUERY,
     groupHits,
+    hitPosition,
     panelState,
+    rowKey,
     sameQuery,
     spliceHits,
     splitHighlight,
     summarize,
     trimIndent,
   } = require(join(out, 'sidebar/SearchModel.js'))
+  const { searchClick, gestureOf } = require(join(out, 'sidebar/clickSemantics.js'))
 
   /* ------------------------------------------------------------------------- grouping */
 
@@ -276,6 +282,77 @@ try {
   }
   eq(EMPTY_QUERY.pattern, '', 'the panel opens with an empty box')
   eq(EMPTY_QUERY.mode, 'literal', 'and in literal mode, not regex')
+
+  /* ------------------------------------------------------ where a hit actually is */
+
+  /*
+   * > *"search result click doesn't point me to found place (should open file and select the
+   * > line)"*
+   *
+   * The file half already worked. The *place* half is this conversion, and it is invisible
+   * when it is wrong: byte offsets and editor columns agree for ASCII and diverge for
+   * everything else, so a caret placed from the raw offsets lands two characters past the
+   * match on exactly the lines a user is least likely to blame the search panel for.
+   */
+  const at = (text, start, end) => hitPosition({ path: '/p', rel: 'p', line: 7, text, start, end })
+
+  eq(at('let needle = 1', 4, 10), { line: 7, column: 5, endColumn: 11 },
+    'an ASCII line: 1-based columns, one past the byte offsets')
+  eq(at('needle', 0, 6).column, 1, 'a match at the start of a line is column 1, not column 0')
+  eq(
+    // `✓` is 3 bytes and 1 UTF-16 unit, so `needle` starts at byte 7 and at column 6.
+    at('// ✓ needle here', 7, 13),
+    { line: 7, column: 6, endColumn: 12 },
+    'a 3-byte glyph before the match shifts the byte offsets by 2 more than the columns — '
+      + 'reading the offsets as columns would put the caret two characters late',
+  )
+  eq(
+    at('🙂 needle', 5, 11),
+    { line: 7, column: 4, endColumn: 10 },
+    'an astral character is 4 bytes and 2 UTF-16 units, which is the case a naive `char` '
+      + 'count gets wrong in the other direction',
+  )
+  eq(
+    at('needle', 99, 200),
+    { line: 7, column: 7, endColumn: 7 },
+    'offsets past the end of the line are clamped rather than trusted: they arrived over IPC, '
+      + 'and a decode of an out-of-range subarray throws inside a render',
+  )
+  eq(
+    hitPosition({ path: '/p', rel: 'p', line: 3, text: '\t\tneedle', start: 2, end: 8 }).column,
+    3,
+    'the position is read from the UNTRIMMED line — `trimIndent` is a display decision for a '
+      + '252px panel, and the file on disk still has the indentation',
+  )
+
+  /* ------------------------------------------------------------ selection identity */
+
+  eq(rowKey({ kind: 'file', path: '/a/b.rs', rel: 'b.rs', hits: 2, collapsed: false }), 'f:/a/b.rs',
+    'a heading is identified by its path')
+  eq(rowKey({ kind: 'hit', index: 12, hit: hit('a.rs', 3) }), 'h:12',
+    'a hit by its index into the flat list, not by path:line — one line can hold two matches, '
+      + 'and they are two rows the user can move between')
+
+  /* ------------------------------------------------------------------- click rules */
+
+  const click = (gesture, kind) => searchClick({ gesture, kind })
+  const act = (select, toggle, open) => ({ select, toggle, open })
+
+  eq(
+    click('single', 'hit'),
+    act(true, false, true),
+    'ONE click on a result opens it — unlike the two trees, and deliberately: a hit is a '
+      + 'request to go somewhere, and there is nothing else a click on one could mean',
+  )
+  eq(
+    click('double', 'hit'),
+    act(false, false, false),
+    'the second half of a double-click navigates nowhere: re-opening would be harmless today '
+      + 'and "one gesture, one navigation" is what keeps it harmless later',
+  )
+  eq(click('single', 'file'), act(true, true, false), 'a heading folds its group')
+  eq(click('double', 'file'), act(false, false, false), 'and does not fold it straight back')
+  eq(gestureOf(2), 'double', 'told apart by `detail`, with no timer to make a click feel late')
 
   if (failed > 0) {
     console.error(`\ncheck-search: ${failed} failure(s)`)

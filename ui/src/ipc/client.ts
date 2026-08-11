@@ -1306,3 +1306,26 @@ export const clipboard = {
   writeText: (text: string) =>
     invoke<void>('plugin:clipboard-manager|write_text', { text, label: null }),
 }
+
+/* --------------------------------------------------------------------------------------
+ * The sidebar's context menus. (M12)
+ *
+ * Appended as one contiguous block, per the house rule about this file. One entry, and it is
+ * down here rather than on the `fs` namespace above only because of that rule — it is an
+ * ordinary `fs_*` handler and belongs beside `fs.reveal` in every other sense.
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Show a path in the desktop file manager, and answer with the directory that opened.
+ *
+ * Not `fs.reveal`, which is the other kind of reveal entirely: that one expands the file
+ * tree's own ancestors and scrolls to a row, inside this window. This one leaves the app.
+ *
+ * The **containing** directory is what opens for a file row, because no "open this folder and
+ * select this entry" flag is portable across Linux file managers. See
+ * `cmd::fs::fs_show_in_manager`.
+ */
+export const fsReveal = {
+  showInManager: (projectId: ProjectId, path: string) =>
+    invoke<string>('fs_show_in_manager', { project: projectId, path }),
+}

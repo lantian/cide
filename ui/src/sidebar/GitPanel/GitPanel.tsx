@@ -1,50 +1,83 @@
 /**
- * The 420px IDEA-style commit tool window.
+ * The 420px IDEA-style commit tool window — everything except its connection to the window.
  *
  * Composition only: tabs, toolbar, tree, guard bar, footer. Every piece of state and every
  * git call lives in `useGitPanel`, and every rule about rows and tri-state lives in
  * `model.ts`. That split is what lets the model be tested under node with no DOM
  * (`ui/scripts/check-git-tree.mjs`) and what keeps this file readable as a layout.
  *
- * The panel takes `project` and an optional place to put a diff, so the sidebar that hosts it
- * needs to know nothing about git:
+ * # Why this is a *view* and `GitPanelHost` is the panel
  *
- * ```tsx
- * {view === 'git' && <GitPanel project={activeProjectId} />}
- * ```
+ * `ui/scripts/check-git-render.mjs` renders this file under node with `react-dom/server` —
+ * that check is the only reason we know the panel paints rather than merely compiles, and it
+ * caught the bug where every repository was silently dropped. It renders with `window` and
+ * `location` stubbed and **nothing else**, deliberately: a check that fakes a browser proves
+ * things about the fake.
+ *
+ * Two things this panel now needs are unreachable under that rule. `useContextMenu` reads the
+ * window's keymap from `@/store/workspace`, and `useIconTheme` reads the theme from the same
+ * store — and that store imports `layout/paneHosts`, which calls `document.createElement` at
+ * module scope and pulls the xterm addons in behind it. Importing either from here turns the
+ * render check into `ReferenceError: document is not defined`.
+ *
+ * So the two window-shaped concerns are lifted one level, into `GitPanelHost.tsx`, and arrive
+ * here as ordinary props: a theme string and a pair of menu handles. This file keeps its
+ * import graph free of the DOM, the check keeps rendering the thing it asserts about, and the
+ * menu is wired in exactly one place. `index.ts` exports the host as `GitPanel`, so nothing
+ * outside this directory notices.
  *
  * With `?git-story=<name>` on the URL it renders a fixture instead of talking to Rust —
  * `mock`, `guard`, `multi`, `empty`. See `fixture.ts` for why that exists.
  */
-import { useEffect, useMemo, useState } from 'react'
-import type { FileDiff, ProjectId, RepoId } from '@/ipc/client'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import type { ProjectId, RepoId } from '@/ipc/client'
+import type { IconTheme } from '@/icons/iconFor'
 import { ChangesTree } from './ChangesTree'
 import { CommitBox } from './CommitBox'
 import { GuardBar } from './GuardBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
 import { allRepos, partialFiles, repoOf, summarize } from './model'
-import { useGitPanel } from './useGitPanel'
+import { useGitDiffTabOpen } from './openDiffTabs'
+import type { GitPanelActions, GitPanelModel } from './useGitPanel'
 import styles from './GitPanel.module.css'
 
 type PanelTab = 'commit' | 'shelf'
 
-export interface GitPanelProps {
-  /** The active project, or `null` before one is open — then the panel is simply empty. */
-  project: ProjectId | null
-  /**
-   * Where a double-clicked file's diff goes.
-   *
-   * Optional because the panel cannot open a pane by itself and must not pretend to: without
-   * it the diff is still fetched and the panel says, in its one warning line, that there is
-   * nowhere to show it. Wiring this is the host's job — see the README note in `index.ts`.
-   */
-  onOpenDiff?: ((diff: FileDiff, repo: RepoId) => void) | undefined
+/** The two halves of a `useContextMenu` handle, threaded down from the host. */
+export interface TreeMenu {
+  onContextMenu: (e: React.MouseEvent) => void
+  /** Must be rendered somewhere; it portals. */
+  menu: ReactNode
 }
 
-export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
-  const git = useGitPanel(project, { onOpenDiff })
+export interface GitPanelViewProps {
+  /** The active project, or `null` before one is open — then the panel is simply empty. */
+  project: ProjectId | null
+  /** The model, built by the host so that the host's menu can act on the same one. */
+  git: GitPanelModel & GitPanelActions
+  /**
+   * `dark` or `light`, for the row icons.
+   *
+   * A prop rather than a `useIconTheme()` call: that hook reads the workspace store, which
+   * this module may not import. See the header.
+   */
+  iconTheme: IconTheme
+  /** Absent in a render with no window — the SSR check, and any fixture harness. */
+  treeMenu?: TreeMenu | undefined
+}
+
+export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelViewProps) {
   const [tab, setTab] = useState<PanelTab>('commit')
+  /**
+   * The row the user is pointing at, by id.
+   *
+   * Held here rather than inside `ChangesTree` because that component unmounts every time the
+   * Shelf tab is opened, and a cursor that resets on a glance at the shelf is a cursor nobody
+   * can rely on. An id rather than an index — see the note in `ChangesTree`.
+   */
+  const [current, setCurrent] = useState<string | null>(null)
+  const diffOpen = useGitDiffTabOpen(project)
 
   const partial = useMemo(() => partialFiles(git.view), [git.view])
   const summary = useMemo(() => summarize(git.picked), [git.picked])
@@ -134,9 +167,15 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
             selected={git.selected}
             expanded={git.expanded}
             partial={partial}
+            current={current}
+            onCurrent={setCurrent}
+            diffOpen={diffOpen}
+            iconTheme={iconTheme}
             onToggleCheck={git.toggleCheck}
             onToggleExpand={git.toggleExpand}
             onOpenDiff={git.openDiff}
+            onContextMenu={treeMenu?.onContextMenu}
+            menu={treeMenu?.menu}
           />
         ) : (
           <ShelfList

@@ -308,6 +308,7 @@ pub fn run() {
             cmd::fs::fs_expand,
             cmd::fs::fs_collapse,
             cmd::fs::fs_reveal,
+            cmd::fs::fs_show_in_manager,
             cmd::fs::fs_read_file,
             cmd::fs::fs_write_file,
             cmd::fs::fs_create,

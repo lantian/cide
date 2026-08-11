@@ -24,7 +24,17 @@
  * file path from `ui/scripts/check-git-tree.mjs`, which compiles that one module with tsc
  * and imports the output, so routing it through a barrel would only drag React in.
  */
-export { GitPanel, type GitPanelProps } from './GitPanel'
+/*
+ * `GitPanel` comes from `GitPanelHost`, not from `GitPanel.tsx`.
+ *
+ * That file holds `GitPanelView`, which is everything the panel draws and nothing that needs a
+ * window — no context menu, no theme lookup — so that `check-git-render.mjs` can render it
+ * under node with `react-dom/server` and no DOM. The host adds the two window-shaped pieces.
+ * Callers import `GitPanel` and are unaffected; see the header of either file for why the
+ * split exists.
+ */
+export { GitPanel, type GitPanelProps } from './GitPanelHost'
+export { GitPanelView, type GitPanelViewProps, type TreeMenu } from './GitPanel'
 export {
   useGitPanel,
   type GitPanelActions,

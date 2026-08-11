@@ -23,12 +23,18 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-tree-status-'))
+
+/** `moveIndex`, named so the assertions below fit on one line each. */
+const m2 = (c, key, at, count) => c.moveIndex(key, at, count)
 try {
   execFileSync(
     'node',
     [
       'node_modules/typescript/bin/tsc',
       'src/sidebar/treeStatus.ts',
+      // The file tree's click rules, pinned at the foot of this file. They live in a module of
+      // their own so a check script can hold them; see `clickSemantics.ts`.
+      'src/sidebar/clickSemantics.ts',
       '--outDir', out,
       // Pinned so the emitted layout is `<out>/sidebar/treeStatus.js` whether or not the
       // type-only import of `../ipc/generated` widens the inferred common root.
@@ -164,6 +170,67 @@ try {
   )
   eq(m.letterFor('untracked', true), '', 'every directory, whatever its status')
   eq(m.letterFor('exploded', false), '', 'an unknown status draws no letter rather than throwing')
+
+  // --- clicks: select, and open only on the second one -----------------------------------
+
+  /*
+   * > *"In file tree when i do one click on element - we should select it, but not open the
+   * > file. Open only by double click"*
+   *
+   * Pinned here rather than left in an `onMouseDown` because the interesting part is not the
+   * happy path — it is what the *second* half of a double-click does. `click` fires twice,
+   * with `detail` 1 and then 2, so a rule that toggled on both halves would expand a folder
+   * and collapse it again, and one that opened on both would open the file twice.
+   */
+  const c = await import(`file://${join(out, 'sidebar', 'clickSemantics.js')}`)
+  const click = (gesture, isDir, onTwisty = false) =>
+    c.fileTreeClick({ gesture, isDir, onTwisty })
+  const act = (select, toggle, open) => ({ select, toggle, open })
+
+  eq(click('single', false), act(true, false, false), 'one click on a file selects and does '
+    + 'not open it — the report this whole module exists for')
+  eq(click('double', false), act(true, false, true), 'the second click opens it')
+  eq(click('single', true), act(true, false, false), 'one click on a folder selects only too')
+  eq(click('double', true), act(true, true, false), 'and the second expands it rather than '
+    + 'opening a tab, because a folder has no tab to open')
+
+  eq(
+    click('single', true, true),
+    act(true, true, false),
+    'the twisty is exempt: one click on the ▸ folds the folder, because requiring a double '
+      + 'click on an 11px arrow to do the only thing it does would be a worse tree',
+  )
+  eq(
+    click('double', true, true),
+    act(false, false, false),
+    'and the second half of a double-click on the twisty does NOTHING — toggling on both '
+      + 'halves would expand the folder and shut it again inside one gesture',
+  )
+
+  eq(c.gestureOf(1), 'single', '`detail` of 1 is a single click')
+  eq(c.gestureOf(2), 'double', 'and 2 is the second of a pair — no timer, so no lag')
+
+  eq(
+    c.enterOn({ expandable: false }),
+    act(true, false, true),
+    'Enter always opens a leaf: the keyboard has no second click to wait for',
+  )
+  eq(c.enterOn({ expandable: true }), act(true, true, false), 'and expands a folder')
+
+  // --- arrow movement --------------------------------------------------------------------
+
+  eq(m2(c, 'ArrowDown', 0, 10), 1, 'Down moves one row')
+  eq(m2(c, 'ArrowUp', 5, 10), 4, 'Up moves one row back')
+  eq(m2(c, 'ArrowUp', 0, 10), 0, 'and stops at the top rather than wrapping to the bottom — a '
+    + 'tree of 100 000 rows where overshooting the top costs you your place is unusable')
+  eq(m2(c, 'ArrowDown', 9, 10), 9, 'the same at the end')
+  eq(m2(c, 'Home', 7, 10), 0, 'Home is the first row')
+  eq(m2(c, 'End', 2, 10), 9, 'End is the last')
+  eq(m2(c, 'a', 2, 10), null, 'a key that is not ours answers null, so the handler can leave '
+    + 'it to the browser rather than swallowing it')
+  eq(m2(c, 'ArrowDown', 0, 0), null, 'an empty tree has nowhere to move')
+  eq(m2(c, 'ArrowDown', 99, 10), 9, 'a stale index — the rows moved under the selection — is '
+    + 'clamped rather than trusted')
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

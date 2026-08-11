@@ -160,6 +160,26 @@
   background: var(--chrome-hi);
 }
 
+/*
+ * The selected result. Identical treatment to the file tree's selected row — same `--sel`
+ * band, same 2px accent rule down the leading edge — because the two sidebars are the same
+ * piece of chrome and a selection that looks different in each reads as two different states.
+ * The rule is drawn with an inset shadow rather than a border so nothing shifts sideways when
+ * a row becomes selected.
+ */
+.rowSelected,
+.rowSelected:hover {
+  background: var(--sel);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* One tab stop for the list, with the arrows moving inside it; the ring belongs on the thing
+   that actually holds focus. */
+.scroll:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
 /* A file heading reads as a heading: dimmer than its hits, and never truncated on the left —
    the tail of a path is what identifies it, so the ellipsis goes at the front. */
 .fileName {
@@ -188,13 +208,12 @@
   font-size: 9px;
 }
 
-.glyph {
-  flex: none;
-  width: 12px;
-  text-align: center;
-  color: var(--faint);
-  font-size: 10.5px;
-}
+/*
+ * There is no `.glyph` here any more, for the same reason `FileTree.module.css` lost its own:
+ * the heading draws a `<FileIcon>`, which brings its own 16px box and is an `<img>` — opaque
+ * to this stylesheet, so a colour rule here would have done nothing while looking like it did
+ * something. The 5px flex `gap` still separates it from the name.
+ */
 
 .hitRow {
   /* Indented under its heading by the tree's own 12px step. */
