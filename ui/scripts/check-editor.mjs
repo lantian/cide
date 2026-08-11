@@ -9,7 +9,7 @@
  *
  * Same shape as `check-status-format.mjs` and `check-picker.mjs`: no JS test runner in this
  * project, so the TypeScript already in `node_modules` compiles the modules and this file
- * imports the output. Seven things are pinned, in the order they appear below.
+ * imports the output. Eight things are pinned, in the order they appear below.
  *
  *  1. **Line endings.** A round trip — capture, hand the text to CodeMirror, restore — is
  *     byte-identical for LF, CRLF, bare CR *and* mixed. This is the regression that already
@@ -34,6 +34,11 @@
  *  7. **The open-buffer registry.** What `file.save` and *Save and close* both go through:
  *     which tab a save means, which tabs can be saved, what happens when one cannot, and
  *     that "no editor here" is distinguishable from "the write failed".
+ *  8. **The reveal queue and its clamp.** What a search-result click goes through: that a
+ *     request made before the editor mounts is parked rather than dropped, that one made
+ *     while it is open still arrives, that neither the queue nor the registry leaks — and
+ *     that a target pointing past the end of a file that has changed since the search
+ *     clamps instead of throwing out of `dispatch` and taking the window down.
  *
  * The fifth found two more quadratics on its first run — the markdown link matcher and the
  * shell `${…}` matcher, both the same unbounded-scan-then-backtrack shape as the YAML key
@@ -99,6 +104,7 @@ try {
       'src/editor/lineEndings.ts',
       'src/editor/byteSize.ts',
       'src/editor/openBuffers.ts',
+      'src/editor/revealRequest.ts',
       'src/editor/languages.ts',
       'src/editor/highlight.ts',
       'src/editor/minimapGeometry.ts',
@@ -138,6 +144,7 @@ try {
     load('lineEndings.js')
   const { exceedsBytes, utf8ByteLength } = load('byteSize.js')
   const buffers = load('openBuffers.js')
+  const reveal = load('revealRequest.js')
   const { basename, languageName, loadLanguage } = load('languages.js')
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
@@ -1278,6 +1285,311 @@ try {
 
     for (const tab of buffers.registeredBuffers()) buffers.unregisterBuffer(tab)
     eq(buffers.registeredBuffers(), [], 'the registry is a module singleton and is left empty')
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 8. The reveal queue and its clamp
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * The queue.
+   *
+   * The case that decides the whole design is the *first* one below: the sidebar requests the
+   * reveal and opens the tab in the same turn, so the editor mounts afterwards. A module that
+   * delivered to whatever was mounted at request time would drop exactly the request the user
+   * made — and would pass any test written the obvious way round, because a file that is
+   * already open works either way.
+   */
+  {
+    const at = (line, column, endColumn) => ({ line, column, endColumn })
+    /** A mounted editor that records what it was told to reveal. */
+    const editor = () => {
+      const seen = []
+      const receive = (target) => seen.push(`${target.line}:${target.column}-${target.endColumn}`)
+      return { seen, receive }
+    }
+
+    /*
+     * A mount is only committed once the stack it was made on has emptied.
+     *
+     * `registerReveal` holds a claimed request until the next microtask, because React
+     * `StrictMode` — which `main.tsx` keeps on deliberately — mounts every effect twice in
+     * development: setup, cleanup, setup, synchronously inside one commit. Everything in this
+     * file runs on one stack, so without this the whole section would look like one enormous
+     * StrictMode remount and no disposer here would be a real tab close.
+     */
+    const settle = () => new Promise((resolve) => queueMicrotask(resolve))
+
+    eq(reveal.pendingReveals(), [], 'the queue starts empty')
+    eq(reveal.revealReceivers(), [], 'and so does the registry')
+
+    // 0. StrictMode's throwaway mount. This is not a hypothetical: the first version of this
+    //    module spent the request on the discarded view, and the caret did not move in `pnpm
+    //    dev` for the exact case the user reported — a hit in a file that was not open.
+    {
+      reveal.requestReveal('/w/strict.rs', at(7, 3, 8))
+      const thrownAway = editor()
+      const live = editor()
+      const stopThrownAway = reveal.registerReveal('/w/strict.rs', thrownAway.receive) // setup
+      stopThrownAway() //                                                                cleanup
+      const stopLive = reveal.registerReveal('/w/strict.rs', live.receive) //             setup
+      eq(live.seen, ['7:3-8'], 'a mount discarded by StrictMode does not swallow the request')
+      await settle()
+      eq(reveal.pendingReveals(), [], 'and the surviving mount spends it for good')
+      stopLive()
+      eq(reveal.pendingReveals(), [], 'closing that editor afterwards does not resurrect it')
+      eq(reveal.revealReceivers(), [], 'and the registry is clear')
+    }
+
+    // 0b. The same remount, but the deadline. A re-parked request keeps the timestamp of the
+    //     click; refreshing it would let a request whose file never opens live one TTL longer
+    //     for every discarded mount, which is the drift `REVEAL_TTL_MS` exists to forbid. The
+    //     real delay is what makes an unrefreshed stamp distinguishable from a refreshed one.
+    {
+      reveal.requestReveal('/w/stamp.rs', at(5, 1, 2))
+      const clickedAt = Date.now()
+      await new Promise((resolve) => setTimeout(resolve, 6))
+      const thrownAway = editor()
+      const stopThrownAway = reveal.registerReveal('/w/stamp.rs', thrownAway.receive)
+      stopThrownAway() // Before any microtask, so this is the StrictMode cleanup.
+      eq(reveal.pendingReveals(), ['/w/stamp.rs'], 'the discarded mount puts the request back')
+      eq(
+        reveal.pendingReveals(clickedAt + reveal.REVEAL_TTL_MS + 1),
+        [],
+        'and its deadline still runs from the click, not from the remount',
+      )
+      reveal.claimReveal('/w/stamp.rs')
+    }
+
+    // 1. A hit in a file that is not open: requested first, mounted second.
+    {
+      reveal.requestReveal('/w/a.rs', at(12, 5, 9))
+      eq(reveal.pendingReveals(), ['/w/a.rs'], 'a request with nothing mounted is parked')
+      const pane = editor()
+      const stop = reveal.registerReveal('/w/a.rs', pane.receive)
+      eq(pane.seen, ['12:5-9'], 'and the editor that mounts for that path is handed it')
+      eq(reveal.pendingReveals(), [], 'the request is spent')
+      await settle()
+
+      // Spent, not broadcast: a second pane opened on the same file later is not scrolled to
+      // a search the user has moved on from.
+      const later = editor()
+      const stopLater = reveal.registerReveal('/w/a.rs', later.receive)
+      eq(later.seen, [], 'a later mount for the same path gets nothing')
+      stopLater()
+      stop()
+      eq(reveal.revealReceivers(), [], 'and both unregistered themselves')
+      // The hold is one turn, not a timer: a tab closed long after the reveal was shown must
+      // not put it back, or reopening the file by hand would replay a search the user has
+      // finished with — which is the whole point of `REVEAL_TTL_MS`.
+      eq(reveal.pendingReveals(), [], 'and a real close does not re-park what was already shown')
+    }
+
+    // 2. A file that is already open. No mount will follow, so parking would drop it.
+    {
+      const pane = editor()
+      const stop = reveal.registerReveal('/w/b.rs', pane.receive)
+      reveal.requestReveal('/w/b.rs', at(3, 1, 4))
+      eq(pane.seen, ['3:1-4'], 'a request for an open file is applied to it now')
+      eq(reveal.pendingReveals(), [], 'and nothing is left parked for a mount that never comes')
+      stop()
+    }
+
+    // 3. Two hits in quick succession. The second click is the one the user meant.
+    {
+      reveal.requestReveal('/w/c.rs', at(1, 1, 2))
+      reveal.requestReveal('/w/c.rs', at(40, 7, 11))
+      eq(reveal.pendingReveals(), ['/w/c.rs'], 'a second request for a path does not accumulate')
+      const pane = editor()
+      const stop = reveal.registerReveal('/w/c.rs', pane.receive)
+      eq(pane.seen, ['40:7-11'], 'and it supersedes the first rather than queueing behind it')
+      await settle()
+      stop()
+    }
+    {
+      // The same, but the file was already open: both are delivered, in order, because each
+      // one moved a caret the user could see.
+      const pane = editor()
+      const stop = reveal.registerReveal('/w/d.rs', pane.receive)
+      reveal.requestReveal('/w/d.rs', at(1, 1, 2))
+      reveal.requestReveal('/w/d.rs', at(40, 7, 11))
+      eq(pane.seen, ['1:1-2', '40:7-11'], 'two hits in an open file both move the caret')
+      stop()
+    }
+    {
+      // Different files do not supersede each other: both tabs are opening.
+      reveal.requestReveal('/w/e.rs', at(2, 1, 2))
+      reveal.requestReveal('/w/f.rs', at(3, 1, 2))
+      eq(reveal.pendingReveals(), ['/w/e.rs', '/w/f.rs'], 'two paths are parked independently')
+      const e = editor()
+      const f = editor()
+      const stopE = reveal.registerReveal('/w/e.rs', e.receive)
+      const stopF = reveal.registerReveal('/w/f.rs', f.receive)
+      eq([e.seen, f.seen], [['2:1-2'], ['3:1-2']], 'and each mount takes its own')
+      await settle()
+      stopE()
+      stopF()
+      eq(reveal.pendingReveals(), [], 'and neither leaves anything behind when it closes')
+    }
+
+    // 4. A split: one file, two panes, one gesture. Neither pane is more right than the other
+    //    and this module cannot see which has focus, so both are told.
+    {
+      const left = editor()
+      const right = editor()
+      const stopLeft = reveal.registerReveal('/w/split.rs', left.receive)
+      const stopRight = reveal.registerReveal('/w/split.rs', right.receive)
+      reveal.requestReveal('/w/split.rs', at(9, 2, 3))
+      eq([left.seen, right.seen], [['9:2-3'], ['9:2-3']], 'both panes over one file are revealed')
+
+      stopLeft()
+      reveal.requestReveal('/w/split.rs', at(10, 1, 2))
+      eq(left.seen.length, 1, 'a closed pane stops being told')
+      eq(right.seen, ['9:2-3', '10:1-2'], 'and the one still open keeps being told')
+      // The disposer is keyed on the receiver, not the path — closing one pane must not
+      // disconnect the other, and calling it twice must not disconnect anything at all.
+      stopLeft()
+      reveal.requestReveal('/w/split.rs', at(11, 1, 2))
+      eq(right.seen.length, 3, 'a disposer called twice does not take the other pane down')
+      stopRight()
+      eq(reveal.revealReceivers(), [], 'the last pane out clears the entry')
+      reveal.requestReveal('/w/split.rs', at(12, 1, 2))
+      eq(reveal.pendingReveals(), ['/w/split.rs'], 'and a later request parks again')
+      eq(reveal.claimReveal('/w/split.rs'), { line: 12, column: 1, endColumn: 2 }, 'claimed')
+      eq(reveal.claimReveal('/w/split.rs'), null, 'and a claim spends it')
+      eq(reveal.claimReveal('/w/never-asked-for'), null, 'a path nobody asked about claims null')
+    }
+
+    /*
+     * 5. A path that never opens. Both bounds, because they answer different failures: the cap
+     *    is the memory, and the deadline is the behaviour. Without the deadline a request
+     *    parked for a file that never opened would fire when the user opens that file by hand
+     *    an hour later, moving the caret for a search they have forgotten.
+     */
+    {
+      for (const path of reveal.pendingReveals()) reveal.claimReveal(path)
+      for (let i = 0; i < reveal.PENDING_LIMIT + 4; i++) {
+        reveal.requestReveal(`/w/never-${i}.rs`, at(i + 1, 1, 2))
+      }
+      eq(reveal.pendingReveals().length, reveal.PENDING_LIMIT, 'the queue cannot grow past its cap')
+      eq(
+        reveal.pendingReveals()[0],
+        '/w/never-4.rs',
+        'and it is the oldest request that is dropped, not the newest',
+      )
+      // A repeated request counts as new: re-inserted rather than updated in place, or the
+      // path the user just clicked would be first in line for eviction.
+      reveal.requestReveal('/w/never-4.rs', at(99, 1, 2))
+      reveal.requestReveal('/w/fresh.rs', at(1, 1, 2))
+      ok(
+        reveal.pendingReveals().includes('/w/never-4.rs'),
+        'a re-requested path goes to the back of the eviction queue',
+      )
+
+      const stale = Date.now() + reveal.REVEAL_TTL_MS + 1
+      eq(reveal.claimReveal('/w/fresh.rs', Date.now()), { line: 1, column: 1, endColumn: 2 },
+        'a request claimed at once is honoured')
+      reveal.requestReveal('/w/fresh.rs', at(1, 1, 2))
+      eq(reveal.pendingReveals(stale), [], 'nothing in the queue survives the deadline')
+      eq(reveal.claimReveal('/w/fresh.rs', stale), null, 'and a stale request is not applied')
+      eq(reveal.claimReveal('/w/fresh.rs'), null, 'looking at it spent it, stale or not')
+
+      for (const path of reveal.pendingReveals()) reveal.claimReveal(path)
+      eq(reveal.pendingReveals(), [], 'the queue is a module singleton and is left empty')
+      eq(reveal.revealReceivers(), [], 'and so is the registry')
+    }
+  }
+
+  /*
+   * The clamp.
+   *
+   * `Text` is CodeMirror's own, so `doc.line()` throws here exactly where it throws in the
+   * editor — which is the whole point. The file can have been edited, truncated or replaced
+   * between the search running and the click landing, and an out-of-range dispatch does not
+   * merely miss: it throws inside CodeMirror, escapes the sidebar's click handler, and takes
+   * the React root — every terminal in the window with it.
+   */
+  {
+    const doc = Text.of(['first line', 'héllo wörld', '', 'last'])
+    const range = (line, column, endColumn) => reveal.revealRange(doc, { line, column, endColumn })
+    const span = (r) => [r.from, r.to]
+    const threw = (fn) => {
+      try {
+        fn()
+        return false
+      } catch {
+        return true
+      }
+    }
+
+    // The unclamped arithmetic, so the assertions below are known to be load-bearing rather
+    // than merely true. If `doc.line` ever stops throwing on these, the clamp still has to.
+    ok(threw(() => doc.line(0)), 'doc.line(0) throws, which is what the line clamp prevents')
+    ok(threw(() => doc.line(5)), 'and so does a line past the end of the document')
+
+    eq(span(range(1, 1, 6)), [0, 5], 'a hit at the top of the file')
+    eq(span(range(1, 7, 11)), [6, 10], 'and one further along the line')
+    // Line 4 is the last, and it has no trailing break: `from` 24, four characters.
+    eq(span(range(4, 1, 5)), [24, 28], 'a hit on the last line')
+    eq(span(range(4, 1, 5))[1], doc.length, 'which ends exactly at the end of the document')
+    eq(span(range(3, 1, 1)), [23, 23], 'a hit on an empty line is an empty selection on it')
+
+    /*
+     * UTF-16 units, not bytes. `héllo wörld` is 11 units and 13 bytes, so `w` is at column 7
+     * here and at byte 8 on the wire — `SearchModel.hitPosition` is what converts, and this
+     * is the assertion that says which of the two conventions arrives. Handed the byte
+     * offsets instead, this selection would start on the `ö`.
+     */
+    eq(span(range(2, 7, 11)), [17, 21], 'columns are UTF-16 units on a non-ASCII line')
+    eq(doc.sliceString(17, 21), 'wörl', 'and land on the characters they name')
+    eq(doc.sliceString(18, 22), 'örld', 'where the byte columns would have landed one late')
+
+    // The file changed since the search ran. Every one of these throws unclamped.
+    eq(span(range(4, 200, 400)), [28, 28], 'a hit past the end of a shortened line')
+    eq(span(range(2, 5, 900)), [15, 22], 'a match running past the end of its line stops at it')
+    eq(span(range(99, 1, 2)), [24, 25], 'a hit past the end of a shortened file clamps to the last line')
+    eq(span(range(0, 1, 2)), [0, 1], 'line 0 is the first line')
+    eq(span(range(-5, 1, 2)), [0, 1], 'and so is a negative line')
+    eq(span(range(1, 0, 3)), [0, 2], 'column 0 is the start of the line')
+    eq(span(range(1, -9, 3)), [0, 2], 'and so is a negative column')
+    eq(span(range(1, 6, 2)), [5, 5], 'an endColumn before the column is an empty selection')
+    eq(span(range(1, 3, 3)), [2, 2], 'an empty match is an empty selection at the caret')
+    eq(span(range(1.7, 2.9, 4.2)), [1, 3], 'a fractional position is truncated, not rounded up')
+
+    /*
+     * `NaN` fails every comparison a clamp is made of, so it sails through one written the
+     * obvious way and throws at the end of it. It cannot come out of `hitPosition` today; it
+     * costs one `Number.isFinite` to make sure it can never reach `doc.line`.
+     */
+    const wild = [NaN, Infinity, -Infinity, 1e21, -1e21, 0, -1, 4.5, Number.MAX_SAFE_INTEGER]
+    for (const line of wild) {
+      for (const column of wild) {
+        for (const endColumn of wild) {
+          const what = `line ${line}, column ${column}, endColumn ${endColumn}`
+          let r = null
+          ok(!threw(() => (r = range(line, column, endColumn))), `revealRange survives ${what}`)
+          if (r === null) continue
+          ok(r.from >= 0 && r.to <= doc.length, `and stays inside the document on ${what}`)
+          ok(r.from <= r.to, `and never runs backwards on ${what}`)
+          // On the document, and on *one line* of it: a selection that spilled onto the next
+          // line would be a highlight over text the search never matched.
+          ok(
+            doc.lineAt(r.from).number === doc.lineAt(r.to).number,
+            `and stays on one line on ${what}`,
+          )
+        }
+      }
+    }
+
+    // A one-line document with no break at all, and an empty one: `line.to === line.from`, so
+    // every column on them clamps to the same position.
+    for (const [what, text] of Object.entries({ empty: '', 'no break': 'abc' })) {
+      const tiny = Text.of(text.split('\n'))
+      for (const target of [{ line: 1, column: 1, endColumn: 2 }, { line: 9, column: 90, endColumn: 99 }]) {
+        const r = reveal.revealRange(tiny, target)
+        ok(r.from >= 0 && r.to <= tiny.length, `a ${what} document clamps to itself`)
+      }
+    }
   }
 
   if (failed > 0) {
