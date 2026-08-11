@@ -204,20 +204,70 @@ impl Inner {
             .map(|(_, conn)| conn.out.clone())
     }
 
-    /// Every connection that has announced a pid and been bound to a pane.
+    /// Every open connection, bound to a pane or not.
     ///
-    /// A connection with no pid never sent `ide_connected`, so nothing knows which pane it
-    /// belongs to; including it would send a selection to a `claude` that may not be in this
-    /// project at all.
-    fn senders_for_all_panes(&self) -> Vec<mpsc::UnboundedSender<Message>> {
-        let c = self.conns.lock();
-        c.open
+    /// This used to require a pane binding, on the theory that including an unbound
+    /// connection "would send a selection to a `claude` that may not be in this project at
+    /// all". That theory was wrong, and it made a documented case silently dead: this server
+    /// is *per project*, it is reachable only with this project's `authToken`, and
+    /// `cmd::session` hands `CLAUDE_CODE_SSE_PORT` to **every** pane — shells included —
+    /// precisely so that "a user who types `claude` into a cide shell should reach this
+    /// project's server too". That `claude` is a grandchild of the shell, so its pid is not
+    /// the pid `pane_bind_session` bound, so it never appears in `pane_of_pid`, so it
+    /// received no selection ever. A connection that got through the handshake is in this
+    /// project by construction.
+    ///
+    /// Addressed notifications still require the binding, and must: `at_mentioned` types into
+    /// one prompt, and picking a pane by guessing is the failure mode the addressing exists
+    /// to avoid. Broadcast is the case where "everyone in this project" is the right answer
+    /// and no attribution is needed to give it.
+    fn all_senders(&self) -> Vec<mpsc::UnboundedSender<Message>> {
+        self.conns
+            .lock()
+            .open
             .values()
-            .filter(|conn| conn.pid.is_some_and(|pid| c.pane_of_pid.contains_key(&pid)))
             .map(|conn| conn.out.clone())
             .collect()
     }
+
+    /// How many CLIs are attached to this project's server at all.
+    ///
+    /// The number is what separates "no Claude is connected to cide" from "a Claude is
+    /// connected, but not the one in that pane" — two different sentences for a user, and the
+    /// only thing that distinguishes a missing feature from a mis-aimed one.
+    fn connection_count(&self) -> usize {
+        self.conns.lock().open.len()
+    }
 }
+
+/// What became of an addressed notification.
+///
+/// Returned rather than only logged. "Nothing was listening" is by far the most common reason
+/// an `@`-mention appears to do nothing, and the layer that can put that on screen is the one
+/// that made the gesture — a `tracing::debug!` reaches a log file nobody has open, which from
+/// the user's chair is indistinguishable from a control wired to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Written to that pane's socket.
+    Sent,
+    /// No connection is bound to that pane.
+    NoConnection {
+        /// Every CLI attached to this project's server, in any pane — *including* one in the
+        /// asked-for pane whose pid was never bound, which is the likeliest reason this
+        /// variant is being returned at all. Zero means no `claude` anywhere in this project
+        /// has completed the IDE handshake.
+        ///
+        /// Deliberately not "other connections": distinguishing them would need the count of
+        /// connections whose pid *is* in `pane_of_pid`, and an unbound connection is exactly
+        /// the one this number exists to account for. Callers that turn it into prose must
+        /// not claim these are elsewhere. See `cmd::file::not_connected`.
+        connections: usize,
+    },
+}
+
+// No `is_sent` helper. One was written and deleted unused: every caller matches the enum
+// exhaustively because the `NoConnection` count is the whole point of returning it, and a
+// boolean accessor invites the one call site that throws that count away.
 
 /// The IDE server for one project.
 pub struct IdeServer {
@@ -320,12 +370,12 @@ impl IdeServer {
     }
 
     /// Tell the `claude` in `pane` where the user is looking.
-    pub fn selection_changed(&self, pane: &str, payload: SelectionChanged) {
+    pub fn selection_changed(&self, pane: &str, payload: SelectionChanged) -> Delivery {
         self.notify_pane(
             pane,
             protocol::notify::SELECTION_CHANGED,
             selection_params(&payload),
-        );
+        )
     }
 
     /// Tell **every** connected `claude` in this project where the editor selection is.
@@ -335,31 +385,41 @@ impl IdeServer {
     /// selection is a fact about the editor, and a project with two Claude panes has two
     /// conversations that both benefit from knowing it. Addressing one would mean picking a
     /// "current" Claude, and when an editor is focused there isn't one.
-    pub fn selection_changed_all(&self, payload: SelectionChanged) {
+    /// Returns how many CLIs it reached, so a caller can tell "sent" from "sent to nobody".
+    pub fn selection_changed_all(&self, payload: SelectionChanged) -> usize {
         let params = selection_params(&payload);
-        for out in self.inner.senders_for_all_panes() {
+        let senders = self.inner.all_senders();
+        for out in &senders {
             send_json(
-                &out,
+                out,
                 &Notification::new(protocol::notify::SELECTION_CHANGED, params.clone()),
             );
         }
+        senders.len()
     }
 
     /// Put a file reference into the prompt of the `claude` in `pane`.
-    pub fn at_mentioned(&self, pane: &str, payload: AtMentioned) {
+    pub fn at_mentioned(&self, pane: &str, payload: AtMentioned) -> Delivery {
         self.notify_pane(
             pane,
             protocol::notify::AT_MENTIONED,
             mention_params(&payload),
-        );
+        )
     }
 
-    fn notify_pane(&self, pane: &str, method: &str, params: Value) {
+    fn notify_pane(&self, pane: &str, method: &str, params: Value) -> Delivery {
         let Some(out) = self.inner.sender_for_pane(pane) else {
-            tracing::debug!(pane, method, "no connected claude in this pane; dropped");
-            return;
+            let connections = self.inner.connection_count();
+            tracing::debug!(
+                pane,
+                method,
+                connections,
+                "no connected claude in this pane; dropped"
+            );
+            return Delivery::NoConnection { connections };
         };
         send_json(&out, &Notification::new(method, params));
+        Delivery::Sent
     }
 
     /// Stop accepting, resolve everything still waiting, and take the lockfile down.
@@ -1384,6 +1444,129 @@ mod tests {
         assert_eq!(notification["params"]["filePath"], "/src/main.rs");
         assert_eq!(notification["params"]["lineStart"], 9);
         assert_eq!(notification["params"]["lineEnd"], 19);
+
+        server.shutdown().await;
+    }
+
+    /// The regression that made *Send lines to Claude* a no-op for a whole class of session.
+    ///
+    /// `cmd::session` gives `CLAUDE_CODE_SSE_PORT` to **every** pane, shells included, so that
+    /// "a user who types `claude` into a cide shell should reach this project's server too".
+    /// That `claude` is a grandchild of the shell, so its pid is not the one
+    /// `pane_bind_session` bound, so it never appears in `pane_of_pid` — and the broadcast
+    /// used to filter on exactly that map. The connection was live, authenticated with this
+    /// project's token, and heard nothing, for ever, with no log line at the sending end.
+    #[tokio::test]
+    async fn a_claude_that_no_pane_owns_still_hears_the_broadcast_selection() {
+        let server = server().await;
+        let mut events = server.events();
+
+        let mut ws = connect(server.port(), TOKEN)
+            .await
+            .expect("the CLI connects");
+        handshake(&mut ws).await;
+        // A pid nothing ever bound: the shell's grandchild, or a `claude` that connected
+        // before the frontend got round to calling `pane_bind_session`.
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":7777}}),
+        )
+        .await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("a connect event"),
+            Some(ServerEvent::Connected { pid: 7777, .. })
+        ));
+
+        let reached = server.selection_changed_all(SelectionChanged {
+            file_path: "/src/main.rs".into(),
+            text: "let x = 1;".into(),
+            start_line: 3,
+            end_line: 3,
+        });
+        assert_eq!(reached, 1, "an unbound connection is still in this project");
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the selection arrives")
+            .expect("the socket is open")
+            .expect("a readable frame");
+        let Message::Text(text) = frame else {
+            panic!("expected a text frame");
+        };
+        let notification: Value = serde_json::from_str(&text).expect("a JSON frame");
+        assert_eq!(notification["method"], "selection_changed");
+        assert_eq!(notification["params"]["filePath"], "/src/main.rs");
+
+        server.shutdown().await;
+    }
+
+    /// A mention that reaches nobody has to *say* so.
+    ///
+    /// Both counts are asserted because they are two different sentences in the UI: zero
+    /// connections is "no Claude in this project has connected to cide", a non-zero count is
+    /// "the plumbing works and this pane is the odd one out". Answering `()` — which is what
+    /// this did — leaves the frontend unable to tell either of them from success.
+    #[tokio::test]
+    async fn a_mention_with_no_claude_in_that_pane_reports_rather_than_vanishing() {
+        let server = server().await;
+
+        assert_eq!(
+            server.at_mentioned(
+                "pane-nobody-is-in",
+                AtMentioned {
+                    file_path: "/src/main.rs".into(),
+                    line_start: Some(9),
+                    line_end: Some(19),
+                },
+            ),
+            Delivery::NoConnection { connections: 0 },
+            "nothing is connected to this project at all"
+        );
+
+        let mut events = server.events();
+        let mut ws = connect(server.port(), TOKEN)
+            .await
+            .expect("the CLI connects");
+        handshake(&mut ws).await;
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":8001}}),
+        )
+        .await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("a connect event"),
+            Some(ServerEvent::Connected { pid: 8001, .. })
+        ));
+
+        assert_eq!(
+            server.at_mentioned(
+                "pane-nobody-is-in",
+                AtMentioned {
+                    file_path: "/src/main.rs".into(),
+                    line_start: None,
+                    line_end: None,
+                },
+            ),
+            Delivery::NoConnection { connections: 1 },
+            "one session is connected, just not that pane's"
+        );
+
+        server.bind_pane(8001, "pane-a".into());
+        assert_eq!(
+            server.at_mentioned(
+                "pane-a",
+                AtMentioned {
+                    file_path: "/src/main.rs".into(),
+                    line_start: None,
+                    line_end: None,
+                },
+            ),
+            Delivery::Sent,
+        );
 
         server.shutdown().await;
     }

@@ -26,16 +26,24 @@
  * `when` clause for "an editor is focused" — and the editor already has all three from
  * `defaultKeymap` and `searchKeymap`. The menu items therefore carry no `command`, so they
  * show no shortcut chip: a chip must come from the live keymap or not at all, and CodeMirror's
- * internal bindings are not in it. `claude.mention.file` *is* an app command and does get its
- * chip.
+ * internal bindings are not in it.
+ *
+ * *Send lines to Claude* used to be the exception — it carried `command: 'claude.mention.file'`
+ * and drew that command's chip. It no longer does, and the reason is worth reading before
+ * putting it back: **that command is registered and dispatched by nobody.** `App.tsx`'s
+ * `runCommand` has no case for it and falls through to `diag.log('command not handled by this
+ * window')`, and `cide-core::commands` gates it `.when("claudePaneFocused")` — which is exactly
+ * inverted for a gesture whose whole premise is that an *editor* is focused. A chip advertising
+ * a shortcut for a dead command is a worse lie than no chip. See `useSendToClaude.ts`, which
+ * binds `Alt-Enter` inside the editor so the keyboard route works without either fix.
  */
 import { selectAll } from '@codemirror/commands'
 import { openSearchPanel } from '@codemirror/search'
 import type { EditorView } from '@codemirror/view'
 import { useContextMenu, type ContextMenuHandle, type MenuEntry } from '@/menus'
-import { claude as claudeApi, diag } from '@/ipc/client'
 import { copyUnavailable, pasteUnavailable, readClipboard, writeClipboard } from './clipboard'
-import { useMentionTarget } from './mentionTarget'
+import { sendLabel } from './sendToClaude'
+import { useSendToClaude } from './useSendToClaude'
 
 export interface CodeMenuOptions {
   /** Live view, or `null` before it is built and after it is destroyed. */
@@ -47,15 +55,9 @@ export interface CodeMenuOptions {
 }
 
 /** The selected text, and where it is. Empty `text` means the caret is just sitting somewhere. */
-function selection(view: EditorView): { text: string; from: number; to: number; lines: [number, number] } {
+function selection(view: EditorView): { text: string; from: number; to: number } {
   const { from, to } = view.state.selection.main
-  return {
-    text: view.state.sliceDoc(from, to),
-    from,
-    to,
-    // 1-based, as `claude.mentionFile` documents; Rust converts to the protocol's 0-based.
-    lines: [view.state.doc.lineAt(from).number, view.state.doc.lineAt(to).number],
-  }
+  return { text: view.state.sliceDoc(from, to), from, to }
 }
 
 /**
@@ -79,7 +81,7 @@ function insert(view: EditorView, text: string): void {
 }
 
 export function useCodeMenu({ view, path, readOnly }: CodeMenuOptions): ContextMenuHandle {
-  const mentionTo = useMentionTarget()
+  const toClaude = useSendToClaude()
 
   return useContextMenu({
     label: 'Code',
@@ -165,33 +167,25 @@ export function useCodeMenu({ view, path, readOnly }: CodeMenuOptions): ContextM
         },
         {
           id: 'mention',
-          label: hasSelection
-            ? sel.lines[0] === sel.lines[1]
-              ? `Send line ${sel.lines[0]} to Claude`
-              : `Send lines ${sel.lines[0]}–${sel.lines[1]} to Claude`
-            : 'Send this file to Claude',
-          command: 'claude.mention.file',
-          disabledReason:
-            mentionTo === null ? 'No Claude session in this project to mention into' : undefined,
+          label: sendLabel(toClaude.range(live)),
+          /*
+           * **No `command`, and that is a report rather than a preference.**
+           *
+           * `claude.mention.file` is in the registry, so it draws a chip — and running it does
+           * nothing: `App.tsx`'s dispatcher has no case for it and falls through to
+           * `diag.log('command not handled by this window')`. It is also gated
+           * `.when("claudePaneFocused")`, which is exactly backwards for a gesture made from an
+           * editor. A chip pointing at a dead command is worse than no chip, so it is gone
+           * until those two lines land — one in `App.tsx`, one in `cide-core/src/commands.rs`,
+           * neither of them this change's file. Meanwhile the item and its `Alt-Enter` binding
+           * both work without either.
+           */
+          disabledReason: toClaude.unavailable ?? undefined,
           run:
-            mentionTo === null
+            toClaude.unavailable !== null
               ? undefined
               : () => {
-                  // Lines only when there is a selection: `mentionFile` documents that omitting
-                  // both mentions the whole file, and `@file#L12-L12` for a caret that happens
-                  // to be resting on line 12 is not what anyone meant by "send this file".
-                  if (hasSelection) {
-                    claudeApi.mentionFile(
-                      mentionTo.project,
-                      mentionTo.pane,
-                      path,
-                      sel.lines[0],
-                      sel.lines[1],
-                    )
-                  } else {
-                    claudeApi.mentionFile(mentionTo.project, mentionTo.pane, path)
-                  }
-                  void diag.log(`editor: mentioned ${path} into ${mentionTo.pane}`)
+                  toClaude.send(live, path)
                 },
         },
       ]

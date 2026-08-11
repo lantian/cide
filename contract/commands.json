@@ -12,6 +12,7 @@
   "claude_headless",
   "claude_mention_file",
   "claude_selection_changed",
+  "claude_send_lines",
   "diag_bench_report",
   "diag_echo_bytes",
   "diag_log",

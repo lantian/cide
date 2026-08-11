@@ -43,10 +43,14 @@
 //! let mut rx  = server.events();        // ServerEvent stream
 //!
 //! server.bind_pane(pid, pane_id);       // the app knows which PtySession has that pid
-//! server.selection_changed(pane, payload);
-//! server.at_mentioned(pane, payload);
+//! server.selection_changed_all(payload);            // -> how many CLIs it reached
+//! server.at_mentioned(pane, payload);               // -> Delivery
 //! server.shutdown().await;
 //! ```
+//!
+//! The two notification calls **report** rather than only logging. Every one of them can be a
+//! no-op — no `claude` has connected, or the one in that pane has not — and a gesture that
+//! silently does nothing is the defect this project keeps shipping. See [`server::Delivery`].
 //!
 //! `ServerEvent` is the whole outbound vocabulary: `Connected { connection, pid }`,
 //! `Disconnected { connection }`, `DiffRequested(DiffRequest)`,
@@ -61,7 +65,7 @@ pub mod tools;
 pub use diff_broker::{CancelReason, DiffBroker, DiffRequest};
 pub use lockfile::{Lockfile, sweep_stale};
 pub use protocol::{AtMentioned, DiffOutcome, OpenDiffParams, SelectionChanged};
-pub use server::{IdeServer, ServerEvent};
+pub use server::{Delivery, IdeServer, ServerEvent};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdeError {
