@@ -712,30 +712,38 @@ fn save_screens(wanted: &[SessionId], registry: &SessionRegistry) {
         let screen = String::from_utf8_lossy(&bytes).into_owned();
         saved.insert(session.to_string(), SavedScreen { screen, at });
     }
+    write_screens(&screens_path(), &saved);
+}
 
-    let path = screens_path();
+/// Publish the sidecar, or clear it when there is nothing to keep.
+///
+/// Split from [`save_screens`] so a test can name its own path: the real one is the
+/// developer's own `~/.local/state/cide/screens.json`, and a test that wrote there would
+/// destroy the screens of their last real session.
+fn write_screens(path: &Path, saved: &std::collections::BTreeMap<String, SavedScreen>) {
     if saved.is_empty() {
         // Removed rather than left behind. A stale file would replay the screens of a run
         // two launches ago into panes that had nothing on them last time.
         if path.exists()
-            && let Err(error) = std::fs::remove_file(&path)
+            && let Err(error) = std::fs::remove_file(path)
         {
             tracing::warn!(%error, "could not clear the saved shell screens");
         }
         return;
     }
-    if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
-    {
-        tracing::warn!(%error, "could not create the state directory for shell screens");
-        return;
-    }
-    match serde_json::to_vec(&saved).map_err(std::io::Error::other) {
-        // Not `save_atomic`: that is `persist`'s own routine for `Workspace`, and this is not
-        // one. A torn write here costs a banner line on the next launch, which is what
-        // `prior_screen` already answers for a missing file.
+    match serde_json::to_vec(saved) {
+        // Through `persist::write_atomic`, and the reason is the file mode rather than the
+        // atomicity. This was a plain `fs::write`, argued for on the grounds that a torn
+        // sidecar costs only a banner line — which is true, and is not the whole trade.
+        // `fs::write` creates at 0666 & umask, so on an ordinary machine this file was 0644:
+        // world-readable, holding a screenful of the user's shell for every open pane. That
+        // is `export AWS_SECRET_ACCESS_KEY=…`, a `.env` someone `cat`ted, a psql URL with a
+        // password in it. `persist` already owns the one routine in this app that creates a
+        // state file 0600 — the same routine, and the same argument, as the `workspace.json`
+        // that holds a proxy password — so this uses it rather than re-deciding the mode.
+        // The atomicity and the directory fsync come along for free.
         Ok(bytes) => {
-            if let Err(error) = std::fs::write(&path, bytes) {
+            if let Err(error) = cide_core::persist::write_atomic(path, &bytes) {
                 tracing::warn!(%error, "could not save the shell screens");
             }
         }
@@ -821,14 +829,56 @@ pub fn shell_preload(session: SessionId) -> Vec<u8> {
     preload_from(prior_screen(session))
 }
 
+/// Hand the terminal back to a child that set none of the previous one's modes.
+///
+/// # The same bug as the SGR, one layer up
+///
+/// `restore_notice` opens with `\x1b[0m` because `state_formatted()` ends by restoring the
+/// screen's live *attributes*. It also ends by restoring the screen's live **input modes** —
+/// `write_input_mode_formatted` emits application keypad, application cursor keys, bracketed
+/// paste and the mouse protocol — and those are not attributes, so no SGR closes them.
+///
+/// A shell is not what sets them. A TUI is: quit cide with `htop`, `vim`, `lazygit` or `btop`
+/// on screen in a shell pane and the saved screen carries `\x1b[?1000h`/`\x1b[?1006h` and
+/// `\x1b[?25l` in it. Replay that into a fresh `bash`, which never asked for mouse reporting
+/// and therefore never turns it off, and the pane is stuck for its whole life: the cursor is
+/// invisible, a drag selects nothing because the terminal is forwarding the drag to the child,
+/// and every click types `\x1b[<0;40;12M` at the prompt. Nothing the user can do clears it —
+/// only closing the pane does — and it happens on the launch *after* the one that caused it,
+/// which is the hardest possible thing to connect to a cause.
+///
+/// So the replayed screen is followed by the modes turned back off, before the notice. Each
+/// one is the DECRST for a mode `write_input_mode_formatted` can emit, and nothing else: a
+/// blanket DECSTR (`\x1b[!p`) was the alternative and it loses twice — it does not clear mouse
+/// tracking in xterm.js, and `vt100` does not implement it at all, so the Rust mirror and the
+/// user's terminal would disagree about the state of the pane from its first byte.
+const NEUTRAL_MODES: &str = concat!(
+    "\x1b[?25h",   // DECTCEM — the previous child may have hidden the cursor and died there.
+    "\x1b>",       // DECKPNM — normal keypad.
+    "\x1b[?1l",    // DECCKM — cursor keys send CSI, not SS3.
+    "\x1b[?1000l", // and the four mouse-tracking modes vt100 tracks, plus its encoding.
+    "\x1b[?1002l",
+    "\x1b[?1003l",
+    "\x1b[?1006l",
+    "\x1b[?1005l",
+    "\x1b[?9l",
+    "\x1b[?2004l", // bracketed paste: the new shell's readline turns it back on if it wants it.
+);
+
 /// The composition, split out from the lookup so a test can drive both answers.
 ///
 /// One function so the screen and the notice can never disagree about whether a replay
 /// happened — a "previous output not retained" line printed under a screenful of retained
 /// output is worse than either alone.
+///
+/// The order is load-bearing: the screen, then [`NEUTRAL_MODES`] to undo what the screen just
+/// set, then the notice. Neutralising first would be undone by the replay itself.
 fn preload_from(prior: Option<Vec<u8>>) -> Vec<u8> {
     let replayed = prior.is_some();
     let mut bytes = prior.unwrap_or_default();
+    if replayed {
+        bytes.extend_from_slice(NEUTRAL_MODES.as_bytes());
+    }
     bytes.extend_from_slice(&restore_notice(replayed));
     bytes
 }
@@ -1406,6 +1456,103 @@ mod tests {
             !replayed.contains("not retained"),
             "a notice that says nothing was kept, under output that was kept, is the worst of \
              the three: {replayed:?}"
+        );
+    }
+
+    /// A replay hands the new child a terminal, not the old child's terminal *modes*.
+    ///
+    /// The SGR half of this was already pinned above. This is the other half, and it is the
+    /// one with no attribute reset behind it: `state_formatted()` ends with
+    /// `write_input_mode_formatted`, so a screen saved while `htop` was running carries mouse
+    /// tracking and a hidden cursor. `bash` never set those and never clears them, so without
+    /// [`NEUTRAL_MODES`] the restored pane spends its whole life unable to select text, typing
+    /// `\x1b[<0;40;12M` on every click, with no cursor. See `cide-pty`'s
+    /// `a_preload_carries_the_old_childs_input_modes_into_the_mirror`, which is the proof that
+    /// those bytes really do survive into the new session.
+    #[test]
+    fn a_replay_turns_off_the_modes_the_old_screen_turned_on() {
+        // Exactly what `vt100`'s `write_input_mode_formatted` can emit, in front of it.
+        let hostile = b"\x1b[?25l\x1b=\x1b[?1h\x1b[?1002h\x1b[?1006h\x1b[?2004h".to_vec();
+        let out = String::from_utf8(preload_from(Some(hostile.clone()))).expect("text");
+
+        for (set, cleared) in [
+            ("\u{1b}[?25l", "\u{1b}[?25h"),
+            ("\u{1b}=", "\u{1b}>"),
+            ("\u{1b}[?1h", "\u{1b}[?1l"),
+            ("\u{1b}[?1002h", "\u{1b}[?1002l"),
+            ("\u{1b}[?1006h", "\u{1b}[?1006l"),
+            ("\u{1b}[?2004h", "\u{1b}[?2004l"),
+        ] {
+            let at_set = out
+                .find(set)
+                .unwrap_or_else(|| panic!("{set:?} is the input"));
+            let at_clear = out.rfind(cleared).unwrap_or_else(|| {
+                panic!("nothing turns {set:?} back off; the pane is stuck in it: {out:?}")
+            });
+            assert!(
+                at_clear > at_set,
+                "{cleared:?} has to come *after* the screen that sets {set:?}, or the replay \
+                 undoes it: {out:?}"
+            );
+        }
+
+        // And the notice is last, so the user reads it under a terminal already handed back.
+        assert!(
+            out.ends_with("is not live —\u{1b}[0m\r\n"),
+            "the notice is the last thing in the preload: {out:?}"
+        );
+
+        // Nothing is neutralised when nothing was replayed: the modes are only ever set by
+        // the bytes above them, and a fresh pane emitting nine DECRSTs before its first
+        // prompt is noise in every transcript for a case that cannot happen.
+        let empty = String::from_utf8(preload_from(None)).expect("text");
+        assert!(!empty.contains("\u{1b}[?1002l"), "{empty:?}");
+    }
+
+    /// The sidecar is the user's shell output. It is not world-readable.
+    ///
+    /// `fs::write` creates at 0666 & umask — 0644 on an ordinary machine — and this file holds
+    /// a screenful per open pane: an `export …_TOKEN=`, a `.env` someone `cat`ted, a psql URL
+    /// with a password in it. `persist` already owns the one routine that writes a private
+    /// state file, and `workspace.json` has a test exactly like this one for exactly the same
+    /// reason.
+    #[test]
+    #[cfg(unix)]
+    fn the_saved_screens_are_not_readable_by_every_user_on_the_machine() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("screens-mode");
+        let path = dir.join("screens.json");
+        // Stand in for a file an older build left behind at 0644.
+        std::fs::write(&path, b"{}").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        let mut saved = std::collections::BTreeMap::new();
+        saved.insert(
+            SessionId::new().to_string(),
+            SavedScreen {
+                screen: "$ echo $AWS_SECRET_ACCESS_KEY\r\n".into(),
+                at: 1,
+            },
+        );
+        write_screens(&path, &saved);
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "screens.json holds the user's shell output");
+    }
+
+    /// Nothing to keep clears the file rather than leaving the run-before-last's screens.
+    #[test]
+    fn an_empty_save_removes_a_sidecar_from_a_previous_run() {
+        let dir = temp_dir("screens-clear");
+        let path = dir.join("screens.json");
+        std::fs::write(&path, b"{\"x\":1}").expect("seed");
+
+        write_screens(&path, &Default::default());
+
+        assert!(
+            !path.exists(),
+            "a stale sidecar replays the screens of a run two launches ago"
         );
     }
 

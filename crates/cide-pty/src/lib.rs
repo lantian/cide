@@ -2001,6 +2001,46 @@ mod tests {
         session.kill();
     }
 
+    /// A preload is not only pixels: its DEC private modes stick to the new session.
+    ///
+    /// This is the hazard `cide_app::lifecycle::NEUTRAL_MODES` exists to answer, pinned here
+    /// because here is where it is true. `screen_state()` ends with the screen's *input* modes,
+    /// so a screen saved while a TUI held mouse tracking and a hidden cursor carries both — and
+    /// a preload feeds them straight into the mirror of a child that never asked for either and
+    /// will never turn them off. Every pane that attaches then gets them, because the snapshot
+    /// is generated from this same mirror.
+    ///
+    /// If this ever stops being true the neutralising tail is dead weight and can go; until
+    /// then, deleting it puts a restored shell in mouse-reporting mode with no cursor.
+    ///
+    /// One `#[test]`, deliberately, and one child. The tests around here are timing-sensitive —
+    /// `small_writes_are_coalesced_into_few_frames` measures a 4 ms coalescing window — and
+    /// every extra test in this module is another pty, another four threads and another process
+    /// competing with it under `cargo test`'s parallelism. A second spawn saying the mirrored
+    /// half of this was enough to make that test flake once in three runs on this machine.
+    /// That the DECRSTs then clear these modes is `vt100`'s own contract and is asserted
+    /// bytewise, without a process, in `cide_app::lifecycle`'s
+    /// `a_replay_turns_off_the_modes_the_old_screen_turned_on`.
+    #[test]
+    fn a_preload_carries_the_old_childs_input_modes_into_the_mirror() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 5")
+            .preload("\x1b[?25l\x1b[?1002h\x1b[?1006h".as_bytes().to_vec());
+        let session = PtySession::spawn(spec).expect("spawn sh");
+
+        let text = String::from_utf8_lossy(&session.screen_state()).into_owned();
+        assert!(
+            text.contains("\u{1b}[?25l"),
+            "a hidden cursor in the preload survives into the new session: {text:?}"
+        );
+        assert!(
+            text.contains("\u{1b}[?1002h"),
+            "mouse tracking in the preload survives into the new session: {text:?}"
+        );
+        session.kill();
+    }
+
     #[test]
     fn resize_updates_the_screen_mirror() {
         let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())

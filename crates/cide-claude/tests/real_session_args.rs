@@ -22,10 +22,15 @@
 //!
 //! # Why it costs nothing
 //!
-//! It never reaches the network and never spends a token. Every case resumes a uuid that
-//! cannot exist, so argument validation either rejects the command line — which is the thing
-//! under test — or the CLI answers `No conversation found with session ID: …` and stops. The
-//! two outcomes are distinguishable in the output, which is the whole assertion.
+//! It never reaches the network and never spends a token, and that takes *two* things, not
+//! one. The resuming cases name a uuid that cannot exist, so the CLI stops at
+//! `No conversation found with session ID: …`. The `fresh` case has no `--resume` and nothing
+//! to stop it: `claude --session-id <uuid> --print x` is a perfectly good command that starts
+//! a conversation and bills for it, on the user's own credentials, once per run of this test.
+//! So no case is given a prompt at all — `--print` with stdin closed fails validation with
+//! `Input must be provided either through stdin or as a prompt argument`, which lands *after*
+//! the argument-combination check this test is about and before any request. All three
+//! outcomes stay distinguishable in the output, which is the whole assertion.
 //!
 //! `#[ignore]`d all the same, because it spawns the real binary and CI has no `claude`.
 //!
@@ -51,15 +56,18 @@ fn on_path(bin: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Run `claude <args> --print x` in a scratch directory and return everything it said.
+/// Run `claude <args> --print` with no prompt in a scratch directory, and return what it said.
 ///
-/// `--print` so the CLI never opens a TUI and never waits for input. The prompt is a single
-/// character that is never sent anywhere: both branches end before a request is made.
+/// `--print` so the CLI never opens a TUI. **No prompt, and stdin closed**, so it never sends
+/// one either: the CLI answers "Input must be provided…" and exits. That check runs after the
+/// argument-combination check under test here, which is the ordering this whole test relies
+/// on — and it is what keeps the `fresh` shape, the one case with no unresumable uuid to stop
+/// it, from starting and billing a real conversation every time someone runs this file.
 fn says(claude: &PathBuf, args: &[String]) -> String {
     let out = Command::new(claude)
         .args(args)
         .arg("--print")
-        .arg("x")
+        .stdin(std::process::Stdio::null())
         .current_dir(std::env::temp_dir())
         .output()
         .expect("run claude");
@@ -70,9 +78,20 @@ fn says(claude: &PathBuf, args: &[String]) -> String {
     )
 }
 
+/// The two ways a run is allowed to end. Anything else and it got further than it should.
+///
+/// `says` gives the CLI no prompt, so a shape whose arguments are accepted must stop at one of
+/// these — either the conversation it was told to resume does not exist, or there was nothing
+/// to say. A run that ends any other way has gone past both and is talking to the model on the
+/// user's account, which is the thing this file promises it never does.
+const HALTS: [&str; 2] = [
+    "No conversation found with session ID",
+    "Input must be provided",
+];
+
 #[test]
-#[ignore = "spawns the real claude binary: needs it on PATH. Costs no tokens — every case \
-            resumes a uuid that cannot exist. Run with: cargo test -p cide-claude -- --ignored"]
+#[ignore = "spawns the real claude binary: needs it on PATH. Costs no tokens — see the module \
+            docs. Run with: cargo test -p cide-claude -- --ignored"]
 fn the_real_cli_accepts_every_shape_we_build() {
     let Some(claude) = on_path("claude") else {
         eprintln!("SKIP: no `claude` on PATH");
@@ -93,6 +112,12 @@ fn the_real_cli_accepts_every_shape_we_build() {
         assert!(
             !said.contains(REJECTION),
             "the CLI rejected the `{name}` shape cide builds — {args:?}\n{said}"
+        );
+        assert!(
+            HALTS.iter().any(|halt| said.contains(halt)),
+            "the `{name}` shape got past every guard that was supposed to stop it before a \
+             request. This test is documented as free; if the CLI has changed where it \
+             validates, fix `says` before running this again — {args:?}\n{said}"
         );
     }
 }
