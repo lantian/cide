@@ -193,7 +193,7 @@ pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<()> {
     let tmp = temp_path(path);
 
     let write = (|| -> io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut file = create_private(&tmp)?;
         file.write_all(&json)?;
         // The rename publishes the new name; without this the bytes behind it may not have
         // reached the disk, and the crash leaves an intact name over empty contents.
@@ -213,6 +213,38 @@ pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<()> {
     // The rename is a directory modification of its own, and an unsynced one can be lost in
     // exactly the crash this function exists to survive.
     sync_dir(dir)
+}
+
+/// Create a file only its owner can read.
+///
+/// `workspace.json` stopped being merely a layout when `Settings::proxy` arrived:
+/// `http://user:hunter2@proxy.corp:3128` is an ordinary value for it, stored as typed
+/// because a proxy that needs credentials cannot be used otherwise until cide has a keyring.
+/// `File::create` asks for 0666, which under the usual umask lands on 0644 — that password
+/// readable by every other account on the machine. Redacting the log and the `Debug` impl,
+/// which is what `cide_ipc::ProxySettings` does, guards the copies; this guards the original.
+///
+/// Applied to the temp file rather than to the target afterwards, because the mode travels
+/// with the inode through the `rename`. Chmod-after-rename would leave a window in which the
+/// finished file exists at 0644, which is exactly the window that matters. It also needs no
+/// migration: a workspace already on disk at 0644 is replaced by this inode on its next save.
+#[cfg(unix)]
+fn create_private(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Whatever the platform's default is. cide is a Linux app; this arm exists so the module
+/// still compiles for anyone building it elsewhere, and claims nothing about permissions.
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> io::Result<File> {
+    File::create(path)
 }
 
 /// The directory a file lives in. A bare file name has an empty parent, which means here.
@@ -1139,6 +1171,33 @@ mod tests {
         save_atomic(&path, &Workspace::default()).expect("save");
 
         assert_eq!(load(&path), Workspace::default());
+    }
+
+    /// The file holds a proxy password now, so its mode is part of its contract.
+    ///
+    /// `Settings::proxy` stores `http://user:hunter2@proxy.corp:3128` verbatim — there is no
+    /// keyring yet and a proxy that authenticates cannot be used otherwise. At the 0644 a
+    /// plain `File::create` produces, every other account on the machine can read it.
+    ///
+    /// The second save is the point of the test as much as the first: an existing workspace
+    /// written by an older build is at 0644, and the rename has to replace it rather than
+    /// write through it, or the tightening never reaches anybody who already has one.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_workspace_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("private");
+        let path = dir.join("workspace.json");
+
+        // Stand in for the pre-existing, world-readable file of an older build.
+        fs::write(&path, b"{}").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        save_atomic(&path, &fixture()).expect("save");
+
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "workspace.json holds a proxy password");
     }
 
     #[test]

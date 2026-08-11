@@ -16,6 +16,7 @@
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:picker": "node scripts/check-picker.mjs",
     "check:problems": "node scripts/check-problems.mjs",
+    "check:proxy": "node scripts/check-proxy.mjs",
     "check:render": "node scripts/check-git-render.mjs",
     "check:rows": "node scripts/check-rows.mjs",
     "check:search": "node scripts/check-search.mjs",

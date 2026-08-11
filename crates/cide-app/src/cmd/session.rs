@@ -135,6 +135,16 @@ fn no_proxy_value(extra: &str) -> String {
 /// already said. Without that, the common case — a corporate laptop with `HTTP_PROXY` in the
 /// profile and no `NO_PROXY` — is one where cide's headline feature has never worked and
 /// nothing reports it. When nothing is inherited, nothing is touched at all.
+///
+/// # What this does not reach, and the UI says so too
+///
+/// Panes only. cide's own network children are spawned elsewhere and do not read this
+/// setting: `cide_git::push` runs `git` with [`std::process::Command`], so a push goes
+/// through whatever proxy the *app's* environment names, not this one. Plumbing settings
+/// into `cide-git` is a change to that crate's shape — it takes no configuration today —
+/// and is deliberately not smuggled in here. `ProxySection`'s closing note names the same
+/// limit on screen, because a corporate user who fixes their panes with this and then
+/// watches `git push` hang deserves to have been told.
 fn proxy_env(
     spec: SpawnSpec,
     proxy: &cide_ipc::ProxySettings,
@@ -152,10 +162,19 @@ fn proxy_env(
 
     match proxy.mode {
         ProxyMode::Inherit => {
+            // Each spelling is tested for a *usable* value before the other is consulted,
+            // rather than filtering once after the fallback. `HTTP_PROXY=` — set but empty,
+            // which is how a profile turns a proxy off without unsetting it, and what
+            // `env -u` leaves behind in a few launchers — would otherwise count as present
+            // and mask a real `http_proxy` beside it. Both consequences are silent: the
+            // loopback exemption is skipped on a machine that does have a proxy, and the
+            // `no_proxy` list the user does have is overwritten with one that dropped its
+            // entries, since `env_both_cases` writes over both spellings.
             let named = |name: &str| {
+                let usable = |v: String| (!v.trim().is_empty()).then_some(v);
                 inherited(name)
-                    .or_else(|| inherited(&name.to_lowercase()))
-                    .filter(|v| !v.trim().is_empty())
+                    .and_then(usable)
+                    .or_else(|| inherited(&name.to_lowercase()).and_then(usable))
             };
             if !PROXY_URL_VARS.iter().any(|v| named(v).is_some()) {
                 // The overwhelmingly common case, and the one where doing anything at all
@@ -1121,6 +1140,32 @@ mod tests {
         assert_eq!(
             value_of(&spec, "NO_PROXY"),
             Some("localhost,127.0.0.1,::1,corp.internal")
+        );
+    }
+
+    /// `HTTP_PROXY=` — set but empty — must not hide the `http_proxy` beside it.
+    ///
+    /// Assigning nothing is how a profile turns a proxy off without unsetting it, and it is
+    /// what a few launchers leave behind. Reading it as "a proxy is present" would be one
+    /// bug; reading it as "no proxy anywhere" is two, both silent. The exemption is skipped
+    /// on a machine that *does* proxy — the IDE server on loopback goes with it — and the
+    /// `no_proxy` the user actually has is overwritten by a value that lost its entries,
+    /// because both spellings are written.
+    #[test]
+    fn a_blank_upper_case_variable_does_not_mask_the_lower_case_one() {
+        let spec = proxy_spec(
+            &ProxySettings::default(),
+            &[
+                ("HTTP_PROXY", ""),
+                ("http_proxy", "http://profile.corp:3128"),
+                ("NO_PROXY", "   "),
+                ("no_proxy", "corp.internal"),
+            ],
+        );
+        assert_eq!(
+            value_of(&spec, "NO_PROXY"),
+            Some("localhost,127.0.0.1,::1,corp.internal"),
+            "the proxy is inherited and the user's own bypass list survives"
         );
     }
 

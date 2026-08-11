@@ -1,5 +1,9 @@
 /**
- * Proxy configuration: what every child cide spawns gets in its environment.
+ * Proxy configuration: the environment cide gives the processes it starts in panes.
+ *
+ * Panes, not "every child" — `cide_git::push` runs its own `git` and does not read this. The
+ * closing `Note` says so on screen, because that gap is silent and expensive: a user fixes
+ * their shells here and then watches the Git tool window hang with nothing connecting the two.
  *
  * Presentational like the rest of `sections.tsx`'s parts — it takes the stored value and a
  * `patch` callback and reads nothing else — so the whole screen can still be rendered from a
@@ -18,14 +22,25 @@
  * does when a pane cannot reach the network. So the exact variable names and values are
  * printed, in both spellings, including the ones being *removed*.
  *
- * [`childEnvironment`] is therefore a mirror of `proxy_env` in
- * `crates/cide-app/src/cmd/session.rs`. Rust is the authority; a divergence here shows the
- * user a wrong label, never gives a child a wrong environment. It is small and both sides are
- * commented as a pair for that reason.
+ * The arithmetic behind that readout is a mirror of `proxy_env` in
+ * `crates/cide-app/src/cmd/session.rs`, and it lives in `./proxyEnv` rather than here so it
+ * can be executed: that module imports nothing, and `ui/scripts/check-proxy.mjs` compiles it
+ * standalone, runs it against the cases the Rust tests assert, and reads the two constant
+ * lists out of `session.rs` to prove they still match. Rust remains the authority — a
+ * divergence shows a wrong label and never gives a child a wrong environment — but the label
+ * is the whole reason this screen exists, so it is checked rather than asserted.
  */
 import { useState } from 'react'
 import type { ProxyMode, ProxySettings, SettingsPatch } from '@/ipc/client'
 import { Group, Note, Segmented } from './controls'
+import {
+  childEnvironment,
+  hasUserinfo,
+  LOOPBACK,
+  normalizeProxyUrl,
+  redactProxyUrl,
+  type EnvLine,
+} from './proxyEnv'
 import styles from './ProxySection.module.css'
 
 export interface ProxySectionProps {
@@ -39,21 +54,18 @@ const MODES: readonly { value: ProxyMode; label: string }[] = [
   { value: 'direct', label: 'No proxy' },
 ]
 
-/**
- * The loopback hosts cide adds to `NO_PROXY` and will not let you remove.
- *
- * Kept in step with `LOOPBACK_EXEMPT` in `cmd/session.rs`. The IDE integration is an MCP
- * server on loopback; a proxy that swallows it takes inline diffs and @-mentions with it,
- * silently.
- */
-const LOOPBACK = ['localhost', '127.0.0.1', '::1'] as const
-
 export function ProxySection({ proxy, patch }: ProxySectionProps) {
   const set = (next: Partial<ProxySettings>) => patch({ proxy: { ...proxy, ...next } })
   const manual = proxy.mode === 'manual'
   const credentialed = manual && [proxy.http, proxy.https, proxy.all].some(hasUserinfo)
   const empty =
     manual && proxy.http.trim() === '' && proxy.https.trim() === '' && proxy.all.trim() === ''
+  // What the HTTPS field will actually fall back to, shown as its placeholder: normalised,
+  // because that is the string the child gets rather than the one that was typed, and
+  // redacted, because a password entered in the field *above* must not be reprinted greyed
+  // out in a field the user never put it in — that is the same screenshot the readout is
+  // careful about, one control higher.
+  const httpsFallback = normalizeProxyUrl(proxy.http)
 
   return (
     <>
@@ -82,7 +94,11 @@ export function ProxySection({ proxy, patch }: ProxySectionProps) {
             label="HTTPS proxy"
             hint="HTTPS_PROXY. Leave empty to use the HTTP proxy above — one CONNECT proxy for both is the usual shape, and typing it twice is how one of the two goes stale."
             value={proxy.https}
-            placeholder={proxy.http.trim() === '' ? 'http://proxy.example.com:3128' : proxy.http}
+            placeholder={
+              httpsFallback === null
+                ? 'http://proxy.example.com:3128'
+                : redactProxyUrl(httpsFallback)
+            }
             onCommit={(https) => set({ https })}
           />
           <Field
@@ -131,6 +147,17 @@ export function ProxySection({ proxy, patch }: ProxySectionProps) {
         reopen a pane, or relaunch cide, for a change here to reach it. Panes opened from now
         on already have it.
       </Note>
+
+      {/* Said out loud because the surprise is expensive and silent: a corporate user fixes
+          their panes here, watches the Git tool window hang on push, and has no reason at all
+          to connect the two. See the note on `proxy_env` in `cmd/session.rs`. */}
+      <Note title="Panes only">
+        This is the environment cide gives the processes it starts <em>in panes</em> — your
+        shells and <code>claude</code>. cide’s own Git operations are not panes: a push or
+        fetch from the Git tool window runs <code>git</code> with the environment cide itself
+        was launched with, so it follows your login profile, not this screen. Configure that
+        one in <code>~/.gitconfig</code> as <code>http.proxy</code>.
+      </Note>
     </>
   )
 }
@@ -142,87 +169,6 @@ const MODE_HINT: Record<ProxyMode, string> = {
     "These addresses win over anything your profile exports, and a field left empty removes that variable rather than deferring to it. A setting that says “this is the proxy” and then quietly loses to a .bashrc is worse than no setting at all.",
   direct:
     'Every proxy variable, in both spellings, is scrubbed from the child. For the machine whose profile exports a proxy you do not want cide’s panes behind.',
-}
-
-/** One environment line in the readout, or one being removed. */
-interface EnvLine {
-  name: string
-  /** `null` when the variable is removed from the child rather than set. */
-  value: string | null
-}
-
-/**
- * The variables a child would be spawned with, as a mirror of `proxy_env` in
- * `crates/cide-app/src/cmd/session.rs`.
- *
- * Only the upper-case name is listed, with the note below explaining that the lower-case
- * twin is set to the same value. Printing eight rows where four carry the information reads
- * as a bug in the readout rather than as the deliberate redundancy it is.
- *
- * The inherit case cannot be shown honestly from here — it depends on the environment *this
- * process* was launched with, which the webview cannot see — so it returns nothing and the
- * prose above says what happens instead.
- */
-function childEnvironment(proxy: ProxySettings): EnvLine[] {
-  if (proxy.mode === 'inherit') return []
-  if (proxy.mode === 'direct') {
-    return ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'].map((name) => ({
-      name,
-      value: null,
-    }))
-  }
-  const http = normalize(proxy.http)
-  return [
-    { name: 'HTTP_PROXY', value: http },
-    { name: 'HTTPS_PROXY', value: normalize(proxy.https) ?? http },
-    { name: 'ALL_PROXY', value: normalize(proxy.all) },
-    { name: 'NO_PROXY', value: bypassList(proxy.noProxy) },
-  ]
-}
-
-/** Mirrors `normalize_proxy_url`: blank is unset, and a bare host:port gains `http://`. */
-function normalize(raw: string): string | null {
-  const trimmed = raw.trim()
-  if (trimmed === '') return null
-  return trimmed.includes('://') ? trimmed : `http://${trimmed}`
-}
-
-/** Mirrors `no_proxy_value`: loopback first, then the user's entries, deduplicated. */
-function bypassList(extra: string): string {
-  const entries: string[] = [...LOOPBACK]
-  for (const raw of extra.split(',')) {
-    const entry = raw.trim()
-    if (entry === '') continue
-    if (!entries.some((e) => e.toLowerCase() === entry.toLowerCase())) entries.push(entry)
-  }
-  return entries.join(',')
-}
-
-/** Whether a URL carries userinfo, i.e. whether it can be carrying a password. */
-function hasUserinfo(url: string): boolean {
-  const rest = url.split('://')[1] ?? url
-  const authority = rest.split('/')[0] ?? ''
-  return authority.includes('@')
-}
-
-/**
- * Mirrors `redact_proxy_url`: the host survives, the credentials do not.
- *
- * Applied to the readout and not to the input field. The readout is the part of this screen
- * that ends up in a screenshot attached to a ticket; the field is the part you have to be
- * able to correct.
- */
-function redact(url: string): string {
-  const at = url.indexOf('://')
-  if (at < 0) return url.includes('@') ? '***' : url
-  const scheme = url.slice(0, at)
-  const rest = url.slice(at + 3)
-  const slash = rest.indexOf('/')
-  const authority = slash < 0 ? rest : rest.slice(0, slash)
-  const tail = slash < 0 ? '' : rest.slice(slash)
-  const marker = authority.lastIndexOf('@')
-  if (marker < 0) return url
-  return `${scheme}://***@${authority.slice(marker + 1)}${tail}`
 }
 
 function Readout({ lines }: { lines: EnvLine[] }) {
@@ -242,7 +188,7 @@ function Readout({ lines }: { lines: EnvLine[] }) {
           <div key={name} className={styles.readoutRow}>
             <dt className={styles.readoutName}>{name}</dt>
             <dd className={value === null ? styles.readoutUnset : styles.readoutValue}>
-              {value === null ? 'removed from the child' : redact(value)}
+              {value === null ? 'removed from the child' : redactProxyUrl(value)}
             </dd>
           </div>
         ))}
