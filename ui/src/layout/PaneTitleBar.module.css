@@ -24,6 +24,18 @@
   min-height: 0;
   /* The pane host inside is `position: absolute; inset: 0` and resolves against this. */
   position: relative;
+  /*
+   * Nothing in a pane may paint outside it, and this is the one line that can guarantee it.
+   *
+   * The host resolves `inset: 0` against this box, so in the ordinary case there is nothing
+   * to clip. The case that is not ordinary is a *second* child: a restored shell used to
+   * render a banner `<p>` above the terminal, and because `PaneSlot` still claimed
+   * `height: 100%`, the terminal was pushed its full height past the bottom of this box and
+   * its background painted over the next row's title bar. The banner is gone, but the shape
+   * that made it possible is not — any future sibling would do the same thing silently, in
+   * a pane frame the user reads as a hard boundary.
+   */
+  overflow: hidden;
 }
 
 .bar {

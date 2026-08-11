@@ -50,9 +50,17 @@ export function exitMarkerText(code?: number): string {
  * and SGR 0 closes it so the child's own colours are not inherited by whatever a user types
  * next. The leading CRLF is what puts this on its own line even when the child died
  * mid-line, which a killed process usually does.
+ *
+ * **The opening SGR 0 is not redundant with the closing one.** SGR 2 *adds* dim to whatever
+ * attributes are already active; it does not clear them. A child that died inside a coloured
+ * prompt — which is most of them, since the shell's prompt is where a pane spends its life —
+ * leaves a background colour set, and this line was then drawn on it, full width, right up
+ * against the edge of the pane. That is the same defect as the restored-shell banner
+ * (`cide_app::lifecycle::restore_notice`, which opens the same way and says why): an
+ * attribute set by someone else and never reset.
  */
 export function exitMarkerBytes(code?: number): string {
-  return `\r\n\x1b[2m${exitMarkerText(code)}\x1b[0m\r\n`
+  return `\r\n\x1b[0m\x1b[2m${exitMarkerText(code)}\x1b[0m\r\n`
 }
 
 /**

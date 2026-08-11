@@ -97,6 +97,21 @@ pub fn shutdown(app: &AppHandle) {
         tracing::error!("no session registry during shutdown; children may outlive the app");
         return;
     };
+
+    // Before the ladder, and it has to be: `screen_state()` reads the mirror of a *live*
+    // session, and a child that has been through SIGKILL has usually cleared the screen or
+    // dumped a shell's exit message over it on the way out. This is the last moment the
+    // screen is the one the user was looking at.
+    //
+    // The pane list is copied out from under the workspace lock before any of the reading or
+    // writing happens. `WorkspaceState::with` is not reentrant and this path serialises a
+    // screen per pane and writes a file; holding the lock across that would stall every other
+    // thread that wants the workspace, on the way out, for no reason.
+    if let Some(state) = app.try_state::<WorkspaceState>() {
+        let shells = state.with(shell_sessions);
+        save_screens(&shells, &registry);
+    }
+
     let children: Vec<Arc<PtySession>> = registry
         .ids()
         .into_iter()
@@ -593,6 +608,231 @@ fn transcript_exists(projects_dir: &Path, cwd: &Path, session: SessionId) -> boo
         .is_file()
 }
 
+// --- the previous run's shell screens --------------------------------------------------
+
+/// Where the last run's shell screens are kept.
+///
+/// **A sidecar, not `workspace.json`, and the size argument decides it.** `workspace.json` is
+/// the layout: it is rewritten on a 500 ms debounce every time the user drags a splitter or
+/// focuses a pane, it is loaded before any window exists, and a corrupt one costs the user
+/// their whole arrangement (`persist::load` moves it aside and starts over). A screenful of
+/// escape codes per pane is 10–40 KiB of churn on every one of those writes, for bytes
+/// nothing but a respawning shell will ever read. Keeping it beside `workspace.json` means it
+/// is written exactly once, at quit, and a corrupt or missing one costs a banner line.
+///
+/// In the state directory rather than the config one, on the argument [`cide_core::persist`]
+/// already makes: the app writes it and nobody would want it in a dotfiles repository.
+fn screens_path() -> PathBuf {
+    cide_core::persist::state_dir().join("screens.json")
+}
+
+/// The visible screen, and only the visible screen.
+///
+/// `cide_pty::SCROLLBACK` is 5,000 lines, and a 5,000-line scrollback per pane is not
+/// something to write to disk at quit — it is megabytes per pane, it takes a visible moment
+/// to serialise on the way out (on the main thread, with the shutdown ladder still to run),
+/// and it is not what the complaint was about. What the user missed was the screen they were
+/// looking at. [`cide_pty::PtySession::screen_state`] is exactly that: contents, cursor,
+/// modes, for the visible rows only.
+///
+/// Anything bigger than this is dropped rather than truncated. A screen is a stream of escape
+/// sequences, and cutting one in half leaves a dangling `CSI` that swallows whatever follows
+/// it — which is the very class of defect the banner bug was. 128 KiB is far above a
+/// full-colour 400×100 screen and far below anything worth worrying about on disk.
+const MAX_SCREEN_BYTES: usize = 128 * 1024;
+
+/// How many screens are kept at all.
+///
+/// The pane host registry evicts at twelve; a workspace with more shells than this has more
+/// than the user is looking at. Bounded so the file cannot grow without limit across a long
+/// life of the app — it is rewritten wholesale at each quit, so a session that is gone is
+/// simply not written again.
+const MAX_SCREENS: usize = 24;
+
+/// One shell's parting screen.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SavedScreen {
+    /// The bytes `screen_state()` produced, as text.
+    ///
+    /// A `String` rather than base64: the payload is escape sequences plus whatever the user
+    /// had on screen, which is UTF-8 by the time it has been through `vt100`. JSON escaping
+    /// turns each escape byte into a six-character `\u001b`, which is larger than base64
+    /// would be — and a file a human can open and read is worth more here than the bytes.
+    screen: String,
+    /// Epoch milliseconds, so a future version can expire these. Nothing reads it yet, and
+    /// it is written now because adding it later means every existing file lacks it.
+    at: u64,
+}
+
+/// Save the visible screen of every shell in the workspace, for the next launch to replay.
+///
+/// Claude panes are deliberately **not** saved. The CLI redraws its whole UI from its own
+/// transcript on `--resume`, so a replayed screen there is a stale frame that the real one
+/// paints over a moment later — cost with no benefit, and by far the largest screens in the
+/// app.
+///
+/// Failure is logged and swallowed. This runs on the quit path, between flushing the
+/// workspace and signalling the children; a disk error here must not stop either.
+///
+/// A torn-out pane counts: `project.detached` is where a pane waits while its own window
+/// holds it, and a shell the user tore into a window of its own is the one they are most
+/// likely to want back.
+fn shell_sessions(ws: &Workspace) -> Vec<SessionId> {
+    let mut wanted: Vec<SessionId> = Vec::new();
+    for project in ws.projects.values() {
+        let panes = project
+            .tabs
+            .iter()
+            .flat_map(|t| t.tree.panes.values())
+            .chain(project.detached.values());
+        for pane in panes {
+            if pane.kind == PaneKind::Shell
+                && let Some(session) = pane.session
+                && !wanted.contains(&session)
+            {
+                wanted.push(session);
+            }
+        }
+    }
+    wanted
+}
+
+/// Serialise those sessions' screens and write the sidecar. See [`shell_sessions`].
+fn save_screens(wanted: &[SessionId], registry: &SessionRegistry) {
+    let at = cide_core::persist::now_ms();
+    let mut saved: std::collections::BTreeMap<String, SavedScreen> = Default::default();
+    for &session in wanted.iter().take(MAX_SCREENS) {
+        let Some(pty) = registry.get(session) else {
+            continue;
+        };
+        let bytes = pty.screen_state();
+        if bytes.is_empty() || bytes.len() > MAX_SCREEN_BYTES {
+            continue;
+        }
+        let screen = String::from_utf8_lossy(&bytes).into_owned();
+        saved.insert(session.to_string(), SavedScreen { screen, at });
+    }
+
+    let path = screens_path();
+    if saved.is_empty() {
+        // Removed rather than left behind. A stale file would replay the screens of a run
+        // two launches ago into panes that had nothing on them last time.
+        if path.exists()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(%error, "could not clear the saved shell screens");
+        }
+        return;
+    }
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(%error, "could not create the state directory for shell screens");
+        return;
+    }
+    match serde_json::to_vec(&saved).map_err(std::io::Error::other) {
+        // Not `save_atomic`: that is `persist`'s own routine for `Workspace`, and this is not
+        // one. A torn write here costs a banner line on the next launch, which is what
+        // `prior_screen` already answers for a missing file.
+        Ok(bytes) => {
+            if let Err(error) = std::fs::write(&path, bytes) {
+                tracing::warn!(%error, "could not save the shell screens");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not serialise the shell screens"),
+    }
+}
+
+/// The screens the previous run left behind, read once.
+///
+/// Latched for the life of the process. The file is written only at quit, so re-reading it
+/// would return the same bytes; and a shell respawned twice in one run (killed, then the pane
+/// re-mounted) should see the same previous screen both times rather than the first read
+/// consuming it.
+fn saved_screens() -> &'static std::collections::BTreeMap<String, SavedScreen> {
+    use std::sync::OnceLock;
+    static LOADED: OnceLock<std::collections::BTreeMap<String, SavedScreen>> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let path = screens_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Default::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            tracing::warn!(%error, "the saved shell screens are unreadable; panes come back empty");
+            Default::default()
+        })
+    })
+}
+
+/// The bytes to seed a respawned shell's mirror with, or `None` if nothing was saved.
+///
+/// **Blocking**: reads a file on the first call. Callers are Tauri commands and must be on
+/// the blocking pool — `session_spawn` asks for it inside the same closure that forks.
+pub fn prior_screen(session: SessionId) -> Option<Vec<u8>> {
+    saved_screens()
+        .get(&session.to_string())
+        .map(|s| s.screen.as_bytes().to_vec())
+}
+
+/// The line a respawned shell prints to say what the user is looking at.
+///
+/// # Why the wording changed
+///
+/// The old line was `— session restored (previous output not retained) —`, and it was honest:
+/// nothing was retained. Now the visible screen is, so the line has to change *meaning*
+/// rather than disappear. Replayed output is **dead text** — the cwd may have moved, the
+/// prompt above the line is a picture of a prompt, and scrolling up finds nothing because
+/// only the visible screen was kept. A user who believes otherwise types into a shell they
+/// think has state it does not have. So the banner stays, and says which of the two happened.
+///
+/// # Why it is written into the terminal
+///
+/// It used to be a React `<p>` rendered above the pane's terminal, which is what broke the
+/// pane: `.body` gives the terminal `height: 100%`, so a sibling with height pushed the
+/// terminal past the bottom of the frame and its background painted over the next row's title
+/// bar. As a line in the transcript it cannot do that, it scrolls away with the text it is
+/// about, and it survives a re-dock the way every other byte in the pane does — the same
+/// argument `ui/src/panes/exitMarker.ts` already makes for `— exited —`.
+///
+/// # The escape sequences
+///
+/// **`\x1b[0m` comes first, and that is the whole bug fix.** `state_formatted()` ends by
+/// emitting the screen's *live* attributes, faithfully — a shell that was sitting inside a
+/// coloured prompt leaves a background colour set. Opening with `\x1b[2m` on top of that
+/// paints this line, and every line after it, on the previous run's background. Reset, then
+/// dim, then reset again.
+pub fn restore_notice(replayed: bool) -> Vec<u8> {
+    let text = if replayed {
+        "— session restored · the output above is from the previous run and is not live —"
+    } else {
+        "— session restored (previous output not retained) —"
+    };
+    // The leading newline only when there is something above to separate from; on an empty
+    // screen it would be a blank first line for no reason.
+    let lead = if replayed { "\r\n" } else { "" };
+    format!("\x1b[0m{lead}\x1b[2m{text}\x1b[0m\r\n").into_bytes()
+}
+
+/// Everything a respawned shell's mirror should start with: the old screen, then the notice.
+///
+/// **Blocking on the first call**, through [`prior_screen`]. `session_spawn` asks for it inside
+/// the closure that forks, which is where this app puts every filesystem read a command needs.
+pub fn shell_preload(session: SessionId) -> Vec<u8> {
+    preload_from(prior_screen(session))
+}
+
+/// The composition, split out from the lookup so a test can drive both answers.
+///
+/// One function so the screen and the notice can never disagree about whether a replay
+/// happened — a "previous output not retained" line printed under a screenful of retained
+/// output is worse than either alone.
+fn preload_from(prior: Option<Vec<u8>>) -> Vec<u8> {
+    let replayed = prior.is_some();
+    let mut bytes = prior.unwrap_or_default();
+    bytes.extend_from_slice(&restore_notice(replayed));
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1324,112 @@ mod tests {
             !entry.eager,
             "a torn-out secondary pane still waits to be asked"
         );
+    }
+
+    // --- the restore notice, and the screens it is about ---------------------------------
+
+    /// Every byte of the notice, so the SGR framing is asserted rather than eyeballed.
+    ///
+    /// This is the pane-breaking bug in test form. The line used to be a React `<p>` above the
+    /// terminal, and `PaneTitleBar.module.css`'s `.body` gives the terminal `height: 100%` —
+    /// so a sibling with a height of its own pushed the terminal past the bottom of the frame
+    /// and its background painted over the next row's title bar. As a line in the transcript
+    /// the only way it can bleed is an SGR it opens and never closes, which is what this pins.
+    #[test]
+    fn the_notice_opens_with_a_reset_and_closes_every_attribute_it_sets() {
+        for replayed in [true, false] {
+            let bytes = restore_notice(replayed);
+            let text = String::from_utf8(bytes).expect("the notice is text");
+
+            assert!(
+                text.starts_with("\u{1b}[0m"),
+                "the notice must reset first: `state_formatted()` ends by restoring the \
+                 screen's live attributes, so a shell that quit inside a coloured prompt \
+                 leaves a background set and this line would inherit it — {text:?}"
+            );
+            assert!(
+                text.ends_with("\u{1b}[0m\r\n"),
+                "the notice must close its own dim attribute, or the shell's first prompt is \
+                 drawn dim — {text:?}"
+            );
+            assert_eq!(
+                text.matches("\u{1b}[").count(),
+                3,
+                "reset, dim, reset — nothing else, and nothing left open: {text:?}"
+            );
+        }
+    }
+
+    /// The banner changed meaning rather than disappearing, which is the point of keeping it:
+    /// replayed output is a picture of a shell, not a shell.
+    #[test]
+    fn the_notice_says_which_of_the_two_things_happened() {
+        let replayed = String::from_utf8(restore_notice(true)).expect("text");
+        let empty = String::from_utf8(restore_notice(false)).expect("text");
+
+        assert!(replayed.contains("is not live"));
+        assert!(empty.contains("previous output not retained"));
+        assert_ne!(
+            replayed, empty,
+            "a user who cannot tell the two apart will type into a dead prompt"
+        );
+    }
+
+    /// Nothing above to separate from means no leading blank line.
+    #[test]
+    fn the_notice_only_spaces_itself_off_when_there_is_output_above_it() {
+        let replayed = String::from_utf8(restore_notice(true)).expect("text");
+        let empty = String::from_utf8(restore_notice(false)).expect("text");
+        assert!(replayed.starts_with("\u{1b}[0m\r\n"));
+        assert!(!empty.starts_with("\u{1b}[0m\r\n"));
+    }
+
+    /// The two preloads, and the rule that the notice must describe the bytes above it.
+    ///
+    /// Driven through [`preload_from`] rather than `shell_preload` on purpose: the latter
+    /// reads the real `~/.local/state/cide/screens.json`, so a developer who has run the app
+    /// would be testing against their own last session.
+    #[test]
+    fn the_notice_always_describes_the_bytes_it_was_put_under() {
+        let empty = String::from_utf8(preload_from(None)).expect("text");
+        assert!(empty.contains("previous output not retained"), "{empty:?}");
+        assert!(
+            !empty.contains("is not live"),
+            "an empty pane must not claim to be showing anything: {empty:?}"
+        );
+
+        let replayed = String::from_utf8(preload_from(Some(b"$ ls\r\nCargo.toml\r\n".to_vec())))
+            .expect("text");
+        assert!(replayed.starts_with("$ ls"), "the screen comes first");
+        assert!(replayed.contains("is not live"), "{replayed:?}");
+        assert!(
+            !replayed.contains("not retained"),
+            "a notice that says nothing was kept, under output that was kept, is the worst of \
+             the three: {replayed:?}"
+        );
+    }
+
+    /// Only shells, and each one once.
+    ///
+    /// Claude panes are deliberately absent: the CLI repaints its whole UI from the transcript
+    /// on `--resume`, so a saved screen there is a stale frame something paints over a moment
+    /// later — and they are by far the largest screens in the app.
+    #[test]
+    fn only_shell_panes_have_a_screen_worth_saving() {
+        let root = temp_dir("screens");
+        let ws = fixture(&root);
+
+        let found = shell_sessions(&ws);
+        let project = ws.projects.values().next().expect("fixture project");
+        let shell = project.tabs[0]
+            .tree
+            .panes
+            .values()
+            .find(|p| p.kind == PaneKind::Shell)
+            .and_then(|p| p.session)
+            .expect("the fixture has a shell");
+
+        assert_eq!(found, vec![shell], "only the shell, and only once");
     }
 
     #[test]
