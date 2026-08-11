@@ -19,6 +19,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { letterFor, statusAt } from './treeStatus'
@@ -81,8 +82,14 @@ export function FileTree({ onOpen }: FileTreeProps) {
    *
    * Note what is *not* here: any wait. `count` and `chunks` come from `treeStore` and paint
    * on their own schedule, so a slow `git status` costs late tags and never a late tree.
+   *
+   * `useShallow` because the *map* is what matters and `gitStatusStore` installs a fresh
+   * object on every refresh, equal or not — and it refreshes on every `cide://fs-changed`,
+   * which is exactly the burst `treeStore.refresh` now answers with no re-render at all. A
+   * plain identity selector would put that re-render straight back. The comparison is over the
+   * changed paths, which the backend caps; it is not a walk of the repository.
    */
-  const statuses = useGitStatus((s) => s.status.statuses)
+  const statuses = useGitStatus(useShallow((s) => s.status.statuses))
   const [selected, setSelected] = useState<string | null>(null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -130,6 +137,17 @@ export function FileTree({ onOpen }: FileTreeProps) {
   return (
     <div className={styles.scroll} ref={scrollRef} data-audit="fileTreeScroll">
       <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        {/*
+          * Keyed by the virtualizer's key — the row *index* — and not by `row.path`.
+          *
+          * A virtualized list's children are positions, not identities: the box at index 42
+          * sits at `42 * ROW_HEIGHT` whatever file happens to be there, so the index is what
+          * two renders have in common. Keying by path meant that a file appearing at the top
+          * of the tree renamed every key below it, and React answered a burst that moved
+          * nothing on screen by unmounting and remounting the visible window instead of
+          * rewriting one row's text. The placeholders shared in that: `pending-42` and the
+          * path of the row that replaced it are two different children at one position.
+          */}
         {items.map((item) => {
           const row = useFileTree.getState().rowAt(item.index)
           if (!row) {
@@ -137,7 +155,7 @@ export function FileTree({ onOpen }: FileTreeProps) {
             // not resize under the user's thumb as rows arrive.
             return (
               <div
-                key={`pending-${item.index}`}
+                key={item.key}
                 className={styles.placeholder}
                 style={{ height: `${item.size}px`, transform: `translateY(${item.start}px)` }}
               />
@@ -145,7 +163,7 @@ export function FileTree({ onOpen }: FileTreeProps) {
           }
           return (
             <Row
-              key={row.path}
+              key={item.key}
               row={row}
               statuses={statuses}
               top={item.start}

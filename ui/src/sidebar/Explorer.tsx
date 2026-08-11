@@ -14,7 +14,7 @@ import { FileTree } from './FileTree'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { groupDigits } from '@/overlays/format'
-import { events, fsEvents, type ProjectId } from '@/ipc/client'
+import { events, type ProjectId } from '@/ipc/client'
 import styles from './FileTree.module.css'
 
 export interface ExplorerProps {
@@ -52,9 +52,22 @@ export function Explorer({ project, onOpenFile }: ExplorerProps) {
      */
     let cancelled = false
     let unlisten: (() => void) | null = null
-    void fsEvents
-      .onChanged((changed) => {
-        // Only this project's events. A second project's watcher firing must not blank the
+    /*
+     * `events.onFsChanged` rather than `fsEvents.onChanged`: the two listen to the same event,
+     * but the second reads `payload.paths`, and the wire carries `payload.change.paths` (see
+     * `emit::FsChanged`) — so its `paths` argument is `undefined` for every burst. Nothing here
+     * read it, which is why it went unnoticed; using the helper that matches the wire keeps it
+     * that way. The stale one is reported rather than deleted — `ipc/client.ts` is not ours.
+     *
+     * The burst itself is deliberately not inspected. Whether a row moved is a question about
+     * the *index*, which applies its own ignore rules to these paths and skips the git files
+     * outright, and re-deriving that judgement from path strings in the frontend would be a
+     * second, worse copy of `cide_fs::filter`. `refresh` asks the index instead, and answers a
+     * burst that moved nothing with no state write at all.
+     */
+    void events
+      .onFsChanged((changed) => {
+        // Only this project's events. A second project's watcher firing must not disturb the
         // tree the user is looking at.
         if (changed !== project) return
         void useFileTree.getState().refresh()

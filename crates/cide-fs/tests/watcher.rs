@@ -213,6 +213,56 @@ fn a_new_file_reaches_the_index_and_a_deleted_one_leaves_it() {
     assert!(index.contains(&dir.join("src/b.rs")));
 }
 
+/// The burst the file tree used to repaint itself for, and what it is worth.
+///
+/// `.git/HEAD`, `.git/index` and the refs are watched on purpose — the git status column has
+/// no other way to hear about a `git add` in a terminal pane — so every git command in the
+/// project produces a change event. What that event can never do is move a row: the walk put
+/// nothing under `.git` in the tree, and `Index::apply` skips those paths by name.
+///
+/// This is the half of the flicker diagnosis that lives in Rust. The frontend used to answer
+/// this event by dropping its whole row cache, so a repository being committed to repainted
+/// the explorer from empty on every gesture; `ui/src/sidebar/treeStore.ts` now revalidates
+/// instead and writes nothing when nothing moved. Asserted here rather than only there,
+/// because "this event cannot change a row" is a property of the index and not of the panel.
+#[test]
+fn a_git_index_write_is_reported_but_moves_no_row() {
+    let dir = scratch("watch-git-noop");
+    std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+    std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(dir.join(".git/index"), "before").unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/a.rs"), "").unwrap();
+
+    let mut index = Index::build(
+        vec![Root::new(dir.path())],
+        BuildOptions::default(),
+        &|_: &[WalkItem]| {},
+    );
+    let dirs = index.dir_paths();
+    let filter = Filter::build(&[dir.to_path_buf()], dirs.iter().map(|p| p.as_path()));
+    index.expand(&dir.join("src")).unwrap();
+    let before = index.rows(0, 100);
+    assert_eq!(before.len(), 2, "src/ and src/a.rs; .git is not a row");
+
+    let (_watcher, rx) = start(dir.path(), 8192);
+    std::fs::write(dir.join(".git/index"), "after").unwrap();
+
+    // The UI hears about it — that is the whole reason the path is watched.
+    let change = next_change(&rx, Duration::from_secs(10)).expect("the index write is reported");
+    assert!(change.git, "{change:?}");
+    assert!(
+        change.paths.iter().all(|p| filter.is_git_path(p)),
+        "the burst is git metadata and nothing else: {change:?}"
+    );
+
+    // And the tree does not move by so much as a row.
+    let added = index.apply(&change, &filter);
+    assert!(added.is_empty(), "{added:?}");
+    assert_eq!(index.count(), before.len());
+    assert_eq!(index.rows(0, 100), before);
+}
+
 #[test]
 fn a_directory_created_after_the_walk_is_watched_and_indexed() {
     let dir = scratch("watch-newdir");

@@ -7,10 +7,28 @@
  *    virtualizer happens to be showing, so requests deduplicate.
  * 2. Resident chunks are capped, so the JS heap stays flat regardless of repository size —
  *    scrolling a 100k-file tree end to end must not retain every row it passed.
- * 3. Any structural change — expand, collapse, a watcher event — drops the whole cache. A
- *    partial invalidation would need to know which rows moved, and the flattened tree
+ * 3. A structural change the *user* made — expand, collapse, reveal — drops the whole cache.
+ *    A partial invalidation would need to know which rows moved, and the flattened tree
  *    renumbers everything after the change; a cache that is subtly wrong about row 900 shows
  *    the user a file that is not there.
+ *
+ * # A watcher burst is a revalidation, not an invalidation
+ *
+ * Rule 3 used to cover `cide://fs-changed` as well, and that is what made the tree flicker.
+ * The burst arrives, [`refresh`] empties `chunks`, and every visible row's `rowAt` answers
+ * `undefined` until `fs_tree_rows` comes back — so the tree blanks to placeholders and
+ * refills, once per burst, whether or not a single row moved. It usually has not: `.git/HEAD`,
+ * `.git/index` and the refs are watched deliberately (`cide_fs::filter::GIT_WATCHED`) so the
+ * git tags stay true, and `Index::apply` skips those paths *by name* because they can change
+ * no row. Every git command in a terminal pane therefore repainted the whole tree from empty.
+ *
+ * So [`refresh`] re-reads the count and the chunks the viewport is showing, compares them
+ * against what is cached, and **writes nothing at all when nothing moved** — zero re-renders
+ * for a burst the tree does not care about. When something did move it writes once, with the
+ * fresh rows already in it, so no frame is ever short a row. Chunks outside the viewport are
+ * not re-read on every burst; they are marked stale in module scope (no re-render) and
+ * revalidated when they are next scrolled into view, still showing their old rows until the
+ * new ones land.
  *
  * Everything reaches Rust through [`tree`] below, which layers two different kinds of "no
  * answer" on top of each other: a handler that is not in this build at all (`pendingCommand`
@@ -71,7 +89,10 @@ interface FileTreeStore {
 
   /** Point the tree at a project, or at nothing. Reads the row count. */
   attach: (project: ProjectId | null) => Promise<void>
-  /** Ask for whatever chunks cover `[from, to)`. Cheap and idempotent; call from render. */
+  /**
+   * Ask for whatever chunks cover `[from, to)`, and record that range as the visible one.
+   * Cheap and idempotent; call from an effect on every render.
+   */
   ensure: (from: number, to: number) => void
   /** The row at a flattened index, or `undefined` while its chunk is in flight. */
   rowAt: (index: number) => TreeRow | undefined
@@ -80,7 +101,10 @@ interface FileTreeStore {
   /** Expand ancestors until `path` is visible, then scroll to it. */
   reveal: (path: string) => Promise<void>
   clearReveal: () => void
-  /** Drop every cached row and re-read the count. The `cide://fs-changed` handler. */
+  /**
+   * Re-read the count and the visible rows, and update only if they moved. The
+   * `cide://fs-changed` and `cide://fs-status` handler; see the module header.
+   */
   refresh: () => Promise<void>
 }
 
@@ -94,6 +118,23 @@ interface FileTreeStore {
 let inFlight = new Set<number>()
 let touched: number[] = []
 /**
+ * The chunks the last `ensure` asked for — what the user can currently see.
+ *
+ * Module scope for the same reason as `touched`, and load-bearing for `refresh`: a burst
+ * re-reads the viewport and nothing else, so its cost is proportional to the panel rather
+ * than to `CHUNK_CAP`.
+ */
+let visible = new Set<number>()
+/**
+ * Resident chunks that may no longer describe the tree.
+ *
+ * Deliberately *not* an eviction. A stale chunk keeps its rows on screen and is re-requested
+ * the next time `ensure` reaches it; `loadChunk` then overwrites them if they moved and
+ * writes nothing if they did not. Dropping them instead is the one-frame blank this whole
+ * file is about, moved from the burst to the scroll.
+ */
+let stale = new Set<number>()
+/**
  * Bumped on every invalidation. A response tagged with an older generation is dropped —
  * without this, a `fs_tree_rows` reply that was in flight when the user collapsed a folder
  * lands afterwards and writes rows from the *previous* flattening into the new one.
@@ -103,7 +144,35 @@ let generation = 0
 function resetCache(): void {
   inFlight = new Set()
   touched = []
+  visible = new Set()
+  stale = new Set()
   generation += 1
+}
+
+/** Whether two windows of rows describe the same thing. Field-wise: `TreeRow` is flat. */
+function sameRows(a: readonly TreeRow[] | undefined, b: readonly TreeRow[]): boolean {
+  if (a === undefined || a.length !== b.length) return false
+  return a.every((row, i) => {
+    const other = b[i]
+    return (
+      other !== undefined &&
+      row.path === other.path &&
+      row.name === other.name &&
+      row.depth === other.depth &&
+      row.kind === other.kind &&
+      row.expanded === other.expanded &&
+      row.hasChildren === other.hasChildren &&
+      row.symlink === other.symlink &&
+      row.root === other.root
+    )
+  })
+}
+
+/** One chunk's rows, or `[]` for a chunk that is entirely past the end. */
+function readChunk(project: ProjectId, chunk: number, total: number): Promise<TreeRow[]> {
+  const { offset, len } = chunkRequest(chunk, total)
+  if (len <= 0) return Promise.resolve([])
+  return tree('fs_tree_rows', () => fsApi.treeRows(project, offset, len), [] as TreeRow[])
 }
 
 export const useFileTree = create<FileTreeStore>((set, get) => ({
@@ -129,6 +198,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     if (project === null || count === 0) return
 
     const wanted = chunksFor(Math.max(0, from), Math.min(to, count), CHUNK_ROWS)
+    visible = new Set(wanted)
     for (const chunk of wanted) {
       // Touch first, so a chunk being re-visited moves to the back of the eviction queue
       // even when it is already resident and no request is made.
@@ -136,7 +206,11 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       if (at >= 0) touched.splice(at, 1)
       touched.push(chunk)
 
-      if (chunks.has(chunk) || inFlight.has(chunk)) continue
+      if (inFlight.has(chunk)) continue
+      // A stale chunk is re-requested but not dropped: its rows are what the user is looking
+      // at, and blanking them for the length of a round trip is the flicker. `loadChunk`
+      // replaces them only if they actually moved.
+      if (chunks.has(chunk) && !stale.has(chunk)) continue
       inFlight.add(chunk)
       void loadChunk(project, chunk, new Set(wanted), set, get)
     }
@@ -196,11 +270,50 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   async refresh() {
     const { project } = get()
     if (project === null) return
-    resetCache()
+
+    // The generation still moves — a `fs_tree_rows` issued before the burst describes the
+    // flattening the burst just changed — but the *cache* does not: see the module header.
+    // `inFlight` is cleared with it so those chunks can be asked for again; the loads
+    // themselves bail on the generation check when they land.
+    generation += 1
     const mine = generation
+    inFlight = new Set()
+
     const count = await tree('fs_tree_count', () => fsApi.treeCount(project), get().count)
-    if (generation !== mine) return
-    set({ count, chunks: new Map() })
+    if (generation !== mine || get().project !== project) return
+
+    const wanted = [...visible].filter((chunk) => chunk * CHUNK_ROWS < count)
+    const fetched = await Promise.all(wanted.map((chunk) => readChunk(project, chunk, count)))
+    if (generation !== mine || get().project !== project) return
+
+    const before = get()
+    const fresh = new Map<number, TreeRow[]>()
+    let moved = count !== before.count
+    wanted.forEach((chunk, i) => {
+      const rows = fetched[i] ?? []
+      fresh.set(chunk, rows)
+      // No early exit on the first difference: every visible chunk has to end up in `fresh`
+      // whatever the answer, or the single write below would blank the ones it skipped.
+      moved ||= !sameRows(before.chunks.get(chunk), rows)
+    })
+
+    if (!moved) {
+      // Nothing the tree is showing moved, so the tree must not re-render — no `set`, not even
+      // one that writes back an equal value, because `chunks` is a Map and a fresh identity is
+      // a re-render of every visible row. What is *not* on screen may still have moved, and
+      // that is what the stale marks are for.
+      for (const chunk of before.chunks.keys()) if (!visible.has(chunk)) stale.add(chunk)
+      return
+    }
+
+    // One write, already carrying every visible row, so there is no frame in which the tree
+    // has fewer rows than it had. The chunks outside the viewport are dropped rather than
+    // carried over: the flattening moved, so their row numbers no longer mean anything, and
+    // keeping them would put rows from two different trees on screen at once the moment the
+    // user scrolled.
+    stale = new Set()
+    touched = [...wanted]
+    set({ count, chunks: fresh })
   },
 }))
 
@@ -213,23 +326,27 @@ async function loadChunk(
   get: () => FileTreeStore,
 ): Promise<void> {
   const mine = generation
-  const { offset, len } = chunkRequest(chunk, get().count)
-  if (len <= 0) {
+  // A chunk that starts past the end is not a request. `ensure` clamps to `count`, so this is
+  // only reachable if the tree shrank under a queued chunk — but caching the empty answer
+  // would leave those rows blank until something else invalidated them.
+  if (chunk * CHUNK_ROWS >= get().count) {
     inFlight.delete(chunk)
     return
   }
-
-  const rows = await tree(
-    'fs_tree_rows',
-    () => fsApi.treeRows(project, offset, len),
-    [] as TreeRow[],
-  )
+  const rows = await readChunk(project, chunk, get().count)
 
   inFlight.delete(chunk)
   // The tree was re-flattened while this was in flight. These rows describe a shape that no
   // longer exists; writing them would show files at the wrong indentation under the wrong
   // parent, which looks like corruption rather than staleness.
   if (generation !== mine || get().project !== project) return
+  stale.delete(chunk)
+
+  // A revalidation that found nothing. Returning before the `set` is the whole point: the
+  // rows on screen are already these rows, and replacing the Map would re-render the tree to
+  // draw exactly what it is drawing.
+  const previous = get().chunks.get(chunk)
+  if (sameRows(previous, rows) && get().degraded === isDegraded('fs_tree_rows')) return
 
   const next = new Map(get().chunks)
   next.set(chunk, rows)
