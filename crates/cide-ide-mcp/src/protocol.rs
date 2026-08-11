@@ -19,18 +19,30 @@
 //!
 //! ## Known-good range
 //!
-//! Verified against 2.1.224 and 2.1.226. [`SUPPORTED_CLI`] records that, and the app warns
-//! outside it rather than failing — a protocol change should degrade the diff view, never
+//! Verified against 2.1.224, 2.1.226 and 2.1.227. [`SUPPORTED_CLI`] records that, and the app
+//! warns outside it rather than failing — a protocol change should degrade the diff view, never
 //! break the terminal.
+//!
+//! 2.1.227 was added on evidence rather than optimism, and the distinction matters because the
+//! same release **did** change something: it began rejecting `--resume <id> --session-id <new>`,
+//! which broke resume until `cide_claude::session` was corrected. So the protocol was re-checked
+//! rather than assumed stable — `server::live::a_real_claude_finds_us_and_completes_the_handshake`
+//! was run against the installed 2.1.227 and passed, meaning a real CLI read our lockfile, chose
+//! the WebSocket transport, sent the auth header and completed the MCP handshake. That is the
+//! whole discovery path end to end, which no amount of grepping the binary establishes.
 
 use serde::{Deserialize, Serialize};
 
 /// CLI versions this protocol description was checked against.
 ///
-/// Recorded rather than enforced. The CLI self-updates — 2.1.221 through 2.1.226 inside a
+/// Recorded rather than enforced. The CLI self-updates — 2.1.221 through 2.1.227 inside a
 /// fortnight on this machine — so refusing to run outside the range would break the app far
 /// more often than the protocol actually changes.
-pub const SUPPORTED_CLI: &[&str] = &["2.1.224", "2.1.226"];
+///
+/// Left stale, this is worse than useless: it warns on every launch about a version that is
+/// fine, which is how a warning stops being read before the launch that should have been
+/// warned about.
+pub const SUPPORTED_CLI: &[&str] = &["2.1.224", "2.1.226", "2.1.227"];
 
 /// The header carrying the lockfile's `authToken`.
 pub const AUTH_HEADER: &str = "x-claude-code-ide-authorization";

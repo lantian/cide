@@ -43,6 +43,7 @@ import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { requestReveal } from '@/editor/revealRequest'
+import { claudeSend } from '@/ipc/client'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
 import { buildKeymap } from '@/keys/keymap'
@@ -56,7 +57,6 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   app as appApi,
   benchMode,
-  claude as claudeApi,
   file as fileApi,
   project as projectApi,
   windows as windowApi,
@@ -566,12 +566,20 @@ export function App() {
       return <WindowFrame>{null}</WindowFrame>
     }
     return (
-      <DetachedPaneWindow
-        pane={detachedPane}
-        cwd={owner.roots[0]?.path ?? PROJECT_ROOT}
-        project={project}
-        onRedock={() => void redockPane(boot.window)}
-      />
+      <>
+        <DetachedPaneWindow
+          pane={detachedPane}
+          cwd={owner.roots[0]?.path ?? PROJECT_ROOT}
+          project={project}
+          onRedock={() => void redockPane(boot.window)}
+        />
+        {/*
+          * A detached window returns before the shell below, so it had no `Failures` at all —
+          * the one window kind where every gesture is new this round, and the only one where
+          * a rejected command had nowhere to be seen. Same reasoning as the shell's copy.
+          */}
+        <Failures />
+      </>
     )
   }
 
@@ -815,7 +823,13 @@ export function App() {
                   diag.log(`no Claude pane to mention ${path} into`)
                   return
                 }
-                claudeApi.mentionFile(activeProjectId, mentionTarget, path)
+                // `claudeSend.lines` rather than `claude.mentionFile`: the latter ends in
+                // `.catch(() => {})`, so ⌥⏎ against a project whose `claude` never completed
+                // the IDE handshake resolves happily and does nothing — the silent no-op this
+                // whole round exists to end. Empty text and no line numbers is a whole-file
+                // mention. Deliberately uncaught: `Failures` turns the rejection into the
+                // sentence saying why nothing was sent.
+                void claudeSend.lines(activeProjectId, mentionTarget, path, '')
               },
               runCommand: (id) => {
                 closeOverlay()
