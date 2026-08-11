@@ -36,6 +36,8 @@ import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
+import { SidebarSplitter } from '@/chrome/SidebarSplitter'
+import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
 import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
@@ -145,6 +147,17 @@ async function pickProject(open: (paths: string[]) => Promise<void>): Promise<vo
   await open(Array.isArray(chosen) ? chosen : [chosen])
 }
 
+// WebKitGTK draws its own menu on every right-click, and with `devtools` enabled that menu
+// offers "Inspect element". Suppressed here rather than per surface: a surface-by-surface
+// `preventDefault` is correct only for the surfaces someone remembered, so the next pane
+// added leaks it again. Module scope because it is window-lifetime — StrictMode's double
+// mount cannot install it twice, and no unmount can tear it down while the window is open.
+//
+// Text inputs keep the native menu deliberately: WebKit refuses `execCommand('paste')` from
+// page script, so a hand-rolled Paste item would be drawn and then do nothing. See
+// `ui/src/menus` for how a surface opts out of that.
+installNativeMenuSuppression()
+
 export function App() {
   const boot = useWorkspace((s) => s.boot)
   const theme = useWorkspace((s) => s.theme)
@@ -158,6 +171,7 @@ export function App() {
   const closePane = useWorkspace((st) => st.closePane)
   const focusPane = useWorkspace((st) => st.focusPane)
   const maximizePane = useWorkspace((st) => st.maximizePane)
+  const contextMenuOpen = useContextMenuOpen()
   const setRatio = useWorkspace((st) => st.setRatio)
   // Adding a ROW, as distinct from adding a tile to one. `pane_split` routes Col to `add_row`
   // in the command layer, so this and `onAddTile` below are the same domain gesture family —
@@ -446,6 +460,10 @@ export function App() {
   const keyContext = {
     projectOpen: activeProjectId !== null,
     overlayOpen: overlay !== null,
+    // `gate.ts` listens on window capture, so it sees a keystroke before an open menu does.
+    // Nothing collides today — every default binding is a modified chord — but this is what
+    // stops a user who rebinds a bare key from having it swallowed while a menu is up.
+    contextMenuOpen,
     editorFocused: focused?.pane.kind === 'editor',
     terminalFocused: overlay === null && focused?.pane.kind !== 'editor',
     // Gates `claude.fork`, `claude.mirror` and `claude.split.newSession` — all three act on
@@ -633,6 +651,10 @@ export function App() {
             />
           )}
           {view === 'problems' && <ProblemsPanel project={activeProjectId} />}
+          {/* The sidebar's drag edge — one handle for all four panels, because there are only
+              two widths: `--w-sidebar-files` sizes the explorer, search and problems, and
+              `--w-sidebar-git` sizes git. Absent under `settings`, which has no panel. */}
+          {view !== 'settings' && <SidebarSplitter panel={view === 'git' ? 'git' : 'files'} />}
 
           <div className={styles.content}>
             {/* An open project always has a console tab, so its `activeTab` is always live —

@@ -205,6 +205,20 @@
   --h-tabstrip: 30px;
   --h-status: 24px;
   --h-panetitle: 26px;
+  /*
+   * The two sidebar widths are the mock's, and they are now *defaults* rather than fixed
+   * values: `chrome/SidebarSplitter.tsx` re-declares both on `<html>` from the saved
+   * settings before the first render, and again on every drag. These literals are what a
+   * first launch shows, what a window with no saved width falls back to, and what
+   * `SidebarSettings::default()` in `crates/cide-ipc/src/settings.rs` and `SIDEBAR_DEFAULT`
+   * in `chrome/sidebarWidth.ts` both mirror — `ui/scripts/check-sidebar.mjs` pins the three
+   * copies against each other.
+   *
+   * Two numbers rather than one because the panels are two shapes: the explorer draws one
+   * truncatable name per row, the git panel draws a path, a stat figure and a checkbox on
+   * the same line. `--w-sidebar-files` also sizes search and problems, which are the
+   * explorer's column with different rows in it.
+   */
   --w-sidebar-files: 252px;
   --w-sidebar-git: 420px;
   --w-minimap: 96px;

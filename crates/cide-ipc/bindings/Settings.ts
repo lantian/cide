@@ -3,6 +3,7 @@ import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { ProxySettings } from "./ProxySettings";
+import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
 import type { WindowMode } from "./WindowMode";
@@ -50,4 +51,4 @@ keepSessionsOnWindowClose: boolean,
  * too. If unsaved edits ever need their own toggle, that is a second field with its own
  * wording, not a second meaning stapled to this one.
  */
-confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: TerminalSettings, graphics: GraphicsSettings, claude: ClaudeSettings, proxy: ProxySettings, };
+confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: TerminalSettings, graphics: GraphicsSettings, claude: ClaudeSettings, proxy: ProxySettings, sidebar: SidebarSettings, };

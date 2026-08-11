@@ -3,6 +3,7 @@ import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { ProxySettings } from "./ProxySettings";
+import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
 import type { Theme } from "./Theme";
 
@@ -30,4 +31,14 @@ export type SettingsPatch = { theme?: Theme, eachProjectKeepsClaudeTab?: boolean
  * the boundary is in-process; see [`crate::settings::ProxySettings`] for what is done
  * about the value once it is at rest.
  */
-proxy?: ProxySettings, };
+proxy?: ProxySettings, 
+/**
+ * Both sidebar widths, sent together.
+ *
+ * Per the rule above: a patch is per top-level field, so the splitter that just moved
+ * the explorer sends the git width it currently holds alongside it. That is not a
+ * theoretical loss of the other panel's value — the splitter reads both out of the same
+ * settings snapshot it renders from, so "currently holds" is the mirror's value and not
+ * a stale local copy.
+ */
+sidebar?: SidebarSettings, };
