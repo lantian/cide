@@ -15,20 +15,67 @@
 //! configuration, so ids are treated as a public interface: added freely, never renamed.
 //! Titles are display text and may change with the mock.
 //!
+//! # Listed, or deleted. Never listed and dead.
+//!
+//! An entry here is a promise that choosing it from the palette does something. There are
+//! exactly two honest states for a command — it runs, or it is drawn disabled with a reason
+//! ([`Command::unavailable`]) — and the third state, listed and silently inert, is what
+//! shipped: of the 37 entries this table held, `keys/dispatch.ts` had an arm for 7 and
+//! `App.tsx`'s fallback for 6 more, so **24 resolved to a diagnostic log line** — the palette
+//! advertised them and the keymap swallowed their keystrokes. `ui/scripts/check-commands.mjs`
+//! is the gate that makes that state unrepresentable: every id here is either handled by
+//! `ui/src/keys/dispatch.ts` or carries an `unavailable` reason, and the build fails
+//! otherwise.
+//!
 //! # `when` vocabulary
 //!
 //! Clauses use the same grammar as [`Binding::when`](cide_ipc::Binding), and the frontend
-//! supplies the context flags. The vocabulary is kept deliberately small — every flag here
-//! is one the webview already tracks to paint focus rings:
+//! supplies the context flags. [`CONTEXT_FLAGS`] is the whole vocabulary and is the single
+//! list the doc, the validation test and the frontend's own check script all read — a flag
+//! named in a clause but never *set* by the webview is false for ever, which hides the
+//! command from the palette on every platform with nothing anywhere reporting it. That had
+//! already happened to `repoOpen`, so every git command was invisible.
 //!
-//! * `claudePaneFocused`, `terminalFocused`, `editorFocused` — the focused pane's kind
-//! * `repoOpen` — the active project has at least one git repository
+//! # Preconditions belong in `when`, not in the handler
+//!
+//! A command that no-ops because there is no focused pane is indistinguishable, from the
+//! user's chair, from one that is unwired — which is the entire complaint this round
+//! answers. So anything that acts on a pane, a tab, a selection or a repository says so in
+//! its clause, and the palette hides it rather than offering a row that does nothing.
 
 use std::sync::OnceLock;
 
 use cide_ipc::Command;
 
 use crate::{CoreError, Result};
+
+/// Every context flag a `when` clause here — or in a user's `keymap.json` — may name.
+///
+/// The frontend must set each of these. `ui/src/keys/context.ts` derives all but the four
+/// marked *host*, which only React knows, and `check-commands.mjs` asserts the two lists
+/// cover this one. An unknown identifier evaluates to `false` rather than erroring, which is
+/// the safe direction for a user's typo and the dangerous one for ours — hence the list.
+pub const CONTEXT_FLAGS: &[&str] = &[
+    // The focused pane, and whether there is one at all.
+    "paneFocused",
+    "claudePaneFocused",
+    "terminalFocused",
+    "editorFocused",
+    // The workspace around it.
+    "projectOpen",
+    "multipleProjects",
+    "multipleTabs",
+    "closableTab",
+    "editorOpen",
+    "claudeTarget",
+    "repoOpen",
+    "shellWindow",
+    // Host flags: transient chrome that only the React tree knows about.
+    "overlayOpen",
+    "contextMenuOpen",
+    "sidebarFiles",
+    "sidebarGit",
+];
 
 /// Every command cide can run, in palette display order.
 ///
@@ -193,6 +240,18 @@ fn validate_table(table: &[Command]) -> Result<()> {
                 command.id
             )));
         }
+        // An empty reason renders as a greyed row with nothing beside it, which says less
+        // than the enabled row it replaced.
+        if command
+            .unavailable
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty())
+        {
+            return Err(CoreError::Invariant(format!(
+                "command {} is unavailable with an empty reason",
+                command.id
+            )));
+        }
         if seen.contains(&command.id.as_str()) {
             return Err(CoreError::Invariant(format!(
                 "duplicate command id: {}",
@@ -206,6 +265,7 @@ fn validate_table(table: &[Command]) -> Result<()> {
 
 /// Group names, as constants so a typo cannot split one group into two.
 const WINDOW: &str = "Window";
+const PROJECT: &str = "Project";
 const CLAUDE: &str = "Claude";
 const TERMINAL: &str = "Terminal";
 const FILE: &str = "File";
@@ -215,27 +275,43 @@ const VIEW: &str = "View";
 /// Build the table. Order here is palette order.
 fn build() -> Vec<Command> {
     vec![
-        // Window.
-        Command::new("pane.split.right", "Split pane right (adds a tile)", WINDOW),
-        Command::new("pane.split.down", "Split pane down (adds a row)", WINDOW),
-        Command::new("pane.promoteToTab", "Promote pane to full tab", WINDOW),
-        Command::new("pane.detachToWindow", "Detach pane into window", WINDOW),
-        Command::new("pane.close", "Close pane", WINDOW),
-        Command::new("pane.maximize", "Maximize pane", WINDOW),
-        Command::new("pane.navigate.left", "Focus pane left", WINDOW),
-        Command::new("pane.navigate.right", "Focus pane right", WINDOW),
-        Command::new("pane.navigate.up", "Focus pane up", WINDOW),
-        Command::new("pane.navigate.down", "Focus pane down", WINDOW),
+        // Window. Everything that acts on the focused pane is gated on there being one:
+        // a detached-pane window and a window whose project has just closed both have none,
+        // and a row that splits nothing is the dead command this round is about.
+        Command::new("pane.split.right", "Split pane right (adds a tile)", WINDOW)
+            .when("paneFocused"),
+        Command::new("pane.split.down", "Split pane down (adds a row)", WINDOW).when("paneFocused"),
+        Command::new("pane.promoteToTab", "Promote pane to full tab", WINDOW)
+            .when("paneFocused")
+            // The domain has no move-pane-to-its-own-tab operation — `contract/commands.json`
+            // has `pane_split`, `pane_add_row`, `pane_close` and `window_detach_pane`, and
+            // nothing that re-parents a leaf into a new tab. The frontend cannot fake it:
+            // closing the pane and opening a tab would kill the session the pane is holding.
+            .unavailable("needs a domain command that moves a pane into a new tab"),
+        Command::new("pane.detachToWindow", "Detach pane into window", WINDOW).when("paneFocused"),
+        Command::new("pane.close", "Close pane", WINDOW).when("paneFocused"),
+        Command::new("pane.maximize", "Maximize pane", WINDOW).when("paneFocused"),
+        Command::new("pane.navigate.left", "Focus pane left", WINDOW).when("paneFocused"),
+        Command::new("pane.navigate.right", "Focus pane right", WINDOW).when("paneFocused"),
+        Command::new("pane.navigate.up", "Focus pane up", WINDOW).when("paneFocused"),
+        Command::new("pane.navigate.down", "Focus pane down", WINDOW).when("paneFocused"),
         Command::new("window.mode.stacked", "Window mode: stacked", WINDOW),
         Command::new(
             "window.mode.perProject",
             "Window mode: one window per project",
             WINDOW,
         ),
-        Command::new("tab.close", "Close tab", WINDOW),
-        Command::new("tab.next", "Next tab", WINDOW),
-        Command::new("tab.prev", "Previous tab", WINDOW),
-        // Claude. All of these act on the focused session, so none of them mean anything
+        // `tabs[0]` is the pinned console and `close_tab` refuses it outright, so Ctrl+W on
+        // it is a refusal with a dialog, not a close. The clause is what keeps that from
+        // reading as "Ctrl+W is broken again".
+        Command::new("tab.close", "Close tab", WINDOW).when("closableTab"),
+        Command::new("tab.next", "Next tab", WINDOW).when("multipleTabs"),
+        Command::new("tab.prev", "Previous tab", WINDOW).when("multipleTabs"),
+        // Project. Ctrl+Tab and Ctrl+Shift+Tab; see `keymap::defaults` for why the order is
+        // the header's and not most-recently-used.
+        Command::new("project.next", "Next project", PROJECT).when("multipleProjects"),
+        Command::new("project.prev", "Previous project", PROJECT).when("multipleProjects"),
+        // Claude. The first four act on the focused session, so none of them mean anything
         // without a Claude pane to act on.
         Command::new(
             "claude.split.newSession",
@@ -246,31 +322,55 @@ fn build() -> Vec<Command> {
         Command::new("claude.fork", "Fork session into new pane", CLAUDE).when("claudePaneFocused"),
         Command::new("claude.mirror", "Mirror session into new pane", CLAUDE)
             .when("claudePaneFocused"),
-        Command::new("claude.restart", "Restart Claude session", CLAUDE).when("claudePaneFocused"),
+        Command::new("claude.restart", "Restart Claude session", CLAUDE)
+            .when("claudePaneFocused")
+            // A restart is kill-then-respawn, and only the pane can respawn: `TerminalPane`
+            // spawns once on mount and `paneHosts` caches the session id for the life of the
+            // host, so killing from here leaves an exit marker and no way back. Killing alone
+            // would be a *stop* command wearing the word restart.
+            .unavailable("needs a respawn path in the pane host; kill alone is not a restart"),
+        // The exception to the rule above, and the reason the rule is not a blanket one: you
+        // mention the file you are *looking at*, which means an editor has focus and a Claude
+        // pane by definition does not. `claudeTarget` is "this project has a Claude pane to
+        // mention into" — the focused one, or the console.
         Command::new("claude.mention.file", "Mention file in Claude", CLAUDE)
-            .when("claudePaneFocused"),
+            .when("editorFocused && claudeTarget"),
         // Terminal. Splitting one below is offered from any pane — it creates the terminal
         // it splits to — whereas clearing needs a terminal already focused.
-        Command::new("terminal.splitBelow", "Split terminal below", TERMINAL),
+        Command::new("terminal.splitBelow", "Split terminal below", TERMINAL).when("paneFocused"),
         Command::new("terminal.clear", "Clear terminal", TERMINAL).when("terminalFocused"),
         Command::new("terminal.paste", "Paste into terminal", TERMINAL).when("terminalFocused"),
         // File.
         Command::new("file.save", "Save file", FILE).when("editorFocused"),
-        Command::new("file.saveAll", "Save all files", FILE),
+        Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
         Command::new("file.reveal", "Reveal file in sidebar", FILE).when("editorFocused"),
         // Git.
-        Command::new("git.commit", "Commit changes", GIT).when("repoOpen"),
+        Command::new("git.commit", "Commit changes", GIT)
+            .when("repoOpen")
+            // A commit needs a message and a set of paths, and both live in the Git panel's
+            // React state (`useGitPanel`) — there is no store a dispatcher can read them
+            // from. Committing with an empty message and every changed file would not be
+            // this command, it would be a different and much worse one.
+            .unavailable(
+                "needs the Git panel's message and ticked paths, which are not in a store",
+            ),
         Command::new("git.push", "Push to remote", GIT).when("repoOpen"),
         Command::new("git.refresh", "Refresh git status", GIT).when("repoOpen"),
-        Command::new("git.stageSelected", "Stage selected changes", GIT).when("repoOpen"),
+        Command::new("git.stageSelected", "Stage selected changes", GIT)
+            .when("repoOpen")
+            // Same reason as `git.commit`: "selected" is the panel's tick state.
+            .unavailable("needs the Git panel's selection, which is not in a store"),
         // View.
-        Command::new("picker.files", "Go to file", VIEW),
+        Command::new("picker.files", "Go to file", VIEW).when("projectOpen"),
         Command::new("palette.commands", "Show all commands", VIEW),
         Command::new("theme.toggle", "Toggle light/dark theme", VIEW),
-        Command::new("settings.open", "Open settings", VIEW),
-        Command::new("settings.keymap", "Open keyboard shortcuts", VIEW),
-        Command::new("sidebar.files", "Show files sidebar", VIEW),
-        Command::new("sidebar.git", "Show git sidebar", VIEW).when("repoOpen"),
+        // Settings opens as a *tab inside a project*, so with no project open there is
+        // nowhere to put it.
+        Command::new("settings.open", "Open settings", VIEW).when("projectOpen"),
+        Command::new("settings.keymap", "Open keyboard shortcuts", VIEW).when("projectOpen"),
+        // The rail and its sidebar exist in the shell window only; a detached pane has none.
+        Command::new("sidebar.files", "Show files sidebar", VIEW).when("shellWindow"),
+        Command::new("sidebar.git", "Show git sidebar", VIEW).when("shellWindow && repoOpen"),
     ]
 }
 
@@ -342,21 +442,82 @@ mod tests {
         }
     }
 
+    /// Every identifier in a `when` clause, ignoring `!`, `&&`, `||` and parentheses.
+    ///
+    /// The clauses are compound now (`editorFocused && claudeTarget`), so matching whole
+    /// strings against a list — which is what this test used to do — would have to grow an
+    /// entry per combination and would pass a clause built from two unknown flags.
+    fn flags_in(clause: &str) -> Vec<String> {
+        clause
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[test]
     fn every_when_clause_uses_the_documented_vocabulary() {
         // The frontend supplies these flags by name. A clause naming a flag it does not set
         // is never true, so the command vanishes from the palette on every platform and
-        // nothing anywhere reports it.
+        // nothing anywhere reports it — which is exactly what had happened to `repoOpen`,
+        // and with it to every git command.
         for command in registry() {
             let Some(clause) = command.when.as_deref() else {
                 continue;
             };
+            for flag in flags_in(clause) {
+                assert!(
+                    CONTEXT_FLAGS.contains(&flag.as_str()),
+                    "{} names {flag}, which is not in CONTEXT_FLAGS: {clause}",
+                    command.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_vocabulary_has_no_duplicates() {
+        let mut seen: Vec<&str> = Vec::new();
+        for flag in CONTEXT_FLAGS {
+            assert!(!seen.contains(flag), "duplicate context flag: {flag}");
+            seen.push(flag);
+        }
+    }
+
+    #[test]
+    fn nothing_binds_a_key_to_an_unavailable_command() {
+        // The point of `unavailable` is that the palette can *say* why. A key bound to one
+        // has no way to say anything: the gate swallows the keystroke — so the editor and
+        // the pty never see it either — and the user gets silence, which is the failure this
+        // whole round is about. Leave the chord unbound and it at least reaches the surface
+        // underneath.
+        let bound = crate::keymap::defaults()
+            .into_iter()
+            .chain(crate::keymap::platform_defaults());
+        for binding in bound {
+            let id = binding.target_command();
+            let Some(command) = by_id(id) else { continue };
             assert!(
-                matches!(
-                    clause,
-                    "claudePaneFocused" | "terminalFocused" | "editorFocused" | "repoOpen"
-                ),
-                "{} has an undocumented when clause: {clause}",
+                command.unavailable.is_none(),
+                "{id} is bound by {} but is unavailable: {:?}",
+                binding.key,
+                command.unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn an_unavailable_reason_names_what_is_missing() {
+        // Read as a whole sentence in the palette: "Restart Claude session — needs a respawn
+        // path in the pane host". A reason that just says "not implemented" tells a user
+        // nothing they had not already worked out from the row being grey.
+        for command in registry() {
+            let Some(reason) = command.unavailable.as_deref() else {
+                continue;
+            };
+            assert!(
+                reason.len() > 20 && reason.contains("needs"),
+                "{}'s reason should say what is missing: {reason}",
                 command.id
             );
         }
@@ -403,7 +564,9 @@ mod tests {
     fn groups_are_listed_once_each_in_table_order() {
         assert_eq!(
             groups(),
-            vec!["Window", "Claude", "Terminal", "File", "Git", "View"]
+            vec![
+                "Window", "Project", "Claude", "Terminal", "File", "Git", "View"
+            ]
         );
     }
 
@@ -421,9 +584,18 @@ mod tests {
     }
 
     #[test]
-    fn claude_commands_require_a_claude_pane() {
+    fn claude_commands_require_a_claude_pane_except_the_one_made_from_an_editor() {
         for command in registry().iter().filter(|c| c.id.starts_with("claude.")) {
-            assert_eq!(command.when.as_deref(), Some("claudePaneFocused"));
+            // `claude.mention.file` is the exception and it is not an oversight: the gesture
+            // is "mention the file I am looking at", which means an editor has focus and so
+            // a Claude pane does not. Requiring `claudePaneFocused` made it a row that could
+            // only ever be offered in the one state where it has no file to mention.
+            let expected = if command.id == "claude.mention.file" {
+                "editorFocused && claudeTarget"
+            } else {
+                "claudePaneFocused"
+            };
+            assert_eq!(command.when.as_deref(), Some(expected), "{}", command.id);
         }
     }
 

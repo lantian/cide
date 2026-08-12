@@ -286,3 +286,31 @@
 .statusFaint {
   color: var(--faint);
 }
+
+/*
+ * A command the build cannot run — `Command::unavailable`.
+ *
+ * Drawn rather than hidden, and that is the point of the state existing at all: a user
+ * hunting for *Restart Claude session* who finds no row concludes the app cannot do it and
+ * stops looking, while a greyed row carrying the reason tells them what is actually true. The
+ * mock has no disabled row, so this is the smallest departure that says it — the name drops
+ * to `--faint`, and the reason takes the slot the group and the key chip would have used,
+ * because neither is worth showing for a row that cannot run.
+ *
+ * Both themes come free: every colour here is a token, and `tokens.css` defines `--faint`
+ * for each.
+ */
+.rowDisabled .name {
+  color: var(--faint);
+}
+
+.reason {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+  color: var(--faint);
+  font-size: 11px;
+  font-style: italic;
+}

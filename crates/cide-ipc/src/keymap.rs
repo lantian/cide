@@ -100,6 +100,23 @@ pub struct Command {
     pub group: String,
     /// Context in which the command is applicable, same grammar as `Binding::when`.
     pub when: Option<String>,
+    /// Why this command cannot run *in any context*, or `None` when it can.
+    ///
+    /// Distinct from [`when`](Self::when), and the distinction is the whole reason this
+    /// field exists. A `when` clause says "not right now, because of where you are" — focus
+    /// a Claude pane and the command works. This says "not in this build, whatever you do":
+    /// the capability it needs does not exist yet. The palette draws these rows greyed with
+    /// the reason instead of hiding them, because a user who is looking for *Restart Claude
+    /// session* and finds nothing concludes the app cannot do it and stops looking; a
+    /// disabled row with a reason tells them what is actually true.
+    ///
+    /// The alternative was to delete such commands from the registry until they work. That
+    /// loses twice: the id stops being reserved (so a keymap.json naming it becomes an
+    /// error rather than a no-op), and nothing anywhere records that the gap exists — which
+    /// is how ~35 dead entries came to be listed in the first place.
+    ///
+    /// Nothing may bind a key to one of these; `cide_core::commands` has a test.
+    pub unavailable: Option<String>,
 }
 
 impl Command {
@@ -109,11 +126,21 @@ impl Command {
             title: title.into(),
             group: group.into(),
             when: None,
+            unavailable: None,
         }
     }
 
     pub fn when(mut self, expr: impl Into<String>) -> Self {
         self.when = Some(expr.into());
+        self
+    }
+
+    /// Mark the command listable but not runnable, with the reason a user will read.
+    ///
+    /// Phrase `reason` as a sentence fragment naming what is missing — it is rendered
+    /// verbatim in the palette next to the row.
+    pub fn unavailable(mut self, reason: impl Into<String>) -> Self {
+        self.unavailable = Some(reason.into());
         self
     }
 }

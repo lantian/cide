@@ -107,7 +107,6 @@ try {
     { key: 'ctrl+alt+right', command: 'pane.split.right', when: null },
     { key: 'ctrl+alt+down', command: 'pane.split.down', when: null },
     { key: 'ctrl+shift+n', command: 'claude.split.newSession', when: null },
-    { key: 'ctrl+shift+up', command: 'pane.promoteToTab', when: null },
     { key: 'ctrl+shift+d', command: 'pane.detachToWindow', when: null },
     { key: 'ctrl+shift+`', command: 'terminal.splitBelow', when: null },
     { key: 'ctrl+p', command: 'picker.files', when: null },
@@ -115,6 +114,11 @@ try {
     { key: 'ctrl+w', command: 'tab.close', when: null },
     { key: 'ctrl+s', command: 'file.save', when: null },
     { key: 'ctrl+shift+t', command: 'theme.toggle', when: null },
+    // Ctrl+Tab is in the sweep's key list, so these two also cover the case that matters
+    // most for a Tab binding: both entry points must swallow it identically, or the stroke
+    // that switched projects also inserts a tab character into whatever had focus.
+    { key: 'ctrl+tab', command: 'project.next', when: null },
+    { key: 'ctrl+shift+tab', command: 'project.prev', when: null },
     { key: 'ctrl+alt+h', command: 'pane.navigate.left', when: null },
     { key: 'ctrl+alt+l', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+alt+k', command: 'pane.navigate.up', when: null },
@@ -474,38 +478,27 @@ try {
     ok(dispatched.size >= 10, `found ${dispatched.size} dispatched commands — the scan still works`)
 
     /*
-     * The bindings that are still dead, each with the reason, so that a *new* one cannot be
-     * added without either wiring it or arguing for a line here.
+     * There is no `KNOWN_DEAD` list any more, and its absence is the result this round was
+     * for.
      *
-     * None of these is in this file's gift: they need the workspace store and `App.tsx`,
-     * which belongs to whoever is merging. They are listed rather than quietly excluded
-     * because the whole point of the assertion is that a dead key is a fact somebody has to
-     * look at.
+     * It held nine bindings — `tab.close` (the Ctrl+W the user reported), `theme.toggle`,
+     * `settings.open`, `pane.detachToWindow`, `pane.promoteToTab` and the four
+     * `pane.navigate.*` — each with a note saying it needed `App.tsx`. Every one of them is
+     * now handled in `keys/dispatch.ts` off the workspace store, except `pane.promoteToTab`,
+     * which has no domain operation behind it and is therefore `Command::unavailable` and
+     * unbound rather than bound and dead.
+     *
+     * The stronger version of this assertion lives in `check-commands.mjs`, which compares
+     * the switch against the *whole registry* rather than against the bound subset — a
+     * palette row with no key was invisible to the loop below. This one stays because it is
+     * the check a keymap change runs.
      */
-    const KNOWN_DEAD = {
-      'tab.close': 'needs the focused tab and `tab_close`; the × button is the only way today',
-      'theme.toggle': 'the app header has the toggle; no command reaches it',
-      'settings.open': 'the activity rail’s ⚙ is the only gesture that opens Settings',
-      'pane.promoteToTab': 'no dispatcher; `pane_promote` is wired to nothing',
-      'pane.detachToWindow': 'no dispatcher; the pane menu is the only route',
-      'pane.navigate.left': 'no dispatcher for the `pane_navigate` family',
-      'pane.navigate.right': 'no dispatcher for the `pane_navigate` family',
-      'pane.navigate.up': 'no dispatcher for the `pane_navigate` family',
-      'pane.navigate.down': 'no dispatcher for the `pane_navigate` family',
-    }
-
     for (const { key, command } of rustDefaults()) {
-      if (Object.hasOwn(KNOWN_DEAD, command)) continue
       ok(
         dispatched.has(command),
         `${key} is bound to ${command} and something dispatches it ` +
           '(a bound key whose command nobody handles swallows the keystroke and does nothing)',
       )
-    }
-    // And the list cannot rot: wiring one of them without deleting its line here would leave
-    // a note claiming a gap that no longer exists.
-    for (const command of Object.keys(KNOWN_DEAD)) {
-      ok(!dispatched.has(command), `${command} is still undispatched — remove it from KNOWN_DEAD`)
     }
 
     /*
@@ -541,9 +534,12 @@ try {
      * `file.saveAll` has no default binding, so the loop over `rustDefaults()` never looks at
      * it — and removing its case leaves every other assertion in this file green. It is in
      * `cide_core::commands::registry()`, which is what the palette lists, so it is reachable
-     * and has to work. Named here because the palette is not otherwise checked at all: 23 of
-     * the 39 registry commands are undispatched today, and building that list is a job for
-     * whoever owns `App.tsx`.
+     * and has to work.
+     *
+     * It used to be the *only* palette-only command anyone had written down, next to a note
+     * that 23 of the 39 registry commands were undispatched and that building the list was
+     * somebody else's job. `check-commands.mjs` builds it now, from the registry itself, and
+     * fails on any gap; this line survives as the smoke test for that script's premise.
      */
     ok(dispatched.has('file.saveAll'), 'file.saveAll is dispatched (palette-only, no binding)')
   }

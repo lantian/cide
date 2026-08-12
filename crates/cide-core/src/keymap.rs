@@ -89,7 +89,10 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+alt+right", "pane.split.right"),
         ("ctrl+alt+down", "pane.split.down"),
         ("ctrl+shift+n", "claude.split.newSession"),
-        ("ctrl+shift+up", "pane.promoteToTab"),
+        // `ctrl+shift+up` was here for `pane.promoteToTab` and is deliberately gone: that
+        // command is `unavailable`, and a key bound to it is swallowed by the gate and does
+        // nothing — worse than an unbound key, which at least reaches whatever is underneath.
+        // `commands::nothing_binds_a_key_to_an_unavailable_command` keeps it gone.
         ("ctrl+shift+d", "pane.detachToWindow"),
         ("ctrl+shift+`", "terminal.splitBelow"),
         ("ctrl+p", "picker.files"),
@@ -97,6 +100,21 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+w", "tab.close"),
         ("ctrl+s", "file.save"),
         ("ctrl+shift+t", "theme.toggle"),
+        // Switching projects, asked for by name: "a hotkey with default CTRL+TAB to switch
+        // between opened projects".
+        //
+        // **Header order, not most-recently-used**, and that is a decision rather than a
+        // shortcut taken. Ctrl+Tab is MRU in editors that have it, but MRU is only usable
+        // with the hold-and-cycle machine behind it: you keep Ctrl down, tab through a
+        // popup, and the choice commits on *key up*. This gate resolves on keydown and has
+        // no key-up path at all, and MRU without the hold degenerates into a toggle between
+        // the two most recent projects — press it twice and you are back where you started,
+        // so a third project is unreachable by this key for ever. Header order is what the
+        // user can see on screen, it wraps, and it needs no stack that has to survive a
+        // project closing. If a hold-and-cycle overlay is ever built, MRU becomes the right
+        // answer and only `project.next`'s handler changes.
+        ("ctrl+tab", "project.next"),
+        ("ctrl+shift+tab", "project.prev"),
         ("ctrl+alt+h", "pane.navigate.left"),
         ("ctrl+alt+l", "pane.navigate.right"),
         ("ctrl+alt+k", "pane.navigate.up"),
@@ -123,6 +141,9 @@ fn platform_layer(macos: bool) -> Vec<Binding> {
     }
     let mut out = Vec::new();
     for binding in defaults() {
+        if keeps_ctrl_on_macos(&binding.key) {
+            continue;
+        }
         let Some(meta_key) = ctrl_to_meta(&binding.key) else {
             continue;
         };
@@ -143,6 +164,20 @@ fn platform_layer(macos: bool) -> Vec<Binding> {
         });
     }
     out
+}
+
+/// Chords that stay on `ctrl` even on macOS.
+///
+/// The blanket ctrl→meta rewrite is right for `⌘P`, `⌘S` and the rest, and wrong for exactly
+/// one thing: **Tab**. `⌘⇥` is the system application switcher — macOS consumes it before any
+/// app sees it — so rewriting `ctrl+tab` there would not move the binding, it would delete
+/// it, and Ctrl+Tab is what switches tabs on macOS in Safari, Chrome and VS Code anyway. This
+/// is the whole exception list; it is a function rather than a `const` array so the rule is
+/// stated where the reason is.
+fn keeps_ctrl_on_macos(key: &str) -> bool {
+    parse_chord(key)
+        .map(|chords| chords.iter().any(|chord| chord.key == "tab"))
+        .unwrap_or(false)
 }
 
 /// The same keystroke with `ctrl` moved to `meta`, or `None` when it uses no `ctrl` and so
@@ -571,7 +606,10 @@ mod tests {
             "pane.split.right",
             "pane.split.down",
             "claude.split.newSession",
-            "pane.promoteToTab",
+            // `pane.promoteToTab` was in this list and is not any more: the mock draws a
+            // shortcut for it, but the command is `unavailable` and binding a key to an
+            // unavailable command means the gate eats the keystroke and nothing happens.
+            // The binding comes back with the domain operation.
             "pane.detachToWindow",
             "terminal.splitBelow",
             "picker.files",
@@ -584,6 +622,8 @@ mod tests {
             "pane.navigate.up",
             "pane.navigate.down",
             "settings.open",
+            "project.next",
+            "project.prev",
         ] {
             assert!(
                 resolved.iter().any(|r| r.command == command),
@@ -790,6 +830,21 @@ mod tests {
             .find(|r| r.command == "picker.files")
             .expect("picker.files stays bound");
         assert_eq!(mac_binding.layer, KeymapLayer::Platform);
+    }
+
+    #[test]
+    fn the_macos_layer_leaves_ctrl_tab_alone() {
+        // `⌘⇥` is the system app switcher: macOS never delivers it, so rewriting this one
+        // would silently *remove* project switching on the platform rather than move it.
+        let resolved = resolve_layers(&platform_layer(true), &[]);
+        assert_eq!(command_for(&resolved, "ctrl+tab"), ["project.next"]);
+        assert_eq!(command_for(&resolved, "ctrl+shift+tab"), ["project.prev"]);
+        assert!(
+            command_for(&resolved, "meta+tab").is_empty(),
+            "nothing may be bound to the macOS application switcher"
+        );
+        // And the exception is narrow: everything else still moves to ⌘.
+        assert_eq!(command_for(&resolved, "meta+w"), ["tab.close"]);
     }
 
     #[test]

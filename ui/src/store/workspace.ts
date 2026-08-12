@@ -199,6 +199,16 @@ interface WorkspaceStore {
   /** Open a project and re-read the tree. */
   openProject: (paths: string[]) => Promise<void>
   /**
+   * Make a project the one this window shows.
+   *
+   * `project_activate` has existed since projects went multi-window, and every caller — the
+   * header tab's click, and now `project.next` / `project.prev` on Ctrl+Tab — had to spell
+   * `projectApi.activate(id).then(hydrate)` for itself. It belongs here with the other
+   * mutations for the same reason they do: the re-read is not optional, and a call site that
+   * forgets it leaves the window painting the old project until something else hydrates.
+   */
+  activateProject: (id: ProjectId) => Promise<void>
+  /**
    * Close a project. Confirms first when it holds unsaved edits or a session mid-turn.
    *
    * `force` is the answer coming back from that confirmation and is never passed by a call
@@ -313,6 +323,10 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   // replaces the re-read in a later milestone.
   openProject: async (paths) => {
     await projectApi.open(paths)
+    await get().hydrate()
+  },
+  activateProject: async (id) => {
+    await projectApi.activate(id)
     await get().hydrate()
   },
   closeProject: async (id, force = false) => {

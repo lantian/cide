@@ -19,11 +19,21 @@
  */
 import { useEffect, useRef } from 'react'
 import { installKeyGate } from './gate'
+import { mergeContext } from './context'
 import type { KeyBinding, KeyContext } from './keymap'
 
 export interface KeyGateWiring {
   /** `Bootstrap.keymap`. `ResolvedBinding` satisfies `KeyBinding`. */
   bindings: readonly KeyBinding[]
+  /**
+   * The flags only this component knows — an overlay being up, a menu being open.
+   *
+   * Everything derivable from the workspace mirror is merged over it by [`mergeContext`], so
+   * the host does not have to remember the whole vocabulary. It could not, in fact: the
+   * registry gated every git command on `repoOpen` and no host ever set it, so all four were
+   * unreachable by key *and* filtered out of the palette, with nothing reporting either. See
+   * `keys/context.ts` for which side owns which flag and why the mirror wins the overlap.
+   */
   context: KeyContext
   run: (command: string, args: unknown) => void
   /** For a status-bar readout while a chord prefix is armed. */
@@ -38,7 +48,9 @@ export function useKeyGate(wiring: KeyGateWiring): void {
     () =>
       installKeyGate({
         bindings: () => live.current.bindings,
-        context: () => live.current.context,
+        // Merged per keystroke, not per render: the gate asks at the moment the chord
+        // resolves, which is the only moment the answer has to be true.
+        context: () => mergeContext(live.current.context),
         run: (command, args) => live.current.run(command, args),
         onPending: (sequence) => live.current.onPending?.(sequence),
       }),

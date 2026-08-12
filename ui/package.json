@@ -7,6 +7,7 @@
     "build": "tsc --noEmit && vite build",
     "check:awaiting": "node scripts/check-awaiting.mjs",
     "check:close": "node scripts/check-close-confirm.mjs",
+    "check:commands": "node scripts/check-commands.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",
     "check:diff-render": "node scripts/check-diff-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",
