@@ -9,7 +9,7 @@
  *
  * Same shape as `check-status-format.mjs` and `check-picker.mjs`: no JS test runner in this
  * project, so the TypeScript already in `node_modules` compiles the modules and this file
- * imports the output. Ten things are pinned, in the order they appear below.
+ * imports the output. Eleven things are pinned, in the order they appear below.
  *
  *  1. **Line endings.** A round trip — capture, hand the text to CodeMirror, restore — is
  *     byte-identical for LF, CRLF, bare CR *and* mixed. This is the regression that already
@@ -45,6 +45,11 @@
  *     in `editor/` and painted in `chrome/`, over one slot that any number of split editors
  *     claim: that the newest holds it, that focus takes it back, that closing hands it down
  *     rather than blanking the bar, and that a released handle can no longer write to it.
+ * 11. **Arriving where a mention landed.** What *send lines to Claude* does after the send:
+ *     which tab has to be activated, whose maximize has to go, which window has to be raised
+ *     — and the two cases where the answer is "none of it, say so instead". Every branch is a
+ *     way for the user to be told nothing happened when something did, which is the report
+ *     this feature has now been filed under twice.
  *
  * The fifth found two more quadratics on its first run — the markdown link matcher and the
  * shell `${…}` matcher, both the same unbounded-scan-then-backtrack shape as the YAML key
@@ -116,6 +121,7 @@ try {
       'src/editor/minimapGeometry.ts',
       'src/editor/streamGrammar.ts',
       'src/editor/sendToClaude.ts',
+      'src/editor/revealTarget.ts',
       'src/editor/statusReadout.ts',
       '--outDir', out,
       '--rootDir', 'src',
@@ -157,6 +163,7 @@ try {
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
   const send = load('sendToClaude.js')
+  const revealPlan = load('revealTarget.js')
   const readout = load('statusReadout.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
@@ -1903,6 +1910,141 @@ try {
       !/\.path\s*\{[^}]*display:\s*flex/.test(barCss),
       'and stays a block box: `text-overflow: ellipsis` needs inline content, and a flex ' +
         'container drops the ellipsis silently',
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 11. Arriving where the mention landed
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * > *"send lines to Claude also should switch to console that added a selected text"*
+   *
+   * `useMentionTarget` falls back to the project's console — its first tab's Claude pane — so
+   * the destination is routinely a tab the user is not looking at. `planReveal` decides what
+   * stands between this window and that pane, and every branch of it is a case that ends with
+   * the user seeing nothing happen if it is decided wrongly. None of it is reachable from a
+   * screenshot: the interesting shapes are a background tab, a maximize hiding a laid-out
+   * pane, a pane torn out into a window of its own, and a pane that has closed.
+   *
+   * The wiring is a source assertion for the reason every other one in this file is: this
+   * project's most repeated defect is a module that passes its own tests while nothing calls
+   * it, and a planner nobody runs after a send is precisely the reported bug with a test
+   * suite attached.
+   */
+  {
+    const shell = (projects) => ({ kind: 'shell', projects })
+    const tabOf = (id, panes, focused, maximized = null) => ({
+      id,
+      tree: { focused, maximized, panes: Object.fromEntries(panes.map((p) => [p, {}])) },
+    })
+    const bootOf = (role, project) => ({ role, workspace: { projects: { p1: project } } })
+
+    // The shape the complaint is about: the console is tab `t0`, the user is in file tab `t1`.
+    const twoTabs = {
+      activeTab: 't1',
+      detached: {},
+      tabs: [tabOf('t0', ['console'], 'console'), tabOf('t1', ['editor'], 'editor')],
+    }
+
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1']), twoTabs), 'p1', 'console'),
+      { here: true, tab: 't0', activateTab: true, clearMaximize: false, focusPane: false, blocked: null },
+      'a console in a background tab is reached by activating its tab — the reported case',
+    )
+    // `focusPane` is false above because `t0`'s tree already names `console` as focused. That
+    // is not a detail: a redundant `pane_focus` is a round trip and a re-render of every pane
+    // in the tab, paid on a gesture the user makes repeatedly.
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1']), { ...twoTabs, activeTab: 't0' }), 'p1', 'console'),
+      { here: true, tab: 't0', activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
+      'a console already in front asks for nothing at all',
+    )
+
+    // A maximized sibling: the pane is mounted and laid out at full size — `TabContent` and
+    // `SplitTree` both keep it that way — and completely invisible. Nothing else in the plan
+    // would notice, so the user would be switched to a tab that still does not show the pane.
+    const maximized = {
+      activeTab: 't0',
+      detached: {},
+      tabs: [tabOf('t0', ['console', 'shell'], 'shell', 'shell')],
+    }
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1']), maximized), 'p1', 'console'),
+      { here: true, tab: 't0', activateTab: false, clearMaximize: true, focusPane: true, blocked: null },
+      'a pane hidden under another pane’s maximize has that maximize cleared',
+    )
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1']), maximized), 'p1', 'shell').clearMaximize,
+      false,
+      'and a pane that *is* the maximized one keeps it — that is already the view it wants',
+    )
+
+    // The two windows. `here` decides whether Rust is asked to raise anything, so getting it
+    // wrong is either a missing raise or a focus steal aimed at the window already in front.
+    const detached = {
+      activeTab: 't0',
+      detached: { torn: {} },
+      tabs: [tabOf('t0', ['console'], 'console')],
+    }
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1']), detached), 'p1', 'torn'),
+      { here: false, tab: null, activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
+      'a torn-out pane has no tab to activate: the raise is the whole of the reveal',
+    )
+    eq(
+      revealPlan.planReveal(bootOf({ kind: 'detachedPane', pane: 'torn' }, detached), 'p1', 'torn').here,
+      true,
+      'and its own window does not ask to raise itself',
+    )
+    eq(
+      revealPlan.planReveal(bootOf({ kind: 'detachedPane', pane: 'torn' }, detached), 'p1', 'console').here,
+      false,
+      'while an editor detached into its own window does have to raise the shell — the case ' +
+        'mentionTarget’s fallback makes ordinary',
+    )
+    eq(
+      revealPlan.planReveal(bootOf(shell(['other']), twoTabs), 'p1', 'console').here,
+      false,
+      'a shell that does not hold the project is not the window showing its console',
+    )
+
+    // The two "cannot be revealed at all" answers. Both are sentences rather than nulls,
+    // because the caller says them out loud — a mention in a prompt nobody can see is exactly
+    // as invisible as no mention at all.
+    for (const [what, plan] of [
+      ['a pane that has closed', revealPlan.planReveal(bootOf(shell(['p1']), twoTabs), 'p1', 'gone')],
+      ['a project that has closed', revealPlan.planReveal(bootOf(shell(['p1']), twoTabs), 'p9', 'console')],
+    ]) {
+      ok(typeof plan.blocked === 'string' && plan.blocked.length > 10, `${what} is refused in words`)
+      ok(!plan.activateTab && !plan.clearMaximize && !plan.focusPane && plan.tab === null,
+        `${what} asks for nothing to be moved`)
+    }
+
+    // --- and that the send actually runs it ------------------------------------------------
+    const hookSrc = readFileSync('src/editor/useSendToClaude.ts', 'utf8')
+    ok(
+      /void sending\.then\(/.test(hookSrc) && !/sending\.finally\(/.test(hookSrc),
+      'the reveal hangs off the send’s `then` — on `finally` a failed send would still switch ' +
+        'tabs, which is the one thing the brief rules out',
+    )
+    ok(/revealPane\(target\.project, target\.pane\)/.test(hookSrc), 'and it is the mention target that is revealed')
+    ok(
+      /view\.state\.doc !== doc/.test(hookSrc),
+      'guarded on the document, so a user who carried on typing does not have the keyboard ' +
+        'taken out from under them mid-word',
+    )
+
+    const revealSrc = readFileSync('src/editor/revealPane.ts', 'utf8')
+    ok(
+      revealSrc.indexOf('sendFocus.revealPane(') > revealSrc.indexOf('ws.focusPane('),
+      'the window is raised after the domain has moved, so it comes forward already showing ' +
+        'the right tab',
+    )
+    ok(
+      /scrollToBottom\(\)/.test(revealSrc),
+      'and the transcript is scrolled to the prompt — a pane the user had scrolled up in shows ' +
+        'the mention off screen below the fold',
     )
   }
 

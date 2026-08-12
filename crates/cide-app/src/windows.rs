@@ -307,6 +307,36 @@ pub fn reveal(app: &AppHandle, label: &str) {
     }
 }
 
+/// Bring a window that is already on screen to the front and give it the keyboard.
+///
+/// Not [`reveal`], and the difference is the `show()`. Making a window visible is first
+/// paint's job — `app_ready` calls `reveal` precisely once per window, and a window that has
+/// not painted has nothing worth bringing forward — so a second caller that shows windows
+/// could put an unpainted webview on screen, which is the blank frame `create` exists to
+/// avoid. Here the window is already up: it is behind another one, or minimized.
+///
+/// Best-effort, and every result is dropped on purpose. A compositor is entitled to refuse a
+/// focus steal — most Wayland compositors do, absent an activation token from the gesture
+/// that asked — and the caller has no better answer than the one it has already given: the
+/// right tab is in front, the right pane is focused, and the window is asking politely. A
+/// `Result` here would only offer callers a failure they cannot act on.
+pub fn raise(app: &AppHandle, label: &WindowLabel) {
+    let Some(window) = app.get_webview_window(label.as_str()) else {
+        // Not an error for the same reason `destroy` says it is not: the workspace is the
+        // record of what should exist, and a window it names that the desktop has lost is
+        // something for `reconcile` to clear up.
+        tracing::warn!(%label, "no window to raise");
+        return;
+    };
+    // Unminimize first. `set_focus` on a minimized window is a no-op on X11 and merely sets
+    // the urgency hint on some compositors, so a pane whose window the user had minimized
+    // would stay minimized and the reveal would be exactly the silent no-op it is fixing.
+    if window.is_minimized().unwrap_or(false) {
+        let _ = window.unminimize();
+    }
+    let _ = window.set_focus();
+}
+
 // --- "Awaiting: X" -----------------------------------------------------------------------
 
 /// Sessions that have finished processing and are waiting for the user.

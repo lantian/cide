@@ -311,6 +311,7 @@ pub fn run() {
             cmd::settings::app_open_log_dir,
             cmd::window::window_detach_pane,
             cmd::window::window_redock_pane,
+            cmd::window::window_reveal_pane,
             cmd::window::window_set_mode,
             cmd::window::window_close,
             cmd::window::window_list,
