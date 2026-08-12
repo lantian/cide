@@ -117,16 +117,69 @@ export const TERMINAL_SLOTS: readonly (readonly [slot: string, token: string])[]
   ['blue', '--blue'],
   ['magenta', '--purple'],
   ['cyan', '--cyan'],
-  ['white', '--text'],
-  ['brightBlack', '--faint'],
+  ['white', '--term-white'],
+  ['brightBlack', '--term-bright-black'],
   ['brightRed', '--red'],
   ['brightGreen', '--green'],
   ['brightYellow', '--yellow'],
   ['brightBlue', '--blue'],
   ['brightMagenta', '--purple'],
   ['brightCyan', '--cyan'],
-  ['brightWhite', '--text-hi'],
+  ['brightWhite', '--term-bright-white'],
 ]
+
+/**
+ * The four greyscale ANSI slots, darkest first. **This order is the same in both themes.**
+ *
+ * Colours 0, 8, 7 and 15 are the one part of the palette whose *ordering* is a contract rather
+ * than a taste: a program picks between them expecting 0 to be the darkest and 15 the lightest,
+ * and it picks 7 or 15 as a background expecting a light bar. That held in the dark theme and
+ * was inverted in the light one, where 7 was `--text` (#1b1b1f) and 15 `--text-hi` (#0a0a0c) —
+ * so 15 was *darker* than 7, and both were darker than 8.
+ *
+ * The theme picks the shades; it does not get to pick the order. `check-theme.mjs` walks this
+ * list and fails a palette whose luminance does not rise across it, which is the assertion the
+ * old mapping would have failed. Exported as slot names rather than tokens because the claim is
+ * about ANSI colour identity, and the tokens behind these slots are free to be renamed.
+ */
+export const TERMINAL_GREY_RAMP: readonly string[] = [
+  'black',
+  'brightBlack',
+  'white',
+  'brightWhite',
+]
+
+/**
+ * The contrast ratio below which a terminal cell counts as unreadable, wherever it is judged.
+ *
+ * Two things read this and they are two halves of one rule. `check-theme.mjs` asserts every ink
+ * slot clears it against the backgrounds *the palette itself paints* — `--panel` and `--sel` —
+ * which is a claim about design: a scheme that needed rescuing to be legible has designed
+ * nothing. `terminal/xterm.ts` hands the same number to xterm's `minimumContrastRatio`, which
+ * enforces it per cell against the background actually resolved there — which is a claim about
+ * the backgrounds the palette *cannot* see, the ones a program paints for itself.
+ *
+ * They have to be one constant. If the gate were stricter than the runtime floor the app would
+ * ship colours the gate rejected; if it were looser, the runtime would quietly repaint colours
+ * the gate had approved and the palette would stop being what is on screen. The gate's four
+ * exemptions are the one place the two disagree on purpose, and they disagree in that second
+ * direction: dark's colours 0 and 8 are approved below the floor because they are meant to be
+ * *fills*, and xterm repaints them wherever they are used as ink instead. `tokens.css` states
+ * the consequence and `check-theme.mjs` forbids an exemption that is not carrying its weight.
+ *
+ * **It must never be 1.** That is xterm's off switch — `_applyMinimumContrast` returns before it
+ * does anything (`DomRendererRowFactory.ts:481`, `TextureAtlas.ts:394`) — and it is also the
+ * floor no pair of colours can fall below, so the palette gate goes vacuous in the same edit.
+ * Changing this line to 1 deletes the whole of this behaviour and leaves every check green,
+ * which is why `check-theme.mjs` pins the value rather than only reading it.
+ *
+ * 3 rather than WCAG AA's 4.5 for the reason `check-theme.mjs` has always given: terminal
+ * colours are not body text, so the floor goes where "a human cannot see this at all" lives
+ * rather than where "comfortable" does. It is also what keeps a raised floor from flattening
+ * the palette — 4.5 would drag every deliberately quiet colour up to the same weight as the
+ * loud ones, which is the standard complaint about VS Code's default of 4.5.
+ */
+export const TERMINAL_MIN_CONTRAST = 3
 
 /** Every design token a terminal reads, deduplicated. What `tokens.css` must define. */
 export const TERMINAL_TOKENS: readonly string[] = [

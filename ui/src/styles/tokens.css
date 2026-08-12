@@ -126,15 +126,38 @@
    */
   --scrim: rgba(38, 24, 18, 0.28);
   /*
-   * ANSI black — colour 0 — is INK on a white terminal, not a background tint.
+   * The ANSI greyscale ramp — colours 0, 8, 7 and 15 — as four tokens of its own.
    *
-   * It used to point at `--panel-2`, which is the right answer in the dark theme (colour 0
-   * sits just under the background, which is the convention every dark scheme follows) and
-   * catastrophic in a white one: `--panel-2` is #f6f6f9 against a #ffffff terminal, 1.08:1,
-   * so anything a program printed in black was invisible. Claude Code draws box-drawing and
-   * dim rules in exactly that slot.
+   * Colour 0 came here first, on its own: it used to point at `--panel-2`, which is the right
+   * answer in the dark theme (colour 0 sits just under the background, as every dark scheme
+   * has it) and catastrophic in a white one — #f6f6f9 on a #ffffff terminal is 1.08:1, so
+   * anything a program printed in black was invisible.
+   *
+   * Colours 7 and 15 have now followed it out of the UI's ink tokens for the mirror-image
+   * reason. They were `--text` and `--text-hi`, so in this theme #1b1b1f and #0a0a0c: fine for
+   * a program that sets only a foreground, wrong for everything else, and wrong in a way no
+   * runtime contrast correction can reach. `ESC[47m` and `ESC[107m` ask for a **light bar** —
+   * a status line, a selected row, a table header — and got a near-black one, because a
+   * *background* is never contrast-corrected. The old mapping also put 15 darker than 7,
+   * inverting the one relation among these four that every program relies on.
+   *
+   * The shades are the ones light schemes conventionally pick rather than anything invented
+   * here — GitHub Light runs #24292f / #57606a / #6e7781 / #8c959f, VS Code Light+ #000000 /
+   * #666666 / #555555 / #a5a5a5. On `--panel` these are 18.16:1, 5.19:1, 4.56:1 and 3.12:1,
+   * so the ramp rises monotonically and colour 15 is the quietest thing a program can print
+   * and still be seen. That is what "white ink in a white terminal" has to mean; Solarized
+   * Light takes the other branch and makes 7 and 15 background tints, which is why every
+   * program that prints in them is invisible under it.
+   *
+   * The alternative that lost was leaving 7 and 15 near-black so a TUI written for a dark
+   * terminal stays comfortably readable here. That buys one case at the cost of every program
+   * using 7/15 as a background or as the light end of a two-tone ramp — and it is the one case
+   * already covered from the other side, by `minimumContrastRatio` in `terminal/xterm.ts`.
    */
   --term-black: #16151a;
+  --term-bright-black: #6c6c77;
+  --term-white: #75757f;
+  --term-bright-white: #91919d;
 }
 
 /* Transcribed verbatim from the design mock, and unchanged by the move to a light default. */
@@ -188,7 +211,30 @@
 
   /* Both keep the values that were hardcoded for this theme, so dark is unchanged. */
   --scrim: rgba(0, 0, 0, 0.42);
+  /*
+   * The same greyscale ramp, and every value is the one this theme already drew — colour 8 was
+   * `--faint`, 7 was `--text`, 15 was `--text-hi`. They are restated as literals rather than
+   * left pointing at those tokens because the two ramps are only *coincidentally* equal here:
+   * a dark UI's ink scale happens to run the same direction as the ANSI one, and a white UI's
+   * does not. `var(--text)` would also defeat `check-theme.mjs`, which resolves these to hex
+   * and cannot take a contrast ratio of a `var()`.
+   *
+   * 0 and 8 sit deliberately inside the background — 1.06:1 and 2.76:1 on `--panel` — because
+   * that is what makes colour 0 usable as a fill and colour 8 usable as "quiet" in a dark
+   * scheme. `check-theme.mjs` exempts exactly these two, in this theme only.
+   *
+   * The exemption is about their use as a **fill**, and only that. A background is never
+   * contrast-corrected, so these are the literal values an `ESC[40m` or `ESC[100m` block is
+   * painted with. As *ink* they are not what reaches the screen: `minimumContrastRatio` in
+   * `terminal/xterm.ts` draws a colour-0 foreground on this background as #636364 and a colour-8
+   * one as #6d6d76. So "dark is unchanged" is a claim about these values and about every
+   * background drawn from them — not about a program that prints *text* in 0 or 8, which was
+   * unreadable in this theme and deliberately is not any more.
+   */
   --term-black: #0e0e10;
+  --term-bright-black: #5c5c66;
+  --term-white: #d7d7dd;
+  --term-bright-white: #f2f2f5;
 }
 
 :root {
