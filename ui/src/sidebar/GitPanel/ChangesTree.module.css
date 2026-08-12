@@ -314,3 +314,147 @@
   color: var(--faint);
   font-size: 12px;
 }
+
+/*
+ * A directory inside a changelist.
+ *
+ * Mono, at the file rows' 12px, because it is a path and it lines up with the names below it —
+ * `.groupName` is 13px `--font-ui`, which is the *header* voice and would make a folder read as
+ * another changelist. `--dim` sits between the group headers and the `--faint` counters: a
+ * directory is structure, and the files under it are the content.
+ */
+.dirName {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * --- dragging rows between changelists ---------------------------------------------------
+ *
+ * Three states, and every one of them is a *token*: this panel is the same in both themes and
+ * the drop outline has to be legible on `--panel` (white) and on the dark `#151518` alike.
+ */
+
+/* While a drag is in flight the hover wash would follow the pointer alongside the drop
+   outline — two bands, two claims about what is happening. The row under the pointer is
+   already saying the true one. `user-select` because a drag across labels otherwise selects
+   the text it crosses and leaves it selected afterwards. */
+.tree[data-dragging] .row:hover {
+  background-image: none;
+}
+
+.tree[data-dragging] {
+  user-select: none;
+  cursor: grabbing;
+}
+
+/*
+ * What is in flight. Dimmed rather than hidden: a row that vanished under the pointer would
+ * reflow the tree mid-gesture and move the target the user is aiming at.
+ */
+.row[data-drag] {
+  opacity: 0.45;
+}
+
+/*
+ * The row under the pointer, and what it will do.
+ *
+ * An inset ring rather than a border, so nothing shifts by a pixel when the outline appears —
+ * the same reason `.rowCurrent` uses an inset shadow. `accept` is the accent (this app's one
+ * "yes"), `noop` is a neutral `--border` ring on the selection ground (the drop is allowed and
+ * changes nothing, which is not an error), and `refuse` is `--red` with the reason on the ghost.
+ */
+.row[data-drop='move'] {
+  background: var(--sel);
+  box-shadow:
+    inset 0 0 0 1px var(--accent),
+    inset 2px 0 0 var(--accent);
+}
+
+.row[data-drop='noop'] {
+  background: var(--sel);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+/*
+ * The rest of the target changelist, tinted.
+ *
+ * The header carries the ring, but in a 420px panel it is usually above the fold by the time
+ * the pointer is over the list's files — so the band says "this list" where the ring cannot be
+ * seen. A wash rather than a ground, for the same reason `.row:hover` is one: a group row has a
+ * colour of its own and an opaque tint would take it away. Nothing for a refused drop: there is
+ * no band to join.
+ */
+.row[data-drop-band='move'],
+.row[data-drop-band='noop'] {
+  background-image: linear-gradient(var(--chrome-hi), var(--chrome-hi));
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--sel) 40%, transparent),
+    color-mix(in srgb, var(--sel) 40%, transparent)
+  );
+}
+
+.row[data-drop='refuse'] {
+  box-shadow: inset 0 0 0 1px var(--red);
+  cursor: not-allowed;
+}
+
+/*
+ * The ghost: what is being carried, and the verdict, under the pointer.
+ *
+ * `position: fixed` because the tree scrolls under it — an absolutely positioned ghost would
+ * ride the scroll and drift off the pointer during an edge auto-scroll. `pointer-events: none`
+ * so it is never what `elementFromPoint` returns, which would make the drop target flicker
+ * between the row and the ghost as the pointer moved.
+ */
+.ghost {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--chrome);
+  box-shadow: var(--shadow);
+}
+
+.ghostLoad {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ghostHint {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.ghost[data-outcome='move'] {
+  border-color: var(--accent);
+}
+
+.ghost[data-outcome='move'] .ghostHint {
+  color: var(--accent);
+}
+
+/* Refused, in words. The colour alone would say "no" to everyone who can see it and nothing
+   at all to everyone who cannot; the sentence is the part that says *why*. */
+.ghost[data-outcome='refuse'] {
+  border-color: var(--red);
+}
+
+.ghost[data-outcome='refuse'] .ghostHint {
+  color: var(--red);
+  white-space: normal;
+}

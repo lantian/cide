@@ -174,6 +174,7 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
         {tab === 'commit' ? (
           <ChangesTree
             rows={git.rows}
+            view={git.view}
             selected={git.selected}
             expanded={git.expanded}
             partial={partial}
@@ -184,6 +185,10 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
             onToggleCheck={git.toggleCheck}
             onToggleExpand={git.toggleExpand}
             onOpenDiff={git.openDiff}
+            /* Drag and drop's only connection to git. The rules live in `dragDrop.ts` and the
+               gesture in `useChangesDrag.ts`; by the time this is called the target has been
+               named and the same-list paths dropped. */
+            onMovePaths={git.movePaths}
             onContextMenu={treeMenu?.onContextMenu}
             menu={treeMenu?.menu}
           />

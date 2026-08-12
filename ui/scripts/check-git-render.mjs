@@ -81,10 +81,13 @@ try {
       + 'shape produces exactly zero, which is what the empty-panel bug looked like',
   )
   eq(
-    byName.mock.rows.slice(0, 3),
-    ['L1:mixed', 'L2:true', 'L2:mixed'],
+    byName.mock.rows.slice(0, 5),
+    ['L1:mixed', 'L2:true', 'L3:true', 'L2:mixed', 'L3:mixed'],
     'Changes is partial because one of its two files is staged only in part: index and '
-      + 'worktree both dirty. The group must not claim a full tick',
+      + 'worktree both dirty. The group must not claim a full tick. Its two files are in two '
+      + 'directories, so each one now sits under a directory row of its own (L2) with the file '
+      + 'inside it (L3) — the row a drag onto another changelist grabs, and the partiality '
+      + 'climbs through it exactly as it climbs to the group',
   )
   eq(byName.mock.summary, '2 modified', "the mock's footer, verbatim")
   eq(byName.mock.guard, null, 'no guard bar unless the index actually moved')
@@ -114,10 +117,11 @@ try {
   )
   eq(byName.multi.rows[0], 'L1:mixed', 'the repo row is the new top level')
   eq(
-    byName.multi.rows.slice(15, 22),
-    ['L1:mixed', 'L2:true', 'L3:true', 'L2:mixed', 'L3:mixed', 'L4:true', 'L4:mixed'],
-    'the second root, its own changelist and file, then the submodule nested inside it with '
-      + 'its changelist and files — four levels deep, not one opaque row',
+    byName.multi.rows.slice(23, 31),
+    ['L1:mixed', 'L2:true', 'L3:true', 'L4:true', 'L2:mixed', 'L3:mixed', 'L4:true', 'L4:mixed'],
+    'the second root, its own changelist, the directory its one file is in and the file, then '
+      + 'the submodule nested inside it with its changelist and its two files — five levels '
+      + 'deep, not one opaque row',
   )
   eq(
     byName.multi.summary,

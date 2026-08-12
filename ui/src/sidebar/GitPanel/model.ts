@@ -41,7 +41,18 @@ import type {
 /** Tri-state. `partial` is the mock's `–` glyph and ARIA's `mixed`. */
 export type CheckState = 'checked' | 'partial' | 'unchecked'
 
-export type RowKind = 'repo' | 'group' | 'file'
+/**
+ * `dir` is a folder *inside one group of one repository*.
+ *
+ * A directory row exists so the tree has something to grab that means "everything under here"
+ * — the user asked to drag whole directories between changelists, and a flat list of full paths
+ * offers no such row. It is scoped to its group, never above it: the same `src/` that has files
+ * in two changelists is two rows, one per list. The alternative — one directory row per repo
+ * that gathers every changelist's files under that path — would let a drag move files the user
+ * cannot see from the row they grabbed, which is the exact surprise `actOn`'s count in the menu
+ * label exists to prevent.
+ */
+export type RowKind = 'repo' | 'group' | 'dir' | 'file'
 
 /** One 23px line in the tree. */
 export interface Row {
@@ -80,6 +91,14 @@ export interface Row {
   groupKind?: GroupKind
   /** File rows only. */
   entry?: ChangeEntry
+  /**
+   * Directory rows only: the repo-relative directory, e.g. `crates/cide-git/src`.
+   *
+   * The whole path rather than the last segment, because a compacted row (`ui/src/sidebar` on
+   * one line) is not reconstructible from `label` plus depth, and the drag ghost names what is
+   * being carried.
+   */
+  path?: string
   /**
    * File rows only: the changelist this file sits in, as *Rust* filed it
    * (`ChangeEntry::changelist`). Commit needs it — committing "the selection" without naming
@@ -146,6 +165,17 @@ export function groupRowId(repo: RepoId, group: string): string {
 /** The id of a file row, and the key under which it is selected. */
 export function fileRowId(repo: RepoId, path: string): string {
   return `${repo}${SEP}f${SEP}${path}`
+}
+
+/**
+ * The id of a directory row.
+ *
+ * The group is part of it because the row is: `src/` under `Changes` and `src/` under `fixes`
+ * are two different rows holding two different sets of files, and one id for both would make
+ * expanding one expand the other and — worse — make a drag from one carry the other's files.
+ */
+export function dirRowId(repo: RepoId, group: string, path: string): string {
+  return `${repo}${SEP}d${SEP}${group}${SEP}${path}`
 }
 
 /**
@@ -230,25 +260,163 @@ function walkRepo(
       files: group.entries.map((e) => fileRowId(repo.id, e.path)),
     })
     if (!expanded.has(id)) continue
-    for (const entry of group.entries) {
-      rows.push({
-        id: fileRowId(repo.id, entry.path),
-        kind: 'file',
-        depth: inner + 1,
-        label: entry.path,
-        repo: repo.id,
-        groupKind: group.kind,
-        entry,
-        changelist: entry.changelist,
-        expandable: false,
-        files: [fileRowId(repo.id, entry.path)],
-      })
-    }
+    walkDir(rows, repo.id, group, dirTree(group.entries), inner + 1, expanded)
   }
 
   // Submodules after the parent's own groups: they are separate repositories with their own
   // index, and burying the parent's changes under them would bury the common case.
   for (const child of repo.children) walkRepo(rows, child, inner, expanded)
+}
+
+/**
+ * One group's files, arranged by directory.
+ *
+ * Built per group and never cached: it is a fold over an array the caller already holds, and a
+ * cache keyed on a `readonly ChangeEntry[]` would have to be invalidated by identity — which
+ * this panel breaks on every refresh anyway, several times a second while an agent edits.
+ */
+interface DirNode {
+  /** Repo-relative directory, e.g. `crates/cide-git/src`. `''` for the group's own root. */
+  path: string
+  /** What the row shows: the last segment, or several joined when the chain was compacted. */
+  label: string
+  dirs: DirNode[]
+  files: ChangeEntry[]
+}
+
+function dirTree(entries: readonly ChangeEntry[]): DirNode {
+  const root: DirNode = { path: '', label: '', dirs: [], files: [] }
+  /*
+   * Prefix to node, for the whole build. The obvious `node.dirs.find(d => d.path === prefix)`
+   * is a linear scan of the siblings for *every segment of every path*, which is quadratic in
+   * the width of a directory — and `dirTree` runs three times per refresh per group (here,
+   * plus `defaultExpanded` and `allGroups` through `arrivals`) on a panel that refreshes
+   * several times a second while an agent edits. A `git status` with a few thousand changed
+   * files in one flat directory is where that shows up, and it shows up as the whole tree
+   * stuttering. Insertion order is unchanged: the map only answers "have I made this one".
+   */
+  const index = new Map<string, DirNode>()
+  for (const entry of entries) {
+    const parts = entry.path.split('/')
+    // The basename never becomes a directory, so a path with no slash lands straight in the
+    // root and the group looks exactly as it did before directories existed.
+    parts.pop()
+    let node = root
+    let prefix = ''
+    for (const part of parts) {
+      // A leading or doubled slash would otherwise mint a directory called `''`, which draws
+      // as a nameless row you can expand. Skipped rather than rejected: the file itself is
+      // real, and hiding it would understate what a commit is about to include.
+      if (part === '') continue
+      prefix = prefix === '' ? part : `${prefix}/${part}`
+      const found = index.get(prefix)
+      if (found === undefined) {
+        const made: DirNode = { path: prefix, label: part, dirs: [], files: [] }
+        node.dirs.push(made)
+        index.set(prefix, made)
+        node = made
+      } else {
+        node = found
+      }
+    }
+    node.files.push(entry)
+  }
+  compact(root)
+  return root
+}
+
+/**
+ * `crates/cide-git/src` is one row, not three.
+ *
+ * A chain of directories with one child and no files of its own carries no information per
+ * level — three rows and three twisties to reach one file, in a 420px panel where indentation
+ * is 14px a level. IDEA compacts the same way. The compacted row keeps the *deepest* path, so
+ * its id and the set of files under it are unchanged by the collapsing.
+ */
+function compact(node: DirNode): void {
+  node.dirs = node.dirs.map((dir) => {
+    let at = dir
+    while (at.files.length === 0 && at.dirs.length === 1) {
+      const only = at.dirs[0]
+      if (only === undefined) break
+      at = { path: only.path, label: `${at.label}/${only.label}`, dirs: only.dirs, files: only.files }
+    }
+    compact(at)
+    return at
+  })
+}
+
+/** Every file id at or below a node, in row order. */
+function dirFileIds(repo: RepoId, node: DirNode): string[] {
+  return [
+    ...node.dirs.flatMap((d) => dirFileIds(repo, d)),
+    ...node.files.map((e) => fileRowId(repo, e.path)),
+  ]
+}
+
+/**
+ * Emit one directory level: its subdirectories, then its own files.
+ *
+ * Directories first at every level, which is what every file manager and both other trees in
+ * this app do — a folder buried between two files is a folder nobody finds.
+ */
+function walkDir(
+  rows: Row[],
+  repo: RepoId,
+  group: GroupView,
+  node: DirNode,
+  depth: number,
+  expanded: ReadonlySet<string>,
+): void {
+  for (const dir of node.dirs) {
+    const id = dirRowId(repo, group.id, dir.path)
+    rows.push({
+      id,
+      kind: 'dir',
+      depth,
+      label: dir.label,
+      repo,
+      group: group.id,
+      groupKind: group.kind,
+      path: dir.path,
+      expandable: true,
+      // Read off the node, not off the rows below: a collapsed directory emits no file rows
+      // at all, and a rows-derived set would leave its checkbox unticked over ticked files and
+      // its drag carrying nothing. Same rule as the repo row's.
+      files: dirFileIds(repo, dir),
+    })
+    if (!expanded.has(id)) continue
+    walkDir(rows, repo, group, dir, depth + 1, expanded)
+  }
+  for (const entry of node.files) {
+    rows.push({
+      id: fileRowId(repo, entry.path),
+      kind: 'file',
+      depth,
+      // The basename alone: the directory is the row above, and repeating it on every leaf is
+      // what the flat tree did. `FileLabel` no longer draws a dimmed parent for the same reason.
+      label: splitPath(entry.path).name,
+      repo,
+      groupKind: group.kind,
+      entry,
+      changelist: entry.changelist,
+      expandable: false,
+      files: [fileRowId(repo, entry.path)],
+    })
+  }
+}
+
+/** Every directory row id in one group, whatever is collapsed. */
+function dirRowIdsOf(repo: RepoId, group: GroupView): string[] {
+  const out: string[] = []
+  const walk = (node: DirNode) => {
+    for (const dir of node.dirs) {
+      out.push(dirRowId(repo, group.id, dir.path))
+      walk(dir)
+    }
+  }
+  walk(dirTree(group.entries))
+  return out
 }
 
 function repoFileIds(repo: RepoView): string[] {
@@ -383,12 +551,15 @@ export function partialFiles(view: StatusView): Set<string> {
   return new Set(flatFiles(view).flatMap((e) => (isPartiallyStaged(e.entry) ? [e.id] : [])))
 }
 
-/** Every collapsible row id: the repo rows and every group. "Expand all". */
+/** Every collapsible row id: repo rows, groups, and every directory inside them. "Expand all". */
 export function allGroups(view: StatusView): Set<string> {
   const out = new Set<string>()
   const walk = (repo: RepoView) => {
     out.add(repoRowId(repo.id))
-    for (const group of repo.groups) out.add(groupRowId(repo.id, group.id))
+    for (const group of repo.groups) {
+      out.add(groupRowId(repo.id, group.id))
+      for (const id of dirRowIdsOf(repo.id, group)) out.add(id)
+    }
     for (const child of repo.children) walk(child)
   }
   for (const repo of view.repos) walk(repo)
@@ -474,13 +645,22 @@ export function arrivals(
   }
 }
 
-/** Groups that start open. Ignored files are noise until asked for, exactly as in IDEA. */
+/**
+ * Groups that start open. Ignored files are noise until asked for, exactly as in IDEA.
+ *
+ * Directories start open too, so the panel opens showing the same files it always did — one
+ * level further in, with the shared prefix hoisted onto a row of its own. A directory that
+ * started shut would hide changes behind a twisty on first paint, which is the one thing a
+ * commit tool window must never do.
+ */
 export function defaultExpanded(view: StatusView): Set<string> {
   const out = new Set<string>()
   const walk = (repo: RepoView) => {
     out.add(repoRowId(repo.id))
     for (const group of repo.groups) {
-      if (group.kind !== 'ignored') out.add(groupRowId(repo.id, group.id))
+      if (group.kind === 'ignored') continue
+      out.add(groupRowId(repo.id, group.id))
+      for (const id of dirRowIdsOf(repo.id, group)) out.add(id)
     }
     for (const child of repo.children) walk(child)
   }
@@ -656,33 +836,14 @@ export function groupOf(view: StatusView, repo: RepoId, group: string): GroupVie
   return repoOf(view, repo)?.groups.find((g) => g.id === group)
 }
 
-/**
- * Which files a menu gesture on `row` acts on.
- *
- * The right-clicked row alone, **unless** that row is itself ticked — then the ticks in the
- * same repository, which is the multi-file selection IDEA's *Move to another changelist*
- * operates on. There is no separate tree selection in this panel; the checkboxes are the only
- * multi-row gesture there is.
- *
- * Same repo only: a changelist lives in one repository's sidecar, so a move that swept in a
- * submodule's ticks would send paths to a `git_changelist_move_paths` that cannot file them.
- *
- * The caller is expected to put `count` in the menu label. That is the whole safeguard against
- * the surprise `useGitPanel::fileVerb` warns about — *Move 4 Files to Changelist…* is a
- * different sentence from *Move to Changelist…*, and the user reads it before clicking.
+/*
+ * `actOn` used to live here: "which files a menu gesture on this row acts on". It is now
+ * `dragDrop.ts::grab`, because a *drag* from a row has to answer exactly the same question and
+ * two functions answering it separately is how the menu and the pointer come to disagree about
+ * what the user is pointing at. The rule it carried is unchanged and still pinned by
+ * `check-git-tree.mjs`: the clicked row alone, unless that row is ticked, and then the ticks in
+ * the same repository and the same list kind.
  */
-export function actOn(
-  view: StatusView,
-  selected: ReadonlySet<string>,
-  row: Row,
-): { repo: RepoId; paths: string[] } {
-  const own = row.entry === undefined ? [] : [row.entry.path]
-  if (!selected.has(row.id)) return { repo: row.repo, paths: own }
-  const ticked = flatFiles(view).flatMap((f) =>
-    f.repo === row.repo && selected.has(f.id) && f.kind === row.groupKind ? [f.entry.path] : [],
-  )
-  return { repo: row.repo, paths: ticked.length > 0 ? ticked : own }
-}
 
 /**
  * The id of the changelist called `name` in `repo`, from a tree Rust just answered with.
