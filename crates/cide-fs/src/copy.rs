@@ -852,7 +852,7 @@ mod tests {
         let roots = roots_of(dir.path());
         std::fs::create_dir(dir.join("into")).unwrap();
         std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+        std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
 
         paste(

@@ -45,6 +45,7 @@ import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } fro
 import { useFileClipboard } from './fileClipboard'
 import {
   copyLabel,
+  escapeCancels,
   isCutPending,
   pasteLabel,
   pasteRefusal,
@@ -466,10 +467,24 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         e.preventDefault()
         return
       }
-      // Escape calls off a cut. Only when there is one to call off, so the key stays available
-      // to whatever else may want it — a cut that cannot be cancelled is a trap, and one that
-      // eats Escape for the rest of the app is a different trap.
-      if (e.key === 'Escape' && useFileClipboard.getState().clip !== null) {
+      /*
+       * Escape calls off a cut — a *cut*, and only one this panel is currently showing.
+       *
+       * The condition used to be `clip !== null`, which cancelled two things the user had no
+       * way to know were there. A **copy** is deliberately silent (`pendingNote` returns null
+       * for it and no row is dimmed), so Escape threw the clipboard away with nothing on
+       * screen having changed, and the next Ctrl+V answered "nothing has been copied yet" —
+       * indistinguishable from a Copy that never worked, which is the report this panel keeps
+       * getting. And a cut belonging to **another project** is announced in that project's
+       * panel, not this one: the strip is gated on `clip.project === project` and so are the
+       * faded rows, so Escape here was cancelling something drawn somewhere else.
+       *
+       * So: cancel exactly what this panel is drawing as pending. Anything else falls through,
+       * which also keeps Escape available to whoever wants it next — a cut that cannot be
+       * cancelled is a trap, and one that eats Escape for the rest of the app is a different
+       * trap.
+       */
+      if (e.key === 'Escape' && escapeCancels(useFileClipboard.getState().clip, project)) {
         useFileClipboard.getState().clear()
         e.preventDefault()
         return
@@ -519,7 +534,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       }
       e.preventDefault()
     },
-    [apply, count, cursor, draft, moveTo, renaming, roots, runPaste, takeClip],
+    [apply, count, cursor, draft, moveTo, project, renaming, roots, runPaste, takeClip],
   )
 
   /**

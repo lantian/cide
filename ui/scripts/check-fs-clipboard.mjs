@@ -9,9 +9,6 @@
  *
  *   * **where a paste lands** — a file row means its *parent*, exactly as *New File…* does,
  *     because two rules that agree today and are written twice disagree after the next change;
- *   * **the collision name**, which has a second copy in `cide_fs::copy::candidate_name`. The
- *     table below is asserted against the Rust source text as well as against this module, so
- *     the panel cannot promise `main copy.rs` while Rust writes something else;
  *   * **"into itself"** as component-wise containment, since the string version of it refuses
  *     a perfectly good paste into a sibling whose name shares a prefix (`src` / `srcx`);
  *   * **what is said afterwards**, whose whole design is that it says *nothing* unless the
@@ -23,7 +20,7 @@
  * Run: `pnpm --dir ui run check:fs-clipboard`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -177,6 +174,17 @@ try {
   ok(!m.isCutPending(clip('copy', ['/a/x.rs']), '/a/x.rs'), 'a copied row is not')
   ok(!m.isCutPending(null, '/a/x.rs'), 'and neither is any row with an empty clipboard')
 
+  // Escape cancels exactly what the two rules above draw, and nothing else.
+  ok(m.escapeCancels(clip('cut', ['/a/x.rs']), 'p1'),
+    'Escape calls off a cut in this project — the one thing the strip promises it can')
+  ok(!m.escapeCancels(clip('copy', ['/a/x.rs']), 'p1'),
+    'but NOT a copy: a copy is deliberately silent, so cancelling it changes nothing on screen '
+      + 'and the next Ctrl+V says "nothing has been copied yet" — which is what a Copy that '
+      + 'never worked looks like')
+  ok(!m.escapeCancels(clip('cut', ['/a/x.rs'], 'p2'), 'p1'),
+    'nor a cut made in another project, whose strip and faded rows are in the other panel')
+  ok(!m.escapeCancels(null, 'p1'), 'and an empty clipboard leaves Escape to whoever wants it')
+
   eq(m.clipboardText(['/a/x.rs', '/a/y.rs']), '/a/x.rs\n/a/y.rs',
     'Copy also puts the paths on the SYSTEM clipboard, one per line, so a copy in the tree '
       + 'is usable in a terminal pane — cide does not put file references there, and cannot')
@@ -214,49 +222,18 @@ try {
     'a renamed CUT does not call the result a copy — it is the file itself, moved',
   )
 
-  // ---- the collision name, against Rust --------------------------------------------------
-
-  const TABLE = [
-    ['main.rs', 0, false, 'main.rs'],
-    ['main.rs', 1, false, 'main copy.rs'],
-    ['main.rs', 2, false, 'main copy 2.rs'],
-    ['a.tar.gz', 1, false, 'a.tar copy.gz'],
-    ['.gitignore', 1, false, '.gitignore copy'],
-    ['Makefile', 1, false, 'Makefile copy'],
-    ['foo.bar', 1, true, 'foo.bar copy'],
-    ['src', 1, true, 'src copy'],
-  ]
-  for (const [name, attempt, directory, expected] of TABLE) {
-    eq(m.candidateName(name, attempt, directory), expected,
-      `candidateName(${JSON.stringify(name)}, ${attempt}, ${directory})`)
-  }
-
   /*
-   * The same table, asserted against the Rust test that pins the other copy.
+   * The collision NAME is not checked here, and that is deliberate.
    *
-   * Two implementations of one rule is a deliberate choice — this one tells the user what the
-   * copy will be called while they can still change their mind, and `cide_fs::copy` is the one
-   * that atomically claims the name against a directory that can gain it in between. What is
-   * not deliberate is them drifting, and nothing else would catch it: the panel would promise
-   * `main copy.rs`, Rust would write something else, and every test on both sides would pass.
-   *
-   * Whitespace *between tokens* is stripped from both sides, so rustfmt wrapping an assertion
-   * across lines cannot fail this — but whitespace *inside a string literal* is kept, because
-   * the space in `main copy.rs` is the very thing being pinned.
+   * There used to be a `candidateName` in `clipboardModel.ts` — a second implementation of
+   * `cide_fs::copy::candidate_name`, pinned row by row against the Rust source text by this
+   * script. Nothing in the app ever called it. The panel cannot honestly predict `main copy.rs`
+   * anyway: only Rust knows the destination's siblings, the folder may be collapsed, and the
+   * name can be taken between the menu opening and the paste. What the user is told is the name
+   * that actually landed (`PastedEntry.dest`, read by `pastedSummary` above), so the rule has
+   * one implementation and `cide_fs::copy`'s own test
+   * `a_collision_becomes_a_copy_rather_than_an_overwrite_or_a_refusal` pins the whole table.
    */
-  const squash = (source) =>
-    source
-      .split(/("(?:[^"\\]|\\.)*")/)
-      .map((part, i) => (i % 2 === 1 ? part : part.replace(/\s+/g, '')))
-      .join('')
-
-  const rust = squash(readFileSync('../crates/cide-fs/src/copy.rs', 'utf8'))
-  for (const [name, attempt, directory, expected] of TABLE) {
-    const needle = squash(`candidate_name("${name}", ${attempt}, ${directory}), "${expected}"`)
-    ok(rust.includes(needle),
-      `the Rust side pins the same case: candidate_name(${JSON.stringify(name)}, ${attempt}, `
-        + `${directory}) == ${JSON.stringify(expected)}`)
-  }
 
   // ---- reporting what Rust refused -------------------------------------------------------
 

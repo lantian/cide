@@ -7,9 +7,16 @@
  *
  * `cide_fs::copy` is the other half. It owns what happens on disk — the collision rename, the
  * recursion, the refusals — and this owns what the user is told *before* they commit to it.
- * The two overlap on purpose in exactly two places, both pinned by tests on both sides:
- * `candidateName` (so the menu can say what the copy will be called) and `isInside` (so the
- * "into itself" refusal is a greyed menu item rather than a rejected command).
+ * The two overlap on purpose in exactly one place: [`isInside`], so the "into itself" refusal
+ * is a greyed menu item with a reason on it rather than a rejected command.
+ *
+ * The collision *name* is deliberately NOT duplicated here. A second `candidateName` lived in
+ * this file, pinned against the Rust source by the check script, and nothing ever called it:
+ * the panel cannot predict `main copy.rs` honestly anyway, because the destination's siblings
+ * are only known to Rust — the folder may be collapsed, or gain the name between the menu
+ * opening and the paste. What the user is told is the name that actually landed, which comes
+ * back in `PastedEntry.dest` and is read by [`pastedSummary`]. `cide_fs::copy` owns the rule
+ * and its own test pins the table.
  *
  * # What is on which clipboard
  *
@@ -162,6 +169,24 @@ export function isCutPending(clip: FileClip | null, path: string): boolean {
   return clip !== null && clip.mode === 'cut' && clip.paths.includes(path)
 }
 
+/**
+ * Does Escape in this project's tree call the clipboard off?
+ *
+ * **Only what this panel is visibly holding**, which is the same condition [`pendingNote`] and
+ * [`isCutPending`] draw: a cut, in this project. The obvious version — "there is a clipboard,
+ * clear it" — cancels two things the user cannot see. A *copy* is deliberately silent, so
+ * Escape after Ctrl+C would throw it away with nothing on screen changing and the next Ctrl+V
+ * answering "nothing has been copied yet", which is indistinguishable from a Copy that never
+ * worked. And a cut made in *another* project is announced in that project's panel, so
+ * cancelling it from this one is a change with no visible cause anywhere.
+ *
+ * A rule and not an inline condition because it has to agree with those two functions forever:
+ * Escape must cancel what the strip promises it cancels, and nothing else.
+ */
+export function escapeCancels(clip: FileClip | null, project: string | null): boolean {
+  return clip !== null && clip.mode === 'cut' && clip.project === project
+}
+
 /** What Copy puts on the *system* clipboard: one absolute path per line. */
 export function clipboardText(paths: readonly string[]): string {
   return paths.join('\n')
@@ -218,23 +243,4 @@ export function pastedSummary(entries: readonly PasteOutcome[], mode: ClipMode):
   }
 
   return parts.length === 0 ? null : parts.join(' ')
-}
-
-/**
- * The name a copy will take when `name` is already used — the frontend's copy of
- * `cide_fs::copy::candidate_name`.
- *
- * Two copies of one rule, for the reason `checkName` is two copies of one rule: this one tells
- * the user what is about to happen while they can still change their mind, and that one is
- * what actually claims the name — atomically, in a loop, against a directory that can gain the
- * name between the two. They are pinned to the same table on both sides.
- */
-export function candidateName(name: string, attempt: number, directory: boolean): string {
-  if (attempt === 0) return name
-  const suffix = attempt === 1 ? ' copy' : ` copy ${attempt}`
-  const dot = directory ? -1 : name.lastIndexOf('.')
-  // `> 0`, not `>= 0`: a leading dot is the whole name of a dot-file, not an extension, so
-  // `.gitignore` copies to `.gitignore copy` rather than to ` copy.gitignore`.
-  if (dot > 0) return `${name.slice(0, dot)}${suffix}${name.slice(dot)}`
-  return `${name}${suffix}`
 }
