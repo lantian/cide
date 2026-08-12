@@ -361,6 +361,45 @@ try {
     'the detached window no longer `display: none`s the cluster — that is its close button',
   )
 
+  // --- the floating cluster's reserve is a measurement, not a guess ---------------------
+  //
+  // `--pane-corner` is what three other stylesheets pad by so their own right-aligned
+  // controls are not covered by the cluster, and it went stale the moment the index and the
+  // title were removed from it: 126px of reserve for 115px of controls. `min-width` holds the
+  // box open and `flex-end` pushes the buttons to its right edge, so the slack showed up as
+  // the margin the user reported.
+  //
+  // Derived from the parts rather than restated, so the next control added to the cluster
+  // fails here instead of quietly widening the gap again.
+  const px = (re) => Number(re.exec(paneCss)?.[1] ?? NaN)
+  const reserve = px(/--pane-corner:\s*(\d+)px/)
+  const button = px(/\.control \{[\s\S]*?width:\s*(\d+)px/)
+  const marker = px(/\.marker \{[\s\S]*?width:\s*(\d+)px/)
+  const markerMargin = /\.marker \{[\s\S]*?margin:\s*0 (\d+)px 0 (\d+)px/.exec(paneCss)
+  const gap = px(/\.actions \{[\s\S]*?gap:\s*(\d+)px/)
+  const pad = /\.cluster \{[\s\S]*?padding:\s*0 (\d+)px 0 (\d+)px/.exec(paneCss)
+  ok(
+    Number.isFinite(reserve) && Number.isFinite(button) && markerMargin !== null && pad !== null,
+    'the cluster still declares a reserve, a control size, a marker and its padding',
+  )
+  if (markerMargin && pad) {
+    const want =
+      Number(pad[1]) + Number(pad[2]) +
+      marker + Number(markerMargin[1]) + Number(markerMargin[2]) +
+      button * 4 + gap * 3
+    eq(reserve, want, '`--pane-corner` equals the controls it reserves for')
+  }
+
+  // And an editor insets it, because a 96px minimap lives where the cluster would land.
+  ok(
+    /\.frame\[data-kind='editor'\]\s*\{[^}]*--pane-cluster-inset:\s*var\(--w-minimap\)/.test(paneCss),
+    "an editor pane insets the cluster by the minimap's width",
+  )
+  ok(
+    /data-kind=\{pane\.kind\}/.test(readFileSync('src/layout/PaneTitleBar.tsx', 'utf8')),
+    'the frame publishes the pane kind, without which that inset selects nothing',
+  )
+
   if (failed === 0) console.log('rows layout: ok')
   else console.error(`\n${failed} failure(s)`)
 } finally {

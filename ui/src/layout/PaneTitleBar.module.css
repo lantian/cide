@@ -13,6 +13,11 @@
  * take two pixels out of its *content* box instead — the pane body would change size on
  * every focus change, and every terminal in the tab would refit for a click.
  */
+/* An editor keeps a 96px minimap on its right edge; nothing else in a pane does. */
+.frame[data-kind='editor'] {
+  --pane-cluster-inset: var(--w-minimap);
+}
+
 .frame {
   display: flex;
   flex-direction: column;
@@ -42,13 +47,16 @@
    * `calc(<their own pad> + var(--pane-corner, 0px))`. `check:rows` pins that they keep doing
    * it, because the failure is silent: the control is drawn, it just cannot be clicked.
    *
-   * The measurement is the interactive part only: 4px of padding, the awaiting marker and
-   * its margins, and the four 22px controls with their gaps. The index and the title extend
-   * further left than this and are deliberately excluded — they are inert text and may
-   * overlay inert text (a diff's path clips itself with an ellipsis) without either being
-   * lost.
+   * The cluster is controls only now, so this is the whole of it and not a part: 2+2px of
+   * padding, the awaiting marker (7px in 10px of margin), four 22px controls, three 2px gaps.
+   * 4 + 17 + 88 + 6 = 115.
+   *
+   * It was 126 while an index and a title lived here too — and the user's report was that the
+   * buttons sat away from the corner. That reserve *was* the margin: `min-width` held the box
+   * open and `flex-end` pushed the controls to its right edge, so the slack showed up as space
+   * nobody had asked for.
    */
-  --pane-corner: 126px;
+  --pane-corner: 115px;
 }
 
 /*
@@ -117,18 +125,30 @@
 .cluster {
   position: absolute;
   top: 0;
-  right: 0;
+  /*
+   * Clear of whatever the pane keeps down its right edge.
+   *
+   * An editor's minimap is 96px of *content* on that edge, and the cluster was floating over
+   * the top of it — reported as the block overflowing the file preview. The frame publishes
+   * the kind, so the inset is a property of the pane rather than something every pane body has
+   * to work around; a terminal keeps 0 because a terminal has nothing there.
+   */
+  right: var(--pane-cluster-inset, 0px);
   z-index: 2;
   display: flex;
   align-items: center;
   height: var(--h-panetitle);
   /*
-   * The right inset is not decoration. `SplitTree`'s splitter widens its hit area with a
-   * `::before` that reaches 3px into the pane beside it and paints above these controls, so
-   * a button flush with the frame's right edge would lose its outermost pixels to a
-   * col-resize target.
+   * Asymmetric, and the right side is the one that was reported: *"in terminal and claude
+   * panels it must be more right placed, not there is some strange margin"*.
+   *
+   * 2px rather than flush. `SplitTree`'s splitter widens its hit area with a `::before` that
+   * reaches 3px into the pane beside it and paints above these controls, so flush would put
+   * the close button's outer edge under a col-resize target — a click that resizes instead of
+   * closing. 2px keeps 20 of the button's 22 clickable columns clear of it, which is the trade
+   * the report asked for: visibly in the corner, and still a button rather than a divider.
    */
-  padding: 0 4px;
+  padding: 0 2px 0 2px;
   /*
    * `min-width` is what makes `--pane-corner` a measurement rather than a claim: the box is
    * that wide whatever is in it, so the number a diff header pads by is the number this
@@ -263,25 +283,8 @@
   }
 }
 
-.index {
-  flex: none;
-  color: var(--faint);
-  padding: 0 4px 0 2px;
-}
 
-.title {
-  flex: 0 1 auto;
-  min-width: 0;
-  padding-right: 6px;
-  color: var(--dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
-.titleFocused {
-  color: var(--text-hi);
-}
 
 /*
  * "This session has finished and is waiting for you."

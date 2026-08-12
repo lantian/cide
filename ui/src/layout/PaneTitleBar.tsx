@@ -421,6 +421,10 @@ export function PaneFrame({
     <div
       className={focused ? `${styles.frame} ${styles.frameFocused}` : styles.frame}
       data-audit="pane"
+      // Which kind this is, so the cluster can clear whatever the pane keeps down its right
+      // edge — an editor's 96px minimap, today the only one. A CSS hook rather than a prop:
+      // the inset belongs to the frame, and a pane body cannot reach its own frame.
+      data-kind={pane.kind}
       data-pane-id={pane.id}
       data-focused={focused ? 'true' : 'false'}
       /*
@@ -472,23 +476,20 @@ export function PaneFrame({
         }}
       >
         <span className={revealed}>
-          {!detachedWindow && (
-            <>
-              {/*
-               * The index is presentation, computed depth-first by the caller at render time
-               * rather than stored: storing it would mean renumbering every sibling on each
-               * split and close, and the number exists so "focus pane 3" has something to
-               * refer to. Nothing dispatches by it — `pane.navigate.{left,right,up,down}` is
-               * the whole of the keyboard's pane addressing — which is why it can live behind
-               * the reveal rather than costing a permanent mark on the transcript.
-               */}
-              <span className={styles.index}>{index}</span>
-              <span className={focused ? `${styles.title} ${styles.titleFocused}` : styles.title}>
-                {pane.title}
-              </span>
-            </>
-          )}
-
+          {/*
+             * No index and no title here any more.
+             *
+             * They were moved into this cluster when the 26px bar was deleted, and the answer
+             * was "no need to keep file name there - remove it". The cluster is a set of
+             * *controls*; a name in it is a caption on a toolbar, drawn over the user's code.
+             *
+             * It was also the margin. `--pane-corner` reserved 126px to hold them, `min-width`
+             * keeps the box that wide and `flex-end` pushes the buttons to its right edge — so
+             * the slack showed up as space between the controls and the corner.
+             *
+             * Neither is lost: the frame is `aria-label="Pane 3: cide : claude"`, the context
+             * menu's accessible name says the same, and the tab strip names the file.
+             */}
           <span className={detachedWindow ? styles.controls : styles.actions}>
             {detachedWindow ? (
               /*
