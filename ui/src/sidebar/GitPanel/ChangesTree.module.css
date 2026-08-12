@@ -132,12 +132,27 @@
 /*
  * The box's hit target, padded out to a comfortable size without changing the 12px the
  * mock draws. Negative margins keep the extra padding from shifting the name.
+ *
+ * `-6px` at the bottom against `-5px` at the top, and the asymmetry is the whole point: it is
+ * the same odd-against-even parity the file icon was resized for, applied to the one box in
+ * this row that still had it. `align-items: center` centres a flex item's *margin* box, and
+ * with `-5px` on both sides that box was `22 − 5 − 5 = 12` — even, in a 23px row, so it landed
+ * at `(23 − 12) / 2 = 5.5` and the 12px checkbox with it. Every tick in the git panel was
+ * therefore drawn on a half-pixel grid, which did not matter much while the mark was a glyph
+ * (type is antialiased anyway) and matters now that it is a 2px bar and a 1.5px stroke with
+ * a 1px border around them: a hard edge on a half pixel is a two-pixel smear.
+ *
+ * Making the margin box *odd* is what fixes it — `22 − 5 − 6 = 11`, so `(23 − 11) / 2 = 6` and
+ * the box sits at 6, whole. The alternative that lost was `position: relative; top: -0.5px`:
+ * it moves the same distance but leaves a fractional length in the file for the next person to
+ * "tidy up", and it needs a containing block this row does not otherwise want. The hit target
+ * is unchanged in size — 5px of slop above the box and 5px below it, as before.
  */
 .checkHit {
   display: grid;
   place-items: center;
   padding: 5px 4px;
-  margin: -5px -4px;
+  margin: -5px -4px -6px;
   cursor: pointer;
   flex: none;
 }
@@ -164,9 +179,16 @@
    repository with its own index and its own changelists, so it is drawn as a nested repo row
    rather than as a coloured group inside its parent's `Changes`. See `types.ts::RepoView`. */
 
-/* Counters are mono, per the type rules. Right-aligned, as the mock has them. 12px, the one
-   mono size this panel now uses — the count and the file names are the same column of type
-   read down the list, and 11px against 12px made it look like two. */
+/*
+ * Counters are mono, per the type rules. Right-aligned, as the mock has them.
+ *
+ * 12px, matching `.fileName` — but NOT because the two sit on one line, which they never do:
+ * a count is only ever rendered by `GroupLabel`, so its neighbour is a 13px `--font-ui`
+ * `.groupName` and never a filename. The reason is the column read *down* the list. A group
+ * row and the file rows under it are one list, and the only mono figures in it were a size
+ * nothing else used. Two mono sizes 1px apart in one panel read as a mistake rather than as a
+ * hierarchy; the hierarchy is already carried by `--faint` against `--text`.
+ */
 .count {
   margin-left: auto;
   padding-left: 8px;
@@ -182,8 +204,8 @@
  * It was `flex: none`, which meant a name longer than what was left of the 420px row could not
  * give way: `.tree` sets `overflow-x: hidden`, so the name was cut mid-glyph at the panel edge
  * with no ellipsis to say it had been. `flex-shrink: 1` plus `min-width: 0` lets it ellipsize,
- * and the `flex-shrink: 100` on `.dir` below keeps the stated order — the directory still
- * collapses to nothing before the name loses its first character.
+ * and the `flex-shrink: 100` on `.dir` below makes the directory give way first — see the
+ * note there for how much "first" is actually worth.
  */
 .fileName {
   font-family: var(--font-mono);
@@ -241,6 +263,15 @@
  * in proportion and the name would start losing characters while there was still a path beside
  * it to throw away.
  *
+ * "First" is a strong bias, not a guarantee, and the difference is worth writing down because
+ * the obvious reading of `100` is wrong. Flexbox distributes the overflow in proportion to
+ * `shrink × base width`, so a 200px path beside a 300px name absorbs `100×200 / (100×200 +
+ * 1×300)` — 98.5% of it, which is the intent. A *short* path does not: 20px of directory
+ * beside a 300px name takes only `2000 / 2300` = 87%, so the name loses a character or two
+ * before the path is gone. There is no flex value that makes the order strict — `flex-shrink:
+ * 0` on the name would, and it is what this replaced, because it is exactly the rule that cut
+ * the name off at the panel edge with no ellipsis.
+ *
  * 12px, up from 11px, so it is the *same* size as the file name it sits 6px from. A flex row
  * centres each child's box, so a child's baseline lands at `rowHeight / 2 + 0.36 × fontSize`
  * for JetBrains Mono — 11px and 12px put the path a third of a pixel above the name it belongs
@@ -256,6 +287,15 @@
   text-overflow: ellipsis;
 }
 
+/*
+ * `13px` leading rather than the `14px` it had, for the parity reason above and not for the
+ * type: this is a bordered box, so its height is `line-height + 2` and `14` made that 16 —
+ * even, in a 23px row, centred at `(23 − 16) / 2 = 3.5`. A 1px border on a half pixel is the
+ * one thing in this row that cannot be antialiased away, because both of its edges are
+ * horizontal. 13 makes the box 15 and the offset `(23 − 15) / 2 = 4`.
+ *
+ * 9.5px of JetBrains Mono needs 12.54px of ascent-plus-descent, so 13 still clears the type.
+ */
 .partialTag {
   flex: none;
   margin-left: 6px;
@@ -264,7 +304,7 @@
   border-radius: 3px;
   font-family: var(--font-mono);
   font-size: 9.5px;
-  line-height: 14px;
+  line-height: 13px;
   color: var(--accent);
 }
 

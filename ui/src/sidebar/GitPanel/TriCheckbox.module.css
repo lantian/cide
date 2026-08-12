@@ -37,7 +37,18 @@
 /*
  * The tick: two borders of an empty box, rotated 45°, which is the shape a real check mark
  * has — a short arm and a long one meeting at a point. 3×6 inside a 10px content area, offset
- * up by a pixel because a rotated glyph's optical centre sits below its geometric one.
+ * up by a pixel because the mark's optical centre sits below its geometric one — the long arm
+ * carries the weight and it hangs down.
+ *
+ * The `1.5px` stroke is the one fractional length in this file and it is deliberate: the arms
+ * are at 45°, so every edge on them is antialiased whatever the number is, and a 1px stroke
+ * inside a 12px box reads as a scratch. It is `border-width` on a border-box element, so the
+ * arms are 1.5px thick and the whole mark is 3×6 — the numbers above are the drawn extent,
+ * not a content box plus borders.
+ *
+ * Both marks land on whole pixels because `ChangesTree.module.css` puts the 12px box at y=6 in
+ * its 23px row; the bar below is `(10 − 2) / 2 = 4` inside it. That was not true before — see
+ * the `.checkHit` note there for why a margin is odd.
  */
 .box[data-state='checked']::after {
   content: '';

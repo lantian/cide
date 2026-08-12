@@ -69,9 +69,13 @@ export function FileIcon({ row, theme, className }: FileIconProps) {
        */
       alt=""
       aria-hidden="true"
-      /* Intrinsic size, so the row does not reflow between the layout pass and the decode. */
-      width={16}
-      height={16}
+      /* Intrinsic size, so the row does not reflow between the layout pass and the decode.
+         It has to be the number `FileIcon.module.css` sets, and it was left at 16 when that
+         moved to 15 — harmless while the stylesheet is there, since a CSS `width` beats a
+         presentational attribute, and a 1px reflow of every row in the tree on the one pass
+         where it is not. Kept in step by hand: an `<img>` cannot read a CSS module. */
+      width={15}
+      height={15}
       /* A file tree row drags as a row, if it ever drags; the icon must not drag as a picture. */
       draggable={false}
     />

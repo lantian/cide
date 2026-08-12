@@ -226,20 +226,27 @@
 
 /* 5×7 and 7×5 against a 21px row and an 11px box, all odd, so every centring offset is a
    whole pixel. `clip-path` over a colour block rather than a border triangle, whose apex at
-   this height would need a fractional border on each side. */
-[aria-expanded='false'] > .twisty::before,
-[aria-expanded='true'] > .twisty::before {
+   this height would need a fractional border on each side.
+
+   `:not(:empty)` matches the file tree's and the git tree's rules character for character,
+   and it is inert *today*: `SearchPanel.tsx` fills this span on every `.fileRow` and every
+   `.fileRow` is expandable, so there is no empty one to guard. It is here so the three trees
+   answer "does this row disclose anything?" the same way. Without it, the first file heading
+   that renders an empty twisty — a hit list of one, say — grows an arrow that folds nothing,
+   and it grows it in this panel only, which is the hardest kind of divergence to find. */
+[aria-expanded='false'] > .twisty:not(:empty)::before,
+[aria-expanded='true'] > .twisty:not(:empty)::before {
   content: '';
   background: currentColor;
 }
 
-[aria-expanded='false'] > .twisty::before {
+[aria-expanded='false'] > .twisty:not(:empty)::before {
   width: 5px;
   height: 7px;
   clip-path: polygon(0 0, 0 100%, 100% 50%);
 }
 
-[aria-expanded='true'] > .twisty::before {
+[aria-expanded='true'] > .twisty:not(:empty)::before {
   width: 7px;
   height: 5px;
   clip-path: polygon(0 0, 100% 0, 50% 100%);
