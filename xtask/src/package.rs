@@ -212,6 +212,11 @@ pub struct AppInfo {
     /// `bundle.externalBin` from `TAURI_CONF`. Must stay empty: `tauri-build` acts on it on
     /// every cargo invocation, so anything here breaks `cargo build --workspace`.
     pub base_external_bin: Vec<String>,
+    /// `bundle.linux.appimage.files` from `TAURI_BUNDLE_CONF`, as AppDir path -> source path.
+    ///
+    /// AppImage-only on purpose. A `.deb` depends on the distribution's own `webkit2gtk`
+    /// package and must not carry a second copy of its helper processes.
+    pub appimage_files: Vec<(String, String)>,
 }
 
 impl AppInfo {
@@ -320,6 +325,17 @@ pub struct Step {
     /// Environment to add, as `(name, value)`. Values that are paths are absolute, because
     /// the process that reads them is several layers below this one and has its own cwd.
     env: Vec<(String, String)>,
+    /// Skip, with a printed reason, when [`Self::program`] is not on `PATH`.
+    ///
+    /// For the steps whose tool is genuinely optional — today that is Flatpak, which the
+    /// preflight already reports as a *warning* rather than a failure because the manifest is
+    /// checked in and worth validating on a machine that cannot build it.
+    ///
+    /// It was a warning and then the run tried anyway, and `Command::status` on a missing
+    /// program is `No such file or directory (os error 2)` — a message that names neither the
+    /// tool nor the fact that everything before it succeeded. A user whose AppImage and .deb
+    /// had both been produced was told the run had failed.
+    optional: bool,
 }
 
 impl Step {
@@ -345,6 +361,24 @@ impl Step {
     }
 
     fn execute(&self, root: &Path) -> Result<()> {
+        // Resolved before it is run, so a missing tool is named rather than reported as
+        // `No such file or directory (os error 2)` — which is what `Command::status` gives for
+        // a program that does not exist, and which reads as a missing *file in the command*.
+        if which(&self.program).is_none() {
+            if self.optional {
+                println!(
+                    "\n· skipped: {} — `{}` is not on PATH",
+                    self.display(),
+                    self.program
+                );
+                return Ok(());
+            }
+            bail!(
+                "`{}` is not on PATH, so this step cannot run: {}",
+                self.program,
+                self.display()
+            );
+        }
         println!("\n$ {}", self.display());
         let status = Command::new(&self.program)
             .args(&self.args)
@@ -401,6 +435,7 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
             ],
             cwd: APP_CRATE.into(),
             env,
+            optional: false,
         });
     }
 
@@ -422,6 +457,11 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
             ],
             cwd: ".".into(),
             env: Vec::new(),
+            // The one optional tool. `flatpak-builder` is a separate package from `flatpak`
+            // and is missing on an ordinary desktop; the AppImage and the .deb are already
+            // built by the time this step is reached, so refusing to continue would report a
+            // successful packaging run as a failure.
+            optional: true,
         });
     }
 
@@ -446,6 +486,7 @@ fn sidecar_steps(triple: &str) -> Vec<Step> {
             ],
             cwd: ".".into(),
             env: Vec::new(),
+            optional: false,
         },
         Step {
             program: "install".into(),
@@ -456,6 +497,7 @@ fn sidecar_steps(triple: &str) -> Vec<Step> {
             ],
             cwd: ".".into(),
             env: Vec::new(),
+            optional: false,
         },
     ]
 }
@@ -513,6 +555,7 @@ fn fetch_appimage_runtime(triple: &str) -> Step {
         ],
         cwd: ".".into(),
         env: Vec::new(),
+        optional: false,
     }
 }
 
@@ -592,7 +635,7 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets) -> Vec<Verdict> 
     }
 
     if targets.appimage {
-        out.push(webkit_helper_check());
+        out.push(webkit_helper_check(info));
         out.push(if info.has_updater {
             Verdict::Ok("the updater plugin is configured".into())
         } else {
@@ -649,57 +692,85 @@ const WEBKIT_HELPERS: [&str; 2] = ["WebKitWebProcess", "WebKitNetworkProcess"];
 
 /// Whether the AppImage will carry WebKit's helper processes.
 ///
-/// **This is the check that catches the quietest failure in this whole file.** The bundler
-/// puts `libwebkit2gtk-4.1.so.0` inside the AppImage, and that library spawns two helper
-/// executables to do anything at all. It tries to bring them along — it looks for them under
+/// **This is the check that catches the quietest failure in this whole file**, and its first
+/// version got the reason wrong in a way worth recording, because the wrong reason made it a
+/// warning when it should have been a failure.
+///
+/// The bundler puts `libwebkit2gtk-4.1.so.0` inside the AppImage, and that library spawns
+/// helper executables to do anything at all. It tries to bring them along — it looks under
 /// `<libdir>/webkit2gtk-4.1/` — and when it does not find them it copies nothing and says
 /// nothing: the loop is `if source.exists()`, with no else. On openSUSE they live in
-/// `/usr/libexec/libwebkit2gtk-4_1-0/`, which is not a name on that list, so the bundle comes
-/// out without them and the run fails on a *different* machine, as a window that never paints.
+/// `/usr/libexec/libwebkit2gtk-4_1-0/`, which is not a name on that list.
 ///
-/// A warning rather than a failure because it is not fatal on every host: nothing sets
-/// `WEBKIT_EXEC_PATH`, so the bundled library falls back to its compiled-in absolute path, and
-/// on a host whose WebKitGTK is laid out like the build machine's that path is there.
-fn webkit_helper_check() -> Verdict {
-    let bundled: Vec<&str> = WEBKIT_HELPERS
+/// The old explanation said the library then "falls back to its compiled-in absolute path", so
+/// the package would still run on a host laid out like the build machine. Both halves are
+/// false, and the observed crash is the proof:
+///
+/// ```text
+/// Failed to spawn child process “././/libexec/libwebkit2gtk-4_1-0/WebKitNetworkProcess”
+/// ```
+///
+/// That path is **relative**, and WebKitGTK resolves it against the directory the library
+/// itself is loaded from. On the system, `/usr/lib64/` + `../libexec/…` is `/usr/libexec/…`
+/// and everything works; inside the AppImage, `<AppDir>/usr/lib/` + `../libexec/…` is
+/// `<AppDir>/usr/libexec/…`, which does not exist. So the package fails **on the build machine
+/// too** — there is no host it runs on — and it aborts before the first frame rather than
+/// showing a window that never paints.
+///
+/// `WEBKIT_EXEC_PATH` was the other half of the old note. That variable is not referenced by
+/// this WebKit at all (checked with `strings` against the bundled 2.52 library), so setting it
+/// changes nothing; it was tried against the failing AppImage and the crash was identical.
+///
+/// The fix is therefore to place the helpers where the relative path lands, which is what
+/// `bundle.linux.appimage.files` does. Verified by copying them into an extracted AppDir and
+/// running `AppRun`: the window opened and the IPC probe reported the fast path.
+fn webkit_helper_check(info: &AppInfo) -> Verdict {
+    let Some(dir) = find_webkit_helpers_elsewhere() else {
+        // Nothing to copy from. The bundler's own search may still find them, in which case
+        // this is fine and the mapping below would be pointing at nothing.
+        return Verdict::Ok("WebKit's helper processes are where the bundler looks".into());
+    };
+
+    let missing: Vec<&str> = WEBKIT_HELPERS
         .into_iter()
         .filter(|helper| {
-            WEBKIT_SEARCH_DIRS
+            !info
+                .appimage_files
                 .iter()
-                .any(|dir| Path::new(dir).join("webkit2gtk-4.1").join(helper).exists())
+                .any(|(target, _)| target.ends_with(&format!("/{helper}")))
         })
         .collect();
-    if bundled.len() == WEBKIT_HELPERS.len() {
-        return Verdict::Ok("WebKit's helper processes will be bundled".into());
-    }
-    let elsewhere = find_webkit_helpers_elsewhere();
-    let found = match elsewhere {
-        Some(dir) => format!(" — this machine keeps them in {dir}"),
-        None => String::new(),
-    };
-    Verdict::Warn(format!(
-        "the AppImage will not contain {}: `cargo tauri build` only looks under \
-         <libdir>/webkit2gtk-4.1/ and copies nothing when they are absent{found}. Nothing \
-         sets WEBKIT_EXEC_PATH either, so the bundled libwebkit2gtk falls back to its \
-         compiled-in absolute path and the package only renders on a host that lays \
-         WebKitGTK out the way this machine does",
-        WEBKIT_HELPERS
+    if missing.is_empty() {
+        // And the sources have to be real, or the bundler copies nothing and says nothing —
+        // the same silence this check exists for, one layer up.
+        let absent: Vec<&str> = info
+            .appimage_files
             .iter()
-            .filter(|h| !bundled.contains(h))
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" and "),
+            .filter(|(_, source)| !Path::new(source).exists())
+            .map(|(_, source)| source.as_str())
+            .collect();
+        if absent.is_empty() {
+            return Verdict::Ok(format!(
+                "the AppImage maps WebKit's helper processes from {dir} into usr/libexec/"
+            ));
+        }
+        return Verdict::Fail(format!(
+            "bundle.linux.appimage.files names {} which does not exist, so the bundler will \
+             copy nothing and the AppImage will abort on launch",
+            absent.join(", ")
+        ));
+    }
+
+    Verdict::Fail(format!(
+        "the AppImage will not contain {}, and will abort before its first frame: the bundled \
+         libwebkit2gtk resolves `././/libexec/libwebkit2gtk-4_1-0` against its own directory, \
+         so inside the package that is <AppDir>/usr/libexec/, which nothing populates. This \
+         machine keeps them in {dir} — map them in with bundle.linux.appimage.files in {}",
+        missing.join(" and "),
+        TAURI_BUNDLE_CONF,
     ))
 }
 
-/// Where this machine actually keeps the helpers, if not where the bundler looks.
-///
-/// Only the directories the bundler already searches are scanned, one level down, which is
-/// enough for the `libwebkit2gtk-4_1-0` style of name and cheap enough to run every preflight.
-///
-/// A machine with both WebKitGTK ABIs installed has two such directories, and naming the 6.0
-/// one would send a reader to the GTK 4 build that Tauri 2 does not link. So the 4.1 spelling
-/// wins when both are there, and directory order decides nothing.
 fn find_webkit_helpers_elsewhere() -> Option<String> {
     let mut fallback = None;
     for dir in WEBKIT_SEARCH_DIRS {
@@ -1099,6 +1170,15 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         icons: list(conf.pointer("/bundle/icon")),
         has_updater: conf.pointer("/plugins/updater").is_some(),
         external_bin: list(overlay.pointer("/bundle/externalBin")),
+        appimage_files: overlay
+            .pointer("/bundle/linux/appimage/files")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         base_external_bin: list(conf.pointer("/bundle/externalBin")),
     })
 }
@@ -1113,6 +1193,7 @@ mod tests {
             version: "0.1.0".into(),
             product_name: "cide".into(),
             bundle_targets: vec!["appimage".into(), "deb".into()],
+            appimage_files: Vec::new(),
             icons: vec!["icons/32x32.png".into()],
             has_updater: false,
             external_bin: vec!["../../target/release/cide-hook".into()],
@@ -1403,27 +1484,55 @@ mod tests {
     }
 
     #[test]
-    fn the_webkit_helper_check_agrees_with_this_machine() {
-        // Not a fixture: the point of the check is to describe the machine it runs on, and a
-        // mocked filesystem would only assert that the mock was read. It has to be one or the
-        // other, and either way it must name the helpers.
-        let verdict = webkit_helper_check();
+    fn the_webkit_helper_check_fails_when_nothing_maps_the_helpers() {
+        // This test used to assert `never a hard failure`, and that assertion was the bug it
+        // should have caught: an AppImage without these helpers does not degrade on an unusual
+        // host, it aborts before its first frame on every host including the one that built it.
+        // A warning let a package ship that could not start.
+        //
+        // Not a fixture for the machine half — the point of the check is to describe the
+        // machine it runs on, and a mocked filesystem would only assert the mock was read.
+        let Some(_) = find_webkit_helpers_elsewhere() else {
+            // The bundler's own search will find them; nothing to map and nothing to assert.
+            return;
+        };
+
+        let bare = info();
+        assert!(bare.appimage_files.is_empty(), "fixture starts unmapped");
+        let verdict = webkit_helper_check(&bare);
         assert!(
-            matches!(verdict, Verdict::Ok(_) | Verdict::Warn(_)),
-            "never a hard failure: {verdict:?}"
+            matches!(verdict, Verdict::Fail(_)),
+            "an unmapped bundle must fail, not warn: {verdict:?}"
         );
-        // Both helpers, not just one: tauri-bundler's loop is per-file over every search dir,
-        // so a machine holding one of the two gets a Warn, and a test that only looked for
-        // WebKitWebProcess would call that a bug in the check.
-        let ok = WEBKIT_HELPERS.iter().all(|helper| {
-            WEBKIT_SEARCH_DIRS
-                .iter()
-                .any(|d| Path::new(d).join("webkit2gtk-4.1").join(helper).exists())
-        });
-        assert_eq!(matches!(verdict, Verdict::Ok(_)), ok, "{verdict:?}");
-        if let Verdict::Warn(detail) = &verdict {
+        // Both helpers named, not just one: the bundler's loop is per-file, so a machine
+        // holding one of the two must still be told which is missing.
+        if let Verdict::Fail(detail) = &verdict {
             assert!(detail.contains("WebKitWebProcess"), "{detail}");
+            assert!(detail.contains("WebKitNetworkProcess"), "{detail}");
         }
+    }
+
+    #[test]
+    fn the_shipped_config_maps_them() {
+        // The real file, because that is the artefact that decides whether a package runs.
+        // `workspace_root` lives in main.rs and is not visible here; the manifest dir of this
+        // crate is its child, which is the same answer by a route a test can take.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has a parent")
+            .to_path_buf();
+        let Ok(real) = read_app_info(&root) else {
+            return;
+        };
+        if find_webkit_helpers_elsewhere().is_none() {
+            return;
+        }
+        assert!(
+            matches!(webkit_helper_check(&real), Verdict::Ok(_)),
+            "the checked-in bundle config must map WebKit's helpers, or the AppImage cannot \
+             start: {:?}",
+            webkit_helper_check(&real)
+        );
     }
 
     #[test]
@@ -1456,6 +1565,7 @@ mod tests {
             args: vec!["tauri".into(), "build".into()],
             cwd: APP_CRATE.into(),
             env: vec![("LDAI_RUNTIME_FILE".into(), "/tmp/runtime-x86_64".into())],
+            optional: false,
         };
         assert_eq!(
             step.display(),
@@ -1643,6 +1753,7 @@ mod tests {
             args: vec!["tauri".into(), "build".into()],
             cwd: APP_CRATE.into(),
             env: Vec::new(),
+            optional: false,
         };
         assert_eq!(step.display(), "cd crates/cide-app && cargo tauri build");
     }

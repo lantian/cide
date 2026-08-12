@@ -1,5 +1,14 @@
 {
   "bundle": {
-    "externalBin": ["../../target/release/cide-hook"]
+    "externalBin": ["../../target/release/cide-hook"],
+    "linux": {
+      "appimage": {
+        "files": {
+          "usr/libexec/libwebkit2gtk-4_1-0/WebKitNetworkProcess": "/usr/libexec/libwebkit2gtk-4_1-0/WebKitNetworkProcess",
+          "usr/libexec/libwebkit2gtk-4_1-0/WebKitWebProcess": "/usr/libexec/libwebkit2gtk-4_1-0/WebKitWebProcess",
+          "usr/libexec/libwebkit2gtk-4_1-0/WebKitGPUProcess": "/usr/libexec/libwebkit2gtk-4_1-0/WebKitGPUProcess"
+        }
+      }
+    }
   }
 }
