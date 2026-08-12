@@ -122,6 +122,7 @@
   "window_detach_pane",
   "window_list",
   "window_redock_pane",
+  "window_reveal_pane",
   "window_set_awaiting",
   "window_set_mode",
   "window_set_viewport"

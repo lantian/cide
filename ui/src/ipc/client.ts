@@ -1686,3 +1686,38 @@ export const branch = {
   pull: (project: ProjectId, repo: BranchRepoId, remote: string | null = null) =>
     invoke<FetchOutcome>('git_pull', { project, repo, remote }),
 }
+
+/**
+ * The one step of *take me to the pane my mention landed in* that a webview cannot take.
+ *
+ * Everything else about that reveal is a workspace mutation — activate the tab, drop a
+ * maximize, move the focused pane — and those already have commands. What is left is raising
+ * an **OS window**, which no amount of JavaScript can do: the target pane may be torn out into
+ * a window of its own, or may be the shell's console while the gesture was made from a
+ * detached editor. See `editor/revealPane.ts` for the order the two halves run in.
+ *
+ * Appended as its own namespace rather than added to `windows` above, per this file's
+ * append-only rule — it has conflicted in five consecutive rounds, once as a redeclaration
+ * that would not compile.
+ */
+export const sendFocus = {
+  /**
+   * Raise the window showing a pane, and answer which window that was.
+   *
+   * `null` — not a rejection — when nothing is showing the pane, which happens when it closed
+   * between the send and the reveal. The mention still landed: it went to a *session*, and a
+   * session outlives the pane that was drawing it. Rust reserves an error for something the
+   * caller could act on, and there is nothing to act on here; the caller words the `null`.
+   *
+   * Rejects only if the command is genuinely missing (a frontend hot-reloaded past its
+   * binary). `revealPane` catches that and folds it into its own sentence, so the user is told
+   * the send worked and the switch did not, rather than being shown a bare failure for a
+   * gesture that half succeeded.
+   */
+  // `string`, not `WindowLabel`, and that is this file's append-only rule rather than a
+  // preference: importing the alias means editing the import block at the top, which is the
+  // exact hunk that has conflicted every round. `windows.detachPane` above returns a label as
+  // `string` for the same reason, and `WindowLabel` *is* `string` in `generated.ts`.
+  revealPane: (projectId: ProjectId, paneId: PaneId) =>
+    invoke<string | null>('window_reveal_pane', { project: projectId, pane: paneId }),
+}
