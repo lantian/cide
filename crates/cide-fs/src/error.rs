@@ -53,6 +53,25 @@ pub enum FsError {
     #[error("{0} is a project root and cannot be moved or deleted from here")]
     IsRoot(String),
 
+    /// A directory pasted into itself, or into something inside itself.
+    ///
+    /// Its own variant rather than prose inside [`FsError::InvalidPath`] because it is the one
+    /// refusal in this file that is about a *pair* of paths rather than about one path being
+    /// malformed — and because obeying it is not a refused gesture but an infinite recursion
+    /// that fills the disk. The message names both halves.
+    #[error("{0}")]
+    IntoItself(String),
+
+    /// A multi-path paste copied some sources and then failed.
+    ///
+    /// The same shape as [`FsError::PartialDelete`] and for the same reason: telling the
+    /// frontend that nothing happened while three of five directories are already on disk
+    /// leaves it drawing a tree it believes is unchanged. What did land is carried so the
+    /// panel can say so; it is not rolled back, because rolling back a copy means deleting
+    /// files the user can see and a cut has already removed its source.
+    #[error("{error} (after pasting {} path(s))", pasted.len())]
+    PartialPaste { pasted: Vec<String>, error: String },
+
     /// A multi-path delete moved some paths and then failed.
     ///
     /// A plain error here would tell the frontend that nothing happened while files were

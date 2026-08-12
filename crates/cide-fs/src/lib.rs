@@ -15,6 +15,7 @@
 //! Nothing here links a webview, and nothing here knows what a pane is. The app wires an
 //! [`Index`], a [`filter::Filter`] and a [`watch::Watcher`] together per project.
 
+pub mod copy;
 pub mod error;
 pub mod filter;
 pub mod index;

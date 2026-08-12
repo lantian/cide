@@ -42,6 +42,18 @@ import { enterOn, fileTreeClick, gestureOf, moveIndex, type RowAction } from './
 import { copyText } from './copyText'
 import { isRootPath, relativeTo } from './rowPaths'
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
+import { useFileClipboard } from './fileClipboard'
+import {
+  copyLabel,
+  escapeCancels,
+  isCutPending,
+  pasteLabel,
+  pasteRefusal,
+  pasteTargetFor,
+  pendingNote,
+  type ClipMode,
+} from './clipboardModel'
+import { fsMessage } from './fsError'
 import {
   diag,
   fs as fsApi,
@@ -209,15 +221,97 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   const [draftTried, setDraftTried] = useState(false)
   /** A `fs_create_in` is in flight for the open draft. See `commitDraft`. */
   const creating = useRef(false)
+  /**
+   * Something true and non-alarming to say, or `null`.
+   *
+   * A second strip rather than a second use of `problem`, because a paste that renamed a file
+   * is not a failure and must not be painted red — and because the two are dismissed by
+   * different things: a note is stale as soon as the next gesture happens, a failure stays
+   * until it is clicked. Sharing one state meant one wiping the other.
+   */
+  const [note, setNote] = useState<string | null>(null)
+  /** What is on the tree's clipboard. Subscribed here because it dims rows and draws a strip. */
+  const clip = useFileClipboard((s) => s.clip)
+  /** An `fs_paste` is in flight. Ctrl+V held down must not start a second one. */
+  const pasting = useRef(false)
 
   /** Report a rejected file command, in the panel and in the log. */
   const fail = useCallback(
     (what: string) => (error: unknown) => {
-      const line = `${what} failed: ${String(error)}`
+      // `fsMessage`, not `String(error)`. An `FsError` crosses the boundary as
+      // `{ kind, detail }` with no `message` field, so the template literal that used to be
+      // here printed `[object Object]` — a refusal the user could have acted on ("that name is
+      // taken", "that is a project root"), rendered as a bug in the message. See `fsError.ts`.
+      const line = `${what} failed: ${fsMessage(error)}`
       setProblem(line)
       void diag.log(`[cide] file tree: ${line}`).catch(() => {})
     },
     [],
+  )
+
+  /**
+   * Put a row on the tree's clipboard.
+   *
+   * Cut refuses a project root here as well as in Rust, for the reason every other refusal is
+   * doubled in this panel: `fs_paste` would reject it after the gesture, and a Ctrl+X that
+   * *looks* like it worked and fails a minute later at the paste is the worse half of that
+   * exchange — by then the user has forgotten what they cut.
+   */
+  const takeClip = useCallback(
+    (mode: ClipMode, row: { path: string; isRoot: boolean }) => {
+      if (project === null) return
+      if (mode === 'cut' && row.isRoot) {
+        setProblem('A project root is closed, not moved.')
+        return
+      }
+      setProblem(null)
+      setNote(null)
+      useFileClipboard.getState().take(mode, project, [row.path])
+    },
+    [project],
+  )
+
+  /**
+   * Paste the clipboard into `target`, and say what happened when it differs from what was
+   * asked for.
+   *
+   * The refusal is checked here rather than left to Rust so that it arrives as a sentence
+   * about folders — "“src” cannot be pasted into itself" — instead of as a rejected command.
+   * Rust checks all of it again; see `clipboardModel.pasteRefusal`.
+   */
+  const runPaste = useCallback(
+    (target: NewEntryTarget | null) => {
+      if (project === null) return
+      const refusal = pasteRefusal(useFileClipboard.getState().clip, project, target)
+      if (refusal !== null || target === null) {
+        setProblem(refusal ?? 'There is nowhere to paste into.')
+        return
+      }
+      // One paste per gesture, however long Ctrl+V is held. A directory paste is seconds of
+      // work, and a second one launched into it would race the first for the same names —
+      // both would succeed, and the user would get `src` and `src copy` from one keystroke.
+      if (pasting.current) return
+      pasting.current = true
+      setProblem(null)
+      setNote(null)
+      void useFileClipboard
+        .getState()
+        .paste(project, target.parent)
+        .finally(() => {
+          pasting.current = false
+        })
+        .then((result) => {
+          setNote(result.note)
+          const first = result.paths[0]
+          // `reveal` rather than `refresh`: the row may be inside a folder that is collapsed,
+          // and a paste whose result is not on screen is one the user cannot check. It
+          // selects too, which is what makes Enter open the thing that was just pasted.
+          if (first !== undefined) void useFileTree.getState().reveal(first)
+          else void useFileTree.getState().refresh()
+        })
+        .catch(fail('Paste'))
+    },
+    [fail, project],
   )
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -320,6 +414,82 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       const store = useFileTree.getState()
       const at = cursor()
 
+      /*
+       * Ctrl+C, Ctrl+X, Ctrl+V and Escape — the tree's clipboard.
+       *
+       * Handled on this element rather than as three entries in `crates/cide-core/src/keymap.rs`,
+       * and the reason is the one the brief asks about: these chords are **focus-scoped**, not
+       * context-scoped. Ctrl+C in a terminal pane is SIGINT and Ctrl+C in the editor copies the
+       * selection, so the question a binding has to answer is "does the file tree have the
+       * caret right now" — and the flag that exists for this, `sidebarFiles`, means the panel
+       * is *visible*, which it is while the user is typing in a terminal beside it. A global
+       * binding would swallow the keystroke there and the pty would never see it. A handler on
+       * the scroller is asked only when the scroller is focused, which is the actual question;
+       * nothing in the default keymap binds these three, so the window-level gate passes them
+       * through untouched and there is no conflict to resolve.
+       *
+       * `!e.altKey && !e.shiftKey` so `ctrl+shift+c` stays free for whoever wants it.
+       */
+      const key = e.key.toLowerCase()
+      // Only these three chords are taken. Every other modified key falls through to the
+      // navigation below, which is deliberate: `moveIndex` reads `e.key` alone, so Ctrl+End
+      // has always moved the selection here and a blanket `return` for modified keys would
+      // have quietly removed that.
+      const clipboardKey = key === 'c' || key === 'x' || key === 'v'
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && clipboardKey) {
+        // Rows are ordinary selectable text. When the user has actually dragged a selection
+        // across one, Ctrl+C means *that* — copying the row's path instead would be taking a
+        // gesture the webview already handles correctly.
+        const text = typeof document === 'undefined' ? null : document.getSelection()
+        if (key === 'c' && text !== null && !text.isCollapsed) return
+
+        const row = at < 0 ? undefined : store.rowAt(at)
+        if (key === 'v') {
+          if (row === undefined && store.selected !== null) {
+            // The selected row has been scrolled out of the row cache, so its *kind* is
+            // unknown — and the kind is what decides whether the paste lands in that folder or
+            // beside that file. Refused rather than guessed: putting a directory somewhere the
+            // user was not looking is the one outcome worth a round trip to avoid, and this
+            // costs a scroll instead.
+            setProblem('Scroll back to the selected row before pasting — it is no longer loaded.')
+          } else {
+            const anchor = row === undefined ? null : { path: row.path, isDir: row.kind === 'dir' }
+            runPaste(pasteTargetFor(anchor, roots))
+          }
+          e.preventDefault()
+          return
+        }
+
+        const path = row?.path ?? store.selected
+        if (path !== null && path !== undefined) {
+          takeClip(key === 'x' ? 'cut' : 'copy', { path, isRoot: isRootPath(path, roots) })
+        }
+        e.preventDefault()
+        return
+      }
+      /*
+       * Escape calls off a cut — a *cut*, and only one this panel is currently showing.
+       *
+       * The condition used to be `clip !== null`, which cancelled two things the user had no
+       * way to know were there. A **copy** is deliberately silent (`pendingNote` returns null
+       * for it and no row is dimmed), so Escape threw the clipboard away with nothing on
+       * screen having changed, and the next Ctrl+V answered "nothing has been copied yet" —
+       * indistinguishable from a Copy that never worked, which is the report this panel keeps
+       * getting. And a cut belonging to **another project** is announced in that project's
+       * panel, not this one: the strip is gated on `clip.project === project` and so are the
+       * faded rows, so Escape here was cancelling something drawn somewhere else.
+       *
+       * So: cancel exactly what this panel is drawing as pending. Anything else falls through,
+       * which also keeps Escape available to whoever wants it next — a cut that cannot be
+       * cancelled is a trap, and one that eats Escape for the rest of the app is a different
+       * trap.
+       */
+      if (e.key === 'Escape' && escapeCancels(useFileClipboard.getState().clip, project)) {
+        useFileClipboard.getState().clear()
+        e.preventDefault()
+        return
+      }
+
       if (at < 0) {
         // Nothing selected. Any navigation key means "start at the top" — `moveIndex` from a
         // notional -1 would answer 0 for Home and 1 for ArrowDown, which skips a row.
@@ -364,7 +534,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       }
       e.preventDefault()
     },
-    [apply, count, cursor, draft, moveTo, renaming],
+    [apply, count, cursor, draft, moveTo, project, renaming, roots, runPaste, takeClip],
   )
 
   /**
@@ -508,6 +678,16 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     [roots],
   )
 
+  /**
+   * The clipboard as of *now*, not as of the last render.
+   *
+   * `items` below is called at open time, so it must read through the store: the subscribed
+   * `clip` is correct today only because this component happens to re-render on every change to
+   * it, and a menu whose *Paste* item describes a clipboard from two gestures ago is the exact
+   * class of bug this panel keeps fixing.
+   */
+  const clipNow = () => useFileClipboard.getState().clip
+
   const { onContextMenu, menu } = useContextMenu({
     label: 'File tree',
     items: ({ target }) => {
@@ -548,10 +728,24 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
               },
             ]
 
-      // Right-clicking the empty space under the last row now offers the two items above and
+      /*
+       * *Paste*, built alongside them and for the same reason: it needs a destination, not a
+       * row, so the empty space under the last row can offer it too. Disabled **with the
+       * reason on it** rather than hidden — an item that appears only sometimes teaches the
+       * user nothing about why, and "nothing has been copied yet" is the answer to the
+       * question they are actually asking.
+       */
+      const refusal = pasteRefusal(clipNow(), project, target_)
+      const paste: MenuEntry = {
+        id: 'paste',
+        label: pasteLabel(clipNow(), target_),
+        ...(refusal === null ? { run: () => runPaste(target_) } : { disabledReason: refusal }),
+      }
+
+      // Right-clicking the empty space under the last row offers the three items above and
       // nothing else. An empty box at the pointer says "this surface is broken";
       // `useContextMenu` declines on `[]`, which is still the answer for a project-less panel.
-      if (row === null) return create
+      if (row === null) return [...create, { kind: 'separator' }, paste]
 
       const store = useFileTree.getState()
       const at = store.indexOf(row.path)
@@ -590,6 +784,23 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           ...sideAction(row.isDir, row.path, onOpenToSide),
         },
         { kind: 'separator' },
+        /*
+         * Cut / Copy / Paste of the **files**, above the two items that copy their *names*.
+         *
+         * The order is every file manager's, and the grouping is what keeps the four apart:
+         * *Copy* and *Copy Path* are one keystroke and one menu row from each other and mean
+         * completely different things, so they do not share a group. Ctrl+C in the tree is
+         * this one — the files — because that is what Ctrl+C means in every other list of
+         * files a user has ever met.
+         */
+        { id: 'cut', label: copyLabel('cut', 1), ...cutAction(row.isRoot, row.path, takeClip) },
+        {
+          id: 'copy',
+          label: copyLabel('copy', 1),
+          run: () => takeClip('copy', { path: row.path, isRoot: row.isRoot }),
+        },
+        paste,
+        { kind: 'separator' },
         {
           id: 'reveal',
           label: 'Reveal in File Manager',
@@ -627,6 +838,15 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       return entries
     },
   })
+
+  /**
+   * The pending-cut strip, or `null`.
+   *
+   * Gated on the clipboard belonging to *this* project. The clipboard deliberately survives a
+   * project switch (see `fileClipboard.ts`), so without this the panel for project B would
+   * carry a strip about a file in project A — one that `pasteRefusal` will not let it paste.
+   */
+  const pending = clip !== null && clip.project === project ? pendingNote(clip) : null
 
   if (degraded && count === 0) {
     // Name the command that actually failed rather than a fixed one: `degraded` is set from
@@ -697,6 +917,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
                 top={item.start}
                 height={item.size}
                 selected={row.path === selected}
+                cut={isCutPending(clip, row.path)}
                 renaming={row.path === renaming}
                 project={project}
                 onAct={apply}
@@ -756,6 +977,37 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           role="status"
         >
           {draftMessage.text}
+        </div>
+      )}
+      {/*
+        * A cut waiting to be pasted.
+        *
+        * The dimmed rows say *which* files; this says what will happen to them and how to call
+        * it off. Only for a cut — see `pendingNote`: a copy changes nothing until it is pasted
+        * and announcing it would be a permanent strip under a panel that is 252px wide.
+        */}
+      {pending !== null && (
+        <div className={styles.draftNote} data-audit="fileTreeClipNote" role="status">
+          {pending}
+        </div>
+      )}
+      {/*
+        * What a paste did, when it is not what was asked for.
+        *
+        * Its own strip and not `.problem`: a rename is a success, and painting it red would
+        * teach the user that pasting a file is an error. `null` most of the time — the tree
+        * scrolls to and selects what it made, so the ordinary paste needs no sentence at all.
+        * Dismissed by clicking, like the failure strip below.
+        */}
+      {note !== null && (
+        <div
+          className={styles.info}
+          data-audit="fileTreePasteNote"
+          role="status"
+          title="Dismiss"
+          onClick={() => setNote(null)}
+        >
+          {note}
         </div>
       )}
       {/*
@@ -926,6 +1178,24 @@ function sideAction(
   return { run: () => onOpenToSide(path) }
 }
 
+/**
+ * *Cut*, or the reason a root cannot be one.
+ *
+ * The same shape as [`sideAction`] and the same rule as Rename and Move to Trash: `fs_paste`
+ * refuses to move a project root (`ops::check_not_root`), so the menu says so up front rather
+ * than letting the user cut something and discover at the paste that it was never going
+ * anywhere. Copy has no such restriction — duplicating a checkout beside itself is a real
+ * thing to want.
+ */
+function cutAction(
+  isRoot: boolean,
+  path: string,
+  take: (mode: ClipMode, row: { path: string; isRoot: boolean }) => void,
+): { disabledReason: string } | { run: () => void } {
+  if (isRoot) return { disabledReason: 'A project root is closed, not moved' }
+  return { run: () => take('cut', { path, isRoot }) }
+}
+
 interface RowProps {
   row: TreeRow
   index: number
@@ -935,6 +1205,8 @@ interface RowProps {
   top: number
   height: number
   selected: boolean
+  /** On the clipboard for a **cut**: drawn faded, because it is about to move. */
+  cut: boolean
   renaming: boolean
   project: ProjectId | null
   onAct: (action: RowAction, row: TreeRow, index: number) => void
@@ -951,6 +1223,7 @@ function Row({
   top,
   height,
   selected,
+  cut,
   renaming,
   project,
   onAct,
@@ -971,9 +1244,15 @@ function Row({
   const hasTwisty = isDir && row.hasChildren
   const twisty = hasTwisty ? (row.expanded ? '▾' : '▸') : ''
 
+  // Composed rather than a ternary chain: a row can be selected *and* pending a cut, which is
+  // the ordinary case — Ctrl+X acts on the selection.
+  const rowClass = [styles.row, selected ? styles.rowSelected : null, cut ? styles.rowCut : null]
+    .filter((name) => name !== undefined && name !== null)
+    .join(' ')
+
   return (
     <div
-      className={selected ? `${styles.row} ${styles.rowSelected}` : styles.row}
+      className={rowClass}
       data-audit="fileTreeRow"
       data-depth={row.depth}
       /*

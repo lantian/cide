@@ -1544,3 +1544,52 @@ export const claudeSend = {
       lineEnd: lineEnd ?? null,
     }),
 }
+
+// The two generated types this block needs, imported here rather than added to the list at the
+// top of the file. This file is **append-only** by house rule — it has conflicted in five
+// consecutive rounds, once as a redeclaration that would not compile — and reaching up into an
+// existing import specifier is exactly the edit that conflicts. An `import` is legal anywhere at
+// a module's top level and is hoisted either way.
+import type { PasteMode, PastedEntry } from './generated'
+
+/**
+ * The file tree's own clipboard: copying, cutting and pasting **the files**, not their paths.
+ *
+ * A separate namespace from `fs` above for the same reason `fsCreate` is one — this file is
+ * appended to, never reached into — and the split is not arbitrary: `fs` is the tree's *read*
+ * surface (count, rows, expand, reveal) plus the single-path edits, and this is the one gesture
+ * that moves bytes between two places on disk.
+ *
+ * Every rule lives in `cide_fs::copy`, and the ones a user meets are worth naming at the call
+ * site because they are not what the words "copy" and "paste" promise on their own:
+ *
+ * * **A collision is never an overwrite.** `main.rs` pasted where one exists becomes
+ *   `main copy.rs`; the entry that comes back has `renamed: true` so the panel can say so.
+ *   Nothing this command does can destroy a file that was already there.
+ * * **`cut` moves nothing until this call.** The mode travels with the paste, so a cut the user
+ *   changed their mind about costs exactly nothing.
+ * * **A directory is copied recursively**, and refused into itself or into anything inside it.
+ * * **A symlink is copied as a symlink.** Its target is not followed and not duplicated.
+ *
+ * Rejects, and the rejection matters: `OutsideProject`, `IsRoot`, `IntoItself` and
+ * `PartialPaste` are all things the user needs to read. The file tree catches it and puts the
+ * reason in its own strip; a call site with no such surface should let it reach `Failures`.
+ */
+export const fsClipboard = {
+  /**
+   * Paste `sources` into `destDir`.
+   *
+   * `destDir` is a *directory*, always — the tree resolves a file row to its parent before
+   * calling, exactly as *New File…* does (`sidebar/clipboardModel.ts`). Answers one entry per
+   * source, in the order they were given, saying where each one actually landed.
+   */
+  paste: (projectId: ProjectId, sources: readonly string[], destDir: string, mode: PasteMode) =>
+    invoke<PastedEntry[]>('fs_paste', {
+      project: projectId,
+      // A fresh array: `invoke` serialises what it is handed, and a `readonly string[]` from a
+      // zustand store is the store's own array.
+      sources: [...sources],
+      destDir,
+      mode,
+    }),
+}
