@@ -72,10 +72,11 @@
   </defs>
 
   <!--
-    The prompt caret. Round cap and round join, radius 6, which is also the bar's corner
-    radius plus its stroke geometry: every terminal in the mark is the same curve. Mitred
-    joins were drawn first and the spike at the vertex resolved into a stray dark pixel at
-    16px, so they lost.
+    The prompt caret. Round cap and round join, so the cap radius is half the stroke, 6.
+    Mitred joins were drawn first and the spike at the vertex resolved into a stray dark
+    pixel at 16px, so they lost. The bar's corners are tighter than 6 on purpose (see
+    below); this is the one place the two objects deliberately do not match, because the
+    caret is a drawn stroke and the bar is a solid.
   -->
   <path d="M10 10 L30 32 L10 54"
         fill="none" stroke="url(#ramp)" stroke-width="12"
