@@ -26,7 +26,17 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 10px;
+  /*
+   * The right pad is the pane frame's floating control cluster.
+   *
+   * This bar is the first child of the pane, so it is what sits under the ⊞ ⛶ ⧉ × that
+   * `layout/PaneTitleBar.module.css` now floats in the pane's top-right — and `Keep mine` is
+   * the last thing in the row, which put it entirely inside those 126px. A button that
+   * preserves unsaved edits must not be one the user can only click the bottom four pixels
+   * of. `--pane-corner` is the frame's own reserve, so this tracks it; the fallback is for
+   * the bar rendered outside a pane.
+   */
+  padding: 6px calc(10px + var(--pane-corner, 0px)) 6px 10px;
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-size: 12px;

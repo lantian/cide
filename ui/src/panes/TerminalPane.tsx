@@ -700,8 +700,9 @@ export function TerminalPane({
       // The innermost surface's menu wins — `useContextMenu`'s stated rule, enforced here by
       // hand because this is a native listener rather than a React one. React 19 delegates to
       // the root container, so stopping the native event is what keeps an outer surface from
-      // also opening one. (The pane title bar's own menu is not among them: its handler is on
-      // the 26px bar, which the terminal is not inside.)
+      // also opening one. (The pane's own menu IS among them now, and this line is the only
+      // thing holding it off: `PaneFrame` moved `onContextMenu` from the deleted 26px title
+      // bar onto the whole frame, which the terminal very much is inside.)
       ev.stopPropagation()
       const target = ev.target instanceof HTMLElement ? ev.target : null
       openMenu.current(ev.clientX, ev.clientY, target)

@@ -34,7 +34,18 @@
   align-items: baseline;
   gap: 6px;
   height: var(--h-panetitle);
-  padding: 0 8px;
+  /*
+   * The right pad is the pane frame's floating control cluster, not decoration.
+   *
+   * `layout/PaneTitleBar.module.css` deleted the 26px pane title bar and put ⊞ ⛶ ⧉ × in the
+   * pane's top-right *over* the content, at exactly this header's height. `.layout` below is
+   * `margin-left: auto`, so the inline/side-by-side switcher lands under those buttons and
+   * stops answering the pointer the moment the cluster reveals — which is whenever the mouse
+   * is anywhere in this pane. `--pane-corner` is published by `.frame` and reserved there
+   * with `min-width`, so it is the width the cluster actually occupies rather than a guess;
+   * the fallback is for this header rendered outside a pane frame.
+   */
+  padding: 0 calc(8px + var(--pane-corner, 0px)) 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);

@@ -296,17 +296,56 @@ try {
   }
   ok(referenced.size > 0, 'the stylesheets reference tokens at all')
 
+  /*
+   * The one thing that is a `var()` and is *not* tokens.css's to supply: a custom property one
+   * CSS module publishes for another.
+   *
+   * `--pane-corner` is the width of the floating control cluster the pane frame parks in every
+   * pane's top-right. Three pane surfaces draw their own controls in that corner and pad by it
+   * so the cluster does not sit on them, which makes it a measurement passed between modules
+   * rather than a colour. It cannot go in tokens.css: it is one box's geometry, it is reserved
+   * with a `min-width` in the same rule that publishes it, and a theme has no opinion on it.
+   *
+   * It still has to resolve, and for the same reason as everything above: the consumers write
+   * `var(--pane-corner, 0px)`, so a renamed or deleted publisher turns the reserve into a
+   * silent zero and puts a diff's layout switcher back underneath the pane's ⧉ — drawn, hovered
+   * and unclickable, which is the state review found it in. So the exemption is not a blanket
+   * one: the property is excused from the palette walk only while some module actually defines
+   * it, and the publisher list is pinned below so a second one is a decision rather than a
+   * surprise.
+   */
+  const publishers = new Map()
+  for (const file of cssModules('src')) {
+    for (const m of readFileSync(file, 'utf8').matchAll(/(--[\w-]+)\s*:/g)) {
+      if (!publishers.has(m[1])) publishers.set(m[1], [])
+      if (!publishers.get(m[1]).includes(file)) publishers.get(m[1]).push(file)
+    }
+  }
+
   const wanted = [...referenced.keys()].sort()
   const darkAll = resolveTheme(docRules, 'dark', wanted)
   const lightAll = resolveTheme(docRules, 'light', wanted)
+  // Unresolved AND published by exactly one module is the cross-module contract; anything else
+  // that fails to resolve is the silent-fallback bug this section was written for.
+  const contract = (t) => publishers.get(t)?.length === 1
   for (const theme of [['dark', darkAll], ['light', lightAll]]) {
     eq(
-      wanted.filter((t) => (theme[1][t] ?? '') === '').map((t) => `${t} (${referenced.get(t)})`),
+      wanted
+        .filter((t) => (theme[1][t] ?? '') === '' && !contract(t))
+        .map((t) => `${t} (${referenced.get(t)})`),
       [],
       `every token the stylesheets use resolves under ${theme[0]} — a missing one takes its ` +
         `\`var()\` fallback in silence`,
     )
   }
+  eq(
+    wanted
+      .filter((t) => (darkAll[t] ?? '') === '' && contract(t))
+      .map((t) => `${t} <- ${publishers.get(t)[0]}`),
+    ['--pane-corner <- src/layout/PaneTitleBar.module.css'],
+    'the only custom property one CSS module publishes to another is the pane corner reserve, ' +
+      'and exactly one file publishes it',
+  )
 
   // --- typography: never ask the engine for a face this app did not bundle ----------------
   //

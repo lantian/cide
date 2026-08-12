@@ -285,6 +285,75 @@ try {
     'and its `⊞` opens a menu, so the kind is a choice rather than the domain’s default',
   )
 
+  // --- the pane's chrome floats now, and must not sit on the pane's own controls ------------
+  //
+  // The 26px pane title bar is gone; ⊞ ⛶ ⧉ × float in each pane's top-right, over the content.
+  // Three of the things this buys are silent when they break, so they are pinned here rather
+  // than argued in a comment. There is still no browser in this harness, so these are read off
+  // the stylesheets — which is where all three failures would live.
+  //
+  // Comments come out first, and not as tidiness: every rule below is quoted verbatim in some
+  // comment nearby (that is the house style), so a check that greps the raw file passes on the
+  // prose after the rule itself is deleted — which is exactly the "test that cannot fail" this
+  // section exists to avoid. The first draft of assertion 4 did precisely that.
+  const css = (path) => readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')
+  const paneCss = css('src/layout/PaneTitleBar.module.css')
+
+  // 1. The cluster is out of flow. An in-flow cluster reserves a row per pane again, which is
+  //    the 162px in a 2x3 grid the user asked us to give back.
+  const clusterRule = /\.cluster \{[^}]*\}/.exec(paneCss)?.[0] ?? ''
+  ok(
+    /position:\s*absolute/.test(clusterRule),
+    'the pane control cluster is out of flow — in flow it is the 26px bar again, per pane',
+  )
+
+  // 2. It hides with `opacity`, never `display`/`visibility`. That is the whole of the answer
+  //    to "what does a user who cannot hover do": the controls stay in the tab order while
+  //    invisible and `:focus-within` lights them up. `display: none` would look identical on a
+  //    mouse and remove the only keyboard route to them.
+  const revealRule = /\.reveal \{[^}]*\}/.exec(paneCss)?.[0] ?? ''
+  ok(
+    /opacity:\s*0/.test(revealRule)
+      && !/display:\s*none/.test(revealRule)
+      && !/visibility:\s*hidden/.test(revealRule),
+    'the cluster hides with `opacity`, so Tab still reaches it — `display: none` would not',
+  )
+
+  // 3. Everything a pane draws in its own top-right stays clickable.
+  //
+  //    This is the regression that shipped and was found in review: the cluster takes the
+  //    pointer over whatever is beneath it, and it reveals whenever the mouse is anywhere in
+  //    the pane — so a control the pane drew there was still painted, still hovered, and no
+  //    longer clickable. `.frame` publishes `--pane-corner` and reserves exactly that width
+  //    with `min-width`; every surface that puts something in that corner pads by it.
+  ok(
+    /--pane-corner:\s*\d+px/.test(/\.frame \{[^}]*\}/.exec(paneCss)?.[0] ?? ''),
+    '`.frame` publishes `--pane-corner`, the width the cluster reserves',
+  )
+  for (const [file, selector] of [
+    ['src/panes/DiffPane.module.css', '.header'],
+    ['src/panes/GitDiffPane.module.css', '.header'],
+    ['src/panes/EditorPane.module.css', '.conflict'],
+  ]) {
+    const rule = new RegExp(`\\${selector} \\{[^}]*\\}`).exec(css(file))?.[0] ?? ''
+    ok(rule !== '', `${file} still has a \`${selector}\` rule to check`)
+    ok(
+      /var\(--pane-corner/.test(rule),
+      `${file} \`${selector}\` reserves \`--pane-corner\` — its right-hand controls sit under `
+        + 'the pane cluster otherwise, drawn but unclickable',
+    )
+  }
+
+  // 4. And the detached window does not hide the cluster's buttons. Those are that window's
+  //    only minimize/zoom/close — it carries no WM decorations — and the rule that used to
+  //    hide the pane actions matched them too.
+  ok(
+    !/\[data-audit='paneTitle'\][^{]*\{[^}]*display:\s*none/.test(
+      css('src/windows/DetachedPaneWindow.module.css'),
+    ),
+    'the detached window no longer `display: none`s the cluster — that is its close button',
+  )
+
   if (failed === 0) console.log('rows layout: ok')
   else console.error(`\n${failed} failure(s)`)
 } finally {

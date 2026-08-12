@@ -83,21 +83,21 @@
 }
 
 /*
- * The pane title bar's three actions, withheld.
+ * The pane's three actions used to be hidden from here with
  *
- * Maximize is a flag on a tab's pane tree, detach is what this window already is, and close
- * addresses a pane through the tab it sits in — a detached pane sits in the project's
- * `detached` map instead. None of the three can be honoured from here, and a control that
- * cannot be honoured is worse than an absent one. `display: none` rather than a disabled
- * look so they leave the tab order and the accessibility tree with them.
+ *     .body [data-audit='paneTitle'] button { display: none; }
  *
- * The selector reaches into `PaneTitleBar`'s markup because that component has no prop for
- * withholding its actions; the attribute it hooks is the stable one the pane audit already
- * locates the bar with. If that prop is added, delete this rule.
+ * — maximize is a flag on a tab's pane tree, detach is what this window already is, and close
+ * addresses a pane through the tab it sits in, so none of the three can be honoured here. That
+ * rule's own comment ended "If that prop is added, delete this rule", and the prop now exists:
+ * `PaneFrame` asks `windowRole()` and renders the *window's* minimize/zoom/close instead of the
+ * pane actions, so there is nothing left for the rule to hide.
+ *
+ * Deleted rather than left in place, because it had stopped being inert and become a trap: it
+ * matched the window controls too, and only lost to them on specificity (`.cluster .controls
+ * .control` at (0,3,0) against its (0,2,1)). A window with no WM decorations whose close button
+ * depends on winning a specificity race is one refactor away from being unclosable.
  */
-.body [data-audit='paneTitle'] button {
-  display: none;
-}
 
 .orphan {
   margin: 0;

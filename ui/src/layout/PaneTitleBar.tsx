@@ -499,9 +499,7 @@ export function PaneFrame({
                * pane actions were dead here — `DetachedPaneWindow` passes no callbacks — and
                * `DetachedPaneWindow.module.css` hid them with a rule that says, in as many
                * words, "if that prop is added, delete this rule". Withholding them here is
-               * that prop. **That CSS rule now hides these controls too and should be
-               * deleted**; the class nesting in the stylesheet outspecifies it in the
-               * meantime.
+               * that prop, so that rule is deleted; it had begun matching these three too.
                *
                * The pane's own index and title are dropped in this window rather than moved:
                * it holds exactly one pane, so the index is always `1`, and
@@ -630,7 +628,7 @@ export function PaneFrame({
          * Outside the reveal, and last in the row, so it keeps the corner and never hides:
          * it is the only mark here that reports on a pane the user is *not* looking at. The
          * box is reserved either way — see the stylesheet for why an empty one still takes
-         * its 15px.
+         * its 17px.
          */}
         <span
           className={awaiting ? `${styles.marker} ${styles.markerOn}` : styles.marker}

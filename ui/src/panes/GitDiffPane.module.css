@@ -42,7 +42,12 @@
   align-items: center;
   gap: 6px;
   min-height: var(--h-panetitle);
-  padding: 0 8px;
+  /*
+   * Reserved for the pane frame's floating controls — same reason as `DiffPane.module.css`'s
+   * header, which see. Both switchers below hang off one `margin-left: auto` wrapper and so
+   * land squarely under ⊞ ⛶ ⧉ ×, which float over this header rather than above it now.
+   */
+  padding: 0 calc(8px + var(--pane-corner, 0px)) 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);

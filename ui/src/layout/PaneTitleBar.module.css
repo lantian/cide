@@ -34,11 +34,13 @@
    * How much of the pane's top-right corner the floating controls claim.
    *
    * Published as a custom property because it is a contract with whatever is *inside* the
-   * pane: a pane whose content draws its own 26px header with right-aligned controls
-   * (`panes/GitDiffPane.module.css`, `panes/DiffPane.module.css`) puts them exactly where
-   * this cluster lands, and one of the two would be unclickable. Those headers want
-   * `padding-right: calc(8px + var(--pane-corner, 0px))`; that is one line in each and it
-   * is *not* applied here, because those files belong to another surface — see the report.
+   * pane: a pane whose content puts its own controls in its top-right puts them exactly where
+   * this cluster lands, and the cluster wins, so they stop answering the pointer. Three
+   * surfaces did — `panes/DiffPane.module.css` and `panes/GitDiffPane.module.css` (the
+   * inline/side-by-side switchers, on a `margin-left: auto`) and `panes/EditorPane.module.css`
+   * (the conflict bar's `Keep mine`) — and all three now pad by
+   * `calc(<their own pad> + var(--pane-corner, 0px))`. `check:rows` pins that they keep doing
+   * it, because the failure is silent: the control is drawn, it just cannot be clicked.
    *
    * The measurement is the interactive part only: 4px of padding, the awaiting marker and
    * its margins, and the four 22px controls with their gaps. The index and the title extend
@@ -57,7 +59,8 @@
  * `#d8d8de` `--border`, so the focused pane's edge came out *paler* than its neighbours' —
  * "focused" read as "less bordered". `--accent` instead, and twice: the frame's own border
  * plus a pseudo-element ring immediately inside it, which is 2px of the app's one
- * "here you are" colour in both themes (`#c4452a` on white, `#d97757` on `#111113`).
+ * "here you are" colour in both themes (`#c4452a` on `--panel` #ffffff, `#d97757` on
+ * `--panel` #151518).
  *
  * The second pixel is a pseudo-element rather than a 2px border (which would resize the
  * body, per the note above) and rather than an `inset` box-shadow (which paints on the
@@ -108,8 +111,8 @@
  *
  * `pointer-events: none` on the container is what keeps the corner *live* while the cluster
  * is at rest: the gaps between the buttons, and the whole box before it is revealed, pass
- * clicks and drags straight through to the terminal underneath. Only the parts that are
- * visible take the pointer back.
+ * clicks and drags straight through to the terminal underneath. Only the four controls take
+ * the pointer back, and only while they are revealed — see the rule below `.revealPinned`.
  */
 .cluster {
   position: absolute;
@@ -203,7 +206,6 @@
  */
 .frame:hover .reveal {
   opacity: 1;
-  pointer-events: auto;
 }
 
 /* The keyboard's route in. Scoped to the cluster, emphatically not `.frame:focus-within` —
@@ -211,7 +213,6 @@
    so that selector would pin the controls open over the one pane being read. */
 .reveal:focus-within {
   opacity: 1;
-  pointer-events: auto;
 }
 
 /*
@@ -228,6 +229,31 @@
  */
 .revealPinned {
   opacity: 1;
+}
+
+/*
+ * The pointer comes back to the BUTTONS, not to the whole revealed box.
+ *
+ * `.reveal` is a strip up to 70% of the pane wide — index, title, four controls — and it is
+ * revealed whenever the pointer is anywhere in the pane, which is whenever anyone is using
+ * one. Handing `pointer-events: auto` to that strip parks a ~200x22 dead zone over the first
+ * line of every terminal for the whole time the mouse is in it: no selection, no click, and
+ * no mouse report to a TUI that asked for one — and the cluster's `mousedown` guard
+ * `preventDefault`s the gesture on the way past, so it does not even fall through as a
+ * no-op. The index and the title are labels; labels do not take clicks. Only the controls
+ * do, and the gaps between them stay live for the content underneath, which is what
+ * `.cluster`'s own `pointer-events: none` was for.
+ *
+ * Gated on the same three states rather than granted to `.action`/`.control` outright: an
+ * invisible button that answers the pointer is the exact failure `.cluster` is written to
+ * avoid, and `:focus-within` is reachable from the keyboard without any of this.
+ */
+.frame:hover .reveal .actions,
+.frame:hover .reveal .controls,
+.reveal:focus-within .actions,
+.reveal:focus-within .controls,
+.revealPinned .actions,
+.revealPinned .controls {
   pointer-events: auto;
 }
 
@@ -271,8 +297,8 @@
  *
  * The space is still reserved when the marker is off. Nothing reflows any more (this box is
  * out of flow entirely, which is what the old bar's version of this comment was defending
- * against), but a marker that arrived mid-hover would shift every button 15px right, under a
- * pointer already aiming at one.
+ * against), but a marker that arrived mid-hover would shift every button 17px right — 7px of
+ * dot plus its 6px and 4px margins — under a pointer already aiming at one.
  */
 .marker {
   flex: none;
@@ -325,8 +351,9 @@
  *
  * The old buttons were a bare glyph in a stretched box: 26px tall and about eleven wide,
  * because nothing gave them a width. Floating over a terminal they have to be aimed at
- * rather than swept into, so each one is now a square target — wider than what it replaces,
- * one pixel shy of the mock's cell in the axis the mock had a bar to fill.
+ * rather than swept into, so each one is now a square target — twice the width of what it
+ * replaces, and four pixels narrower than the mock's cell, which had a full-width bar to
+ * fill and could spend them.
  */
 .action {
   display: inline-flex;
@@ -415,19 +442,12 @@
  * the desktop's own order, acting on the OS window rather than on the pane. They are pinned
  * visible — see `.revealPinned`.
  *
- * # Why this nesting depth
- *
- * `DetachedPaneWindow.module.css` carries
- *
- *     .body [data-audit='paneTitle'] button { display: none; }
- *
- * written when this component had no way to withhold its three pane actions — its own comment
- * says "If that prop is added, delete this rule." The prop now exists (the cluster renders the
- * window controls *instead of* the pane actions in a detached window), so **that rule should
- * be deleted**; until it is, it would hide these three too. `.cluster .controls .control` is
- * three classes to its one-class-plus-attribute-plus-element (0,3,0 against 0,2,1), so the
- * controls survive either way. This is a stated overlap, not an accident — delete the other
- * rule and this selector can lose a level.
+ * One class, not three. `DetachedPaneWindow.module.css` used to carry
+ * `.body [data-audit='paneTitle'] button { display: none; }`, written when this component had
+ * no way to withhold its pane actions, and it matched these buttons too — they survived only
+ * because `.cluster .controls .control` outspecified it. That rule is gone (see the note where
+ * it stood), so the nesting that beat it is gone with it: a window whose only close button
+ * depends on winning a specificity race is a window one refactor away from being unclosable.
  */
 .controls {
   display: flex;
@@ -435,7 +455,7 @@
   gap: 2px;
 }
 
-.cluster .controls .control {
+.control {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -451,12 +471,12 @@
   line-height: 1;
 }
 
-.cluster .controls .control:hover {
+.control:hover {
   background: var(--chrome-hi);
   color: var(--text-hi);
 }
 
-.cluster .controls .control:focus-visible {
+.control:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
@@ -466,7 +486,7 @@
  * gesture re-docks the pane and kills nothing, so a permanently red control in the corner of
  * every detached window would advertise a danger that is not there.
  */
-.cluster .controls .controlClose:hover {
+.controlClose:hover {
   background: var(--red);
   color: var(--on-accent);
 }
