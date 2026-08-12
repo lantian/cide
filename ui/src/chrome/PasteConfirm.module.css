@@ -1,0 +1,224 @@
+/*
+ * The paste confirmation's body. The scrim and the 620px card come from `OverlayCard`
+ * (`overlays/Overlay.module.css`), so this file styles only what sits inside them.
+ *
+ * Deliberately the same measurements as `CloseConfirm.module.css`: 16/18px head padding,
+ * 12.5px body, the same button shape. The two are the only confirmations in the app and a
+ * user meets them a minute apart; two dialogs that are 4px and half a font-size different is
+ * how an app stops looking like one app. They are not merged into a shared stylesheet because
+ * the shared part is already `OverlayCard` — what is left is each dialog's own content, and a
+ * common file for that would be a place for one dialog's tweak to move the other.
+ *
+ * Every colour is a token, so both themes come out of `tokens.css`. `--red` appears once, on
+ * the answer that cannot be undone.
+ */
+
+/* Re-declares the column for the reason `CloseConfirm`'s wrapper does: `OverlayCard` makes the
+   card a flex column, and a plain block in between would make the list stop being the only
+   thing that scrolls. */
+.dialog {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.head {
+  flex: none;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.titleRow {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.title {
+  flex: 1;
+  min-width: 0;
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-hi);
+}
+
+/* `3 of 7`. Mono and dim: it is a position, not a message, and it must not compete with the
+   name of the file being asked about. */
+.progress {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.body {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--dim);
+}
+
+/* The full destination path. Mono, dim, and ellipsised from the end — the same treatment as
+   `CloseConfirm`'s `.where`, and for the same reason: two folders called `src` are the normal
+   case, so the dialog has to say which one. */
+.where {
+  margin: 6px 0 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+/*
+ * The sample of what would be overwritten.
+ *
+ * Capped in Rust at six entries, so this never needs to grow without bound — but it still
+ * scrolls, because a dialog taller than the window puts its own buttons off screen.
+ */
+.list {
+  flex: 1;
+  min-height: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  margin: 0;
+  padding: 6px 0;
+  list-style: none;
+}
+
+.groupLabel {
+  padding: 8px 18px 4px;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 3px 18px;
+  white-space: nowrap;
+}
+
+/* Red rather than the accent `CloseConfirm` uses for its dirty dot: these rows are not "at
+   risk if you continue", they are the exact files the button below destroys. */
+.mark {
+  flex: none;
+  width: 10px;
+  font-size: 10px;
+  line-height: 18px;
+  color: var(--red);
+}
+
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-hi);
+}
+
+.more {
+  padding-left: 37px;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+
+/* Pushed hard left, away from the three answers. A checkbox beside `Replace` is one that gets
+   ticked by a click that was 4px off — and this one multiplies whichever answer follows it. */
+.applyAll {
+  margin-right: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--dim);
+  cursor: default;
+}
+
+.applyAll input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.button {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1;
+  padding: 7px 13px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--chrome-hi);
+  color: var(--text);
+  cursor: default;
+}
+
+.button:hover {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
+ * *Keep both* is the default and the prominent one.
+ *
+ * It takes the accent fill, the initial focus and therefore the Enter key. Replace is the
+ * plain button: this dialog exists because something is about to be destroyed, and making the
+ * destruction the eye-catching default is how it gets clicked by reflex.
+ */
+.buttonPrimary {
+  background: var(--accent);
+  border-color: var(--accent);
+  /* `--bg`, not white: the accent is light in the dark theme and dark in the light one, and a
+     fixed label colour fails contrast in one of them. Same pair as `CloseConfirm`. */
+  color: var(--bg);
+  font-weight: 500;
+}
+
+.buttonPrimary:hover {
+  background: var(--accent-hi);
+  border-color: var(--accent-hi);
+  color: var(--bg);
+}
+
+.buttonDanger {
+  color: var(--red);
+}
+
+.buttonDanger:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* The claim the whole ordering exists to make, under the buttons rather than in the body: it
+   is reassurance about the Cancel beside it, not part of the question. */
+.note {
+  flex: none;
+  margin: 0;
+  padding: 0 18px 14px;
+  font-size: 11.5px;
+  line-height: 16px;
+  color: var(--faint);
+}

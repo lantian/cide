@@ -148,7 +148,11 @@ pub enum PasteMode {
 pub struct PastedEntry {
     #[ts(type = "string")]
     pub source: PathBuf,
-    /// Where it landed. Never a path that was overwritten — see `renamed`.
+    /// Where it landed.
+    ///
+    /// A path that was already occupied only when `replaced` is non-zero — that is, only when
+    /// the caller sent a `Replace` decision for this source. Otherwise the name moved out of
+    /// the way instead; see `renamed`.
     #[ts(type = "string")]
     pub dest: PathBuf,
     /// The destination took a *different* name because the one it wanted was taken.
@@ -164,4 +168,98 @@ pub struct PastedEntry {
     /// writer that never comes), and refusing a whole paste over one stray `.sock` in a project
     /// would be the worse answer. Counted so the panel can say so.
     pub skipped: u32,
+    /// Existing files this entry overwrote, because the user chose [`PasteChoice::Replace`].
+    ///
+    /// Zero for every paste nobody explicitly answered *Replace* to, which is the invariant
+    /// worth being able to read off the result: a non-zero count here can only come from a
+    /// decision that was sent with the command.
+    ///
+    /// More than one when a folder was merged: the answer was given about `src`, and the files
+    /// it overwrote were inside it. That is the number the panel says afterwards, because
+    /// "replaced src" describes something the user cannot check by looking.
+    pub replaced: u32,
+}
+
+/// What to do about one name a paste would land on that is already taken.
+///
+/// **There is no `Cancel` here on purpose.** Cancel is not a third thing the disk does; it is
+/// the command never being sent. Every question is answered *before* `fs_paste` is called, so a
+/// user who backs out halfway has nothing to undo — see [`PasteCollision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PasteChoice {
+    /// Overwrite what is there.
+    ///
+    /// **For two directories this is a *merge*, not a swap.** The pasted folder's contents are
+    /// laid into the existing one: files that exist in both are overwritten, files that exist
+    /// only in the destination are left alone. The alternative — delete the destination folder
+    /// and put the source in its place — is the one that destroys files the user never saw and
+    /// was never shown, so it is not what this word means here.
+    Replace,
+    /// The rename that has always shipped: `main.rs` beside a `main.rs` becomes `main copy.rs`.
+    KeepBoth,
+}
+
+/// One answer, bound to the source it answers for.
+///
+/// A list of pairs rather than a map keyed by path: JSON object keys would make a path with a
+/// `.` or a `/` in it a key nobody can round-trip safely, and the order the sources were given
+/// in is the order the questions were asked in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PasteDecision {
+    /// Exactly one of the paths in the paste's `sources`, matched by equality.
+    #[ts(type = "string")]
+    pub source: PathBuf,
+    pub choice: PasteChoice,
+}
+
+/// A name a paste is about to land on that something already occupies.
+///
+/// Answered by `fs_paste_plan` **before** anything is written, which is the whole shape of this
+/// feature: the dialog collects every answer, and only then is `fs_paste` called. A user who
+/// cancels at the fourth of seven questions has had nothing written on their behalf, so there
+/// is no partial paste to describe and no half-finished folder to clean up.
+///
+/// The counts are what make *Replace* an informed answer rather than a dare. A file collision
+/// costs one file; a folder merge can cost hundreds, and the number is the only way to know
+/// that before choosing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PasteCollision {
+    #[ts(type = "string")]
+    pub source: PathBuf,
+    /// The path that is already taken: `dest_dir` joined with the source's own name.
+    #[ts(type = "string")]
+    pub dest: PathBuf,
+    /// The last component, which is what the dialog says.
+    pub name: String,
+    /// Both sides are directories, so *Replace* means merge. See [`PasteChoice::Replace`].
+    pub merge: bool,
+    /// *Replace* is refused for this collision, and this sentence says why.
+    ///
+    /// Set when one side is a directory and the other is not — at the top, or anywhere inside a
+    /// folder being merged. Swapping a file for a folder is not a replacement of anything, and
+    /// guessing which one the user meant to keep is not a guess worth making. The dialog offers
+    /// only *Keep both* and *Cancel* when this is set, and `fs_paste` refuses a `Replace`
+    /// decision for it even if one is sent.
+    pub blocked: Option<String>,
+    /// How many existing **files** *Replace* would overwrite. 1 for a file-on-file collision.
+    pub replaces: u32,
+    /// Entries in the destination folder a merge would leave completely alone.
+    ///
+    /// A folder counts as one entry and is not descended into: this number exists to say "your
+    /// files are still there", and inflating it by counting a `node_modules` recursively would
+    /// make it read as noise.
+    pub keeps: u32,
+    /// The first few relative paths `replaces` counted, so the dialog can name names.
+    pub sample: Vec<String>,
+    /// The preview walk hit its budget: `replaces` and `keeps` are lower bounds.
+    ///
+    /// Reported rather than swallowed. "at least 4096 files" is an answer; a wrong exact number
+    /// in a dialog about data loss is not.
+    pub truncated: bool,
 }

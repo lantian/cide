@@ -15,7 +15,13 @@
  * until [`paste`] runs — see `cide_fs::copy` for why that is the whole point.
  */
 import { create } from 'zustand'
-import { fsClipboard, type PastedEntry, type ProjectId } from '@/ipc/client'
+import {
+  fsClipboard,
+  type PasteCollision,
+  type PasteDecision,
+  type PastedEntry,
+  type ProjectId,
+} from '@/ipc/client'
 import { copyText } from './copyText'
 import {
   clipboardText,
@@ -40,14 +46,33 @@ interface FileClipboardStore {
   /** Drop the clipboard. Escape in the tree, and every successful cut-paste. */
   clear: () => void
   /**
+   * Which names this paste would land on that are already taken. **Writes nothing.**
+   *
+   * Always called before [`paste`], and the empty answer — the common one — means the paste can
+   * go straight through with no dialog. Anything in it is a question for `PasteConfirm`, whose
+   * answers come back as the `decisions` argument below. Asking first is what makes cancelling
+   * free: there is no half-finished paste to describe, because none has started.
+   *
+   * Rejects with the same `FsError` a paste would; the caller reports it and asks nothing.
+   */
+  plan: (project: ProjectId, destDir: string) => Promise<PasteCollision[]>
+  /**
    * Paste into `destDir`. Resolves to the sentence the panel should show, or `null` when
    * there is nothing worth saying — see `pastedSummary`.
+   *
+   * `decisions` are the dialog's answers, and the only thing that can make this overwrite a
+   * file. An empty list is the ordinary call: every collision is then renamed, exactly as
+   * before this dialog existed.
    *
    * Rejects with the tagged `FsError` on refusal; the caller reports it. A cut clears the
    * clipboard on success and **only** on success: a failed move must leave the clip alone so
    * the user can fix the reason and press Ctrl+V again.
    */
-  paste: (project: ProjectId, destDir: string) => Promise<PasteResult>
+  paste: (
+    project: ProjectId,
+    destDir: string,
+    decisions: readonly PasteDecision[],
+  ) => Promise<PasteResult>
 }
 
 export interface PasteResult {
@@ -74,11 +99,17 @@ export const useFileClipboard = create<FileClipboardStore>((set, get) => ({
     set({ clip: null })
   },
 
-  async paste(project, destDir) {
+  async plan(project, destDir) {
+    const clip = get().clip
+    if (clip === null) return []
+    return fsClipboard.plan(project, clip.paths, destDir, clip.mode)
+  },
+
+  async paste(project, destDir, decisions) {
     const clip = get().clip
     if (clip === null) return { paths: [], note: null }
 
-    const entries = await fsClipboard.paste(project, clip.paths, destDir, clip.mode)
+    const entries = await fsClipboard.paste(project, clip.paths, destDir, clip.mode, decisions)
     // A cut is consumed by the paste it was made for. A copy is not: pressing Ctrl+V twice is
     // how anyone makes two copies, and clearing here would make the second press do nothing.
     if (clip.mode === 'cut') set({ clip: null })

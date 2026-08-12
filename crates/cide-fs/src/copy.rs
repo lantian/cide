@@ -7,20 +7,48 @@
 //!
 //! # The four decisions, and what lost
 //!
-//! **A collision never overwrites, and never refuses.** Pasting `main.rs` into a directory
-//! that already has one produces `main copy.rs`, then `main copy 2.rs`. The two alternatives
-//! were both worse from here: *overwrite* destroys a file that is not the one the user was
-//! pointing at, and this layer has no way to ask — a confirmation dialog belongs to a webview
-//! that has already sent the command. *Refuse* is safe and makes the ordinary gesture (paste
-//! a file beside itself to duplicate it) impossible, which is how a paste ends up feeling
-//! broken. Finder and VS Code both rename; so does this, and [`PastedEntry::renamed`] carries
-//! the fact back so the panel can say what happened rather than leaving the user to spot it.
+//! **A collision is asked about, and the default answer is still the rename.** Pasting
+//! `main.rs` into a directory that already has one produces `main copy.rs`, then
+//! `main copy 2.rs` — unless the caller sent a [`PasteChoice::Replace`] for that source, which
+//! is the only thing in this module that can destroy a file the user already had.
+//!
+//! It shipped without the question, and the answer to
+//!
+//! > *"Paste collisions - yes, should be a confirmation"*
+//!
+//! is [`plan`]: it answers every collision *before* anything is written, so the dialog can ask
+//! all of its questions and only then call [`paste_with`]. That ordering is the feature. Asking
+//! *during* the write is the version where a user who backs out at the fourth of seven
+//! questions is left with three files already on disk and a dialog apologising for it; here,
+//! cancelling means the command was never sent and nothing was written at all.
+//!
+//! The two rejected shapes are still rejected. *Always overwrite* destroys a file that is not
+//! the one the user was pointing at. *Always refuse* makes the ordinary gesture — paste a file
+//! beside itself to duplicate it — impossible, which is how a paste ends up feeling broken; so
+//! a paste into the source's **own folder** is a duplicate and is never asked about at all.
+//! [`PastedEntry::renamed`] still carries the rename back, because the row the user was looking
+//! at is still there holding the older file.
 //!
 //! The renaming is not a check-then-create. The name is *claimed* with `create_new`/
 //! `create_dir`, which fail atomically when something is already there, and the loop moves to
 //! the next candidate — so two pastes racing each other, or a `git checkout` landing between
 //! the check and the write, cannot end with one clobbering the other. That is the whole reason
 //! the reservation exists rather than a `Path::exists` call.
+//!
+//! **An overwrite is as deliberate as the refusal it replaces.** Nothing here ever writes over
+//! a path the caller did not name in a decision, and no overwrite is a truncate-in-place: the
+//! new bytes go to a uniquely named sibling and arrive by `rename(2)`, so the destination holds
+//! either the old file or the new one and never half of the new one. A copy that failed a
+//! megabyte in would otherwise leave the user's file destroyed *and* the replacement
+//! incomplete, which is worse than either outcome the dialog offered.
+//!
+//! **Replacing a folder with a folder is a merge, and that word is load-bearing.** The
+//! contents are laid into the existing directory: a file in both is overwritten, a file only in
+//! the destination is left exactly where it is. The other reading — remove the destination and
+//! put the source in its place — deletes files that were never on screen and never mentioned,
+//! and no count in a dialog can make that safe. Replacing a file **with** a directory (or the
+//! reverse) is not a replacement of anything and is refused outright: [`FsError::CannotReplace`],
+//! raised by [`plan`] before the question is even asked.
 //!
 //! **A cut moves nothing until it is pasted.** [`PasteMode`] travels with the paste; Ctrl+X
 //! only writes to a clipboard in the frontend. A cut that is never pasted therefore costs
@@ -52,10 +80,12 @@
 //! * **Hard links become separate files**, and extended attributes are dropped. Both are
 //!   `cp`'s default behaviour too.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
-use cide_ipc::{PasteMode, PastedEntry};
+use cide_ipc::{PasteChoice, PasteCollision, PasteDecision, PasteMode, PastedEntry};
 
 use crate::error::{FsError, Result};
 use crate::ops;
@@ -67,30 +97,68 @@ use crate::ops;
 /// a hung paste with no error — the failure mode this whole crate keeps writing comments about.
 const MAX_CANDIDATES: u32 = 1000;
 
-/// Paste `sources` into `dest_dir`.
+/// How many entries a merge preview reads before it stops counting and says so.
 ///
-/// Every source is checked before any source moves, so a selection with one bad path in it
-/// pastes nothing rather than half of itself — the same rule `ops::delete`'s caller follows,
-/// and for the same reason: a partial result the caller was told nothing about is what leaves
-/// a tree drawing files that are not there.
+/// [`plan`] runs before the user has agreed to anything, so it must not be the expensive half
+/// of the gesture: walking a `node_modules` on both sides to produce a number nobody reads past
+/// the first two digits is a dialog that takes a second to open. Past this the counts become
+/// lower bounds and [`PasteCollision::truncated`] says so — which is a true answer, unlike an
+/// exact number that took a second to compute or a wrong one that took none.
+const PREVIEW_LIMIT: u32 = 4096;
+
+/// How many of the files a merge would overwrite are named individually.
 ///
-/// Once the work starts a failure part way through cannot be undone. What did land is carried
-/// in [`FsError::PartialPaste`] rather than discarded, unless *nothing* landed, in which case
-/// the caller gets the real error instead of a wrapper claiming a partial success of zero.
+/// Six, because the dialog is a list the user reads, not a manifest. The rest are the count.
+const PREVIEW_SAMPLE: usize = 6;
+
+/// Paste `sources` into `dest_dir`, renaming every collision.
+///
+/// The four-argument form, kept because it is what every caller that has no dialog wants and
+/// what the collision tests are written against: no decision means [`PasteChoice::KeepBoth`],
+/// which is the behaviour that shipped. Nothing reachable from here can overwrite.
 pub fn paste(
     roots: &[PathBuf],
     sources: &[PathBuf],
     dest_dir: &Path,
     mode: PasteMode,
 ) -> Result<Vec<PastedEntry>> {
+    paste_with(roots, sources, dest_dir, mode, &[])
+}
+
+/// Paste `sources` into `dest_dir`, answering collisions with `decisions`.
+///
+/// Every source is checked before any source moves, so a selection with one bad path in it
+/// pastes nothing rather than half of itself — the same rule `ops::delete`'s caller follows,
+/// and for the same reason: a partial result the caller was told nothing about is what leaves
+/// a tree drawing files that are not there. A [`PasteChoice::Replace`] whose two sides are not
+/// the same kind is refused in that same pass, so the file-for-a-folder case costs nothing
+/// rather than stopping half way down a list.
+///
+/// A source with no decision is [`PasteChoice::KeepBoth`]. That default is the safety property:
+/// this function overwrites **only** what it was explicitly told to, so a caller that forgets
+/// to pass its decisions along renames rather than destroys.
+///
+/// Once the work starts a failure part way through cannot be undone. What did land is carried
+/// in [`FsError::PartialPaste`] rather than discarded, unless *nothing* landed, in which case
+/// the caller gets the real error instead of a wrapper claiming a partial success of zero.
+pub fn paste_with(
+    roots: &[PathBuf],
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mode: PasteMode,
+    decisions: &[PasteDecision],
+) -> Result<Vec<PastedEntry>> {
     check_dest(roots, dest_dir)?;
     for source in sources {
         check_source(roots, source, dest_dir, mode)?;
+        if matches!(choice_for(decisions, source), PasteChoice::Replace) {
+            check_replaceable(source, dest_dir)?;
+        }
     }
 
     let mut done: Vec<PastedEntry> = Vec::with_capacity(sources.len());
     for source in sources {
-        match paste_one(source, dest_dir, mode) {
+        match paste_one(source, dest_dir, mode, choice_for(decisions, source)) {
             Ok(entry) => done.push(entry),
             // The first source failing is not a partial anything. Reporting it as one would
             // wrap a perfectly clear "already exists" in a sentence about zero paths.
@@ -109,6 +177,212 @@ pub fn paste(
         }
     }
     Ok(done)
+}
+
+/// Every name this paste would land on that is already taken — **and nothing is written**.
+///
+/// The read half of the gesture, run first so the dialog has something to ask about. It repeats
+/// [`paste_with`]'s own checks so that a refusal the user cannot answer (outside the project, a
+/// folder into itself) arrives *instead of* a question rather than after one; the frontend
+/// reports it the same way it reports a rejected paste.
+///
+/// An empty answer means "go ahead, nothing is in the way". That is the common case, and it is
+/// the reason this is a separate call rather than a flag on `fs_paste`: the ordinary paste stays
+/// one round trip with no dialog in it.
+///
+/// Racy by nature, and deliberately not defended against here. A name can be taken between this
+/// answer and the paste, and a name that was taken can be freed. Both are handled where they
+/// have to be — [`paste_one`] claims names atomically, and a `Replace` whose destination has
+/// vanished falls back to claiming the free name rather than inventing a file to overwrite.
+pub fn plan(
+    roots: &[PathBuf],
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    mode: PasteMode,
+) -> Result<Vec<PasteCollision>> {
+    check_dest(roots, dest_dir)?;
+    for source in sources {
+        check_source(roots, source, dest_dir, mode)?;
+    }
+    let mut out = Vec::new();
+    for source in sources {
+        if let Some(collision) = collision_for(source, dest_dir)? {
+            out.push(collision);
+        }
+    }
+    Ok(out)
+}
+
+/// The answer for one source, defaulting to the rename.
+fn choice_for(decisions: &[PasteDecision], source: &Path) -> PasteChoice {
+    decisions
+        .iter()
+        .find(|decision| decision.source == source)
+        .map_or(PasteChoice::KeepBoth, |decision| decision.choice)
+}
+
+/// Refuse a `Replace` that is not one, before anything is written.
+///
+/// The kind mismatch is checked at the top *and* everywhere inside a merge, by walking the pair
+/// exactly as [`plan`] does. Doing it here rather than discovering it half way through the
+/// recursion is the difference between a refusal and a directory left half merged: by the time
+/// `merge_into` meets a file where it expected a folder, it has already overwritten everything
+/// above it.
+fn check_replaceable(source: &Path, dest_dir: &Path) -> Result<()> {
+    match collision_for(source, dest_dir)? {
+        Some(collision) => match collision.blocked {
+            Some(why) => Err(FsError::CannotReplace(why)),
+            None => Ok(()),
+        },
+        // Nothing is there to replace. Not an error: the name may have been freed since the
+        // question was asked, and `paste_one` will claim it like any other free name.
+        None => Ok(()),
+    }
+}
+
+/// What is in the way of `source` landing in `dest_dir`, or `None`.
+fn collision_for(source: &Path, dest_dir: &Path) -> Result<Option<PasteCollision>> {
+    // A paste into the folder the source is already in is never a collision, and this is the
+    // line that keeps *duplicate a file beside itself* a single gesture. The file would collide
+    // with itself; asking "replace main.rs with main.rs?" is a question with no good answer, and
+    // the only honest one — Keep both — is what the rename already does.
+    if source.parent() == Some(dest_dir) {
+        return Ok(None);
+    }
+    let name = name_of(source)?;
+    let dest = dest_dir.join(name);
+    let Some(existing) = optional_meta(&dest)? else {
+        return Ok(None);
+    };
+    // `symlink_metadata` on both sides: a symlink is a thing in its own right here, so a link
+    // sitting on the name is a collision, and a link is never "a directory" — replacing one
+    // with a folder would be the mismatch below, which is exactly right.
+    let meta = std::fs::symlink_metadata(source).map_err(|e| FsError::io(source, e))?;
+
+    let mut collision = PasteCollision {
+        source: source.to_path_buf(),
+        dest,
+        name: name.to_string(),
+        merge: false,
+        blocked: None,
+        replaces: 0,
+        keeps: 0,
+        sample: Vec::new(),
+        truncated: false,
+    };
+    if meta.is_dir() != existing.is_dir() {
+        collision.blocked = Some(mismatch_message(name, meta.is_dir()));
+        return Ok(Some(collision));
+    }
+    if meta.is_dir() {
+        collision.merge = true;
+        let mut seen = 0;
+        // Cloned out first: the walk fills in the counts on `collision`, so it cannot also
+        // borrow the destination path out of it.
+        let into = collision.dest.clone();
+        preview_merge(source, &into, "", &mut collision, &mut seen)?;
+    } else {
+        collision.replaces = 1;
+    }
+    Ok(Some(collision))
+}
+
+/// The sentence a kind mismatch is refused with. Names which side is which.
+fn mismatch_message(what: &str, source_is_dir: bool) -> String {
+    let (from, to) = if source_is_dir {
+        ("a folder", "a file")
+    } else {
+        ("a file", "a folder")
+    };
+    format!(
+        "“{what}” is {from} and what is already there is {to} — replacing one with the other \
+         would delete something nobody named. Keep both, or remove it yourself first."
+    )
+}
+
+/// Count what merging `source` into `dest` would overwrite and what it would leave alone.
+///
+/// Both are directories. The destination's entries are read into a map and *removed* as the
+/// source's names are matched against them, so what is left at the end is precisely the set the
+/// merge does not touch — which is the number that makes the answer safe to give.
+fn preview_merge(
+    source: &Path,
+    dest: &Path,
+    rel: &str,
+    out: &mut PasteCollision,
+    seen: &mut u32,
+) -> Result<()> {
+    let mut existing: HashMap<OsString, bool> = HashMap::new();
+    for entry in std::fs::read_dir(dest).map_err(|e| FsError::io(dest, e))? {
+        let entry = entry.map_err(|e| FsError::io(dest, e))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| FsError::io(&entry.path(), e))?;
+        existing.insert(entry.file_name(), kind.is_dir());
+    }
+
+    for entry in std::fs::read_dir(source).map_err(|e| FsError::io(source, e))? {
+        // One refusal is enough: the dialog cannot offer Replace either way, and walking on to
+        // find a second one only makes the answer slower.
+        if out.blocked.is_some() {
+            return Ok(());
+        }
+        if *seen >= PREVIEW_LIMIT {
+            out.truncated = true;
+            return Ok(());
+        }
+        *seen += 1;
+        let entry = entry.map_err(|e| FsError::io(source, e))?;
+        let name = entry.file_name();
+        let kind = entry
+            .file_type()
+            .map_err(|e| FsError::io(&entry.path(), e))?;
+        let Some(dest_is_dir) = existing.remove(&name) else {
+            // A name only the source has. The merge creates it and destroys nothing.
+            continue;
+        };
+        let child_rel = join_rel(rel, &name);
+        if kind.is_dir() != dest_is_dir {
+            out.blocked = Some(mismatch_message(&child_rel, kind.is_dir()));
+            return Ok(());
+        }
+        if kind.is_dir() {
+            preview_merge(&entry.path(), &dest.join(&name), &child_rel, out, seen)?;
+        } else {
+            out.replaces += 1;
+            if out.sample.len() < PREVIEW_SAMPLE {
+                out.sample.push(child_rel);
+            }
+        }
+    }
+
+    // Whatever is left in the map is destination-only, at this level. Counted, not descended
+    // into: this number is here to say "your files are still there", and a recursive count over
+    // an untouched `node_modules` would drown that in five digits.
+    out.keeps += u32::try_from(existing.len()).unwrap_or(u32::MAX);
+    Ok(())
+}
+
+/// `src/main.rs` from `src` and `main.rs`, for the dialog to print.
+///
+/// Lossy on purpose and only here: this string is *shown*, never opened. Every path this module
+/// acts on is a real `Path`, and `name_of` still refuses a non-UTF-8 name at the top of a paste.
+fn join_rel(rel: &str, name: &OsString) -> String {
+    let leaf = name.to_string_lossy();
+    if rel.is_empty() {
+        leaf.into_owned()
+    } else {
+        format!("{rel}/{leaf}")
+    }
+}
+
+/// `symlink_metadata`, with "nothing is there" as a value rather than an error.
+fn optional_meta(path: &Path) -> Result<Option<Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FsError::io(path, err)),
+    }
 }
 
 /// The folder a paste lands in has to be inside the project and has to still be a folder.
@@ -166,7 +440,12 @@ fn name_of(path: &Path) -> Result<&str> {
         .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
 }
 
-fn paste_one(source: &Path, dest_dir: &Path, mode: PasteMode) -> Result<PastedEntry> {
+fn paste_one(
+    source: &Path,
+    dest_dir: &Path,
+    mode: PasteMode,
+    choice: PasteChoice,
+) -> Result<PastedEntry> {
     let meta = std::fs::symlink_metadata(source).map_err(|e| FsError::io(source, e))?;
     let name = name_of(source)?;
 
@@ -181,10 +460,34 @@ fn paste_one(source: &Path, dest_dir: &Path, mode: PasteMode) -> Result<PastedEn
             dest: source.to_path_buf(),
             renamed: false,
             skipped: 0,
+            replaced: 0,
         });
     }
 
     let directory = meta.is_dir();
+
+    // The one branch that can destroy something, and it is reachable only from a decision the
+    // caller sent. `source.parent() != dest_dir` guards the duplicate gesture a second time:
+    // `plan` never reports that as a collision, so a Replace arriving for one is a caller bug —
+    // and honouring it would be a file copying over itself through a temporary, which is the
+    // one way this module could lose a file with nothing left to blame.
+    if matches!(choice, PasteChoice::Replace) && source.parent() != Some(dest_dir) {
+        let dest = dest_dir.join(name);
+        if optional_meta(&dest)?.is_some() {
+            let mut tally = Tally::default();
+            replace_onto(source, &dest, &meta, mode, &mut tally)?;
+            return Ok(PastedEntry {
+                source: source.to_path_buf(),
+                dest,
+                renamed: false,
+                skipped: tally.skipped,
+                replaced: tally.replaced,
+            });
+        }
+        // The name came free between the question and the answer. Fall through and claim it the
+        // ordinary way rather than conjuring a destination to overwrite.
+    }
+
     let (dest, renamed) = reserve(dest_dir, name, directory)?;
     match place(source, &dest, &meta, mode) {
         Ok(skipped) => Ok(PastedEntry {
@@ -192,6 +495,7 @@ fn paste_one(source: &Path, dest_dir: &Path, mode: PasteMode) -> Result<PastedEn
             dest,
             renamed,
             skipped,
+            replaced: 0,
         }),
         Err(err) => {
             // Safe to remove without looking: the reservation *created* this path, so
@@ -216,27 +520,38 @@ fn paste_one(source: &Path, dest_dir: &Path, mode: PasteMode) -> Result<PastedEn
 fn reserve(dir: &Path, name: &str, directory: bool) -> Result<(PathBuf, bool)> {
     for attempt in 0..MAX_CANDIDATES {
         let candidate = dir.join(candidate_name(name, attempt, directory));
-        let made = if directory {
-            std::fs::create_dir(&candidate)
-        } else {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-                .map(|_| ())
-        };
-        match made {
-            Ok(()) => return Ok((candidate, attempt > 0)),
-            // Includes a *dangling* symlink sitting on the name, which `Path::exists` reports
-            // as absent. It is a real directory entry and the kernel says so.
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(FsError::io(&candidate, err)),
+        if claim(&candidate, directory)? {
+            return Ok((candidate, attempt > 0));
         }
     }
     Err(FsError::Io {
         path: dir.display().to_string(),
         message: format!("already holds {MAX_CANDIDATES} entries named after “{name}”"),
     })
+}
+
+/// Take `path` for a paste, answering whether it was free.
+///
+/// The claim *is* the creation, which is the whole safety property of this module: `create_dir`
+/// and `create_new` fail with `EEXIST` in the kernel, so nothing between a test and a write can
+/// lose a file. A `Path::exists` check followed by a copy is the version of this that overwrites
+/// under a race — including against a *dangling* symlink sitting on the name, which `exists`
+/// reports as absent and the kernel does not.
+fn claim(path: &Path, directory: bool) -> Result<bool> {
+    let made = if directory {
+        std::fs::create_dir(path)
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map(|_| ())
+    };
+    match made {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(FsError::io(path, err)),
+    }
 }
 
 /// The name to try on the `attempt`-th go: `main.rs`, `main copy.rs`, `main copy 2.rs`.
@@ -313,6 +628,177 @@ fn is_cross_device(err: &std::io::Error) -> bool {
         let _ = err;
         false
     }
+}
+
+/// What one *Replace* did, accumulated through the recursion.
+#[derive(Default)]
+struct Tally {
+    /// Existing files overwritten. The number the panel says afterwards.
+    replaced: u32,
+    /// Sockets, fifos and devices left behind, exactly as a fresh copy leaves them.
+    skipped: u32,
+}
+
+/// Overwrite `dest`, which exists, with `source`.
+///
+/// The kind is checked once more here even though [`check_replaceable`] already refused a
+/// mismatch: between that pass and this one a `git checkout` can turn a file into a directory,
+/// and the whole point of the refusal is that nothing guesses which of the two to keep.
+fn replace_onto(
+    source: &Path,
+    dest: &Path,
+    meta: &Metadata,
+    mode: PasteMode,
+    tally: &mut Tally,
+) -> Result<()> {
+    let existing = std::fs::symlink_metadata(dest).map_err(|e| FsError::io(dest, e))?;
+    if meta.is_dir() != existing.is_dir() {
+        return Err(FsError::CannotReplace(mismatch_message(
+            name_of(dest)?,
+            meta.is_dir(),
+        )));
+    }
+    if meta.is_dir() {
+        merge_into(source, dest, mode, tally)
+    } else {
+        replace_leaf(source, dest, meta, mode, tally)
+    }
+}
+
+/// Lay `source`'s contents into the existing directory `dest`.
+///
+/// **A merge, not a swap.** A name only the destination has is not touched and not counted; a
+/// name only the source has is created; a name both have is recursed into when both are folders
+/// and overwritten when both are leaves. The rejected alternative — `remove_dir_all(dest)` and
+/// then an ordinary paste — is four lines shorter and deletes every file the user had in there
+/// that the source happens not to contain, which is a set nothing ever showed them.
+///
+/// There is no rollback. Half a merge cannot be undone, because undoing it means restoring
+/// files this process overwrote and it does not keep them. That is why the question is asked
+/// before the first byte is written and why a mismatch is refused in [`check_replaceable`]
+/// rather than discovered here.
+fn merge_into(source: &Path, dest: &Path, mode: PasteMode, tally: &mut Tally) -> Result<()> {
+    for entry in std::fs::read_dir(source).map_err(|e| FsError::io(source, e))? {
+        let entry = entry.map_err(|e| FsError::io(source, e))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| FsError::io(&entry.path(), e))?;
+        if !(kind.is_dir() || kind.is_file() || kind.is_symlink()) {
+            // A fifo, a socket, a device node — skipped for the reason `copy_dir_contents`
+            // skips them: reading one blocks until somebody writes to the other end.
+            tally.skipped += 1;
+            continue;
+        }
+
+        let name = entry.file_name();
+        let child = entry.path();
+        let target = dest.join(&name);
+        let child_meta = std::fs::symlink_metadata(&child).map_err(|e| FsError::io(&child, e))?;
+        let directory = child_meta.is_dir();
+
+        if claim(&target, directory)? {
+            match place(&child, &target, &child_meta, mode) {
+                Ok(skipped) => tally.skipped += skipped,
+                Err(err) => {
+                    // Safe to remove unlooked-at: the claim created this path a moment ago, so
+                    // nothing under it is the user's.
+                    let _ = if directory {
+                        std::fs::remove_dir_all(&target)
+                    } else {
+                        std::fs::remove_file(&target)
+                    };
+                    return Err(err);
+                }
+            }
+            continue;
+        }
+
+        let existing = std::fs::symlink_metadata(&target).map_err(|e| FsError::io(&target, e))?;
+        if directory && existing.is_dir() {
+            merge_into(&child, &target, mode, tally)?;
+        } else if directory != existing.is_dir() {
+            return Err(FsError::CannotReplace(mismatch_message(
+                &name.to_string_lossy(),
+                directory,
+            )));
+        } else {
+            replace_leaf(&child, &target, &child_meta, mode, tally)?;
+        }
+    }
+
+    if matches!(mode, PasteMode::Cut) {
+        // Every entry left by its own `rename`, so the folder is empty unless something was
+        // skipped. `remove_dir` refuses a non-empty one, which is exactly the check wanted: the
+        // leftovers are reported through `skipped` and the user still has them.
+        let _ = std::fs::remove_dir(source);
+    }
+    Ok(())
+}
+
+/// Overwrite one existing non-directory `dest` with `source`.
+fn replace_leaf(
+    source: &Path,
+    dest: &Path,
+    meta: &Metadata,
+    mode: PasteMode,
+    tally: &mut Tally,
+) -> Result<()> {
+    tally.replaced += 1;
+    if matches!(mode, PasteMode::Cut) {
+        return move_over(source, dest, meta);
+    }
+    if meta.file_type().is_symlink() {
+        // Already a temporary-plus-rename, so it lands on an occupied name in one step.
+        return link_onto(source, dest);
+    }
+    copy_over(source, dest)
+}
+
+/// A cut's overwrite: one `rename(2)`, which replaces the destination atomically.
+fn move_over(source: &Path, dest: &Path, meta: &Metadata) -> Result<()> {
+    match std::fs::rename(source, dest) {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device(&err) => {
+            // Same fallback as `place`, and the same reason the source goes to the trash rather
+            // than being unlinked: the copy's success is only as good as the return codes that
+            // reported it.
+            if meta.file_type().is_symlink() {
+                link_onto(source, dest)?;
+            } else {
+                copy_over(source, dest)?;
+            }
+            crate::trash::move_to_trash(source)?;
+            Ok(())
+        }
+        Err(err) => Err(FsError::io(source, err)),
+    }
+}
+
+/// Copy `source` over an existing `dest`, through a sibling and a `rename(2)`.
+///
+/// Not `std::fs::copy(source, dest)`, which truncates the destination first: a copy that fails
+/// a megabyte in would leave the user's file destroyed *and* the replacement incomplete — a
+/// third outcome the dialog never offered. Through a temporary, `dest` holds the old file or
+/// the new one and nothing in between, and a failure leaves the old one exactly as it was.
+///
+/// The temporary is a sibling so that the `rename` is within one filesystem; `/tmp` is
+/// routinely a different mount and would turn the atomic step back into a copy.
+fn copy_over(source: &Path, dest: &Path) -> Result<()> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| FsError::InvalidPath(dest.display().to_string()))?;
+    let name = name_of(dest)?;
+    let tmp = dir.join(format!(".{}.cide-paste-{}.tmp", name, std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(err) = std::fs::copy(source, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(FsError::io(source, err));
+    }
+    if let Err(err) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(FsError::io(dest, err));
+    }
+    Ok(())
 }
 
 /// Copy `source` onto the placeholder at `dest`. Returns the count of skipped entries.
@@ -424,6 +910,17 @@ mod tests {
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// Every name in `dir`, sorted — for asserting that a read wrote nothing.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     /// The name arithmetic, which is the whole of the collision policy.
@@ -899,6 +1396,516 @@ mod tests {
         assert_eq!(out[0].skipped, 1, "the fifo was not reported as skipped");
         assert_eq!(read(&dir.join("into/pkg/a.rs")), "a");
         assert!(!dir.join("into/pkg/pipe").exists());
+    }
+
+    // --- the confirmation: asking first, and the three answers ---------------------------
+    //
+    // > *"Paste collisions - yes, should be a confirmation"*
+    //
+    // The dialog is `ui/src/chrome/PasteConfirm.tsx` and its wording is pinned by
+    // `check-fs-clipboard.mjs`. What is pinned *here* is the half a dialog cannot promise:
+    // that the question can be asked without writing anything, that Replace is reachable only
+    // by asking for it, and that backing out leaves the disk exactly as it was.
+
+    fn replace(source: PathBuf) -> PasteDecision {
+        PasteDecision {
+            source,
+            choice: PasteChoice::Replace,
+        }
+    }
+
+    /// `plan` reads, and only reads.
+    ///
+    /// The whole ordering rests on this: the questions are answered before the first byte is
+    /// written, so *Cancel* is a command that is never sent rather than an apology for three
+    /// files that already landed. A `plan` that created so much as a placeholder would make
+    /// cancelling a thing with consequences.
+    #[test]
+    fn planning_a_paste_writes_nothing_at_all() {
+        let dir = scratch("plan-writes-nothing");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::write(dir.join("main.rs"), "new").unwrap();
+        std::fs::write(dir.join("into/main.rs"), "already here").unwrap();
+        std::fs::write(dir.join("fresh.rs"), "f").unwrap();
+
+        let before: Vec<String> = names_in(&dir.join("into"));
+        let collisions = plan(
+            &roots,
+            &[dir.join("main.rs"), dir.join("fresh.rs")],
+            &dir.join("into"),
+            PasteMode::Copy,
+        )
+        .unwrap();
+
+        assert_eq!(collisions.len(), 1, "only the taken name is a question");
+        assert_eq!(collisions[0].name, "main.rs");
+        assert_eq!(collisions[0].dest, dir.join("into/main.rs"));
+        assert_eq!(collisions[0].replaces, 1);
+        assert!(!collisions[0].merge);
+        assert!(collisions[0].blocked.is_none());
+
+        // The destination is byte-for-byte what it was, and nothing new appeared beside it —
+        // no placeholder, no `.tmp`, no `main copy.rs` reserved in advance.
+        assert_eq!(read(&dir.join("into/main.rs")), "already here");
+        assert_eq!(names_in(&dir.join("into")), before);
+    }
+
+    /// The answer the user asked for, and the one that shipped instead.
+    #[test]
+    fn replace_overwrites_and_keep_both_still_renames() {
+        let dir = scratch("replace-file");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::write(dir.join("main.rs"), "new").unwrap();
+        std::fs::write(dir.join("into/main.rs"), "old").unwrap();
+
+        // Keep both is the default, and is what an empty decision list means.
+        let kept = paste(
+            &roots,
+            &[dir.join("main.rs")],
+            &dir.join("into"),
+            PasteMode::Copy,
+        )
+        .unwrap();
+        assert_eq!(kept[0].dest, dir.join("into/main copy.rs"));
+        assert_eq!(kept[0].replaced, 0);
+        assert_eq!(read(&dir.join("into/main.rs")), "old");
+
+        let out = paste_with(
+            &roots,
+            &[dir.join("main.rs")],
+            &dir.join("into"),
+            PasteMode::Copy,
+            &[replace(dir.join("main.rs"))],
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].dest,
+            dir.join("into/main.rs"),
+            "the name did not move"
+        );
+        assert!(!out[0].renamed);
+        assert_eq!(out[0].replaced, 1, "the caller has to be told what it cost");
+        assert_eq!(read(&dir.join("into/main.rs")), "new");
+        // The rename from the first paste is still there. Replace replaced one file, not the
+        // folder's history.
+        assert_eq!(read(&dir.join("into/main copy.rs")), "new");
+        assert!(
+            names_in(&dir.join("into"))
+                .iter()
+                .all(|n| !n.contains("tmp")),
+            "the temporary the overwrite goes through was left behind"
+        );
+    }
+
+    /// A decision names *one* source, and reaches no further than that.
+    ///
+    /// The bug this rules out is a policy flag: `overwrite: true` on the command would answer
+    /// for every path in the selection, including the ones the user was never asked about.
+    #[test]
+    fn a_decision_replaces_only_the_source_it_names() {
+        let dir = scratch("replace-scoped");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::write(dir.join("a.rs"), "new a").unwrap();
+        std::fs::write(dir.join("b.rs"), "new b").unwrap();
+        std::fs::write(dir.join("into/a.rs"), "old a").unwrap();
+        std::fs::write(dir.join("into/b.rs"), "old b").unwrap();
+
+        let out = paste_with(
+            &roots,
+            &[dir.join("a.rs"), dir.join("b.rs")],
+            &dir.join("into"),
+            PasteMode::Copy,
+            &[replace(dir.join("a.rs"))],
+        )
+        .unwrap();
+
+        assert_eq!(read(&dir.join("into/a.rs")), "new a");
+        assert_eq!(
+            read(&dir.join("into/b.rs")),
+            "old b",
+            "b was never asked about"
+        );
+        assert_eq!(out[1].dest, dir.join("into/b copy.rs"));
+        assert_eq!(out[1].replaced, 0);
+    }
+
+    /// *Apply to all remaining* is a list of decisions, and it covers exactly the rest.
+    ///
+    /// The frontend builds the list (`ui/src/chrome/pasteConfirm.ts`); this is the half that
+    /// has to honour it — three answers arriving as three entries and three overwrites, with
+    /// nothing renamed and nothing asked about twice.
+    #[test]
+    fn answering_the_rest_at_once_replaces_every_one_of_them() {
+        let dir = scratch("replace-all");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        let sources: Vec<PathBuf> = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|name| {
+                std::fs::write(dir.join(name), format!("new {name}")).unwrap();
+                std::fs::write(dir.join("into").join(name), "old").unwrap();
+                dir.join(name)
+            })
+            .collect();
+
+        let decisions: Vec<PasteDecision> = sources.iter().cloned().map(replace).collect();
+        let out = paste_with(
+            &roots,
+            &sources,
+            &dir.join("into"),
+            PasteMode::Copy,
+            &decisions,
+        )
+        .unwrap();
+
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|e| e.replaced == 1 && !e.renamed));
+        assert_eq!(read(&dir.join("into/a.rs")), "new a.rs");
+        assert_eq!(read(&dir.join("into/c.rs")), "new c.rs");
+        assert_eq!(
+            names_in(&dir.join("into")).len(),
+            3,
+            "a rename crept in beside an overwrite"
+        );
+    }
+
+    /// Replacing a folder with a folder **merges**, and the count says so beforehand.
+    ///
+    /// The rejected reading is `remove_dir_all(dest)` followed by a plain paste. It is shorter,
+    /// it is what "replace" sounds like, and it deletes every file in the destination that the
+    /// source happens not to contain — a set the user was never shown. `keeps` is the number
+    /// that makes the difference visible in the dialog.
+    #[test]
+    fn replacing_a_folder_merges_and_leaves_what_only_the_destination_had() {
+        let dir = scratch("replace-merge");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "new main").unwrap();
+        std::fs::write(dir.join("src/added.rs"), "brand new").unwrap();
+        std::fs::write(dir.join("src/deep/nested.rs"), "new nested").unwrap();
+
+        std::fs::create_dir_all(dir.join("into/src/deep")).unwrap();
+        std::fs::write(dir.join("into/src/main.rs"), "old main").unwrap();
+        std::fs::write(dir.join("into/src/theirs.rs"), "only theirs").unwrap();
+        std::fs::write(dir.join("into/src/deep/nested.rs"), "old nested").unwrap();
+        std::fs::write(dir.join("into/src/deep/keep.rs"), "only theirs, deeper").unwrap();
+
+        let collisions = plan(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Copy,
+        )
+        .unwrap();
+        assert!(collisions[0].merge, "a folder on a folder is a merge");
+        assert_eq!(collisions[0].replaces, 2, "main.rs and deep/nested.rs");
+        assert_eq!(collisions[0].keeps, 2, "theirs.rs and deep/keep.rs");
+        assert!(!collisions[0].truncated);
+        assert!(collisions[0].sample.contains(&"main.rs".to_string()));
+        assert!(collisions[0].sample.contains(&"deep/nested.rs".to_string()));
+
+        let out = paste_with(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Copy,
+            &[replace(dir.join("src"))],
+        )
+        .unwrap();
+        assert_eq!(out[0].dest, dir.join("into/src"));
+        assert_eq!(
+            out[0].replaced, 2,
+            "the count is the promise the dialog made"
+        );
+
+        assert_eq!(read(&dir.join("into/src/main.rs")), "new main");
+        assert_eq!(read(&dir.join("into/src/deep/nested.rs")), "new nested");
+        assert_eq!(read(&dir.join("into/src/added.rs")), "brand new");
+        // The whole reason merge won: these two are not in the source and are still here.
+        assert_eq!(read(&dir.join("into/src/theirs.rs")), "only theirs");
+        assert_eq!(
+            read(&dir.join("into/src/deep/keep.rs")),
+            "only theirs, deeper"
+        );
+        assert!(
+            !dir.join("into/src copy").exists(),
+            "a replace also left a rename behind"
+        );
+    }
+
+    /// A file for a folder is not a replacement of anything, and is refused before any write.
+    #[test]
+    fn swapping_a_file_for_a_folder_is_refused_rather_than_guessed() {
+        let dir = scratch("replace-mismatch");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::create_dir(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "a").unwrap();
+        std::fs::write(dir.join("into/src"), "a FILE called src").unwrap();
+
+        // The dialog is told first, so it can offer Keep both and Cancel and nothing else.
+        let collisions = plan(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Copy,
+        )
+        .unwrap();
+        let blocked = collisions[0].blocked.as_deref().expect("a refusal");
+        assert!(blocked.contains("folder"), "{blocked}");
+
+        // And the domain refuses it even if the answer arrives anyway — the dialog is the
+        // courtesy, this is the guarantee.
+        assert!(matches!(
+            paste_with(
+                &roots,
+                &[dir.join("src")],
+                &dir.join("into"),
+                PasteMode::Copy,
+                &[replace(dir.join("src"))],
+            ),
+            Err(FsError::CannotReplace(_))
+        ));
+        assert_eq!(read(&dir.join("into/src")), "a FILE called src");
+
+        // Keep both is still available, and is what the dialog offers instead.
+        let out = paste(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Copy,
+        )
+        .unwrap();
+        assert_eq!(out[0].dest, dir.join("into/src copy"));
+    }
+
+    /// The same refusal, one level down inside a merge.
+    ///
+    /// This is the one the recursion would otherwise discover half way through, with everything
+    /// above it already overwritten. `plan` walks the pair, so the dialog never offers Replace
+    /// and the paste refuses before the first byte.
+    #[test]
+    fn a_mismatch_inside_a_merge_blocks_the_replace_before_it_starts() {
+        let dir = scratch("replace-mismatch-nested");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir_all(dir.join("src/mod")).unwrap();
+        std::fs::write(dir.join("src/mod/a.rs"), "a").unwrap();
+        std::fs::write(dir.join("src/top.rs"), "new top").unwrap();
+        std::fs::create_dir_all(dir.join("into/src")).unwrap();
+        std::fs::write(dir.join("into/src/mod"), "a FILE where a folder is").unwrap();
+        std::fs::write(dir.join("into/src/top.rs"), "old top").unwrap();
+
+        let collisions = plan(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Copy,
+        )
+        .unwrap();
+        let blocked = collisions[0].blocked.as_deref().expect("a refusal");
+        assert!(
+            blocked.contains("mod"),
+            "the offending path is named: {blocked}"
+        );
+
+        assert!(matches!(
+            paste_with(
+                &roots,
+                &[dir.join("src")],
+                &dir.join("into"),
+                PasteMode::Copy,
+                &[replace(dir.join("src"))],
+            ),
+            Err(FsError::CannotReplace(_))
+        ));
+        // Nothing above the mismatch was touched, which is the point of refusing in the
+        // pre-flight pass rather than when the recursion trips over it.
+        assert_eq!(read(&dir.join("into/src/top.rs")), "old top");
+        assert_eq!(read(&dir.join("into/src/mod")), "a FILE where a folder is");
+    }
+
+    /// A cut answered *Replace* moves over the destination and leaves nothing behind.
+    #[test]
+    fn a_cut_can_replace_and_the_source_is_gone_afterwards() {
+        let dir = scratch("replace-cut");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::write(dir.join("main.rs"), "moving").unwrap();
+        std::fs::write(dir.join("into/main.rs"), "old").unwrap();
+
+        let out = paste_with(
+            &roots,
+            &[dir.join("main.rs")],
+            &dir.join("into"),
+            PasteMode::Cut,
+            &[replace(dir.join("main.rs"))],
+        )
+        .unwrap();
+        assert_eq!(out[0].dest, dir.join("into/main.rs"));
+        assert_eq!(out[0].replaced, 1);
+        assert_eq!(read(&dir.join("into/main.rs")), "moving");
+        assert!(!dir.join("main.rs").exists(), "the source survived a cut");
+        assert_eq!(names_in(&dir.join("into")).len(), 1);
+    }
+
+    /// A cut folder answered *Replace* merges, and the emptied source folder goes.
+    #[test]
+    fn a_cut_folder_merges_and_removes_what_it_emptied() {
+        let dir = scratch("replace-cut-merge");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "moving").unwrap();
+        std::fs::write(dir.join("src/deep/x.rs"), "moving deep").unwrap();
+        std::fs::create_dir_all(dir.join("into/src")).unwrap();
+        std::fs::write(dir.join("into/src/main.rs"), "old").unwrap();
+        std::fs::write(dir.join("into/src/theirs.rs"), "kept").unwrap();
+
+        paste_with(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Cut,
+            &[replace(dir.join("src"))],
+        )
+        .unwrap();
+
+        assert_eq!(read(&dir.join("into/src/main.rs")), "moving");
+        assert_eq!(read(&dir.join("into/src/deep/x.rs")), "moving deep");
+        assert_eq!(read(&dir.join("into/src/theirs.rs")), "kept");
+        assert!(
+            !dir.join("src").exists(),
+            "a cut left the folder it emptied behind"
+        );
+    }
+
+    /// The duplicate gesture is never a question.
+    ///
+    /// Pasting a file into the folder it is already in is how anybody duplicates one, and the
+    /// only honest answer to "replace main.rs with main.rs?" is the rename. So it is not
+    /// reported as a collision at all, and a `Replace` sent for one anyway is ignored rather
+    /// than copying a file over itself through a temporary.
+    #[test]
+    fn duplicating_a_file_beside_itself_is_never_asked_about() {
+        let dir = scratch("replace-duplicate");
+        let roots = roots_of(dir.path());
+        std::fs::write(dir.join("main.rs"), "body").unwrap();
+
+        let collisions = plan(&roots, &[dir.join("main.rs")], dir.path(), PasteMode::Copy).unwrap();
+        assert!(collisions.is_empty(), "{collisions:?}");
+
+        let out = paste_with(
+            &roots,
+            &[dir.join("main.rs")],
+            dir.path(),
+            PasteMode::Copy,
+            &[replace(dir.join("main.rs"))],
+        )
+        .unwrap();
+        assert_eq!(out[0].dest, dir.join("main copy.rs"));
+        assert_eq!(out[0].replaced, 0);
+        assert_eq!(read(&dir.join("main.rs")), "body");
+    }
+
+    /// A `Replace` whose destination vanished between the question and the answer.
+    ///
+    /// It claims the free name like any other paste rather than erroring or inventing a file to
+    /// overwrite. The window is small and real: a `git checkout` between the dialog opening and
+    /// the user clicking is all it takes.
+    #[test]
+    fn a_replace_whose_destination_disappeared_just_pastes() {
+        let dir = scratch("replace-vanished");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::write(dir.join("main.rs"), "new").unwrap();
+
+        let out = paste_with(
+            &roots,
+            &[dir.join("main.rs")],
+            &dir.join("into"),
+            PasteMode::Copy,
+            &[replace(dir.join("main.rs"))],
+        )
+        .unwrap();
+        assert_eq!(out[0].dest, dir.join("into/main.rs"));
+        assert_eq!(out[0].replaced, 0, "nothing was there to replace");
+        assert!(!out[0].renamed);
+    }
+
+    /// A multi-source paste that stops part way says what already landed.
+    ///
+    /// Not the dialog's cancel — that writes nothing, because every question is answered before
+    /// the first byte. This is the other half: once the writing has started it cannot be undone,
+    /// and the failure carries the destinations that already exist so the panel can say so
+    /// instead of reporting a clean failure over a folder that is half full of new files.
+    #[test]
+    fn a_paste_that_stops_part_way_reports_what_already_landed() {
+        let dir = scratch("replace-partial");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir(dir.join("into")).unwrap();
+        std::fs::write(dir.join("main.rs"), "moving").unwrap();
+        std::fs::write(dir.join("into/main.rs"), "old").unwrap();
+
+        // The same source twice: both pass the pre-flight checks, the first cut moves it, and
+        // the second finds nothing there. A duplicated selection is a frontend bug, and this is
+        // what the user is told when one happens rather than "nothing was pasted".
+        let err = paste_with(
+            &roots,
+            &[dir.join("main.rs"), dir.join("main.rs")],
+            &dir.join("into"),
+            PasteMode::Cut,
+            &[replace(dir.join("main.rs"))],
+        )
+        .expect_err("the second copy of the source is gone");
+
+        let FsError::PartialPaste { pasted, .. } = err else {
+            panic!("a paste that half-happened was reported as if nothing had: {err:?}");
+        };
+        assert_eq!(pasted, vec![dir.join("into/main.rs").display().to_string()]);
+        assert_eq!(read(&dir.join("into/main.rs")), "moving");
+    }
+
+    /// A folder pasted into itself is refused by `plan` too, not asked about.
+    ///
+    /// The dialog must never be the thing that surfaces a refusal the user cannot answer: a
+    /// question with only wrong answers in it is worse than the rejection it was hiding.
+    #[test]
+    fn the_plan_refuses_what_the_paste_refuses() {
+        let dir = scratch("plan-refusals");
+        let roots = roots_of(dir.path());
+        let outside = scratch("plan-elsewhere");
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+
+        assert!(matches!(
+            plan(
+                &roots,
+                &[dir.join("src")],
+                &dir.join("src/deep"),
+                PasteMode::Copy
+            ),
+            Err(FsError::IntoItself(_))
+        ));
+        assert!(matches!(
+            plan(
+                &roots,
+                &[outside.join("secret")],
+                dir.path(),
+                PasteMode::Copy
+            ),
+            Err(FsError::OutsideProject(_))
+        ));
+        assert!(matches!(
+            plan(
+                &roots,
+                &[dir.path().to_path_buf()],
+                &dir.join("src"),
+                PasteMode::Cut
+            ),
+            Err(FsError::IsRoot(_))
+        ));
     }
 
     #[test]

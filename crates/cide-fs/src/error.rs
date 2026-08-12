@@ -62,6 +62,16 @@ pub enum FsError {
     #[error("{0}")]
     IntoItself(String),
 
+    /// *Replace* was asked for where it is not a replacement.
+    ///
+    /// One side is a directory and the other is not — at the top of the paste, or anywhere
+    /// inside a folder being merged. There is no sensible reading of "replace this file with
+    /// that folder": whichever way it went, something the user did not name would be deleted.
+    /// Its own variant rather than an [`FsError::Io`] because it is a *refusal* and the panel
+    /// draws refusals differently from failures; the message names both halves.
+    #[error("{0}")]
+    CannotReplace(String),
+
     /// A multi-path paste copied some sources and then failed.
     ///
     /// The same shape as [`FsError::PartialDelete`] and for the same reason: telling the

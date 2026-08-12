@@ -461,12 +461,44 @@ pub async fn fs_delete(
     .await?
 }
 
+/// Which names a paste would land on that are already taken — and nothing is written.
+///
+/// The read half of Ctrl+V, asked first so the confirmation can be a decision rather than an
+/// apology. An empty answer is the common case and means the paste can go straight through;
+/// anything in it is a question for the user, and [`fs_paste`] is called afterwards carrying
+/// the answers. Cancelling costs nothing because nothing has happened yet — which is the
+/// whole reason this is a separate command instead of a flag on the paste.
+///
+/// I/O (it stats the destination and walks a folder pair to count what a merge would cost), so
+/// `spawn_blocking` like every other handler here. The refusals arrive from this call as well
+/// as from the paste: a folder pasted into itself is refused *instead of* being asked about.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_paste_plan(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    sources: Vec<PathBuf>,
+    dest_dir: PathBuf,
+    mode: cide_ipc::PasteMode,
+) -> Result<Vec<cide_ipc::PasteCollision>, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_paste_plan", move || {
+        let roots = fs.root_paths();
+        cide_fs::copy::plan(&roots, &sources, &dest_dir, mode)
+    })
+    .await?
+}
+
 /// Copy or move paths into a folder — the file tree's Ctrl+C / Ctrl+X / Ctrl+V.
 ///
 /// The rules are all in [`cide_fs::copy`], because they are decisions about the disk rather
-/// than about Tauri: a collision is renamed and never overwritten, a cut moves nothing until
-/// it is pasted, a directory is copied recursively and refused into itself, and a symlink is
-/// copied as a link. Read that module before changing anything here.
+/// than about Tauri: a collision is renamed unless a `decisions` entry says otherwise, a cut
+/// moves nothing until it is pasted, a directory is copied recursively and refused into itself,
+/// and a symlink is copied as a link. Read that module before changing anything here.
+///
+/// `decisions` is the dialog's answers, and it is the *only* way anything here can overwrite a
+/// file. A source that is not named in it is renamed on collision, exactly as before — so this
+/// command is safe to call with an empty list, and a frontend that loses its answers renames
+/// rather than destroys. The confirmation is a courtesy; this refusal is the guarantee.
 ///
 /// What is this layer's own is the same two things every handler in this file owns: the paths
 /// are checked against the project's roots before anything touches the disk (twice over —
@@ -486,10 +518,11 @@ pub async fn fs_paste(
     sources: Vec<PathBuf>,
     dest_dir: PathBuf,
     mode: cide_ipc::PasteMode,
+    decisions: Vec<cide_ipc::PasteDecision>,
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
     let fs = project_fs(&registry, project)?;
     blocking("fs_paste", move || {
-        paste_into(&fs, &sources, &dest_dir, mode)
+        paste_into(&fs, &sources, &dest_dir, mode, &decisions)
     })
     .await?
 }
@@ -504,9 +537,10 @@ pub(crate) fn paste_into(
     sources: &[PathBuf],
     dest_dir: &std::path::Path,
     mode: cide_ipc::PasteMode,
+    decisions: &[cide_ipc::PasteDecision],
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
     let roots = fs.root_paths();
-    let pasted = cide_fs::copy::paste(&roots, sources, dest_dir, mode)?;
+    let pasted = cide_fs::copy::paste_with(&roots, sources, dest_dir, mode, decisions)?;
 
     // Sources first so a rename that lands on the *same* directory reads as one rescan, and
     // because a cut's old row has to go in the same write that adds the new one.
@@ -1279,6 +1313,7 @@ mod tests {
             &[dir.path().join("src/main.rs")],
             &dir.path().join("dest"),
             cide_ipc::PasteMode::Cut,
+            &[],
         )
         .expect("moving a file between two folders of the same project");
         assert_eq!(pasted[0].dest, dir.path().join("dest/main.rs"));
@@ -1314,6 +1349,59 @@ mod tests {
         drop(registry.remove(project));
     }
 
+    /// A paste that *replaced* a file adds no row, because the row was already there.
+    ///
+    /// The fold names every destination unconditionally, and an overwrite's destination is a
+    /// path the index already holds. `Index::apply` rescanning its parent has to reconcile that
+    /// to nothing — the version that appends what it is given would leave the tree drawing the
+    /// same file twice, which looks exactly like the duplicate the user chose Replace to avoid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacing_a_file_leaves_the_row_it_already_had() {
+        let dir = scratch("cmd-paste-replace");
+        std::fs::create_dir(dir.path().join("src")).expect("a source directory");
+        std::fs::create_dir(dir.path().join("dest")).expect("a destination directory");
+        std::fs::write(dir.path().join("src/main.rs"), "new").expect("a file to paste");
+        std::fs::write(dir.path().join("dest/main.rs"), "old").expect("a file to replace");
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+        fs.with_index_mut(|index| index.expand(&dir.path().join("src")));
+        fs.with_index_mut(|index| index.expand(&dir.path().join("dest")));
+        let before = fs.with_index(|index| index.count());
+
+        let source = dir.path().join("src/main.rs");
+        let pasted = paste_into(
+            &fs,
+            std::slice::from_ref(&source),
+            &dir.path().join("dest"),
+            cide_ipc::PasteMode::Copy,
+            &[cide_ipc::PasteDecision {
+                source: source.clone(),
+                choice: cide_ipc::PasteChoice::Replace,
+            }],
+        )
+        .expect("replacing a file the user was asked about");
+
+        assert_eq!(pasted[0].dest, dir.path().join("dest/main.rs"));
+        assert_eq!(pasted[0].replaced, 1);
+        assert_eq!(
+            std::fs::read_to_string(&pasted[0].dest).expect("the replaced file"),
+            "new"
+        );
+        assert_eq!(
+            fs.with_index(|index| index.count()),
+            before,
+            "an overwrite added a row for a path that already had one"
+        );
+
+        drop(registry.remove(project));
+    }
+
     /// The containment check, driven through the command layer rather than through `copy`.
     ///
     /// `cide-fs` has its own tests for every rule; what is pinned here is that this handler
@@ -1338,7 +1426,8 @@ mod tests {
                 &fs,
                 &[outside.path().join("secret")],
                 dir.path(),
-                cide_ipc::PasteMode::Copy
+                cide_ipc::PasteMode::Copy,
+                &[]
             ),
             Err(FsError::OutsideProject(_))
         ));

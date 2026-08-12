@@ -1,7 +1,11 @@
 /**
- * Checks `src/sidebar/clipboardModel.ts` and `src/sidebar/fsError.ts` — every decision the
- * file tree's Copy / Cut / Paste makes before it calls Rust, and how it reports what Rust
- * says back.
+ * Checks `src/sidebar/clipboardModel.ts`, `src/sidebar/fsError.ts` and
+ * `src/chrome/pasteConfirm.ts` — every decision the file tree's Copy / Cut / Paste makes
+ * before it calls Rust, what the collision dialog asks, and how the result is reported back.
+ *
+ * All three in one script rather than a fourth `check:*` beside it: they are one gesture. The
+ * dialog's answers become `pasteRefusal`'s command and `pastedSummary`'s sentence, and a rule
+ * split across two scripts is one that gets changed in one of them.
  *
  * Same shape as `check-new-entry.mjs` beside it, and for the same reason: this project has no
  * JS test runner, and the rules worth pinning are pure functions whose wrong versions all
@@ -34,6 +38,9 @@ try {
       'node_modules/typescript/bin/tsc',
       'src/sidebar/clipboardModel.ts',
       'src/sidebar/fsError.ts',
+      // Import-free and DOM-free by design, exactly like `chrome/closeConfirm.ts` — which is
+      // what lets it be compiled here beside a module that does import something.
+      'src/chrome/pasteConfirm.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS and `node10`, like `check-picker.mjs`, and for the reason that script does not
@@ -61,6 +68,7 @@ try {
   const require = createRequire(import.meta.url)
   const m = require(join(out, 'sidebar', 'clipboardModel.js'))
   const errors = require(join(out, 'sidebar', 'fsError.js'))
+  const ask = require(join(out, 'chrome', 'pasteConfirm.js'))
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -191,7 +199,7 @@ try {
 
   // ---- what is said after a paste --------------------------------------------------------
 
-  const pasted = (over) => ({ source: '/a/main.rs', dest: '/b/main.rs', renamed: false, skipped: 0, ...over })
+  const pasted = (over) => ({ source: '/a/main.rs', dest: '/b/main.rs', renamed: false, skipped: 0, replaced: 0, ...over })
 
   eq(m.pastedSummary([pasted()], 'copy'), null,
     'the ORDINARY paste says nothing at all: the tree scrolls to and selects what it made, so '
@@ -221,6 +229,120 @@ try {
       .includes('moved file'),
     'a renamed CUT does not call the result a copy — it is the file itself, moved',
   )
+
+  ok(
+    m.pastedSummary([pasted({ replaced: 1 })], 'copy').includes('1 existing file was replaced'),
+    'a REPLACE is reported even though the user agreed to it: they agreed per folder, and a '
+      + 'merge overwrites files one level down that the tree never showed them',
+  )
+  ok(
+    m.pastedSummary([pasted({ replaced: 12 })], 'copy').includes('12 existing files'),
+    'and the count is the receipt for the number the dialog quoted',
+  )
+
+  // ---- the collision dialog --------------------------------------------------------------
+  //
+  // > *"Paste collisions - yes, should be a confirmation"*
+  //
+  // What shipped renamed silently: `main.rs` became `main copy.rs`, which never loses data and
+  // makes "I meant to replace that file" impossible. These are the rules of the dialog that
+  // replaces it. Every one of them has a wrong version that type-checks.
+
+  const collision = (over = {}) => ({
+    source: '/a/main.rs',
+    dest: '/b/main.rs',
+    name: 'main.rs',
+    merge: false,
+    blocked: null,
+    replaces: 1,
+    keeps: 0,
+    sample: [],
+    truncated: false,
+    ...over,
+  })
+  const folder = (over = {}) =>
+    collision({ source: '/a/src', dest: '/b/src', name: 'src', merge: true, replaces: 12, keeps: 30, ...over })
+
+  // The three answers, and which of them is real.
+  ok(ask.canReplace(collision()), 'Replace is offered for a file onto a file')
+  ok(
+    !ask.canReplace(collision({ blocked: 'a folder and a file' })),
+    'but NOT where one side is a folder and the other is not — swapping those is not a '
+      + 'replacement of anything, and Rust refuses it whatever this says',
+  )
+
+  // A folder merge has to say so, in numbers, before it is chosen. "Replace src?" with no
+  // counts is a dare rather than a question — and the word decides whether the files that are
+  // only in the destination survive.
+  ok(ask.askBody(folder()).includes('merges'), 'a folder Replace says it MERGES')
+  ok(ask.askBody(folder()).includes('12 files'), 'and how many files it overwrites')
+  ok(ask.askBody(folder()).includes('30 items'), 'and how many it leaves alone — the whole '
+    + 'difference between merging and swapping the folder out')
+  ok(
+    ask.askBody(folder({ truncated: true })).includes('at least'),
+    'a count that hit its walk budget is hedged: an exact-looking lower bound in a dialog '
+      + 'about data loss is worse than no number',
+  )
+  ok(
+    ask.askBody(collision()).includes('does not go to the trash'),
+    'and a plain file replacement says the old one is simply gone',
+  )
+  eq(ask.askBody(collision({ blocked: 'that is a folder' })), 'that is a folder',
+    'a blocked collision shows Rust\'s own sentence rather than inventing a second one')
+  eq(ask.replaceLabel(folder()), 'Merge, replacing 12 files',
+    'the button says what it does — "Replace" alone on a folder hides the merge again')
+  eq(ask.replaceLabel(collision()), 'Replace', 'a file is just Replace')
+
+  // Ten collisions must not be ten questions.
+  const three = ask.startAsk([collision(), folder(), collision({ source: '/a/z.rs', name: 'z.rs' })])
+  eq(ask.askProgress(three), '1 of 3', 'the position is shown when there is more than one')
+  eq(ask.askProgress(ask.startAsk([collision()])), null, 'and not when there is only one')
+  eq(ask.applyToRestLabel(three), 'Do the same for the remaining 2 files',
+    'the checkbox names how many it covers — a user four questions into seven needs to know '
+      + 'it is three, not seven')
+
+  const one = ask.answerAsk(three, 'keepBoth', false)
+  eq(ask.currentCollision(one).name, 'src', 'answering one moves to the next')
+  ok(!ask.askIsDone(one), 'and the paste is not sent until every question has an answer')
+  eq(ask.applyToRestLabel(ask.answerAsk(one, 'replace', false)), null,
+    'the last question offers no "apply to the rest"')
+
+  const all = ask.answerAsk(three, 'replace', true)
+  ok(ask.askIsDone(all), 'apply-to-all answers every remaining collision at once')
+  eq(
+    ask.askDecisions(all),
+    [
+      { source: '/a/main.rs', choice: 'replace' },
+      { source: '/a/src', choice: 'replace' },
+      { source: '/a/z.rs', choice: 'replace' },
+    ],
+    'and each answer is bound to the source it answers for — a blanket `overwrite: true` flag '
+      + 'would answer for paths the user was never asked about',
+  )
+
+  const mixed = ask.answerAsk(
+    ask.startAsk([collision(), collision({ source: '/a/b', name: 'b', blocked: 'a file here, a folder there' })]),
+    'replace',
+    true,
+  )
+  eq(
+    ask.askDecisions(mixed),
+    [
+      { source: '/a/main.rs', choice: 'replace' },
+      { source: '/a/b', choice: 'keepBoth' },
+    ],
+    'Replace-to-all DOWNGRADES the one collision Replace is refused for, rather than sending a '
+      + 'decision the backend rejects and failing the whole paste over it',
+  )
+
+  ok(
+    ask.nothingWrittenYet().includes('Nothing has been written'),
+    'the dialog can promise this because the questions are all asked before the paste is sent '
+      + '— the version that asks as it writes can only apologise for the three files that landed',
+  )
+  ok(ask.cancelledNote().includes('Nothing was written'),
+    'and the strip after a cancel says the same thing, because a dialog that vanishes in '
+      + 'silence is indistinguishable from a paste that failed')
 
   /*
    * The collision NAME is not checked here, and that is deliberate.

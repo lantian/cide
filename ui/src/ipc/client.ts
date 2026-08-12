@@ -1558,7 +1558,7 @@ export const claudeSend = {
 // consecutive rounds, once as a redeclaration that would not compile — and reaching up into an
 // existing import specifier is exactly the edit that conflicts. An `import` is legal anywhere at
 // a module's top level and is hoisted either way.
-import type { PasteMode, PastedEntry } from './generated'
+import type { PasteCollision, PasteDecision, PasteMode, PastedEntry } from './generated'
 
 /**
  * The file tree's own clipboard: copying, cutting and pasting **the files**, not their paths.
@@ -1571,27 +1571,56 @@ import type { PasteMode, PastedEntry } from './generated'
  * Every rule lives in `cide_fs::copy`, and the ones a user meets are worth naming at the call
  * site because they are not what the words "copy" and "paste" promise on their own:
  *
- * * **A collision is never an overwrite.** `main.rs` pasted where one exists becomes
- *   `main copy.rs`; the entry that comes back has `renamed: true` so the panel can say so.
- *   Nothing this command does can destroy a file that was already there.
+ * * **A collision is asked about first.** `plan` answers which names are taken *without
+ *   writing anything*; the dialog collects an answer for each and `paste` carries them. A
+ *   source with no decision is renamed to `main copy.rs`, exactly as before — so `paste` can
+ *   only ever overwrite what it was explicitly told to, and a caller that drops its answers on
+ *   the floor renames rather than destroys.
  * * **`cut` moves nothing until this call.** The mode travels with the paste, so a cut the user
  *   changed their mind about costs exactly nothing.
  * * **A directory is copied recursively**, and refused into itself or into anything inside it.
  * * **A symlink is copied as a symlink.** Its target is not followed and not duplicated.
  *
- * Rejects, and the rejection matters: `OutsideProject`, `IsRoot`, `IntoItself` and
- * `PartialPaste` are all things the user needs to read. The file tree catches it and puts the
- * reason in its own strip; a call site with no such surface should let it reach `Failures`.
+ * Rejects, and the rejection matters: `OutsideProject`, `IsRoot`, `IntoItself`, `CannotReplace`
+ * and `PartialPaste` are all things the user needs to read. The file tree catches it and puts
+ * the reason in its own strip; a call site with no such surface should let it reach `Failures`.
  */
 export const fsClipboard = {
   /**
-   * Paste `sources` into `destDir`.
+   * Which names this paste would land on that are already taken. Writes nothing.
+   *
+   * Called before `paste`, so a confirmation can be a decision rather than an apology: an empty
+   * answer means the paste goes straight through, and anything in it is a question. Cancelling
+   * after this call has cost the user nothing, because nothing has happened yet.
+   *
+   * Rejects with the same refusals `paste` does — a folder pasted into itself is refused here
+   * *instead of* being asked about, which is the point of running the same checks twice.
+   */
+  plan: (projectId: ProjectId, sources: readonly string[], destDir: string, mode: PasteMode) =>
+    invoke<PasteCollision[]>('fs_paste_plan', {
+      project: projectId,
+      sources: [...sources],
+      destDir,
+      mode,
+    }),
+
+  /**
+   * Paste `sources` into `destDir`, answering collisions with `decisions`.
    *
    * `destDir` is a *directory*, always — the tree resolves a file row to its parent before
    * calling, exactly as *New File…* does (`sidebar/clipboardModel.ts`). Answers one entry per
    * source, in the order they were given, saying where each one actually landed.
+   *
+   * `decisions` is the dialog's answers and the only way anything here overwrites a file. An
+   * empty list is the safe call and is what a paste with no collisions sends.
    */
-  paste: (projectId: ProjectId, sources: readonly string[], destDir: string, mode: PasteMode) =>
+  paste: (
+    projectId: ProjectId,
+    sources: readonly string[],
+    destDir: string,
+    mode: PasteMode,
+    decisions: readonly PasteDecision[],
+  ) =>
     invoke<PastedEntry[]>('fs_paste', {
       project: projectId,
       // A fresh array: `invoke` serialises what it is handed, and a `readonly string[]` from a
@@ -1599,6 +1628,7 @@ export const fsClipboard = {
       sources: [...sources],
       destDir,
       mode,
+      decisions: [...decisions],
     }),
 }
 

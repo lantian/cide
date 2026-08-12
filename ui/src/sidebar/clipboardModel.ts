@@ -73,6 +73,8 @@ export interface PasteOutcome {
   readonly dest: string
   readonly renamed: boolean
   readonly skipped: number
+  /** Existing files this entry overwrote — non-zero only where the user answered *Replace*. */
+  readonly replaced: number
 }
 
 /**
@@ -205,7 +207,10 @@ export function clipboardText(paths: readonly string[]): string {
  *   holds the older file — so a silent success reads as a paste that did nothing;
  * * **skipped** entries — sockets, fifos, devices — which are absent from the copy;
  * * a **cut pasted where it already was**, which is a legitimate no-op and looks exactly like
- *   a broken Ctrl+V unless it says so.
+ *   a broken Ctrl+V unless it says so;
+ * * a **replacement**, which the user did agree to — but agreed to per *folder*, and a merge
+ *   overwrites files one level down that the tree never showed them. The count is the receipt
+ *   for the number the dialog quoted, and it is the only place the two can be compared.
  */
 export function pastedSummary(entries: readonly PasteOutcome[], mode: ClipMode): string | null {
   if (entries.length === 0) return null
@@ -231,6 +236,15 @@ export function pastedSummary(entries: readonly PasteOutcome[], mode: ClipMode):
     }
   } else if (renamed.length > 1) {
     parts.push(`${renamed.length} names were already taken, so those were renamed.`)
+  }
+
+  const replaced = entries.reduce((total, entry) => total + entry.replaced, 0)
+  if (replaced > 0) {
+    parts.push(
+      replaced === 1
+        ? '1 existing file was replaced.'
+        : `${replaced} existing files were replaced.`,
+    )
   }
 
   const skipped = entries.reduce((total, entry) => total + entry.skipped, 0)

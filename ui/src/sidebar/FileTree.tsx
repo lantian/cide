@@ -54,6 +54,16 @@ import {
   type ClipMode,
 } from './clipboardModel'
 import { fsMessage } from './fsError'
+import { PasteConfirm } from '@/chrome/PasteConfirm'
+import {
+  answerAsk,
+  askDecisions,
+  askIsDone,
+  cancelledNote,
+  startAsk,
+  type PasteAnswer,
+  type PasteAsk,
+} from '@/chrome/pasteConfirm'
 import {
   diag,
   fs as fsApi,
@@ -232,8 +242,25 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   const [note, setNote] = useState<string | null>(null)
   /** What is on the tree's clipboard. Subscribed here because it dims rows and draws a strip. */
   const clip = useFileClipboard((s) => s.clip)
-  /** An `fs_paste` is in flight. Ctrl+V held down must not start a second one. */
+  /**
+   * A paste is in flight, **or** waiting on the confirmation.
+   *
+   * Held for the whole gesture rather than only for the command: Ctrl+V held down must not
+   * start a second paste, and it must not stack a second dialog behind the first either. The
+   * flag is cleared by whatever ends the gesture — the paste settling, or the user cancelling.
+   */
   const pasting = useRef(false)
+  /**
+   * The collisions the user is being asked about, and where they would land.
+   *
+   * `null` for every paste with nothing in its way, which is nearly all of them. The dialog
+   * lives here rather than in the shell because this panel owns the gesture that opens it —
+   * `App.tsx` never needs to know it exists.
+   */
+  const [pendingPaste, setPendingPaste] = useState<{
+    readonly destDir: string
+    readonly ask: PasteAsk
+  } | null>(null)
 
   /** Report a rejected file command, in the panel and in the log. */
   const fail = useCallback(
@@ -272,31 +299,17 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   )
 
   /**
-   * Paste the clipboard into `target`, and say what happened when it differs from what was
-   * asked for.
+   * Send the paste, with whatever the user answered about the names that were taken.
    *
-   * The refusal is checked here rather than left to Rust so that it arrives as a sentence
-   * about folders — "“src” cannot be pasted into itself" — instead of as a rejected command.
-   * Rust checks all of it again; see `clipboardModel.pasteRefusal`.
+   * Split from `runPaste` because it is the second half of a gesture that may have paused for
+   * a dialog in between: everything that has to happen once, before the question, is up there,
+   * and everything that happens once the answer is in is here.
    */
-  const runPaste = useCallback(
-    (target: NewEntryTarget | null) => {
-      if (project === null) return
-      const refusal = pasteRefusal(useFileClipboard.getState().clip, project, target)
-      if (refusal !== null || target === null) {
-        setProblem(refusal ?? 'There is nowhere to paste into.')
-        return
-      }
-      // One paste per gesture, however long Ctrl+V is held. A directory paste is seconds of
-      // work, and a second one launched into it would race the first for the same names —
-      // both would succeed, and the user would get `src` and `src copy` from one keystroke.
-      if (pasting.current) return
-      pasting.current = true
-      setProblem(null)
-      setNote(null)
+  const commitPaste = useCallback(
+    (project_: ProjectId, destDir: string, decisions: ReturnType<typeof askDecisions>) => {
       void useFileClipboard
         .getState()
-        .paste(project, target.parent)
+        .paste(project_, destDir, decisions)
         .finally(() => {
           pasting.current = false
         })
@@ -311,8 +324,86 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         })
         .catch(fail('Paste'))
     },
-    [fail, project],
+    [fail],
   )
+
+  /**
+   * Paste the clipboard into `target`, asking first about anything it would land on top of.
+   *
+   * > *"Paste collisions - yes, should be a confirmation"*
+   *
+   * `plan` reads and writes nothing, so the ordinary paste — nothing in the way — costs one
+   * extra round trip and no dialog, and a paste that *would* overwrite is stopped before a
+   * single byte is written. That ordering is why `PasteConfirm` can promise that cancelling
+   * leaves everything as it was: there is no partial paste to report, because none started.
+   *
+   * The refusals are checked here rather than left to Rust so that they arrive as a sentence
+   * about folders — "“src” cannot be pasted into itself" — instead of as a rejected command.
+   * Rust checks all of it again, in `plan` as well as in the paste; see
+   * `clipboardModel.pasteRefusal`.
+   */
+  const runPaste = useCallback(
+    (target: NewEntryTarget | null) => {
+      if (project === null) return
+      const refusal = pasteRefusal(useFileClipboard.getState().clip, project, target)
+      if (refusal !== null || target === null) {
+        setProblem(refusal ?? 'There is nowhere to paste into.')
+        return
+      }
+      // One paste per gesture, however long Ctrl+V is held. A directory paste is seconds of
+      // work, and a second one launched into it would race the first for the same names —
+      // both would succeed, and the user would get `src` and `src copy` from one keystroke.
+      // The flag also covers the time the dialog is open, so a held key cannot stack questions.
+      if (pasting.current) return
+      pasting.current = true
+      setProblem(null)
+      setNote(null)
+      const destDir = target.parent
+      void useFileClipboard
+        .getState()
+        .plan(project, destDir)
+        .then((collisions) => {
+          if (collisions.length === 0) {
+            commitPaste(project, destDir, [])
+            return
+          }
+          setPendingPaste({ destDir, ask: startAsk(collisions) })
+        })
+        .catch((error: unknown) => {
+          pasting.current = false
+          fail('Paste')(error)
+        })
+    },
+    [commitPaste, fail, project],
+  )
+
+  /** One answer from the dialog. The last one sends the paste. */
+  const answerPaste = useCallback(
+    (answer: PasteAnswer, applyToRest: boolean) => {
+      if (project === null || pendingPaste === null) return
+      const next = answerAsk(pendingPaste.ask, answer, applyToRest)
+      if (!askIsDone(next)) {
+        setPendingPaste({ destDir: pendingPaste.destDir, ask: next })
+        return
+      }
+      setPendingPaste(null)
+      commitPaste(project, pendingPaste.destDir, askDecisions(next))
+    },
+    [commitPaste, pendingPaste, project],
+  )
+
+  /**
+   * Back out. The clipboard is left alone so the gesture can simply be repeated.
+   *
+   * The note is not decoration: a dialog that vanishes with nothing said is indistinguishable
+   * from a paste that silently failed, and the one thing worth saying here is the property the
+   * whole plan-then-paste ordering was built for — nothing was written.
+   */
+  const cancelPaste = useCallback(() => {
+    setPendingPaste(null)
+    pasting.current = false
+    setNote(cancelledNote())
+  }, [])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   /**
@@ -1031,6 +1122,21 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         >
           {problem}
         </div>
+      )}
+      {/*
+        * The paste confirmation.
+        *
+        * Mounted by the panel that owns the gesture rather than by the shell: it is opened only
+        * by a Ctrl+V or a *Paste* menu item in this tree, its state has exactly this panel's
+        * lifetime, and putting it here is what makes the feature reachable without an `App.tsx`
+        * edit. `OverlayCard`'s scrim is `position: fixed`, so it covers the window from here
+        * exactly as it would from the root — and being a sibling of the scroller rather than a
+        * child keeps it out of the `role="tree"` subtree.
+        *
+        * Nothing has been written when this is on screen; see `pasteConfirm.ts`.
+        */}
+      {pendingPaste !== null && (
+        <PasteConfirm ask={pendingPaste.ask} onAnswer={answerPaste} onCancel={cancelPaste} />
       )}
     </>
   )

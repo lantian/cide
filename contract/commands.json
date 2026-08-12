@@ -28,6 +28,7 @@
   "fs_expand",
   "fs_index",
   "fs_paste",
+  "fs_paste_plan",
   "fs_read_file",
   "fs_rename",
   "fs_reveal",

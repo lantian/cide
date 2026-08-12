@@ -8,7 +8,11 @@
  */
 export type PastedEntry = { source: string, 
 /**
- * Where it landed. Never a path that was overwritten — see `renamed`.
+ * Where it landed.
+ *
+ * A path that was already occupied only when `replaced` is non-zero — that is, only when
+ * the caller sent a `Replace` decision for this source. Otherwise the name moved out of
+ * the way instead; see `renamed`.
  */
 dest: string, 
 /**
@@ -27,4 +31,16 @@ renamed: boolean,
  * writer that never comes), and refusing a whole paste over one stray `.sock` in a project
  * would be the worse answer. Counted so the panel can say so.
  */
-skipped: number, };
+skipped: number, 
+/**
+ * Existing files this entry overwrote, because the user chose [`PasteChoice::Replace`].
+ *
+ * Zero for every paste nobody explicitly answered *Replace* to, which is the invariant
+ * worth being able to read off the result: a non-zero count here can only come from a
+ * decision that was sent with the command.
+ *
+ * More than one when a folder was merged: the answer was given about `src`, and the files
+ * it overwrote were inside it. That is the number the panel says afterwards, because
+ * "replaced src" describes something the user cannot check by looking.
+ */
+replaced: number, };
