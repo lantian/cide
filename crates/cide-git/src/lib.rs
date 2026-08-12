@@ -53,6 +53,7 @@
 //! something always does. Opening costs a few hundred microseconds; a stale index costs the
 //! user their work.
 
+pub mod branch;
 pub mod changelist;
 pub mod commit;
 pub mod diff;

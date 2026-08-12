@@ -376,6 +376,21 @@ fn build() -> Vec<Command> {
             ),
         Command::new("git.push", "Push to remote", GIT).when("repoOpen"),
         Command::new("git.refresh", "Refresh git status", GIT).when("repoOpen"),
+        // Branches. The two that need a name or a choice open the branch popup
+        // (`ui/src/chrome/BranchSelector.tsx`) rather than acting blind; the two network ones
+        // take no input at all and run.
+        //
+        // The popup is an overlay, not a child of the status bar widget, precisely so these
+        // rows work in a window whose status bar has not mounted the widget — a palette entry
+        // that depends on a control being on screen is a palette entry that sometimes does
+        // nothing.
+        Command::new("git.branch.switch", "Switch branch…", GIT).when("repoOpen"),
+        Command::new("git.branch.new", "New branch…", GIT).when("repoOpen"),
+        Command::new("git.fetch", "Fetch from remote", GIT).when("repoOpen"),
+        // Fast-forward only, and the title says so: cide has no conflict-resolution surface,
+        // so a pull that had to merge would leave a working tree nothing in the app can
+        // finish. A divergence is reported with both counts. See `cide_git::branch::pull`.
+        Command::new("git.pull", "Pull (fast-forward only)", GIT).when("repoOpen"),
         Command::new("git.stageSelected", "Stage selected changes", GIT)
             .when("repoOpen")
             // Same reason as `git.commit`: "selected" is the panel's tick state.

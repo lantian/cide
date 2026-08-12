@@ -26,7 +26,15 @@
  */
 import { create } from 'zustand'
 
-export type OverlayKind = 'files' | 'commands'
+/**
+ * `branches` is the status bar's branch popup (`chrome/BranchSelector.tsx`).
+ *
+ * It is an overlay rather than a child of the widget so it has exactly one instance per
+ * window — and so the command palette can open it without the status bar being involved at
+ * all. A popup owned by the widget would be unreachable in any window whose bar does not
+ * mount it, which is the "control wired to nothing" shape this app keeps producing.
+ */
+export type OverlayKind = 'files' | 'commands' | 'branches'
 
 interface OverlayStore {
   open: OverlayKind | null

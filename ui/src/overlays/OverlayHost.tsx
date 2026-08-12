@@ -8,6 +8,7 @@
  * `picker_close`.
  */
 import { useEffect } from 'react'
+import { BranchPopup } from '@/chrome/BranchSelector'
 import { CommandPalette } from './CommandPalette'
 import { FilePicker } from './FilePicker'
 import { useOverlays } from './store'
@@ -68,6 +69,14 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
       />
     )
   }
+
+  /*
+   * The branch popup takes no props: it reads the window's project from the workspace mirror
+   * and its rows from its own store, because the same popup is opened from the status bar
+   * widget and from `git.branch.switch` in the palette — and the palette dispatches from
+   * outside React, where there is nothing to hand props from.
+   */
+  if (open === 'branches') return <BranchPopup onDismiss={close} />
 
   return (
     <CommandPalette
