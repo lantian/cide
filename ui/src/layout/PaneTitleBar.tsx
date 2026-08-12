@@ -1,19 +1,46 @@
 /**
- * The pane frame and the 26px bar at the top of it: index, centred title, pane actions.
+ * The pane frame, and the controls that float in its top-right corner.
  *
- * The two live in one module because they share a single rule — the focus ring on the
- * frame's border and the lift of the title's colour are the same piece of state, and
- * splitting them across files invites one being updated without the other.
+ * # There is no title bar any more
  *
- * The index is computed depth-first by the caller at render time rather than stored.
- * Storing it would mean renumbering every sibling on each split and close, and the number
- * is presentation — it exists so "focus pane 3" has something to refer to.
+ * The user's report: *"doesn't like currently header of panels and opened files - it takes a
+ * lot of space. And the main idea of it to have buttons to work with split, maximize, etc.
+ * Let's instead of a header row move this button to right top corner as floating button
+ * without background, they will be inside the context of pane and will be just a buttons
+ * without background."*
  *
- * # What changed in M12, and why the old "neither component talks to Rust" is gone
+ * The bar was 26px plus a 1px rule per pane; a 2x3 grid spent 162 vertical pixels on six
+ * copies of the same project name. What was in it and where it went:
  *
- * This file used to take every action as a callback, so that a detached-pane window could
- * render the same frame from a different workspace slice. Two of the three things added here
- * cannot be done that way:
+ * | was                | now                                                                |
+ * | ------------------ | ------------------------------------------------------------------ |
+ * | index `3`          | in the cluster, revealed with it; always in the frame's `aria-label` |
+ * | title `cide : bash`| the same, plus the frame's `aria-label` and the menu's              |
+ * | awaiting dot       | in the corner, and the one thing that never hides                   |
+ * | ⊞ ⛶ ⧉ ×            | in the cluster, 22px squares, revealed on hover or focus            |
+ * | right-click menu   | the whole frame now, not a 26px strip                               |
+ *
+ * The two components this file used to export are one. `PaneTitleBar` was separate so that a
+ * fixture could draw a bar with no pane behind it; nothing ever did, and the split now costs
+ * something real — the context menu has to hang off the *frame* (see below) while its items
+ * are built from the pane, and threading a hook's return value between two components to
+ * achieve that is worse than the duplication it would save.
+ *
+ * # Why the menu moved to the frame
+ *
+ * With no bar, a right-click on a 26px strip would have become a right-click on an invisible
+ * 126px corner — and that menu is now the *primary* route to split/detach/close for anyone
+ * not using the buttons. So the handler is on the frame. It does not fight the pane's
+ * contents for the gesture: `useContextMenu`'s handler stops propagation, so any inner
+ * surface with a menu of its own (the editor, a tree) shields this one, and `TerminalPane`
+ * binds `contextmenu` natively and stops it too — a right-click inside a terminal still gets
+ * the terminal's Copy/Paste menu and nothing else. What changes is that a right-click on the
+ * parts of a pane that claimed nothing now answers.
+ *
+ * # What the component reads for itself, and why
+ *
+ * This used to take every action as a callback so that a detached-pane window could render
+ * the same frame from a different workspace slice. Two things cannot be done that way:
  *
  * * **The awaiting marker** is driven by a session's *history* of `cide://session-state`
  *   events (see `panes/awaitingRule.ts`), which no caller holds and which would have to be
@@ -21,7 +48,7 @@
  *   shape that has already left three controls in this app wired to nothing, so it is read
  *   from the store instead and installs itself on first render.
  * * **The window controls** exist only in a detached-pane window, and `DetachedPaneWindow`
- *   passes this component no props at all. Rather than require an edit there, the bar asks
+ *   passes this component no props at all. Rather than require an edit there, the frame asks
  *   the URL what kind of window it is in — the same `?window=` parameter every other part of
  *   the app boots from.
  *
@@ -63,11 +90,11 @@ function inDetachedPaneWindow(): boolean {
 /**
  * Which project and tab hold a pane, or `null` when nothing in this window does.
  *
- * `pane_split` is addressed by project **and** tab **and** pane, and the bar is handed only the
- * last of the three — so the two other thirds are looked up rather than threaded down. A walk
- * of the snapshot rather than a prop for the same reason `RowControls` re-reads `rowTarget` at
- * click time instead of taking one: the alternative is two more props on this component, on
- * `PaneFrame`, and at both call sites in `App.tsx` and `DetachedPaneWindow.tsx`, which is the
+ * `pane_split` is addressed by project **and** tab **and** pane, and the frame is handed only
+ * the last of the three — so the two other thirds are looked up rather than threaded down. A
+ * walk of the snapshot rather than a prop for the same reason `RowControls` re-reads
+ * `rowTarget` at click time instead of taking one: the alternative is two more props on this
+ * component and at both call sites in `App.tsx` and `DetachedPaneWindow.tsx`, which is the
  * exact arrangement this file's own header blames for three controls being wired to nothing.
  *
  * It is a linear scan and that is fine — it runs once per click, over the tabs of the projects
@@ -100,7 +127,8 @@ export interface PaneFrameProps {
   onAddTile?: (() => void) | undefined
   /**
    * Split this pane *downwards* — a new row under it. Menu-only; there is no button for it,
-   * because the bar has room for four glyphs and this is the less-used of the two axes.
+   * because the cluster has room for four glyphs before it starts covering the content it
+   * floats on, and this is the less-used of the two axes.
    *
    * Absent leaves the menu item present and disabled with a reason, rather than hiding it.
    * A gesture the user has been told about in the release notes and cannot find is worse
@@ -139,6 +167,33 @@ export function PaneFrame({
   // child starts, and a pane that spawned in this run is bound in the host registry first.
   const session = paneSessionId(pane.id) ?? pane.session
 
+  const awaiting = useAwaiting(session)
+  const detachedWindow = useMemo(inDetachedPaneWindow, [])
+  const clusterRef = useRef<HTMLDivElement>(null)
+  const addTileRef = useRef<HTMLButtonElement>(null)
+
+  /*
+   * False for the project console's pane. Withholding the button is a courtesy to the user,
+   * not the enforcement — Rust answers `PanePrimary` whether or not we offer it — and detach
+   * gets the same answer for the same reason: `layout::take_pane` refuses the primary for
+   * detach exactly as it does for close, so a live detach button here would be one gesture in
+   * the frame guaranteed to fail, into an error toast that reads as a bug rather than a rule.
+   */
+  const closable = pane.role !== 'primary'
+  const detachable = pane.role !== 'primary'
+
+  /*
+   * The *window's* maximized flag, which is a different thing from the pane's.
+   *
+   * Subscribed unconditionally because hooks must be, and it costs nothing in a shell: the
+   * store notifies only when the flag actually flips — `refresh()` compares before it emits —
+   * and `WindowFrame` has already attached the one listener behind it. Without this the
+   * detached window's zoom item would be labelled from `maximized`, which
+   * `DetachedPaneWindow` hardcodes to `false`, so it would read "Maximize window" while the
+   * window was maximized.
+   */
+  const { isMaximized } = useWindowChrome()
+
   /*
    * Clearing the awaiting marker is an *act*, not a state.
    *
@@ -154,14 +209,14 @@ export function PaneFrame({
    * Two gestures land inside this frame and are emphatically *not* that, so both handlers
    * screen for them:
    *
-   * * a **window control**. The bar of a detached window now draws minimize, and minimizing
+   * * a **window control**. The cluster of a detached window draws minimize, and minimizing
    *   is the user putting the window away *to come back to it* — clearing the marker there
    *   destroys the one thing that would bring them back, and the `Awaiting: 1` in the task
    *   bar with it, which is the exact case the feature exists for. Close and maximize sit in
-   *   the same span and read the same way. Screened in the focus handler too, not only in
+   *   the same cluster and read the same way. Screened in the focus handler too, not only in
    *   pointer-down: clicking a button focuses it, so guarding one and not the other guards
    *   nothing.
-   * * a **secondary button**. A right-click opens this bar's menu rather than reading a
+   * * a **secondary button**. A right-click opens the pane menu rather than reading a
    *   conversation — and that menu is where `Minimize window` is chosen from.
    *
    * `raise` stays outside both screens: focus should follow the pointer either way, and a
@@ -172,134 +227,8 @@ export function PaneFrame({
 
   const seen = () => acknowledge(session)
 
-  return (
-    // Pointer-down *capture*, so a click that lands inside a terminal focuses the pane
-    // before xterm consumes the event. Focus-in capture for the same reason one step out:
-    // a pane reached by Tab, or by anything that moves DOM focus without going through the
-    // domain, would otherwise take the keystrokes while the ring stayed on another pane.
-    // This is not `:focus-within` — the handler asks Rust to move focus and the ring is
-    // still drawn only from `tree.focused`, so an overlay taking focus cannot steal it.
-    <div
-      className={focused ? `${styles.frame} ${styles.frameFocused}` : styles.frame}
-      data-audit="pane"
-      data-pane-id={pane.id}
-      data-focused={focused ? 'true' : 'false'}
-      onPointerDownCapture={(event) => {
-        if (event.button === 0 && !onWindowControl(event.target)) seen()
-        raise?.()
-      }}
-      onFocusCapture={(event) => {
-        if (!onWindowControl(event.target)) seen()
-        raise?.()
-      }}
-    >
-      <PaneTitleBar
-        index={index}
-        title={pane.title}
-        // So the bar's `⊞` can address `pane_split` itself and offer a *kind*. See
-        // `paneLocation` for why the other two thirds of that address are looked up.
-        paneId={pane.id}
-        session={session}
-        focused={focused}
-        maximized={maximized}
-        closable={pane.role !== 'primary'}
-        // Same role, same answer. `layout::take_pane` refuses the primary for detach exactly
-        // as it does for close, so offering a live detach button here would be one gesture
-        // in the frame that is guaranteed to fail — and it fails into an error toast, which
-        // reads as a bug rather than as a rule.
-        detachable={pane.role !== 'primary'}
-        onAddTile={onAddTile}
-        onSplitDown={onSplitDown}
-        onAddRow={onAddRow}
-        onMaximize={onMaximize}
-        onDetach={onDetach}
-        onClose={onClose}
-      />
-      <div className={styles.body}>{children}</div>
-    </div>
-  )
-}
-
-export interface PaneTitleBarProps {
-  index: number
-  title: string
-  /**
-   * The pane this bar belongs to, so `⊞` can ask for a *kind* of pane rather than whatever the
-   * domain defaults to.
-   *
-   * Optional because a caller that only wants a bar drawn — a fixture, a measurement harness —
-   * has no pane id to give, and because the detached-pane window draws window controls here
-   * instead. Absent, `⊞` falls back to calling [`onAddTile`] with no intent, which is what it
-   * did before the choice existed.
-   */
-  paneId?: PaneId | undefined
-  /**
-   * The session this pane is showing, for the awaiting marker. Absent — a diff or editor
-   * pane, or one whose child has not started — means there is nothing that can wait.
-   */
-  session?: string | null | undefined
-  focused: boolean
-  maximized?: boolean | undefined
-  /**
-   * False for the project console's pane. Withholding the button is a courtesy to the
-   * user, not the enforcement — Rust answers `PanePrimary` whether or not we offer it.
-   */
-  closable?: boolean | undefined
-  /**
-   * False for the project console's pane, for the same reason as `closable`: detaching goes
-   * through the same `take_pane` refusal, so the button would never once succeed.
-   */
-  detachable?: boolean | undefined
-  /**
-   * Add a tile beside this pane, in its row. Absent hides the button — a detached-pane
-   * window has no row to add to.
-   *
-   * This bar had no split affordance at all until M11, which is a large part of why the
-   * gesture was unfindable: the only one in the app was the header's ⊞, six inches away from
-   * the pane it acts on.
-   */
-  onAddTile?: (() => void) | undefined
-  onSplitDown?: (() => void) | undefined
-  onAddRow?: (() => void) | undefined
-  onMaximize?: (() => void) | undefined
-  onDetach?: (() => void) | undefined
-  onClose?: (() => void) | undefined
-}
-
-export function PaneTitleBar({
-  index,
-  title,
-  paneId,
-  session,
-  focused,
-  maximized = false,
-  closable = true,
-  detachable = true,
-  onAddTile,
-  onSplitDown,
-  onAddRow,
-  onMaximize,
-  onDetach,
-  onClose,
-}: PaneTitleBarProps): ReactNode {
-  const awaiting = useAwaiting(session)
-  const detachedWindow = useMemo(inDetachedPaneWindow, [])
-  const barRef = useRef<HTMLDivElement>(null)
-  const addTileRef = useRef<HTMLButtonElement>(null)
   /*
-   * The *window's* maximized flag, which is a different thing from the pane's.
-   *
-   * Subscribed unconditionally because hooks must be, and it costs nothing in a shell: the
-   * store notifies only when the flag actually flips — `refresh()` compares before it emits —
-   * and `WindowFrame` has already attached the one listener behind it. Without this the
-   * detached window's zoom item would be labelled from `maximized`, which
-   * `DetachedPaneWindow` hardcodes to `false`, so it would read "Maximize window" while the
-   * window was maximized.
-   */
-  const { isMaximized } = useWindowChrome()
-
-  /*
-   * Reach the window controls through the buttons this bar already draws.
+   * Reach the window controls through the buttons the cluster already draws.
    *
    * Close, minimize and zoom are `WindowFrame`'s: it owns the one delegated `click` listener
    * that turns `data-window-button` into a call on `@tauri-apps/api/window`, and that
@@ -308,10 +237,11 @@ export function PaneTitleBar({
    * instead, and the behaviour stays in exactly one place.
    *
    * The buttons are always rendered when these items are offered, because both are gated on
-   * the same `detachedWindow`.
+   * the same `detachedWindow`, and in that window the cluster is pinned visible — but a
+   * `click()` does not need the element on screen either way.
    */
   function fireWindowButton(action: 'minimize' | 'zoom' | 'close'): void {
-    barRef.current
+    clusterRef.current
       ?.querySelector<HTMLButtonElement>(`[data-window-button="${action}"]`)
       ?.click()
   }
@@ -338,29 +268,29 @@ export function PaneTitleBar({
    *
    * **A menu under one button, not two buttons**, and that is the whole of the interaction
    * decision. The header can afford `⊞ bash row  ⊞ claude row` because it has a whole window's
-   * width; this bar is 26px tall, holds an index, a centred title that already clips, and three
-   * more actions, and a second unlabelled `⊞` beside the first would be two identical glyphs
-   * meaning different things. Two items in the existing right-click menu was the other
-   * candidate and lost on discoverability — the button is the thing the user said they were
-   * looking at, and a right-click menu is where they were not looking. The context menu's
-   * `Split right` is deliberately left as the one-shot, default-kind version, because it is the
-   * line that carries the `pane.split.right` key chip and a keystroke cannot pick a kind.
+   * width; this cluster floats over live content and every glyph in it is a glyph over a
+   * terminal, so a second unlabelled `⊞` beside the first would be two identical marks meaning
+   * different things and 22 more pixels of transcript covered. Two items in the right-click
+   * menu was the other candidate and lost on discoverability — the button is the thing the
+   * user said they were looking at. The context menu's `Split right` is deliberately left as
+   * the one-shot, default-kind version, because it is the line that carries the
+   * `pane.split.right` key chip and a keystroke cannot pick a kind.
    */
   const addTile = (intent: SplitIntent): void => {
-    const target = paneId === undefined ? null : paneLocation(useWorkspace.getState().boot, paneId)
+    const target = paneLocation(useWorkspace.getState().boot, pane.id)
     /*
-     * No pane id, or a pane this window's snapshot does not hold: fall back to the host's
-     * intent-less handler rather than doing nothing. `App.tsx` supplies one — it is a plain
+     * A pane this window's snapshot does not hold: fall back to the host's intent-less
+     * handler rather than doing nothing. `App.tsx` supplies one — it is a plain
      * `splitPane(…, 'row', 'after')` with no intent — so the worst case here is the behaviour
      * that shipped, not a dead button.
      */
-    if (paneId === undefined || target === null) {
+    if (target === null) {
       onAddTile?.()
       return
     }
     void useWorkspace
       .getState()
-      .splitPane(target.project, target.tab, paneId, 'row', 'after', intent)
+      .splitPane(target.project, target.tab, pane.id, 'row', 'after', intent)
   }
 
   const tileMenu = useContextMenu({
@@ -464,162 +394,256 @@ export function PaneTitleBar({
     ]
   }
 
-  const { onContextMenu, menu } = useContextMenu({ label: 'Pane', items })
+  /*
+   * The menu's `label` is its accessible name, and it is where the index and the title are
+   * *always* readable — the cluster shows them only while it is revealed, and a right-click is
+   * the one gesture that works on every pixel of the pane.
+   */
+  const { onContextMenu, menu, isOpen: paneMenuOpen } = useContextMenu({
+    label: `Pane ${index} — ${pane.title}`,
+    items,
+  })
+
+  // Pinned open while either menu is up (its trigger must not vanish under it), and for the
+  // whole life of a detached window, whose *window* close button cannot be hover-only.
+  const revealed =
+    detachedWindow || paneMenuOpen || tileMenu.isOpen
+      ? `${styles.reveal} ${styles.revealPinned}`
+      : styles.reveal
 
   return (
+    // Pointer-down *capture*, so a click that lands inside a terminal focuses the pane
+    // before xterm consumes the event. Focus-in capture for the same reason one step out:
+    // a pane reached by Tab, or by anything that moves DOM focus without going through the
+    // domain, would otherwise take the keystrokes while the ring stayed on another pane.
+    // This is not `:focus-within` — the handler asks Rust to move focus and the ring is
+    // still drawn only from `tree.focused`, so an overlay taking focus cannot steal it.
     <div
-      ref={barRef}
-      className={styles.bar}
-      data-audit="paneTitle"
-      data-awaiting={awaiting ? 'true' : 'false'}
+      className={focused ? `${styles.frame} ${styles.frameFocused}` : styles.frame}
+      data-audit="pane"
+      data-pane-id={pane.id}
+      data-focused={focused ? 'true' : 'false'}
+      /*
+       * The index and the title, permanently, for the reader who gets none of the chrome.
+       * `role="group"` is what makes the name reachable at all — `aria-label` on a bare div
+       * is dropped — and `group` rather than `region` because six landmarks in a 2x3 grid is
+       * a worse table of contents than none.
+       */
+      role="group"
+      aria-label={`Pane ${index}: ${pane.title}`}
       onContextMenu={onContextMenu}
+      onPointerDownCapture={(event) => {
+        if (event.button === 0 && !onWindowControl(event.target)) seen()
+        raise?.()
+      }}
+      onFocusCapture={(event) => {
+        if (!onWindowControl(event.target)) seen()
+        raise?.()
+      }}
     >
-      <span className={styles.index}>{index}</span>
-      {/*
-       * Always rendered, filled only when it means something.
-       *
-       * The box is reserved either way, and that is the requirement rather than a nicety: a
-       * bar that grows when the marker appears changes the height of the pane body under it,
-       * every terminal in the tab refits, and a `claude` mid-turn reflows its output — a
-       * notification that costs the thing it is notifying you about.
-       */}
-      <span
-        className={awaiting ? `${styles.marker} ${styles.markerOn}` : styles.marker}
-        role={awaiting ? 'status' : undefined}
-        aria-label={awaiting ? 'This session is waiting for you' : undefined}
-        title={awaiting ? 'This session has finished and is waiting for you' : undefined}
-        aria-hidden={awaiting ? undefined : true}
-      />
-      <span className={focused ? `${styles.title} ${styles.titleFocused}` : styles.title}>
-        {title}
-      </span>
-      <span className={styles.actions}>
-        {detachedWindow ? (
-          /*
-           * A detached-pane window's bar carries WINDOW controls, not pane controls.
-           *
-           * The user's report: "there is no way to close undocked window, only redock - but
-           * it should have same variants of maximize, close, etc". All three of the pane
-           * actions were dead here — `DetachedPaneWindow` passes no callbacks, so ⛶, ⧉ and ×
-           * were three buttons that did nothing — and `DetachedPaneWindow.module.css` hid
-           * them with a rule that says, in as many words, "if that prop is added, delete this
-           * rule". Withholding them here is that prop. **That CSS rule now hides these
-           * controls too and should be deleted**; the class nesting below outspecifies it in
-           * the meantime.
-           *
-           * `data-window-button` is `WindowFrame`'s contract — see the delegated click
-           * handler there, which is what the app header's traffic lights already use.
-           */
-          <span className={styles.controls}>
-            <button
-              type="button"
-              className={styles.control}
-              data-window-button="minimize"
-              title="Minimize window"
-              aria-label="Minimize window"
-            >
-              ─
-            </button>
-            <button
-              type="button"
-              className={styles.control}
-              data-window-button="zoom"
-              title={isMaximized ? 'Restore window' : 'Maximize window'}
-              aria-label={isMaximized ? 'Restore window' : 'Maximize window'}
-              aria-pressed={isMaximized}
-            >
-              ▢
-            </button>
-            <button
-              type="button"
-              className={`${styles.control} ${styles.controlClose}`}
-              data-window-button="close"
-              // The tooltip says what closing means here, because it is not what a close
-              // means anywhere else: the session survives and the pane goes home. Losing a
-              // running conversation to a window control would be unrecoverable, so the
-              // gesture is a re-dock and the label says so rather than surprising anyone.
-              title="Close window — the pane returns to its tab and its session keeps running"
-              aria-label="Close window; the pane returns to its tab"
-            >
-              ✕
-            </button>
-          </span>
-        ) : (
-          <>
-            {onAddTile && (
+      {/* Before the cluster in DOM order, so Tab reaches the pane's own content first and the
+          chrome after it, and so the cluster paints on top without a second z-index. */}
+      <div className={styles.body}>{children}</div>
+
+      <div
+        ref={clusterRef}
+        className={styles.cluster}
+        data-audit="paneTitle"
+        data-awaiting={awaiting ? 'true' : 'false'}
+        /*
+         * A click on this cluster must not take DOM focus off whatever the user was typing
+         * into.
+         *
+         * The old buttons were in a bar of their own above the terminal; these sit *on* it,
+         * two centimetres from the caret, so mis-aimed and deliberate clicks alike are far
+         * more likely to land here mid-keystroke. Preventing the mousedown default leaves
+         * focus exactly where it was — the terminal keeps taking keys — while the frame's
+         * pointer-down capture above still moves the *domain's* focus, which is the only
+         * thing the key gate reads (`App.tsx` builds `keyContext` from `tree.focused`, never
+         * from `document.activeElement`). So the ring, the `when` clauses and the typing all
+         * agree, which they did not when a click parked focus on a button that answers no
+         * keys.
+         *
+         * Only the primary button, and never `pointerdown`: preventing that one would take
+         * the click, and `contextmenu` has to keep arriving.
+         */
+        onMouseDown={(event) => {
+          if (event.button === 0) event.preventDefault()
+        }}
+      >
+        <span className={revealed}>
+          {!detachedWindow && (
+            <>
+              {/*
+               * The index is presentation, computed depth-first by the caller at render time
+               * rather than stored: storing it would mean renumbering every sibling on each
+               * split and close, and the number exists so "focus pane 3" has something to
+               * refer to. Nothing dispatches by it — `pane.navigate.{left,right,up,down}` is
+               * the whole of the keyboard's pane addressing — which is why it can live behind
+               * the reveal rather than costing a permanent mark on the transcript.
+               */}
+              <span className={styles.index}>{index}</span>
+              <span className={focused ? `${styles.title} ${styles.titleFocused}` : styles.title}>
+                {pane.title}
+              </span>
+            </>
+          )}
+
+          <span className={detachedWindow ? styles.controls : styles.actions}>
+            {detachedWindow ? (
               /*
-               * A menu trigger, not a one-shot. The `▾` is drawn *inside* the same button
-               * rather than beside it as a second control: at 26px there is no room for a
-               * split button's two hit targets, and a caret that opens the same menu the
-               * glyph does would be two ways to do one thing in eleven pixels.
+               * A detached-pane window's cluster carries WINDOW controls, not pane controls.
+               *
+               * The user's report: "there is no way to close undocked window, only redock -
+               * but it should have same variants of maximize, close, etc". All three of the
+               * pane actions were dead here — `DetachedPaneWindow` passes no callbacks — and
+               * `DetachedPaneWindow.module.css` hid them with a rule that says, in as many
+               * words, "if that prop is added, delete this rule". Withholding them here is
+               * that prop. **That CSS rule now hides these controls too and should be
+               * deleted**; the class nesting in the stylesheet outspecifies it in the
+               * meantime.
+               *
+               * The pane's own index and title are dropped in this window rather than moved:
+               * it holds exactly one pane, so the index is always `1`, and
+               * `DetachedPaneWindow` already prints the title in its 34px header — a second
+               * copy 26 pixels below the first is what "the header takes a lot of space"
+               * was about.
+               *
+               * `data-window-button` is `WindowFrame`'s contract — see the delegated click
+               * handler there, which is what the app header's traffic lights already use.
                */
-              <button
-                ref={addTileRef}
-                type="button"
-                className={`${styles.action} ${styles.actionMenu}`}
-                title="Add a pane to this row — bash or claude"
-                aria-label="Add a pane to this row"
-                aria-haspopup="menu"
-                aria-expanded={tileMenu.isOpen}
-                onClick={() => {
-                  const anchor = addTileRef.current
-                  if (anchor !== null) tileMenu.openFor(anchor)
-                }}
-              >
-                ⊞<span className={styles.caret} aria-hidden="true">▾</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  className={styles.control}
+                  data-window-button="minimize"
+                  title="Minimize window"
+                  aria-label="Minimize window"
+                >
+                  ─
+                </button>
+                <button
+                  type="button"
+                  className={styles.control}
+                  data-window-button="zoom"
+                  title={isMaximized ? 'Restore window' : 'Maximize window'}
+                  aria-label={isMaximized ? 'Restore window' : 'Maximize window'}
+                  aria-pressed={isMaximized}
+                >
+                  ▢
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.control} ${styles.controlClose}`}
+                  data-window-button="close"
+                  // The tooltip says what closing means here, because it is not what a close
+                  // means anywhere else: the session survives and the pane goes home. Losing a
+                  // running conversation to a window control would be unrecoverable, so the
+                  // gesture is a re-dock and the label says so rather than surprising anyone.
+                  title="Close window — the pane returns to its tab and its session keeps running"
+                  aria-label="Close window; the pane returns to its tab"
+                >
+                  ✕
+                </button>
+              </>
+            ) : (
+              <>
+                {onAddTile && (
+                  /*
+                   * A menu trigger, not a one-shot. The `▾` is drawn *inside* the same button
+                   * rather than beside it as a second control: a split button's two hit
+                   * targets would be two more squares over the transcript, and a caret that
+                   * opens the same menu the glyph does would be two ways to do one thing.
+                   */
+                  <button
+                    ref={addTileRef}
+                    type="button"
+                    className={`${styles.action} ${styles.actionMenu}`}
+                    title="Add a pane to this row — bash or claude"
+                    aria-label="Add a pane to this row"
+                    aria-haspopup="menu"
+                    aria-expanded={tileMenu.isOpen}
+                    onClick={() => {
+                      const anchor = addTileRef.current
+                      if (anchor !== null) tileMenu.openFor(anchor)
+                    }}
+                  >
+                    ⊞<span className={styles.caret} aria-hidden="true">▾</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className={maximized ? `${styles.action} ${styles.actionOn}` : styles.action}
+                  title={maximized ? 'Restore pane' : 'Maximize pane'}
+                  aria-label={maximized ? 'Restore pane' : 'Maximize pane'}
+                  aria-pressed={maximized}
+                  onClick={onMaximize}
+                >
+                  ⛶
+                </button>
+                {/* `aria-disabled`, not `disabled`, for the reason spelled out on the close
+                    button. */}
+                <button
+                  type="button"
+                  className={
+                    detachable ? styles.action : `${styles.action} ${styles.actionDisabled}`
+                  }
+                  title={
+                    detachable
+                      ? 'Detach into a window'
+                      : 'The project console pane cannot be detached'
+                  }
+                  aria-label={
+                    detachable
+                      ? 'Detach pane into a window'
+                      : 'The project console pane cannot be detached'
+                  }
+                  aria-disabled={!detachable}
+                  onClick={detachable ? onDetach : undefined}
+                >
+                  ⧉
+                </button>
+                {/*
+                 * `aria-disabled` rather than `disabled`: a disabled button swallows
+                 * pointerdown without bubbling, so clicking the close button of the primary
+                 * pane would be the one click in the frame that fails to focus it.
+                 */}
+                <button
+                  type="button"
+                  className={closable ? styles.action : `${styles.action} ${styles.actionDisabled}`}
+                  title={closable ? 'Close pane' : 'The project console pane cannot be closed'}
+                  // The reason travels in the name, not only in the tooltip: `title` reaches a
+                  // mouse pointer, and the one user who cannot see the dimming is the one
+                  // reading this button through a screen reader.
+                  aria-label={closable ? 'Close pane' : 'The project console pane cannot be closed'}
+                  aria-disabled={!closable}
+                  onClick={closable ? onClose : undefined}
+                >
+                  ×
+                </button>
+              </>
             )}
-            <button
-              type="button"
-              className={maximized ? `${styles.action} ${styles.actionOn}` : styles.action}
-              title={maximized ? 'Restore pane' : 'Maximize pane'}
-              aria-label={maximized ? 'Restore pane' : 'Maximize pane'}
-              aria-pressed={maximized}
-              onClick={onMaximize}
-            >
-              ⛶
-            </button>
-            {/* `aria-disabled`, not `disabled`, for the reason spelled out on the close button. */}
-            <button
-              type="button"
-              className={detachable ? styles.action : `${styles.action} ${styles.actionDisabled}`}
-              title={
-                detachable ? 'Detach into a window' : 'The project console pane cannot be detached'
-              }
-              aria-label={
-                detachable
-                  ? 'Detach pane into a window'
-                  : 'The project console pane cannot be detached'
-              }
-              aria-disabled={!detachable}
-              onClick={detachable ? onDetach : undefined}
-            >
-              ⧉
-            </button>
-            {/*
-             * `aria-disabled` rather than `disabled`: a disabled button swallows pointerdown
-             * without bubbling, so clicking the close button of the primary pane would be the
-             * one click in the frame that fails to focus it.
-             */}
-            <button
-              type="button"
-              className={closable ? styles.action : `${styles.action} ${styles.actionDisabled}`}
-              title={closable ? 'Close pane' : 'The project console pane cannot be closed'}
-              // The reason travels in the name, not only in the tooltip: `title` reaches a
-              // mouse pointer, and the one user who cannot see the dimming is the one reading
-              // this button through a screen reader.
-              aria-label={closable ? 'Close pane' : 'The project console pane cannot be closed'}
-              aria-disabled={!closable}
-              onClick={closable ? onClose : undefined}
-            >
-              ×
-            </button>
-          </>
-        )}
-      </span>
+          </span>
+        </span>
+
+        {/*
+         * Outside the reveal, and last in the row, so it keeps the corner and never hides:
+         * it is the only mark here that reports on a pane the user is *not* looking at. The
+         * box is reserved either way — see the stylesheet for why an empty one still takes
+         * its 15px.
+         */}
+        <span
+          className={awaiting ? `${styles.marker} ${styles.markerOn}` : styles.marker}
+          role={awaiting ? 'status' : undefined}
+          aria-label={awaiting ? 'This session is waiting for you' : undefined}
+          title={awaiting ? 'This session has finished and is waiting for you' : undefined}
+          aria-hidden={awaiting ? undefined : true}
+        />
+      </div>
+
       {/* Both portal to a sibling of `#root`, so the pane's `overflow: hidden` cannot clip
           them. Two hooks rather than one because they answer different gestures — a
-          right-click anywhere in the bar, and a click on one button — and `useContextMenu`
+          right-click anywhere in the frame, and a click on one button — and `useContextMenu`
           holds one open menu each. */}
       {menu}
       {tileMenu.menu}

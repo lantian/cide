@@ -1,5 +1,12 @@
 /*
- * The pane frame and its 26px title bar.
+ * The pane frame, and the control cluster that floats in its top-right corner.
+ *
+ * There is no title bar any more. The user's report: *"doesn't like currently header of
+ * panels and opened files - it takes a lot of space … let's instead of a header row move
+ * this button to right top corner as floating button without background"*. The bar was
+ * `--h-panetitle` (26px) plus its own 1px border per pane, so a 2x3 grid spent 162px — a
+ * seventh of a 1080p window — on six rows of chrome that repeated the project name six
+ * times.
  *
  * The frame carries a border in *both* focus states and only changes its colour. Boxes are
  * `border-box`, so toggling between `0` and `1px` would leave the frame where it is and
@@ -13,10 +20,62 @@
   min-height: 0;
   background: var(--panel);
   border: 1px solid var(--border);
+  /* What `.cluster` and the focus ring resolve `top/right/inset` against. */
+  position: relative;
+  /*
+   * A stacking context of its own, so the cluster's `z-index: 2` is scoped to this pane.
+   * Without it the number competes with `SplitTree`'s splitter (`z-index: 1`), which is
+   * deliberately above the panes so that half of its widened hit area is not dead — a
+   * cluster that escaped this box would take those pixels back.
+   */
+  isolation: isolate;
+
+  /*
+   * How much of the pane's top-right corner the floating controls claim.
+   *
+   * Published as a custom property because it is a contract with whatever is *inside* the
+   * pane: a pane whose content draws its own 26px header with right-aligned controls
+   * (`panes/GitDiffPane.module.css`, `panes/DiffPane.module.css`) puts them exactly where
+   * this cluster lands, and one of the two would be unclickable. Those headers want
+   * `padding-right: calc(8px + var(--pane-corner, 0px))`; that is one line in each and it
+   * is *not* applied here, because those files belong to another surface — see the report.
+   *
+   * The measurement is the interactive part only: 4px of padding, the awaiting marker and
+   * its margins, and the four 22px controls with their gaps. The index and the title extend
+   * further left than this and are deliberately excluded — they are inert text and may
+   * overlay inert text (a diff's path clips itself with an ellipsis) without either being
+   * lost.
+   */
+  --pane-corner: 126px;
 }
 
+/*
+ * Focus, when the bar is no longer there to carry it.
+ *
+ * The old ring was 1px of `--accent-dim`, with the bar's lit title doing most of the work.
+ * On its own that ring is not a ring: light `--accent-dim` is `#f6d0bf` against a
+ * `#d8d8de` `--border`, so the focused pane's edge came out *paler* than its neighbours' —
+ * "focused" read as "less bordered". `--accent` instead, and twice: the frame's own border
+ * plus a pseudo-element ring immediately inside it, which is 2px of the app's one
+ * "here you are" colour in both themes (`#c4452a` on white, `#d97757` on `#111113`).
+ *
+ * The second pixel is a pseudo-element rather than a 2px border (which would resize the
+ * body, per the note above) and rather than an `inset` box-shadow (which paints on the
+ * frame's own background layer and would therefore be covered by the terminal, which is
+ * opaque and fills the frame).
+ */
 .frameFocused {
-  border-color: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.frameFocused::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--accent);
+  /* Above the body, below the cluster. Never a hit target. */
+  z-index: 1;
+  pointer-events: none;
 }
 
 .body {
@@ -38,43 +97,192 @@
   overflow: hidden;
 }
 
-.bar {
-  height: var(--h-panetitle);
-  flex: none;
+/*
+ * The floating cluster: index, title, actions, awaiting marker — in the corner, over the
+ * content, out of flow.
+ *
+ * `height: var(--h-panetitle)` is not the old bar coming back: nothing is reserved, the box
+ * is absolutely positioned and the pane body runs underneath it. It is that number because
+ * the two panes that draw a header of their own use the same token, so the floating controls
+ * sit centred on that header rather than a pixel or two off it.
+ *
+ * `pointer-events: none` on the container is what keeps the corner *live* while the cluster
+ * is at rest: the gaps between the buttons, and the whole box before it is revealed, pass
+ * clicks and drags straight through to the terminal underneath. Only the parts that are
+ * visible take the pointer back.
+ */
+.cluster {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
-  background: var(--chrome);
-  border-bottom: 1px solid var(--border);
-  padding: 0 6px;
+  height: var(--h-panetitle);
+  /*
+   * The right inset is not decoration. `SplitTree`'s splitter widens its hit area with a
+   * `::before` that reaches 3px into the pane beside it and paints above these controls, so
+   * a button flush with the frame's right edge would lose its outermost pixels to a
+   * col-resize target.
+   */
+  padding: 0 4px;
+  /*
+   * `min-width` is what makes `--pane-corner` a measurement rather than a claim: the box is
+   * that wide whatever is in it, so the number a diff header pads by is the number this
+   * cluster occupies. `flex-end` then keeps the contents in the corner instead of at the
+   * left edge of the reserve.
+   */
+  min-width: var(--pane-corner);
+  justify-content: flex-end;
+  /* A long title clips itself rather than reaching across the pane it is labelling. */
+  max-width: 70%;
   font-family: var(--font-mono);
   font-size: 11.5px;
+  pointer-events: none;
+}
+
+/*
+ * Everything that is not the marker, hidden until the user reaches for it.
+ *
+ * **A terminal is opaque and scrolls under this.** A borderless glyph sitting permanently
+ * over a live transcript is unreadable about half the time and is visual noise the rest, and
+ * the user asked for controls with no background — so a permanent chrome-coloured pill was
+ * out. Three candidates:
+ *
+ *   * *bare glyphs, always visible, with a text-shadow halo* — still illegible over
+ *     box-drawing and dense output, and it puts four glyphs over the first line of every
+ *     pane's output forever;
+ *   * *a permanent scrim behind the cluster* — legible, but it is the background the user
+ *     asked us to remove, only smaller;
+ *   * *reveal on hover/focus, with a scrim only while revealed* — nothing over the transcript
+ *     at rest, and legible the moment it is on screen.
+ *
+ * The third, and both halves are load-bearing: revealing without the scrim gives you the
+ * unreadable glyph again at the exact moment you are trying to aim at it.
+ *
+ * `opacity`, never `visibility` or `display`: this has to stay in the tab order while it is
+ * invisible, because that is how a user who cannot hover reaches it — Tab lands on a control,
+ * `:focus-within` below lights the cluster up, and the focus outline says which one.
+ */
+.reveal {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  /* So the scrim's `z-index: -1` cannot escape behind the pane body. */
+  position: relative;
+  isolation: isolate;
+  padding: 0 3px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 80ms linear;
+}
+
+/*
+ * The scrim, and only behind the cluster.
+ *
+ * `--panel` is the pane's own background, so the effect reads as the pane surfacing through
+ * its content rather than as a new piece of chrome. Held at 0.82 so a hint of what is
+ * underneath still shows: it is a temporary lid, not a hole in the transcript.
+ */
+.reveal::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: 4px;
+  background: var(--panel);
+  opacity: 0.82;
+}
+
+/*
+ * Hovering anywhere in the pane, not just the corner: the corner is 126px of a pane that may
+ * be a third of the window, and a control you must already know about to hover is a control
+ * nobody finds. The pointer is inside the frame before it can reach the cluster, so this also
+ * means the cluster is always visible by the time it can be clicked — which is what makes the
+ * `pointer-events: none` above safe rather than a click that lands on an invisible button.
+ */
+.frame:hover .reveal {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* The keyboard's route in. Scoped to the cluster, emphatically not `.frame:focus-within` —
+   the frame holds the terminal, which has DOM focus for as long as anyone is typing in it,
+   so that selector would pin the controls open over the one pane being read. */
+.reveal:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/*
+ * Pinned open. Two cases, and they are different enough to say out loud:
+ *
+ *  * a menu opened *from* one of these buttons — focus is in the menu, which portals out of
+ *    this frame, so `:focus-within` is false and the pointer has usually left; without this
+ *    the trigger of an open menu would vanish and `aria-expanded="true"` would point at
+ *    nothing;
+ *  * a detached-pane window, where the cluster carries the *window's* minimize/zoom/close
+ *    rather than pane actions. A window whose close button appears only on hover is a window
+ *    a user can be unable to close, and this app's detached windows have no WM decorations
+ *    (ADR 0006) — so those are always on screen, scrim and all.
+ */
+.revealPinned {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    transition: none;
+  }
 }
 
 .index {
   flex: none;
   color: var(--faint);
+  padding: 0 4px 0 2px;
+}
+
+.title {
+  flex: 0 1 auto;
+  min-width: 0;
+  padding-right: 6px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.titleFocused {
+  color: var(--text-hi);
 }
 
 /*
  * "This session has finished and is waiting for you."
  *
- * Always in the box, filled only when it means something. `visibility` and `opacity` are both
- * ways of saying that; neither takes the space back, which is the whole requirement — the bar
- * sits directly above the pane body, so a marker that appeared and pushed one pixel would
- * change every terminal's row count in the tab and reflow a `claude` that is mid-answer. That
- * is a notification costing the thing it notifies you about.
+ * The one thing in the cluster that does **not** hide with the rest, and the reason is the
+ * whole point of it: it says a pane you are *not* looking at wants you back, so a marker that
+ * appeared only when you hovered that pane would be a notification you can see only after you
+ * have already gone to look.
  *
- * Fixed `width`/`height` with `flex: none` rather than a padded glyph: a text marker's box
- * depends on the font the user has, and the reserved space has to be the same in every theme
- * and at every zoom.
+ * Last in the flex row, so it is the child anchored to the corner. The cluster is
+ * right-aligned and out of flow, so the box that grows and shrinks in front of it — a title
+ * of any length, four buttons or three — moves leftwards and never moves the dot.
+ *
+ * The space is still reserved when the marker is off. Nothing reflows any more (this box is
+ * out of flow entirely, which is what the old bar's version of this comment was defending
+ * against), but a marker that arrived mid-hover would shift every button 15px right, under a
+ * pointer already aiming at one.
  */
 .marker {
   flex: none;
   width: 7px;
   height: 7px;
-  margin: 0 6px;
+  margin: 0 4px 0 6px;
   border-radius: 50%;
   background: transparent;
+  /* Transparent and inert: 7px of a live terminal's corner must not eat a click. */
+  pointer-events: none;
 }
 
 /*
@@ -87,47 +295,46 @@
  *
  * `--yellow` is one of the six tokens `tokens.css` pitches per theme *as a text colour*: a
  * dark amber (#8a5a00) on the light theme's near-white chrome, a light amber (#dfae68) on
- * dark. Both are legible against their own `--chrome` without this file knowing which theme
- * it is in, which is exactly what a token is for. The 1px halo in the bar's own colour keeps
- * the edge crisp on either ground; the soft outer glow is what makes a 7px dot findable
- * across a wide window without making it large enough to reserve more space.
+ * dark. Both are legible against their own `--panel` without this file knowing which theme
+ * it is in, which is exactly what a token is for. The 1px halo is in `--panel` — the pane's
+ * background, not the vanished bar's — because what this dot now sits on is whatever the
+ * terminal last painted, and the halo is what keeps its edge crisp against it. The soft outer
+ * glow is what makes a 7px dot findable across a wide window without making it large enough
+ * to have to reserve more space.
+ *
+ * Live to the pointer, unlike the empty marker, so its tooltip can explain itself.
  */
 .markerOn {
   background: var(--yellow);
   box-shadow:
-    0 0 0 1px var(--chrome),
+    0 0 0 1px var(--panel),
     0 0 4px var(--yellow);
+  pointer-events: auto;
 }
 
-.title {
-  flex: 1;
-  text-align: center;
-  color: var(--dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.titleFocused {
-  color: var(--text-hi);
-}
-
-/* `flex: none` so a long title clips itself rather than squeezing the action cluster. */
 .actions {
   flex: none;
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 2px;
   color: var(--dim);
-  /*
-   * Full bar height rather than the height of an 11.5px glyph. The bar centres its
-   * children, which would leave these buttons about eleven pixels tall and force the user
-   * to hit a target the size of the character; stretching costs nothing visually, since
-   * the buttons paint no background.
-   */
-  align-self: stretch;
 }
 
+/*
+ * 22x22, against the mock's 26x22 for a bar cell.
+ *
+ * The old buttons were a bare glyph in a stretched box: 26px tall and about eleven wide,
+ * because nothing gave them a width. Floating over a terminal they have to be aimed at
+ * rather than swept into, so each one is now a square target — wider than what it replaces,
+ * one pixel shy of the mock's cell in the axis the mock had a bar to fill.
+ */
 .action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 3px;
   background: transparent;
   border: 0;
   color: inherit;
@@ -137,23 +344,41 @@
   line-height: 1;
 }
 
+/*
+ * The one background in here, and it is per-button and only under the pointer.
+ *
+ * "Just buttons without background" is the rest state and it is honoured. A 22px square with
+ * no fill and no border gives no edge to aim at once it is on screen, and the app's other
+ * icon buttons — the window controls below, the row strip in `SplitTree` — all answer the
+ * pointer with `--chrome-hi`. Silent controls would have been the odd ones out.
+ */
 .action:hover {
+  background: var(--chrome-hi);
   color: var(--text-hi);
+}
+
+/*
+ * The cluster is the only chrome a pane has now, so a control that has been tabbed to has to
+ * say so — this is the other half of "what does a user who cannot hover do".
+ */
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 /*
  * The one action that opens a menu instead of doing a thing.
  *
  * `⊞` alone said "add a pane" and the user had no way to know which kind they were about to
- * get; the caret is the only affordance in this bar that says "there is a choice behind this".
- * `inline-flex` with a 2px gap rather than a space character between the glyphs, because the
- * bar is set in `--font-mono` and a literal space there is a full cell wide — which at 26px is
- * enough to push the title's ellipsis.
+ * get; the caret is the only affordance in this cluster that says "there is a choice behind
+ * this". A 2px gap rather than a space character between the glyphs, because this is set in
+ * `--font-mono` and a literal space there is a full cell wide.
  */
 .actionMenu {
-  display: inline-flex;
-  align-items: center;
+  width: auto;
+  min-width: 26px;
   gap: 2px;
+  padding: 0 3px;
 }
 
 /* Smaller and dimmer than the glyph it hangs off: it is a hint about the control, not a
@@ -178,6 +403,7 @@
 }
 
 .actionDisabled:hover {
+  background: transparent;
   color: inherit;
 }
 
@@ -186,7 +412,8 @@
  *
  * The user's report was that a detached window can only be re-docked and "should have same
  * variants of maximize, close, etc". These are those: minimize, maximize/restore, close, in
- * the desktop's own order, acting on the OS window rather than on the pane.
+ * the desktop's own order, acting on the OS window rather than on the pane. They are pinned
+ * visible — see `.revealPinned`.
  *
  * # Why this nesting depth
  *
@@ -194,11 +421,11 @@
  *
  *     .body [data-audit='paneTitle'] button { display: none; }
  *
- * written when this bar had no way to withhold its three pane actions — its own comment says
- * "If that prop is added, delete this rule." The prop now exists (`PaneTitleBar` renders the
+ * written when this component had no way to withhold its three pane actions — its own comment
+ * says "If that prop is added, delete this rule." The prop now exists (the cluster renders the
  * window controls *instead of* the pane actions in a detached window), so **that rule should
- * be deleted**; until it is, it would hide these three too. `.bar .controls .control` is
- * three classes to its two-classes-plus-an-element, which wins on the class count, so the
+ * be deleted**; until it is, it would hide these three too. `.cluster .controls .control` is
+ * three classes to its one-class-plus-attribute-plus-element (0,3,0 against 0,2,1), so the
  * controls survive either way. This is a stated overlap, not an accident — delete the other
  * rule and this selector can lose a level.
  */
@@ -208,12 +435,13 @@
   gap: 2px;
 }
 
-.bar .controls .control {
+.cluster .controls .control {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 22px;
-  align-self: stretch;
+  height: 22px;
+  border-radius: 3px;
   background: transparent;
   border: 0;
   color: var(--dim);
@@ -223,14 +451,14 @@
   line-height: 1;
 }
 
-.bar .controls .control:hover {
+.cluster .controls .control:hover {
   background: var(--chrome-hi);
   color: var(--text-hi);
 }
 
-.bar .controls .control:focus-visible {
+.cluster .controls .control:focus-visible {
   outline: 1px solid var(--accent);
-  outline-offset: -2px;
+  outline-offset: -1px;
 }
 
 /*
@@ -238,7 +466,7 @@
  * gesture re-docks the pane and kills nothing, so a permanently red control in the corner of
  * every detached window would advertise a danger that is not there.
  */
-.bar .controls .controlClose:hover {
+.cluster .controls .controlClose:hover {
   background: var(--red);
   color: var(--on-accent);
 }
