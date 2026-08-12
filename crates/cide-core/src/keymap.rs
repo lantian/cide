@@ -101,20 +101,28 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+s", "file.save"),
         ("ctrl+shift+t", "theme.toggle"),
         // Switching projects, asked for by name: "a hotkey with default CTRL+TAB to switch
-        // between opened projects".
+        // between opened projects" — and then, when asked whether the cycle should be header
+        // order or most-recently-used, answered precisely: "most-recently-used, but until
+        // CTRL is pressed and pressing TAB twice - should follow to iteration between whole
+        // list".
         //
-        // **Header order, not most-recently-used**, and that is a decision rather than a
-        // shortcut taken. Ctrl+Tab is MRU in editors that have it, but MRU is only usable
-        // with the hold-and-cycle machine behind it: you keep Ctrl down, tab through a
-        // popup, and the choice commits on *key up*. This gate resolves on keydown and has
-        // no key-up path at all, and MRU without the hold degenerates into a toggle between
-        // the two most recent projects — press it twice and you are back where you started,
-        // so a third project is unreachable by this key for ever. Header order is what the
-        // user can see on screen, it wraps, and it needs no stack that has to survive a
-        // project closing. If a hold-and-cycle overlay is ever built, MRU becomes the right
-        // answer and only `project.next`'s handler changes.
-        ("ctrl+tab", "project.next"),
-        ("ctrl+shift+tab", "project.prev"),
+        // That is the Windows / IDEA / browser switcher and nothing else: **hold** Ctrl, and
+        // the popup that appears selects the previously used project, so one press-and-release
+        // is the two-item toggle everyone expects; each further Tab with Ctrl still down walks
+        // one further down the whole MRU list; the release commits.
+        //
+        // An earlier round shipped header order here, and its stated reason was that this gate
+        // resolves on keydown and has no key-up path, so MRU without a hold would degenerate
+        // into a toggle between two projects with the third unreachable for ever. The premise
+        // was right and the conclusion was the wrong way round: the fix is the hold, not a
+        // different order. It is built — `ui/src/keys/switcher.ts` is the walk, and the
+        // release is watched by a modifier latch that resolves no chords, so the gate is still
+        // keydown-only at both of its entry points.
+        //
+        // `project.next` / `project.prev` still exist and still walk the header strip. They
+        // are simply not what Ctrl+Tab means any more.
+        ("ctrl+tab", "project.switcher.next"),
+        ("ctrl+shift+tab", "project.switcher.prev"),
         ("ctrl+alt+h", "pane.navigate.left"),
         ("ctrl+alt+l", "pane.navigate.right"),
         ("ctrl+alt+k", "pane.navigate.up"),
@@ -622,8 +630,8 @@ mod tests {
             "pane.navigate.up",
             "pane.navigate.down",
             "settings.open",
-            "project.next",
-            "project.prev",
+            "project.switcher.next",
+            "project.switcher.prev",
         ] {
             assert!(
                 resolved.iter().any(|r| r.command == command),
@@ -837,8 +845,14 @@ mod tests {
         // `⌘⇥` is the system app switcher: macOS never delivers it, so rewriting this one
         // would silently *remove* project switching on the platform rather than move it.
         let resolved = resolve_layers(&platform_layer(true), &[]);
-        assert_eq!(command_for(&resolved, "ctrl+tab"), ["project.next"]);
-        assert_eq!(command_for(&resolved, "ctrl+shift+tab"), ["project.prev"]);
+        assert_eq!(
+            command_for(&resolved, "ctrl+tab"),
+            ["project.switcher.next"]
+        );
+        assert_eq!(
+            command_for(&resolved, "ctrl+shift+tab"),
+            ["project.switcher.prev"]
+        );
         assert!(
             command_for(&resolved, "meta+tab").is_empty(),
             "nothing may be bound to the macOS application switcher"

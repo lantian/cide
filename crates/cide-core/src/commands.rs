@@ -321,10 +321,34 @@ fn build() -> Vec<Command> {
         Command::new("tab.close", "Close tab", WINDOW).when("closableTab"),
         Command::new("tab.next", "Next tab", WINDOW).when("multipleTabs"),
         Command::new("tab.prev", "Previous tab", WINDOW).when("multipleTabs"),
-        // Project. Ctrl+Tab and Ctrl+Shift+Tab; see `keymap::defaults` for why the order is
-        // the header's and not most-recently-used.
-        Command::new("project.next", "Next project", PROJECT).when("multipleProjects"),
-        Command::new("project.prev", "Previous project", PROJECT).when("multipleProjects"),
+        // Project. Two families, and the split is the point rather than duplication.
+        //
+        // The *switcher* is Ctrl+Tab: hold the modifier, tab through a popup in
+        // most-recently-used order, release to commit. That is what the user asked for by
+        // name, and `keymap::defaults` carries the argument for why the hold is not optional.
+        // Running it from the palette holds no modifier, so it degenerates to "switch to the
+        // most recently used project" — one keystroke, terminating, and the titles say so.
+        Command::new(
+            "project.switcher.next",
+            "Switch project (most recently used)",
+            PROJECT,
+        )
+        .when("multipleProjects"),
+        Command::new(
+            "project.switcher.prev",
+            "Switch project (least recently used)",
+            PROJECT,
+        )
+        .when("multipleProjects"),
+        // The immediate walk along the header strip. Unbound by default — Ctrl+Tab belongs to
+        // the switcher — and kept because the two answer different questions: this one matches
+        // the tabs on screen, the switcher matches the order the user works in. A user who
+        // prefers strip order binds these and the switcher stops being reachable by key,
+        // which is the whole reason both are registered rather than one being deleted.
+        Command::new("project.next", "Next project (header order)", PROJECT)
+            .when("multipleProjects"),
+        Command::new("project.prev", "Previous project (header order)", PROJECT)
+            .when("multipleProjects"),
         // Claude. `fork`, `mirror` and `restart` act on the focused *session*, so none of
         // them mean anything without a Claude pane to act on.
         //
@@ -634,6 +658,33 @@ mod tests {
             };
             assert_eq!(command.when.as_deref(), Some(expected), "{}", command.id);
         }
+    }
+
+    #[test]
+    fn the_switcher_owns_ctrl_tab_and_the_header_walk_stays_registered_and_unbound() {
+        // Two families that answer different questions, and the way this goes wrong is that
+        // one of them quietly becomes unreachable. So both halves are pinned here.
+        for id in [
+            "project.switcher.next",
+            "project.switcher.prev",
+            "project.next",
+            "project.prev",
+        ] {
+            let command = by_id(id).unwrap_or_else(|| panic!("{id} is registered"));
+            assert_eq!(command.when.as_deref(), Some("multipleProjects"), "{id}");
+            assert_eq!(command.unavailable, None, "{id} must be runnable");
+        }
+
+        let bound: Vec<String> = crate::keymap::defaults()
+            .iter()
+            .filter(|b| b.key.contains("tab"))
+            .map(|b| b.command.clone())
+            .collect();
+        assert_eq!(
+            bound,
+            ["project.switcher.next", "project.switcher.prev"],
+            "Ctrl+Tab is the held-modifier switcher; the header walk is palette-only"
+        );
     }
 
     #[test]

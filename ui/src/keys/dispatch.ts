@@ -71,6 +71,7 @@ import {
   type TabId,
 } from '@/ipc/client'
 import { focusedTabOf, registeredBuffers, saveAll, saveTab } from '@/editor/openBuffers'
+import { startProjectSwitch } from './switcherStore'
 import {
   activeProjectOf,
   claudeTargetOf,
@@ -280,13 +281,27 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       /* ---------------------------------------------------------------------- Projects */
 
+      /*
+       * Ctrl+Tab / Ctrl+Shift+Tab — the held-modifier switcher, in most-recently-used order.
+       *
+       * The whole gesture is in `keys/switcher.ts` (pure) and `keys/switcherStore.ts` (the
+       * open walk and its release watcher); this arm only names the direction. Running either
+       * from the command palette is a legitimate, terminating thing to do and switches
+       * immediately to the most — or least — recently used project, because no modifier is
+       * being held for the popup to wait on. See `begin` in `keys/switcher.ts`.
+       */
+      case 'project.switcher.next':
+      case 'project.switcher.prev':
+        return startProjectSwitch(command === 'project.switcher.next' ? 1 : -1)
+
       case 'project.next':
       case 'project.prev': {
-        // Ctrl+Tab / Ctrl+Shift+Tab, in **header order** — `role.projects` is this window's
-        // strip in the order it is drawn, so the cycle matches what the user sees.
-        // `keymap.rs` argues the MRU alternative down at length; `windowProjectsOf` argues
-        // down the workspace-wide list, which is a keystroke that does nothing in
-        // `perProject` window mode.
+        // The *immediate* walk, in **header order** — `role.projects` is this window's strip
+        // in the order it is drawn. Unbound by default and kept for the palette and for
+        // anyone who wants a plain next/previous on a key of their own: it is the one that
+        // matches the strip on screen, where the switcher above matches how the user works.
+        // `windowProjectsOf` argues down the workspace-wide list, which is a keystroke that
+        // does nothing in `perProject` window mode.
         const current = boot()
         const ids = windowProjectsOf(current)
         const active = current?.role.kind === 'shell' ? current.role.active : null
