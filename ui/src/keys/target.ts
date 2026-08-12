@@ -18,9 +18,16 @@
  * * `shell` — the project in `role.active`, its `activeTab`, that tab's focused pane.
  * * `detachedTab` — one tab in its own window; the project and tab come from the role.
  * * `detachedPane` — one pane in its own window, and its pane lives in `project.detached`
- *   rather than in any tab's tree. [`focusTarget`] answers `null` there on purpose: a pane
- *   that is not in a tree cannot be split, closed or navigated away from, and every
- *   `pane_*` command takes the tab that holds it.
+ *   rather than in any tab's tree. [`activeTabOf`] and so [`focusTarget`] answer `null`
+ *   there: a pane that is not in a tree cannot be split, closed or navigated away from, and
+ *   every `pane_*` command takes the tab that holds it.
+ *
+ *   That guard is not defensive tidiness, it is the whole reason this note exists. A
+ *   `detachedPane` role carries `tab` — the tab the pane came *out of* — and that tab is
+ *   still in the shell window. Reading it here made `focusTarget` resolve, in the detached
+ *   window, to whatever pane the *shell* window had focused, and `App.tsx` installs the key
+ *   gate before it branches on the role. Ctrl+W in a detached pane therefore closed a tab in
+ *   another window, and Ctrl+Alt+arrow moved focus over there.
  */
 import type { Bootstrap, Pane, PaneId, Project, ProjectId, Tab } from '@/ipc/client'
 
@@ -50,8 +57,45 @@ export function activeTabOf(boot: Bootstrap | null): Tab | null {
   const project = activeProjectOf(boot)
   if (boot === null || project === null) return null
   const role = boot.role
+  // A detached-pane window shows no tab at all, so it must not name one. `role.tab` here
+  // is the tab the pane was torn out of and it belongs to the shell window — see the module
+  // note. Answering `null` is what keeps every tab and pane command in this window reporting
+  // an unmet precondition instead of quietly acting on the other one.
+  if (role.kind === 'detachedPane') return null
   const wanted = role.kind === 'shell' ? project.activeTab : role.tab
   return project.tabs.find((tab) => tab.id === wanted) ?? null
+}
+
+/**
+ * The projects in *this window's* header strip, in header order.
+ *
+ * `role.projects`, not `workspace.projects`, and the difference is only invisible in the
+ * default mode. In `WindowMode::PerProject` the workspace holds every project while each
+ * shell window's strip holds exactly one, and `workspace::activate_project` only touches
+ * windows whose strip contains the id — so cycling the workspace list there sends
+ * `project_activate` for a project this window does not hold, which sets `active` on some
+ * *other* window and leaves this one exactly as it was. A keystroke that does nothing, which
+ * is the defect this round exists to remove.
+ *
+ * Empty for a detached window: it has no strip, so nothing to cycle.
+ */
+export function windowProjectsOf(boot: Bootstrap | null): readonly ProjectId[] {
+  return boot !== null && boot.role.kind === 'shell' ? boot.role.projects : []
+}
+
+/**
+ * Whether the tab this window shows can actually be closed.
+ *
+ * `tabs[0]` is the pinned project console and `cide_core::workspace::close_tab` answers
+ * `TabPinned` for it. Shared by the `closableTab` flag and by `tab.close`'s handler on
+ * purpose: the gate evaluates `Binding::when`, never `Command::when`, so the clause hides
+ * the palette row but does not stop Ctrl+W — and the handler has to enforce the same fact or
+ * the two disagree.
+ */
+export function isClosableTab(boot: Bootstrap | null): boolean {
+  const project = activeProjectOf(boot)
+  const tab = activeTabOf(boot)
+  return project !== null && tab !== null && project.tabs[0]?.id !== tab.id
 }
 
 /** The focused pane, with the tab and project that own it, or `null`. */

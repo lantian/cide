@@ -31,10 +31,17 @@
  * * **`unavailable`** — the capability does not exist in this build. The reason travels in
  *   the registry (`Command::unavailable`), the palette draws the row greyed with it, and no
  *   key may be bound to one. Reached from here only if something runs it anyway.
- * * **`when`** — the precondition is not met right now. The palette hides the row and the
- *   gate does not fire the binding, so a handler that finds nothing to act on means the
- *   clause and the handler disagree. That is a bug, and it says so in the log rather than
- *   returning quietly, because "nothing happened" is the symptom this round exists to kill.
+ * * **`when`** — the precondition is not met right now. The palette hides the row, and the
+ *   handler re-checks the same fact and reports it.
+ *
+ *   Both halves are needed, because **a `Command::when` does not gate the keyboard**. The
+ *   gate resolves through `keys/keymap.ts`, which evaluates `Binding::when` — a different
+ *   field, `None` on every default binding — so Ctrl+W arrives at `tab.close` whatever the
+ *   registry's clause says. Treating the clause as a guard is how Ctrl+W on the pinned
+ *   console came to raise a "close anyway?" dialog and then fail with `TabPinned`. So a
+ *   handler whose clause names a precondition checks it here as well, through the same
+ *   function `keys/context.ts` derives the flag from — `keys/target.ts` — so the two cannot
+ *   drift into two answers.
  *
  * Nothing here takes its state from a prop. Each store is read with `getState()` at the
  * moment the command runs, because the key gate is a window listener living outside React —
@@ -61,7 +68,15 @@ import {
   type TabId,
 } from '@/ipc/client'
 import { focusedTabOf, registeredBuffers, saveAll, saveTab } from '@/editor/openBuffers'
-import { activeProjectOf, claudeTargetOf, focusTarget, focusedFilePath, reposOf } from './target'
+import {
+  activeProjectOf,
+  claudeTargetOf,
+  focusTarget,
+  focusedFilePath,
+  isClosableTab,
+  reposOf,
+  windowProjectsOf,
+} from './target'
 
 export interface DispatchDeps {
   /**
@@ -231,6 +246,19 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // swallowed the keystroke, and no arm existed. `closeTab` confirms first when the
         // tab holds unsaved edits or a live session.
         if (on === null) return unmet(command, 'no focused tab')
+        /*
+         * `closableTab` again, because the clause alone does not reach the keyboard.
+         *
+         * `tabs[0]` is the pinned console and `close_tab` answers `TabPinned`. The console is
+         * also the tab a project *opens* on and it always has a Claude session bound, so
+         * without this the most ordinary Ctrl+W in the app took the session branch of
+         * `closeTab`, asked "close anyway?" about work it could never close, and then failed
+         * on the confirmation. Hiding the palette row while the key ran into that was the
+         * worst of the three states.
+         */
+        if (!isClosableTab(boot())) {
+          return unmet(command, 'the project console is pinned and cannot be closed')
+        }
         return void ws.closeTab(on.project, on.tab)
       }
 
@@ -251,15 +279,17 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       case 'project.next':
       case 'project.prev': {
-        // Ctrl+Tab / Ctrl+Shift+Tab, in **header order** — `workspace.projects` is an
-        // insertion-ordered map and its order *is* the tab order the user sees, so the
-        // cycle matches the strip. `keymap.rs` argues the MRU alternative down at length.
+        // Ctrl+Tab / Ctrl+Shift+Tab, in **header order** — `role.projects` is this window's
+        // strip in the order it is drawn, so the cycle matches what the user sees.
+        // `keymap.rs` argues the MRU alternative down at length; `windowProjectsOf` argues
+        // down the workspace-wide list, which is a keystroke that does nothing in
+        // `perProject` window mode.
         const current = boot()
-        const ids = current === null ? [] : Object.keys(current.workspace.projects)
+        const ids = windowProjectsOf(current)
         const active = current?.role.kind === 'shell' ? current.role.active : null
-        if (active === null) return unmet(command, 'no active project')
+        if (active === null) return unmet(command, 'this window shows no project strip')
         const next = neighbour(ids, active, command === 'project.next' ? 1 : -1)
-        if (next === null) return unmet(command, 'only one project is open')
+        if (next === null) return unmet(command, 'this window holds only one project')
         return void ws.activateProject(next as ProjectId)
       }
 

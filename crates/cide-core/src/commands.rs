@@ -36,12 +36,23 @@
 //! command from the palette on every platform with nothing anywhere reporting it. That had
 //! already happened to `repoOpen`, so every git command was invisible.
 //!
-//! # Preconditions belong in `when`, not in the handler
+//! # Preconditions go in `when` **and** in the handler
 //!
 //! A command that no-ops because there is no focused pane is indistinguishable, from the
 //! user's chair, from one that is unwired — which is the entire complaint this round
 //! answers. So anything that acts on a pane, a tab, a selection or a repository says so in
 //! its clause, and the palette hides it rather than offering a row that does nothing.
+//!
+//! A clause here does **not** gate the keyboard, and that is worth stating plainly because
+//! the shape invites the opposite assumption. The key gate resolves a chord through
+//! [`Binding::when`](cide_ipc::Binding) — a different field, `None` on every entry in
+//! [`crate::keymap::defaults`] — and never consults the command it dispatches to. So the
+//! clause is the palette's filter, and the handler in `ui/src/keys/dispatch.ts` re-checks
+//! the same fact for the key path, deriving it from the same place the flag is derived from.
+//! Leaving that second check out is how Ctrl+W on the pinned console came to raise a
+//! confirmation dialog and then fail. Merging the two fields instead was the alternative and
+//! it loses: `file.save` is `editorFocused`, and a Ctrl+S the gate stopped swallowing would
+//! reach a focused terminal as `^S`, which is flow control, and freeze the pane.
 
 use std::sync::OnceLock;
 
@@ -302,8 +313,11 @@ fn build() -> Vec<Command> {
             WINDOW,
         ),
         // `tabs[0]` is the pinned console and `close_tab` refuses it outright, so Ctrl+W on
-        // it is a refusal with a dialog, not a close. The clause is what keeps that from
-        // reading as "Ctrl+W is broken again".
+        // it is a refusal with a dialog, not a close. The clause keeps the palette from
+        // offering it — and only the palette: a clause here never reaches the keyboard,
+        // because the gate resolves `Binding::when`, which is `None` on every default. The
+        // handler in `keys/dispatch.ts` therefore re-checks the same fact through the same
+        // function `keys/context.ts` derives this flag from.
         Command::new("tab.close", "Close tab", WINDOW).when("closableTab"),
         Command::new("tab.next", "Next tab", WINDOW).when("multipleTabs"),
         Command::new("tab.prev", "Previous tab", WINDOW).when("multipleTabs"),
@@ -311,14 +325,20 @@ fn build() -> Vec<Command> {
         // the header's and not most-recently-used.
         Command::new("project.next", "Next project", PROJECT).when("multipleProjects"),
         Command::new("project.prev", "Previous project", PROJECT).when("multipleProjects"),
-        // Claude. The first four act on the focused session, so none of them mean anything
-        // without a Claude pane to act on.
+        // Claude. `fork`, `mirror` and `restart` act on the focused *session*, so none of
+        // them mean anything without a Claude pane to act on.
+        //
+        // `claude.split.newSession` is not one of those: it creates the session it splits to,
+        // exactly as `terminal.splitBelow` creates its shell, and `ctrl+shift+n` has always
+        // done that from any pane. Requiring `claudePaneFocused` did not stop the key — no
+        // clause here does — it only hid the palette row in the state where the key still
+        // worked, which is the palette and the keyboard disagreeing about one command.
         Command::new(
             "claude.split.newSession",
             "Split: new Claude session",
             CLAUDE,
         )
-        .when("claudePaneFocused"),
+        .when("paneFocused"),
         Command::new("claude.fork", "Fork session into new pane", CLAUDE).when("claudePaneFocused"),
         Command::new("claude.mirror", "Mirror session into new pane", CLAUDE)
             .when("claudePaneFocused"),
@@ -584,16 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn claude_commands_require_a_claude_pane_except_the_one_made_from_an_editor() {
+    fn claude_commands_require_a_claude_pane_except_the_two_that_do_not_act_on_a_session() {
         for command in registry().iter().filter(|c| c.id.starts_with("claude.")) {
-            // `claude.mention.file` is the exception and it is not an oversight: the gesture
-            // is "mention the file I am looking at", which means an editor has focus and so
-            // a Claude pane does not. Requiring `claudePaneFocused` made it a row that could
-            // only ever be offered in the one state where it has no file to mention.
-            let expected = if command.id == "claude.mention.file" {
-                "editorFocused && claudeTarget"
-            } else {
-                "claudePaneFocused"
+            let expected = match command.id.as_str() {
+                // "Mention the file I am looking at", which means an editor has focus and so
+                // a Claude pane does not. Requiring `claudePaneFocused` made it a row that
+                // could only ever be offered in the one state where it has no file to
+                // mention.
+                "claude.mention.file" => "editorFocused && claudeTarget",
+                // Creates the session it splits to, so it needs a pane to split and not a
+                // conversation to act on — the same clause `terminal.splitBelow` carries.
+                "claude.split.newSession" => "paneFocused",
+                _ => "claudePaneFocused",
             };
             assert_eq!(command.when.as_deref(), Some(expected), "{}", command.id);
         }

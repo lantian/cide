@@ -35,7 +35,11 @@
  *
  * Run: `pnpm --dir ui run check:commands`
  */
-import { readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 let failed = 0
@@ -290,6 +294,135 @@ const HOST_FLAGS = flagList('HOST_FLAGS')
       `${key} is bound to ${command}, which is a registered command`,
     )
   }
+}
+
+/* ------------------------------------------------- what "focused" means, per window role */
+
+/*
+ * `keys/target.ts` decides the project, the tab and the pane every handler acts on, and
+ * every `when` flag `keys/context.ts` derives. It is pure and its only import is a `type`
+ * one, so unlike `dispatch.ts` it can be compiled and driven from fixtures — and it has to
+ * be, because the three window roles are the case source review cannot check by reading.
+ *
+ * The bug this pins: a `detachedPane` role carries `tab`, naming the tab the pane was torn
+ * *out* of — which is still in the shell window. Reading it made `focusTarget` resolve, in
+ * the detached window, to whatever pane the shell window had focused, and `App.tsx` installs
+ * the key gate before it branches on the role. Ctrl+W in a detached pane closed a tab in
+ * another window. Nothing failed: the id was registered, the case existed, the chord
+ * resolved, and `check-commands` itself was green.
+ */
+{
+  const uiDir = fileURLToPath(new URL('..', import.meta.url))
+  const out = mkdtempSync(join(tmpdir(), 'cide-commands-'))
+  const config = join(out, 'tsconfig.json')
+  // Written next to the output rather than committed: `baseUrl` is resolved from the
+  // config's own directory, so an absolute one lets the `@/*` alias work from anywhere.
+  writeFileSync(
+    config,
+    JSON.stringify({
+      compilerOptions: {
+        module: 'commonjs',
+        moduleResolution: 'node10',
+        target: 'es2022',
+        strict: true,
+        exactOptionalPropertyTypes: true,
+        noUncheckedIndexedAccess: true,
+        baseUrl: uiDir,
+        paths: { '@/*': ['src/*'] },
+        rootDir: join(uiDir, 'src'),
+        outDir: join(out, 'js'),
+        // Types only, and the DTOs drag in the whole IPC client. Emitting the one file and
+        // skipping the library check keeps this to the module under test.
+        skipLibCheck: true,
+        types: [],
+      },
+      files: [join(uiDir, 'src/keys/target.ts')],
+    }),
+  )
+  execFileSync('node', ['node_modules/typescript/bin/tsc', '--project', config], {
+    cwd: uiDir,
+    stdio: 'inherit',
+  })
+
+  const target = createRequire(import.meta.url)(join(out, 'js/keys/target.js'))
+
+  const pane = (id, kind) => ({ id, kind, session: null })
+  const tab = (id, panes, focused) => ({
+    id,
+    kind: { kind: 'claude' },
+    tree: { root: null, focused, maximized: null, panes: Object.fromEntries(panes.map((p) => [p.id, p])) },
+  })
+  /** One workspace, three windows onto it. `t1` is the pinned console of `p1`. */
+  const boot = (role) => ({
+    role,
+    commands: [],
+    workspace: {
+      rev: 1,
+      settings: { windowMode: 'stacked' },
+      windows: {},
+      projects: {
+        p1: {
+          id: 'p1',
+          name: 'one',
+          activeTab: 't1',
+          roots: [{ path: '/a', repo: 'r1' }],
+          detached: { pD: pane('pD', 'shell') },
+          tabs: [tab('t1', [pane('pA', 'claude')], 'pA'), tab('t2', [pane('pB', 'editor')], 'pB')],
+        },
+        p2: {
+          id: 'p2',
+          name: 'two',
+          activeTab: 't3',
+          roots: [{ path: '/b', repo: null }],
+          detached: {},
+          tabs: [tab('t3', [pane('pC', 'claude')], 'pC')],
+        },
+      },
+    },
+  })
+
+  const shell = boot({ kind: 'shell', projects: ['p1', 'p2'], active: 'p1' })
+  const detachedPane = boot({ kind: 'detachedPane', project: 'p1', tab: 't1', pane: 'pD' })
+  const detachedTab = boot({ kind: 'detachedTab', project: 'p1', tab: 't2' })
+
+  eq(
+    target.focusTarget(shell)?.pane.id,
+    'pA',
+    'the shell window focuses its active tab’s focused pane',
+  )
+  eq(
+    target.focusTarget(detachedPane),
+    null,
+    'a detached-pane window has no focus target (its role.tab names a tab in the shell ' +
+      'window, so anything else makes every pane and tab command act on the wrong window)',
+  )
+  eq(target.activeTabOf(detachedPane), null, 'a detached-pane window shows no tab')
+  eq(
+    target.focusTarget(detachedTab)?.tab.id,
+    't2',
+    'a detached-tab window focuses the tab it was opened for',
+  )
+
+  // `closableTab`, which `tab.close` re-checks: `tabs[0]` is the pinned console and
+  // `close_tab` answers `TabPinned`, so Ctrl+W there must report rather than raise a
+  // "close anyway?" dialog about a tab that cannot close.
+  eq(target.isClosableTab(shell), false, 'the pinned project console is not closable')
+  const onSecondTab = structuredClone(shell)
+  onSecondTab.workspace.projects.p1.activeTab = 't2'
+  eq(target.isClosableTab(onSecondTab), true, 'an ordinary tab is closable')
+  eq(target.isClosableTab(detachedPane), false, 'a detached-pane window closes no tab')
+
+  // The project strip Ctrl+Tab cycles is the *window's*, not the workspace's. In
+  // `perProject` mode the workspace holds every project and each window holds one, and
+  // `activate_project` only touches windows whose strip contains the id — so cycling the
+  // workspace list there is a keystroke that does nothing.
+  eq([...target.windowProjectsOf(shell)], ['p1', 'p2'], 'the shell window cycles its own strip')
+  eq(
+    [...target.windowProjectsOf(boot({ kind: 'shell', projects: ['p1'], active: 'p1' }))],
+    ['p1'],
+    'a per-project window holds one project however many the workspace has',
+  )
+  eq([...target.windowProjectsOf(detachedTab)], [], 'a detached window has no project strip')
 }
 
 if (failed > 0) {

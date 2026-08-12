@@ -37,7 +37,14 @@
  */
 import { useWorkspace } from '@/store/workspace'
 import { registeredBuffers } from '@/editor/openBuffers'
-import { activeProjectOf, activeTabOf, claudeTargetOf, focusTarget, reposOf } from './target'
+import {
+  activeProjectOf,
+  claudeTargetOf,
+  focusTarget,
+  isClosableTab,
+  reposOf,
+  windowProjectsOf,
+} from './target'
 import type { KeyContext } from './when'
 import type { Bootstrap } from '@/ipc/client'
 
@@ -78,10 +85,8 @@ export const DERIVED_FLAGS = [
  */
 export function deriveContext(boot: Bootstrap | null): KeyContext {
   const project = activeProjectOf(boot)
-  const tab = activeTabOf(boot)
   const focused = focusTarget(boot)
   const kind = focused?.pane.kind
-  const projects = boot === null ? [] : Object.values(boot.workspace.projects)
 
   return {
     paneFocused: focused !== null,
@@ -93,12 +98,16 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
     editorFocused: kind === 'editor',
 
     projectOpen: project !== null,
-    multipleProjects: projects.length > 1,
+    // This window's strip, not the workspace's project map: in `perProject` window mode the
+    // map holds every project and the strip holds one, and Ctrl+Tab can only reach what the
+    // strip holds. See `windowProjectsOf`.
+    multipleProjects: windowProjectsOf(boot).length > 1,
     multipleTabs: (project?.tabs.length ?? 0) > 1,
     // `tabs[0]` is the pinned console and `close_tab` refuses it — see
     // `cide_core::workspace::close_tab`. Ctrl+W there is a refusal, not a close, so the
-    // command is not offered rather than offered and rejected.
-    closableTab: tab !== null && project !== null && project.tabs[0]?.id !== tab.id,
+    // palette does not offer the row; `tab.close`'s handler enforces the same fact through
+    // the same function, because the gate never reads a `Command::when`.
+    closableTab: isClosableTab(boot),
     // Asked of the live registry, not of the tree: `file.saveAll` writes through the savers
     // `EditorPane` registers on mount, so "a file tab exists somewhere" is not the same
     // claim as "something here can save one".
