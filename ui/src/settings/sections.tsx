@@ -210,6 +210,12 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
           onChange={(v) => set({ disableMouse: v })}
         />
         <ToggleRow
+          label="Resume every Claude pane on launch"
+          hint="On, a restored pane picks its conversation up by itself. Off, only the project's console does and the rest wait behind a Resume button. Resuming is not forking — it continues a conversation that already exists and sends no prompt — but it does start one claude process per pane. A pane whose transcript is gone always waits, either way."
+          checked={claude.resumeAllOnLaunch}
+          onChange={(v) => set({ resumeAllOnLaunch: v })}
+        />
+        <ToggleRow
           label="Full repaint on the alternate screen"
           hint="CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT=1. Costs bandwidth; fixes a TUI that leaves debris behind after a resize."
           checked={claude.altScreenFullRepaint}

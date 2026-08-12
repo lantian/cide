@@ -297,8 +297,14 @@ pub struct GraphicsSettings {
     pub disable_nvidia_explicit_sync: Option<bool>,
 }
 
-/// Environment toggles passed to `claude` children. All default off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+/// Environment toggles passed to `claude` children, and how many of them come back on launch.
+///
+/// The three environment toggles default off. [`Self::resume_all_on_launch`] does not, which
+/// is why this has a hand-written [`Default`] rather than a derived one — a derive would give
+/// it `false` silently, and it did: the field was added with a `true` written into a `Default`
+/// impl that did not exist, the edit was a no-op, and only a test asserting the default caught
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct ClaudeSettings {
@@ -310,6 +316,33 @@ pub struct ClaudeSettings {
     pub alt_screen_full_repaint: bool,
     /// `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`.
     pub disable_alternate_screen: bool,
+    /// Resume **every** Claude pane on launch, rather than only the project's console.
+    ///
+    /// The plan shipped the cautious answer — one eager pane, the rest showing a Resume
+    /// splash — on the reasoning that "reopening a six-pane project should not silently fork
+    /// six agents at once", and named this flag as the way out. It is the way out.
+    ///
+    /// Two things make the caution smaller than it reads. Resuming is not forking: `--resume`
+    /// continues a conversation that already exists and starts no new one, and it sends no
+    /// prompt, so nothing is spent until the user types. What it does cost is one `claude`
+    /// process per pane at launch, which is the honest reason someone might turn this off.
+    ///
+    /// Default **on**, because the splash is a screen asking a question whose answer is
+    /// always yes: a pane restored into a saved layout is a pane the user left open.
+    pub resume_all_on_launch: bool,
+}
+
+impl Default for ClaudeSettings {
+    fn default() -> Self {
+        Self {
+            disable_mouse: false,
+            alt_screen_full_repaint: false,
+            disable_alternate_screen: false,
+            // On. See the field's own note: a pane restored into a saved layout is a pane the
+            // user left open, and the splash asks a question whose answer is always yes.
+            resume_all_on_launch: true,
+        }
+    }
 }
 
 /// What cide does about the proxy variables in a child's environment.

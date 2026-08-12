@@ -463,6 +463,8 @@ pub fn plan_restore(ws: &Workspace) -> Vec<PaneRestore> {
 
 fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneRestore> {
     let mut plan = Vec::new();
+    // Read once for the whole plan: it is one bool for the launch, not a per-pane decision.
+    let resume_all = ws.settings.claude.resume_all_on_launch;
 
     for (id, project) in &ws.projects {
         // `validate` forbids a rootless project, but a restore plan is the wrong place to
@@ -485,6 +487,7 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
                     tab.id,
                     &root.path,
                     projects_dir,
+                    resume_all,
                 ) {
                     plan.push(entry);
                 }
@@ -497,7 +500,15 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
             let Some((window, tab)) = detached_pane_window(ws, pane.id) else {
                 continue;
             };
-            if let Some(entry) = entry_for(pane, window, project, tab, &root.path, projects_dir) {
+            if let Some(entry) = entry_for(
+                pane,
+                window,
+                project,
+                tab,
+                &root.path,
+                projects_dir,
+                resume_all,
+            ) {
                 plan.push(entry);
             }
         }
@@ -514,12 +525,14 @@ fn entry_for(
     tab: TabId,
     cwd: &Path,
     projects_dir: Option<&Path>,
+    resume_all: bool,
 ) -> Option<PaneRestore> {
     // A diff or an editor pane has nothing to spawn, and listing it would leave the
     // frontend to filter out entries it can only ignore.
     if !matches!(pane.kind, PaneKind::Claude | PaneKind::Shell) {
         return None;
     }
+    let restore = restore_for(pane, cwd, projects_dir);
     Some(PaneRestore {
         window,
         project: project.id,
@@ -527,8 +540,17 @@ fn entry_for(
         pane: pane.id,
         kind: pane.kind,
         cwd: cwd.to_path_buf(),
-        restore: restore_for(pane, cwd, projects_dir),
-        eager: pane.session == Some(project.primary_session),
+        restore,
+        // Eager when it is the project's console, and — with `resume_all_on_launch` — when
+        // there is a conversation to pick up.
+        //
+        // Gated on `Resumable` rather than on the setting alone, and that is the distinction
+        // the splash was really protecting. Resuming a pane whose transcript still exists
+        // returns the user to what they left; spawning one whose transcript is gone starts a
+        // *new* conversation they did not ask for, in a pane that looks identical. So an
+        // unresumable pane keeps its splash however this is set.
+        eager: pane.session == Some(project.primary_session)
+            || (resume_all && matches!(restore, SessionRestore::Resumable { .. })),
     })
 }
 
@@ -875,12 +897,62 @@ const NEUTRAL_MODES: &str = concat!(
 /// set, then the notice. Neutralising first would be undone by the replay itself.
 fn preload_from(prior: Option<Vec<u8>>) -> Vec<u8> {
     let replayed = prior.is_some();
-    let mut bytes = prior.unwrap_or_default();
+    let mut bytes = strip_old_notices(prior.unwrap_or_default());
     if replayed {
         bytes.extend_from_slice(NEUTRAL_MODES.as_bytes());
     }
     bytes.extend_from_slice(&restore_notice(replayed));
     bytes
+}
+
+/// The notice texts, so [`strip_old_notices`] recognises what [`restore_notice`] wrote.
+///
+/// Both variants, because a pane can have been restored with and without a replay across
+/// different runs and the screen keeps whichever it got each time.
+const NOTICE_TEXTS: [&str; 2] = [
+    "— session restored · the output above is from the previous run and is not live —",
+    "— session restored (previous output not retained) —",
+];
+
+/// Drop the notices a previous restore left on the screen.
+///
+/// **Without this the banner multiplies, once per launch.** The replay is the *screen*, and
+/// the screen contains whatever was on it — including the notice the last restore printed. So
+/// the composition was `[screen containing yesterday's notice] + [today's notice]`, and after
+/// six restarts a shell pane opened with six identical lines claiming its output was not live.
+/// Observed at six; it grows without bound.
+///
+/// Line-oriented rather than a byte replace: the notice is written as its own line, and taking
+/// the line with it is what stops a bare `\r\n` accumulating in its place — which would push the
+/// real output down the pane one row per launch and be the same bug wearing a blank.
+///
+/// Matched on the *text*, not on the full escape framing. The framing is this module's and can
+/// change; the sentence is what identifies the line, and a screen that legitimately contains
+/// that sentence is a shell echoing our own notice back at us, which is not a case worth
+/// protecting.
+fn strip_old_notices(screen: Vec<u8>) -> Vec<u8> {
+    let Ok(text) = String::from_utf8(screen) else {
+        // Not UTF-8, so not something to reason about line by line. A screen holding a binary
+        // splat is replayed as-is rather than mangled — it was already unreadable.
+        return Vec::new();
+    };
+    if !NOTICE_TEXTS.iter().any(|n| text.contains(n)) {
+        return text.into_bytes();
+    }
+    let kept: Vec<&str> = text
+        .split_inclusive("\r\n")
+        .filter(|line| {
+            // The notice's own line, and the `NEUTRAL_MODES` line that precedes it. Both are
+            // written by `preload_from` and both were accumulating — the first test of this
+            // caught only the sentence, and the mode run kept multiplying on the line above
+            // it, which is the identical unbounded growth with nothing legible to show for it.
+            //
+            // `NEUTRAL_MODES` is a ten-escape run this module concatenates; a shell emitting
+            // that exact sequence is emitting our preamble back at us.
+            !NOTICE_TEXTS.iter().any(|n| line.contains(n)) && !line.contains(NEUTRAL_MODES)
+        })
+        .collect();
+    kept.concat().into_bytes()
 }
 
 #[cfg(test)]
@@ -1261,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_primary_session_is_eager() {
+    fn only_the_primary_is_eager_when_nothing_can_be_resumed() {
         let root = temp_dir("eager");
         let ws = fixture(&root);
         let plan = plan_restore_in(&ws, None);
@@ -1278,8 +1350,93 @@ mod tests {
             .get(&entry.pane)
             .expect("the eager pane is in the console tab");
         assert_eq!(pane.session, Some(project.primary_session));
-        // No transcript directory was given, so nothing can claim to be resumable.
+        // No transcript directory was given, so nothing can claim to be resumable — which is
+        // also why `resume_all_on_launch` cannot widen this, and why the name of this test had
+        // to narrow when that setting arrived. It passed unchanged under the new default, for
+        // the wrong reason: the clause it should have been exercising was unreachable here.
         assert_eq!(entry.restore, SessionRestore::Fresh);
+    }
+
+    /// With `resume_all_on_launch`, every pane that *has* a conversation comes back live.
+    ///
+    /// The user's report: four Claude panes all showing `Resume "cide : claude"` after a
+    /// restart, a screen asking a question whose answer is always yes.
+    #[test]
+    fn resume_all_makes_every_resumable_claude_pane_eager() {
+        let root = temp_dir("resume-all");
+        let projects_dir = temp_dir("resume-all-projects");
+        let mut ws = fixture(&root);
+        assert!(
+            ws.settings.claude.resume_all_on_launch,
+            "the default is on; this test would otherwise pass by describing the old behaviour"
+        );
+
+        // Both Claude panes get a transcript, so both are genuinely resumable.
+        let project = ws
+            .projects
+            .values()
+            .next()
+            .expect("fixture project")
+            .clone();
+        for pane in project.tabs[0].tree.panes.values() {
+            if pane.kind == PaneKind::Claude
+                && let Some(session) = pane.session
+            {
+                write_transcript(&projects_dir, &root, session);
+            }
+        }
+
+        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let claude: Vec<&PaneRestore> =
+            plan.iter().filter(|e| e.kind == PaneKind::Claude).collect();
+        assert!(claude.len() >= 2, "fixture has two Claude panes");
+        assert!(
+            claude.iter().all(|e| e.eager),
+            "every resumable Claude pane should come back live: {claude:?}"
+        );
+
+        // And turning it off restores the cautious behaviour rather than merely renaming it.
+        ws.settings.claude.resume_all_on_launch = false;
+        let cautious = plan_restore_in(&ws, Some(&projects_dir));
+        let eager: Vec<&PaneRestore> = cautious.iter().filter(|e| e.eager).collect();
+        assert_eq!(eager.len(), 1, "only the console: {eager:?}");
+    }
+
+    /// A pane whose transcript is gone keeps its splash, whatever the setting says.
+    ///
+    /// This is the distinction the splash was really protecting. Resuming returns the user to
+    /// what they left; spawning a pane with no transcript starts a *new* conversation they did
+    /// not ask for, in a pane that looks identical to one that was restored.
+    #[test]
+    fn resume_all_does_not_start_conversations_that_do_not_exist() {
+        let root = temp_dir("resume-all-fresh");
+        let projects_dir = temp_dir("resume-all-fresh-projects");
+        let ws = fixture(&root);
+        // No transcripts written at all.
+        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let unresumable: Vec<&PaneRestore> = plan
+            .iter()
+            .filter(|e| e.restore == SessionRestore::Fresh && e.kind == PaneKind::Claude)
+            .collect();
+        assert!(!unresumable.is_empty(), "fixture has an unresumable pane");
+        assert!(
+            unresumable.iter().all(|e| !e.eager
+                || ws
+                    .projects
+                    .values()
+                    .any(|p| Some(p.primary_session) == plan_session(e, &ws))),
+            "a Fresh pane must not spawn on its own: {unresumable:?}"
+        );
+    }
+
+    /// The pane's session id, for a plan entry. Test-only.
+    fn plan_session(entry: &PaneRestore, ws: &Workspace) -> Option<SessionId> {
+        ws.projects.values().find_map(|p| {
+            p.tabs
+                .iter()
+                .find_map(|t| t.tree.panes.get(&entry.pane))
+                .and_then(|pane| pane.session)
+        })
     }
 
     #[test]
@@ -1370,9 +1527,26 @@ mod tests {
         assert_eq!(entry.window, label, "it restores into its own window");
         assert_eq!(entry.tab, tab, "and remembers where it re-docks");
         assert_eq!(entry.restore, SessionRestore::Resumable { session });
+        // It resumes with everything else, because it has a transcript and the default is to
+        // pick conversations up. This assertion used to read `!entry.eager` — "a torn-out
+        // secondary pane still waits to be asked" — which was true when exactly one pane was
+        // eager and is now false by intent rather than by accident. Both directions are pinned
+        // so the setting cannot be quietly dropped, and so this does not have to be revisited
+        // as a mystery the next time the default moves.
+        assert!(
+            entry.eager,
+            "a detached pane with a transcript comes back live like any other"
+        );
+        let mut cautious_ws = ws.clone();
+        cautious_ws.settings.claude.resume_all_on_launch = false;
+        let cautious = plan_restore_in(&cautious_ws, Some(&projects_dir));
+        let entry = cautious
+            .iter()
+            .find(|e| e.pane == pane)
+            .expect("still planned with the setting off");
         assert!(
             !entry.eager,
-            "a torn-out secondary pane still waits to be asked"
+            "with the setting off, a torn-out secondary pane waits to be asked"
         );
     }
 
@@ -1596,6 +1770,62 @@ mod tests {
         assert!(
             !transcript_exists(&projects_dir, &cwd, SessionId::new()),
             "another session's id must not match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod notice_accumulation {
+    use super::*;
+
+    /// The banner does not multiply across restarts.
+    ///
+    /// Reported from a screenshot after six launches: a shell pane opened with six identical
+    /// `— session restored —` lines. The replay is the *screen*, and the screen holds whatever
+    /// the last restore printed on it, so each launch appended one more.
+    #[test]
+    fn a_restored_screen_carries_one_notice_however_often_it_is_restored() {
+        let mut screen =
+            b"lantian@powerhall:~/work/cide> pwd\r\n/home/lantian/work/cide\r\n".to_vec();
+        for _ in 0..6 {
+            // Each round is the next launch: yesterday's screen in, today's screen out.
+            screen = preload_from(Some(screen));
+        }
+        let text = String::from_utf8(screen).expect("utf8");
+        let notices = NOTICE_TEXTS
+            .iter()
+            .map(|n| text.matches(n).count())
+            .sum::<usize>();
+        assert_eq!(notices, 1, "six launches left {notices} notices:\n{text}");
+        // And the shell's own output is still there — stripping must not take the transcript.
+        assert!(text.contains("/home/lantian/work/cide"), "{text}");
+    }
+
+    /// A screen with no notice is passed through untouched.
+    ///
+    /// The strip runs on every restored shell, so the ordinary case has to be a no-op rather
+    /// than a re-encode: `split_inclusive`/`concat` on a screen full of escape sequences must
+    /// return exactly what it was given.
+    #[test]
+    fn a_screen_without_a_notice_is_unchanged() {
+        let screen = b"\x1b[32muser@host\x1b[0m:~$ ls\r\nCargo.toml  src\r\n".to_vec();
+        assert_eq!(strip_old_notices(screen.clone()), screen);
+    }
+
+    /// The line goes with the notice, not just the words.
+    ///
+    /// Replacing the text and leaving its line behind would push the real output down one row
+    /// per launch — the same unbounded growth wearing a blank instead of a sentence.
+    #[test]
+    fn the_whole_line_goes_not_only_the_sentence() {
+        let once = preload_from(Some(b"output\r\n".to_vec()));
+        let twice = preload_from(Some(once.clone()));
+        let a = String::from_utf8(once).expect("utf8");
+        let b = String::from_utf8(twice).expect("utf8");
+        assert_eq!(
+            a.matches("\r\n").count(),
+            b.matches("\r\n").count(),
+            "a restore added a line:\n{a}\n---\n{b}"
         );
     }
 }
