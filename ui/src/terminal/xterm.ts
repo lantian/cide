@@ -130,12 +130,26 @@ export function createTerminal(): TerminalHandle {
      * the foreground toward whichever end reaches the ratio (`Color.ts:288`), lightening it over
      * a dark bar and darkening it over a light one.
      *
-     * Set to the same constant `check-theme.mjs` gates the palette with, so this can only ever
-     * repaint a pair the palette was never asked about: every ink slot already clears it on
-     * `--panel` and `--sel` by that gate, which leaves a program's own backgrounds as the only
-     * thing this touches. Both renderers honour it — `DomRendererRowFactory._applyMinimumContrast`
-     * and, via `CharAtlasUtils.configEquals`, the WebGL texture atlas — and both cache the result
-     * per (bg, fg), so it costs one adjustment per distinct pair rather than one per cell.
+     * Set to the same constant `check-theme.mjs` gates the palette with, so on the backgrounds
+     * this app paints it is *nearly* inert: every ink slot clears the floor on `--panel` and on
+     * `--sel` by that gate. Nearly, and the gap is worth naming rather than rounding off. The four
+     * exemptions that gate grants are precisely the pairs this repaints — dark ANSI 0 (#0e0e10 on
+     * #151518, 1.06:1) comes out #636364 and dark ANSI 8 (#5c5c66, 2.76:1) comes out #6d6d76 the
+     * moment either is used as a *foreground*, and light ANSI 15 on `--sel` likewise.
+     *
+     * That is accepted, not overlooked. Colour 0 is sunk into the background so it works as a
+     * fill, and a fill is a background, which is never corrected — so the sink survives exactly
+     * where it is meant to be used and stops being invisible where it is not. The alternative that
+     * lost was raising those two tokens to clear the floor outright, which would have made the
+     * gate and this option agree at the cost of the one property they exist for.
+     *
+     * Both renderers honour it — `DomRendererRowFactory._applyMinimumContrast` and, via
+     * `CharAtlasUtils.configEquals`, the WebGL texture atlas. The (bg, fg) contrast cache carries
+     * most of the cost, but **not** for a cell that has a background override: dim, selected and
+     * decorated cells set `bgOverride` and skip the cache read entirely
+     * (`DomRendererRowFactory.ts:488`). Those pay one `ensureContrastRatio` per *merged span* per
+     * row render — per span rather than per cell only because the merge branch `continue`s before
+     * reaching this at all.
      *
      * Two things it deliberately does not fix. Powerline separators and box/block glyphs are
      * excluded upstream (`RendererUtils.treatGlyphAsBackgroundColor`) because they are drawn as

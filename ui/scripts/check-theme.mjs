@@ -261,6 +261,13 @@ try {
   // exempted **on the selection only** — it must still clear the floor on `--panel`, because
   // that is the assertion that fails for a genuinely invisible palette. Set `--term-bright-white`
   // to #ffffff and the light case fails here while dark stays green.
+  //
+  // An exemption is a statement about a *fill*, not a licence to be invisible as ink. Nothing
+  // exempted here reaches the screen at the ratio written beside it: xterm's
+  // `minimumContrastRatio` repaints every one of them the moment the slot is used as a
+  // foreground, which is the whole reason the two halves share a number. The second assertion in
+  // this loop is what keeps that true — an exemption for a slot that would pass anyway is a dead
+  // one, and a dead exemption is how the next regression walks past this gate.
   const INK_FLOOR = TERMINAL_MIN_CONTRAST
   const QUIET = {
     '--panel': { dark: ['black', 'brightBlack'], light: [] },
@@ -269,21 +276,48 @@ try {
   const inkSlots = TERMINAL_SLOTS.filter(
     ([slot]) => !['background', 'cursorAccent', 'selectionBackground'].includes(slot),
   )
+  const belowFloor = (palette, ground, slots) =>
+    slots
+      .map(([slot, token]) => [slot, palette[token], contrast(palette[token], ground)])
+      .filter(([, , ratio]) => ratio !== null && ratio < INK_FLOOR)
+      .map(([slot, value, ratio]) => `${slot}=${value} ${ratio.toFixed(2)}:1`)
+
   for (const [name, palette] of [['dark', dark], ['light', light]]) {
     for (const [groundToken, quiet] of Object.entries(QUIET)) {
       const ground = palette[groundToken]
-      const invisible = inkSlots
-        .filter(([slot]) => !quiet[name].includes(slot))
-        .map(([slot, token]) => [slot, palette[token], contrast(palette[token], ground)])
-        .filter(([, , ratio]) => ratio !== null && ratio < INK_FLOOR)
-        .map(([slot, value, ratio]) => `${slot}=${value} ${ratio.toFixed(2)}:1`)
       eq(
-        invisible,
+        belowFloor(palette, ground, inkSlots.filter(([slot]) => !quiet[name].includes(slot))),
         [],
         `every ink colour clears ${INK_FLOOR}:1 on the ${name} theme's ${groundToken} ${ground}`,
       )
+      eq(
+        quiet[name].filter(
+          (slot) => belowFloor(palette, ground, inkSlots.filter(([s]) => s === slot)).length === 0,
+        ),
+        [],
+        `every slot exempted on the ${name} theme's ${groundToken} is one that would fail — an ` +
+          `exemption the palette has outgrown stops being a decision and starts being a hole`,
+      )
     }
   }
+
+  // The floor itself, pinned rather than only read.
+  //
+  // Reading `TERMINAL_MIN_CONTRAST` above is what keeps this gate and xterm's
+  // `minimumContrastRatio` equal to each other. It is not what keeps them equal to *something*.
+  // At 1 they are equal to nothing: xterm's `_applyMinimumContrast` returns before it does
+  // anything when the ratio is 1 (`DomRendererRowFactory.ts:481`, `TextureAtlas.ts:394`), and
+  // `ratio < 1` is unsatisfiable, so every assertion in the loop above passes against any palette
+  // whatsoever. That edit was made and run: one character, all 25 check scripts green, the whole
+  // change gone. So the value is pinned here the way `DEFAULT_THEME` is — the app reads the
+  // constant, this file states what the constant is allowed to be.
+  ok(TERMINAL_MIN_CONTRAST > 1, 'the ink floor is above 1, which is xterm’s "do not correct"')
+  eq(
+    TERMINAL_MIN_CONTRAST,
+    3,
+    'the ink floor is 3:1 — where "a human cannot see this at all" lives, rather than AA’s 4.5, ' +
+      'which would drag every deliberately quiet colour up to the weight of the loud ones',
+  )
 
   // --- and whether the four greys are still in the order every program assumes -------------
   //
@@ -298,6 +332,15 @@ try {
   // Strictly increasing rather than non-decreasing, so a theme cannot quietly collapse two of
   // the four into one colour — which is the state the light palette was in, with 0, 7 and the
   // default foreground all within a few points of #1b1b1f.
+  //
+  // Membership is pinned before ordering is checked, because a ramp with a slot dropped out of it
+  // still rises: shortening `TERMINAL_GREY_RAMP` would turn the assertion below green by giving
+  // it less to look at, which is the one way a check of this shape goes quiet without failing.
+  eq(
+    [...TERMINAL_GREY_RAMP],
+    ['black', 'brightBlack', 'white', 'brightWhite'],
+    'the ramp is still all four ANSI greys, in the order ANSI gives them',
+  )
   for (const [name, palette] of [['dark', dark], ['light', light]]) {
     const ramp = TERMINAL_GREY_RAMP.map((slot) => {
       const entry = TERMINAL_SLOTS.find(([s]) => s === slot)

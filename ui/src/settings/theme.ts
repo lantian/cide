@@ -161,7 +161,17 @@ export const TERMINAL_GREY_RAMP: readonly string[] = [
  *
  * They have to be one constant. If the gate were stricter than the runtime floor the app would
  * ship colours the gate rejected; if it were looser, the runtime would quietly repaint colours
- * the gate had approved and the palette would stop being what is on screen.
+ * the gate had approved and the palette would stop being what is on screen. The gate's four
+ * exemptions are the one place the two disagree on purpose, and they disagree in that second
+ * direction: dark's colours 0 and 8 are approved below the floor because they are meant to be
+ * *fills*, and xterm repaints them wherever they are used as ink instead. `tokens.css` states
+ * the consequence and `check-theme.mjs` forbids an exemption that is not carrying its weight.
+ *
+ * **It must never be 1.** That is xterm's off switch — `_applyMinimumContrast` returns before it
+ * does anything (`DomRendererRowFactory.ts:481`, `TextureAtlas.ts:394`) — and it is also the
+ * floor no pair of colours can fall below, so the palette gate goes vacuous in the same edit.
+ * Changing this line to 1 deletes the whole of this behaviour and leaves every check green,
+ * which is why `check-theme.mjs` pins the value rather than only reading it.
  *
  * 3 rather than WCAG AA's 4.5 for the reason `check-theme.mjs` has always given: terminal
  * colours are not body text, so the floor goes where "a human cannot see this at all" lives

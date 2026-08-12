@@ -222,6 +222,14 @@
    * 0 and 8 sit deliberately inside the background — 1.06:1 and 2.76:1 on `--panel` — because
    * that is what makes colour 0 usable as a fill and colour 8 usable as "quiet" in a dark
    * scheme. `check-theme.mjs` exempts exactly these two, in this theme only.
+   *
+   * The exemption is about their use as a **fill**, and only that. A background is never
+   * contrast-corrected, so these are the literal values an `ESC[40m` or `ESC[100m` block is
+   * painted with. As *ink* they are not what reaches the screen: `minimumContrastRatio` in
+   * `terminal/xterm.ts` draws a colour-0 foreground on this background as #636364 and a colour-8
+   * one as #6d6d76. So "dark is unchanged" is a claim about these values and about every
+   * background drawn from them — not about a program that prints *text* in 0 or 8, which was
+   * unreadable in this theme and deliberately is not any more.
    */
   --term-black: #0e0e10;
   --term-bright-black: #5c5c66;
