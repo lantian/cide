@@ -137,6 +137,44 @@ export function reconcile(order: readonly string[], live: readonly string[]): st
 }
 
 /**
+ * The stack one window's snapshot implies, or `previous` unchanged when it has no say in it.
+ *
+ * `strip` is this window's header strip and `active` the project it is showing. The identity of
+ * `previous` is returned when nothing moved, so a caller can use `next !== previous` as "this is
+ * worth persisting" and a subscriber does not re-render on every snapshot.
+ *
+ * # A window that cannot walk the stack must not rewrite it
+ *
+ * The guard on `strip.length` is the whole reason this is a function rather than three lines at
+ * the call site, and it is not a degenerate-input check. Two live cases reach here with a strip
+ * the switcher can do nothing with:
+ *
+ * * a **detached tab or pane window**, whose strip is `[]` — see `keys/target.ts`;
+ * * **`WindowMode::PerProject`**, where every shell window's strip holds exactly one project.
+ *
+ * In both, reconciling would read the missing projects as *closed* and answer a stack of one
+ * entry or none — and the store persists this answer to a `localStorage` key that every window
+ * of the origin shares. Opening a single detached pane would therefore wipe the shell window's
+ * remembered order, and the next launch would start Ctrl+Tab from header order: exactly the
+ * behaviour the switcher exists to replace, undone by a window that has no Ctrl+Tab at all.
+ *
+ * Freezing instead is safe in the direction that matters. The stale ids a frozen stack keeps are
+ * dropped by [`reconcile`] the moment a window with two projects sees a snapshot, and no walk can
+ * start before then — [`begin`] needs two entries as well.
+ */
+export function restack(
+  previous: readonly string[],
+  strip: readonly string[],
+  active: string | null,
+): readonly string[] {
+  if (strip.length < 2) return previous
+  const reconciled = reconcile(previous, strip)
+  const next = active === null ? reconciled : touch(reconciled, active)
+  const unchanged = next.length === previous.length && next.every((id, at) => id === previous[at])
+  return unchanged ? previous : next
+}
+
+/**
  * The modifiers held by the chord that is opening the switcher, or `null` when it holds none.
  *
  * `null` is the palette case and the bare-key-binding case; [`begin`] turns it into an

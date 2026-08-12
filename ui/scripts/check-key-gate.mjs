@@ -94,7 +94,7 @@ try {
   )
 
   const require = createRequire(import.meta.url)
-  const { createKeyGate } = require(join(out, 'keys/gate.js'))
+  const { createKeyGate, currentStroke } = require(join(out, 'keys/gate.js'))
   const { buildKeymap } = require(join(out, 'keys/keymap.js'))
   const { chipLabel, normalizeSequence, strokeFromEvent } = require(join(out, 'keys/chords.js'))
   const { evaluateWhen } = require(join(out, 'keys/when.js'))
@@ -463,6 +463,52 @@ try {
       eq(g.dispatched.length, 0, `and dispatched nothing via ${entry}`)
     }
   }
+  {
+    /*
+     * `currentStroke()` — the only thing a handler has that says a *key* ran it.
+     *
+     * `run` takes two strings, so a command cannot otherwise tell a keystroke from a command
+     * palette click. The project switcher's whole shape turns on that difference: with a
+     * stroke it opens a held-modifier walk and waits for the release, with `null` it switches
+     * immediately. Stop publishing the stroke and Ctrl+Tab silently becomes a two-item toggle
+     * — the exact behaviour the switcher replaced, with every other assertion in this file
+     * still green. So it is pinned here, on the gate that publishes it.
+     */
+    const seenDuring = []
+    const g = makeGate({})
+    g.gate.windowHandler(event({ code: 'KeyP', key: 'p', ctrl: true }))
+    eq(currentStroke(), null, 'no stroke is published outside a dispatch')
+
+    const publishing = createKeyGate({
+      bindings: () => BINDINGS,
+      context: () => ({}),
+      run: () => seenDuring.push(currentStroke()),
+    })
+    publishing.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true }))
+    publishing.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true, shift: true }))
+    // `eq` here is `Object.is`, so the log is compared as a string rather than as an array.
+    eq(seenDuring.join(','), 'ctrl+tab,ctrl+shift+tab', 'the dispatching stroke is what the handler sees')
+    eq(currentStroke(), null, 'and it is withdrawn again the moment the handler returns')
+
+    // A handler is allowed to throw; a stroke left published would make the *next* palette
+    // invocation believe a modifier was being held.
+    const throwing = createKeyGate({
+      bindings: () => BINDINGS,
+      context: () => ({}),
+      run: () => {
+        throw new Error('handler blew up')
+      },
+    })
+    let threw = false
+    try {
+      throwing.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true }))
+    } catch {
+      threw = true
+    }
+    ok(threw, 'a throwing handler still propagates')
+    eq(currentStroke(), null, 'and leaves no stroke published behind it')
+  }
+
   {
     // A gate with no capture at all behaves exactly as it did before this feature existed.
     const bare = makeGate({})

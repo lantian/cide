@@ -85,6 +85,7 @@ try {
     commit,
     holdOf,
     reconcile,
+    restack,
     selection,
     stillHeld,
     touch,
@@ -358,6 +359,33 @@ try {
   }
 
   {
+    /*
+     * `restack` — the snapshot rule, and specifically **which windows are allowed to speak**.
+     *
+     * The stack is persisted to a `localStorage` key shared by every window of the origin, so
+     * this is the one place where a window that has nothing to do with Ctrl+Tab can destroy the
+     * order the user actually built. A detached tab or pane window's strip is `[]`
+     * (`keys/target.ts`), and in `WindowMode::PerProject` every shell window's strip holds one
+     * project — reconciling against either would answer "everything closed".
+     */
+    const stack = ['alpha', 'beta', 'gamma']
+    eq(restack(stack, ['alpha', 'beta', 'gamma'], 'gamma'), ['gamma', 'alpha', 'beta'],
+      'a shell window with a walkable strip promotes its active project')
+    eq(restack(stack, ['alpha', 'gamma'], 'alpha'), ['alpha', 'gamma'],
+      'and drops a project that really did close')
+    eq(restack(stack, ['alpha', 'beta', 'gamma', 'delta'], 'alpha'), [...stack, 'delta'],
+      'a project opened elsewhere arrives at the back')
+
+    ok(restack(stack, [], null) === stack,
+      'a detached window — strip `[]` — leaves the stack alone, identity and all: it shares the ' +
+        'cache with the shell window and must not wipe it')
+    ok(restack(stack, ['beta'], 'beta') === stack,
+      'and neither may a PerProject shell window, whose strip holds one project')
+    ok(restack(stack, ['alpha', 'beta', 'gamma'], 'alpha') === stack,
+      'an unchanged order keeps its identity, so nothing is written back for a no-op')
+  }
+
+  {
     // A project closing *during* a walk. The frozen order still names it; the commit must not.
     const s = session(STACK, { live: ['alpha', 'beta', 'delta'] })
     s.press(1, 'ctrl+tab')
@@ -431,6 +459,27 @@ try {
       commitBody.indexOf('rememberMru(') < commitBody.indexOf('activateProject('),
       'order before activation, so a second Ctrl+Tab inside the round trip reads the new stack',
     )
+  }
+
+  {
+    /*
+     * The hold comes from the *keystroke that dispatched the command*, and nowhere else.
+     *
+     * This one line is what separates the two behaviours: with a stroke, Ctrl+Tab opens a walk
+     * that waits for the release; with `null` it degenerates to an immediate switch — a
+     * two-item toggle, which is precisely what the user rejected. `check-key-gate.mjs` proves
+     * the gate publishes the stroke; this proves the store still asks for it.
+     */
+    const store = read('../src/keys/switcherStore.ts')
+    ok(
+      /begin\([^)]*holdOf\(currentStroke\(\)\)/.test(store),
+      'startProjectSwitch reads the hold off the dispatching stroke — a constant here would ' +
+        'turn Ctrl+Tab back into the toggle the switcher replaced',
+    )
+    // And the snapshot rule is the shared one, so the guard on which windows may rewrite the
+    // stack cannot be re-inlined without the assertions above noticing.
+    const ws = read('../src/store/workspace.ts')
+    ok(/restack\(/.test(ws), 'the workspace store derives its stack through `restack`')
   }
 
   {

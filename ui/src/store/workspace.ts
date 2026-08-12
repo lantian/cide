@@ -10,7 +10,7 @@
  * splitter is mid-drag. Those never outlive the window and never need to agree with anyone.
  */
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
-import { reconcile, touch } from '@/keys/switcher'
+import { restack } from '@/keys/switcher'
 import { windowProjectsOf } from '@/keys/target'
 import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
@@ -217,11 +217,14 @@ function syncFileIndex(workspace: Workspace): void {
  *
  * Two honest limits, stated rather than hidden:
  *
- * * `localStorage` is per *origin*, so several shell windows would share one stack. In
- *   `Stacked` mode there is one shell window; in `PerProject` mode each strip holds exactly
- *   one project and Ctrl+Tab has nothing to walk. The overlap is theoretical today.
- * * A stale id for a project that has since been closed is dropped by [`reconcile`] on the
- *   first snapshot, not persisted forward.
+ * * `localStorage` is per *origin*, so **every** window of this app shares this one key — the
+ *   detached tab and pane windows included, and they are not theoretical. That is what
+ *   [`restack`] guards: a window whose strip holds fewer than two projects reads as "everything
+ *   closed" and would write that emptiness over the shell window's order. It is therefore not
+ *   allowed to write at all. In `PerProject` mode that silences every window, which costs
+ *   nothing because each strip holds one project and Ctrl+Tab has nothing to walk there.
+ * * A stale id for a project that has since been closed is dropped by `reconcile` on the first
+ *   snapshot a window with a walkable strip sees, not persisted forward.
  */
 const MRU_CACHE_KEY = 'cide.projectMru'
 
@@ -260,17 +263,15 @@ function saveMru(order: readonly string[]): void {
  * committed from the switcher, or activated in *another* window — and only three of them pass
  * through this store's actions. `cide://workspace-changed` is the one path all four share.
  *
- * Returns the same array identity when nothing moved, so subscribers do not re-render on every
- * snapshot and nothing is written back to `localStorage` for a no-op.
+ * The rule itself is [`restack`], in the pure module beside the walk, because the interesting
+ * half of it is not "what does this window's strip say" but "may this window speak at all" — a
+ * detached window's strip is empty and would otherwise reconcile the whole stack away, into a
+ * cache every window of this origin shares. Returns the same array identity when nothing moved,
+ * so subscribers do not re-render on every snapshot and nothing is written back for a no-op.
  */
 function nextMru(previous: readonly string[], boot: Bootstrap | null): readonly string[] {
-  const live = windowProjectsOf(boot)
   const active = boot?.role.kind === 'shell' ? boot.role.active : null
-  const reconciled = reconcile(previous, live)
-  const next = active === null ? reconciled : touch(reconciled, active)
-  const unchanged =
-    next.length === previous.length && next.every((id, at) => id === previous[at])
-  return unchanged ? previous : next
+  return restack(previous, windowProjectsOf(boot), active)
 }
 
 /** [`nextMru`], writing the cache whenever the order actually moved. */
