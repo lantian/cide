@@ -71,6 +71,8 @@ try {
     themeToAdopt,
     TERMINAL_SLOTS,
     TERMINAL_TOKENS,
+    TERMINAL_GREY_RAMP,
+    TERMINAL_MIN_CONTRAST,
     terminalPalette,
     unresolvedSlots,
     paletteSignature,
@@ -239,35 +241,81 @@ try {
   // the user's chair looks exactly like the theme switch this whole change is about failing
   // to reach that terminal. The gate above stayed green through all of it.
   //
-  // 3:1 rather than AA's 4.5:1 for body text. Terminal colours are not body text, so the floor
-  // is set where "a human cannot see this at all" lives, not where "comfortable" does.
+  // The floor is `TERMINAL_MIN_CONTRAST` and is deliberately *not* restated here: the same
+  // number is handed to xterm's `minimumContrastRatio` in `src/terminal/xterm.ts`, and the two
+  // are one rule seen from two sides — this gate covers the backgrounds the palette paints,
+  // that option covers the backgrounds a program paints for itself. A gate stricter than the
+  // runtime floor ships colours it rejected; a looser one lets the runtime silently repaint
+  // colours it approved. `theme.ts` carries the argument for the value.
   //
-  // The exemptions are per theme, and that asymmetry IS the rule rather than a softening of
-  // it. A dark scheme is conventionally expected to sink colour 0 into its background — that
-  // is what makes it usable as a shadow and a fill — so `black` at 1.06:1 on #151518 is
-  // correct there and would be a bug in a white terminal. `brightBlack` is the dim-grey slot
-  // by universal convention and is only ever asked to be *quiet*, not invisible; it is
-  // exempted in dark alone, and clears the floor unaided in light.
+  // Judged against BOTH backgrounds this palette chooses. `--sel` was the gap: nothing checked
+  // that selected text stays readable, and in a light theme the selection is the one large
+  // tinted surface, so a colour can clear the terminal background and disappear the moment a
+  // user drags across it.
   //
-  // The consequence worth stating: `black` is checked in light, which is precisely the bug
-  // this was written after. Move colour 0 back to a near-background token and the light case
-  // fails while dark stays green.
-  const INK_FLOOR = 3
-  const CONVENTIONALLY_QUIET = { dark: ['black', 'brightBlack'], light: [] }
+  // The exemptions are per theme AND per ground, and that asymmetry IS the rule rather than a
+  // softening of it. A scheme is conventionally expected to sink the end of the greyscale ramp
+  // that shares its background's lightness: in dark that is colours 0 and 8, which is what makes
+  // 0 usable as a fill and 8 usable as "quiet", so `black` at 1.06:1 on #151518 is correct there
+  // and would be a bug in a white terminal. In light the corresponding end is 15, and it is
+  // exempted **on the selection only** — it must still clear the floor on `--panel`, because
+  // that is the assertion that fails for a genuinely invisible palette. Set `--term-bright-white`
+  // to #ffffff and the light case fails here while dark stays green.
+  const INK_FLOOR = TERMINAL_MIN_CONTRAST
+  const QUIET = {
+    '--panel': { dark: ['black', 'brightBlack'], light: [] },
+    '--sel': { dark: ['black', 'brightBlack'], light: ['brightWhite'] },
+  }
   const inkSlots = TERMINAL_SLOTS.filter(
     ([slot]) => !['background', 'cursorAccent', 'selectionBackground'].includes(slot),
   )
   for (const [name, palette] of [['dark', dark], ['light', light]]) {
-    const ground = palette['--panel']
-    const invisible = inkSlots
-      .filter(([slot]) => !CONVENTIONALLY_QUIET[name].includes(slot))
-      .map(([slot, token]) => [slot, palette[token], contrast(palette[token], ground)])
-      .filter(([, , ratio]) => ratio !== null && ratio < INK_FLOOR)
-      .map(([slot, value, ratio]) => `${slot}=${value} ${ratio.toFixed(2)}:1`)
+    for (const [groundToken, quiet] of Object.entries(QUIET)) {
+      const ground = palette[groundToken]
+      const invisible = inkSlots
+        .filter(([slot]) => !quiet[name].includes(slot))
+        .map(([slot, token]) => [slot, palette[token], contrast(palette[token], ground)])
+        .filter(([, , ratio]) => ratio !== null && ratio < INK_FLOOR)
+        .map(([slot, value, ratio]) => `${slot}=${value} ${ratio.toFixed(2)}:1`)
+      eq(
+        invisible,
+        [],
+        `every ink colour clears ${INK_FLOOR}:1 on the ${name} theme's ${groundToken} ${ground}`,
+      )
+    }
+  }
+
+  // --- and whether the four greys are still in the order every program assumes -------------
+  //
+  // A ratio floor is a claim about visibility and says nothing about identity. Colours 0, 8, 7
+  // and 15 are the one run of the palette whose *ordering* is a contract: a program picks
+  // between them expecting 0 darkest and 15 lightest, and picks 7 or 15 as a **background**
+  // expecting a light bar. The light theme used to fail that while passing everything above —
+  // 7 was `--text` (#1b1b1f) and 15 `--text-hi` (#0a0a0c), so 15 was darker than 7 and both were
+  // darker than 8, and `ESC[47m` painted a near-black status bar in a white terminal. No
+  // contrast option can catch it either: backgrounds are never adjusted.
+  //
+  // Strictly increasing rather than non-decreasing, so a theme cannot quietly collapse two of
+  // the four into one colour — which is the state the light palette was in, with 0, 7 and the
+  // default foreground all within a few points of #1b1b1f.
+  for (const [name, palette] of [['dark', dark], ['light', light]]) {
+    const ramp = TERMINAL_GREY_RAMP.map((slot) => {
+      const entry = TERMINAL_SLOTS.find(([s]) => s === slot)
+      const value = entry ? palette[entry[1]] : undefined
+      return { slot, value, l: luminance(value) }
+    })
+    // A step whose value is not a hex colour fails here rather than being skipped: `luminance`
+    // answers null for a `var()` or an `rgba()`, and a ramp this file cannot order is a ramp
+    // nothing is checking.
+    const rises = (step, i) =>
+      i === 0 || (step.l !== null && ramp[i - 1].l !== null && step.l > ramp[i - 1].l)
+    const wrong = ramp.filter((step, i) => !rises(step, i)).map((s) => `${s.slot}=${s.value}`)
     eq(
-      invisible,
+      wrong,
       [],
-      `every ink colour clears ${INK_FLOOR}:1 on the ${name} terminal background ${ground}`,
+      `the ${name} greyscale ramp rises across ${TERMINAL_GREY_RAMP.join(' < ')} — a program ` +
+        `that picks between ANSI 0, 8, 7 and 15 is picking on that order, and one that sets 7 ` +
+        `or 15 as a background is asking for the light end of it`,
     )
   }
 
@@ -423,6 +471,18 @@ try {
       `the terminal reads \`${token}\` rather than a number of its own`,
     )
   }
+
+  // The runtime half of the floor above, asserted on the *option assignment* rather than on the
+  // constant appearing somewhere in the file — the lesson two paragraphs up, where a comment
+  // naming a token kept a check green after the code had moved off it. Without this line the
+  // palette gate is the only thing standing, and it cannot see a background a program paints
+  // for itself: Claude Code's default theme prints `rgb(255,255,255)` as a 24-bit literal, which
+  // reaches no ANSI slot and lands at 1.00:1 on this app's white terminal.
+  ok(
+    /minimumContrastRatio:\s*TERMINAL_MIN_CONTRAST/.test(xtermText),
+    '`minimumContrastRatio` is handed the same floor this file gates the palette with, so a ' +
+      'foreground a program pairs with its own background is still readable',
+  )
 
   // And that a size change reaches a terminal that already exists. The editor follows the
   // cascade; a terminal holds resolved numbers, so without this call the two Settings
