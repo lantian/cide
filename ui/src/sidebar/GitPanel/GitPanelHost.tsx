@@ -38,7 +38,8 @@ import { useContextMenu, type MenuEntry } from '@/menus'
 import { copyText } from '../copyText'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
-import { DEFAULT_CHANGELIST, actOn, changelistIdOf, type Row } from './model'
+import { DEFAULT_CHANGELIST, changelistIdOf, groupOf, type Row } from './model'
+import { grab, plural } from './dragDrop'
 
 export interface GitPanelProps {
   /** The active project, or `null` before one is open — then the panel is simply empty. */
@@ -76,12 +77,20 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
       if (row === null) return []
 
       const entry = row.entry
-      if (entry === undefined) return groupMenu(row, git)
+      if (entry === undefined) return row.kind === 'dir' ? dirMenu(row, git) : groupMenu(row, git)
 
       const path = entry.path
-      // Which files this gesture is about — the row alone, or the ticks in the same repo when
-      // the row is one of them. The count goes in the label; see `model.ts::actOn`.
-      const scope = actOn(git.view, git.selected, row)
+      /*
+       * Which files this gesture is about — the row alone, or the ticks in the same repo when
+       * the row is one of them. The count goes in the label; see `dragDrop.ts::grab`.
+       *
+       * Through `grab`, which is also what a *drag* from this row picks up. The two routes to
+       * "move these files" are then the same set by construction rather than by two
+       * implementations that agree today: a menu that moved four files where a drag moved one
+       * would be the panel disagreeing with itself about what the user is pointing at.
+       */
+      const carried = grab(git.view, git.selected, row)
+      const scope = { repo: row.repo, paths: carried?.files.map((f) => f.path) ?? [path] }
       const staged = entry.index !== 'unmodified'
       const unstaged = entry.worktree !== 'unmodified'
       const conflicted = entry.index === 'conflicted' || entry.worktree === 'conflicted'
@@ -163,6 +172,51 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
       treeMenu={{ onContextMenu, menu }}
     />
   )
+}
+
+/**
+ * The menu for a directory row — the keyboard's half of dragging a folder.
+ *
+ * Drag and drop is unusable without a pointer, so every gesture it offers has to exist here
+ * too: this is where Shift+F10 on a focused directory row lands. `useContextMenu` treats a
+ * `contextmenu` event at 0,0 as a keyboard invocation and anchors it to the focused element,
+ * and the tree's rows are focusable, so the route is already wired — what was missing was a
+ * menu for these rows at all. Without this branch a directory would open the *changelist*
+ * menu, offering to rename and delete the list it happens to sit in.
+ *
+ * `grab` supplies the files, so the menu moves exactly what a drag from the same row would.
+ */
+function dirMenu(row: Row, git: ReturnType<typeof useGitPanel>): MenuEntry[] {
+  const carried = grab(git.view, git.selected, row)
+  const paths = carried?.files.map((f) => f.path) ?? []
+  const count = paths.length
+  const path = row.path ?? row.label
+  return [
+    {
+      id: 'move',
+      // The count is the safeguard, exactly as on a file row: *Move 4 Files to Changelist…*
+      // is a sentence the user reads before clicking, and the dialog then names every path.
+      label: `Move ${plural(count)} to Changelist…`,
+      ...(row.groupKind === 'changelist' && count > 0
+        ? { run: () => git.moveToChangelist(row.repo, paths) }
+        : {
+            disabledReason:
+              row.groupKind === 'conflicts'
+                ? 'Resolve the conflict first — conflicts are listed apart from changelists'
+                : 'Only tracked changes belong to a changelist',
+          }),
+    },
+    { kind: 'separator' },
+    {
+      id: 'revertDir',
+      label: `Roll Back ${plural(count)}`,
+      danger: true,
+      ...(count > 0
+        ? { run: () => git.revertFiles(row.repo, paths) }
+        : { disabledReason: 'Nothing under this directory to roll back' }),
+    },
+    { id: 'copyPath', label: 'Copy Path', run: () => void copyText(path) },
+  ]
 }
 
 /**
@@ -254,6 +308,26 @@ function groupMenu(
         : { run: () => git.deleteChangelist(repo, id) }),
     },
     { kind: 'separator' },
+    {
+      id: 'move',
+      /*
+       * A whole changelist, moved. This is the keyboard's answer to dragging a changelist
+       * header, which the pointer deliberately cannot do — a press on a group row folds it
+       * (`gitTreeClick`), so a drag from one would begin by collapsing the thing being dragged.
+       * See the header of `dragDrop.ts`.
+       */
+      label: `Move ${plural(count)} to Changelist…`,
+      ...(empty
+        ? { disabledReason: 'Nothing in this changelist to move' }
+        : {
+            run: () => {
+              const found = groupOf(git.view, repo, row.group ?? '')
+              if (found !== undefined) {
+                git.moveToChangelist(repo, [...found.entries.map((e) => e.path)])
+              }
+            },
+          }),
+    },
     {
       id: 'shelve',
       label: 'Shelve Changelist',

@@ -217,6 +217,16 @@ export interface GitPanelActions {
   setActiveChangelist: (repo: RepoId, id: string) => void
   /** Open the chooser on `Move to changelist` for these repo-relative paths. */
   moveToChangelist: (repo: RepoId, paths: string[]) => void
+  /**
+   * File these paths into that changelist. No dialog — the target was already named by the
+   * gesture, which is what a drop onto a changelist row is.
+   *
+   * The `id` is the **raw** changelist id, never the `cl:`-prefixed group id — see
+   * `changelistIdOf`. The rules deciding whether a drop may happen at all live in
+   * `dragDrop.ts`, so this is deliberately unguarded past the empty check: a caller that has
+   * a target and a non-empty path list has already been told the move is legal.
+   */
+  movePaths: (repo: RepoId, changelist: string, paths: string[]) => void
   /** Throw away everything in one group. **Opens the confirmation**, which names every file. */
   revertGroup: (repo: RepoId, group: string) => void
   /** Same, for an explicit list of paths. */
@@ -836,6 +846,25 @@ export function useGitPanel(
     [view],
   )
 
+  /**
+   * The drop half of drag and drop: file these paths, no dialog.
+   *
+   * Through `mutate`, so the tree the command answers with is adopted directly — a `refresh()`
+   * here would be a second full status walk of every root, and the frame in between shows the
+   * files back where they came from, which reads as the drop having failed.
+   */
+  const movePaths = useCallback(
+    (repo: RepoId, changelist: string, paths: string[]) => {
+      // An empty list is what `dropOutcome` returns for a drop onto the list the files are
+      // already in. Sending it would be a round trip and a busy line for a no-op.
+      if (paths.length === 0) return
+      mutate('git changelist move', 'Moving…', (p) =>
+        gitApi.changelist.movePaths(p, repo, changelist, paths),
+      )
+    },
+    [mutate],
+  )
+
   const dismissDialog = useCallback(() => setDialog(null), [])
 
   const deleteChangelist = useCallback(
@@ -1309,6 +1338,7 @@ export function useGitPanel(
     deleteChangelist,
     setActiveChangelist,
     moveToChangelist,
+    movePaths,
     revertGroup,
     revertFiles,
     shelveGroup,

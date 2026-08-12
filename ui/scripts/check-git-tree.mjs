@@ -74,6 +74,11 @@ try {
       },
       files: [
         join(UI, 'src', 'sidebar', 'GitPanel', 'model.ts'),
+        // The drag-and-drop rules: what a grab carries, which targets accept it, what a
+        // same-list drop does. Pure, and in a module of its own precisely so this script can
+        // run them — the gesture that drives them needs a pointer and a DOM, so the rules are
+        // the only half of that feature anything in this repo can execute.
+        join(UI, 'src', 'sidebar', 'GitPanel', 'dragDrop.ts'),
         // The click rules. They are in a module of their own precisely so the three sidebar
         // check scripts can each hold the rule belonging to their tree; the git tree's is the
         // conditional one, and it is pinned at the foot of this file.
@@ -86,7 +91,23 @@ try {
     cwd: UI,
   })
 
+  /*
+   * `dragDrop.ts` imports two *values* from `model.ts` — `flatFiles` and `changelistIdOf` —
+   * which `model.ts` itself deliberately does not do from anywhere (its imports are all
+   * type-only, so it emits a file with no imports at all and node can load it directly).
+   * TypeScript emits the specifier exactly as written, `'./model'`, and node refuses an
+   * extensionless one.
+   *
+   * Rewriting it here beats the two alternatives: `'./model.js'` in the source is a lie in a
+   * file the bundler reads, and duplicating the two functions into `dragDrop.ts` would put the
+   * `cl:` prefix rule in two places, which is the one rule in this panel whose second copy
+   * silently produces `NoSuchChangelist`.
+   */
+  const emitted = join(out, 'sidebar', 'GitPanel', 'dragDrop.js')
+  writeFileSync(emitted, readFileSync(emitted, 'utf8').replace(/from '(\.\/[^']+)'/g, "from '$1.js'"))
+
   const m = await import(`file://${join(out, 'sidebar', 'GitPanel', 'model.js')}`)
+  const d = await import(`file://${emitted}`)
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -738,34 +759,287 @@ try {
   eq(m.groupOf(withEmptyView, APP, 'cl:fixes').name, 'fixes', 'a group is found by its group id')
   eq(m.groupOf(withEmptyView, APP, 'nope'), undefined, 'and an unknown one is undefined')
 
-  // `actOn`: the count that ends up in the menu label, and the safeguard against a gesture
-  // that quietly sweeps in files the user forgot were ticked.
+  // --- directory rows -------------------------------------------------------------------
+
+  /*
+   * > *"i should be able to drag one or multiple selected elements (including whole
+   * > directories) to another changelist"*
+   *
+   * There was nothing to grab: every file was one row carrying its whole path. A directory row
+   * is the row that means "everything under here", and it is scoped to one group — the same
+   * `src/` in two changelists is two rows, so a drag from one can never carry the other's files.
+   */
   const rowsE = m.buildRows(withEmptyView, openAll(withEmptyView))
   const rowA = rowsE.find((r) => r.label === 'a.rs')
-  const rowB = rowsE.find((r) => r.label === 'src/b.rs')
+  const rowB = rowsE.find((r) => r.label === 'b.rs')
+  const rowSrc = rowsE.find((r) => r.kind === 'dir' && r.path === 'src')
   const rowNotes = rowsE.find((r) => r.label === 'notes.md')
   eq(
-    m.actOn(withEmptyView, new Set(), rowA).paths,
+    [rowSrc.kind, rowSrc.depth, rowSrc.label, rowSrc.groupKind],
+    ['dir', 1, 'src', 'changelist'],
+    'a file at `src/b.rs` puts a directory row between its changelist and itself',
+  )
+  eq(rowB.depth, 2, 'and the file sits one level inside it')
+  eq(
+    rowB.label,
+    'b.rs',
+    'showing its basename alone — the row above says `src`, and repeating it on every leaf is '
+      + 'what the flat list did with the widest thing in a 420px panel',
+  )
+  eq(rowA.depth, 1, 'a file with no directory in its path stays where it always was')
+  eq(
+    rowSrc.files,
+    [m.fileRowId(APP, 'src/b.rs')],
+    'a directory row owns every file under it — this is what a drag from it carries, and what '
+      + 'its tri-state checkbox folds over',
+  )
+  eq(
+    m.dirRowId(APP, 'cl:default', 'src') === m.dirRowId(APP, 'cl:fixes', 'src'),
+    false,
+    'the same directory in two changelists is two rows: one id for both would make a drag from '
+      + "one carry the other's files, and expanding one expand the other",
+  )
+  eq(
+    m.defaultExpanded(withEmptyView).has(rowSrc.id),
+    true,
+    'directories start open, or the panel would open with changes hidden behind a twisty',
+  )
+  eq(
+    m.buildRows(withEmptyView, new Set([m.groupRowId(APP, 'cl:default')])).map((r) => r.label),
+    ['Changes', 'src', 'a.rs', 'fixes', 'My list', 'Unversioned Files', 'Ignored Files'],
+    'a collapsed directory hides its files and keeps its own row; directories come before the '
+      + "files beside them, which is what both other trees in this app do",
+  )
+  eq(
+    m.buildRows(
+      m.normalizeStatus({
+        repos: [
+          {
+            repo: { id: APP, root: '/w/app' },
+            changelists: [
+              {
+                id: 'default',
+                name: 'C',
+                changes: [
+                  entry('ui/src/sidebar/GitPanel/model.ts', 'unmodified', 'modified', 'default'),
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+      new Set(['x']),
+    ).flatMap((r) => (r.kind === 'dir' ? [[r.label, r.path]] : [])),
+    [],
+    'a collapsed changelist emits no directory rows either',
+  )
+
+  const deep = m.normalizeStatus({
+    repos: [
+      {
+        repo: { id: APP, root: '/w/app' },
+        changelists: [
+          {
+            id: 'default',
+            name: 'C',
+            changes: [
+              entry('ui/src/sidebar/GitPanel/model.ts', 'unmodified', 'modified', 'default'),
+              entry('ui/src/sidebar/GitPanel/types.ts', 'unmodified', 'modified', 'default'),
+            ],
+          },
+        ],
+      },
+    ],
+  })
+  eq(
+    m.buildRows(deep, m.allGroups(deep)).map((r) => [r.kind, r.label]),
+    [
+      ['group', 'C'],
+      ['dir', 'ui/src/sidebar/GitPanel'],
+      ['file', 'model.ts'],
+      ['file', 'types.ts'],
+    ],
+    'a chain of directories with one child and no files of its own is compacted onto one row: '
+      + 'four twisties to reach one file, at 14px of indent each, in a 420px panel',
+  )
+  eq(
+    m.buildRows(deep, m.allGroups(deep))[1].path,
+    'ui/src/sidebar/GitPanel',
+    'and the compacted row keeps the deepest path, so its id and its files are unchanged by '
+      + 'the collapsing',
+  )
+
+  // --- what a grab carries ---------------------------------------------------------------
+
+  /*
+   * `grab` is `actOn` with the rest of the rows added: it is the one answer to "which files is
+   * this gesture about", read by the context menu *and* by the drag. Two functions answering
+   * that separately is how a menu that moves four files ends up beside a drag that moves one.
+   */
+  const paths = (set) => set?.files.map((f) => f.path) ?? null
+  eq(
+    paths(d.grab(withEmptyView, new Set(), rowA)),
     ['a.rs'],
-    'a right-click on an unticked row acts on that row alone',
+    'a gesture on an unticked row carries that row alone',
   )
   eq(
-    m.actOn(withEmptyView, new Set([rowA.id, rowB.id]), rowA).paths,
+    paths(d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA)),
     ['a.rs', 'src/b.rs'],
-    'and on the ticks when the clicked row is one of them — IDEA\'s multi-file move, and the '
-      + 'reason the count goes in the label',
+    "and the ticks when the row is one of them — IDEA's multi-file move, and the reason the "
+      + 'count goes in the menu label and on the drag ghost',
   )
   eq(
-    m.actOn(withEmptyView, new Set([rowA.id, rowNotes.id]), rowA).paths,
+    d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA).widened,
+    true,
+    'a widened grab says so, because that is the fact the user has to see before they let go',
+  )
+  eq(
+    d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA).label,
+    '2 files',
+    'and the ghost says it in words',
+  )
+  eq(
+    paths(d.grab(withEmptyView, new Set([rowA.id, rowNotes.id]), rowA)),
     ['a.rs'],
     'an unversioned tick is never swept into a changelist gesture: `status::repo_changes` '
       + 'builds `live` from paths that are neither Untracked nor Ignored, so filing one is a '
       + 'write the next status walk undoes',
   )
   eq(
-    m.actOn(withEmptyView, new Set([rowNotes.id]), rowNotes).paths,
+    paths(d.grab(withEmptyView, new Set([rowNotes.id]), rowNotes)),
     ['notes.md'],
     'and the widening never returns an empty set, whatever is ticked',
+  )
+  eq(
+    paths(d.grab(withEmptyView, new Set(), rowSrc)),
+    ['src/b.rs'],
+    'a directory row carries every file under it — the whole point of the row',
+  )
+  eq(
+    paths(d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowSrc)),
+    ['src/b.rs'],
+    'and never widens to the ticks: the row already names a set, and sweeping in files from '
+      + 'outside it would move what the user cannot see from the row they grabbed',
+  )
+  eq(
+    d.grab(withEmptyView, new Set(), rowsE.find((r) => r.label === 'Changes')),
+    null,
+    'a changelist header is not a drag source: a press on one FOLDS it (see `gitTreeClick`), '
+      + 'so a drag from it would begin by collapsing the thing being dragged. The group menu '
+      + 'moves a whole changelist instead, with a count to read first',
+  )
+  eq(
+    d.grab(m.normalizeStatus({ repos: [repo(APP, '/w/app', 'app'), repo(LIB, '/w/lib', 'lib')] }),
+      new Set(),
+      m.buildRows(two, openAll(two)).find((r) => r.kind === 'repo')),
+    null,
+    'and neither is a repository row: it is in no changelist, and its files span its submodules '
+      + "— which have their own sidecar and cannot be filed into this repo's lists",
+  )
+
+  // --- which targets accept ---------------------------------------------------------------
+
+  const carried = d.grab(withEmptyView, new Set(), rowA)
+  const group = (label) => rowsE.find((r) => r.kind === 'group' && r.label === label)
+  eq(
+    d.dropOutcome(carried, group('fixes')),
+    {
+      kind: 'move',
+      repo: APP,
+      changelist: 'fixes',
+      list: 'fixes',
+      paths: ['a.rs'],
+      hint: 'Move 1 file to “fixes”',
+    },
+    'dropping a file on another changelist moves it, and the id sent to Rust is the RAW one — '
+      + 'the `cl:` prefix on a group id is a `NoSuchChangelist` on arrival',
+  )
+  eq(
+    d.dropOutcome(carried, group('Changes')),
+    { kind: 'noop', list: 'Changes', hint: 'Already in “Changes”' },
+    'dropping it on the list it is already in is a no-op, not an error: nothing is sent, no '
+      + 'busy line flashes, and the target still reads as accepting',
+  )
+  eq(
+    d.dropOutcome(d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA), group('fixes')).paths,
+    ['a.rs', 'src/b.rs'],
+    'a multi-file drop sends every file that changes list',
+  )
+  eq(
+    d.dropOutcome(
+      { ...carried, files: [carried.files[0], { id: 'x', path: 'c.rs', changelist: 'fixes' }] },
+      group('fixes'),
+    ).paths,
+    ['a.rs'],
+    'and only those: a file already in the target is left out of the command rather than sent '
+      + 'as a move to where it is',
+  )
+  eq(
+    d.dropOutcome(carried, group('Unversioned Files')),
+    {
+      kind: 'refuse',
+      reason: '“Unversioned Files” is not a changelist — nothing can be filed there',
+      hint: '“Unversioned Files” is not a changelist — nothing can be filed there',
+    },
+    'the sibling lists refuse, VISIBLY. This is the drop that must not silently succeed: '
+      + '`Sidecar::move_paths` would happily record it and the next status walk would drop it, '
+      + 'which looks exactly like a broken feature',
+  )
+  eq(
+    d.dropOutcome(carried, group('Ignored Files')).kind,
+    'refuse',
+    'the ignored list too',
+  )
+  eq(
+    d.dropOutcome(d.grab(withEmptyView, new Set(), rowNotes), group('fixes')).reason,
+    'Only tracked changes belong to a changelist',
+    'and an unversioned file refuses wherever it is dropped — the source is reported before '
+      + 'the target, so the answer is the same over every row instead of a new complaint per '
+      + 'changelist. Same sentence the context menu gives',
+  )
+  eq(
+    d.dropOutcome(carried, null).kind,
+    'refuse',
+    'the empty space below the tree takes nothing',
+  )
+  eq(
+    d.dropOutcome({ ...carried, repo: LIB }, group('fixes')).reason,
+    'A changelist belongs to one repository — these files are in another',
+    'and neither does another repository: a changelist lives in one repo\'s sidecar',
+  )
+
+  eq(
+    [...d.bands(rowsE)].filter(([, g]) => g === group('Changes').id).map(([id]) =>
+      rowsE.find((r) => r.id === id).label,
+    ),
+    ['Changes', 'src', 'b.rs', 'a.rs'],
+    'the band of a changelist is the group row and everything under it, directories included — '
+      + 'what gets tinted while a drop is being aimed, because the header itself is usually '
+      + 'above the fold by the time the pointer is over the files',
+  )
+  eq(
+    d.bands(m.buildRows(two, openAll(two))).get(m.repoRowId(LIB)),
+    undefined,
+    'a repository row is in no band: it sits above its own groups, and the group before it '
+      + 'belongs to the other repository',
+  )
+
+  // Where a drop lands: any row inside a changelist resolves to that changelist, so the target
+  // is the whole band rather than one 23px header that may have scrolled off the top.
+  eq(d.dropTarget(rowsE, rowB.id)?.label, 'Changes', 'a file row resolves to its changelist')
+  eq(d.dropTarget(rowsE, rowSrc.id)?.label, 'Changes', 'a directory row does too')
+  eq(d.dropTarget(rowsE, group('fixes').id)?.label, 'fixes', 'and a group row is its own target')
+  eq(d.dropTarget(rowsE, null), null, 'nothing under the pointer is no target')
+  eq(
+    d.dropTarget(m.buildRows(two, openAll(two)), m.repoRowId(LIB)),
+    null,
+    'a REPOSITORY row resolves to nothing at all: it sits above its own groups, so walking '
+      + "back from it finds the previous repository's last changelist — the wrong sidecar",
+  )
+  eq(
+    d.dropTarget(m.buildRows(nested, openAll(nested)), m.repoRowId(SUB)),
+    null,
+    'including a submodule row, whose parent’s changelist cannot hold its files',
   )
 
   /*
@@ -776,8 +1050,54 @@ try {
    */
   const host = readFileSync(join(UI, 'src/sidebar/GitPanel/GitPanelHost.tsx'), 'utf8')
   ok(
-    /if \(entry === undefined\) return groupMenu\(row, git\)/.test(host),
-    'a right-click on a group row opens the group menu rather than nothing',
+    /if \(entry === undefined\) return row\.kind === 'dir' \? dirMenu\(row, git\) : groupMenu\(row, git\)/
+      .test(host),
+    'a right-click on a group row opens the group menu rather than nothing — and a directory '
+      + 'row opens its own, rather than the menu of the changelist it happens to sit in, which '
+      + 'would offer to rename and delete that list',
+  )
+  /*
+   * Drag and drop is unusable without a pointer, so every gesture it offers must also be on the
+   * menu — which `useContextMenu` opens from Shift+F10 on the focused row. These are source
+   * assertions: they prove the route is spelled out, not that a keystroke travels it.
+   */
+  ok(
+    /const carried = grab\(git\.view, git\.selected, row\)/.test(host),
+    'the file-row menu takes its files from `grab` — the same function a drag from that row '
+      + 'uses, so the two routes cannot come to disagree about what the user is pointing at',
+  )
+  ok(
+    /function dirMenu\([\s\S]{0,900}?git\.moveToChangelist\(row\.repo, paths\)/.test(host),
+    'a directory row can be moved from the keyboard, not only dragged',
+  )
+  ok(
+    /label: `Move \$\{plural\(count\)\} to Changelist…`,\s*\.\.\.\(empty/.test(host),
+    'and so can a whole changelist — the one row a drag deliberately cannot start from',
+  )
+  const tree2 = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangesTree.tsx'), 'utf8')
+  ok(
+    /onPointerDown=\{\(e\) => drag\.onPointerDown\(e, row\)\}/.test(tree2)
+      && /useChangesDrag\(\{ rows, view, selected, container, onMove: onMovePaths \}\)/.test(tree2),
+    'every row is a drag source candidate and the tree is wired to the pointer state machine — '
+      + 'the rules being right is worth nothing if no gesture reaches them',
+  )
+  ok(
+    /onMouseUp=\{\(e\) => \{\s*if \(e\.button !== 0 \|\| drag\.dragged\(\)\) return/.test(tree2),
+    'and an expandable row folds on RELEASE, skipped when the press became a drag: a directory '
+      + 'row is both a twisty and a drag handle, and folding on the press would take the rows '
+      + 'being dragged off the screen at the moment the drag starts',
+  )
+  ok(
+    /className=\{styles\.checkHit\}[\s\S]{0,600}?onPointerDown=\{\(e\) => e\.stopPropagation\(\)\}/
+      .test(tree2),
+    'the checkbox is a control and not a handle — a hand that shifts two pixels while ticking '
+      + 'a box must not pick the row up',
+  )
+  ok(
+    /className=\{styles\.checkHit\}[\s\S]{0,400}?onMouseUp=\{\(e\) => e\.stopPropagation\(\)\}/
+      .test(tree2),
+    'and the box swallows the release as well as the press, or ticking a changelist would fold '
+      + 'it — the fold moved to mouseup, and the box only ever stopped mousedown',
   )
   ok(
     /git\.revertGroup\(/.test(host) && /git\.moveToChangelist\(/.test(host)
@@ -796,6 +1116,12 @@ try {
       && /rollbackFile = useCallback\(\s*\(repo: RepoId, path: string\) => revertFiles/.test(model),
     'every route to `git_rollback` goes through the confirmation: the unguarded call is '
       + 'private to the hook, which is what stops the next caller skipping the dialog',
+  )
+  ok(
+    /onMovePaths=\{git\.movePaths\}/.test(panel)
+      && /gitApi\.changelist\.movePaths\(p, repo, changelist, paths\)/.test(model),
+    'and a drop reaches `git_changelist_move_paths` through the panel itself — no line in '
+      + 'App.tsx, which this feature does not own, stands between the gesture and the command',
   )
 
   if (failed > 0) {
