@@ -11,6 +11,7 @@
     "check:diff-render": "node scripts/check-diff-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",
     "check:exit": "node scripts/check-exit-marker.mjs",
+    "check:fonts": "node scripts/check-fonts.mjs",
     "check:format": "node scripts/check-status-format.mjs",
     "check:git": "node scripts/check-git-tree.mjs",
     "check:icons": "node scripts/check-icons.mjs",
@@ -33,7 +34,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit"
   },
-  "//": "Versions are pinned exactly, with no carets. Vite 8 defaults to the Rolldown/Oxc pipeline, where the known breakage class is plugins reaching into Rollup internals \u2014 a caret range would let that arrive unannounced during a milestone.",
+  "//": "Versions are pinned exactly, with no carets. Vite 8 defaults to the Rolldown/Oxc pipeline, where the known breakage class is plugins reaching into Rollup internals — a caret range would let that arrive unannounced during a milestone.",
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
     "@codemirror/commands": "6.10.4",

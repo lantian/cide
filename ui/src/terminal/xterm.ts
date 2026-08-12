@@ -101,7 +101,7 @@ export function createTerminal(): TerminalHandle {
      * written out beside the tokens, which is also where it has to be redone if the size
      * moves.
      */
-    fontSize: metric(style, '--fs-code', 12.5),
+    fontSize: metric(style, '--fs-term', 12.5),
     lineHeight: metric(style, '--term-line-height', 1.27),
     cursorBlink: true,
     cursorStyle: 'block',
@@ -376,5 +376,51 @@ function warnUnresolved(theme: Record<string, string>, signature: string): void 
     console.warn(
       `[cide] terminal palette unresolved: ${missing.join(', ')} — xterm will substitute its own colours`,
     )
+  }
+}
+
+/**
+ * Repaint every live terminal at the current font tokens.
+ *
+ * The sibling of {@link retheme}, and it exists for the same reason: a terminal holds resolved
+ * numbers, not CSS variables, so a token that changes after construction reaches the editor
+ * through the cascade and reaches a terminal through nothing at all. That is why the two
+ * Settings font-size controls appeared to do nothing — the editor half would have followed a
+ * token had one been written, and this half needed a call that did not exist.
+ *
+ * Three things have to happen in order and none is optional:
+ *
+ * 1. The options change, which is what resizes the cell.
+ * 2. `fit()` recomputes how many cells the pane now holds — a bigger font means fewer columns
+ *    in the same box, and without this the terminal keeps its old grid and clips.
+ * 3. The child is told, or it keeps writing at the old width and every wrapped line is wrong.
+ *    This is a real `SIGWINCH`, which is the same thing a window resize does.
+ *
+ * Step 3 is the caller's, because this module does not know about sessions; `onResized` is
+ * handed each handle that actually changed so the caller can push geometry for exactly those.
+ */
+export function refont(handles: Iterable<TerminalHandle>, onResized: (h: TerminalHandle) => void): void {
+  const style = getComputedStyle(document.documentElement)
+  const family = style.getPropertyValue('--font-mono').trim() || 'monospace'
+  const size = metric(style, '--fs-term', 12.5)
+  const lineHeight = metric(style, '--term-line-height', 1.27)
+
+  for (const handle of handles) {
+    const term = handle.term
+    // Skipped when nothing moved. Assigning an unchanged `fontSize` still makes xterm drop its
+    // character atlas and re-measure, which on a pane full of output is a visible hitch — and
+    // this runs on every settings change, including the ones that are not about fonts.
+    if (term.options.fontSize === size && term.options.lineHeight === lineHeight && term.options.fontFamily === family) {
+      continue
+    }
+    term.options.fontFamily = family
+    term.options.fontSize = size
+    term.options.lineHeight = lineHeight
+    try {
+      handle.fit.fit()
+    } catch {
+      // An unlaid-out pane fits to nonsense; the next `ResizeObserver` callback corrects it.
+    }
+    onResized(handle)
   }
 }

@@ -66,7 +66,32 @@
   gap: 1px;
   flex: 0 1 auto;
   min-width: 0;
-  overflow: hidden;
+  /*
+   * Scrolls rather than clips. Moving the `+` and the caret out of this box made *them*
+   * reachable and left the tabs themselves unreachable: past the width of the strip a project
+   * tab was simply gone, with no scrollbar, no wheel and no overflow menu — you could not
+   * switch to a project you could not see, which is worse than the control it replaced.
+   *
+   * `overflow-y: hidden` as well, and not by symmetry: a flex row that scrolls on one axis
+   * gets `auto` on the other by default, and a tab one pixel taller than the strip would add a
+   * vertical scrollbar to a 34px header.
+   */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+/*
+ * No scrollbar, deliberately.
+ *
+ * The strip is 34px and a tab is most of it; even `scrollbar-width: thin` eats a visible
+ * slice of the mock's row and lands under the tab's bottom rule. The affordances are the
+ * wheel (mapped to horizontal in `AppHeader.tsx`, because a vertical wheel over a horizontal
+ * scroller does nothing on Linux) and the active tab scrolling itself into view — which is
+ * what makes a project reachable after you pick it from the recents menu.
+ */
+.tabs::-webkit-scrollbar {
+  display: none;
 }
 
 /*

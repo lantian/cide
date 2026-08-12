@@ -10,7 +10,10 @@ use ts_rs::TS;
 
 use crate::{Theme, WindowMode};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+// No `Eq`: `EditorSettings`/`TerminalSettings` carry an `f32` font size now, and a float has
+// no total equality — which is the honest answer rather than an obstacle. Nothing compares
+// settings for equality; `PartialEq` is what the tests and the patch path use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct Settings {
@@ -172,11 +175,46 @@ pub enum DiffView {
     Split,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+/// The mock's mono size, and the default for both code surfaces.
+///
+/// One constant because they default equal — see [`TerminalSettings::font_size`]. It is also
+/// the literal in `tokens.css`'s `--fs-code`/`--fs-term`, and `check-fonts.mjs` fails if the
+/// two disagree, because a mismatch means the first settings write silently restyles the app.
+pub const DEFAULT_CODE_FONT_SIZE: f32 = 12.5;
+
+/// The band a stored font size is held inside.
+///
+/// Enforced in Rust as well as in the frontend's number input, because `settings.json` is a
+/// file a user can edit and a zero reaches xterm as a zero-wide cell — a blank pane with no
+/// error, which is indistinguishable from every other way a pane comes up blank.
+pub const MIN_CODE_FONT_SIZE: f32 = 6.0;
+pub const MAX_CODE_FONT_SIZE: f32 = 40.0;
+
+/// Bring a font size inside the band, and turn a non-finite one into the default.
+///
+/// `NaN` deserves the explicit arm: it compares false against every bound, so a naive
+/// `clamp` propagates it, and `NaN` px makes every cell in the pane `NaN` wide.
+#[must_use]
+pub fn clamp_font_size(size: f32) -> f32 {
+    if !size.is_finite() {
+        return DEFAULT_CODE_FONT_SIZE;
+    }
+    size.clamp(MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct EditorSettings {
-    pub font_size: u8,
+    /// Point size for the editor's mono face.
+    ///
+    /// `f32`, not `u8`, and the type is the fix rather than a refinement of it: the design
+    /// mock specifies **12.5px**, `tokens.css` ships that, and an integer cannot hold the
+    /// project's own default. The two defaults here were 13 and 12 — neither the mock's number
+    /// nor each other's — which went unnoticed for exactly as long as nothing read them.
+    ///
+    /// Clamped where a patch lands, not here: see [`clamp_font_size`].
+    pub font_size: f32,
     pub tab_size: u8,
     pub insert_spaces: bool,
     pub show_minimap: bool,
@@ -189,7 +227,7 @@ pub struct EditorSettings {
 impl Default for EditorSettings {
     fn default() -> Self {
         Self {
-            font_size: 13,
+            font_size: DEFAULT_CODE_FONT_SIZE,
             tab_size: 4,
             insert_spaces: true,
             show_minimap: true,
@@ -200,11 +238,17 @@ impl Default for EditorSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct TerminalSettings {
-    pub font_size: u8,
+    /// Point size for the terminal's mono face. See [`EditorSettings::font_size`] for the type.
+    ///
+    /// Defaults **equal to the editor's**, which is a decision rather than a coincidence:
+    /// `tokens.css` unified the two because a terminal beside an editor at a half-pixel
+    /// difference reads as two typefaces, and that shipped once already. Two controls means
+    /// they *can* diverge; nothing should make them diverge on their own.
+    pub font_size: f32,
     pub scrollback: u32,
     /// Which xterm.js renderer to prefer.
     ///
@@ -218,7 +262,7 @@ pub struct TerminalSettings {
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
-            font_size: 12,
+            font_size: DEFAULT_CODE_FONT_SIZE,
             scrollback: 5_000,
             renderer: TerminalRenderer::default(),
         }
@@ -577,5 +621,64 @@ mod tests {
             SidebarSettings::default().clamped(),
             SidebarSettings::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod font_size_tests {
+    use super::*;
+
+    /// The two code surfaces start at the same size, and it is the mock's.
+    ///
+    /// Not a style preference: `tokens.css` unified them because a terminal beside an editor at
+    /// a half-pixel difference reads as two typefaces, and that shipped once. The old defaults
+    /// were 13 and 12 — disagreeing with the mock and with each other — which nothing noticed
+    /// because nothing read them.
+    #[test]
+    fn both_code_surfaces_default_to_the_mocks_size() {
+        assert_eq!(EditorSettings::default().font_size, DEFAULT_CODE_FONT_SIZE);
+        assert_eq!(
+            TerminalSettings::default().font_size,
+            DEFAULT_CODE_FONT_SIZE
+        );
+        assert_eq!(DEFAULT_CODE_FONT_SIZE, 12.5, "the mock's mono size");
+    }
+
+    /// A hand-edited settings file cannot produce a pane with no visible text.
+    ///
+    /// Zero is the one that matters: it reaches xterm as a zero-wide cell, which renders as a
+    /// blank pane with no error anywhere — indistinguishable from a spawn that failed, a
+    /// renderer that died, or a session still connecting.
+    #[test]
+    fn a_size_that_would_blank_a_pane_is_refused() {
+        assert_eq!(clamp_font_size(0.0), MIN_CODE_FONT_SIZE);
+        assert_eq!(clamp_font_size(-12.0), MIN_CODE_FONT_SIZE);
+        assert_eq!(clamp_font_size(1_000.0), MAX_CODE_FONT_SIZE);
+    }
+
+    /// `NaN` gets its own arm because `clamp` propagates it.
+    ///
+    /// It compares false against both bounds, so `f32::clamp` returns it unchanged — and `NaN`
+    /// px makes every cell in the pane `NaN` wide. Reachable from a `settings.json` holding
+    /// `null` or a string, which serde will not accept, and from arithmetic upstream, which it
+    /// would.
+    #[test]
+    fn nan_becomes_the_default_rather_than_propagating() {
+        assert_eq!(clamp_font_size(f32::NAN), DEFAULT_CODE_FONT_SIZE);
+        assert_eq!(clamp_font_size(f32::INFINITY), DEFAULT_CODE_FONT_SIZE);
+    }
+
+    /// The fractional default survives a round trip through the wire format.
+    ///
+    /// This is what `u8` could not do: the field held the project's own design spec and
+    /// truncated it. A `12` coming back here would be the old bug, silently restored.
+    #[test]
+    fn a_half_pixel_size_survives_serde() {
+        let mut settings = Settings::default();
+        settings.editor.font_size = 13.5;
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.editor.font_size, 13.5);
+        assert_eq!(back.terminal.font_size, DEFAULT_CODE_FONT_SIZE);
     }
 }

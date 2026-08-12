@@ -231,6 +231,19 @@
    */
   --fs-code: 12.5px;
   --lh-code: 21px;
+  /*
+   * The terminal's own size, and why it is a second token rather than `--fs-code` again.
+   *
+   * Settings offers an editor size and a terminal size separately, so they have to be able to
+   * differ — but the paragraph above is still the reason they *default* equal: a terminal
+   * beside an editor at a half-pixel difference reads as two typefaces, and that shipped once
+   * already. Both start at the mock's 12.5px and diverge only when a user asks.
+   *
+   * `settings/fontScale.ts` overwrites these four on `<html>` from the stored settings, which
+   * is what makes the two controls do anything at all; the values here are the pre-hydration
+   * paint and the fallback when settings cannot be read.
+   */
+  --fs-term: 12.5px;
   --term-line-height: 1.27;
 
   /* Fixed chrome heights from the mock. */

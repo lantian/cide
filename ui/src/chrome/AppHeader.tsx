@@ -15,6 +15,7 @@
  * — go further and drive the store directly, and each says at length why; neither is measured,
  * and neither replaces a prop a host was already passing.
  */
+import { useEffect, useRef } from 'react'
 import { useContextMenu } from '@/menus'
 import { projectMenu } from '@/ipc/client'
 import type { SplitIntent } from '@/ipc/generated'
@@ -108,6 +109,22 @@ export function AppHeader({
    * captured per tab — one hook for the whole strip instead of one per project, which is what
    * keeps the cost independent of how many are open.
    */
+  const tabsRef = useRef<HTMLDivElement>(null)
+
+  // Bring the active project's tab into view when it changes.
+  //
+  // Without this the recents menu is half a feature: picking a project past the edge of the
+  // strip activates it and leaves its tab off-screen, so the header still shows some other
+  // project as the one you are in. `block: 'nearest'` so a tab already visible does not
+  // scroll, and `inline: 'nearest'` so reaching one just past the edge moves by the least it
+  // can rather than centring and shuffling the whole strip.
+  useEffect(() => {
+    const strip = tabsRef.current
+    if (!strip) return
+    const tab = strip.querySelector('[data-active="true"]')
+    tab?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }, [activeProject])
+
   const tabMenu = useContextMenu({
     label: 'Project tab',
     items: ({ target }) => {
@@ -160,7 +177,25 @@ export function AppHeader({
         />
       </div>
 
-      <div className={styles.tabs} onContextMenu={tabMenu.onContextMenu}>
+      <div
+        ref={tabsRef}
+        className={styles.tabs}
+        onContextMenu={tabMenu.onContextMenu}
+        // A vertical wheel over a horizontally-scrolling box does nothing on Linux, so the
+        // strip would scroll only by dragging a scrollbar that is deliberately hidden. Mapped
+        // here rather than in CSS because there is no CSS for it.
+        //
+        // `deltaX` is preferred when the device reports one (a touchpad's horizontal gesture,
+        // or a tilt wheel); an ordinary wheel reports only `deltaY` and that is what is
+        // borrowed. Not `preventDefault`: the header has nothing else to scroll, so letting
+        // the event through costs nothing and swallowing it would break a browser default
+        // nobody asked us to own.
+        onWheel={(e) => {
+          const strip = tabsRef.current
+          if (!strip || strip.scrollWidth <= strip.clientWidth) return
+          strip.scrollLeft += e.deltaX !== 0 ? e.deltaX : e.deltaY
+        }}
+      >
         {projects.map((project) => {
           const active = project.id === activeProject
           return (

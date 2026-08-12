@@ -13,7 +13,7 @@ import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
 import { useContextMenu, type MenuEntry } from '@/menus'
-import { exitMarkerBytes, markFor } from './exitMarker'
+import { exitMarkerBytes, markFor, spawnFailureBytes, spawnFailureText } from './exitMarker'
 import { acknowledge } from './awaiting'
 import {
   clipboard,
@@ -656,7 +656,15 @@ export function TerminalPane({
       // dead child, a different sentence depending only on whether it happened to be mounted.
       const mark = await exitMark(id)
       if (mark && markExited(paneId, mark.code)) exitCb.current?.()
-    })().catch((e) => console.error('[cide] terminal pane failed to start', e))
+    })().catch((e) => {
+      // Into the pane, not only the console. A pane whose spawn failed is blank, and blank is
+      // also what "still connecting" and "the renderer died" look like — so the reason has to
+      // land where the user is already looking. `SessionError::AlreadyOpen` was invisible for
+      // exactly this reason: refused for a good cause, said so precisely, unreadable.
+      console.error('[cide] terminal pane failed to start', e)
+      void diag.log(`pane ${paneId} failed to start: ${spawnFailureText(e)}`).catch(() => {})
+      getHost(paneId).terminal?.term.write(spawnFailureBytes(spawnFailureText(e)))
+    })
 
     const onData = term.onData((data) => {
       const id = getHost(paneId).sessionId

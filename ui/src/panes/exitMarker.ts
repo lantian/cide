@@ -128,3 +128,51 @@ export function markFor(answer: ExitAnswer): { code?: number } | null {
       return {}
   }
 }
+
+/**
+ * The line a pane prints when its child never started.
+ *
+ * A pane whose spawn fails is *blank*. It looks exactly like a pane that is still connecting,
+ * and exactly like one whose terminal failed to paint — three very different problems wearing
+ * one appearance, and the only record was a `console.error` in a webview whose console is not
+ * reachable from a shell on Wayland. That is how `SessionError::AlreadyOpen` shipped invisible:
+ * the domain refused the spawn for a good reason, said so precisely, and nobody could read it.
+ *
+ * Written into the terminal rather than rendered as chrome, for the same reason as
+ * {@link exitMarkerBytes}: it belongs in the transcript, where it survives scrollback, a
+ * re-mount and a detach, and where the user is already looking. A toast would be in the
+ * corner, describing a pane it cannot point at.
+ *
+ * The framing is {@link exitMarkerBytes}' — including the leading SGR 0, which is not
+ * redundant. A pane that fails to spawn has written nothing, so nothing is set; a pane that
+ * *re*-spawns after a child died inside a coloured prompt has a background still active, and
+ * this line would otherwise be drawn on it full width.
+ */
+export function spawnFailureBytes(message: string): string {
+  return `\r\n\x1b[0m\x1b[2m— ${message} —\x1b[0m\r\n`
+}
+
+/**
+ * Turn a rejected `session.spawn` into a sentence for the pane.
+ *
+ * Errors cross the IPC boundary tagged — `{ kind, message }` — and `message` is the half
+ * written for a person, so it is preferred verbatim. `kind` is deliberately not shown: the
+ * user does not need to know it is called `alreadyOpen`, and the message already says a
+ * conversation cannot be resumed twice.
+ *
+ * The fallback matters more than it looks. A rejection that is not our tagged error — a
+ * command that does not exist because the binary is stale, which has happened in this project
+ * — arrives as a bare string or an `Error`, and rendering `[object Object]` into the pane
+ * would replace one unreadable state with another.
+ */
+export function spawnFailureText(reason: unknown): string {
+  if (typeof reason === 'string' && reason.length > 0) return reason
+  if (reason instanceof Error && reason.message.length > 0) return reason.message
+  if (reason !== null && typeof reason === 'object') {
+    const message = (reason as { message?: unknown }).message
+    if (typeof message === 'string' && message.length > 0) return message
+    const kind = (reason as { kind?: unknown }).kind
+    if (typeof kind === 'string' && kind.length > 0) return `session error: ${kind}`
+  }
+  return 'this pane could not start, and gave no reason'
+}

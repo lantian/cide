@@ -244,8 +244,11 @@ function Editor({ settings, patch }: SectionProps) {
             <NumberField
               label="Editor font size"
               value={editor.fontSize}
-              min={8}
-              max={32}
+              // Half steps, because the default *is* a half: the mock's mono size is 12.5px
+              // and an integer-only input snaps it to 12 the first time anyone touches it.
+              step={0.5}
+              min={6}
+              max={40}
               onChange={(fontSize) => set({ fontSize })}
             />
           }
@@ -313,8 +316,9 @@ function Terminal({ settings, patch }: SectionProps) {
             <NumberField
               label="Terminal font size"
               value={terminal.fontSize}
-              min={8}
-              max={32}
+              step={0.5}
+              min={6}
+              max={40}
               onChange={(fontSize) => set({ fontSize })}
             />
           }

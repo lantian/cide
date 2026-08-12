@@ -230,7 +230,10 @@ try {
   // strip, and the strip must not claim the slack (`flex: 1`) that the filler beside it now
   // takes. Both halves matter — moving the control out while leaving `.tabs` greedy would park
   // it against the window's right edge instead.
-  const tabsBlock = /<div className=\{styles\.tabs\}[\s\S]*?\n {6}<\/div>/.exec(header)?.[0] ?? ''
+  // Matched from the `className` rather than from `<div` : the opening tag is multi-line now
+  // (it carries a ref and a wheel handler), and the old one-line pattern silently matched
+  // nothing — which reported as "the header has no tab strip" rather than as a stale regex.
+  const tabsBlock = /className=\{styles\.tabs\}[\s\S]*?\n {6}<\/div>/.exec(header)?.[0] ?? ''
   ok(tabsBlock !== '', 'the header still has a `.tabs` strip to check')
   ok(
     !/<ProjectMenu\b/.test(tabsBlock) && /<ProjectMenu\b/.test(header),
@@ -243,9 +246,21 @@ try {
   // just as `flex: 1` does while reading nothing like it. Shrink is deliberately not pinned —
   // it may shrink, it may not grow.
   const grow = /flex:\s*([\d.]+)/.exec(tabsRule)?.[1]
+  ok(grow === '0', '`.tabs` does not claim the header’s slack — `.filler` does')
+  // The strip **scrolls**, and this assertion replaced one that pinned `overflow: hidden`.
+  //
+  // That earlier fix moved the `+` and the caret out of the clipping box, which made *them*
+  // reachable and left the tabs themselves unreachable: past the width of the strip a project
+  // tab was simply gone, with no scrollbar and no wheel. Pinning `hidden` pinned half a fix.
+  // Both halves are checked now — the control is outside the strip, and the strip can be
+  // scrolled to the tab that is outside the view.
   ok(
-    /overflow:\s*hidden/.test(tabsRule) && grow === '0',
-    '`.tabs` still clips, and no longer claims the header’s slack — `.filler` does',
+    /overflow-x:\s*auto/.test(tabsRule) && /overflow-y:\s*hidden/.test(tabsRule),
+    '`.tabs` scrolls horizontally and never vertically — a 34px header cannot hold a y scrollbar',
+  )
+  ok(
+    /onWheel=/.test(header) && /scrollIntoView/.test(header),
+    'and it is reachable: a wheel scrolls it, and the active tab scrolls itself into view',
   )
 
   // --- the pane bar asks WHICH pane, and asks it in the header's words ----------------------

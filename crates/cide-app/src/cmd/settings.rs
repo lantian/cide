@@ -113,10 +113,17 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     if let Some(v) = confirm_close_with_live_session {
         settings.confirm_close_with_live_session = v;
     }
-    if let Some(v) = editor {
+    // Clamped where the patch lands, for the same reason `sidebar` is: `settings.json` is a
+    // file a user can edit, and a zero font size reaches xterm as a zero-wide cell — a blank
+    // pane with no error, indistinguishable from every other way a pane comes up blank. The
+    // frontend's number input clamps too, and has to, but a clamp that lives only there is one
+    // `invoke` away from being bypassed.
+    if let Some(mut v) = editor {
+        v.font_size = cide_ipc::clamp_font_size(v.font_size);
         settings.editor = v;
     }
-    if let Some(v) = terminal {
+    if let Some(mut v) = terminal {
+        v.font_size = cide_ipc::clamp_font_size(v.font_size);
         settings.terminal = v;
     }
     if let Some(v) = graphics {
@@ -770,7 +777,7 @@ mod tests {
     #[test]
     fn a_patch_touches_only_the_fields_it_names() {
         let mut settings = Settings::default();
-        settings.terminal.font_size = 17;
+        settings.terminal.font_size = 17.0;
 
         // Dark, because Light is now `Theme::default()`: patching a field to the value it
         // already holds asserts nothing, and this half of the test would pass against an
@@ -790,7 +797,10 @@ mod tests {
         );
 
         assert_eq!(settings.theme, Theme::Dark);
-        assert_eq!(settings.terminal.font_size, 17, "an untouched group moved");
+        assert_eq!(
+            settings.terminal.font_size, 17.0,
+            "an untouched group moved"
+        );
         assert!(settings.reopen_last_project, "an untouched toggle moved");
     }
 
@@ -814,7 +824,7 @@ mod tests {
     #[test]
     fn a_sidebar_patch_is_clamped_and_does_not_disturb_the_other_panel() {
         let mut settings = Settings::default();
-        settings.terminal.font_size = 17;
+        settings.terminal.font_size = 17.0;
 
         // What a drag past the right-hand limit sends. The frontend would have clamped it
         // against the viewport already; this asserts the store does not depend on that.
@@ -833,7 +843,10 @@ mod tests {
             settings.sidebar.git_width, 500,
             "the git width was rewritten"
         );
-        assert_eq!(settings.terminal.font_size, 17, "an untouched group moved");
+        assert_eq!(
+            settings.terminal.font_size, 17.0,
+            "an untouched group moved"
+        );
 
         // And a patch that names nothing leaves the widths where the drag left them —
         // the case where flipping an unrelated toggle would reset the panel.

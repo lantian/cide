@@ -413,9 +413,26 @@ try {
       `\`${token}\` is read by a stylesheet rather than restated as a literal beside it`,
     )
   }
+  // The terminal's two, matched on the *call* rather than on the token name appearing
+  // anywhere in the file. The old assertion was `xtermText.includes('--fs-code')`, which a
+  // comment satisfies — and did: this file kept passing after the terminal was moved onto
+  // `--fs-term`, because the paragraph explaining the move still named the old token.
+  for (const token of ['--fs-term', '--term-line-height']) {
+    ok(
+      new RegExp(`metric\\(style, '${token}'`).test(xtermText),
+      `the terminal reads \`${token}\` rather than a number of its own`,
+    )
+  }
+
+  // And that a size change reaches a terminal that already exists. The editor follows the
+  // cascade; a terminal holds resolved numbers, so without this call the two Settings
+  // controls move the editor and leave every open pane where it was — which is most of what
+  // "the setting does nothing" looked like.
+  ok(/export function refont\(/.test(xtermText), '`refont` exists to repaint live terminals')
+  const appliesFonts = readFileSync('src/settings/useSettings.ts', 'utf8')
   ok(
-    xtermText.includes('--fs-code') && xtermText.includes('--term-line-height'),
-    'the terminal derives its cell from the same scale rather than its own numbers',
+    /refont\(/.test(appliesFonts),
+    '`refont` is called when the settings change — otherwise only new panes pick the size up',
   )
 
   if (failed > 0) {

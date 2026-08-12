@@ -24,6 +24,7 @@
  */
 import { useCallback } from 'react'
 import {
+  session as sessionApi,
   settings as settingsApi,
   type Settings,
   type SettingsPatch,
@@ -31,7 +32,8 @@ import {
 } from '@/ipc/client'
 import { useWorkspace, type Theme } from '@/store/workspace'
 import { liveHosts } from '@/layout/paneHosts'
-import { retheme } from '@/terminal/xterm'
+import { fontVariables } from './fontScale'
+import { refont, retheme } from '@/terminal/xterm'
 import { asThemeName, DEFAULT_THEME, otherTheme, themeToAdopt } from './theme'
 
 /** The settings this window currently mirrors, or `null` before bootstrap resolves. */
@@ -132,6 +134,54 @@ function paintTheme(theme: Theme): void {
   retheme([...liveHosts()].flatMap((h) => (h.terminal ? [h.terminal] : [])))
 }
 
+
+/**
+ * Write the font tokens the two Settings controls decide, and repaint what is already open.
+ *
+ * The mirror of [`paintTheme`], and it exists for the same reason: a token change reaches the
+ * editor through the cascade and reaches a live terminal through nothing. What made these two
+ * controls appear dead was not an unwired `onChange` — the values were stored correctly — but
+ * that nothing turned them into `--fs-code`/`--lh-code`/`--fs-term`/`--term-line-height`, two
+ * of which cannot be derived in CSS at all. See `fontScale.ts`.
+ *
+ * Guarded on the resolved values rather than on the settings object, so the store changes that
+ * are not font changes — which is nearly all of them — cost four string compares and no work.
+ */
+function paintFonts(editorSize: number, terminalSize: number): void {
+  const root = document.documentElement
+  const vars = fontVariables(editorSize, terminalSize, window.devicePixelRatio || 1)
+  let moved = false
+  for (const [name, value] of Object.entries(vars)) {
+    if (root.style.getPropertyValue(name) === value) continue
+    root.style.setProperty(name, value)
+    moved = true
+  }
+  if (!moved) return
+  // After the properties, never before, and for `retheme`'s reason: `refont` reads the tokens
+  // back off `<html>` with `getComputedStyle`, so it has to observe the ones just written.
+  refont(
+    [...liveHosts()].flatMap((h) => (h.terminal ? [h.terminal] : [])),
+    (handle) => {
+      // The child has to be told, or it keeps writing at the old width and every wrapped line
+      // is wrong. Found by pane, because `refont` deliberately knows nothing about sessions.
+      for (const host of liveHosts()) {
+        if (host.terminal === handle && host.sessionId) {
+          const cell = handle.cellSize()
+          host.lastGeometry = undefined
+          void sessionApi
+            .resize(host.sessionId, {
+              cols: handle.term.cols,
+              rows: handle.term.rows,
+              cellWidth: cell.width,
+              cellHeight: cell.height,
+            })
+            .catch(() => {})
+        }
+      }
+    },
+  )
+}
+
 /**
  * Follow the theme in the workspace mirror, and repaint this window whenever it moves.
  *
@@ -179,6 +229,8 @@ export function installThemeSync(): () => void {
   const start = asThemeName(document.documentElement.dataset.theme) ?? DEFAULT_THEME
   useWorkspace.getState().setTheme(start)
   paintTheme(start)
+  const bootSettings = useWorkspace.getState().boot?.workspace.settings
+  if (bootSettings) paintFonts(bootSettings.editor.fontSize, bootSettings.terminal.fontSize)
 
   const unsubscribe = useWorkspace.subscribe((state, previous) => {
     const adopt = themeToAdopt(
@@ -193,6 +245,8 @@ export function installThemeSync(): () => void {
       return
     }
     paintTheme(state.theme)
+    const settings = state.boot?.workspace.settings
+    if (settings) paintFonts(settings.editor.fontSize, settings.terminal.fontSize)
   })
 
   themeSyncInstalled = () => {

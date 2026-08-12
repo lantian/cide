@@ -117,12 +117,14 @@ export interface NumberFieldProps {
   value: number
   min: number
   max: number
+  /** Spinner increment. Omitted, the browser uses 1, which cannot express a half-pixel size. */
+  step?: number | undefined
   onChange: (next: number) => void
   label: string
 }
 
 /**
- * A bounded integer.
+ * A bounded number.
  *
  * Clamped, because these values reach a terminal's font metrics and a scrollback allocation
  * and a pasted `999999` scrollback is a live session's memory — but clamped **on commit, not
@@ -135,13 +137,16 @@ export interface NumberFieldProps {
  * An unparseable commit is ignored rather than treated as zero: clearing the field to type a
  * new number must not set a scrollback of 0 on the way past.
  */
-export function NumberField({ value, min, max, onChange, label }: NumberFieldProps) {
+export function NumberField({ value, min, max, step, onChange, label }: NumberFieldProps) {
   /** The text being typed, or `null` when the field is showing the stored value. */
   const [draft, setDraft] = useState<string | null>(null)
 
   const commit = (text: string) => {
     setDraft(null)
-    const next = Number.parseInt(text, 10)
+    // `parseFloat`, not `parseInt`. The font sizes default to the mock's 12.5px, and
+    // `parseInt` truncated every commit to an integer — so the field showed 12.5, and the
+    // moment it was touched it stored 12 and could never get back.
+    const next = Number.parseFloat(text)
     if (Number.isNaN(next)) return
     const clamped = Math.min(max, Math.max(min, next))
     // Guarded so that tabbing through an untouched field is not a workspace write and a
@@ -153,10 +158,13 @@ export function NumberField({ value, min, max, onChange, label }: NumberFieldPro
     <input
       className={styles.number}
       type="number"
-      inputMode="numeric"
+      // `decimal`, not `numeric`: a phone keypad without a decimal point cannot type 12.5.
+      inputMode="decimal"
       aria-label={label}
       min={min}
       max={max}
+      // Absent, the browser's default step is 1 and the spinner arrows snap a 12.5 to 13.
+      {...(step === undefined ? {} : { step })}
       value={draft ?? String(value)}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={(e) => commit(e.target.value)}
