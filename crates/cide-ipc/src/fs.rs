@@ -118,3 +118,50 @@ pub struct FsChange {
     /// git panel refresh on this; nothing else needs to.
     pub git: bool,
 }
+
+// --- Copy / cut / paste of the files themselves -----------------------------------------
+
+/// Which gesture put the paths on the tree's clipboard.
+///
+/// Two variants and not three: there is no "duplicate". A duplicate is a [`PasteMode::Copy`]
+/// whose destination happens to be the source's own parent, and the collision rule already
+/// answers it with `main copy.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PasteMode {
+    /// The source stays where it is.
+    Copy,
+    /// The source is removed **on paste**, never before — a cut that is never pasted must
+    /// cost nothing, which is the whole reason the mode travels with the paste rather than
+    /// being acted on when the user pressed Ctrl+X.
+    Cut,
+}
+
+/// What one pasted path became.
+///
+/// One of these per *source*, not per file on disk: pasting a directory of 4000 files is one
+/// entry describing the directory. The counts inside it are what the panel says afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PastedEntry {
+    #[ts(type = "string")]
+    pub source: PathBuf,
+    /// Where it landed. Never a path that was overwritten — see `renamed`.
+    #[ts(type = "string")]
+    pub dest: PathBuf,
+    /// The destination took a *different* name because the one it wanted was taken.
+    ///
+    /// Reported rather than left for the user to notice, because the other reading of a paste
+    /// that quietly produced `main copy.rs` is that it did nothing: the row the user was
+    /// looking at is still there, still holding the older file.
+    pub renamed: bool,
+    /// Entries inside a copied directory that are neither a file, a directory nor a symlink —
+    /// fifos, sockets, devices — and were left behind.
+    ///
+    /// Copying them is either meaningless (a socket) or a hang (reading a fifo waits for a
+    /// writer that never comes), and refusing a whole paste over one stray `.sock` in a project
+    /// would be the worse answer. Counted so the panel can say so.
+    pub skipped: u32,
+}

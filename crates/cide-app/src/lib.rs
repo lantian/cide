@@ -331,6 +331,7 @@ pub fn run() {
             cmd::fs::fs_create_in,
             cmd::fs::fs_rename,
             cmd::fs::fs_delete,
+            cmd::fs::fs_paste,
             cmd::picker::picker_query,
             cmd::picker::picker_rank,
             cmd::search::search_query,

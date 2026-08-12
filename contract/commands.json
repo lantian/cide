@@ -27,6 +27,7 @@
   "fs_delete",
   "fs_expand",
   "fs_index",
+  "fs_paste",
   "fs_read_file",
   "fs_rename",
   "fs_reveal",

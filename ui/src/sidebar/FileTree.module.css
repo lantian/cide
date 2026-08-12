@@ -369,3 +369,40 @@
   overflow-wrap: anywhere;
   cursor: pointer;
 }
+
+/*
+ * Something true and non-alarming: what a paste actually did.
+ *
+ * Same geometry as `.problem`, deliberately a different colour. A paste that renamed a file to
+ * `main copy.rs` is a *success* the user has to be told about, and reusing the red strip would
+ * teach them that pasting is an error — the same distinction `.draftNote` and `.draftError`
+ * already draw one strip above. `--dim` is defined in both palettes and is the same token the
+ * draft note uses, so the two informational strips read as one voice.
+ */
+.info {
+  flex: none;
+  padding: 5px 8px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: 10.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+/*
+ * A row that has been cut and is waiting to be pasted.
+ *
+ * Faded, which is what every file manager does and the only signal that survives this row's
+ * three other states — a cut row can be selected, hovered and git-tagged at the same time, so
+ * anything that paints a background would have to fight `.rowSelected` and lose in one theme
+ * or the other. Opacity composes with all of them and needs no second palette.
+ *
+ * Not `text-decoration: line-through`: the file is not gone and may never go — an unpasted cut
+ * costs nothing — and a struck-through name already means `deleted` in this tree (see
+ * `.statusDeleted`).
+ */
+.rowCut {
+  opacity: 0.5;
+}

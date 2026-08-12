@@ -13,6 +13,7 @@
     "check:exit": "node scripts/check-exit-marker.mjs",
     "check:fonts": "node scripts/check-fonts.mjs",
     "check:format": "node scripts/check-status-format.mjs",
+    "check:fs-clipboard": "node scripts/check-fs-clipboard.mjs",
     "check:git": "node scripts/check-git-tree.mjs",
     "check:icons": "node scripts/check-icons.mjs",
     "check:input": "node scripts/check-input-emitters.mjs",

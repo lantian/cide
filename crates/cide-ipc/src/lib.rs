@@ -37,7 +37,9 @@ pub use workspace::{
 pub mod fs;
 pub mod search;
 
-pub use fs::{FsChange, FsStatus, TreeRow, TreeRowKind, WatchBackend, WatchStatus};
+pub use fs::{
+    FsChange, FsStatus, PasteMode, PastedEntry, TreeRow, TreeRowKind, WatchBackend, WatchStatus,
+};
 pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section
 // comment in `search.rs` for why they are not the picker's.

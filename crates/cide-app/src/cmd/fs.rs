@@ -461,6 +461,73 @@ pub async fn fs_delete(
     .await?
 }
 
+/// Copy or move paths into a folder — the file tree's Ctrl+C / Ctrl+X / Ctrl+V.
+///
+/// The rules are all in [`cide_fs::copy`], because they are decisions about the disk rather
+/// than about Tauri: a collision is renamed and never overwritten, a cut moves nothing until
+/// it is pasted, a directory is copied recursively and refused into itself, and a symlink is
+/// copied as a link. Read that module before changing anything here.
+///
+/// What is this layer's own is the same two things every handler in this file owns: the paths
+/// are checked against the project's roots before anything touches the disk (twice over —
+/// `copy::paste` checks them again, because it is also called from tests with roots of their
+/// own), and the result is folded into the index so the tree shows the new rows **now**
+/// instead of a few hundred milliseconds later when the watcher's debounce expires. A paste
+/// that appears to do nothing for half a second is a paste the user presses again.
+///
+/// The fold names the *sources* as well as the destinations. `Index::apply` rescans the parent
+/// directory of every path it is given, so naming a cut's source is what makes the row it left
+/// behind disappear in the same repaint that draws the row it arrived at — otherwise a move
+/// shows the file in two places until the watcher catches up.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_paste(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    sources: Vec<PathBuf>,
+    dest_dir: PathBuf,
+    mode: cide_ipc::PasteMode,
+) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_paste", move || {
+        paste_into(&fs, &sources, &dest_dir, mode)
+    })
+    .await?
+}
+
+/// [`fs_paste`] with its Tauri-injected argument already resolved to a value.
+///
+/// A named function for the same reason [`create_entry`] is one: the property worth testing is
+/// that the pasted rows are in the tree the instant the command returns, and a body inline in
+/// the `#[tauri::command]` item cannot be called from a test.
+pub(crate) fn paste_into(
+    fs: &crate::files::ProjectFs,
+    sources: &[PathBuf],
+    dest_dir: &std::path::Path,
+    mode: cide_ipc::PasteMode,
+) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
+    let roots = fs.root_paths();
+    let pasted = cide_fs::copy::paste(&roots, sources, dest_dir, mode)?;
+
+    // Sources first so a rename that lands on the *same* directory reads as one rescan, and
+    // because a cut's old row has to go in the same write that adds the new one.
+    let mut touched: Vec<PathBuf> = sources.to_vec();
+    touched.extend(pasted.iter().map(|entry| entry.dest.clone()));
+    let change = cide_ipc::FsChange {
+        paths: touched,
+        truncated: false,
+        git: false,
+    };
+    let filter = fs.filter();
+    let added = fs.with_index_mut(|index| index.apply(&change, &filter));
+    for item in added.iter().filter(|i| !i.is_dir) {
+        fs.matcher().push(cide_search::Candidate::new(
+            item.rel.clone(),
+            item.path.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(pasted)
+}
+
 /// Stop watching everything, and stop every search.
 ///
 /// **No caller today.** It reads like the quit path and is not: `lifecycle::shutdown` is,
@@ -1171,6 +1238,111 @@ mod tests {
             "the watcher's event added the path a second time, so the picker holds it twice"
         );
         assert_eq!(fs.with_index(|index| index.count()), before + 1);
+
+        drop(registry.remove(project));
+    }
+
+    /// A paste moves the rows in the same repaint, in **both** directions.
+    ///
+    /// The claim `cide-fs` cannot make: `copy::paste` writes bytes and knows nothing about an
+    /// index, and this wiring is what puts the result on screen without waiting out the
+    /// watcher's debounce. A cut is the case that needs both halves — the row it *left* has to
+    /// go at the same moment the row it *arrived at* appears, or the file is visibly in two
+    /// places for a few hundred milliseconds and the tree looks like it duplicated it.
+    ///
+    /// That is why `paste_into` names the sources as well as the destinations in the change it
+    /// folds: `Index::apply` rescans the parent of every path it is given, and naming only the
+    /// destinations leaves the source's directory unread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pasted_path_is_a_row_and_a_cut_source_stops_being_one_immediately() {
+        let dir = scratch("cmd-paste-now");
+        std::fs::create_dir(dir.path().join("src")).expect("a source directory");
+        std::fs::create_dir(dir.path().join("dest")).expect("a destination directory");
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").expect("a file to move");
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+        // Both folders expanded, exactly as a user pasting between two visible directories
+        // would have them: a row inside a collapsed folder is in the index and contributes no
+        // visible row, so the counts below would be about twisties rather than about rows.
+        fs.with_index_mut(|index| index.expand(&dir.path().join("src")));
+        fs.with_index_mut(|index| index.expand(&dir.path().join("dest")));
+        let before = fs.with_index(|index| index.count());
+
+        let pasted = paste_into(
+            &fs,
+            &[dir.path().join("src/main.rs")],
+            &dir.path().join("dest"),
+            cide_ipc::PasteMode::Cut,
+        )
+        .expect("moving a file between two folders of the same project");
+        assert_eq!(pasted[0].dest, dir.path().join("dest/main.rs"));
+
+        let rows = fs.with_index(|index| index.rows(0, 64));
+        assert!(
+            rows.iter().any(|r| r.path == pasted[0].dest),
+            "the moved file has no row until the watcher fires: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.path == dir.path().join("src/main.rs")),
+            "the row it moved OUT of is still drawn, so the tree shows the file twice: {rows:?}"
+        );
+        assert_eq!(
+            fs.with_index(|index| index.count()),
+            before,
+            "a move added a row without removing one"
+        );
+
+        // The watcher's own event for the same move, replayed. It must reconcile to nothing.
+        let filter = fs.filter();
+        let change = FsChange {
+            paths: vec![dir.path().join("src/main.rs"), pasted[0].dest.clone()],
+            truncated: false,
+            git: false,
+        };
+        let added = fs.with_index_mut(|index| index.apply(&change, &filter));
+        assert!(added.is_empty(), "the watcher's event added the path again");
+        assert_eq!(fs.with_index(|index| index.count()), before);
+
+        drop(registry.remove(project));
+    }
+
+    /// The containment check, driven through the command layer rather than through `copy`.
+    ///
+    /// `cide-fs` has its own tests for every rule; what is pinned here is that this handler
+    /// resolves the *project's* roots and hands them over — the version that forgets to is the
+    /// one that copies `/etc/shadow` into the user's repository because a webview asked it to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pasting_from_outside_the_project_is_refused_by_the_handler() {
+        let dir = scratch("cmd-paste-outside");
+        let outside = scratch("cmd-paste-elsewhere");
+        std::fs::write(outside.path().join("secret"), "s").expect("a file outside the project");
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+
+        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+
+        assert!(matches!(
+            paste_into(
+                &fs,
+                &[outside.path().join("secret")],
+                dir.path(),
+                cide_ipc::PasteMode::Copy
+            ),
+            Err(FsError::OutsideProject(_))
+        ));
+        assert!(!dir.path().join("secret").exists());
 
         drop(registry.remove(project));
     }
