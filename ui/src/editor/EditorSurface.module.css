@@ -71,13 +71,12 @@
   color: var(--dim);
 }
 
-.readout {
-  flex: none;
-  color: var(--faint);
-  /* `tabular-nums` keeps `Ln 9` and `Ln 128` from shifting the whole readout as the caret
-     crosses a power of ten. */
-  font-variant-numeric: tabular-nums;
-}
+/*
+ * `.readout` was here — `Markdown · UTF-8 · LF · Ln 7, Col 48`, at the right-hand end of
+ * this row. It is a status bar line and now lives in `chrome/StatusBar.module.css`; this row
+ * is the path and only the path. The 12px `gap` above stays: it is between-children spacing,
+ * and one child costs nothing.
+ */
 
 /* --- the buffer ------------------------------------------------------------------------ */
 

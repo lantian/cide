@@ -888,10 +888,13 @@ export function App() {
           />
         )}
 
-        <StatusBar
-          claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
-          cursor={`rev ${boot?.workspace.rev ?? 0}`}
-        />
+        {/*
+          * The cursor slot used to carry `rev 0` — the workspace revision, a boot-time
+          * debugging aid in the one place on screen reserved for the caret. The editor now
+          * fills that end of the bar with the file readout it owns, and the bar subscribes
+          * to it directly (see `chrome/StatusBar.tsx`), so nothing is passed for it here.
+          */}
+        <StatusBar claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined} />
 
         {/*
           * Says so when the IPC transport has silently degraded. WebKitGTK's custom-protocol

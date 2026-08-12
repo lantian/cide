@@ -82,3 +82,27 @@
 .claude {
   color: var(--accent);
 }
+
+/*
+ * The open file's `Markdown · UTF-8 · LF · Ln 7, Col 48`, filled in from
+ * `editor/statusReadout.ts`.
+ *
+ * `:empty` rather than a React branch, because React never sees the text: the node is
+ * written to directly from a CodeMirror update listener, so a bar rendering with no editor
+ * open would leave this box and the 16px gap beside it standing over nothing. `display:
+ * none` takes the flex item out and the gap with it.
+ */
+.readout {
+  flex: none;
+  /* No colour of its own: it inherits the bar's `--dim`, which is what the cursor and
+     encoding slots it replaces were painted in. `--faint` is the breadcrumb row's tone and
+     was right there, above a file; here it would be the one line on the bar a user actually
+     reads, printed fainter than the branch name they do not. */
+  /* `tabular-nums` keeps `Ln 9` and `Ln 128` from shifting the readout — and everything
+     right of it — as the caret crosses a power of ten. */
+  font-variant-numeric: tabular-nums;
+}
+
+.readout:empty {
+  display: none;
+}

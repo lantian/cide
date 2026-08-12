@@ -9,9 +9,10 @@
  * Two things here are not the obvious implementation, and both are about not paying React
  * for something CodeMirror already does:
  *
- * * The cursor readout is written straight into the DOM from the update listener. Holding
- *   `Ln 128, Col 24` in React state re-renders this component on every caret move, which on
- *   a held arrow key is 30 renders a second, each one re-running the effect guards below.
+ * * The cursor readout is pushed straight out of the update listener, through
+ *   `statusReadout.ts`, into a DOM node the status bar owns. Holding `Ln 128, Col 24` in
+ *   React state re-renders on every caret move, which on a held arrow key is 30 renders a
+ *   second, each one re-running the effect guards below.
  * * The `EditorView` is created once per document and reconfigured afterwards. Rebuilding
  *   it on a prop change would drop the undo history, the scroll position and the selection
  *   — and, if the buffer were dirty, the user's edits.
@@ -50,6 +51,7 @@ import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import { exceedsBytes } from './byteSize'
 import { registerReveal, revealRange } from './revealRequest'
+import { claimStatusReadout, formatReadout, type ReadoutSlot } from './statusReadout'
 import { useSendToClaude } from './useSendToClaude'
 import styles from './EditorSurface.module.css'
 
@@ -161,7 +163,6 @@ export function EditorSurface({
   onSaveHandle,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
-  const readoutRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
 
   // Callbacks in refs so a parent that rebuilds its handlers every render cannot reach the
@@ -226,6 +227,16 @@ export function EditorSurface({
 
     const languageSlot = new Compartment()
     let baseline: EditorState['doc'] | null = null
+    /*
+     * The status bar's line, claimed once the view exists further down — the update
+     * listener is built before the editor it listens to, so this is a `let` rather than a
+     * parameter. Every use is optional-chained: nothing dispatches into a view during
+     * construction, and a listener that fired before the claim would be reporting a position
+     * in a buffer the user cannot see yet.
+     */
+    let readout: ReadoutSlot | null = null
+    const readoutFor = (state: EditorState): string =>
+      formatReadout({ language, ending: endings.ending, cursor: cursorLabel(state) })
 
     /**
      * Write the buffer and resolve once it has landed — or reject.
@@ -326,10 +337,12 @@ export function EditorSurface({
       ]),
       EditorView.updateListener.of((update) => {
         if (update.selectionSet || update.docChanged) {
-          const el = readoutRef.current
-          if (el !== null) {
-            el.textContent = `${language} · UTF-8 · ${endings.ending} · ${cursorLabel(update.state)}`
-          }
+          // Typing is a claim on the slot, not only clicking into the pane: an editor that
+          // mounts in a fresh split takes the readout when it appears, and without this the
+          // bar would keep reporting that new pane's `Ln 1, Col 1` while the user carries on
+          // typing over here. `focus` costs one array read when the slot is already held.
+          if (update.view.hasFocus) readout?.focus()
+          readout?.set(readoutFor(update.state))
           // Read from `update.state`, not from a captured view: this listener outlives
           // several states and the one that changed is the one to report.
           const { from, to } = update.state.selection.main
@@ -345,7 +358,12 @@ export function EditorSurface({
           // a walk of a five-megabyte rope.
           setDirty(!update.state.doc.eq(baseline))
         }
-        if (update.focusChanged && update.view.hasFocus) focusCb.current?.()
+        if (update.focusChanged && update.view.hasFocus) {
+          // Before the callback, so the bar follows a click into a pane even when the click
+          // lands on the caret's own position and no selection change follows it.
+          readout?.focus()
+          focusCb.current?.()
+        }
       }),
     ]
 
@@ -378,10 +396,10 @@ export function EditorSurface({
     // that is no longer on screen.
     saveHandleCb.current?.(() => saveNow(view))
 
-    const el = readoutRef.current
-    if (el !== null) {
-      el.textContent = `${language} · UTF-8 · ${endings.ending} · ${cursorLabel(view.state)}`
-    }
+    // Claimed after the view is built and released in the cleanup below, so the bar's line
+    // and the buffer on screen have exactly the same lifetime. A view that failed to
+    // construct returned above and never claims one.
+    readout = claimStatusReadout(readoutFor(view.state))
 
     /*
      * "Open this file at this line", from a click in the search results.
@@ -425,6 +443,9 @@ export function EditorSurface({
     return () => {
       viewRef.current = null
       saveHandleCb.current?.(null)
+      // Hands the bar back to whichever editor is under this one, and blanks it when there
+      // is none. A slot left behind would keep a closed file's position on screen.
+      readout?.release()
       // Before `destroy`, so a request racing the unmount cannot dispatch into a dead view.
       stopReveal()
       view.destroy()
@@ -436,6 +457,13 @@ export function EditorSurface({
 
   return (
     <div className={styles.pane}>
+      {/*
+        * The trail, and nothing else. `Markdown · UTF-8 · LF · Ln 7, Col 48` used to sit at
+        * the right-hand end of this row and now goes to the status bar — see
+        * `statusReadout.ts`. The path gets the whole 28px row back, which is what it wanted:
+        * a pane split three ways had been showing `crates › cide-…` beside a readout that
+        * says the same thing under every file.
+        */}
       <div className={styles.breadcrumbs} data-audit="editorBreadcrumbs">
         <div className={styles.trail}>
           {segments.map((segment, i) => (
@@ -446,9 +474,6 @@ export function EditorSurface({
               {segment}
             </span>
           ))}
-        </div>
-        <div className={styles.readout} ref={readoutRef} data-audit="editorReadout">
-          {`${language} · UTF-8 · ${endings.ending} · Ln 1, Col 1`}
         </div>
       </div>
 

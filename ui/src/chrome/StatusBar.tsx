@@ -8,7 +8,16 @@
  *
  * Every field is a prop with a placeholder default. The bar reads nothing from the store,
  * so it stays a pure render target that a screenshot test can drive directly.
+ *
+ * The editor readout is the one thing that does not arrive as a prop, and it is deliberately
+ * not a store subscription either: `editor/statusReadout.ts` pushes
+ * `Markdown · UTF-8 · LF · Ln 7, Col 48` straight into the span below, because a caret
+ * readout in React state would re-render this bar — and, through `App`, the pane grid under
+ * it — thirty times a second under a held arrow key. Nothing else here re-renders for it,
+ * and the bar still renders correctly from props alone with no editor open.
  */
+import { useEffect, useRef } from 'react'
+import { subscribeStatusReadout } from '@/editor/statusReadout'
 import { NO_DIAGNOSTICS_SOURCE } from '@/sidebar/ProblemsPanel/model'
 import styles from './StatusBar.module.css'
 
@@ -24,8 +33,6 @@ export interface StatusBarProps {
   /** `null` means no diagnostics source is running, which is distinct from zero of each. */
   diagnostics?: Diagnostics | null | undefined
   claude?: string | undefined
-  cursor?: string | undefined
-  encoding?: string | undefined
 }
 
 /*
@@ -52,9 +59,22 @@ export function StatusBar({
   removed = 0,
   diagnostics = null,
   claude = CLAUDE_PLACEHOLDER,
-  cursor = 'Ln 1, Col 1',
-  encoding = 'UTF-8',
 }: StatusBarProps) {
+  const readoutRef = useRef<HTMLSpanElement | null>(null)
+
+  // Returns the unsubscriber directly, and runs once: the subscription fires immediately
+  // with whatever the current editor is showing, so a bar that mounts after an editor —
+  // StrictMode's second pass, a hot reload — is filled in rather than blank until the next
+  // keystroke.
+  useEffect(
+    () =>
+      subscribeStatusReadout((text) => {
+        const el = readoutRef.current
+        if (el !== null) el.textContent = text
+      }),
+    [],
+  )
+
   return (
     <div className={styles.bar} data-audit="statusBar">
       <div className={styles.left}>
@@ -90,6 +110,18 @@ export function StatusBar({
       </div>
 
       <div className={styles.right}>
+        {/*
+         * The open file: `Markdown · UTF-8 · LF · Ln 7, Col 48`, and empty when no editor is
+         * open at all — clicking into a terminal leaves the last buffer's position standing,
+         * which is what it means. Written from `editor/statusReadout.ts` and therefore
+         * childless in JSX: giving React a child here would let the next render — a branch
+         * change, a token tick — overwrite the live text.
+         *
+         * First in the group, so the four facts that change as the user moves sit inboard of
+         * the Claude readout rather than pushing it around: the session slot is the widest
+         * thing on the bar and the one whose position should not move.
+         */}
+        <span className={styles.readout} ref={readoutRef} data-audit="editorReadout" />
         <span
           className={styles.claude}
           title={claude === CLAUDE_PLACEHOLDER ? CLAUDE_PENDING : 'Claude session'}
@@ -97,8 +129,6 @@ export function StatusBar({
           ◆ {claude}
         </span>
         {/* The mock's `rust-analyzer` slot sits here and stays out until one is running. */}
-        <span title="Cursor position">{cursor}</span>
-        <span title="File encoding">{encoding}</span>
       </div>
     </div>
   )

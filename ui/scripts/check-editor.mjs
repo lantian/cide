@@ -9,7 +9,7 @@
  *
  * Same shape as `check-status-format.mjs` and `check-picker.mjs`: no JS test runner in this
  * project, so the TypeScript already in `node_modules` compiles the modules and this file
- * imports the output. Eight things are pinned, in the order they appear below.
+ * imports the output. Ten things are pinned, in the order they appear below.
  *
  *  1. **Line endings.** A round trip — capture, hand the text to CodeMirror, restore — is
  *     byte-identical for LF, CRLF, bare CR *and* mixed. This is the regression that already
@@ -39,6 +39,12 @@
  *     while it is open still arrives, that neither the queue nor the registry leaks — and
  *     that a target pointing past the end of a file that has changed since the search
  *     clamps instead of throwing out of `dispatch` and taking the window down.
+ *  9. **Send lines to Claude.** The line arithmetic, the singular/plural label, the `#L10-20`
+ *     mention spelling — and that the menu item and the ⌥⏎ binding both actually call it.
+ * 10. **The status bar's file readout.** `Markdown · UTF-8 · LF · Ln 7, Col 48` is composed
+ *     in `editor/` and painted in `chrome/`, over one slot that any number of split editors
+ *     claim: that the newest holds it, that focus takes it back, that closing hands it down
+ *     rather than blanking the bar, and that a released handle can no longer write to it.
  *
  * The fifth found two more quadratics on its first run — the markdown link matcher and the
  * shell `${…}` matcher, both the same unbounded-scan-then-backtrack shape as the YAML key
@@ -110,6 +116,7 @@ try {
       'src/editor/minimapGeometry.ts',
       'src/editor/streamGrammar.ts',
       'src/editor/sendToClaude.ts',
+      'src/editor/statusReadout.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -150,6 +157,7 @@ try {
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
   const send = load('sendToClaude.js')
+  const readout = load('statusReadout.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
   const { tags } = require('@lezer/highlight')
@@ -1691,6 +1699,123 @@ try {
       /key: 'Alt-Enter'/.test(surfaceSrc),
       'EditorSurface binds ⌥⏎ — without it the gesture is mouse-only, which is a gesture most ' +
         'people never find',
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 10. The status bar's file readout
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * `Markdown · UTF-8 · LF · Ln 7, Col 48` moved out of the editor's breadcrumb row and into
+   * the status bar, which put a single slot behind an unbounded number of editors. Everything
+   * that can go wrong with that is invisible on screen until it is annoying: a split whose
+   * second pane reports the position of the pane you are not typing in, a closed tab that
+   * leaves its caret on the bar forever, a listener the bar never drops.
+   *
+   * The claim stack is exercised directly. The wiring is a source assertion, the same gate
+   * `requestReveal` and `useSendToClaude` get above: a channel with no publisher and a span
+   * with no subscriber both pass every test a module can write about itself.
+   */
+  {
+    eq(
+      readout.formatReadout({ language: 'Markdown', ending: 'LF', cursor: 'Ln 7, Col 48' }),
+      'Markdown · UTF-8 · LF · Ln 7, Col 48',
+      'the readout is the line the user reported, separators and all',
+    )
+
+    eq(readout.statusReadout(), '', 'no editor open means an empty slot, which the bar hides')
+
+    const seen = []
+    const stop = readout.subscribeStatusReadout((text) => seen.push(text))
+    eq(seen, [''], 'a subscriber is told the current line immediately, not on the next change')
+
+    const first = readout.claimStatusReadout('Rust · UTF-8 · LF · Ln 1, Col 1')
+    eq(readout.statusReadout(), 'Rust · UTF-8 · LF · Ln 1, Col 1', 'a mounted editor claims it')
+
+    first.set('Rust · UTF-8 · LF · Ln 9, Col 3')
+    eq(readout.statusReadout(), 'Rust · UTF-8 · LF · Ln 9, Col 3', 'and the caret moves it')
+    const beforeIdle = seen.length
+    first.set('Rust · UTF-8 · LF · Ln 9, Col 3')
+    eq(seen.length, beforeIdle, 'setting the same line again notifies nobody')
+
+    // A split: the second pane mounts and takes the bar, which is right — it is the file the
+    // user just opened.
+    const second = readout.claimStatusReadout('TOML · UTF-8 · LF · Ln 1, Col 1')
+    eq(readout.statusReadout(), 'TOML · UTF-8 · LF · Ln 1, Col 1', 'the newest editor holds it')
+
+    // …and typing in the first pane takes it back. Without this the bar reports the other
+    // pane's `Ln 1, Col 1` while the user types, which is a wrong answer rather than a
+    // missing one.
+    first.set('Rust · UTF-8 · LF · Ln 10, Col 1')
+    eq(
+      readout.statusReadout(),
+      'TOML · UTF-8 · LF · Ln 1, Col 1',
+      'an unfocused pane moving its own caret does not steal the bar',
+    )
+    first.focus()
+    eq(
+      readout.statusReadout(),
+      'Rust · UTF-8 · LF · Ln 10, Col 1',
+      'focusing it does, and brings the position it had been keeping',
+    )
+    eq(readout.readoutClaims().length, 2, 'focus reorders the claims rather than adding one')
+
+    // Closing the focused pane hands the bar back to the one still open, rather than blanking
+    // it — the other half of the split is still on screen with a caret in it.
+    first.release()
+    eq(
+      readout.statusReadout(),
+      'TOML · UTF-8 · LF · Ln 1, Col 1',
+      'releasing hands the slot down the stack',
+    )
+    first.set('Rust · UTF-8 · LF · Ln 99, Col 1')
+    first.focus()
+    eq(
+      readout.statusReadout(),
+      'TOML · UTF-8 · LF · Ln 1, Col 1',
+      'a released handle is inert — a torn-down CodeMirror cannot write to the bar',
+    )
+
+    second.release()
+    eq(readout.statusReadout(), '', 'the last editor closing empties the slot')
+    eq(readout.readoutClaims(), [], 'and leaves no claim behind')
+    eq(seen.at(-1), '', 'the subscriber was told, so the span empties and the CSS hides it')
+
+    stop()
+    const quiet = seen.length
+    readout.claimStatusReadout('Python · UTF-8 · LF · Ln 1, Col 1').release()
+    eq(seen.length, quiet, 'an unsubscribed listener stops being called')
+
+    // --- and that both halves of the wire are connected -----------------------------------
+    const surfaceSrc = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
+    ok(
+      /claimStatusReadout\(/.test(surfaceSrc) && /readout\?\.release\(\)/.test(surfaceSrc),
+      'EditorSurface claims the slot and releases it — a claim without the release leaves a ' +
+        'closed file’s caret on the bar',
+    )
+    ok(
+      !/styles\.readout/.test(surfaceSrc),
+      'and no longer prints the readout in its breadcrumb row, which is the row this change ' +
+        'gave back to the path',
+    )
+
+    const barSrc = readFileSync('src/chrome/StatusBar.tsx', 'utf8')
+    ok(
+      /subscribeStatusReadout\(/.test(barSrc),
+      'StatusBar subscribes — without it the readout is computed for nobody',
+    )
+    ok(
+      // The span is written to from outside React. A child in JSX would be restored by the
+      // next render of the bar, which happens on every branch change and every token tick.
+      /<span className=\{styles\.readout\}[^>]*\/>/.test(barSrc),
+      'and renders that span childless, so a re-render cannot overwrite the live text',
+    )
+
+    const barCss = readFileSync('src/chrome/StatusBar.module.css', 'utf8')
+    ok(
+      /\.readout:empty\s*\{[^}]*display:\s*none/.test(barCss),
+      'an empty readout is removed from the flex row, gap included, rather than left as a hole',
     )
   }
 

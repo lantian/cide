@@ -1,5 +1,6 @@
 # cide
 
+
 An IDE whose centre of gravity is a live Claude Code session rather than a text buffer.
 
 The distinguishing feature is a **pinned, non-closable Claude tab per project**, hosting a
