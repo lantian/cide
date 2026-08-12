@@ -38,9 +38,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SVG="$ROOT/crates/cide-app/icons/icon.svg"
 OUT="$ROOT/crates/cide-app/icons"
 
-# name:size. `icon.png` is 512 and keeps its Tauri name: `bundle.icon` in tauri.conf.json
-# names it, and the AppImage bundler picks the largest square icon for `.DirIcon`, so this
-# is the one a file manager shows for the download.
+# name:size. Every entry below is listed in `bundle.icon` in crates/cide-app/tauri.conf.json,
+# and that is load-bearing: tauri-bundler installs exactly the files that array names and
+# nothing else. When the array held only 32, 128 and 512, the other four rasters here were
+# generated, committed and drift-checked while reaching no desktop at all — GTK and Qt were
+# left to scale 32 down to 16 themselves, which is precisely the mud the 16px drawing was
+# tuned to avoid. Add a size here and it must be added there too.
+#
+# `icon.png` is 512 and keeps its Tauri name: the AppImage bundler picks the largest square
+# icon for `.DirIcon`, so this is the one a file manager shows for the download.
+#
+# It is also listed FIRST in `bundle.icon`, and that ordering is load-bearing rather than
+# tidy. tauri-codegen's `find_icon` embeds `default_window_icon` from the FIRST `.png` in
+# that array (tauri-codegen/src/context.rs), and that icon is what the running window hands
+# to KDE for the task manager, the window list and Alt-Tab. Listing the sizes small-first
+# would embed the 16px raster and leave KDE upscaling it to 48 and 128 — the worst possible
+# source for the exact surface the artwork was drawn for. Largest first, so every consumer
+# scales down from the best raster instead of up from the worst.
+# Nothing else reads the order: the freedesktop installer keys on each PNG's own pixel
+# dimensions and the AppImage picks the largest square, both order-independent.
 #
 # The freedesktop hicolor sizes are spelled `WxH.png` because tauri-bundler derives the
 # install directory from the file's pixel dimensions, not from its name
@@ -95,6 +111,23 @@ if ! command -v magick >/dev/null 2>&1; then
   exit 1
 fi
 
+# Normalised RMSE between two rasters; empty when ImageMagick refuses the pair outright.
+rmse_of() {
+  local raw
+  raw="$(magick compare -metric RMSE "$1" "$2" null: 2>&1 >/dev/null || true)"
+  printf '%s' "$raw" | sed -n 's/.*(\([0-9.e-]*\)).*/\1/p'
+}
+
+# Everything strictly inside the artwork: the antialiased rim eroded away, everything
+# outside it forced to black. Both rasters are masked with the SAME mask, taken from the
+# committed file, so what is left compares the colour of the solid interior and nothing
+# else. Erode and not a plain alpha threshold, because a threshold still keeps the pixel
+# just inside the edge, which is exactly the one two renderers disagree about.
+interior() { # interior <raster> <mask> <destination>
+  magick "$1" "$2" -alpha off -compose CopyOpacity -composite \
+         -background black -alpha remove -alpha off "$3"
+}
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -128,24 +161,59 @@ for entry in "${SIZES[@]}"; do
   fi
 
   render "$size" "$TMP/$name"
-  # Pixel comparison with a tolerance, not `cmp`. Two librsvg releases disagree in the last
-  # bit of an antialiased edge, and a byte comparison would turn a toolchain upgrade into a
-  # red build that says the artwork changed when it did not. RMSE over the whole image
-  # catches the failure that matters — somebody edited the SVG and did not re-run this —
-  # because that moves whole shapes, not edge pixels.
-  rmse="$(magick compare -metric RMSE "$dest" "$TMP/$name" null: 2>&1 >/dev/null || true)"
-  norm="$(printf '%s' "$rmse" | sed -n 's/.*(\([0-9.e-]*\)).*/\1/p')"
-  if [[ -z "$norm" ]]; then
+
+  # Two comparisons, because one number provably cannot do both jobs.
+  #
+  # Whole-image RMSE catches geometry: a moved shape, a changed stroke width, a wrong
+  # corner radius. It has to keep a loose tolerance, because two renderers (or two librsvg
+  # releases) disagree along every antialiased edge, and `cmp` would turn a toolchain
+  # upgrade into a red build claiming the artwork changed when it did not.
+  #
+  # That loose tolerance is blind to colour, and this was measured rather than assumed:
+  # deleting the middle gradient stop — reverting the ramp to the straight two-stop version
+  # icon.svg explicitly rejects, which doubles the share of the mark under 3:1 on white —
+  # moves whole-image RMSE to only 0.0115, under any tolerance wide enough for
+  # antialiasing. A check that waves through the one edit its own artwork comments argue
+  # about is not a check. So colour is tested separately, over the eroded interior, where
+  # no antialiased pixel survives and the tolerance can therefore be tight.
+  geometry="$(rmse_of "$dest" "$TMP/$name")"
+  if [[ -z "$geometry" ]]; then
     printf 'DIFFERS %s (dimensions differ from the SVG at %s)\n' "$name" "$size"
     status=1
     continue
   fi
-  if awk -v v="$norm" 'BEGIN { exit !(v > 0.02) }'; then
-    printf 'DIFFERS %s (RMSE %s > 0.02; re-run scripts/gen-icons.sh)\n' "$name" "$norm"
+  if awk -v v="$geometry" 'BEGIN { exit !(v > 0.02) }'; then
+    printf 'DIFFERS %s (geometry RMSE %s > 0.02; re-run scripts/gen-icons.sh)\n' \
+           "$name" "$geometry"
     status=1
-  else
-    printf 'ok      %s (RMSE %s)\n' "$name" "$norm"
+    continue
   fi
+
+  # Only where there IS an interior. Eroding 2px off the 16px raster, whose caret stroke is
+  # 3px wide, would leave nothing to compare and the test would pass by being empty — the
+  # exact failure mode this whole block exists to remove. Every size is rendered from the
+  # same SVG, so a colour edit caught at 128 and above is a colour edit caught everywhere.
+  colour="skipped"
+  if [[ "$size" -ge 128 ]]; then
+    magick "$dest" -alpha extract -threshold 99% \
+           -morphology Erode Octagon:2 "$TMP/mask-$name"
+    interior "$dest" "$TMP/mask-$name" "$TMP/ref-$name"
+    interior "$TMP/$name" "$TMP/mask-$name" "$TMP/new-$name"
+    colour="$(rmse_of "$TMP/ref-$name" "$TMP/new-$name")"
+    if [[ -z "$colour" ]]; then
+      printf 'DIFFERS %s (interior could not be compared)\n' "$name"
+      status=1
+      continue
+    fi
+    if awk -v v="$colour" 'BEGIN { exit !(v > 0.004) }'; then
+      printf 'DIFFERS %s (interior colour RMSE %s > 0.004; re-run scripts/gen-icons.sh)\n' \
+             "$name" "$colour"
+      status=1
+      continue
+    fi
+  fi
+
+  printf 'ok      %s (geometry %s, colour %s)\n' "$name" "$geometry" "$colour"
 done
 
 exit "$status"
