@@ -502,6 +502,53 @@ try {
   }
   eq(badWeights, [], 'every `font-weight` in the stylesheets is a weight `fonts.css` imports')
 
+  // --- the sidebar lists are the UI face, and the code inside them is not -------------------
+  //
+  // A deliberate departure from the mock, which specifies "21px mono rows" for the explorer.
+  // Side by side with IDEA the monospace tree reads as a terminal listing rather than a list
+  // of names, and it is the one piece of feedback this panel has drawn twice. The reason it
+  // survived the first pass is instructive: that pass checked JetBrains Mono was *loading* —
+  // it was, and that was never the question — and recorded the rows as correct.
+  //
+  // So it is pinned here, because "restore the mock's mono rows" is a plausible-looking edit
+  // that a future reader of `Grount IDE.dc.html` would make in good faith, and nothing else
+  // in the repo would contradict them.
+  //
+  // The second half matters as much as the first. A hit row in the search panel carries a
+  // path *and* a line of source, and only the path is a name: `.lineText` must stay mono or
+  // the match highlight sits over glyphs of a width the file does not have. Checking only
+  // "the trees are proportional" would pass a change that swept the source preview along
+  // with the names, which is the more damaging half of the mistake.
+  for (const [file, uiSelectors, monoSelectors] of [
+    ['src/sidebar/FileTree.module.css', ['.row', '.rename'], []],
+    ['src/sidebar/GitPanel/ChangesTree.module.css', ['.fileName', '.dirName'], ['.count']],
+    ['src/sidebar/SearchPanel.module.css', ['.fileRow'], ['.lineText', '.lineNo']],
+  ]) {
+    const rules = leafRules(readFileSync(file, 'utf8'))
+    for (const [selectors, want, why] of [
+      [uiSelectors, '--font-ui', 'a name, so the proportional face'],
+      [monoSelectors, '--font-mono', 'code or a column, so the mono face'],
+    ]) {
+      for (const selector of selectors) {
+        const rule = rules.find((r) => parts(r.selector).includes(selector))
+        ok(rule !== undefined, `${file} still has a \`${selector}\` rule`)
+        // Stated, not inherited. `.lineText` inherited mono from its row for as long as the
+        // row was mono, and the day the row changed it silently followed — which is exactly
+        // the regression this pins, so an inherited pass would be no check at all.
+        //
+        // Not `declares()`: that asks whether a rule *defines* the custom property, and none
+        // of these do — they consume it. The first draft of this loop used it and failed all
+        // eight, including the three that were already right.
+        const family = rule && /font-family:\s*var\((--font-[a-z]+)\)/.exec(rule.body)?.[1]
+        ok(
+          family === want,
+          `${file} \`${selector}\` sets its own \`font-family: var(${want})\` — ${why}` +
+            (family && family !== want ? ` (found ${family})` : family ? '' : ' (found none)'),
+        )
+      }
+    }
+  }
+
   // The specific elements that were muddy. The UA sheet bolds them to 700 and no stylesheet
   // says otherwise, so the normalisation has to be here or it is nowhere.
   const uaBold = leafRules(readFileSync('src/styles/tokens.css', 'utf8')).find((r) =>

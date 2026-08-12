@@ -84,8 +84,26 @@
      per-depth indentation is applied to the twisty as a margin rather than to the row, so
      the selection band still spans the full width. */
   padding: 0 8px 0 6px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
+  /*
+   * The UI face, not the mono one, and this overrides the mock deliberately.
+   *
+   * `Grount IDE.dc.html` specifies "21px mono rows" and that is what shipped. Compared
+   * side by side with IDEA's project tree the difference is not subtle: a monospace face
+   * gives every filename the same column width per character, so `.gitignore` and
+   * `rust-toolchain.toml` are spaced like a terminal listing rather than a list of names,
+   * and at the 11.5px needed to fit them the letterforms go muddy. IDEA, VS Code and every
+   * file manager use a proportional UI face here; mono belongs where columns have to line
+   * up, which in this panel is only the status tag.
+   *
+   * A previous pass looked at this and recorded "tree rows already declare `--font-mono`
+   * and JetBrains Mono really loads. Not the bug." That checked the face was *arriving*,
+   * which was never in question — the question is whether it is the right face.
+   *
+   * 13px because a proportional face at 11.5 is smaller than it reads: the mono figure was
+   * chosen to fit fixed-width columns into 252px, and that constraint is gone.
+   */
+  font-family: var(--font-ui);
+  font-size: 13px;
   white-space: nowrap;
   cursor: default;
   color: var(--text);
@@ -153,8 +171,11 @@
   border-radius: 2px;
   background: var(--panel-2);
   color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
+  /* Follows `.row`, and has to: this input is drawn *over* the row it renames, so any
+     disagreement about face or size makes the name visibly jump the moment F2 is pressed
+     and jump back on commit. */
+  font-family: var(--font-ui);
+  font-size: 13px;
 }
 
 .rename:focus {
