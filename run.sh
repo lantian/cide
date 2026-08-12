@@ -128,55 +128,43 @@ except Exception:
   fi
 fi
 
-# --- launch ----------------------------------------------------------------------------
-
-if [ ! -x "$BIN" ]; then
-  if [ "$release" = 1 ]; then
-    echo "[run] $BIN is missing; run: pnpm --dir ui build && cargo build --release -p cide-app" >&2
-  else
-    echo "[run] $BIN is missing; run: cargo build -p cide-app" >&2
-  fi
+# --- build the binary, rather than refusing to launch an old one ------------------------
+#
+# This script starts Vite, which hot-reloads the frontend the instant a file changes. If it
+# then launched a binary it never rebuilt, the two halves of the app would sit at different
+# commits, silently: Tauri deserialises each command argument *by name*
+# (`tauri/src/ipc/command.rs` — no whole-payload struct, no `deny_unknown_fields`), so a stale
+# binary does not reject a new payload. It ignores the fields it has not heard of and carries
+# on, and the symptom is a feature that is simply absent or a pane that comes up blank, with no
+# error anywhere. Hours went into a reported bug that turned out to be exactly this.
+#
+# **This used to REFUSE, by comparing mtimes with `find -newer`, and that was wrong twice over.**
+#
+# Its own comment said a guard that refuses when nothing is wrong gets bypassed and then
+# deleted, so its false-positive rate is the whole design — and it named two sources it had
+# avoided (`bindings/*.ts`, rewritten by every `cargo test`; `xtask/`, not linked in). It
+# missed the one that matters: **cargo fingerprints file *contents*, `find` compares mtimes.**
+# A manifest that is touched but unchanged — which `cargo` itself does, and any tool that
+# rewrites a file with the same bytes — makes `find` report it as newer while cargo correctly
+# has nothing to do. The guard then refused for ever and told the user to run
+# `cargo build -p cide-app`, which finished in 0.16s and cleared nothing. A guard whose
+# suggested fix cannot satisfy it is worse than no guard.
+#
+# So: ask cargo, which is the only thing that knows. When the binary is current this costs
+# ~0.2s; when it is not, rebuilding is precisely what the old guard was asking for anyway.
+build=(cargo build -p cide-app)
+if [ "$release" = 1 ]; then
+  build+=(--release)
+fi
+echo "[run] ${build[*]}"
+if ! "${build[@]}"; then
+  echo "[run] REFUSING: the backend did not build, so there is nothing safe to launch." >&2
+  echo "[run] The compiler's own output is above." >&2
   exit 1
 fi
 
-# --- refuse a binary older than the Rust it is supposed to be ---------------------------
-#
-# This script starts Vite, which hot-reloads the frontend the instant a file changes, and then
-# launches a binary it never rebuilds. So an ordinary edit-and-relaunch loop leaves the two
-# halves of the app at different commits, silently, and the failure is invisible from both
-# sides: Tauri deserialises each command argument *by name* (`tauri/src/ipc/command.rs`, and
-# there is no whole-payload struct and no `deny_unknown_fields`), so a stale binary does not
-# reject a new payload — it ignores the fields it has not heard of and carries on. The symptom
-# is a feature that is simply absent, or a pane that comes up blank, with no error anywhere.
-#
-# Hours were spent on a reported bug asking whether this had happened. Refusing here is cheaper
-# than any handshake: the check is one `find`, and the answer is available before a window
-# exists rather than after.
-#
-# **Only `*.rs` and the manifests, and only under `crates/`.** A guard that refuses when
-# nothing is wrong gets bypassed and then deleted, so its false-positive rate is the whole
-# design. Two things would have given it one:
-#
-#   * `crates/*/bindings/*.ts` — ts-rs rewrites every one of them on every `cargo test`, so a
-#     plain `find crates` refuses after any test run, with the binary perfectly current.
-#     Verified, not assumed: their mtime moves on a bare `cargo test -p cide-ipc`.
-#   * `xtask/` — not linked into `cide` at all. Editing the build tool says nothing about
-#     whether the binary is stale.
-newer=$(find crates -name '*.rs' -newer "$BIN" -type f 2>/dev/null; \
-        find crates -name Cargo.toml -newer "$BIN" -type f 2>/dev/null; \
-        find Cargo.toml Cargo.lock -newer "$BIN" -type f 2>/dev/null)
-newer=$(printf '%s\n' "$newer" | grep -v '^$' | head -n 3)
-if [ -n "$newer" ]; then
-  echo "[run] REFUSING: $BIN is older than the Rust sources it was built from."
-  echo "[run] Newer than the binary, among others:"
-  echo "$newer" | sed 's/^/[run]   /'
-  echo "[run] This script rebuilds the frontend but never the binary, so launching now would"
-  echo "[run] run a new UI against an old backend — which fails silently, not loudly."
-  if [ "$release" = 1 ]; then
-    echo "[run] Fix:  pnpm --dir ui build && cargo build --release -p cide-app"
-  else
-    echo "[run] Fix:  cargo build -p cide-app"
-  fi
+if [ ! -x "$BIN" ]; then
+  echo "[run] REFUSING: $BIN is still missing after a successful build." >&2
   exit 1
 fi
 
