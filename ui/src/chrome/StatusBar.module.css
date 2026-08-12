@@ -43,12 +43,29 @@
   overflow: hidden;
 }
 
+/*
+ * Shrinkable since the file's trail joined it — an absolute path in a project with no root
+ * is longer than the bar, and `flex: none` here would push the branch and the counts off the
+ * left edge to fit it. Only `.path` inside actually gives way; see below.
+ */
 .right {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 /* Only the branch may give way; the counts and diagnostics keep their content width. */
 .left > * {
+  flex: none;
+}
+
+/*
+ * Same rule on the other side: the readout and the session slot keep their content width.
+ *
+ * Matched on the element rather than `.right > *`, which would tie with `.path` on
+ * specificity and be settled by which rule happens to sit lower in this file. The trail is
+ * the only child that is not a span, and it is the only one that may shrink.
+ */
+.right > span {
   flex: none;
 }
 
@@ -105,4 +122,46 @@
 
 .readout:empty {
   display: none;
+}
+
+/*
+ * The open file's trail: `crates › cide-core › src › lib.rs`.
+ *
+ * The one slot on the bar that may shrink, and it clips from the *left* so the file name
+ * survives a narrow window: `direction: rtl` moves the overflow — and the ellipsis — to the
+ * start of the box, and the inner `ltr` puts the characters back the right way round. Without
+ * it a squeezed bar shows `crates › cide-…` and hides the one segment the user needs. Carried
+ * over from the editor's breadcrumb row, which is where this trick was first needed.
+ *
+ * A block box and not a flex one, deliberately: `text-overflow` needs a block container with
+ * inline content, and `display: flex` here silently drops the ellipsis and leaves a hard cut.
+ * The segments are inline spans for the same reason.
+ */
+.path {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  color: var(--faint);
+}
+
+/* No file open: no box, and no 16px gap where one would have been. */
+.path:empty {
+  display: none;
+}
+
+.crumb {
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+.separator {
+  padding: 0 6px;
+  color: var(--border);
+}
+
+/* The last segment is the file itself, and it is the segment the row is really about. */
+.crumb:last-child {
+  color: var(--dim);
 }

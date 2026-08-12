@@ -1,6 +1,9 @@
 /**
- * The buffer, its breadcrumb bar and everything CodeMirror needs to be one of this app's
- * panes.
+ * The buffer, and everything CodeMirror needs to be one of this app's panes.
+ *
+ * The buffer and nothing else, since M11: the 28px breadcrumb bar that used to sit above it
+ * is a line in the status bar now (`statusReadout.ts`), so the pane is all editor from the
+ * tab strip down.
  *
  * Pure by design, in the same sense `panes/DiffPane.tsx` is: no IPC, no store, no knowledge
  * of tabs. Text comes in as a string and leaves through `onSave`, so the whole surface can
@@ -51,7 +54,7 @@ import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import { exceedsBytes } from './byteSize'
 import { registerReveal, revealRange } from './revealRequest'
-import { claimStatusReadout, formatReadout, type ReadoutSlot } from './statusReadout'
+import { claimStatusReadout, formatReadout, pathTrail, type ReadoutSlot } from './statusReadout'
 import { useSendToClaude } from './useSendToClaude'
 import styles from './EditorSurface.module.css'
 
@@ -76,14 +79,14 @@ import styles from './EditorSurface.module.css'
 export const HIGHLIGHT_LIMIT_BYTES = 1024 * 1024
 
 export interface EditorSurfaceProps {
-  /** Absolute path, used for the breadcrumb trail and to pick the language. */
+  /** Absolute path, used for the status bar's trail and to pick the language. */
   path: string
   /**
    * The project root the trail is drawn relative to.
    *
    * Absent shows the whole absolute path, which is right for a file outside any project and
    * wrong-looking for one inside it — `crates › cide-core › src › lib.rs` is the mock, not
-   * `home › lantian › work › cide › crates › …`.
+   * `home › lantian › work › cide › crates › …`. See `pathTrail`.
    */
   root?: string | undefined
   /** The file exactly as it came off disk, line endings included. */
@@ -133,16 +136,6 @@ export interface EditorSurfaceProps {
   onSaveHandle?: ((save: (() => Promise<void>) | null) => void) | undefined
 }
 
-/** The `crates › cide-core › src › lib.rs` trail. */
-export function breadcrumbSegments(path: string, root?: string): string[] {
-  let rest = path
-  if (root !== undefined && root.length > 0) {
-    const base = root.endsWith('/') ? root : `${root}/`
-    if (path.startsWith(base)) rest = path.slice(base.length)
-  }
-  return rest.split(/[/\\]/).filter((s) => s.length > 0)
-}
-
 /** `Ln 128, Col 24`, one-based in both, which is what every editor and every stack trace uses. */
 export function cursorLabel(state: EditorState): string {
   const head = state.selection.main.head
@@ -164,6 +157,8 @@ export function EditorSurface({
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
+  /** This buffer's hold on the status bar, for the trail effect below. See `statusReadout.ts`. */
+  const slotRef = useRef<ReadoutSlot | null>(null)
 
   // Callbacks in refs so a parent that rebuilds its handlers every render cannot reach the
   // effect below and tear the editor down — which would take the user's unsaved edits.
@@ -204,7 +199,7 @@ export function EditorSurface({
   const sendCb = useRef(toClaude)
   sendCb.current = toClaude
 
-  const segments = useMemo(() => breadcrumbSegments(path, root), [path, root])
+  const segments = useMemo(() => pathTrail(path, root), [path, root])
   const language = useMemo(() => languageName(path), [path])
   const endings = useMemo(() => captureLineEndings(doc), [doc])
 
@@ -399,7 +394,8 @@ export function EditorSurface({
     // Claimed after the view is built and released in the cleanup below, so the bar's line
     // and the buffer on screen have exactly the same lifetime. A view that failed to
     // construct returned above and never claims one.
-    readout = claimStatusReadout(readoutFor(view.state))
+    readout = claimStatusReadout(segments, readoutFor(view.state))
+    slotRef.current = readout
 
     /*
      * "Open this file at this line", from a click in the search results.
@@ -446,6 +442,7 @@ export function EditorSurface({
       // Hands the bar back to whichever editor is under this one, and blanks it when there
       // is none. A slot left behind would keep a closed file's position on screen.
       readout?.release()
+      if (slotRef.current === readout) slotRef.current = null
       // Before `destroy`, so a request racing the unmount cannot dispatch into a dead view.
       stopReveal()
       view.destroy()
@@ -455,28 +452,28 @@ export function EditorSurface({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, reloadKey])
 
+  /*
+   * The trail against a root that arrived late.
+   *
+   * The claim above is taken once per buffer and carries the trail as it stood then, which
+   * is wrong exactly once: `PaneBody` passes `roots[0]?.path ?? PROJECT_ROOT`, so an editor
+   * restored before its project record lands computes an absolute path and, without this,
+   * would keep showing one until the tab is reopened. Runs after the mount effect on the
+   * first pass and is a no-op there — `setTrail` compares before it publishes.
+   */
+  useEffect(() => {
+    slotRef.current?.setTrail(segments)
+  }, [segments])
+
+  /*
+   * No breadcrumb bar. `crates › cide-core › src › lib.rs · Rust · UTF-8 · LF · Ln 7, Col 48`
+   * is one line in the status bar now (`statusReadout.ts` → `chrome/StatusBar.tsx`), and the
+   * 28px row it used to need goes to the buffer — in every pane of a split, which is where
+   * the row was costing the most for saying the least: the tab above it already names the
+   * file, badge and all, with the full path on hover.
+   */
   return (
     <div className={styles.pane}>
-      {/*
-        * The trail, and nothing else. `Markdown · UTF-8 · LF · Ln 7, Col 48` used to sit at
-        * the right-hand end of this row and now goes to the status bar — see
-        * `statusReadout.ts`. The path gets the whole 28px row back, which is what it wanted:
-        * a pane split three ways had been showing `crates › cide-…` beside a readout that
-        * says the same thing under every file.
-        */}
-      <div className={styles.breadcrumbs} data-audit="editorBreadcrumbs">
-        <div className={styles.trail}>
-          {segments.map((segment, i) => (
-            // Keyed by position as well as text: a path can repeat a segment
-            // (`src/cide/src`), and the text alone would collide.
-            <span key={`${i}:${segment}`} className={styles.crumb}>
-              {i > 0 && <span className={styles.separator}>›</span>}
-              {segment}
-            </span>
-          ))}
-        </div>
-      </div>
-
       {/*
         * `data-native-menu="false"` even though the surface would already be suppressed: the
         * host is a `contenteditable`, which is the one shape `wantsNativeMenu` treats as a text

@@ -24,58 +24,12 @@
   background: var(--panel);
 }
 
-/* --- breadcrumb bar, 28px from the mock ------------------------------------------------ */
-
-.breadcrumbs {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: 28px;
-  padding: 0 10px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--panel);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--faint);
-  white-space: nowrap;
-  overflow: hidden;
-}
-
 /*
- * The trail clips from the left so the file name survives a narrow pane: `direction: rtl`
- * moves the overflow to the start of the box, and the inner `ltr` puts the characters back
- * the right way round. Without it a split three ways shows `crates › cide-…` and hides the
- * one segment the user needs.
- */
-.trail {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  direction: rtl;
-}
-
-.crumb {
-  direction: ltr;
-  unicode-bidi: embed;
-}
-
-.separator {
-  padding: 0 6px;
-  color: var(--border);
-}
-
-/* The last segment is the file itself, and the mock reads it before the path. */
-.crumb:last-child {
-  color: var(--dim);
-}
-
-/*
- * `.readout` was here — `Markdown · UTF-8 · LF · Ln 7, Col 48`, at the right-hand end of
- * this row. It is a status bar line and now lives in `chrome/StatusBar.module.css`; this row
- * is the path and only the path. The 12px `gap` above stays: it is between-children spacing,
- * and one child costs nothing.
+ * The mock's 28px breadcrumb bar was here: `crates › cide-core › src › lib.rs` on the left,
+ * `Markdown · UTF-8 · LF · Ln 7, Col 48` on the right. Both are one line in the status bar
+ * now — `.path` and `.readout` in `chrome/StatusBar.module.css`, which is where the rtl
+ * clipping trick and the `›` separators went with them. The pane is the buffer and nothing
+ * else, which is 28px per split pane back.
  */
 
 /* --- the buffer ------------------------------------------------------------------------ */

@@ -6,7 +6,7 @@
  * keyword table. The extension table itself is static and tiny, so a tab strip can label a
  * file without loading anything.
  *
- * `languageName` is separated from `loadLanguage` for the same reason. The breadcrumb bar
+ * `languageName` is separated from `loadLanguage` for the same reason. The status bar
  * has to say `Rust` the moment the buffer appears — before the chunk has resolved, and
  * still for a file too large to highlight at all.
  */
@@ -17,7 +17,7 @@ import type { Extension } from '@codemirror/state'
 type LanguageId = 'rust' | 'typescript' | 'python' | 'clike' | 'shell' | 'json' | 'toml' | 'yaml' | 'markdown'
 
 interface Entry {
-  /** What the breadcrumb readout calls it. */
+  /** What the status bar readout calls it. */
   label: string
   load: () => Promise<Extension>
 }
@@ -136,7 +136,7 @@ function lookup(path: string): { id: LanguageId; label: string } | null {
   return { id: found.id, label: found.label ?? REGISTRY[found.id].label }
 }
 
-/** What the breadcrumb calls this file's language. `Plain Text` when nothing matches. */
+/** What the status bar calls this file's language. `Plain Text` when nothing matches. */
 export function languageName(path: string): string {
   return lookup(path)?.label ?? 'Plain Text'
 }

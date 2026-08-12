@@ -74,7 +74,7 @@ export function countLines(text: string): number {
   return 1 + lf + crlf + cr
 }
 
-/** What the breadcrumb readout says after the encoding. */
+/** What the status bar readout says after the encoding. */
 export type LineEnding = 'LF' | 'CRLF' | 'CR' | 'Mixed'
 
 /** A break exactly as it appears in a file. The three shapes CodeMirror splits on. */
@@ -96,7 +96,7 @@ const BREAK_OF: Record<Exclude<LineEnding, 'Mixed'>, Break> = {
  * is how the loss this module documented for two milestones happened.
  */
 export interface DocumentEndings {
-  /** The classification, for the breadcrumb readout. */
+  /** The classification, for the status bar readout. */
   readonly ending: LineEnding
   /**
    * The break that followed each line, in file order, or `null`.

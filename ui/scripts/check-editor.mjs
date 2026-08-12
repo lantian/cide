@@ -1707,15 +1707,17 @@ try {
   // ---------------------------------------------------------------------------------------
 
   /*
-   * `Markdown · UTF-8 · LF · Ln 7, Col 48` moved out of the editor's breadcrumb row and into
-   * the status bar, which put a single slot behind an unbounded number of editors. Everything
-   * that can go wrong with that is invisible on screen until it is annoying: a split whose
-   * second pane reports the position of the pane you are not typing in, a closed tab that
-   * leaves its caret on the bar forever, a listener the bar never drops.
+   * `crates › cide-core › src › lib.rs · Rust · UTF-8 · LF · Ln 7, Col 48` moved out of the
+   * editor's 28px breadcrumb row and into the status bar, which put a single slot behind an
+   * unbounded number of editors. Everything that can go wrong with that is invisible on screen
+   * until it is annoying: a split whose second pane reports the position of the pane you are
+   * not typing in, a closed tab that leaves its caret on the bar forever, a trail computed
+   * against a root that had not loaded yet, a listener the bar never drops.
    *
-   * The claim stack is exercised directly. The wiring is a source assertion, the same gate
-   * `requestReveal` and `useSendToClaude` get above: a channel with no publisher and a span
-   * with no subscriber both pass every test a module can write about itself.
+   * The trail arithmetic and the claim stack are exercised directly. The wiring is a source
+   * assertion, the same gate `requestReveal` and `useSendToClaude` get above: a channel with
+   * no publisher and a bar with no subscriber both pass every test a module writes about
+   * itself.
    */
   {
     eq(
@@ -1724,39 +1726,91 @@ try {
       'the readout is the line the user reported, separators and all',
     )
 
-    eq(readout.statusReadout(), '', 'no editor open means an empty slot, which the bar hides')
+    // --- the trail -------------------------------------------------------------------------
+    const ROOT = '/home/lantian/work/cide'
+    eq(
+      readout.pathTrail(`${ROOT}/crates/cide-core/src/lib.rs`, ROOT),
+      ['crates', 'cide-core', 'src', 'lib.rs'],
+      'a file inside the project is drawn relative to it',
+    )
+    eq(
+      readout.pathTrail(`${ROOT}/crates/cide-core/src/lib.rs`, `${ROOT}/`),
+      ['crates', 'cide-core', 'src', 'lib.rs'],
+      'a root with a trailing slash means the same thing',
+    )
+    eq(
+      readout.pathTrail('/etc/hosts', ROOT),
+      ['etc', 'hosts'],
+      'a file outside the project shows its own path rather than a relative fiction',
+    )
+    eq(
+      readout.pathTrail('/etc/hosts'),
+      ['etc', 'hosts'],
+      'and so does one opened with no project at all',
+    )
+    eq(readout.pathTrail('/etc/hosts', ''), ['etc', 'hosts'], 'an empty root is no root')
+    eq(
+      readout.pathTrail(`${ROOT}-other/src/lib.rs`, ROOT),
+      ['home', 'lantian', 'work', 'cide-other', 'src', 'lib.rs'],
+      'a sibling whose name merely starts with the root is not inside it — the trailing ' +
+        'separator is what makes `cide-other` fall through to its own path',
+    )
+
+    // --- the slot --------------------------------------------------------------------------
+    const RS = ['crates', 'cide-core', 'src', 'lib.rs']
+    const TOML = ['Cargo.toml']
+    const line = (trail, detail) => ({ trail, detail })
+
+    eq(readout.statusReadout(), line([], ''), 'no editor open means an empty slot the bar hides')
 
     const seen = []
-    const stop = readout.subscribeStatusReadout((text) => seen.push(text))
-    eq(seen, [''], 'a subscriber is told the current line immediately, not on the next change')
+    const stop = readout.subscribeStatusReadout((l) => seen.push(l))
+    eq(seen, [line([], '')], 'a subscriber is told the current line at once, not on the next change')
 
-    const first = readout.claimStatusReadout('Rust · UTF-8 · LF · Ln 1, Col 1')
-    eq(readout.statusReadout(), 'Rust · UTF-8 · LF · Ln 1, Col 1', 'a mounted editor claims it')
+    const first = readout.claimStatusReadout(RS, 'Rust · UTF-8 · LF · Ln 1, Col 1')
+    eq(
+      readout.statusReadout(),
+      line(RS, 'Rust · UTF-8 · LF · Ln 1, Col 1'),
+      'a mounted editor claims the slot, trail and all',
+    )
 
     first.set('Rust · UTF-8 · LF · Ln 9, Col 3')
-    eq(readout.statusReadout(), 'Rust · UTF-8 · LF · Ln 9, Col 3', 'and the caret moves it')
+    eq(readout.statusReadout().detail, 'Rust · UTF-8 · LF · Ln 9, Col 3', 'the caret moves it')
     const beforeIdle = seen.length
     first.set('Rust · UTF-8 · LF · Ln 9, Col 3')
     eq(seen.length, beforeIdle, 'setting the same line again notifies nobody')
 
+    // The boot race: the project record lands after the editor did, and the trail it was
+    // claimed with was drawn against the fallback root.
+    first.setTrail(['cide', 'crates', 'cide-core', 'src', 'lib.rs'])
+    eq(
+      readout.statusReadout().trail,
+      ['cide', 'crates', 'cide-core', 'src', 'lib.rs'],
+      'a root that arrives late redraws the trail rather than leaving an absolute path',
+    )
+    const beforeSameTrail = seen.length
+    first.setTrail(['cide', 'crates', 'cide-core', 'src', 'lib.rs'])
+    eq(seen.length, beforeSameTrail, 'and an unchanged trail notifies nobody')
+    first.setTrail(RS)
+
     // A split: the second pane mounts and takes the bar, which is right — it is the file the
     // user just opened.
-    const second = readout.claimStatusReadout('TOML · UTF-8 · LF · Ln 1, Col 1')
-    eq(readout.statusReadout(), 'TOML · UTF-8 · LF · Ln 1, Col 1', 'the newest editor holds it')
+    const second = readout.claimStatusReadout(TOML, 'TOML · UTF-8 · LF · Ln 1, Col 1')
+    eq(readout.statusReadout().trail, TOML, 'the newest editor holds it')
 
     // …and typing in the first pane takes it back. Without this the bar reports the other
     // pane's `Ln 1, Col 1` while the user types, which is a wrong answer rather than a
     // missing one.
     first.set('Rust · UTF-8 · LF · Ln 10, Col 1')
     eq(
-      readout.statusReadout(),
-      'TOML · UTF-8 · LF · Ln 1, Col 1',
+      readout.statusReadout().trail,
+      TOML,
       'an unfocused pane moving its own caret does not steal the bar',
     )
     first.focus()
     eq(
       readout.statusReadout(),
-      'Rust · UTF-8 · LF · Ln 10, Col 1',
+      line(RS, 'Rust · UTF-8 · LF · Ln 10, Col 1'),
       'focusing it does, and brings the position it had been keeping',
     )
     eq(readout.readoutClaims().length, 2, 'focus reorders the claims rather than adding one')
@@ -1764,30 +1818,40 @@ try {
     // Closing the focused pane hands the bar back to the one still open, rather than blanking
     // it — the other half of the split is still on screen with a caret in it.
     first.release()
-    eq(
-      readout.statusReadout(),
-      'TOML · UTF-8 · LF · Ln 1, Col 1',
-      'releasing hands the slot down the stack',
-    )
+    eq(readout.statusReadout().trail, TOML, 'releasing hands the slot down the stack')
     first.set('Rust · UTF-8 · LF · Ln 99, Col 1')
+    first.setTrail(['gone.rs'])
     first.focus()
     eq(
-      readout.statusReadout(),
-      'TOML · UTF-8 · LF · Ln 1, Col 1',
+      readout.statusReadout().trail,
+      TOML,
       'a released handle is inert — a torn-down CodeMirror cannot write to the bar',
     )
 
     second.release()
-    eq(readout.statusReadout(), '', 'the last editor closing empties the slot')
+    eq(readout.statusReadout(), line([], ''), 'the last editor closing empties the slot')
     eq(readout.readoutClaims(), [], 'and leaves no claim behind')
-    eq(seen.at(-1), '', 'the subscriber was told, so the span empties and the CSS hides it')
+    eq(seen.at(-1), line([], ''), 'the subscriber was told, so both boxes empty and the CSS hides them')
+
+    // The claim copies what it is handed: a caller mutating its own array afterwards — a
+    // `useMemo` result it still owns — must not silently redraw the bar.
+    const owned = ['src', 'main.rs']
+    const third = readout.claimStatusReadout(owned)
+    owned.push('nope')
+    eq(readout.statusReadout().trail, ['src', 'main.rs'], 'the claim holds its own copy')
+    third.release()
 
     stop()
     const quiet = seen.length
-    readout.claimStatusReadout('Python · UTF-8 · LF · Ln 1, Col 1').release()
+    readout.claimStatusReadout(RS, 'Python · UTF-8 · LF · Ln 1, Col 1').release()
     eq(seen.length, quiet, 'an unsubscribed listener stops being called')
 
-    // --- and that both halves of the wire are connected -----------------------------------
+    // `StatusBar` guards its `setTrail` with this, so it has to answer the way React needs.
+    ok(readout.sameTrail(RS, [...RS]), 'equal trails compare equal across array identities')
+    ok(!readout.sameTrail(RS, RS.slice(0, 3)), 'a shorter trail is a different trail')
+    ok(!readout.sameTrail(RS, ['crates', 'cide-app', 'src', 'lib.rs']), 'so is a renamed segment')
+
+    // --- and that every half of the wire is connected --------------------------------------
     const surfaceSrc = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
     ok(
       /claimStatusReadout\(/.test(surfaceSrc) && /readout\?\.release\(\)/.test(surfaceSrc),
@@ -1795,27 +1859,50 @@ try {
         'closed file’s caret on the bar',
     )
     ok(
-      !/styles\.readout/.test(surfaceSrc),
-      'and no longer prints the readout in its breadcrumb row, which is the row this change ' +
-        'gave back to the path',
+      /setTrail\(segments\)/.test(surfaceSrc),
+      'and redraws the trail when the root arrives, which is the one thing the claim cannot ' +
+        'carry from mount',
+    )
+    ok(
+      !/styles\.breadcrumbs/.test(surfaceSrc),
+      'the breadcrumb row is gone — the whole point of the move was the 28px it cost every ' +
+        'pane in a split',
     )
 
     const barSrc = readFileSync('src/chrome/StatusBar.tsx', 'utf8')
     ok(
       /subscribeStatusReadout\(/.test(barSrc),
-      'StatusBar subscribes — without it the readout is computed for nobody',
+      'StatusBar subscribes — without it the line is computed for nobody',
     )
     ok(
       // The span is written to from outside React. A child in JSX would be restored by the
       // next render of the bar, which happens on every branch change and every token tick.
       /<span className=\{styles\.readout\}[^>]*\/>/.test(barSrc),
-      'and renders that span childless, so a re-render cannot overwrite the live text',
+      'and renders the readout span childless, so a re-render cannot overwrite the live text',
+    )
+    ok(
+      /sameTrail\(prev, line\.trail\) \? prev : line\.trail/.test(barSrc),
+      'while the trail goes through state guarded by `sameTrail` — an unguarded setter would ' +
+        're-render the bar on every keystroke, which is what the DOM write above avoids',
     )
 
     const barCss = readFileSync('src/chrome/StatusBar.module.css', 'utf8')
+    for (const slot of ['readout', 'path']) {
+      ok(
+        new RegExp(`\\.${slot}:empty\\s*\\{[^}]*display:\\s*none`).test(barCss),
+        `an empty .${slot} is removed from the flex row, gap included, rather than left as a hole`,
+      )
+    }
     ok(
-      /\.readout:empty\s*\{[^}]*display:\s*none/.test(barCss),
-      'an empty readout is removed from the flex row, gap included, rather than left as a hole',
+      /\.path\s*\{[^}]*direction:\s*rtl/.test(barCss) &&
+        /\.crumb\s*\{[^}]*direction:\s*ltr/.test(barCss),
+      'the trail still clips from the left, so a squeezed bar drops `crates ›` and keeps the ' +
+        'file name',
+    )
+    ok(
+      !/\.path\s*\{[^}]*display:\s*flex/.test(barCss),
+      'and stays a block box: `text-overflow: ellipsis` needs inline content, and a flex ' +
+        'container drops the ellipsis silently',
     )
   }
 

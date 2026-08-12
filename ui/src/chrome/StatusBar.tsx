@@ -9,15 +9,23 @@
  * Every field is a prop with a placeholder default. The bar reads nothing from the store,
  * so it stays a pure render target that a screenshot test can drive directly.
  *
- * The editor readout is the one thing that does not arrive as a prop, and it is deliberately
- * not a store subscription either: `editor/statusReadout.ts` pushes
- * `Markdown · UTF-8 · LF · Ln 7, Col 48` straight into the span below, because a caret
- * readout in React state would re-render this bar — and, through `App`, the pane grid under
- * it — thirty times a second under a held arrow key. Nothing else here re-renders for it,
- * and the bar still renders correctly from props alone with no editor open.
+ * The open file is the one thing that does not arrive as a prop. It comes from
+ * `editor/statusReadout.ts`, which the editor pane feeds, and it arrives in two pieces
+ * because they change at different rates:
+ *
+ * * `crates › cide-core › src › lib.rs` — the trail, in React state. It moves when the user
+ *   switches file, which is rare, and it wants real markup: one element per segment, so the
+ *   `›` separators can be their own colour and each segment can carry its own bidi
+ *   direction inside a box that clips from the left.
+ * * `Rust · UTF-8 · LF · Ln 7, Col 48` — written straight into a DOM node this component
+ *   owns. It moves on every caret move, which under a held arrow key is 30 times a second,
+ *   and no version of re-rendering the bar that often is worth having.
+ *
+ * Both used to be a 28px row above every buffer. See `statusReadout.ts` for why they moved,
+ * and `editor/EditorSurface.tsx` for the row that is no longer there.
  */
-import { useEffect, useRef } from 'react'
-import { subscribeStatusReadout } from '@/editor/statusReadout'
+import { useEffect, useRef, useState } from 'react'
+import { sameTrail, subscribeStatusReadout } from '@/editor/statusReadout'
 import { NO_DIAGNOSTICS_SOURCE } from '@/sidebar/ProblemsPanel/model'
 import styles from './StatusBar.module.css'
 
@@ -61,6 +69,7 @@ export function StatusBar({
   claude = CLAUDE_PLACEHOLDER,
 }: StatusBarProps) {
   const readoutRef = useRef<HTMLSpanElement | null>(null)
+  const [trail, setTrail] = useState<readonly string[]>([])
 
   // Returns the unsubscriber directly, and runs once: the subscription fires immediately
   // with whatever the current editor is showing, so a bar that mounts after an editor —
@@ -68,9 +77,14 @@ export function StatusBar({
   // keystroke.
   useEffect(
     () =>
-      subscribeStatusReadout((text) => {
+      subscribeStatusReadout((line) => {
         const el = readoutRef.current
-        if (el !== null) el.textContent = text
+        if (el !== null) el.textContent = line.detail
+        // Returning the previous array is what keeps a caret move out of React: the state
+        // setter bails on an identical value, and the trail only ever moves when the user
+        // changes file. Without the guard this would re-render the bar on every keystroke —
+        // the whole reason `detail` above goes straight into the DOM.
+        setTrail((prev) => (sameTrail(prev, line.trail) ? prev : line.trail))
       }),
     [],
   )
@@ -111,15 +125,31 @@ export function StatusBar({
 
       <div className={styles.right}>
         {/*
-         * The open file: `Markdown · UTF-8 · LF · Ln 7, Col 48`, and empty when no editor is
-         * open at all — clicking into a terminal leaves the last buffer's position standing,
-         * which is what it means. Written from `editor/statusReadout.ts` and therefore
-         * childless in JSX: giving React a child here would let the next render — a branch
-         * change, a token tick — overwrite the live text.
+         * `crates › cide-core › src › lib.rs`. Empty — and gone, along with its gap — when no
+         * editor is open at all; clicking into a terminal leaves the last buffer's trail
+         * standing, which is what it means. This is the only thing on the bar allowed to give
+         * way when the window narrows, and it gives way from the *left*, so the file name is
+         * the last segment to go.
+         */}
+        <div className={styles.path} data-audit="editorPath" title={trail.join('/')}>
+          {trail.map((segment, i) => (
+            // Keyed by position as well as text: a path can repeat a segment
+            // (`src/cide/src`), and the text alone would collide.
+            <span key={`${i}:${segment}`} className={styles.crumb}>
+              {i > 0 && <span className={styles.separator}>›</span>}
+              {segment}
+            </span>
+          ))}
+        </div>
+
+        {/*
+         * `Rust · UTF-8 · LF · Ln 7, Col 48`. Written from `editor/statusReadout.ts` and
+         * therefore childless in JSX: giving React a child here would let the next render —
+         * a branch change, a token tick — overwrite the live text.
          *
-         * First in the group, so the four facts that change as the user moves sit inboard of
-         * the Claude readout rather than pushing it around: the session slot is the widest
-         * thing on the bar and the one whose position should not move.
+         * Inboard of the Claude readout, so the four facts that move as the user types do not
+         * push the session slot around: that one is the widest thing on the bar and the one
+         * whose position should stay put.
          */}
         <span className={styles.readout} ref={readoutRef} data-audit="editorReadout" />
         <span

@@ -36,7 +36,7 @@ export interface GrammarState {
 }
 
 export interface GrammarSpec {
-  /** Shown in the breadcrumb readout: `Rust · UTF-8 · LF · …`. */
+  /** Shown in the status bar readout: `Rust · UTF-8 · LF · …`. */
   name: string
   keywords?: readonly string[]
   /** Coloured as keywords too; kept separate so a language can tag control flow if it wants. */

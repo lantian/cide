@@ -17,9 +17,9 @@
 }
 
 /*
- * Above the breadcrumb bar rather than over the buffer. A bar that overlays text hides the
- * lines the user needs in order to decide, and this one is asking them to choose between
- * two versions of exactly that text.
+ * In the flow above the buffer rather than over it — it used to sit above the breadcrumb bar,
+ * which is gone. A banner that overlays text hides the lines the user needs in order to
+ * decide, and this one is asking them to choose between two versions of exactly that text.
  */
 .conflict {
   flex: none;

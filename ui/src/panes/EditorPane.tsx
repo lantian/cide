@@ -27,7 +27,7 @@ import styles from './EditorPane.module.css'
 export interface EditorPaneProps {
   /** Absolute path of the file this tab shows. */
   path: string
-  /** The project root, so the breadcrumb trail is repo-relative. */
+  /** The project root, so the status bar's trail is repo-relative. */
   root?: string | undefined
   /** Set when this pane is inside a project; without it the dirty dot cannot be reported. */
   project?: string | undefined
