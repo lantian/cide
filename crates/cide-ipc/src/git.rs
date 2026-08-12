@@ -670,8 +670,14 @@ pub enum GitError {
     InvalidBranchName {
         name: String,
     },
-    /// Deleting a branch whose commits are on no other branch. Carries the name so the
-    /// confirmation can say *what* would be lost rather than "are you sure".
+    /// Deleting a branch that `HEAD` cannot reach — `git branch -d`'s refusal.
+    ///
+    /// **It does not mean the commits are on no other branch**, and no message built from this
+    /// variant may say so: the test behind it is "is this branch's tip an ancestor of where I
+    /// am standing", so a branch already merged into `release` while you sit on `main` lands
+    /// here with nothing whatsoever at stake. Saying "deleting it loses them" there is a false
+    /// statement attached to a red button, which is how a user learns to stop reading them.
+    /// The honest phrasing is git's own: not fully merged into the current branch.
     BranchNotMerged {
         name: String,
     },
@@ -759,7 +765,7 @@ impl std::fmt::Display for GitError {
             Self::BranchExists { name } => write!(f, "a branch named {name} already exists"),
             Self::InvalidBranchName { name } => write!(f, "{name} is not a valid branch name"),
             Self::BranchNotMerged { name } => {
-                write!(f, "{name} has commits that are on no other branch")
+                write!(f, "{name} is not fully merged into the current branch")
             }
             Self::BranchIsCurrent { name } => write!(f, "{name} is the branch you are on"),
             Self::CheckoutWouldOverwrite { branch, paths } => write!(

@@ -522,8 +522,14 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
           <div className={styles.panel}>
             <p className={styles.panelTitle}>Delete {mode.name}?</p>
             <p className={styles.panelBody}>
+              {/*
+               * Not "its commits are on no other branch" — Rust only checked whether HEAD can
+               * reach the tip (`git branch -d`'s question), so a branch already merged into
+               * `release` while you stand on `main` reaches this panel with nothing at stake.
+               * A red button carrying a false claim is how a user learns to stop reading them.
+               */}
               {mode.force
-                ? `${mode.name} has commits that are on no other branch. Deleting it loses them.`
+                ? `${mode.name} is not fully merged into the branch you are on. Anything only on it would be left unreachable — check it out, or merge it somewhere, if you are not sure.`
                 : 'Deleting a branch removes the name. The commits stay until git collects them.'}
             </p>
             <div className={styles.panelButtons}>
@@ -584,6 +590,18 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
               ones that differ. There is no “discard and switch”: use the git panel’s rollback
               if you mean to throw the work away.
             </p>
+            {/*
+             * The scope sentence, and it is not decoration. Both buttons run `git stash -u`,
+             * which takes the **whole** working tree — every modification and every untracked
+             * file, including ones nothing above named. A panel that lists one file and then
+             * empties the tree is a confirmation that understated what it was asking for, and
+             * *Stash and switch* is the route that leaves the rest of it off disk.
+             */}
+            <p className={styles.panelBody}>
+              Both stash buttons take the whole working tree, not only the files listed — every
+              change and every untracked file goes into one stash entry. Nothing is discarded;{' '}
+              <code>git stash list</code> has it either way.
+            </p>
             <div className={styles.panelButtons}>
               <button type="button" className={styles.action} onClick={back}>
                 Cancel
@@ -593,7 +611,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 className={styles.action}
                 disabled={busy}
                 onClick={() => tryCheckout(mode.refusal.branch, 'stash')}
-                title="git stash -u, then switch. The changes stay in the stash."
+                title="git stash -u, then switch. The whole working tree — including untracked files — stays in the stash."
               >
                 Stash and switch
               </button>
@@ -602,7 +620,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 className={styles.primary}
                 disabled={busy}
                 onClick={() => tryCheckout(mode.refusal.branch, 'stashAndRestore')}
-                title="Stash, switch, and put the changes back on the new branch."
+                title="Stash the whole working tree, switch, then put it all back on the new branch."
               >
                 Bring changes along
               </button>

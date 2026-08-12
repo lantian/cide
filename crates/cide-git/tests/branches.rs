@@ -453,6 +453,46 @@ fn deleting_an_unmerged_branch_needs_force_and_a_merged_one_does_not() {
     assert_eq!(list.local.len(), 1);
 }
 
+/// `BranchNotMerged` means "HEAD cannot reach it", **not** "these commits are on no other
+/// branch" — and the difference is a sentence under a red button.
+///
+/// `is_merged` is `git branch -d`'s test on purpose (see its doc comment), so a branch already
+/// merged into `release` refuses while you are standing on `main`, with nothing whatsoever at
+/// stake. This test exists so nobody re-derives the stronger claim from the variant's name and
+/// writes it into a confirmation again: `explain` in `ui/src/chrome/branchModel.ts` and the
+/// popup's delete panel both used to say "has commits that are on no other branch. Deleting it
+/// loses them.", which this arrangement disproves.
+#[test]
+fn a_branch_merged_into_some_other_branch_is_still_refused_from_here() {
+    let repo = TempRepo::new("delete-merged-elsewhere");
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("first");
+    repo.git(&["checkout", "-q", "-b", "release"]);
+    repo.git(&["checkout", "-q", "-b", "feature"]);
+    repo.write("b.txt", b"work\n");
+    repo.commit_all("the work");
+    repo.git(&["checkout", "-q", "release"]);
+    repo.git(&["merge", "-q", "--no-ff", "-m", "merge", "feature"]);
+    repo.git(&["checkout", "-q", "main"]);
+
+    // Every commit on `feature` is reachable from `release`. Deleting the name loses nothing,
+    // and cide still refuses — which is fine, and is exactly why the message may not claim it.
+    assert_eq!(
+        branch::delete(&repo.root, "feature", false),
+        Err(GitError::BranchNotMerged {
+            name: "feature".to_string()
+        })
+    );
+    assert_eq!(
+        GitError::BranchNotMerged {
+            name: "feature".to_string()
+        }
+        .to_string(),
+        "feature is not fully merged into the current branch",
+        "the wording is the claim; it has to stay the one that was measured"
+    );
+}
+
 // --- fetch and pull ---------------------------------------------------------------------------
 
 #[test]
@@ -561,5 +601,55 @@ fn a_fetch_updates_the_remote_row_without_moving_the_working_tree() {
         (main.ahead, main.behind),
         (0, 1),
         "the row now knows it is a commit behind"
+    );
+}
+
+/// `output` is what the popup prints, verbatim, as the single line a fetch earns. So it has to
+/// be a sentence.
+///
+/// It was libgit2's sideband stream, and this test is the one that would have caught it: a
+/// successful fetch of three objects handed the UI `"Counting objects 1\rCounting objects
+/// 3\r\nCompressing objects: 0% (0/3)\rCompressing objects: 100% (3/3), done\n"`, carriage
+/// returns and all. Both halves are pinned, because the empty case is load-bearing too —
+/// `fetchNote` reads an empty `output` as "already up to date", so a fetch that really brought
+/// something down must not produce one.
+#[test]
+fn a_fetch_reports_a_sentence_and_not_a_progress_meter() {
+    let origin = TempRepo::new("fetch-says-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+    let work = clone_of(&origin, "fetch-says-work");
+
+    // Nothing new: silence, which is what makes the UI say "already up to date".
+    let quiet = branch::fetch(&work.root, None).expect("fetch");
+    assert!(
+        !quiet.shelled_out,
+        "a path remote stays on the libgit2 side"
+    );
+    assert_eq!(quiet.output, "", "an up-to-date fetch has nothing to say");
+
+    origin.write("a.txt", b"two\n");
+    origin.commit_all("second");
+
+    let outcome = branch::fetch(&work.root, None).expect("fetch");
+    assert!(
+        !outcome.output.is_empty(),
+        "a fetch that brought commits must not read as 'already up to date'"
+    );
+    assert!(
+        !outcome.output.contains('\r') && !outcome.output.contains('\n'),
+        "the note bar is one line: {:?}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("Counting objects")
+            && !outcome.output.contains("Compressing objects"),
+        "sideband progress is not a message: {:?}",
+        outcome.output
+    );
+    assert!(
+        outcome.output.contains("origin"),
+        "it names the remote it talked to: {:?}",
+        outcome.output
     );
 }

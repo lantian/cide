@@ -47,6 +47,7 @@ import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
+import { explain } from '@/chrome/branchModel'
 import {
   branch as branchApi,
   claudeSend,
@@ -428,14 +429,24 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // Every repository in the project, like `git.push` directly above — the command names
         // none of them, and in a superproject picking one would be a guess.
         //
-        // Uncaught on purpose: a rejected pull is `notFastForward` with both counts, or
-        // `noUpstream`, and `chrome/Failures.tsx` is what puts either on screen. cide never
-        // merges for you; see `cide_git::branch::pull`.
+        // The rejection still reaches `chrome/Failures.tsx` through `unhandledrejection`, but
+        // it may not reach it as a raw `GitError`: that is `{kind, detail}` with no `message`
+        // field at all, and `Failures.describe` falls through to `kind` — so a divergent pull
+        // used to toast the bare word `notFastForward`, with the two counts that are the whole
+        // point of refusing sitting unread in `detail`. `explain` is the sentence. Rethrown
+        // rather than reported here, so the one window listener stays the only surface.
+        //
+        // One chain per repository rather than `Promise.all`: with four repositories and two
+        // failures, `Promise.all` reports the first and marks the rest handled.
         const project = activeProjectOf(boot())
         const repos = reposOf(boot())
         if (project === null || repos.length === 0) return unmet(command, 'no repository open')
         const run = command === 'git.pull' ? branchApi.pull : branchApi.fetch
-        void Promise.all(repos.map((repo) => run(project.id, repo)))
+        for (const repo of repos) {
+          void run(project.id, repo).catch((error: unknown) => {
+            throw new Error(explain(error))
+          })
+        }
         return
       }
 

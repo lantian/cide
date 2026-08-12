@@ -446,9 +446,13 @@ pub fn rename(root: &Path, from: &str, to: &str) -> Result<()> {
 
 /// Delete a local branch.
 ///
-/// Refuses the current branch, and refuses one whose commits are on no other branch unless
-/// `force`. The second check is the one that matters: deleting a merged branch loses a name,
-/// deleting an unmerged one loses commits, and only the user can say whether that is intended.
+/// Refuses the current branch, and refuses one that `HEAD` cannot reach unless `force`.
+///
+/// The second check is [`is_merged`], which is `git branch -d`'s question and **not** "are
+/// these commits on some other branch". It is deliberately the narrower test — see
+/// [`is_merged`] — and the consequence is that every message built on
+/// [`GitError::BranchNotMerged`] has to be phrased as "not fully merged into the current
+/// branch". Anything stronger is a claim this function never checked.
 ///
 /// Deleting the branch **on the remote** is deliberately not here. It is a push of an empty
 /// refspec, it is not undoable by the person who ran it, and it belongs behind a gesture that
@@ -479,6 +483,13 @@ pub fn delete(root: &Path, name: &str, force: bool) -> Result<()> {
 /// button has to answer is "would this lose commits from where I am standing", and walking
 /// every ref to see whether some other branch happens to contain them is both slower and a
 /// different question.
+///
+/// It is one-directional, and only one direction is safe. `true` really does mean nothing is
+/// lost — the tip is an ancestor of `HEAD`. `false` means only "`HEAD` cannot reach it": a
+/// branch merged into `release` while you stand on `main` answers `false` with nothing at
+/// stake at all. So `false` may never be reported to a user as "these commits exist nowhere
+/// else"; it is reported as "not fully merged into the current branch", which is exactly what
+/// was measured.
 fn is_merged(repo: &Repository, branch: &git2::Branch<'_>) -> Result<bool> {
     let Some(tip) = branch.get().target() else {
         return Ok(true);
@@ -546,27 +557,41 @@ fn fetch_with(repo: &Repository, root: &Path, remote: &str) -> Result<FetchOutco
         }
         push::Route::Libgit2 => {
             let mut handle = repo.find_remote(remote).wrap()?;
-            let mut messages = String::new();
             {
-                let mut callbacks = git2::RemoteCallbacks::new();
-                callbacks.sideband_progress(|bytes| {
-                    messages.push_str(&String::from_utf8_lossy(bytes));
-                    true
-                });
-                let mut options = git2::FetchOptions::new();
-                options.remote_callbacks(callbacks);
                 // An empty refspec list means "the remote's configured ones", which is what
                 // a bare `git fetch origin` does.
                 handle
-                    .fetch::<&str>(&[], Some(&mut options), None)
+                    .fetch::<&str>(&[], None, None)
                     .map_err(|e| GitError::Fetch {
                         output: format!("{:?}: {}", e.class(), e.message()),
                     })?;
             }
+            /*
+             * `output` is a sentence, not the sideband stream.
+             *
+             * Collecting `sideband_progress` was the obvious thing and it lost: that stream is
+             * written for a terminal that rewrites its own line, so a successful fetch handed
+             * the popup `"Counting objects 1\rCounting objects 3\r\nCompressing objects: 0%
+             * (0/3)\rCompressing objects: 100% (3/3), done\n"` — which `fetchNote` then showed
+             * verbatim as the one line a user gets for asking to fetch. Only local remotes
+             * reach this arm (see `push::route`), and a local remote has no server-side
+             * messages in that stream at all: it is pure progress meter.
+             *
+             * The object count is the part a person can read, and it is also the only signal
+             * this arm has for "something actually came down" — `advanced` is a pull's number
+             * and is always zero here, so an empty `output` is what makes `fetchNote` say
+             * "already up to date". Reporting nothing at all would make it say that after a
+             * fetch that really did bring commits.
+             */
+            let received = handle.stats().received_objects();
             Ok(FetchOutcome {
                 remote: remote.to_string(),
                 shelled_out: false,
-                output: messages,
+                output: if received == 0 {
+                    String::new()
+                } else {
+                    format!("Fetched {received} objects from {remote}")
+                },
                 advanced: 0,
             })
         }

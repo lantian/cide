@@ -267,6 +267,16 @@ try {
     { branch: 'f', paths: ['a'] },
     'a malformed payload is filtered rather than rendered as `7`',
   )
+  /*
+   * A refusal with no path list at all is not a refusal. Returning `{branch, paths: []}` would
+   * put the popup into its stash panel over an empty `<ul>` — a question about no files, whose
+   * two answers both stash the working tree. `null` sends it down `explain` instead.
+   */
+  eq(
+    m.refusalOf({ kind: 'checkoutWouldOverwrite', detail: { branch: 'f' } }),
+    null,
+    'a refusal missing its paths is not turned into an empty one',
+  )
 
   // --- every failure becomes a sentence --------------------------------------------------------
 
@@ -275,7 +285,14 @@ try {
     [refusal, 'src/a.rs', 'a refusal names the files even outside the panel'],
     [{ kind: 'branchExists', detail: { name: 'main' } }, 'main', 'branchExists names the branch'],
     [{ kind: 'invalidBranchName', detail: { name: 'a b' } }, 'valid branch name', 'invalidBranchName explains'],
-    [{ kind: 'branchNotMerged', detail: { name: 'old' } }, 'loses them', 'branchNotMerged says what is lost'],
+    [
+      { kind: 'branchNotMerged', detail: { name: 'old' } },
+      'not fully merged into the branch you are on',
+      // Rust's test is `git branch -d`'s — is the tip an ancestor of HEAD — so this variant
+      // arrives for a branch already merged into some *other* branch, with nothing at stake.
+      // The sentence may therefore not claim the commits exist nowhere else.
+      'branchNotMerged says only what was measured, not "the commits are on no other branch"',
+    ],
     [{ kind: 'branchIsCurrent', detail: { name: 'main' } }, 'Switch somewhere else', 'branchIsCurrent suggests the fix'],
     [{ kind: 'noSuchBranch', detail: { name: 'gone' } }, 'gone', 'noSuchBranch names it'],
     [
@@ -351,6 +368,34 @@ try {
     m.fetchNote({ remote: 'origin', advanced: 0, output: ' From /tmp/x\n' }),
     'From /tmp/x',
     "git's own text is shown when there is any",
+  )
+  /*
+   * The note bar is one line. `git fetch` writes several, and libgit2's sideband stream — which
+   * `branch::fetch_with` no longer forwards, precisely because of this — is a progress meter
+   * full of carriage returns. Both used to be printed verbatim as the one sentence a user got
+   * for asking to fetch.
+   */
+  eq(
+    m.fetchNote({
+      remote: 'origin',
+      advanced: 0,
+      output: 'From /srv/thing\n   abc1234..def5678  main       -> origin/main\n',
+    }),
+    'From /srv/thing · abc1234..def5678  main       -> origin/main',
+    'multi-line transport output is joined, not printed with newlines in a one-line bar',
+  )
+  eq(
+    m.fetchNote({
+      remote: 'origin',
+      advanced: 0,
+      output: 'Counting objects 1\rCounting objects 3\r\nCompressing objects: 100% (3/3), done\n',
+    }),
+    'Counting objects 1 · Counting objects 3 · Compressing objects: 100% (3/3), done',
+    'carriage returns are line breaks here too — a progress meter never reaches the bar intact',
+  )
+  ok(
+    m.fetchNote({ remote: 'origin', advanced: 0, output: 'x'.repeat(400) }).length <= 160,
+    'a fetch of forty branches is truncated rather than pushing the list off the popup',
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

@@ -264,7 +264,10 @@ export function explain(error: unknown): string {
     case 'invalidBranchName':
       return `${name('name') === '' ? 'A branch name' : name('name')} is not a valid branch name — no spaces, no “..”, no trailing “.lock”`
     case 'branchNotMerged':
-      return `${name('name')} has commits that are on no other branch. Deleting it loses them.`
+      // Not "its commits are on no other branch". Rust's test is `git branch -d`'s — is the
+      // tip an ancestor of HEAD — so a branch already merged into `release` while you stand
+      // on `main` lands here with nothing at stake. See `GitError::BranchNotMerged`.
+      return `${name('name')} is not fully merged into the branch you are on. Anything only on it would be left unreachable.`
     case 'branchIsCurrent':
       return `${name('name')} is the branch you are on. Switch somewhere else first.`
     case 'noSuchBranch':
@@ -316,13 +319,38 @@ export function checkoutNote(outcome: {
   return ''
 }
 
-/** What a fetch or a fast-forward pull has to say. Never empty: the user asked for network. */
+/**
+ * Transport output as a single line.
+ *
+ * `git fetch` writes several — `From /srv/thing` then a line per ref — and the note bar is one
+ * line high with no scroll. Joining with `·` rather than taking the first keeps the part that
+ * says what moved, which is the last line, not the first.
+ *
+ * The cap is on characters and not on lines because a fetch of forty new branches is forty
+ * lines, and a note that pushes the branch list off the popup is worse than a truncated one.
+ */
+function oneLine(text: string): string {
+  const said = text
+    .split(/[\r\n]+/)
+    .map((part) => part.trim())
+    .filter((part) => part !== '')
+    .join(' · ')
+  return said.length > 160 ? `${said.slice(0, 159)}…` : said
+}
+
+/**
+ * What a fetch or a fast-forward pull has to say. Never empty: the user asked for network.
+ *
+ * `output` is trusted to be a *message*, which is why `cide_git::branch::fetch_with` no longer
+ * forwards libgit2's sideband stream: that is a progress meter full of carriage returns, and
+ * it used to arrive here and be printed verbatim as the one sentence a successful fetch got.
+ */
 export function fetchNote(outcome: { remote: string; advanced: number; output: string }): string {
   if (outcome.advanced > 0) {
     const commits = outcome.advanced === 1 ? '1 commit' : `${outcome.advanced} commits`
     return `Fast-forwarded ${commits} from ${outcome.remote}`
   }
-  const said = outcome.output.trim()
+  const said = oneLine(outcome.output)
   return said === '' ? `Already up to date with ${outcome.remote}` : said
 }
 
