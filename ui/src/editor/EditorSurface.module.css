@@ -166,6 +166,24 @@
   font-size: 11px;
 }
 
+/*
+ * The number column fills the 56px reserved above, rather than being sized by its digits.
+ *
+ * `.cm-gutter` is `flex-shrink: 0` with no grow (`@codemirror/view` L6958-6966), so without this
+ * the `.cm-lineNumbers` box is only as wide as the widest number plus its padding — about 32px
+ * at three digits — and the other ~24px of the reservation is bare `.cm-gutters` background
+ * sitting between the numbers and the text.
+ *
+ * That slack is `--panel`, the same colour as the editor behind it, so it is invisible until
+ * something paints one side of it: `.cm-activeLineGutter` below tints the number cell at full
+ * `--sel` and `.cm-activeLine` tints the text line at 40%, leaving an untinted strip down the
+ * middle of the caret's row that reads as a separate white column. Growing the gutter puts the
+ * whole reservation inside the element those two rules paint, so the tint is continuous.
+ */
+.body :global(.cm-lineNumbers) {
+  flex: 1;
+}
+
 .body :global(.cm-lineNumbers .cm-gutterElement) {
   min-width: 0;
   padding: 0 12px 0 0;
