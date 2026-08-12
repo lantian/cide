@@ -36,6 +36,7 @@ import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
+import { ProjectSwitcher } from '@/chrome/ProjectSwitcher'
 import { SidebarSplitter } from '@/chrome/SidebarSplitter'
 import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
 import { TransportNotice } from '@/ipc/TransportNotice'
@@ -869,6 +870,15 @@ export function App() {
           * `void` call sites above it discard.
           */}
         <Failures />
+
+        {/*
+          * The Ctrl+Tab popup. No props and no keyboard handling: the walk, its claim on Tab
+          * and Escape, and the release watcher all live in `keys/switcherStore.ts`, so the
+          * gesture already works without this line — mounting it is what makes it *visible*.
+          * Without it Ctrl+Tab switches projects silently, which is the same "did anything
+          * happen?" failure this session has now fixed nine times.
+          */}
+        <ProjectSwitcher />
 
         {pendingClose && (
           <CloseConfirm
