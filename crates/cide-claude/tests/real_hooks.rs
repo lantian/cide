@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use cide_claude::{HookEvent, StatusLine, inline_settings};
+use cide_claude::{ClaudeTheme, HookEvent, StatusLine, inline_settings};
 
 fn on_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -80,7 +80,11 @@ fn the_real_cli_calls_the_hooks_our_settings_register() {
     // `--session-id`: without it the CLI picks its own uuid, every hook frame names a session
     // the app never minted, and the state machine silently never runs.
     let session_id = uuid::Uuid::new_v4().to_string();
-    let settings = inline_settings(&hook.to_string_lossy(), &StatusLine::Ours);
+    let settings = inline_settings(
+        &hook.to_string_lossy(),
+        &StatusLine::Ours,
+        ClaudeTheme::Dark,
+    );
 
     let output = std::process::Command::new(&claude)
         .arg("-p")
@@ -172,6 +176,7 @@ fn a_chained_statusline_is_not_lost() {
     let settings = inline_settings(
         &hook.to_string_lossy(),
         &StatusLine::Chained("printf MINE".into()),
+        ClaudeTheme::Dark,
     );
     let command = settings["statusLine"]["command"]
         .as_str()

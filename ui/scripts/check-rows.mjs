@@ -212,9 +212,16 @@ try {
   // is the whole of the wiring; there is no prop to check on the other side.
   const header = readFileSync('src/chrome/AppHeader.tsx', 'utf8')
   ok(/<RowControls\b/.test(header), 'the header mounts `RowControls`')
+  // Scoped to the `<SplitTree>` element, not to the whole file. It used to grep all of
+  // App.tsx, and that was too broad the moment the pane's title bar was deleted: the floating
+  // controls' context menu takes an `onAddRow` of its own, on `<PaneFrame>`, which is a menu
+  // item and not a second strip. The invariant was never "the string appears nowhere" — it is
+  // "the pane TREE is not handed one", because that is what draws the strip.
+  const splitTree = /<SplitTree\b[\s\S]*?renderPane=/.exec(app)?.[0] ?? ''
+  ok(splitTree !== '', 'the App still mounts a `SplitTree` to check')
   ok(
-    !/\bonAddRow=\{/.test(app),
-    'App.tsx no longer feeds `onAddRow` to the pane tree — it would draw a second strip',
+    !/\bonAddRow=\{/.test(splitTree),
+    '`<SplitTree>` is not handed `onAddRow` — it would draw a second strip under the panes',
   )
 
   // --- and that the header's own controls are still reachable at eight projects -------------

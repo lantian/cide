@@ -279,14 +279,20 @@ fn wants_fork(fork: Option<bool>) -> bool {
 ///
 /// Looked up beside our own executable, which is where every packaging format this project
 /// ships puts the two binaries together.
-fn hook_settings() -> Option<String> {
+fn hook_settings(theme: cide_ipc::Theme) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let hook = exe.parent()?.join("cide-hook");
     if !hook.exists() {
         return None;
     }
-    let settings =
-        cide_claude::inline_settings(&hook.to_string_lossy(), &cide_claude::StatusLine::Ours);
+    let settings = cide_claude::inline_settings(
+        &hook.to_string_lossy(),
+        &cide_claude::StatusLine::Ours,
+        match theme {
+            cide_ipc::Theme::Light => cide_claude::ClaudeTheme::Light,
+            cide_ipc::Theme::Dark => cide_claude::ClaudeTheme::Dark,
+        },
+    );
     serde_json::to_string(&settings).ok()
 }
 
@@ -337,6 +343,15 @@ pub async fn session_spawn(
     // Optional on the wire, and it has to be: see [`wants_fork`].
     fork: Option<bool>,
 ) -> Result<SessionId, SessionError> {
+    // Read before the blocking closure: `WorkspaceState` is Tauri-managed state and the
+    // closure below is `spawn_blocking`, which cannot hold a `State<'_, _>` across the await.
+    // One bool's worth of work on the caller's thread, and it decides which way round the
+    // child draws itself — see `hook_settings`.
+    let theme = app
+        .try_state::<crate::workspace_state::WorkspaceState>()
+        .map(|ws| ws.with(|w| w.settings.theme))
+        .unwrap_or_default();
+
     let mut spec = SpawnSpec::new(program, PathBuf::from(cwd)).geometry(pty_geometry(geometry));
     for a in args {
         spec = spec.arg(a);
@@ -419,7 +434,7 @@ pub async fn session_spawn(
         );
 
         if is_claude {
-            match hook_settings() {
+            match hook_settings(theme) {
                 Some(json) => spec = spec.arg("--settings").arg(json),
                 // Without an absolute path to `cide-hook` the child cannot run it: its cwd is
                 // the project root and its PATH is the user's. Skipping the flag leaves a

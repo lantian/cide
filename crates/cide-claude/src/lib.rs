@@ -34,6 +34,6 @@ pub use headless::{Headless, ToolAccess};
 pub use hook::{HookEvent, HookFrame};
 pub use orphans::{arm, on_spawn_thread, sweep_hook_sockets};
 pub use session::conversation;
-pub use settings::{StatusLine, inline_settings};
+pub use settings::{ClaudeTheme, StatusLine, inline_settings};
 pub use state::{is_permission_request, next_state};
 pub use version::{Support, check_once};

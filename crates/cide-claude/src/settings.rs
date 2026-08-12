@@ -54,7 +54,7 @@ impl StatusLine {
 /// `hook_bin` is the absolute path to `cide-hook`; it must be absolute because the child's
 /// working directory is the project root and its `PATH` is the user's, neither of which is
 /// guaranteed to contain our binary.
-pub fn inline_settings(hook_bin: &str, status: &StatusLine) -> Value {
+pub fn inline_settings(hook_bin: &str, status: &StatusLine, theme: ClaudeTheme) -> Value {
     let mut hooks = serde_json::Map::new();
 
     for event in HookEvent::ALL {
@@ -83,16 +83,75 @@ pub fn inline_settings(hook_bin: &str, status: &StatusLine) -> Value {
         });
     }
 
+    // Tell the CLI which way round its own palette should be.
+    //
+    // **This is the real fix for "white text in claude code".** Claude Code's `theme` defaults
+    // to `dark`, whose `text` is `rgb(255,255,255)` — emitted as a 24-bit `SGR 38;2;255;255;255`
+    // literal, not an ANSI slot, so no terminal palette we choose can touch it. In a white pane
+    // that is 1.00:1: invisible. Its diff rows survived only because the CLI paints those with
+    // backgrounds of its own, which is exactly the reported screenshot — two readable coloured
+    // bars and nothing else.
+    //
+    // `xterm`'s `minimumContrastRatio` is the safety net and it lands that white on grey at
+    // about 3.6:1: legible, and grey prose is not a palette working. This is the source.
+    //
+    // Set at spawn, so a theme switch does not re-theme a *running* session — the CLI reads
+    // this once. A pane spawned after the switch is correct; an open one keeps what it was
+    // given, which is the same limitation `--settings` has for hooks.
+    settings["theme"] = Value::String(theme.as_str().to_owned());
+
     settings
+}
+
+/// Which way round Claude Code should draw itself.
+///
+/// Deliberately not cide's own `Theme`: this crate must not depend on `cide-ipc`, and these are
+/// the CLI's own strings — `dark`, `light`, and the `-ansi` variants that resolve through the
+/// terminal palette instead of 24-bit literals. Only the two are offered, because the `-ansi`
+/// pair is what a user picks when their terminal theme is authoritative and ours is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeTheme {
+    Dark,
+    Light,
+}
+
+impl ClaudeTheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The palette the CLI draws itself in follows cide's.
+    ///
+    /// The bug this closes: Claude Code's `theme` defaults to `dark`, whose `text` is
+    /// `rgb(255,255,255)` emitted as a 24-bit SGR literal rather than an ANSI slot — so no
+    /// terminal palette can reach it, and in a white pane it is 1.00:1. Only the CLI can fix
+    /// that, and this is the one channel we have to tell it.
+    ///
+    /// Asserted on the wire strings, not on the enum: these are the CLI's own vocabulary
+    /// (`dark`, `light`, and the `-ansi` pair), read out of the shipped 2.1.228 binary. A
+    /// rename here is a rename of something we do not own.
+    #[test]
+    fn the_cli_is_told_which_way_round_to_draw_itself() {
+        let dark = inline_settings("/opt/cide/cide-hook", &StatusLine::None, ClaudeTheme::Dark);
+        let light = inline_settings("/opt/cide/cide-hook", &StatusLine::None, ClaudeTheme::Light);
+        assert_eq!(dark["theme"], "dark");
+        assert_eq!(light["theme"], "light");
+        // And the hooks are still there: the theme rides in the same `--settings` document, so
+        // getting it wrong would cost the session its hooks as well as its colours.
+        assert!(light["hooks"].is_object(), "{light}");
+    }
+
     #[test]
     fn every_hook_event_is_registered_under_its_cli_name() {
-        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::Ours);
+        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::Ours, ClaudeTheme::Dark);
         let hooks = s["hooks"].as_object().expect("hooks is an object");
 
         assert_eq!(hooks.len(), HookEvent::ALL.len());
@@ -112,7 +171,7 @@ mod tests {
 
     #[test]
     fn the_statusline_is_a_command_because_nothing_else_is_honoured() {
-        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::Ours);
+        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::Ours, ClaudeTheme::Dark);
         assert_eq!(s["statusLine"]["type"], "command");
         assert_eq!(s["statusLine"]["command"], "/opt/cide/cide-hook statusline");
     }
@@ -123,6 +182,7 @@ mod tests {
         let s = inline_settings(
             "/opt/cide/cide-hook",
             &StatusLine::Chained("~/bin/my-status --fancy".into()),
+            ClaudeTheme::Dark,
         );
         assert_eq!(
             s["statusLine"]["command"],
@@ -133,7 +193,7 @@ mod tests {
     #[test]
     fn no_statusline_means_the_key_is_absent_not_empty() {
         // An empty command string would be configured-and-broken rather than unconfigured.
-        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::None);
+        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::None, ClaudeTheme::Dark);
         assert!(s.get("statusLine").is_none());
         assert_eq!(
             s["hooks"].as_object().expect("still has hooks").len(),
@@ -146,7 +206,7 @@ mod tests {
     fn the_payload_is_valid_json_for_a_command_line() {
         // It is passed as one argv entry to `--settings`, so it has to survive a round trip
         // through a string with no shell quoting of its own.
-        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::Ours);
+        let s = inline_settings("/opt/cide/cide-hook", &StatusLine::Ours, ClaudeTheme::Dark);
         let text = serde_json::to_string(&s).expect("serialises");
         let back: Value = serde_json::from_str(&text).expect("round trips");
         assert_eq!(back, s);

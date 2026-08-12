@@ -749,6 +749,16 @@ export function App() {
                         onAddTile={() =>
                           void splitPane(activeProject.id, tab.id, paneNode.id, 'row', 'after')
                         }
+                        // Both were drawn disabled, and that mattered more once the pane's
+                        // title bar was deleted: the right-click menu became the primary route
+                        // to splitting, so two of its items naming "use the header instead"
+                        // was most of the gesture missing.
+                        onSplitDown={() =>
+                          void splitPane(activeProject.id, tab.id, paneNode.id, 'col', 'after')
+                        }
+                        onAddRow={() =>
+                          void splitPane(activeProject.id, tab.id, tab.tree.focused, 'col', 'after')
+                        }
                         onMaximize={() =>
                           void maximizePane(
                             activeProject.id,

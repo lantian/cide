@@ -34,6 +34,10 @@
   align-items: baseline;
   gap: 6px;
   height: var(--h-panetitle);
+  /* Room for the floating pane cluster, which now lands exactly where this header's own
+     right-aligned controls sit. `--pane-corner` is published by `.frame` and reserved by the
+     cluster's `min-width`, so the number cannot drift from the box it is avoiding. */
+  padding-right: calc(8px + var(--pane-corner, 0px));
   /*
    * The right pad is the pane frame's floating control cluster, not decoration.
    *
