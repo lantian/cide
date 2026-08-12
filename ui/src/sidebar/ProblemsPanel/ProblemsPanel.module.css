@@ -200,8 +200,14 @@
   cursor: pointer;
 }
 
+/* The same hover the other two sidebars now use, so a row under the pointer means one thing
+   across the three panels the rail swaps between. `--chrome-hi` is the fallback for an engine
+   without `color-mix()`; the reason it is not the first choice any more is in
+   `sidebar/FileTree.module.css` — on the white panel it is a heavier wash than the selected
+   band it is supposed to sit under. */
 .rowButton:hover {
   background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
 }
 
 .rowButton:focus-visible {

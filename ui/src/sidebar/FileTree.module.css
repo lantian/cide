@@ -91,8 +91,29 @@
   color: var(--text);
 }
 
+/*
+ * Hover, derived from the selection band rather than from the chrome.
+ *
+ * `--chrome-hi` was the wrong side of `--sel` in the light theme, and only there. On the white
+ * panel (#ffffff, L 1.000) the hover band `--chrome-hi` (#e6e6eb) sits at L 0.794 while the
+ * selected band `--sel` (#ffe7d9) sits at L 0.835 — so hovering an *unselected* row painted a
+ * heavier wash than the selected row next to it, and the list read as though the mouse were
+ * the selection. Dark has the two the right way round (panel L 0.008, hover L 0.017, sel
+ * L 0.042), which is why this survived: the ordering flipped with the theme.
+ *
+ * Mixing `--sel` down is what makes the ordering true by construction instead of by two
+ * palettes happening to agree — hover is always a fraction of the same colour selection is,
+ * in whatever theme. The alternative that lost was picking a third token per theme: there
+ * isn't one that works in both (`--panel-2` is *below* `--panel` in dark, so a hover made of
+ * it reads as a hole), and it would have to be re-checked every time the palette moves.
+ *
+ * The `--chrome-hi` line above it is the fallback, not a leftover: an engine without
+ * `color-mix()` drops the second declaration and keeps the first, so the worst case is the
+ * hover this replaces rather than no hover at all.
+ */
 .row:hover {
   background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
 }
 
 /*
@@ -173,17 +194,76 @@
 /*
  * The twisty. A fixed 11px box so the glyph column lines up whether or not a row has one —
  * without it, files sit one glyph-width left of their sibling folders.
+ *
+ * # Why the arrow is drawn here and not typed
+ *
+ * The row still renders `▾`/`▸` as text (`FileTree.tsx`), and **neither bundled face has
+ * those characters**. U+25BE and U+25B8 are outside every `unicode-range` the six
+ * `@fontsource` subsets declare — the union stops at U+2000-206F plus a handful of singletons
+ * (U+2191, U+2193, U+2212, U+2215), and Geometric Shapes is not in it. So every twisty in this
+ * tree was being resolved by fontconfig to whatever the machine happens to have, at a foreign
+ * advance width, a foreign baseline and a foreign weight, and differently on someone else's
+ * machine. `font-synthesis: none` does not cover this: a *missing glyph* is fallback, not
+ * synthesis, so the backstop in `tokens.css` never saw it.
+ *
+ * `font-size: 0` hides the text and the shape below replaces it, so the arrow is this app's
+ * in both trees. The alternative that lost was swapping the character for one the subsets do
+ * cover (U+2191/U+2193 are the only arrows in range) — those are *stroked* arrows, not
+ * disclosure triangles, and they would have changed what the control looks like it does.
  */
 .twisty {
   flex: none;
   width: 11px;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /*
+   * `stretch` because this span is a *hit target*, not just a picture: `FileTree.tsx` folds a
+   * directory on a single click that `closest()`-es to this class. As a flex item its height
+   * is its content, and its content used to be a 9px line box (~12px tall) — with the glyph
+   * gone that would have collapsed to the 5px of the triangle, leaving a quarter of the row's
+   * height to hit. Stretched, the column is the 11×21 the mock's gutter actually is.
+   */
+  align-self: stretch;
+  font-size: 0;
   color: var(--faint);
-  font-size: 9px;
 }
 
 /*
- * There is no `.glyph` here any more. The row draws a `<FileIcon>`, which brings its own 16px
+ * The disclosure triangle, sized odd-against-odd so it centres on a whole pixel.
+ *
+ * 5×7 and 7×5 rather than one square: the row is 21px and the twisty box 11px, both odd, so an
+ * even-sized shape would land on a half pixel exactly as the icon did. `(21 − 5) / 2 = 8`,
+ * `(21 − 7) / 2 = 7`, `(11 − 7) / 2 = 2`, `(11 − 5) / 2 = 3` — every offset whole.
+ *
+ * `clip-path` over a `currentColor` block rather than the classic border triangle: a border
+ * triangle of odd height needs a fractional border-width on each side of the apex, which puts
+ * the blur back where this is meant to take it out.
+ *
+ * `:not(:empty)` is what keeps an *empty* directory from growing an arrow. `aria-expanded`
+ * is on every directory row, but the row only fills the span for `isDir && hasChildren`, and
+ * a triangle on a folder whose twisty does nothing invites the click that does nothing.
+ */
+[aria-expanded='false'] > .twisty:not(:empty)::before,
+[aria-expanded='true'] > .twisty:not(:empty)::before {
+  content: '';
+  background: currentColor;
+}
+
+[aria-expanded='false'] > .twisty:not(:empty)::before {
+  width: 5px;
+  height: 7px;
+  clip-path: polygon(0 0, 0 100%, 100% 50%);
+}
+
+[aria-expanded='true'] > .twisty:not(:empty)::before {
+  width: 7px;
+  height: 5px;
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+}
+
+/*
+ * There is no `.glyph` here any more. The row draws a `<FileIcon>`, which brings its own 15px
  * box (`icons/FileIcon.module.css`) and is an `<img>` — opaque to this stylesheet, so a colour
  * rule here would have done nothing while looking like it did something. The 5px flex `gap` on
  * `.row` still separates it from the name.
@@ -196,11 +276,24 @@
   text-overflow: ellipsis;
 }
 
+/*
+ * The status letter. Deliberately no `font-size` — it takes the row's 11.5px.
+ *
+ * It was 10.5px, which made the `M` beside a filename 9% smaller than the filename, and put
+ * it on a different baseline: a flex row centres each child's *box*, so a child's baseline
+ * lands at `rowHeight / 2 + 0.36 × fontSize` for JetBrains Mono (hhea 1020/-300 over 1000
+ * upem). At 11.5px that is 14.64px from the row top and at 10.5px 14.28px, so the tag column
+ * rode a third of a pixel high down the whole tree. One size per row is the only fix that
+ * holds — `align-items: baseline` was the alternative, and it would have hung the file icon,
+ * which is an `<img>` whose baseline is its bottom edge, 4px above where it belongs.
+ *
+ * The 9px column stays: a mono glyph at 11.5px advances 6.9px, so the letter still fits with
+ * room to spare and the name column does not move.
+ */
 .tag {
   flex: none;
   width: 9px;
   text-align: right;
-  font-size: 10.5px;
 }
 
 /* Status colours, from the mock: M blue, A green, D faint and struck through. */
@@ -218,7 +311,7 @@
 }
 
 /* The `D` itself: faint, but not struck through — a one-glyph tag with a rule through it is
-   unreadable at 10.5px. */
+   unreadable at this size. */
 .tagDeleted {
   color: var(--faint);
 }

@@ -23,8 +23,25 @@
   cursor: default;
 }
 
+/*
+ * Hover, mixed down from the selection band. `--chrome-hi` is a heavier wash than `--sel` on
+ * the white panel (L 0.794 against L 0.835 on a panel at L 1.000) and a lighter one in dark,
+ * so hover and the current row read in opposite orders in the two themes; deriving one from
+ * the other makes the ordering hold in both. See `sidebar/FileTree.module.css`.
+ *
+ * A `background-image` layer rather than a `background-color`, which is what the other two
+ * sidebars use, because this is the one tree whose rows already have a colour of their own: a
+ * group row is `--panel-2`, and an opaque hover *replaced* it, so hovering a changelist header
+ * made it stop looking like a header. An image composites over the colour instead of
+ * displacing it. The `--chrome-hi` line is the fallback an engine without `color-mix()` keeps —
+ * one flat stop, so it is the band this replaces rather than nothing.
+ */
 .row:hover {
-  background: var(--chrome-hi);
+  background-image: linear-gradient(var(--chrome-hi), var(--chrome-hi));
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--sel) 55%, transparent),
+    color-mix(in srgb, var(--sel) 55%, transparent)
+  );
 }
 
 /* Keyboard focus has to be visible in a tree whose selection is drawn as checkboxes: the
@@ -38,9 +55,11 @@
   background: var(--panel-2);
 }
 
-.groupRow:hover {
-  background: var(--chrome-hi);
-}
+/* There is no `.groupRow:hover` any more, and its absence is the fix: it repainted the row
+   `--chrome-hi` and threw away the `--panel-2` that says "this is a changelist header", so a
+   group under the pointer looked like a file. `.row:hover` above tints *over* whatever colour
+   the row has, and it outranks this rule's `background-image: none` on specificity, so the
+   group keeps its own ground and gains the hover on top of it. */
 
 /*
  * The current row — what a click points at, which is *not* what the ticks say will be
@@ -68,12 +87,46 @@
   flex: none;
 }
 
+/*
+ * The twisty, drawn rather than typed — the same fix as the explorer's, for the same reason.
+ * `▾`/`▸` (U+25BE, U+25B8) are outside every `unicode-range` the two bundled `@fontsource`
+ * families declare, so the character this row renders was resolved by fontconfig to whatever
+ * arrow the machine had, at a foreign width and baseline. The long version of the argument is
+ * in `sidebar/FileTree.module.css`.
+ */
 .twisty {
   width: 9px;
   flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Full row height, as in the explorer: a flex item is as tall as its content, and with the
+     glyph gone that is the 5px of the triangle. */
+  align-self: stretch;
+  font-size: 0;
   color: var(--faint);
-  font-size: 9px;
-  text-align: center;
+}
+
+/* 5×7 and 7×5 against a 23px row and a 9px box: `(23 − 7) / 2 = 8`, `(23 − 5) / 2 = 9`,
+   `(9 − 7) / 2 = 1`, `(9 − 5) / 2 = 2` — every centring offset a whole pixel, which an
+   even-sized shape in an odd box cannot manage. `:not(:empty)` keeps the arrow off the rows
+   that are not expandable; they render the span empty. */
+[aria-expanded='false'] > .twisty:not(:empty)::before,
+[aria-expanded='true'] > .twisty:not(:empty)::before {
+  content: '';
+  background: currentColor;
+}
+
+[aria-expanded='false'] > .twisty:not(:empty)::before {
+  width: 5px;
+  height: 7px;
+  clip-path: polygon(0 0, 0 100%, 100% 50%);
+}
+
+[aria-expanded='true'] > .twisty:not(:empty)::before {
+  width: 7px;
+  height: 5px;
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
 /*
@@ -111,21 +164,35 @@
    repository with its own index and its own changelists, so it is drawn as a nested repo row
    rather than as a coloured group inside its parent's `Changes`. See `types.ts::RepoView`. */
 
-/* Counters are mono, per the type rules. Right-aligned, as the mock has them. */
+/* Counters are mono, per the type rules. Right-aligned, as the mock has them. 12px, the one
+   mono size this panel now uses — the count and the file names are the same column of type
+   read down the list, and 11px against 12px made it look like two. */
 .count {
   margin-left: auto;
   padding-left: 8px;
   flex: none;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--faint);
 }
 
+/*
+ * The file name.
+ *
+ * It was `flex: none`, which meant a name longer than what was left of the 420px row could not
+ * give way: `.tree` sets `overflow-x: hidden`, so the name was cut mid-glyph at the panel edge
+ * with no ellipsis to say it had been. `flex-shrink: 1` plus `min-width: 0` lets it ellipsize,
+ * and the `flex-shrink: 100` on `.dir` below keeps the stated order — the directory still
+ * collapses to nothing before the name loses its first character.
+ */
 .fileName {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text);
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /*
@@ -168,12 +235,22 @@
   color: var(--red);
 }
 
-/* The directory gives way first: the file name is what identifies the row. */
+/*
+ * The directory gives way first: the file name is what identifies the row. `100` rather than
+ * the `1` it had, because the name can now shrink too — with both at 1 the two would give way
+ * in proportion and the name would start losing characters while there was still a path beside
+ * it to throw away.
+ *
+ * 12px, up from 11px, so it is the *same* size as the file name it sits 6px from. A flex row
+ * centres each child's box, so a child's baseline lands at `rowHeight / 2 + 0.36 × fontSize`
+ * for JetBrains Mono — 11px and 12px put the path a third of a pixel above the name it belongs
+ * to, and read as two sizes scattered across one line.
+ */
 .dir {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   color: var(--faint);
-  flex: 0 1 auto;
+  flex: 0 100 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

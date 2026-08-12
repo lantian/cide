@@ -1,10 +1,22 @@
 /*
  * The icon box.
  *
- * 16px in a 21px row, which is the ratio the Material Icon Theme is drawn for; below about
- * 14px its two-tone folders stop reading as two tones. The vendored SVGs have square viewBoxes
- * in four different units (16, 24, 32, 3473 …), so the box is fixed and `object-fit` does the
- * scaling rather than each icon's intrinsic size leaking into the row.
+ * 15px, sized so it centres on a whole pixel in both trees. The vendored SVGs have square
+ * viewBoxes in four different units (16, 24, 32, 3473 …), so the box is fixed and `object-fit`
+ * does the scaling rather than each icon's intrinsic size leaking into the row.
+ *
+ * It was 16px, and 16 is the wrong parity for the rows it lands in. Both trees centre it with
+ * `align-items: center`, so the top offset is `(row − icon) / 2`: in the explorer's 21px row
+ * that was `(21 − 16) / 2 = 2.5px` and in the git panel's 23px row `3.5px`. Every icon in both
+ * sidebars was therefore rasterised onto a half-pixel grid, which softens exactly the 1px
+ * horizontal edges the Material set is drawn on — a whole column of slightly blurred glyphs,
+ * which is what a list of them reads as rather than any one of them looking wrong.
+ *
+ * 15 makes both leftovers even: `(21 − 15) / 2 = 3` and `(23 − 15) / 2 = 4`, whole pixels in
+ * each tree from the one number. The alternative that lost was keeping 16 and nudging it with
+ * a margin — that needs a *different* nudge per tree, so the icon module would have had to
+ * know which list it was in, and a third row height would have been a silent regression.
+ * 15px also stays above the ~14px floor where the two-tone folders stop reading as two tones.
  *
  * Nothing here recolours anything: an `<img>` is opaque to this stylesheet, and the light
  * theme is served a different *file* instead — see `iconFor.ts`. That is also why there is no
@@ -15,8 +27,8 @@
 
 .icon {
   flex: none;
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   object-fit: contain;
   /* The rows are absolutely positioned and translated; an inline image's baseline gap would
      push the icon a pixel low against the mono filename beside it. */

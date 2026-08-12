@@ -1,29 +1,69 @@
 /*
- * 12px box, per the mock. The glyph is drawn at 10px so the tick sits inside the border
- * rather than touching it; `line-height: 1` because the UI font's default leading would
- * push the tick a pixel low and make a column of them look ragged.
+ * 12px box, per the mock. The mark inside it is drawn here rather than set in type.
+ *
+ * `TriCheckbox.tsx` renders `✓` for checked and `–` for partial, and its own comment worries
+ * about coverage — for the wrong character. U+2013 EN DASH is in the bundled subsets; **U+2713
+ * CHECK MARK is not**. Neither `@fontsource` family declares a `unicode-range` that contains
+ * it (the union stops at U+2000-206F plus a few singletons), so every ticked box in the git
+ * panel was drawing its tick from whatever font fontconfig resolved to — a different weight
+ * and a different optical size from the border around it, and a different one on someone
+ * else's machine. `font-synthesis: none` does not catch this: a missing glyph is fallback,
+ * not synthesis.
+ *
+ * So both marks are geometry now. `font-size: 0` collapses the text the component still
+ * renders, and the `::after` below is what is seen. The alternative that lost was an inline
+ * `<svg>` in the component: it would have been sharper about nothing — these are a stroke and
+ * a bar — and it needs a change to a file this stylesheet does not own.
+ *
+ * `flex` rather than the `grid` this used: with the mark on a pseudo-element there are two
+ * children, and grid auto-placement would put them in two rows and centre neither. A flex line
+ * holds the zero-width text and the mark together, and `line-height` stops mattering at all —
+ * which was the other thing the old comment here was working around.
  */
 .box {
   width: 12px;
   height: 12px;
   flex: none;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--border);
   border-radius: 3px;
   background: var(--panel-2);
   color: var(--bg);
-  font-size: 10px;
-  line-height: 1;
+  font-size: 0;
 }
 
 /*
- * Set boxes are `--accent` filled, with the glyph in `--bg`.
+ * The tick: two borders of an empty box, rotated 45°, which is the shape a real check mark
+ * has — a short arm and a long one meeting at a point. 3×6 inside a 10px content area, offset
+ * up by a pixel because a rotated glyph's optical centre sits below its geometric one.
+ */
+.box[data-state='checked']::after {
+  content: '';
+  width: 3px;
+  height: 6px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  transform: translateY(-1px) rotate(45deg);
+}
+
+/* Partial: the en dash the mock draws, as a bar. 6×2 and centred, so it reads as "some of
+   this" against the tick's diagonal rather than as a smaller tick. */
+.box[data-state='partial']::after {
+  content: '';
+  width: 6px;
+  height: 2px;
+  background: currentColor;
+}
+
+/*
+ * Set boxes are `--accent` filled, with the mark in `--bg`.
  *
  * `--bg` rather than a fixed white: the accent is a light orange in the dark theme and a
  * darker one in the light theme, so a fixed foreground would fail contrast in one of them.
  * The app's own ground inverts in exactly the right direction, which is also what the
- * primary Commit button does with the same pair.
+ * primary Commit button does with the same pair. The mark reads `currentColor`, so it follows.
  */
 .box[data-state='checked'],
 .box[data-state='partial'] {
