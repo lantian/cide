@@ -1933,12 +1933,18 @@ try {
    * suite attached.
    */
   {
-    const shell = (projects) => ({ kind: 'shell', projects })
+    const shell = (projects, active = projects[0] ?? null) => ({ kind: 'shell', projects, active })
     const tabOf = (id, panes, focused, maximized = null) => ({
       id,
       tree: { focused, maximized, panes: Object.fromEntries(panes.map((p) => [p, {}])) },
     })
-    const bootOf = (role, project) => ({ role, workspace: { projects: { p1: project } } })
+    // `windows` defaults to the ordinary arrangement — one shell, holding `p1` and drawing it.
+    // The interesting shape is a shell that *holds* the project and is showing another one,
+    // which `stacked` mode (the default) makes an everyday state, and it is passed explicitly.
+    const bootOf = (role, project, windows = { 'shell:1': shell(['p1']) }) => ({
+      role,
+      workspace: { projects: { p1: project }, windows },
+    })
 
     // The shape the complaint is about: the console is tab `t0`, the user is in file tab `t1`.
     const twoTabs = {
@@ -1949,7 +1955,7 @@ try {
 
     eq(
       revealPlan.planReveal(bootOf(shell(['p1']), twoTabs), 'p1', 'console'),
-      { here: true, tab: 't0', activateTab: true, clearMaximize: false, focusPane: false, blocked: null },
+      { here: true, tab: 't0', activateProject: false, activateTab: true, clearMaximize: false, focusPane: false, blocked: null },
       'a console in a background tab is reached by activating its tab — the reported case',
     )
     // `focusPane` is false above because `t0`'s tree already names `console` as focused. That
@@ -1957,7 +1963,7 @@ try {
     // in the tab, paid on a gesture the user makes repeatedly.
     eq(
       revealPlan.planReveal(bootOf(shell(['p1']), { ...twoTabs, activeTab: 't0' }), 'p1', 'console'),
-      { here: true, tab: 't0', activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
+      { here: true, tab: 't0', activateProject: false, activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
       'a console already in front asks for nothing at all',
     )
 
@@ -1971,7 +1977,7 @@ try {
     }
     eq(
       revealPlan.planReveal(bootOf(shell(['p1']), maximized), 'p1', 'console'),
-      { here: true, tab: 't0', activateTab: false, clearMaximize: true, focusPane: true, blocked: null },
+      { here: true, tab: 't0', activateProject: false, activateTab: false, clearMaximize: true, focusPane: true, blocked: null },
       'a pane hidden under another pane’s maximize has that maximize cleared',
     )
     eq(
@@ -1989,7 +1995,7 @@ try {
     }
     eq(
       revealPlan.planReveal(bootOf(shell(['p1']), detached), 'p1', 'torn'),
-      { here: false, tab: null, activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
+      { here: false, tab: null, activateProject: false, activateTab: false, clearMaximize: false, focusPane: false, blocked: null },
       'a torn-out pane has no tab to activate: the raise is the whole of the reveal',
     )
     eq(
@@ -2009,6 +2015,52 @@ try {
       'a shell that does not hold the project is not the window showing its console',
     )
 
+    /*
+     * The project the shell is *holding* but not *drawing*.
+     *
+     * `stacked` is the default window mode: every open project docks into one shell that
+     * renders `role.active` and nothing else. So `tab_activate` alone moves a tab in a project
+     * that is not on screen, and the raise that follows brings the shell forward still showing
+     * the other project — the reveal reports success and the user sees nothing happen, which
+     * is the exact report this feature answers.
+     *
+     * Reached from a detached editor: `useMentionTarget` names *its* project, which need not
+     * be the one the shell was left on.
+     */
+    const stacked = { 'shell:1': shell(['p1', 'p2'], 'p2') }
+    eq(
+      revealPlan.planReveal(bootOf({ kind: 'detachedPane', pane: 'torn' }, twoTabs, stacked), 'p1', 'console'),
+      { here: false, tab: 't0', activateProject: true, activateTab: true, clearMaximize: false, focusPane: false, blocked: null },
+      'a shell parked on another project is switched to the one the mention landed in',
+    )
+    eq(
+      revealPlan.planReveal(bootOf(shell(['p1', 'p2'], 'p1'), twoTabs, { 'shell:1': shell(['p1', 'p2'], 'p1') }), 'p1', 'console')
+        .activateProject,
+      false,
+      'and a shell already drawing it is not switched to it again',
+    )
+    eq(
+      revealPlan.planReveal(bootOf({ kind: 'detachedPane', pane: 'torn' }, twoTabs, {}), 'p1', 'console')
+        .activateProject,
+      false,
+      'while no shell at all leaves nothing to switch — the raise says so instead',
+    )
+    // `perProject` mode: the project has a shell of its own that is already drawing it, and a
+    // second shell merely holds it. Activating would drag that second window onto a project it
+    // is not the one being raised for.
+    eq(
+      revealPlan.planReveal(
+        bootOf({ kind: 'detachedPane', pane: 'torn' }, twoTabs, {
+          'shell:1': shell(['p1', 'p2'], 'p2'),
+          'shell:2': shell(['p1'], 'p1'),
+        }),
+        'p1',
+        'console',
+      ).activateProject,
+      false,
+      'and one shell drawing the project is enough, however many others merely hold it',
+    )
+
     // The two "cannot be revealed at all" answers. Both are sentences rather than nulls,
     // because the caller says them out loud — a mention in a prompt nobody can see is exactly
     // as invisible as no mention at all.
@@ -2017,7 +2069,7 @@ try {
       ['a project that has closed', revealPlan.planReveal(bootOf(shell(['p1']), twoTabs), 'p9', 'console')],
     ]) {
       ok(typeof plan.blocked === 'string' && plan.blocked.length > 10, `${what} is refused in words`)
-      ok(!plan.activateTab && !plan.clearMaximize && !plan.focusPane && plan.tab === null,
+      ok(!plan.activateProject && !plan.activateTab && !plan.clearMaximize && !plan.focusPane && plan.tab === null,
         `${what} asks for nothing to be moved`)
     }
 
@@ -2036,6 +2088,12 @@ try {
     )
 
     const revealSrc = readFileSync('src/editor/revealPane.ts', 'utf8')
+    ok(
+      /plan\.activateProject/.test(revealSrc) &&
+        revealSrc.indexOf('projectApi.activate(') < revealSrc.indexOf('ws.activateTab('),
+      'the project is brought to the front before its tab is — a tab activated inside a ' +
+        'project the shell is not drawing moves something nobody can see',
+    )
     ok(
       revealSrc.indexOf('sendFocus.revealPane(') > revealSrc.indexOf('ws.focusPane('),
       'the window is raised after the domain has moved, so it comes forward already showing ' +

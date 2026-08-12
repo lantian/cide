@@ -45,15 +45,30 @@ export interface ProjectLike {
   readonly detached: Readonly<Record<string, unknown>>
 }
 
-/** What the asking window is showing. Mirrors `WindowRole`, minus the fields not read here. */
+/** What a window is showing. Mirrors `WindowRole`, minus the fields not read here. */
 export type RoleLike =
-  | { readonly kind: 'shell'; readonly projects: readonly string[] }
+  | {
+      readonly kind: 'shell'
+      readonly projects: readonly string[]
+      /**
+       * The one project a shell **draws**. `projects` is what it holds.
+       *
+       * The distinction is the whole of `activateProject` below: in the default `stacked`
+       * window mode every project docks into one shell and only the active one is rendered,
+       * so a shell can hold a project it is showing nothing of.
+       */
+      readonly active: string | null
+    }
   | { readonly kind: 'detachedPane'; readonly pane: string }
   | { readonly kind: 'detachedTab'; readonly tab: string }
 
 export interface BootLike {
   readonly role: RoleLike
-  readonly workspace: { readonly projects: Readonly<Record<string, ProjectLike>> }
+  readonly workspace: {
+    readonly projects: Readonly<Record<string, ProjectLike>>
+    /** Every window the workspace names. Read for the shells' `active`; keys are not used. */
+    readonly windows: Readonly<Record<string, RoleLike>>
+  }
 }
 
 /**
@@ -75,6 +90,20 @@ export interface RevealPlan {
   readonly here: boolean
   /** The tab holding the pane; `null` for a detached pane, which is in no tab. */
   readonly tab: string | null
+  /**
+   * No shell that holds this project is currently *drawing* it.
+   *
+   * `stacked` is the default window mode and it docks every open project into one shell that
+   * renders only `role.active` — so `tab_activate` on a project the shell is not showing
+   * moves a tab nobody can see, and the raise that follows brings a window forward still
+   * displaying a different project. That is the reported "nothing happened" exactly, which is
+   * why this is a step of the plan and not an assumption.
+   *
+   * Answered from `workspace.windows` rather than from `boot.role`, because the window that
+   * has to change is usually not this one: the case that reaches it is a detached editor
+   * mentioning into its project's console while the shell has been switched elsewhere.
+   */
+  readonly activateProject: boolean
   /** The tab is not its project's active one. */
   readonly activateTab: boolean
   /** Another pane in that tab is maximized, so this one is laid out but not visible. */
@@ -89,6 +118,7 @@ function nothing(blocked: string): RevealPlan {
   return {
     here: false,
     tab: null,
+    activateProject: false,
     activateTab: false,
     clearMaximize: false,
     focusPane: false,
@@ -96,9 +126,29 @@ function nothing(blocked: string): RevealPlan {
   }
 }
 
-/** Whether the window with this role is one that draws `project`'s tabs. */
+/**
+ * Whether the window with this role is the one `project`'s tabs live in.
+ *
+ * *Holds*, not *draws* — a `stacked` shell holds several projects and draws one. That is why
+ * `here` alone is not enough to say the user can see the pane, and why `activateProject`
+ * exists beside it.
+ */
 function showsProject(role: RoleLike, project: string): boolean {
   return role.kind === 'shell' && role.projects.includes(project)
+}
+
+/**
+ * Whether a shell holds `project` and none of them is drawing it.
+ *
+ * False when no shell holds it at all: there is nothing for `project_activate` to move, and
+ * the raise that follows answers "no window is showing it", which the caller says out loud.
+ * Every holding shell is asked rather than the first, because `perProject` mode gives each
+ * project a shell whose `active` is already it — and a spurious activation there would drag a
+ * *second* shell onto the project for a pane it is not showing.
+ */
+function needsProjectActivated(boot: BootLike, project: string): boolean {
+  const shells = Object.values(boot.workspace.windows).filter((r) => showsProject(r, project))
+  return shells.length > 0 && !shells.some((r) => r.kind === 'shell' && r.active === project)
 }
 
 /**
@@ -106,8 +156,8 @@ function showsProject(role: RoleLike, project: string): boolean {
  *
  * The three shapes it can answer with:
  *
- * * **a pane in a tab** — activate the tab, drop a maximize that hides it, focus it, and
- *   raise its window if that is not this one;
+ * * **a pane in a tab** — bring its project to the front of the shell holding it, activate the
+ *   tab, drop a maximize that hides it, focus it, and raise its window if that is not this one;
  * * **a detached pane** — nothing but the raise. A detached-pane window shows exactly one
  *   pane: there is no tab to activate, nothing that could be maximized over it, and its tree
  *   names it focused by construction. Doing the tab work anyway would mean calling
@@ -132,6 +182,7 @@ export function planReveal(boot: BootLike, project: string, pane: string): Revea
     return {
       here: shows,
       tab: tab.id,
+      activateProject: needsProjectActivated(boot, project),
       activateTab: open.activeTab !== tab.id,
       // Cleared rather than moved: maximizing the *target* would be a bigger rearrangement
       // than the gesture asked for, and it would leave the user's own maximize undone with
@@ -146,6 +197,9 @@ export function planReveal(boot: BootLike, project: string, pane: string): Revea
     return {
       here: boot.role.kind === 'detachedPane' && boot.role.pane === pane,
       tab: null,
+      // A torn-out pane has its own window and is drawn there whatever the shell has in
+      // front, so switching the shell's project would move a window nobody is being sent to.
+      activateProject: false,
       activateTab: false,
       clearMaximize: false,
       focusPane: false,

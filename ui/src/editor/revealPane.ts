@@ -7,10 +7,13 @@
  *
  * # The order, and why it is that order
  *
- * 1. **The tab, then the maximize, then the domain's focus.** All three are workspace
- *    mutations, so they are one shared truth every window agrees on — which is what makes a
- *    reveal *into another window* possible at all: this webview cannot touch that one's React
- *    tree, but it can move the domain and let `cide://workspace-changed` carry it over.
+ * 1. **The project, the tab, the maximize, then the domain's focus** — outermost container
+ *    first, because in `stacked` mode (the default) a shell draws one project of the several
+ *    it holds, and a tab activated inside one it is not drawing moves something nobody can
+ *    see. All four are workspace mutations, so they are one shared truth every window agrees
+ *    on — which is what makes a reveal *into another window* possible at all: this webview
+ *    cannot touch that one's React tree, but it can move the domain and let
+ *    `cide://workspace-changed` carry it over.
  * 2. **The raise.** Last, so the window that comes forward is already showing the right tab.
  *    Raising first would put a window on screen displaying whatever the user last left in it
  *    and then switch tabs under their eyes a frame later.
@@ -33,7 +36,7 @@
  * the pane, so by the time `term.focus()` fires its event there is nothing left for it to do.
  */
 import { peekHost } from '@/layout/paneHosts'
-import { sendFocus, type PaneId, type ProjectId } from '@/ipc/client'
+import { project as projectApi, sendFocus, type PaneId, type ProjectId } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import { planReveal } from './revealTarget'
 
@@ -82,6 +85,21 @@ export async function revealPane(project: ProjectId, pane: PaneId): Promise<stri
   if (plan.tab !== null) {
     const tab = plan.tab
     try {
+      /*
+       * The project, before its tab. `stacked` is the default window mode: every open project
+       * docks into one shell that renders only the active one, so activating a tab of a
+       * project the shell is not drawing moves a tab nobody can see — and the raise below
+       * then brings a window forward still showing a different project, which is the silent
+       * nothing this whole change exists to fix.
+       *
+       * Its own `hydrate` rather than leaning on `activateTab`'s: the tab may already be the
+       * project's active one, in which case `activateTab` is skipped and the mirror would
+       * keep naming the old project until some unrelated event moved it.
+       */
+      if (plan.activateProject) {
+        await projectApi.activate(project)
+        await ws.hydrate()
+      }
       if (plan.activateTab) await ws.activateTab(project, tab)
       if (plan.clearMaximize) await ws.maximizePane(project, tab, null)
       if (plan.focusPane) await ws.focusPane(project, tab, pane)

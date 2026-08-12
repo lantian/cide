@@ -128,33 +128,33 @@ export function useSendToClaude(): SendToClaude {
       )
 
       void sending.then(async () => {
-          /*
-           * The user carried on typing while the send was in flight, so they are not waiting
-           * to be taken anywhere — and the reveal's last act is to move the keyboard, which
-           * would cut a word in half between this buffer and Claude's prompt. Nothing moves;
-           * the log records that the choice was made rather than that the feature is missing,
-           * which is the distinction this whole round is about.
-           *
-           * `view.hasFocus` was the obvious guard and is wrong: the context-menu route runs
-           * with focus on the menu item for the whole of its life, so it would refuse the
-           * reveal on every single mouse-driven send.
-           */
-          if (view.state.doc !== doc) {
-            void diag.log('editor: not revealing the Claude pane — the buffer moved on')
-            return
-          }
-          const stuck = await revealPane(target.project, target.pane)
-          if (stuck === null) return
-          /*
-           * Sent, but the user is not looking at where it went — the pane closed under us, its
-           * window would not come forward, the project was closed mid-flight. This is the case
-           * the brief asks about and it gets a sentence rather than silence, because a mention
-           * in a prompt nobody can see is exactly as invisible as no mention at all. The
-           * wording names the file and the range, so the user can find the conversation by
-           * hand from what it says.
-           */
-          report(`Sent ${mentionLabel(path, span)} to Claude — but ${stuck}.`)
-        })
+        /*
+         * The user carried on typing while the send was in flight, so they are not waiting
+         * to be taken anywhere — and the reveal's last act is to move the keyboard, which
+         * would cut a word in half between this buffer and Claude's prompt. Nothing moves;
+         * the log records that the choice was made rather than that the feature is missing,
+         * which is the distinction this whole round is about.
+         *
+         * `view.hasFocus` was the obvious guard and is wrong: the context-menu route runs
+         * with focus on the menu item for the whole of its life, so it would refuse the
+         * reveal on every single mouse-driven send.
+         */
+        if (view.state.doc !== doc) {
+          void diag.log('editor: not revealing the Claude pane — the buffer moved on')
+          return
+        }
+        const stuck = await revealPane(target.project, target.pane)
+        if (stuck === null) return
+        /*
+         * Sent, but the user is not looking at where it went — the pane closed under us, its
+         * window would not come forward, the project was closed mid-flight. This is the case
+         * the brief asks about and it gets a sentence rather than silence, because a mention
+         * in a prompt nobody can see is exactly as invisible as no mention at all. The
+         * wording names the file and the range, so the user can find the conversation by
+         * hand from what it says.
+         */
+        report(`Sent ${mentionLabel(path, span)} to Claude — but ${stuck}.`)
+      })
 
       // Logged whether or not it lands. A report of "it did nothing" is answerable from a log
       // that records the attempt and the pane it was aimed at; one that records only successes

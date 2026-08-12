@@ -426,28 +426,40 @@ pub fn window_reveal_pane(
 
 /// The window a pane is on screen in, or `None` when nothing shows it.
 ///
-/// A pane is in exactly one place — a tab's tree or its project's holding map, never both,
-/// which is the invariant `detach_pane` maintains — so the first match is the only match and
-/// the scan order does not matter.
+/// **Torn-out windows are asked first, and that is not a style choice.** A pane detached into
+/// its own window leaves its tab's tree, so a shell would decline it whatever the order — but
+/// a detached *tab* keeps its tab in `project.tabs`, so the shell that owns the project still
+/// answers `holds` for every pane in it. Scanning one pass over `ws.windows` therefore hands
+/// the answer to whichever role `IndexMap` happens to name first, and on a fresh workspace
+/// that is always the shell: the reveal would raise a window that is not drawing the pane, and
+/// the `DetachedTab` arm — written out precisely so a future detach inherits a working reveal
+/// — would never be reached to be noticed.
 fn window_showing(ws: &Workspace, project: ProjectId, pane: PaneId) -> Option<WindowLabel> {
-    ws.windows.iter().find_map(|(label, role)| match role {
+    let torn_out = ws.windows.iter().find_map(|(label, role)| match role {
         WindowRole::DetachedPane { pane: shown, .. } if *shown == pane => Some(label.clone()),
-        // The project is checked as well as the pane, because a shell holding several
-        // projects would otherwise claim a pane belonging to any of them. `holds` then asks
-        // the tabs, so a shell whose project has *torn the pane out* declines and the
-        // detached window above answers instead.
-        WindowRole::Shell { projects, .. } if projects.contains(&project) => {
-            holds(ws, project, pane).then(|| label.clone())
-        }
-        // Nothing creates one of these yet (see `window_close`), and it is written out
-        // rather than folded into the wildcard so that whatever does create one inherits a
-        // reveal that works instead of one that silently answers `None`.
+        // Nothing creates one of these yet (see `window_close`), and it is written out rather
+        // than folded into the wildcard so that whatever does create one inherits a reveal
+        // that works instead of one that raises the shell the tab came from.
         WindowRole::DetachedTab {
             project: owner,
             tab,
         } if *owner == project => workspace::tab(ws, *owner, *tab)
             .is_ok_and(|t| t.tree.panes.contains_key(&pane))
             .then(|| label.clone()),
+        _ => None,
+    });
+    if torn_out.is_some() {
+        return torn_out;
+    }
+
+    ws.windows.iter().find_map(|(label, role)| match role {
+        // The project is checked as well as the pane, because a shell holding several
+        // projects would otherwise claim a pane belonging to any of them. `holds` then asks
+        // the tabs, so a shell whose project has *torn the pane out* declines and the pass
+        // above has already answered.
+        WindowRole::Shell { projects, .. } if projects.contains(&project) => {
+            holds(ws, project, pane).then(|| label.clone())
+        }
         _ => None,
     })
 }
@@ -852,6 +864,31 @@ mod tests {
             window_showing(&ws, project, cide_ipc::PaneId::new()),
             None,
             "a pane that is in no tab and no holding map is shown by nothing"
+        );
+    }
+
+    /// A tab in a window of its own, which is the case a single scan gets wrong.
+    ///
+    /// Unlike a detached *pane*, a detached tab stays in `project.tabs` — so the shell that
+    /// owns the project still answers `holds` for every pane in it, and whichever role the
+    /// window map names first wins. On a fresh workspace that is always the shell, so the
+    /// reveal would raise a window that is not drawing the pane at all.
+    #[test]
+    fn a_tab_in_its_own_window_is_shown_by_that_window_and_not_by_the_shell_it_left() {
+        let mut ws = Workspace::default();
+        let project =
+            workspace::open_project(&mut ws, vec!["/home/dev/work/atlas".into()], None).unwrap();
+        let tab = workspace::project(&ws, project).unwrap().tabs[0].id;
+        let console = workspace::tab(&ws, project, tab).unwrap().tree.focused;
+
+        let torn = cide_ipc::WindowLabel::detached_tab();
+        ws.windows
+            .insert(torn.clone(), WindowRole::DetachedTab { project, tab });
+
+        assert_eq!(
+            window_showing(&ws, project, console),
+            Some(torn),
+            "the tab's own window shows its panes, however early the map names the shell"
         );
     }
 
