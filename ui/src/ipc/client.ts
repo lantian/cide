@@ -1544,3 +1544,96 @@ export const claudeSend = {
       lineEnd: lineEnd ?? null,
     }),
 }
+
+import type {
+  BranchList,
+  CheckoutMode,
+  CheckoutOutcome,
+  FetchOutcome,
+  RepoId as BranchRepoId,
+} from './generated'
+
+/**
+ * Branches: the status bar's selector, and the git half of the command palette.
+ *
+ * # Why a namespace of its own rather than fields on `git`
+ *
+ * The house rule for this file is append-only — it has conflicted in five consecutive rounds
+ * — so a new capability arrives as a block at the end rather than as fields reaching inside
+ * an existing object literal. `claudeSend` above says the same thing at length.
+ *
+ * It also happens to be the right seam. `git` is the commit tool window's surface: everything
+ * on it takes a `RepoId` and answers with a `ChangesTree`, because every one of those calls
+ * moves a tri-state checkbox. Nothing here does. `list` answers for the whole project at once
+ * (a superproject has several repositories and the selector has one slot), and the mutations
+ * answer with the new branch lists, or with an outcome carrying something a list cannot
+ * express — which files a refusal named, whether a stash was made and survived.
+ *
+ * # None of these swallow their rejection
+ *
+ * Every call rejects with a `GitError` and every call site is expected to let it. A checkout
+ * that cannot be made rejects with `{kind: 'checkoutWouldOverwrite', detail: {branch, paths}}`
+ * — and `paths` is the whole feature: it is what the popup turns into *stash* or *stash and
+ * bring them along*. A `.catch(() => {})` here would reduce that to a menu item that appears
+ * to do nothing, which is the class of bug this round exists to remove.
+ */
+export const branch = {
+  /**
+   * Every repository in the project, each with its local and remote branches.
+   *
+   * The whole project in one round trip, because the popup has to be able to say which
+   * repository a branch belongs to when there is more than one — and because the status bar
+   * widget wants the same answer for its one line. Repositories that cannot be read are
+   * skipped, so an unmounted root does not empty the list.
+   */
+  list: (project: ProjectId) => invoke<BranchList[]>('git_branch_list', { project }),
+
+  /**
+   * Create a branch, optionally switching to it.
+   *
+   * Never stashes and never overwrites: when `checkout` is asked for and `startPoint` is not
+   * `HEAD`, Rust computes the blockers *before* creating anything, so a refusal leaves no
+   * stray branch behind. To switch with a stash, `checkout` afterwards with a mode.
+   */
+  create: (
+    project: ProjectId,
+    repo: BranchRepoId,
+    name: string,
+    startPoint: string | null = null,
+    checkout = false,
+  ) => invoke<BranchList[]>('git_branch_create', { project, repo, name, startPoint, checkout }),
+
+  /**
+   * Switch branches. `name` may be a remote-tracking branch (`origin/feature`), which creates
+   * and tracks a local one.
+   *
+   * `mode` is `'refuse'` on the first attempt, always. The rejection carries the paths that
+   * stand in the way; `'stash'` and `'stashAndRestore'` are what the user's answer to that
+   * sends back. There is no force — see `cide_git::branch` for why.
+   */
+  checkout: (project: ProjectId, repo: BranchRepoId, name: string, mode: CheckoutMode = 'refuse') =>
+    invoke<CheckoutOutcome>('git_branch_checkout', { project, repo, name, mode }),
+
+  /** Which paths a switch would overwrite, without switching. Empty means it is safe. */
+  blockers: (project: ProjectId, repo: BranchRepoId, name: string) =>
+    invoke<string[]>('git_branch_blockers', { project, repo, name }),
+
+  rename: (project: ProjectId, repo: BranchRepoId, from: string, to: string) =>
+    invoke<BranchList[]>('git_branch_rename', { project, repo, from, to }),
+
+  /** `force` is the answer to `branchNotMerged`, and the UI must have said what would be lost. */
+  delete: (project: ProjectId, repo: BranchRepoId, name: string, force = false) =>
+    invoke<BranchList[]>('git_branch_delete', { project, repo, name, force }),
+
+  /** `git fetch`. Shells out when a credential helper is configured, like `git.push`. */
+  fetch: (project: ProjectId, repo: BranchRepoId, remote: string | null = null) =>
+    invoke<FetchOutcome>('git_fetch', { project, repo, remote }),
+
+  /**
+   * Fetch, then fast-forward. **Never merges**: a divergence rejects with `notFastForward`
+   * and both counts, because there is no conflict-resolution surface in this app to finish a
+   * merge in.
+   */
+  pull: (project: ProjectId, repo: BranchRepoId, remote: string | null = null) =>
+    invoke<FetchOutcome>('git_pull', { project, repo, remote }),
+}

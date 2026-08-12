@@ -24,11 +24,13 @@
 use std::path::PathBuf;
 
 use cide_git::{
-    changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status, tree_status,
+    branch, changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status,
+    tree_status,
 };
 use cide_ipc::git::{
-    BranchInfo, ChangesTree, CommitOutcome, CommitRequest, DiffSide, FileDiff, GitError,
-    PathSelection, PushOutcome, ShelfEntry, StashEntry, TreeStatusMap,
+    BranchInfo, BranchList, ChangesTree, CheckoutMode, CheckoutOutcome, CommitOutcome,
+    CommitRequest, DiffSide, FetchOutcome, FileDiff, GitError, PathSelection, PushOutcome,
+    ShelfEntry, StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId};
 use tauri::State;
@@ -321,6 +323,207 @@ pub async fn git_push(
     blocking(move || {
         let root = repo_root(&roots, repo)?;
         push::push(&root, remote.as_deref(), refspec.as_deref(), set_upstream)
+    })
+    .await
+}
+
+// --- branches -----------------------------------------------------------------------------
+
+/// Every repository's branches, in root order.
+///
+/// The whole project rather than one repository, because the selector is one control in a
+/// status bar with one window's worth of room: in a superproject the branch the user means is
+/// genuinely ambiguous, and the popup has to be able to name which repository each list
+/// belongs to. One round trip for the whole popup, and one for the widget behind it.
+///
+/// A repository that cannot be read is skipped rather than failing the call — the same rule
+/// `status::changes_tree` follows, for the same reason: three working repositories and one on
+/// an unmounted share is still a usable list.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_branch_list(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Vec<BranchList>> {
+    let roots = roots(&state, project)?;
+    blocking(move || Ok(lists(&roots))).await
+}
+
+fn lists(roots: &[PathBuf]) -> Vec<BranchList> {
+    let mut out = Vec::new();
+    for info in cide_git::repo::discover(roots) {
+        match branch::list(&info) {
+            Ok(list) => out.push(list),
+            Err(error) => {
+                tracing::warn!(root = %info.root.display(), %error, "skipping unreadable repository")
+            }
+        }
+    }
+    out
+}
+
+/// Create a branch, optionally switching to it.
+///
+/// **Never stashes and never overwrites.** When `checkout` is asked for and the start point is
+/// not `HEAD`, the blockers are computed *before* the branch is created, so a refusal leaves
+/// nothing behind — a create that succeeded followed by a switch that failed is a branch the
+/// user did not ask for and now has to delete. Starting from `HEAD` cannot block: the tree is
+/// the one already on disk.
+///
+/// To switch with a stash, call `git_branch_checkout` with a mode. Creating is not the gesture
+/// that should be allowed to move a working tree around.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_branch_create(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    name: String,
+    start_point: Option<String>,
+    checkout: bool,
+) -> Result<Vec<BranchList>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        if checkout && let Some(start) = start_point.as_deref() {
+            let blocked = branch::checkout_blockers(&root, start)?;
+            if !blocked.is_empty() {
+                return Err(GitError::CheckoutWouldOverwrite {
+                    branch: name.clone(),
+                    paths: blocked,
+                });
+            }
+        }
+        branch::create(&root, &name, start_point.as_deref())?;
+        if checkout {
+            branch::checkout(&root, &name, CheckoutMode::Refuse)?;
+        }
+        let _ = refreshed(&app, &roots, project);
+        Ok(lists(&roots))
+    })
+    .await
+}
+
+/// Switch branches.
+///
+/// The interesting outcome is the *refusal*: `CheckoutWouldOverwrite` carries the paths that
+/// stand in the way, and the popup turns that list into the choice IDEA offers — stash, or
+/// stash and bring them along. `mode` is what the second click sends back.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_branch_checkout(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    name: String,
+    mode: CheckoutMode,
+) -> Result<CheckoutOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = branch::checkout(&root, &name, mode)?;
+        // A switch rewrites the working tree, so every open panel is looking at stale status.
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
+    })
+    .await
+}
+
+/// The paths a switch to `name` would overwrite, without switching.
+///
+/// Separate from the checkout so the popup can grey a row, or explain before the user commits
+/// to anything. Empty means the switch is safe.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_branch_blockers(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    name: String,
+) -> Result<Vec<String>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        branch::checkout_blockers(&root, &name)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_branch_rename(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    from: String,
+    to: String,
+) -> Result<Vec<BranchList>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        branch::rename(&root, &from, &to)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(lists(&roots))
+    })
+    .await
+}
+
+/// Delete a local branch. `force` is the answer to `GitError::BranchNotMerged`, and the UI is
+/// expected to have said which commits would go before sending it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_branch_delete(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    name: String,
+    force: bool,
+) -> Result<Vec<BranchList>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        branch::delete(&root, &name, force)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(lists(&roots))
+    })
+    .await
+}
+
+/// `git fetch`. Network work, so it sits on the blocking pool for as long as the transport
+/// takes — the same argument `git_push` makes.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_fetch(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    remote: Option<String>,
+) -> Result<FetchOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = branch::fetch(&root, remote.as_deref())?;
+        // Nothing in the working tree moved, but every branch row's behind-count did.
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
+    })
+    .await
+}
+
+/// Fetch, then fast-forward. Refuses a divergence rather than merging — see
+/// `cide_git::branch::pull`.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_pull(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    remote: Option<String>,
+) -> Result<FetchOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = branch::pull(&root, remote.as_deref())?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
     })
     .await
 }

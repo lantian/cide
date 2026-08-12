@@ -106,7 +106,12 @@ fn has_credential_helper(repo: &Repository) -> bool {
     found
 }
 
-fn default_remote(repo: &Repository, upstream: &Option<String>) -> String {
+/// The remote a branch's upstream names, else `origin`.
+///
+/// `pub(crate)` for [`crate::branch::fetch`], which has to pick the same remote a push would:
+/// a *Fetch* that reads a different remote from the *Push* beside it in the same menu is a
+/// bug the user would diagnose as flaky networking.
+pub(crate) fn default_remote(repo: &Repository, upstream: &Option<String>) -> String {
     if let Some(upstream) = upstream
         && let Some((remote, _)) = upstream.split_once('/')
         && repo.find_remote(remote).is_ok()

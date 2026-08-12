@@ -46,7 +46,9 @@ import { useGitStatus } from '@/sidebar/gitStatusStore'
 import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
+import { openBranchPopup } from '@/chrome/BranchSelector'
 import {
+  branch as branchApi,
   claudeSend,
   clipboard,
   diag,
@@ -400,6 +402,40 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         const repos = reposOf(boot())
         if (project === null || repos.length === 0) return unmet(command, 'no repository open')
         void Promise.all(repos.map((repo) => gitApi.push(project.id, repo, null, null)))
+        return
+      }
+
+      /*
+       * The branch half. `switch` and `new` open the popup rather than acting, because both
+       * need something only the user can supply — which branch, or what to call it — and a
+       * palette row that guessed would be worse than no row.
+       *
+       * The popup is an overlay (`overlays/store.ts`), not a child of the status bar widget,
+       * so these work in a window whose status bar never mounted the widget. That is the
+       * whole reason it is built that way.
+       */
+      case 'git.branch.switch':
+      case 'git.branch.new': {
+        const project = activeProjectOf(boot())
+        const repos = reposOf(boot())
+        if (project === null || repos.length === 0) return unmet(command, 'no repository open')
+        openBranchPopup(command === 'git.branch.new' ? 'new' : 'list')
+        return
+      }
+
+      case 'git.fetch':
+      case 'git.pull': {
+        // Every repository in the project, like `git.push` directly above — the command names
+        // none of them, and in a superproject picking one would be a guess.
+        //
+        // Uncaught on purpose: a rejected pull is `notFastForward` with both counts, or
+        // `noUpstream`, and `chrome/Failures.tsx` is what puts either on screen. cide never
+        // merges for you; see `cide_git::branch::pull`.
+        const project = activeProjectOf(boot())
+        const repos = reposOf(boot())
+        if (project === null || repos.length === 0) return unmet(command, 'no repository open')
+        const run = command === 'git.pull' ? branchApi.pull : branchApi.fetch
+        void Promise.all(repos.map((repo) => run(project.id, repo)))
         return
       }
 

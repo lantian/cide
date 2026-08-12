@@ -1,0 +1,410 @@
+/*
+ * The status bar's branch widget and the popup it opens.
+ *
+ * Every colour is a token, so both themes fall out of `styles/tokens.css` and nothing here
+ * hardcodes a light or a dark value. Light is the default and it is white; the surfaces below
+ * are `--panel` over `--scrim`, which is what every other overlay in the app sits on.
+ *
+ * The popup is anchored **bottom-left**, above the status bar, because that is where the
+ * control that opens it lives — a centred modal would make the user's eye travel to the
+ * middle of the window for a click they made in the corner. It is a fixed-position box rather
+ * than one positioned against the widget: the widget may not be mounted at all (the palette
+ * can open this popup on its own), so the anchor has to be the window.
+ */
+
+/* --- the 24px widget ------------------------------------------------------------------- */
+
+/*
+ * A real button, reset back to the bar's typography. `--purple` and the ellipsis behaviour
+ * are inherited from what `StatusBar.module.css`'s `.branch` span did, so replacing that span
+ * with this component does not move a pixel when nothing is happening.
+ */
+.widget {
+  appearance: none;
+  border: 0;
+  padding: 0 4px;
+  margin: 0 -4px;
+  background: transparent;
+  font: inherit;
+  color: var(--purple);
+  cursor: pointer;
+  border-radius: 3px;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.widget:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+.widget:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* No repository: still occupies its slot, so the readouts beside it do not jump. */
+.widget:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* --- the popup ------------------------------------------------------------------------- */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--scrim);
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-start;
+  /* Clear of the status bar itself, so the widget stays visible under the popup. */
+  padding: 24px 12px calc(var(--h-status) + 6px);
+}
+
+.popup {
+  display: flex;
+  flex-direction: column;
+  width: 460px;
+  max-width: 100%;
+  max-height: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  overflow: hidden;
+}
+
+/* The repository strip, only drawn when the project holds more than one. */
+.repos {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-soft);
+  overflow-x: auto;
+}
+
+.repo,
+.repoOn {
+  appearance: none;
+  border: 0;
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: transparent;
+  font: inherit;
+  color: var(--dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.repo:hover {
+  background: var(--chrome-hi);
+}
+
+.repoOn {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.repoHead {
+  margin-left: 6px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.head {
+  flex: none;
+  padding: 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.search {
+  width: 100%;
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+}
+
+.search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.search::placeholder {
+  color: var(--faint);
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.action,
+.primary,
+.danger {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  background: var(--panel-2);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.action:hover:not(:disabled),
+.primary:hover:not(:disabled),
+.danger:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.action:disabled,
+.primary:disabled,
+.danger:disabled {
+  color: var(--faint);
+  cursor: default;
+  border-color: var(--border-soft);
+}
+
+/* The default action of whichever panel is open. `--grad-accent-ink` is the gradient whose
+   stops both clear AA against `--on-accent`; `--grad-accent` is decorative and would put a
+   2.4:1 label on the orange end. */
+.primary {
+  background: var(--grad-accent-ink);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+
+/* Deleting an unmerged branch — the one action here that can lose commits. */
+.danger {
+  background: transparent;
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* --- rows ------------------------------------------------------------------------------ */
+
+.rows {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 0 6px;
+}
+
+.section {
+  padding: 8px 12px 4px;
+  color: var(--faint);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.row,
+.rowCurrent {
+  display: flex;
+  align-items: stretch;
+}
+
+.row:hover,
+.rowCurrent:hover {
+  background: var(--chrome-hi);
+}
+
+.rowMain {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 5px 4px 5px 12px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rowMain:disabled {
+  cursor: default;
+}
+
+.rowMain:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* The branch you are on, marked by weight and colour rather than by a glyph that would need
+   its own column on every other row. */
+.rowCurrent .name {
+  color: var(--accent);
+  font-weight: var(--w-bold);
+}
+
+.name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.counts {
+  flex: none;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The tip's summary. First to give way — it is context, and the name is the row. */
+.subject {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+
+.more {
+  flex: none;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0 10px;
+  color: var(--dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.more:hover {
+  color: var(--accent);
+}
+
+.rowMenu {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 12px 8px 24px;
+  background: var(--panel-2);
+}
+
+.menuItem {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  background: var(--panel);
+  padding: 3px 8px;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.menuItem:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.empty {
+  padding: 18px 12px;
+  color: var(--faint);
+  text-align: center;
+}
+
+/* --- panels ---------------------------------------------------------------------------- */
+
+.panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.panelTitle {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: var(--w-bold);
+  color: var(--text-hi);
+}
+
+.panelBody {
+  margin: 8px 0 0;
+  color: var(--dim);
+  line-height: 17px;
+}
+
+/*
+ * The files a checkout refusal named. Capped and scrollable: a switch between two long-lived
+ * branches can name dozens, and a popup taller than the window puts its own buttons off
+ * screen. Same rule as `ChangelistDialog`'s path list.
+ */
+.paths {
+  margin: 8px 0 0;
+  padding: 8px;
+  max-height: 160px;
+  overflow-y: auto;
+  list-style: none;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+  /* Paths are the one thing here worth copying out. */
+  user-select: text;
+}
+
+.paths li {
+  overflow-wrap: anywhere;
+}
+
+.panelButtons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* --- the one-line outcome -------------------------------------------------------------- */
+
+/*
+ * Where every result and every failure lands. Below the body rather than replacing it, so the
+ * list is still there to act on — a refusal that took the popup away would make the user
+ * reopen it and find the row again.
+ */
+.note {
+  flex: none;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 16px;
+  max-height: 88px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  user-select: text;
+}

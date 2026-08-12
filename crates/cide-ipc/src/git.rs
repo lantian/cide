@@ -405,6 +405,115 @@ pub struct PushOutcome {
     pub output: String,
 }
 
+// --- branches ---------------------------------------------------------------------------
+
+/// One branch as the selector draws it.
+///
+/// Local and remote-tracking branches share this shape because the popup treats them the
+/// same way: both are things you can check out, branch from, and read a tip line for. The
+/// difference is [`Self::remote`], and it is what decides whether *Rename* and *Delete* are
+/// offered — those write `refs/heads/`, and a remote-tracking ref is a cache of somebody
+/// else's repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BranchRef {
+    /// Short name: `main`, or `origin/main` for a remote-tracking branch.
+    pub name: String,
+    pub remote: bool,
+    /// This is `HEAD`. At most one entry in a [`BranchList`] has it.
+    pub current: bool,
+    /// `origin/main`, for a local branch that has one.
+    pub upstream: Option<String>,
+    /// Commits on this branch that its upstream does not have, and vice versa. Both zero
+    /// for a remote-tracking branch, which is nobody's downstream.
+    pub ahead: u32,
+    pub behind: u32,
+    /// Abbreviated tip oid, 8 hex digits.
+    pub tip: String,
+    /// Summary line of the tip commit — the second line of a branch row.
+    pub subject: String,
+    /// Committer time of the tip, unix seconds. The popup sorts by it, because the branch
+    /// you want next is nearly always one of the handful you touched last.
+    pub committed: i64,
+}
+
+/// Every branch of one repository, plus what `HEAD` is doing.
+///
+/// One of these per repository, because a project can hold several roots and each root its
+/// submodules — and in a superproject the branch you mean is genuinely ambiguous. The
+/// selector names the repository whenever there is more than one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BranchList {
+    pub repo: RepoInfo,
+    /// The same [`BranchInfo`] the status bar reads, so the widget and the popup cannot
+    /// disagree about what is checked out.
+    pub head: BranchInfo,
+    /// Local branches, most recently committed first.
+    pub local: Vec<BranchRef>,
+    /// Remote-tracking branches, same order. `origin/HEAD` is dropped: it is a symbolic ref
+    /// that duplicates whichever branch it points at.
+    pub remote: Vec<BranchRef>,
+}
+
+/// What a checkout should do about local changes that stand in its way.
+///
+/// There is deliberately **no `Force`**. Discarding uncommitted work is the one thing this
+/// crate exists to never do by accident, and a dropdown in a status bar is the last place it
+/// should be one click away; `git_rollback` is the command that destroys work and it says so.
+/// Everything here either refuses or preserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum CheckoutMode {
+    /// Refuse with [`GitError::CheckoutWouldOverwrite`], which names the files. The default,
+    /// and the only mode the first click ever uses.
+    Refuse,
+    /// `git stash -u`, then switch. The changes stay in the stash for the user to pop —
+    /// IDEA's *Stash*.
+    Stash,
+    /// Stash, switch, then pop. IDEA's *Smart checkout*: the changes come along.
+    ///
+    /// The pop can conflict, because the files it touches are exactly the ones that differ
+    /// between the two branches. That is reported in [`CheckoutOutcome::restore_failed`]
+    /// rather than swallowed, and the stash is still there either way.
+    StashAndRestore,
+}
+
+/// What a checkout actually did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CheckoutOutcome {
+    /// The local branch that is now checked out.
+    pub branch: String,
+    /// A local branch was created to track a remote one — `origin/feature` → `feature`.
+    pub created_from_remote: Option<String>,
+    /// The stash entry that was made, when the mode asked for one.
+    pub stashed: Option<String>,
+    /// The stash was made, the switch succeeded, and the changes could **not** be put back.
+    /// They are in `git stash list`; this is git's own message for why.
+    pub restore_failed: Option<String>,
+}
+
+/// Result of a fetch or a fast-forward pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FetchOutcome {
+    pub remote: String,
+    /// True when the `git` binary did it because a credential helper is configured — the
+    /// same rule [`PushOutcome::shelled_out`] records for pushes.
+    pub shelled_out: bool,
+    /// git's own text. `Everything up-to-date`, or the transport's complaint, lives here.
+    pub output: String,
+    /// How many commits the fast-forward moved `HEAD`. Zero for a plain fetch, and for a
+    /// pull that had nothing to take.
+    pub advanced: u32,
+}
+
 // --- shelf and stash --------------------------------------------------------------------
 
 /// One shelved patch. Ours, not git's — see `cide-git::shelf` for why they are separate.
@@ -547,6 +656,56 @@ pub enum GitError {
         index: u32,
     },
 
+    // --- branches ---
+    /// No branch of that name, local or remote-tracking.
+    NoSuchBranch {
+        name: String,
+    },
+    /// Creating a branch over one that exists. Never forced: two people's `feature/login`
+    /// are two different things and silently moving the ref loses one of them.
+    BranchExists {
+        name: String,
+    },
+    /// `git check-ref-format` would reject it — a space, `..`, a trailing `.lock`.
+    InvalidBranchName {
+        name: String,
+    },
+    /// Deleting a branch whose commits are on no other branch. Carries the name so the
+    /// confirmation can say *what* would be lost rather than "are you sure".
+    BranchNotMerged {
+        name: String,
+    },
+    /// Deleting the branch that is checked out. git refuses this too, and the useful answer
+    /// is "switch first" rather than an error code.
+    BranchIsCurrent {
+        name: String,
+    },
+    /// The switch would overwrite local changes. **The whole point of this variant is
+    /// `paths`**: "checkout failed" is unactionable, and the files that are in the way are
+    /// the ones the user has to decide about. Only paths that genuinely block are listed —
+    /// a modified file that is identical on both branches comes along and is not here.
+    CheckoutWouldOverwrite {
+        branch: String,
+        paths: Vec<String>,
+    },
+    /// A pull that is not a fast-forward. cide does not merge or rebase for you — there is
+    /// no conflict-resolution surface yet — so it says how far the two have diverged and
+    /// stops.
+    NotFastForward {
+        branch: String,
+        ahead: u32,
+        behind: u32,
+    },
+    /// The branch has no upstream, so there is nothing to pull from.
+    NoUpstream {
+        branch: String,
+    },
+    /// `git fetch` failed. Same shape as [`Self::Push`] and for the same reason: the
+    /// transport's own text is what the user needs.
+    Fetch {
+        output: String,
+    },
+
     /// `git push` failed. `output` is the transport's own text, which is what the user
     /// actually needs.
     Push {
@@ -596,6 +755,29 @@ impl std::fmt::Display for GitError {
             Self::DuplicateChangelist { name } => write!(f, "a changelist named {name} exists"),
             Self::NoSuchShelf { id } => write!(f, "no such shelved change: {id}"),
             Self::NoSuchStash { index } => write!(f, "no such stash entry: {index}"),
+            Self::NoSuchBranch { name } => write!(f, "no such branch: {name}"),
+            Self::BranchExists { name } => write!(f, "a branch named {name} already exists"),
+            Self::InvalidBranchName { name } => write!(f, "{name} is not a valid branch name"),
+            Self::BranchNotMerged { name } => {
+                write!(f, "{name} has commits that are on no other branch")
+            }
+            Self::BranchIsCurrent { name } => write!(f, "{name} is the branch you are on"),
+            Self::CheckoutWouldOverwrite { branch, paths } => write!(
+                f,
+                "switching to {branch} would overwrite {} local change(s): {}",
+                paths.len(),
+                paths.join(", ")
+            ),
+            Self::NotFastForward {
+                branch,
+                ahead,
+                behind,
+            } => write!(
+                f,
+                "{branch} is {ahead} ahead and {behind} behind its upstream, so this is not a fast-forward"
+            ),
+            Self::NoUpstream { branch } => write!(f, "{branch} has no upstream branch"),
+            Self::Fetch { output } => write!(f, "fetch failed: {output}"),
             Self::Push { output } => write!(f, "push failed: {output}"),
             Self::Io { detail } | Self::Git { detail } => f.write_str(detail),
             Self::Sidecar { path, detail } => write!(f, "{path}: {detail}"),
