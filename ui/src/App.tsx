@@ -42,6 +42,7 @@ import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
+import { revealPane } from '@/editor/revealPane'
 import { requestReveal } from '@/editor/revealRequest'
 import { claudeSend } from '@/ipc/client'
 import { useKeyGate } from '@/keys/useKeyGate'
@@ -839,7 +840,14 @@ export function App() {
                 // whole round exists to end. Empty text and no line numbers is a whole-file
                 // mention. Deliberately uncaught: `Failures` turns the rejection into the
                 // sentence saying why nothing was sent.
-                void claudeSend.lines(activeProjectId, mentionTarget, path, '')
+                // …then take the user to the pane that got it. Without this the mention lands
+                // in a prompt that may be in another tab, and Ctrl+P's ⌥⏎ looks exactly like
+                // the silent no-op it used to be — the same complaint in a new disguise. The
+                // reveal is deliberately after the send resolves: nothing should move if the
+                // send failed, and `Failures` is already reporting that.
+                void claudeSend
+                  .lines(activeProjectId, mentionTarget, path, '')
+                  .then(() => revealPane(activeProjectId, mentionTarget))
               },
               runCommand: (id) => {
                 closeOverlay()

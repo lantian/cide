@@ -27,6 +27,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { sameTrail, subscribeStatusReadout } from '@/editor/statusReadout'
 import { NO_DIAGNOSTICS_SOURCE } from '@/sidebar/ProblemsPanel/model'
+import { BranchSelector } from './BranchSelector'
 import styles from './StatusBar.module.css'
 
 export interface Diagnostics {
@@ -35,7 +36,11 @@ export interface Diagnostics {
 }
 
 export interface StatusBarProps {
-  branch?: string | undefined
+  /*
+   * No `branch` prop. It was here, defaulted to `'—'`, and nothing ever passed one — so the
+   * slot printed a dash forever. `BranchSelector` reads the repository itself; a prop would be
+   * a second source of truth for a value it already holds to draw its list.
+   */
   added?: number | undefined
   removed?: number | undefined
   /** `null` means no diagnostics source is running, which is distinct from zero of each. */
@@ -62,7 +67,6 @@ const CLAUDE_PENDING = 'Session readout arrives from the Claude statusline hook.
 const CLAUDE_PLACEHOLDER = 'claude · —'
 
 export function StatusBar({
-  branch = '—',
   added = 0,
   removed = 0,
   diagnostics = null,
@@ -92,9 +96,16 @@ export function StatusBar({
   return (
     <div className={styles.bar} data-audit="statusBar">
       <div className={styles.left}>
-        <span className={styles.branch} title={`Branch: ${branch}`}>
-          ⑂ {branch}
-        </span>
+        {/*
+          * The live control, not a label. This slot used to be a `<span>` printing a `branch`
+          * prop that the app never passed — so it read `⑂ —` on every launch and did nothing
+          * when clicked, which is what the user reported.
+          *
+          * `BranchSelector` fetches its own data and owns its popup, so the bar hands it
+          * nothing: a prop would be a second source of truth for a value the selector already
+          * has to hold to render the list.
+          */}
+        <BranchSelector />
 
         {/*
          * The mock separates the two counts by two spaces inside one slot rather than by
