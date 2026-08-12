@@ -191,6 +191,10 @@ function dirMenu(row: Row, git: ReturnType<typeof useGitPanel>): MenuEntry[] {
   const paths = carried?.files.map((f) => f.path) ?? []
   const count = paths.length
   const path = row.path ?? row.label
+  // What `Roll Back` would actually do to these files. An untracked path has nothing in HEAD,
+  // so `stage::rollback` deletes it; an ignored one is not part of any change at all.
+  const untracked = row.groupKind === 'unversioned'
+  const ignored = row.groupKind === 'ignored'
   return [
     {
       id: 'move',
@@ -209,11 +213,26 @@ function dirMenu(row: Row, git: ReturnType<typeof useGitPanel>): MenuEntry[] {
     { kind: 'separator' },
     {
       id: 'revertDir',
-      label: `Roll Back ${plural(count)}`,
+      /*
+       * The label is per kind, exactly as on the group row, because the command is not the
+       * same command: `stage::rollback` restores a tracked path from HEAD and *deletes* an
+       * untracked one, and this row can name two hundred of them at once. `Roll Back 214
+       * files` over a directory of unversioned work is a sentence that promises a restore and
+       * performs a delete, which is the one thing in this panel with no undo at all.
+       *
+       * The ignored list is refused outright, which is the stance the group menu already
+       * takes: those files are not part of any change, and a directory row inside it is
+       * `target/` or `node_modules/` — nothing a context menu should be able to erase in one
+       * click. The group row's own `Revert Group` has been disabled there since it shipped;
+       * a directory row inside the same list must not be the way around it.
+       */
+      label: untracked ? `Delete ${plural(count)}` : `Roll Back ${plural(count)}`,
       danger: true,
-      ...(count > 0
-        ? { run: () => git.revertFiles(row.repo, paths) }
-        : { disabledReason: 'Nothing under this directory to roll back' }),
+      ...(ignored
+        ? { disabledReason: 'Ignored files are not part of any change — nothing to roll back' }
+        : count > 0
+          ? { run: () => git.revertFiles(row.repo, paths, untracked) }
+          : { disabledReason: 'Nothing under this directory to roll back' }),
     },
     { id: 'copyPath', label: 'Copy Path', run: () => void copyText(path) },
   ]

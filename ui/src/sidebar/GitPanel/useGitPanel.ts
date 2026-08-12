@@ -229,8 +229,15 @@ export interface GitPanelActions {
   movePaths: (repo: RepoId, changelist: string, paths: string[]) => void
   /** Throw away everything in one group. **Opens the confirmation**, which names every file. */
   revertGroup: (repo: RepoId, group: string) => void
-  /** Same, for an explicit list of paths. */
-  revertFiles: (repo: RepoId, paths: string[]) => void
+  /**
+   * Same, for an explicit list of paths.
+   *
+   * `untracked` is not a flavour of wording, it is what the command *does*: `stage::rollback`
+   * finds nothing in HEAD for an untracked path and deletes it from disk instead. Pass it for
+   * any set drawn from the unversioned list, or the dialog promises a restore before running a
+   * delete — see `revertGroup`, which has split on the same fact since the group menu shipped.
+   */
+  revertFiles: (repo: RepoId, paths: string[], untracked?: boolean) => void
   /** Shelve a whole group under its own name — the group menu's `Shelve Changelist`. */
   shelveGroup: (repo: RepoId, group: string) => void
   dismissDialog: () => void
@@ -959,15 +966,27 @@ export function useGitPanel(
   // --- reverting, which is the one thing here with no undo ------------------------------------
 
   const revertFiles = useCallback(
-    (repo: RepoId, paths: string[]) => {
+    (repo: RepoId, paths: string[], untracked = false) => {
       if (paths.length === 0) return
       setConfirm({
-        title: paths.length === 1 ? 'Revert this file?' : `Revert ${files(paths.length)}?`,
-        body:
-          'These files go back to their last committed state. Uncommitted work in them is '
-          + 'thrown away, and git has no undo for it.',
+        // The same split `revertGroup` makes, and for the same reason: git has nothing to
+        // restore an untracked path from, so `stage::rollback` removes the file. A dialog
+        // saying "goes back to its last committed state" over a delete is the one wording in
+        // this panel that could cost work the user cannot get back.
+        title: untracked
+          ? `Delete ${files(paths.length)}?`
+          : paths.length === 1
+            ? 'Revert this file?'
+            : `Revert ${files(paths.length)}?`,
+        body: untracked
+          ? 'Git is not tracking these files, so there is nothing to restore them from. '
+            + 'They are deleted from disk.'
+          : 'These files go back to their last committed state. Uncommitted work in them is '
+            + 'thrown away, and git has no undo for it.',
         files: paths,
-        confirmLabel: `Revert ${files(paths.length)}`,
+        confirmLabel: untracked
+          ? `Delete ${files(paths.length)}`
+          : `Revert ${files(paths.length)}`,
         run: () => doRollback(repo, paths),
       })
     },

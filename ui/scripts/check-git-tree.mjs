@@ -1074,12 +1074,55 @@ try {
     /label: `Move \$\{plural\(count\)\} to Changelist…`,\s*\.\.\.\(empty/.test(host),
     'and so can a whole changelist — the one row a drag deliberately cannot start from',
   )
+  /*
+   * The directory row's *destructive* verb, which the row model made much bigger than it was.
+   *
+   * `stage::rollback` restores a tracked path from HEAD and **deletes** an untracked one from
+   * disk (`crates/cide-git/src/stage.rs`), and a directory row names every file under it at
+   * once. So the label has to split on the kind exactly as the group row's does — `Roll Back
+   * 214 files` over a directory of unversioned work promises a restore and performs a delete —
+   * and the ignored list is refused outright, because the group row's `Revert Group` is
+   * disabled there and a directory row inside the same list must not be the way around it.
+   */
+  ok(
+    /function dirMenu\([\s\S]{0,2600}?label: untracked \? `Delete \$\{plural\(count\)\}` : `Roll Back \$\{plural\(count\)\}`/
+      .test(host),
+    'a directory of UNVERSIONED files says Delete, not Roll Back: git has nothing to restore '
+      + 'them from, so the command removes them from disk, and the dialog must not promise a '
+      + 'restore before running a delete',
+  )
+  ok(
+    /function dirMenu\([\s\S]{0,2900}?\.\.\.\(ignored\s*\?\s*\{ disabledReason:/.test(host),
+    'and a directory inside IGNORED FILES refuses to roll back at all — `target/` and '
+      + '`node_modules/` are not part of any change, and the group row above it has refused '
+      + 'the same verb since it shipped',
+  )
+  ok(
+    /git\.revertFiles\(row\.repo, paths, untracked\)/.test(host)
+      && /\(repo: RepoId, paths: string\[\], untracked = false\)/.test(
+        readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8'),
+      ),
+    'and the fact travels to the confirmation rather than stopping at the label: one dialog, '
+      + 'worded by what the command will actually do',
+  )
   const tree2 = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangesTree.tsx'), 'utf8')
   ok(
     /onPointerDown=\{\(e\) => drag\.onPointerDown\(e, row\)\}/.test(tree2)
       && /useChangesDrag\(\{ rows, view, selected, container, onMove: onMovePaths \}\)/.test(tree2),
     'every row is a drag source candidate and the tree is wired to the pointer state machine — '
       + 'the rules being right is worth nothing if no gesture reaches them',
+  )
+  /*
+   * And it does not start when there is nothing to land on. Without this the drag ran in full
+   * against a tree with no `onMovePaths` — rows dimmed, the ghost read `Move 4 files to
+   * “fixes”`, the target ringed in the accent — and the drop did nothing at all, because
+   * `finish` ends at an optional call. Both doc comments already promised the opposite.
+   */
+  const gesture = readFileSync(join(UI, 'src/sidebar/GitPanel/useChangesDrag.ts'), 'utf8')
+  ok(
+    /if \(live\.current\.onMove === undefined\) return/.test(gesture),
+    'a tree with no `onMovePaths` is inert rather than decorative: a press never becomes a '
+      + 'drag, instead of a full gesture whose drop silently does nothing',
   )
   ok(
     /onMouseUp=\{\(e\) => \{\s*if \(e\.button !== 0 \|\| drag\.dragged\(\)\) return/.test(tree2),

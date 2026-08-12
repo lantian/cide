@@ -286,6 +286,16 @@ interface DirNode {
 
 function dirTree(entries: readonly ChangeEntry[]): DirNode {
   const root: DirNode = { path: '', label: '', dirs: [], files: [] }
+  /*
+   * Prefix to node, for the whole build. The obvious `node.dirs.find(d => d.path === prefix)`
+   * is a linear scan of the siblings for *every segment of every path*, which is quadratic in
+   * the width of a directory — and `dirTree` runs three times per refresh per group (here,
+   * plus `defaultExpanded` and `allGroups` through `arrivals`) on a panel that refreshes
+   * several times a second while an agent edits. A `git status` with a few thousand changed
+   * files in one flat directory is where that shows up, and it shows up as the whole tree
+   * stuttering. Insertion order is unchanged: the map only answers "have I made this one".
+   */
+  const index = new Map<string, DirNode>()
   for (const entry of entries) {
     const parts = entry.path.split('/')
     // The basename never becomes a directory, so a path with no slash lands straight in the
@@ -299,10 +309,11 @@ function dirTree(entries: readonly ChangeEntry[]): DirNode {
       // real, and hiding it would understate what a commit is about to include.
       if (part === '') continue
       prefix = prefix === '' ? part : `${prefix}/${part}`
-      const found = node.dirs.find((d) => d.path === prefix)
+      const found = index.get(prefix)
       if (found === undefined) {
         const made: DirNode = { path: prefix, label: part, dirs: [], files: [] }
         node.dirs.push(made)
+        index.set(prefix, made)
         node = made
       } else {
         node = found

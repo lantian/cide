@@ -132,6 +132,17 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
       if (gesture.current !== null) return
       // A new press: whatever the previous gesture was, this one is a click until it moves.
       wasDrag.current = false
+      /*
+       * Nothing to land on, so nothing is picked up.
+       *
+       * `onMove` is absent in a fixture and in the server render, and without this the drag
+       * ran in full — rows dimmed, the ghost read `Move 4 files to “fixes”`, the target
+       * ringed in the accent — and the drop did nothing whatever, because `finish` ends at an
+       * optional call. That is the silent failure this feature exists to remove, dressed as
+       * the feature. Read through `live` rather than closed over, so a panel that gains the
+       * action between renders is not stuck inert until it remounts.
+       */
+      if (live.current.onMove === undefined) return
       if (grab(live.current.view, live.current.selected, row) === null) return
 
       const el = e.currentTarget
