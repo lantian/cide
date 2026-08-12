@@ -377,10 +377,34 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     [commitPaste, fail, project],
   )
 
+  /**
+   * Back out. The clipboard is left alone so the gesture can simply be repeated.
+   *
+   * The note is not decoration: a dialog that vanishes with nothing said is indistinguishable
+   * from a paste that silently failed, and the one thing worth saying here is the property the
+   * whole plan-then-paste ordering was built for — nothing was written.
+   *
+   * Above `answerPaste` because that one depends on it, and a `const` named in a dependency
+   * array is read *during* the render that declares it.
+   */
+  const cancelPaste = useCallback(() => {
+    setPendingPaste(null)
+    pasting.current = false
+    setNote(cancelledNote())
+  }, [])
+
   /** One answer from the dialog. The last one sends the paste. */
   const answerPaste = useCallback(
     (answer: PasteAnswer, applyToRest: boolean) => {
-      if (project === null || pendingPaste === null) return
+      if (pendingPaste === null) return
+      // The project closed while the question was on screen. Backing out rather than returning
+      // is the difference between a dialog and a picture of one: an early `return` here left
+      // both answers dead on a card the user could only dismiss with Escape, and the paste flag
+      // set behind it, so the next Ctrl+V did nothing either.
+      if (project === null) {
+        cancelPaste()
+        return
+      }
       const next = answerAsk(pendingPaste.ask, answer, applyToRest)
       if (!askIsDone(next)) {
         setPendingPaste({ destDir: pendingPaste.destDir, ask: next })
@@ -389,21 +413,8 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       setPendingPaste(null)
       commitPaste(project, pendingPaste.destDir, askDecisions(next))
     },
-    [commitPaste, pendingPaste, project],
+    [cancelPaste, commitPaste, pendingPaste, project],
   )
-
-  /**
-   * Back out. The clipboard is left alone so the gesture can simply be repeated.
-   *
-   * The note is not decoration: a dialog that vanishes with nothing said is indistinguishable
-   * from a paste that silently failed, and the one thing worth saying here is the property the
-   * whole plan-then-paste ordering was built for — nothing was written.
-   */
-  const cancelPaste = useCallback(() => {
-    setPendingPaste(null)
-    pasting.current = false
-    setNote(cancelledNote())
-  }, [])
 
   const scrollRef = useRef<HTMLDivElement>(null)
   /**

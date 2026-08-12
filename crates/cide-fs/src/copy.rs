@@ -48,7 +48,10 @@
 //! put the source in its place — deletes files that were never on screen and never mentioned,
 //! and no count in a dialog can make that safe. Replacing a file **with** a directory (or the
 //! reverse) is not a replacement of anything and is refused outright: [`FsError::CannotReplace`],
-//! raised by [`plan`] before the question is even asked.
+//! raised by [`plan`] before the question is even asked — and raised again, over the *whole*
+//! pair with no walk budget, before [`paste_with`] writes anything. The dialog's counts may stop
+//! early and say so; the refusal may not, because a merge abandoned at the mismatch has already
+//! overwritten every file above it.
 //!
 //! **A cut moves nothing until it is pasted.** [`PasteMode`] travels with the paste; Ctrl+X
 //! only writes to a clipboard in the frontend. A cut that is never pasted therefore costs
@@ -104,7 +107,22 @@ const MAX_CANDIDATES: u32 = 1000;
 /// the first two digits is a dialog that takes a second to open. Past this the counts become
 /// lower bounds and [`PasteCollision::truncated`] says so — which is a true answer, unlike an
 /// exact number that took a second to compute or a wrong one that took none.
+///
+/// **This bounds the dialog's numbers and nothing else.** [`check_replaceable`] walks the pair
+/// with no budget at all, because a *refusal* that gives up early is not a lower bound — it is
+/// a wrong answer that lets [`merge_into`] discover the mismatch after it has already
+/// overwritten everything above it. A budget is affordable for a count nobody has agreed to
+/// yet; it is not affordable for the check that decides whether a byte gets written.
 const PREVIEW_LIMIT: u32 = 4096;
+
+/// The budget [`check_replaceable`] walks with: none.
+///
+/// Its own name rather than a literal at the call site, because the mistake it prevents is a
+/// one-word edit that no fixture small enough to be a test can catch — the folder pair has to
+/// hold more than [`PREVIEW_LIMIT`] entries before a bounded refusal starts lying, and building
+/// one of those is seconds of I/O for a walk whose order the test cannot control. So the
+/// constant is what the test pins, and this is where the reason lives.
+const REFUSAL_LIMIT: u32 = u32::MAX;
 
 /// How many of the files a merge would overwrite are named individually.
 ///
@@ -206,7 +224,7 @@ pub fn plan(
     }
     let mut out = Vec::new();
     for source in sources {
-        if let Some(collision) = collision_for(source, dest_dir)? {
+        if let Some(collision) = collision_for(source, dest_dir, PREVIEW_LIMIT)? {
             out.push(collision);
         }
     }
@@ -224,12 +242,18 @@ fn choice_for(decisions: &[PasteDecision], source: &Path) -> PasteChoice {
 /// Refuse a `Replace` that is not one, before anything is written.
 ///
 /// The kind mismatch is checked at the top *and* everywhere inside a merge, by walking the pair
-/// exactly as [`plan`] does. Doing it here rather than discovering it half way through the
-/// recursion is the difference between a refusal and a directory left half merged: by the time
-/// `merge_into` meets a file where it expected a folder, it has already overwritten everything
-/// above it.
+/// as [`plan`] does — but with **no budget**, which is the difference that makes it a guarantee.
+/// Doing it here rather than discovering it half way through the recursion is the difference
+/// between a refusal and a directory left half merged: by the time `merge_into` meets a file
+/// where it expected a folder, it has already overwritten everything above it.
+///
+/// [`PREVIEW_LIMIT`] must not reach this walk. It exists so the *dialog* opens quickly, and a
+/// count that stops early is honest about it ([`PasteCollision::truncated`]); a refusal that
+/// stops early is simply wrong, and a folder pair with more entries than the budget would then
+/// be merged right up to the mismatch and abandoned there with a `CannotReplace` that reads as
+/// "nothing happened".
 fn check_replaceable(source: &Path, dest_dir: &Path) -> Result<()> {
-    match collision_for(source, dest_dir)? {
+    match collision_for(source, dest_dir, REFUSAL_LIMIT)? {
         Some(collision) => match collision.blocked {
             Some(why) => Err(FsError::CannotReplace(why)),
             None => Ok(()),
@@ -241,7 +265,12 @@ fn check_replaceable(source: &Path, dest_dir: &Path) -> Result<()> {
 }
 
 /// What is in the way of `source` landing in `dest_dir`, or `None`.
-fn collision_for(source: &Path, dest_dir: &Path) -> Result<Option<PasteCollision>> {
+///
+/// `limit` caps how many entries a folder-on-folder preview reads. [`plan`] passes
+/// [`PREVIEW_LIMIT`] so the dialog opens at once; [`check_replaceable`] passes
+/// [`REFUSAL_LIMIT`], because the `blocked` it reads has to be the whole answer rather than the
+/// first 4096 entries of it.
+fn collision_for(source: &Path, dest_dir: &Path, limit: u32) -> Result<Option<PasteCollision>> {
     // A paste into the folder the source is already in is never a collision, and this is the
     // line that keeps *duplicate a file beside itself* a single gesture. The file would collide
     // with itself; asking "replace main.rs with main.rs?" is a question with no good answer, and
@@ -280,7 +309,7 @@ fn collision_for(source: &Path, dest_dir: &Path) -> Result<Option<PasteCollision
         // Cloned out first: the walk fills in the counts on `collision`, so it cannot also
         // borrow the destination path out of it.
         let into = collision.dest.clone();
-        preview_merge(source, &into, "", &mut collision, &mut seen)?;
+        preview_merge(source, &into, "", &mut collision, &mut seen, limit)?;
     } else {
         collision.replaces = 1;
     }
@@ -311,6 +340,7 @@ fn preview_merge(
     rel: &str,
     out: &mut PasteCollision,
     seen: &mut u32,
+    limit: u32,
 ) -> Result<()> {
     let mut existing: HashMap<OsString, bool> = HashMap::new();
     for entry in std::fs::read_dir(dest).map_err(|e| FsError::io(dest, e))? {
@@ -327,7 +357,7 @@ fn preview_merge(
         if out.blocked.is_some() {
             return Ok(());
         }
-        if *seen >= PREVIEW_LIMIT {
+        if *seen >= limit {
             out.truncated = true;
             return Ok(());
         }
@@ -347,7 +377,14 @@ fn preview_merge(
             return Ok(());
         }
         if kind.is_dir() {
-            preview_merge(&entry.path(), &dest.join(&name), &child_rel, out, seen)?;
+            preview_merge(
+                &entry.path(),
+                &dest.join(&name),
+                &child_rel,
+                out,
+                seen,
+                limit,
+            )?;
         } else {
             out.replaces += 1;
             if out.sample.len() < PREVIEW_SAMPLE {
@@ -774,6 +811,24 @@ fn move_over(source: &Path, dest: &Path, meta: &Metadata) -> Result<()> {
     }
 }
 
+/// A sibling name no other write in this process is using: `.main.rs.cide-paste-4021-7.tmp`.
+///
+/// The pid alone is not enough, and the difference is a corrupted file rather than a lost race.
+/// `fs_paste` is `async` over `spawn_blocking`, so two pastes — two windows, two panels — run
+/// concurrently in **one** process; two overwrites of the same name in the same folder would
+/// then have picked the same temporary, `std::fs::copy` into it from both sides, and `rename`
+/// the interleaving onto the destination. That is a third file the user never had, arriving
+/// under a guarantee that says the destination holds the old bytes or the new ones. The counter
+/// makes the name unique per write, which is what the temporary was always assumed to be.
+///
+/// Leading dot so the tree's filter hides it for the milliseconds it exists.
+fn temp_name(name: &str, what: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(".{name}.cide-{what}-{}-{seq}.tmp", std::process::id())
+}
+
 /// Copy `source` over an existing `dest`, through a sibling and a `rename(2)`.
 ///
 /// Not `std::fs::copy(source, dest)`, which truncates the destination first: a copy that fails
@@ -787,8 +842,7 @@ fn copy_over(source: &Path, dest: &Path) -> Result<()> {
     let dir = dest
         .parent()
         .ok_or_else(|| FsError::InvalidPath(dest.display().to_string()))?;
-    let name = name_of(dest)?;
-    let tmp = dir.join(format!(".{}.cide-paste-{}.tmp", name, std::process::id()));
+    let tmp = dir.join(temp_name(name_of(dest)?, "paste"));
     let _ = std::fs::remove_file(&tmp);
     if let Err(err) = std::fs::copy(source, &tmp) {
         let _ = std::fs::remove_file(&tmp);
@@ -835,8 +889,7 @@ fn link_onto(source: &Path, dest: &Path) -> Result<()> {
         let dir = dest
             .parent()
             .ok_or_else(|| FsError::InvalidPath(dest.display().to_string()))?;
-        let name = name_of(dest)?;
-        let tmp = dir.join(format!(".{}.cide-link-{}.tmp", name, std::process::id()));
+        let tmp = dir.join(temp_name(name_of(dest)?, "link"));
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&target, &tmp).map_err(|e| FsError::io(&tmp, e))?;
         if let Err(err) = std::fs::rename(&tmp, dest) {
@@ -1725,6 +1778,64 @@ mod tests {
         // pre-flight pass rather than when the recursion trips over it.
         assert_eq!(read(&dir.join("into/src/top.rs")), "old top");
         assert_eq!(read(&dir.join("into/src/mod")), "a FILE where a folder is");
+    }
+
+    /// The preview's budget must not become the refusal's budget.
+    ///
+    /// `plan` stops counting at [`PREVIEW_LIMIT`] so the dialog opens at once, and says so with
+    /// `truncated`. Reading `blocked` off that same bounded walk is what made a folder pair
+    /// bigger than the budget merge right up to the file-versus-folder clash and *then* refuse:
+    /// the caller saw a `CannotReplace` that reads as "nothing happened" while the destination
+    /// was half overwritten and, for a cut, the source half emptied. So `check_replaceable`
+    /// walks with no budget, and this pins the two apart with a budget of zero — the smallest
+    /// truncation there is, and the one every real one behaves like.
+    #[test]
+    fn a_truncated_preview_never_becomes_permission_to_merge() {
+        let dir = scratch("replace-truncated-preview");
+        let roots = roots_of(dir.path());
+        std::fs::create_dir_all(dir.join("src/mod")).unwrap();
+        std::fs::write(dir.join("src/mod/a.rs"), "a").unwrap();
+        std::fs::write(dir.join("src/top.rs"), "new top").unwrap();
+        std::fs::create_dir_all(dir.join("into/src")).unwrap();
+        std::fs::write(dir.join("into/src/mod"), "a FILE where a folder is").unwrap();
+        std::fs::write(dir.join("into/src/top.rs"), "old top").unwrap();
+
+        // What the dialog would be handed if the walk gave up immediately: an honest
+        // `truncated`, and no idea that a refusal is waiting one level down.
+        let peeked = collision_for(&dir.join("src"), &dir.join("into"), 0)
+            .unwrap()
+            .expect("a folder on a folder");
+        assert!(peeked.truncated, "a zero budget has to report itself");
+        assert!(
+            peeked.blocked.is_none(),
+            "the budget stopped before the mismatch, which is the whole premise"
+        );
+
+        // The paste refuses anyway, and refuses *first*: `top.rs` is what it was.
+        let out = paste_with(
+            &roots,
+            &[dir.join("src")],
+            &dir.join("into"),
+            PasteMode::Copy,
+            &[replace(dir.join("src"))],
+        );
+        assert!(matches!(out, Err(FsError::CannotReplace(_))), "{out:?}");
+        assert_eq!(
+            read(&dir.join("into/src/top.rs")),
+            "old top",
+            "the merge started before the refusal and overwrote a file"
+        );
+        assert!(!dir.join("into/src/mod").is_dir());
+
+        // And the budget the production refusal walks with. Pinned as a constant rather than
+        // through a fixture: a folder pair has to hold more than PREVIEW_LIMIT entries before
+        // a bounded refusal starts lying, `read_dir` order decides whether it lies on any given
+        // run, and a test that fails four times in five is not a test.
+        assert_eq!(
+            REFUSAL_LIMIT,
+            u32::MAX,
+            "the refusal walk must not inherit the preview's budget"
+        );
     }
 
     /// A cut answered *Replace* moves over the destination and leaves nothing behind.
