@@ -10,6 +10,8 @@
  * splitter is mid-drag. Those never outlive the window and never need to agree with anyone.
  */
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
+import { reconcile, touch } from '@/keys/switcher'
+import { windowProjectsOf } from '@/keys/target'
 import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
@@ -188,10 +190,120 @@ function syncFileIndex(workspace: Workspace): void {
   }
 }
 
+/* ------------------------------------------------------------------------ the MRU stack */
+
+/**
+ * Where the project MRU order lives, and why it is not in Rust.
+ *
+ * Ctrl+Tab walks *most-recently-used* order (`keys/switcher.ts`), so something has to
+ * remember the order the user visited projects in. There were two places it could go and the
+ * choice is not a toss-up:
+ *
+ * * **The workspace** — persisted in `workspace.json`, shared by every window. Rejected. It
+ *   is not domain state: `Workspace` is the tree two windows must *agree* on, and "the order
+ *   I visited things in" is a fact about one window's user. Putting it there means every
+ *   Ctrl+Tab bumps `rev` and broadcasts `cide://workspace-changed` to every window — a
+ *   keystroke that repaints somebody else's screen — and it means a new field on `Project` or
+ *   `Workspace`, a schema migration, and a `project_touch` command, for a list of strings.
+ * * **The window** — which is what this is. Module-scope state in one webview, mirrored to
+ *   `localStorage` so it survives a quit.
+ *
+ * The `localStorage` half is not optional and is the reason "the window" is not the wrong
+ * answer: a stack that resets every launch makes the first Ctrl+Tab of every session land on
+ * whatever happens to be second in the header, which is precisely the header-order behaviour
+ * this replaced. `chrome/SidebarSplitter.tsx` already keeps per-window durable chrome the same
+ * way, and the ids are stable — `ProjectId` is persisted in `workspace.json`, so an id written
+ * here is still the same project after a restart.
+ *
+ * Two honest limits, stated rather than hidden:
+ *
+ * * `localStorage` is per *origin*, so several shell windows would share one stack. In
+ *   `Stacked` mode there is one shell window; in `PerProject` mode each strip holds exactly
+ *   one project and Ctrl+Tab has nothing to walk. The overlap is theoretical today.
+ * * A stale id for a project that has since been closed is dropped by [`reconcile`] on the
+ *   first snapshot, not persisted forward.
+ */
+const MRU_CACHE_KEY = 'cide.projectMru'
+
+/** The remembered stack, or `[]` when there is nothing readable there. */
+function loadMru(): string[] {
+  try {
+    const raw = globalThis.localStorage?.getItem(MRU_CACHE_KEY)
+    if (raw === null || raw === undefined) return []
+    const parsed: unknown = JSON.parse(raw)
+    // Validated rather than cast: this is data from disk that a user can edit, and a
+    // malformed entry would otherwise reach `project_activate` as a project id.
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((id): id is string => typeof id === 'string')
+  } catch {
+    // A quota error, a private-mode throw, or a half-written line. An empty stack degrades to
+    // header order on the first press, which is worse than the feature and better than a
+    // window that fails to boot over a cache.
+    return []
+  }
+}
+
+function saveMru(order: readonly string[]): void {
+  try {
+    globalThis.localStorage?.setItem(MRU_CACHE_KEY, JSON.stringify(order))
+  } catch {
+    // Same argument as above, and the write is the half that can genuinely fail on quota.
+  }
+}
+
+/**
+ * The stack this snapshot implies: closed projects dropped, new ones added, the active one at
+ * the front.
+ *
+ * Snapshot-driven rather than hung off `activateProject`, and that is the whole reason it is
+ * one function. A project becomes the active one in four ways — opened, clicked in the header,
+ * committed from the switcher, or activated in *another* window — and only three of them pass
+ * through this store's actions. `cide://workspace-changed` is the one path all four share.
+ *
+ * Returns the same array identity when nothing moved, so subscribers do not re-render on every
+ * snapshot and nothing is written back to `localStorage` for a no-op.
+ */
+function nextMru(previous: readonly string[], boot: Bootstrap | null): readonly string[] {
+  const live = windowProjectsOf(boot)
+  const active = boot?.role.kind === 'shell' ? boot.role.active : null
+  const reconciled = reconcile(previous, live)
+  const next = active === null ? reconciled : touch(reconciled, active)
+  const unchanged =
+    next.length === previous.length && next.every((id, at) => id === previous[at])
+  return unchanged ? previous : next
+}
+
+/** [`nextMru`], writing the cache whenever the order actually moved. */
+function mruFor(previous: readonly ProjectId[], boot: Bootstrap | null): readonly ProjectId[] {
+  const next = nextMru(previous, boot) as readonly ProjectId[]
+  if (next !== previous) saveMru(next)
+  return next
+}
+
 interface WorkspaceStore {
   /** Null until the first `app.getBootstrap` resolves. */
   boot: Bootstrap | null
   theme: Theme
+  /**
+   * Projects in most-recently-used order, `mru[0]` being the active one.
+   *
+   * What Ctrl+Tab walks. Read the note on [`MRU_CACHE_KEY`] for why it lives here and not in
+   * the Rust workspace, and `keys/switcher.ts` for the walk itself. Never written by a
+   * component: it is derived from every snapshot by [`nextMru`], so it cannot drift from the
+   * set of projects that actually exist.
+   */
+  mru: readonly ProjectId[]
+  /**
+   * Record the order the switcher committed to, before the activation round trip lands.
+   *
+   * The snapshot recomputes exactly this a moment later — [`nextMru`] puts the active project
+   * at the front over the same reconciled list — so the two agree by construction and this is
+   * an early copy of an answer, not a second opinion. It exists because the round trip is not
+   * instant and the user can press Ctrl+Tab again inside it: reading a stack whose front is
+   * still the *previous* project makes the second press pick the project that was just
+   * activated, which is the double-tap doing nothing.
+   */
+  rememberMru: (order: readonly ProjectId[]) => void
 
   hydrate: () => Promise<void>
   /** Start following `cide://workspace-changed`. Returns an unlisten function. */
@@ -202,7 +314,7 @@ interface WorkspaceStore {
    * Make a project the one this window shows.
    *
    * `project_activate` has existed since projects went multi-window, and every caller — the
-   * header tab's click, and now `project.next` / `project.prev` on Ctrl+Tab — had to spell
+   * header tab's click, the Ctrl+Tab switcher's commit, `project.next` / `project.prev` — had to spell
    * `projectApi.activate(id).then(hydrate)` for itself. It belongs here with the other
    * mutations for the same reason they do: the re-read is not optional, and a call site that
    * forgets it leaves the window painting the old project until something else hydrates.
@@ -294,9 +406,14 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   // default case and leave dark-theme users flashing; only the attribute knows.
   theme: globalThis.document?.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
 
+  // Read from the cache at module load, before any snapshot has arrived, so the very first
+  // Ctrl+Tab of a session has a real order to walk. It is reconciled against the live project
+  // list on the first snapshot, so a stale id never survives to reach `project_activate`.
+  mru: loadMru() as readonly ProjectId[],
+
   hydrate: async () => {
     const boot = await appApi.getBootstrap()
-    set({ boot, theme: boot.workspace.settings.theme })
+    set({ boot, theme: boot.workspace.settings.theme, mru: mruFor(get().mru, boot) })
     // After the state is set, not before: the explorer and the picker read the project from
     // the store, and an index that started against a project the window has not adopted yet
     // would race the components that are about to ask it questions.
@@ -507,11 +624,19 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // Events carry the revision precisely so a snapshot that arrives out of order can be
     // dropped rather than winding the UI backwards.
     if (workspace.rev < current.workspace.rev) return
-    set({ boot: { ...current, workspace } })
+    const boot = { ...current, workspace }
+    // The MRU stack follows the snapshot, not the action: a project activated, opened or
+    // closed in another window reaches this one only here. See `nextMru`.
+    set({ boot, mru: mruFor(get().mru, boot) })
     // A project opened or closed in *another* window reaches this one only here. Without
     // this line the second window's tree and picker stay empty until something in it happens
     // to call `hydrate`.
     syncFileIndex(workspace)
+  },
+
+  rememberMru: (order) => {
+    saveMru(order)
+    set({ mru: order })
   },
 
   setTheme: (theme) => set({ theme }),

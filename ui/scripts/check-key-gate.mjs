@@ -75,6 +75,9 @@ try {
       'src/keys/when.ts',
       'src/keys/keymap.ts',
       'src/keys/gate.ts',
+      // The switcher's capture is the gate's one stateful claim on a stroke, so the sweep
+      // below has to drive the real one rather than a stand-in that agrees with itself.
+      'src/keys/switcher.ts',
       '--outDir', out,
       '--rootDir', 'src',
       '--module', 'commonjs',
@@ -95,6 +98,7 @@ try {
   const { buildKeymap } = require(join(out, 'keys/keymap.js'))
   const { chipLabel, normalizeSequence, strokeFromEvent } = require(join(out, 'keys/chords.js'))
   const { evaluateWhen } = require(join(out, 'keys/when.js'))
+  const switcher = require(join(out, 'keys/switcher.js'))
 
   /* ------------------------------------------------------------------ the fixture keymap */
 
@@ -117,8 +121,8 @@ try {
     // Ctrl+Tab is in the sweep's key list, so these two also cover the case that matters
     // most for a Tab binding: both entry points must swallow it identically, or the stroke
     // that switched projects also inserts a tab character into whatever had focus.
-    { key: 'ctrl+tab', command: 'project.next', when: null },
-    { key: 'ctrl+shift+tab', command: 'project.prev', when: null },
+    { key: 'ctrl+tab', command: 'project.switcher.next', when: null },
+    { key: 'ctrl+shift+tab', command: 'project.switcher.prev', when: null },
     { key: 'ctrl+alt+h', command: 'pane.navigate.left', when: null },
     { key: 'ctrl+alt+l', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+alt+k', command: 'pane.navigate.up', when: null },
@@ -196,8 +200,39 @@ try {
     },
   })
 
-  /** A gate with a frozen clock, plus the log of what it dispatched. */
-  const makeGate = (ctx) => {
+  /**
+   * A live project-switcher walk, wired the way `keys/switcherStore.ts` wires one.
+   *
+   * The store's `switcherCapture` is four lines over `switcher.capture`, and those four lines
+   * are reproduced here rather than imported because the store pulls in zustand, the IPC
+   * client and the workspace mirror. What is *not* reproduced is the decision itself — that
+   * comes from the compiled module, so a change to the capture rules is felt here.
+   */
+  const walking = (order, hold) => {
+    let walk = { order, index: 1, hold }
+    return {
+      state: () => walk,
+      capture: (stroke) => {
+        if (walk === null) return false
+        const action = switcher.capture(walk, stroke)
+        if (action.kind === 'advance') walk = switcher.advance(walk, action.step)
+        else if (action.kind === 'cancel') walk = null
+        return action.consumed
+      },
+    }
+  }
+
+  const CTRL = { ctrl: true, alt: false, meta: false }
+
+  /**
+   * A gate with a frozen clock, plus the log of what it dispatched.
+   *
+   * `walk` optionally arms the switcher's capture. A *fresh* one per gate, never shared: the
+   * capture is stateful, and handing both entry points one object would let the first call
+   * decide the second's answer — which is the very asymmetry this script exists to detect,
+   * planted by the test rather than found in the code.
+   */
+  const makeGate = (ctx, walk) => {
     const dispatched = []
     let clock = 0
     const gate = createKeyGate({
@@ -206,10 +241,12 @@ try {
       run: (command, args) => dispatched.push({ command, args }),
       now: () => clock,
       timeoutMs: 1000,
+      ...(walk === undefined ? {} : { capture: walk.capture }),
     })
     return {
       gate,
       dispatched,
+      walk,
       advance: (ms) => {
         clock += ms
       },
@@ -293,6 +330,148 @@ try {
     )
     ok(results.window.every((through) => through === false), `sequence fully swallowed: ${label}`)
     eq(a.gate.pending(), null, `sequence disarmed the prefix: ${label}`)
+  }
+
+  /* ------------------------------- the same claim again, with the switcher's capture armed */
+
+  /*
+   * The capture makes the gate **stateful for the duration of a Ctrl+Tab walk**, and a
+   * stateful gate is exactly where the two entry points drift apart: the window listener runs
+   * in the capture phase and the terminal handler runs after the event has reached xterm, so
+   * a claim that mutated on one path and not the other would swallow Tab in a terminal and
+   * pass it through everywhere else — or the reverse, which sends a tab character to the
+   * shell in the middle of switching projects.
+   *
+   * So the whole sweep runs a second time with a walk open. Two gates, two captures, two
+   * event objects, same three assertions.
+   */
+  let capturedCompared = 0
+  for (const ctx of CONTEXTS) {
+    for (const spec of KEYS) {
+      for (let bits = 0; bits < 16; bits++) {
+        const mods = {
+          ctrl: (bits & 1) !== 0,
+          alt: (bits & 2) !== 0,
+          shift: (bits & 4) !== 0,
+          meta: (bits & 8) !== 0,
+        }
+        const label = `switcher open: ${JSON.stringify(mods)} ${spec.code} in ${JSON.stringify(ctx)}`
+        const order = ['p1', 'p2', 'p3']
+
+        const a = makeGate(ctx, walking(order, CTRL))
+        const b = makeGate(ctx, walking(order, CTRL))
+        const evA = event({ ...spec, ...mods })
+        const evB = event({ ...spec, ...mods })
+
+        const viaWindow = a.gate.windowHandler(evA)
+        const viaTerminal = b.gate.terminalHandler(evB)
+
+        capturedCompared += 1
+        if (viaWindow !== viaTerminal) {
+          fail(`entry points disagree on pass-through: ${label}`, `window=${viaWindow} terminal=${viaTerminal}`)
+        }
+        if (JSON.stringify(a.dispatched) !== JSON.stringify(b.dispatched)) {
+          fail(`entry points dispatched differently: ${label}`)
+        }
+        if (JSON.stringify(a.walk.state()) !== JSON.stringify(b.walk.state())) {
+          fail(
+            `entry points left the walk in different states: ${label}`,
+            `window=${JSON.stringify(a.walk.state())} terminal=${JSON.stringify(b.walk.state())}`,
+          )
+        }
+        if (!viaWindow && evA.prevented === 0) fail(`window entry did not preventDefault: ${label}`)
+        if (!viaTerminal && evB.prevented === 0) fail(`terminal entry did not preventDefault: ${label}`)
+        if (evB.stopped !== 0) fail(`terminal entry called stopPropagation: ${label}`)
+      }
+    }
+  }
+  ok(
+    capturedCompared === CONTEXTS.length * KEYS.length * 16,
+    'swept the whole modifier × key space again with a walk open',
+  )
+
+  /* The specific things the capture must and must not do. */
+  {
+    // Tab, with the hold down, is the switcher's — swallowed, and the keymap never sees it,
+    // so `project.switcher.next` does not run a second time.
+    const g = makeGate({ terminalFocused: true }, walking(['p1', 'p2', 'p3'], CTRL))
+    eq(
+      g.gate.terminalHandler(event({ code: 'Tab', key: 'Tab', ctrl: true })),
+      false,
+      'ctrl+tab during a walk is swallowed before the PTY',
+    )
+    eq(g.dispatched.length, 0, 'and dispatches nothing — the capture outranks the keymap')
+    eq(g.walk.state().index, 2, 'it advanced the walk instead')
+    eq(
+      g.gate.terminalHandler(event({ code: 'Tab', key: 'Tab', ctrl: true, shift: true })),
+      false,
+      'ctrl+shift+tab is swallowed too',
+    )
+    eq(g.walk.state().index, 1, 'and walks back')
+  }
+  {
+    // Bare Tab, hold lost. Not the switcher's: the walk cancels and the stroke goes on to
+    // whatever it was for, which is a tab character in a shell.
+    const g = makeGate({}, walking(['p1', 'p2'], CTRL))
+    eq(g.gate.windowHandler(event({ code: 'Tab', key: 'Tab' })), true, 'a bare Tab passes through')
+    eq(g.walk.state(), null, 'and cancels the walk — this is the lost-keyup case')
+  }
+  {
+    // Escape is ours, with or without the modifier, and must never reach a terminal as `^[`.
+    for (const spec of [
+      { code: 'Escape', key: 'Escape' },
+      { code: 'Escape', key: 'Escape', ctrl: true },
+    ]) {
+      const g = makeGate({ terminalFocused: true }, walking(['p1', 'p2'], CTRL))
+      eq(g.gate.terminalHandler(event(spec)), false, 'escape during a walk is swallowed')
+      eq(g.walk.state(), null, 'and cancels')
+      eq(g.dispatched.length, 0, 'and runs no command')
+    }
+  }
+  {
+    // An armed prefix outranks the capture. `ctrl+k` then `ctrl+tab` completes nothing, so it
+    // is swallowed and disarms — and the walk is left exactly where it was.
+    const g = makeGate({}, walking(['p1', 'p2', 'p3'], CTRL))
+    eq(g.gate.windowHandler(event({ code: 'KeyK', key: 'k', ctrl: true })), false, 'ctrl+k arms')
+    eq(g.gate.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true })), false, 'the second stroke is swallowed')
+    eq(g.gate.pending(), null, 'the prefix disarmed')
+    eq(g.walk.state().index, 1, 'and the capture never saw the stroke')
+    eq(g.dispatched.length, 0, 'nothing ran')
+  }
+  {
+    // A chord that is not the switcher's still works while the popup is up.
+    const g = makeGate({}, walking(['p1', 'p2'], CTRL))
+    eq(g.gate.windowHandler(event({ code: 'KeyP', key: 'p', ctrl: true })), false, 'ctrl+p resolves')
+    eq(g.dispatched[0]?.command, 'picker.files', 'and runs its command')
+    eq(g.walk.state().index, 1, 'leaving the walk open and where it was')
+  }
+  {
+    /*
+     * **No third entry point.** The release that commits a walk is watched by a modifier latch
+     * in `keys/switcherStore.ts`, not by the gate — see that module's note. The gate's own
+     * contract is unchanged and that is what this asserts: a keyup is still `PASS` on both
+     * paths, with a walk open, whatever the capture would have said about the same stroke on
+     * a keydown.
+     */
+    for (const entry of ['windowHandler', 'terminalHandler']) {
+      const g = makeGate({}, walking(['p1', 'p2'], CTRL))
+      for (const type of ['keyup', 'keypress']) {
+        const ev = { ...event({ code: 'Tab', key: 'Tab', ctrl: true }), type }
+        eq(g.gate[entry](ev), true, `${type} passes through ${entry} during a walk`)
+      }
+      eq(g.walk.state().index, 1, `and never reached the capture via ${entry}`)
+      eq(g.dispatched.length, 0, `and dispatched nothing via ${entry}`)
+    }
+  }
+  {
+    // A gate with no capture at all behaves exactly as it did before this feature existed.
+    const bare = makeGate({})
+    eq(
+      bare.gate.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true })),
+      false,
+      'with no walk open, ctrl+tab is an ordinary binding',
+    )
+    eq(bare.dispatched[0]?.command, 'project.switcher.next', 'and it opens the switcher')
   }
 
   /* ------------------------------------------------------------------ specific claims */
@@ -548,7 +727,10 @@ try {
     console.error(`\ncheck-key-gate: ${failed} failure(s)`)
     process.exit(1)
   }
-  console.log(`check-key-gate: ok (${compared} chords through both entry points)`)
+  console.log(
+    `check-key-gate: ok (${compared + capturedCompared} chords through both entry points, ` +
+      `${capturedCompared} of them with a switcher walk open)`,
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

@@ -41,6 +41,35 @@
  * `ctrl+k ctrl+s` needs a prefix state machine with a ~1 s timeout, because CodeMirror's
  * `KeyBinding.key` parser handles single chords only and nothing else in the stack tracks
  * multi-stroke sequences. See [`PREFIX_TIMEOUT_MS`].
+ *
+ * # The capture, and why it does not fight the prefix machine
+ *
+ * The gate is stateless per chord apart from that prefix machine — with one exception, added
+ * for the held-modifier project switcher (`keys/switcher.ts`). While that popup is up it has
+ * to own Tab, or the stroke that moves the highlight also inserts a tab character into
+ * whatever had focus, which for a shell pane means completing a filename.
+ *
+ * So [`KeyGateHost::capture`] is a *stateful claim on a stroke*, consulted in one place with
+ * one rule:
+ *
+ * ```text
+ * an armed prefix  >  the capture  >  the keymap
+ * ```
+ *
+ * An armed prefix outranks it because a half-typed `ctrl+k` is a sequence the user has
+ * already started, and stealing its second stroke would make the gate lie about what is in
+ * flight. The capture outranks the keymap because a switcher that only worked while
+ * `ctrl+tab` happened to be bound to it would break the moment a user rebound the chord —
+ * and because a `when` clause going false mid-walk would otherwise strand the popup open.
+ *
+ * The two can never both be armed by accident: a walk only starts on a chord that dispatched
+ * a command, which is exactly the branch that clears the prefix. `ctrl+k` then `ctrl+tab` is
+ * an unbound sequence — swallowed, prefix disarmed, no walk — which is deterministic and is
+ * what the ordering above buys.
+ *
+ * The capture is **not** a second resolution path. It never reads the keymap, never names a
+ * command, and answers only "consumed / not consumed"; `check-key-gate.mjs` sweeps it through
+ * both entry points alongside everything else for exactly that reason.
  */
 import { strokeFromEvent, type KeyStroke } from './chords'
 import { buildKeymap, type KeyBinding, type KeyContext, type Keymap } from './keymap'
@@ -65,6 +94,15 @@ export interface KeyGateHost {
   run: (command: string, args: unknown) => void
   /** Called whenever the pending prefix changes, for a status-bar readout like `⌃K …`. */
   onPending?: ((sequence: string | null) => void) | undefined
+  /**
+   * A stateful claim on a stroke, for a modal keyboard gesture — today only the project
+   * switcher. Returns `true` when the stroke was consumed and must not reach the keymap, the
+   * DOM or the PTY.
+   *
+   * Ranked below an armed prefix and above the keymap; see the module note. Called at most
+   * once per event, because [`KeyGate::decide`] memoises, so an implementation may act on it.
+   */
+  capture?: ((stroke: string) => boolean) | undefined
   /** Injectable clock, so the timeout is testable without waiting a second. */
   now?: (() => number) | undefined
   timeoutMs?: number | undefined
@@ -108,6 +146,26 @@ export interface KeyGate {
   reset: () => void
   /** The indexed keymap as of now. Rebuilt when `bindings()` returns a different array. */
   keymap: () => Keymap
+}
+
+/**
+ * The stroke currently being handed to a command handler, or `null`.
+ *
+ * Module scope rather than per-gate, because the reader is a command handler and handlers do
+ * not know which gate invoked them — and only one gate is ever installed. See the `run`
+ * branch of `resolveStroke` for why this exists at all.
+ */
+let dispatchingStroke: string | null = null
+
+/**
+ * The keystroke that is dispatching the command running right now, e.g. `ctrl+tab`.
+ *
+ * `null` when the command was not started by a key at all — which is the command palette, and
+ * is exactly the distinction the project switcher needs: no key means no modifier is being
+ * held, so there is no release to wait for.
+ */
+export function currentStroke(): string | null {
+  return dispatchingStroke
 }
 
 export function createKeyGate(host: KeyGateHost): KeyGate {
@@ -188,6 +246,12 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
     // Expire a stale prefix before it can absorb this stroke.
     if (pendingSequence !== null && clock() - pendingAt >= timeout) setPending(null)
 
+    // An armed prefix outranks the capture; the capture outranks the keymap. See the module
+    // note for why that order and not the other one.
+    if (pendingSequence === null && host.capture?.(stroke) === true) {
+      return { passThrough: false, command: null, sequence: stroke }
+    }
+
     const sequence = pendingSequence === null ? stroke : `${pendingSequence} ${stroke}`
     const armed = pendingSequence !== null
     const resolution = keymap().resolve(sequence, ctx)
@@ -200,7 +264,24 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
 
     if (resolution.kind === 'run') {
       setPending(null)
-      host.run(resolution.command, resolution.args)
+      /*
+       * The stroke is published for the duration of the dispatch, and only for that.
+       *
+       * A command that opens a held-modifier gesture has to know *which modifiers were down
+       * when it ran* — a `KeyboardEvent` is the only thing that knows, and by design the
+       * dispatcher never sees one (the palette calls it with two strings). Widening `run` to
+       * carry the event was the alternative and it loses: it would put a DOM type in the
+       * signature the palette also calls, for a fact exactly one command wants.
+       *
+       * `try`/`finally` because a handler is allowed to throw, and a stroke left published
+       * would make the *next* palette invocation believe a key was held.
+       */
+      dispatchingStroke = stroke
+      try {
+        host.run(resolution.command, resolution.args)
+      } finally {
+        dispatchingStroke = null
+      }
       return { passThrough: false, command: resolution.command, sequence }
     }
 

@@ -20,6 +20,7 @@
 import { useEffect, useRef } from 'react'
 import { installKeyGate } from './gate'
 import { mergeContext } from './context'
+import { switcherCapture } from './switcherStore'
 import type { KeyBinding, KeyContext } from './keymap'
 
 export interface KeyGateWiring {
@@ -53,6 +54,16 @@ export function useKeyGate(wiring: KeyGateWiring): void {
         context: () => mergeContext(live.current.context),
         run: (command, args) => live.current.run(command, args),
         onPending: (sequence) => live.current.onPending?.(sequence),
+        /*
+         * The project switcher's claim on Tab and Escape while its popup is up.
+         *
+         * Wired here rather than through `KeyGateWiring` on purpose: the switcher is global
+         * to the window and owns its own listeners (`keys/switcherStore.ts`), so a host that
+         * passes nothing gets a working gesture. Making it a prop would mean every window
+         * that installs a gate has to remember to pass it, and the one that forgot would
+         * leave a popup swallowing nothing while Tab reached the shell underneath it.
+         */
+        capture: switcherCapture,
       }),
     [],
   )
