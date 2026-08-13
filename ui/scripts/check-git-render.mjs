@@ -89,6 +89,29 @@ try {
       + 'inside it (L3) — the row a drag onto another changelist grabs, and the partiality '
       + 'climbs through it exactly as it climbs to the group',
   )
+  /*
+   * The row selection, and the ARIA claim it made honest.
+   *
+   * The tree has carried `aria-multiselectable="true"` since it shipped, on markup whose
+   * `aria-selected` tracked a single *cursor*. That is a promise to a screen reader the app
+   * could not keep, and it stayed unnoticed because nothing rendered the tree and read the two
+   * attributes together. Both are pinned here, from both ends.
+   *
+   * `selectedRows` is 0 on a panel that has just painted, and that is the assertion, not an
+   * accident of the fixture: `defaultSelection` *ticks* the active changelist so that "Claude
+   * edited a file, commit it" is one click, and `rows` above shows those ticks as `true`. The
+   * row selection starts empty regardless, because selecting rows nobody pointed at is what
+   * made the drag carry a whole changelist when the user grabbed one file out of it. A
+   * non-zero count here means the two concepts have been wired back together.
+   */
+  eq(byName.mock.multiSelectable, true, 'the tree claims multi-selection to assistive tech')
+  eq(
+    byName.mock.selectedRows,
+    0,
+    'and nothing is selected on a freshly painted panel, while its checkboxes are already '
+      + 'ticked — the ticks are what a commit takes, the selection is what a gesture is about, '
+      + 'and this is the one place the gap between them is visible',
+  )
   eq(byName.mock.summary, '2 modified', "the mock's footer, verbatim")
   eq(byName.mock.guard, null, 'no guard bar unless the index actually moved')
   eq(

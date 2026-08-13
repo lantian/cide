@@ -28,6 +28,7 @@
    * neighbour. The same measurement `SplitTree.module.css` records for the pane dividers.
    */
   z-index: 1;
+  -webkit-user-select: none;
   user-select: none;
   /* Pointer capture on a touch screen only works if the browser is not busy scrolling. */
   touch-action: none;

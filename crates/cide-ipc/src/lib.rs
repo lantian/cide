@@ -301,6 +301,42 @@ impl SessionState {
     }
 }
 
+/// Where *Send lines to Claude* actually put the mention.
+///
+/// # Why the command answers with a pane instead of `()`
+///
+/// The caller names a pane and the router may not be able to use it — the pane's `claude`
+/// has never completed the IDE handshake, most often because that pane is sitting at a
+/// resume splash with no process at all. When that happens the mention goes to a Claude in
+/// the same project that *can* receive it rather than failing, and the frontend then has two
+/// jobs it cannot do without being told which pane was used:
+///
+/// * **reveal the right one.** The gesture ends by bringing the receiving pane forward and
+///   putting the keyboard in it. Revealing the pane that was *asked for* after delivering
+///   somewhere else would be strictly worse than the plain error it replaced: the user would
+///   be looking at a prompt with nothing in it while their lines sat in another.
+/// * **say so.** A selection that lands in conversation B while the user believes it is in A
+///   is the one genuinely harmful outcome here, and the only defence is naming the
+///   destination out loud.
+///
+/// [`Self::fallback`] is what separates the two cases, so the ordinary send stays silent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ClaudeSendTarget {
+    /// The pane the mention was delivered to. Reveal *this* one.
+    pub pane: PaneId,
+    /// That pane's title, e.g. `cide : claude`. Carried rather than re-derived in the
+    /// webview: the two would be read from the same mirror at different instants, and the
+    /// only reason this string exists is to appear in a sentence naming where the lines went.
+    pub title: String,
+    /// Whether [`Self::pane`] is a different pane from the one the gesture named.
+    ///
+    /// Never true for a send that went where it was aimed, which is the overwhelmingly
+    /// common case — so a caller can use it directly as "is there anything to tell the user".
+    pub fallback: bool,
+}
+
 /// How the app is laid out across OS windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

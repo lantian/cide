@@ -27,6 +27,7 @@
   letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--dim);
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -214,6 +215,7 @@
   line-height: 1.4;
   /* A path relative to the root runs past 252px long before a repository is large. */
   overflow-wrap: anywhere;
+  -webkit-user-select: none;
   user-select: none;
 }
 

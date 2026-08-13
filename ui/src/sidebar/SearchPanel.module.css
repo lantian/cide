@@ -33,6 +33,7 @@
   letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--dim);
+  -webkit-user-select: none;
   user-select: none;
 }
 

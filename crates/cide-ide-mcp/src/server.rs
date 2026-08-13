@@ -204,6 +204,30 @@ impl Inner {
             .map(|(_, conn)| conn.out.clone())
     }
 
+    /// Exactly the panes [`Self::sender_for_pane`] would find a sender for.
+    ///
+    /// Deliberately the *same* join rather than a second reading of the same two maps: this
+    /// answers "would an addressed notification land", and a predicate that agreed with
+    /// `sender_for_pane` only most of the time would hand a caller a pane to route to that
+    /// then dropped the message — which is the silent no-op the `Delivery` enum was added to
+    /// end. Written as a filter over `sender_for_pane`'s own condition for that reason.
+    ///
+    /// Deduplicated, because `pane_of_pid` can hold two pids for one pane: a Claude pane that
+    /// respawned is bound again under the new pid and the old entry only goes when that child
+    /// is reaped. Two identical entries would make a candidate look twice as reachable to a
+    /// caller ranking them, which is a distinction it must not be able to draw.
+    fn addressable_panes(&self) -> Vec<String> {
+        let c = self.conns.lock();
+        let mut panes: Vec<String> = c
+            .open
+            .values()
+            .filter_map(|conn| c.pane_of_pid.get(&conn.pid?).cloned())
+            .collect();
+        panes.sort();
+        panes.dedup();
+        panes
+    }
+
     /// Every open connection, bound to a pane or not.
     ///
     /// This used to require a pane binding, on the theory that including an unbound
@@ -363,10 +387,36 @@ impl IdeServer {
         self.inner.conns.lock().pane_of_pid.insert(pid, pane);
     }
 
-    /// Forget a pid's pane. Called when a pane closes, so that a recycled pid cannot inherit
-    /// the dead pane's selections.
+    /// Forget a pid's pane, so that a recycled pid cannot inherit the dead pane's selections.
+    ///
+    /// # This had no caller at all until now, and that is worth recording
+    ///
+    /// It was written with the doc comment above and wired to nothing, so `pane_of_pid` grew
+    /// monotonically for the life of the server and every binding it ever made outlived the
+    /// process it described. The hazard it names is real but narrow — a pid has to be recycled
+    /// *and* the new process has to complete this project's token-gated handshake — which is
+    /// exactly why it survived: nothing it protects against is visible until it happens.
+    ///
+    /// It matters more now than when it was written, because [`Self::addressable_panes`] turns
+    /// this map into *routing*. A stale entry cannot resurrect a dead pane on its own (the
+    /// dead `claude`'s connection is gone, so the join finds nothing), but a recycled pid
+    /// would make an unrelated child answer for a pane that no longer holds it, and the
+    /// fallback would then deliver a user's selection into it.
+    ///
+    /// Called from `cide-app`'s `report_exit` — the moment the child is reaped, which is the
+    /// earliest instant at which its pid can be handed out again.
     pub fn unbind_pane(&self, pid: u32) {
         self.inner.conns.lock().pane_of_pid.remove(&pid);
+    }
+
+    /// The panes an addressed notification can actually reach right now.
+    ///
+    /// Opaque strings, exactly as [`Self::bind_pane`] takes them: this crate has no notion of
+    /// tabs, projects or windows and must not gain one to answer a routing question. The
+    /// caller ranks its own panes and asks this which of them are live — the ordering is a
+    /// workspace decision and belongs where the workspace is.
+    pub fn addressable_panes(&self) -> Vec<String> {
+        self.inner.addressable_panes()
     }
 
     /// Tell the `claude` in `pane` where the user is looking.
@@ -1219,6 +1269,85 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(200), a.next())
                 .await
                 .is_err()
+        );
+
+        server.shutdown().await;
+    }
+
+    /// The routing question, asked of the same join that answers the delivery question.
+    ///
+    /// `addressable_panes` exists so `cmd::file` can rank its own panes and pick one that will
+    /// actually receive — so the property that matters is not "it lists something", it is that
+    /// it agrees with [`IdeServer::at_mentioned`] on every pane, in both directions. A
+    /// predicate that over-reports routes a user's selection into a prompt that never gets it;
+    /// one that under-reports refuses a send that would have worked and leaves the user with
+    /// the error this whole change is removing.
+    #[tokio::test]
+    async fn a_pane_is_addressable_exactly_when_a_mention_to_it_would_land() {
+        let server = server().await;
+        let mut events = server.events();
+
+        // Bound before anything connects, which is the ordinary order: the app learns the pid
+        // when it spawns the child, and the child connects some milliseconds later.
+        server.bind_pane(5001, "pane-a".into());
+        server.bind_pane(5002, "pane-b".into());
+
+        assert!(
+            server.addressable_panes().is_empty(),
+            "a binding is not a connection; a pane whose claude has not handshaken cannot \
+             receive anything, and the resume-splash pane that started this bug report is \
+             precisely this state"
+        );
+
+        let mut a = connect(server.port(), TOKEN)
+            .await
+            .expect("pane a connects");
+        handshake(&mut a).await;
+        send(
+            &mut a,
+            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":5001}}),
+        )
+        .await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Connected { pid: 5001, .. })
+        ));
+
+        assert_eq!(
+            server.addressable_panes(),
+            vec!["pane-a".to_string()],
+            "only the pane whose child is on the wire"
+        );
+
+        let mention = AtMentioned {
+            file_path: "/src/main.rs".into(),
+            line_start: Some(9),
+            line_end: Some(19),
+        };
+        assert_eq!(
+            server.at_mentioned("pane-a", mention.clone()),
+            Delivery::Sent,
+            "a pane this call reports must accept a mention, or the caller routes into a hole"
+        );
+        assert_eq!(
+            server.at_mentioned("pane-b", mention.clone()),
+            Delivery::NoConnection { connections: 1 },
+            "and a pane it does not report must not — pane-b is bound, and bound is not enough"
+        );
+
+        // The unbind that had no caller. Its whole job is to stop a pid speaking for a pane
+        // after the child is gone, so the observable effect is that the pane stops being
+        // addressable while the connection is still open.
+        server.unbind_pane(5001);
+        assert!(
+            server.addressable_panes().is_empty(),
+            "unbinding takes the pane out of the routing table, which is the only way to \
+             observe that `unbind_pane` does anything at all"
+        );
+        assert_eq!(
+            server.at_mentioned("pane-a", mention),
+            Delivery::NoConnection { connections: 1 },
+            "and the two stay in agreement afterwards"
         );
 
         server.shutdown().await;

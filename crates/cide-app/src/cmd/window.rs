@@ -305,11 +305,19 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
     windows::awaiting_sessions()
 }
 
-/// Recompute every window's title from the workspace and the waiting set.
+/// Recompute every window's title **and its urgency hint** from the workspace and the waiting
+/// set.
 ///
 /// Called after a report and after any mutation that moves a pane between windows, because
 /// both change the answer: detaching a waiting pane has to take the `Awaiting: 1` out of the
 /// shell's title and put it in the new window's.
+///
+/// The two go together deliberately and must stay together. They are one fact — *does this
+/// window hold a session that wants the user* — asked once and applied to the two surfaces the
+/// desktop offers, and the reason the title alone was not enough is that a task bar is not
+/// obliged to draw it (see [`windows::demand_attention`], which is the half that was missing
+/// and is the literal content of "no cide title change in taskbar"). Computing the count twice,
+/// in two functions, is how a window ends up flashing with `Awaiting: 0` in its title.
 ///
 /// **Which sessions count toward which window** is the question the user's wording leaves
 /// open, and the answer is *the sessions that window is showing*. A title is read in a task
@@ -329,6 +337,11 @@ pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
         let base = title_for(ws, role);
         let count = windows::awaiting_among(&sessions_of(ws, role));
         windows::set_title(app, label, &windows::title_with(&base, count));
+        // Unconditionally, both ways round. Raising it repeatedly while the count stays
+        // positive is free — the WM already holds the hint and the call is a no-op on a
+        // focused window — while *not* lowering it the moment the count reaches zero would
+        // leave a task entry lit for a window with nothing left to come back to.
+        windows::demand_attention(app, label, count > 0);
     }
 }
 

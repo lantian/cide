@@ -428,6 +428,21 @@ export function PaneFrame({
       data-pane-id={pane.id}
       data-focused={focused ? 'true' : 'false'}
       /*
+       * On the **frame**, not only on the cluster.
+       *
+       * It was on the cluster alone, which meant no CSS anywhere could reach the panel: the
+       * whole on-screen signal for "this session finished and is waiting for you" was a 7px
+       * dot in the corner of a terminal that may be filling the window. The request was for
+       * the console to be *highlighted*, and a dot is not that.
+       *
+       * The frame already carries a 1px border in both focus states, deliberately, so that
+       * its colour can change without resizing the content box — see the stylesheet. So this
+       * costs no reflow, no terminal refit and no second element. The dot stays: the border
+       * says *this pane*, the dot survives being read at the edge of vision, and neither can
+       * disagree with the other because both come from `awaiting` above.
+       */
+      data-awaiting={awaiting ? 'true' : 'false'}
+      /*
        * The index and the title, permanently, for the reader who gets none of the chrome.
        * `role="group"` is what makes the name reachable at all — `aria-label` on a bare div
        * is dropped — and `group` rather than `region` because six landmarks in a 2x3 grid is
@@ -453,7 +468,6 @@ export function PaneFrame({
         ref={clusterRef}
         className={styles.cluster}
         data-audit="paneTitle"
-        data-awaiting={awaiting ? 'true' : 'false'}
         /*
          * A click on this cluster must not take DOM focus off whatever the user was typing
          * into.

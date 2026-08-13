@@ -170,6 +170,66 @@ export function enterOn(row: { readonly expandable: boolean }): RowAction {
   return row.expandable ? SELECT_TOGGLE : SELECT_OPEN
 }
 
+/** The modifier state of a keystroke, as the four booleans a `KeyboardEvent` carries. */
+export interface KeyMods {
+  readonly ctrl: boolean
+  readonly meta: boolean
+  readonly alt: boolean
+  readonly shift: boolean
+}
+
+/** What a keystroke asks the file tree to do to the selected row, beyond moving. */
+export type TreeKeyAction = 'rename' | 'delete'
+
+/**
+ * Rename or delete the selected row, or `null` when the keystroke means neither.
+ *
+ * # Why these two are decided here and not in `crates/cide-core/src/keymap.rs`
+ *
+ * Both are **focus-scoped**, not context-scoped, and that is the same argument the tree's
+ * clipboard keys already make (see the long comment in `FileTree.tsx`'s `onKeyDown`). Delete
+ * in a terminal is a character the pty must receive; Ctrl+R in a shell or a Claude pane is
+ * readline's reverse-i-search, which people use constantly. The question a binding would have
+ * to answer is "does the file tree hold the caret right now", and the flag that exists —
+ * `sidebarFiles` — means the panel is *visible*, which it is while the user types in a
+ * terminal beside it. A global binding would be resolved by the key gate's window-capture
+ * listener before the event ever reached its target and swallowed in all of those places.
+ *
+ * A handler on the tree's scroller is asked only when the scroller is focused, which is the
+ * actual question. The cost is that neither gets a key chip in the context menu, because chips
+ * come from resolving a command id through the keymap and these have no command id — the same
+ * trade Cut/Copy/Paste already make one group up in that menu.
+ *
+ * # Why it is a function in this module rather than a `switch` in the component
+ *
+ * Because it is a *decision*, and the decisions in this file are the ones a check script can
+ * hold. `check-tree-status.mjs` pins every row below. A `case 'Delete':` inside a 1500-line
+ * component is reviewable only by reading it, and "Delete with Shift held also deletes" is
+ * exactly the kind of thing that is true by accident and invisible in a screenshot.
+ *
+ * # The rules, and what each one is protecting
+ *
+ * * **Bare Delete** deletes. Any modifier at all — Ctrl, Alt, Shift, Meta — means *not this*.
+ *   Shift+Delete is "delete permanently, no trash" in Windows Explorer and in IDEA, and this
+ *   app has no such operation (`fs_delete` always goes to the trash). Answering it with the
+ *   ordinary trash delete would silently do something other than what the user asked for, and
+ *   the one thing worse than not supporting a destructive gesture is appearing to.
+ * * **Ctrl+R** (or ⌘R) renames, with **no** Alt and **no** Shift. `ctrl+shift+r` stays free —
+ *   it is "hard reload" muscle memory and belongs to nobody here yet.
+ * * Everything else is `null`, so the caller leaves the keystroke alone. Notably `F2`: it is
+ *   the rename key in Explorer and IDEA and it is deliberately **not** claimed here, because
+ *   the brief asked for Ctrl+R and a second undocumented binding for the same action is a
+ *   thing to decide rather than to slip in.
+ */
+export function treeKeyAction(key: string, mods: KeyMods): TreeKeyAction | null {
+  const primary = mods.ctrl || mods.meta
+  if (key === 'Delete') {
+    return primary || mods.alt || mods.shift ? null : 'delete'
+  }
+  if (key.toLowerCase() === 'r' && primary && !mods.alt && !mods.shift) return 'rename'
+  return null
+}
+
 /**
  * Where up/down/home/end move the selection, or `null` when the key is not one of ours.
  *

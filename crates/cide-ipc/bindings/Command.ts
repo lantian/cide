@@ -22,6 +22,21 @@ group: string,
  */
 when: string | null, 
 /**
+ * Extra words the palette should match this command on, beyond its title and its id.
+ *
+ * Not synonyms for their own sake. Every entry here answers a phrase somebody actually
+ * typed and got "No matching commands" for: *New branch…* is what the app calls it and
+ * **create** is what the user calls it, and the scorer's five title/id tiers cannot bridge
+ * that — the needle is not a prefix, not a word of the title, not a substring, not in the
+ * id, and (being longer than the title) not even a subsequence of it.
+ *
+ * Kept out of the title rather than folded into it, because the title is the label a user
+ * reads back to check they picked the right row, and "New branch… (create, make)" is a
+ * worse label. Ranked below every title and id tier for the same reason: a keyword hit is
+ * a guess about vocabulary, and a title hit is not.
+ */
+keywords: Array<string>, 
+/**
  * Why this command cannot run *in any context*, or `None` when it can.
  *
  * Distinct from [`when`](Self::when), and the distinction is the whole reason this

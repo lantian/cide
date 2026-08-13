@@ -35,7 +35,8 @@ import type { IconTheme } from '@/icons/iconFor'
 import { ChangelistDialog } from './ChangelistDialog'
 import { ChangesTree } from './ChangesTree'
 import { CommitBox } from './CommitBox'
-import { ConfirmDestructive } from './ConfirmDestructive'
+import { ConfirmDestructive } from '@/chrome/ConfirmDestructive'
+import { useFocusRequested } from '@/chrome/focusRequests'
 import { GuardBar } from './GuardBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
@@ -71,15 +72,32 @@ export interface GitPanelViewProps {
 
 export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelViewProps) {
   const [tab, setTab] = useState<PanelTab>('commit')
-  /**
-   * The row the user is pointing at, by id.
-   *
-   * Held here rather than inside `ChangesTree` because that component unmounts every time the
-   * Shelf tab is opened, and a cursor that resets on a glance at the shelf is a cursor nobody
-   * can rely on. An id rather than an index — see the note in `ChangesTree`.
+  /*
+   * The cursor used to be a `useState` right here, held above `ChangesTree` because that
+   * component unmounts every time the Shelf tab is opened and a cursor that resets on a glance
+   * at the shelf is a cursor nobody can rely on. It has moved one level further down, into
+   * `useGitPanel`, and it took the row selection with it: the context menu builds its scope in
+   * `GitPanelHost` — *above* this file — so anything the menu and the drag must agree on has
+   * to be visible from the model. The Shelf-tab argument is unchanged and still holds there.
    */
-  const [current, setCurrent] = useState<string | null>(null)
   const diffOpen = useGitDiffTabOpen(project)
+
+  /*
+   * *Commit changes…* asked for the message box, and the Shelf tab is showing.
+   *
+   * `CommitBox` is mounted only under the Commit tab, so without this the command would reveal
+   * the panel, park a focus request nobody could answer, and look exactly like a palette row
+   * that does nothing — for a user who happened to leave the panel on Shelf. The tab is local
+   * state here, so this is the only place that can move it.
+   *
+   * The request itself is *not* cleared here: `CommitBox` consumes it, one render later, once
+   * the tab change has mounted it. Clearing it here would answer the request by throwing it
+   * away, which is the same bug with an extra step.
+   */
+  const commitFocusWanted = useFocusRequested('commitMessage')
+  useEffect(() => {
+    if (commitFocusWanted) setTab('commit')
+  }, [commitFocusWanted])
 
   const partial = useMemo(() => partialFiles(git.view), [git.view])
   const summary = useMemo(() => summarize(git.picked), [git.picked])
@@ -176,13 +194,21 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
             rows={git.rows}
             view={git.view}
             selected={git.selected}
+            selection={git.selection}
+            carried={git.carried}
             expanded={git.expanded}
             partial={partial}
-            current={current}
-            onCurrent={setCurrent}
+            current={git.current}
+            onCurrent={git.setCurrent}
+            onPress={git.pressRow}
+            onRelease={git.releaseRow}
+            onKeyTo={git.keyToRow}
+            onSelectAll={git.selectAllRows}
+            onCollapseSelection={git.collapseSelection}
             diffOpen={diffOpen}
             iconTheme={iconTheme}
             onToggleCheck={git.toggleCheck}
+            onToggleCheckSelected={git.toggleCheckSelected}
             onToggleExpand={git.toggleExpand}
             onOpenDiff={git.openDiff}
             /* Drag and drop's only connection to git. The rules live in `dragDrop.ts` and the

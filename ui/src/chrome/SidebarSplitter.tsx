@@ -23,6 +23,7 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { settings as settingsApi } from '@/ipc/client'
+import { lockBodyForDrag, unlockBodyAfterDrag } from './dragLock'
 import { useWorkspace } from '@/store/workspace'
 import {
   SIDEBAR_CACHE_KEY,
@@ -195,14 +196,13 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     [],
   )
 
-  // A view switch can unmount this mid-drag. Without this the body keeps `user-select: none`
+  // A view switch can unmount this mid-drag. Without this the body keeps the selection lock
   // and a resize cursor for the rest of the session.
   useEffect(
     () => () => {
       if (dragging.current) {
         gesturing = false
-        document.body.style.cursor = ''
-        document.body.style.userSelect = ''
+        unlockBodyAfterDrag()
       }
     },
     [],
@@ -231,8 +231,7 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
       dragging.current = false
       gesturing = false
       setActive(false)
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
+      unlockBodyAfterDrag()
       if (doCommit) commit(live.current)
     },
     [commit],
@@ -251,9 +250,10 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     gesturing = true
     setActive(true)
     // On the body, not on this element: the pointer spends the drag over the panel and the
-    // panes, and without these the cursor flickers to a text caret on every crossing.
-    document.body.style.cursor = 'col-resize'
-    document.body.style.userSelect = 'none'
+    // panes, and without this the cursor flickers to a text caret on every crossing. Through
+    // `dragLock` because the selection half of it cannot be written as `style.userSelect` in
+    // this engine and silently appears to work — see that module.
+    lockBodyForDrag('col-resize')
   }
 
   /** Move the edge. No React, no store, one custom property. */

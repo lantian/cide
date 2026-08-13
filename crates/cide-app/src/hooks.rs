@@ -20,6 +20,26 @@
 //! to share it: the work per frame is a JSON parse and a map lookup, connections are
 //! short-lived, and putting it on OS threads keeps a wedged hook from occupying a runtime
 //! worker that the IDE server needs to answer a blocked `openDiff`.
+//!
+//! # Read in parallel, apply in order
+//!
+//! Reading is per connection, so a hook that connects and never writes blocks only itself.
+//! **Applying is not.** Every frame goes down one channel to one thread, and that is a
+//! correctness requirement rather than a simplification:
+//!
+//! * [`decide`] reads a session's current state and then writes the next one. Two threads
+//!   doing that concurrently can both read `Busy`, and whichever writes second wins whatever
+//!   it happened to read — so a transition can be computed from a state that no longer holds.
+//! * Even with that made atomic, order would still decide the answer. A `Stop` and a
+//!   `PostToolUse` are separate short-lived `cide-hook` processes writing to separate sockets;
+//!   with a thread each, the OS decides which is applied first. `PostToolUse` applied *after*
+//!   `Stop` takes the session from `Idle` back to `Busy` (`cide_claude::next_state` records
+//!   tool traffic as liveness on purpose, so a session wrongly marked idle mid-turn corrects
+//!   itself), which raises the awaiting marker and then clears it again with nobody at the
+//!   keyboard. The user comes back to a task bar that says nothing is waiting.
+//!
+//! The window is small and the failure is silent and unreproducible, which is the combination
+//! that keeps a bug like this alive. One channel closes it for the cost of one thread.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -64,20 +84,38 @@ impl HookServer {
         }
 
         let states: Arc<DashMap<SessionId, SessionState>> = Arc::new(DashMap::new());
-        let accept_states = Arc::clone(&states);
+        let apply_states = Arc::clone(&states);
+
+        // The serialising channel. Unbounded, and deliberately: a hook process is blocked on
+        // its own `write` until this side reads the line, so back-pressure here would be
+        // back-pressure on `claude` itself — a slow `emit` would stall the CLI mid-turn.
+        // Frames are two small strings and a `Value`, and they arrive at the rate a human
+        // prompts, not at the rate a terminal prints.
+        let (frames, inbox) = std::sync::mpsc::channel::<HookFrame>();
+
+        thread::Builder::new()
+            .name("cide-hook-apply".into())
+            .spawn(move || {
+                // Ends when every sender has gone, which is when the accept loop below has
+                // ended and no connection thread is left holding a clone.
+                for frame in inbox {
+                    apply(&frame, &app, &apply_states);
+                }
+            })?;
 
         thread::Builder::new()
             .name("cide-hook-accept".into())
             .spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
-                    let app = app.clone();
-                    let states = Arc::clone(&accept_states);
-                    // One thread per connection, each one short-lived. A hook that connects
-                    // and never writes therefore blocks only itself.
+                    let frames = frames.clone();
+                    // One thread per connection, each one short-lived, and each one *reading*
+                    // only. A hook that connects and never writes therefore blocks only
+                    // itself — while the frames that do arrive are applied in the order they
+                    // were parsed, by the one thread above. See the module comment.
                     let _ = thread::Builder::new()
                         .name("cide-hook-conn".into())
-                        .spawn(move || handle(stream, &app, &states));
+                        .spawn(move || handle(stream, &frames));
                 }
             })?;
 
@@ -150,7 +188,11 @@ fn socket_path() -> PathBuf {
     dir.join(format!("cide-hooks-{}.sock", std::process::id()))
 }
 
-fn handle(stream: UnixStream, app: &AppHandle, states: &DashMap<SessionId, SessionState>) {
+/// Read one connection's frames and hand them to the applier, in the order they parse.
+///
+/// Parsing stays here, on the connection's own thread, so a malformed or enormous payload
+/// costs that hook and nothing else. Only the decision is serialised.
+fn handle(stream: UnixStream, frames: &std::sync::mpsc::Sender<HookFrame>) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { return };
@@ -160,7 +202,11 @@ fn handle(stream: UnixStream, app: &AppHandle, states: &DashMap<SessionId, Sessi
         // A frame we cannot parse is dropped with a note rather than killing the connection:
         // a CLI release that changes a payload should cost one event, not the hook channel.
         match serde_json::from_str::<HookFrame>(&line) {
-            Ok(frame) => apply(&frame, app, states),
+            // A send that fails means the applier thread has gone, which only happens on the
+            // way out. Nothing to report and nowhere left to report it.
+            Ok(frame) => {
+                let _ = frames.send(frame);
+            }
             Err(error) => tracing::debug!(%error, "unparseable hook frame"),
         }
     }
@@ -529,6 +575,85 @@ mod tests {
         assert!(
             state_of(&states, dying).is_none(),
             "the dead session is still tracked"
+        );
+    }
+
+    /// Why the frames have to be applied in the order they arrive.
+    ///
+    /// `PostToolUse` records liveness on purpose — a session somehow marked idle mid-turn
+    /// corrects itself rather than staying wrong until the next prompt. That is right, and it
+    /// is exactly what makes ordering load-bearing at the end of a turn: `Stop` then
+    /// `PostToolUse` leaves the session **Busy**, which is a finished turn reported as a
+    /// running one. The awaiting marker goes up on the `Stop` and comes straight back down,
+    /// with nobody at the keyboard, and the user returns to a task bar that says nothing is
+    /// waiting for them.
+    ///
+    /// Nothing about the two frames prevents it: each is a separate short-lived `cide-hook`
+    /// process on a separate socket, and before the serialising channel there was a thread per
+    /// connection deciding the order. This pins the consequence, so the channel cannot be
+    /// refactored away as an unnecessary hop.
+    #[test]
+    fn a_tool_frame_applied_after_stop_reports_a_finished_turn_as_a_running_one() {
+        let session = SessionId::new();
+        let id = session.to_string();
+
+        let in_order = States::new();
+        for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+            decide(&frame(event, &id), &in_order);
+        }
+        assert_eq!(
+            state_of(&in_order, session),
+            Some(SessionState::Idle),
+            "in arrival order the turn ends idle, which is what raises the marker"
+        );
+
+        let reordered = States::new();
+        for event in ["UserPromptSubmit", "Stop", "PostToolUse"] {
+            decide(&frame(event, &id), &reordered);
+        }
+        assert_eq!(
+            state_of(&reordered, session),
+            Some(SessionState::Busy),
+            "and swapping the last two loses the finished turn entirely — this is the \
+             failure the single applier thread exists to prevent, not a quirk of the fixture"
+        );
+    }
+
+    /// The connection half of that: every frame a socket carries reaches the applier, once,
+    /// in the order it was parsed.
+    ///
+    /// Driven through a real `UnixStream` because the ordering claim is about what `handle`
+    /// does with a stream of lines, and a test that called `send` itself would assert about
+    /// `std::sync::mpsc`. The unparseable line in the middle is here for the other half of the
+    /// contract: a CLI release that changes a payload costs one frame, not the connection and
+    /// not the frames behind it.
+    #[test]
+    fn every_frame_on_a_connection_reaches_the_applier_in_arrival_order() {
+        use std::io::Write;
+
+        let (mut writer, reader) = UnixStream::pair().expect("a socket pair");
+        let (frames, inbox) = std::sync::mpsc::channel::<HookFrame>();
+        let session = SessionId::new().to_string();
+
+        for line in [
+            serde_json::to_string(&frame("UserPromptSubmit", &session)).expect("serialises"),
+            "{not json".to_string(),
+            serde_json::to_string(&frame("PostToolUse", &session)).expect("serialises"),
+            serde_json::to_string(&frame("Stop", &session)).expect("serialises"),
+        ] {
+            writeln!(writer, "{line}").expect("writes");
+        }
+        // EOF, so `handle` returns rather than blocking this thread for ever.
+        drop(writer);
+
+        handle(reader, &frames);
+        drop(frames);
+
+        let seen: Vec<String> = inbox.into_iter().map(|f| f.event).collect();
+        assert_eq!(
+            seen,
+            vec!["UserPromptSubmit", "PostToolUse", "Stop"],
+            "order is the whole point, and the bad line must cost exactly itself"
         );
     }
 }

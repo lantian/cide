@@ -36,12 +36,33 @@
 //! command from the palette on every platform with nothing anywhere reporting it. That had
 //! already happened to `repoOpen`, so every git command was invisible.
 //!
+//! ## And then it happened again, to the same flag, past that gate
+//!
+//! `repoOpen` was given a supplier — `keys/target.ts::reposOf`, over `ProjectRoot::repo` — and
+//! `check-commands.mjs` went green because the flag was now *named* by `deriveContext`. It was
+//! still false for everybody. `ProjectRoot::repo` is set to `None` by
+//! [`crate::workspace::project_root`] and by nothing else in the workspace, so the list was
+//! empty for every project ever opened and the whole Git group stayed hidden — this time with
+//! a passing gate over the top of it. A check that a flag has a supplier cannot see that the
+//! supplier is a constant.
+//!
+//! So the rule that came out of it, and it is stronger than "every flag has a supplier":
+//! **a flag must be derivable from the workspace mirror as Rust actually fills it.** Whether a
+//! project contains a git repository is not such a fact — it is a property of the disk that a
+//! `git init` in a bash pane changes — so it is asked over IPC (`git_repos`) by the handler
+//! that needs it, and no clause claims to know it. The field it was read from has been deleted
+//! (see [`cide_ipc::workspace::ProjectRoot`]) so it cannot come back by accident.
+//!
 //! # Preconditions go in `when` **and** in the handler
 //!
 //! A command that no-ops because there is no focused pane is indistinguishable, from the
 //! user's chair, from one that is unwired — which is the entire complaint this round
-//! answers. So anything that acts on a pane, a tab, a selection or a repository says so in
-//! its clause, and the palette hides it rather than offering a row that does nothing.
+//! answers. So anything that acts on a pane, a tab or a selection says so in its clause, and
+//! the palette hides it rather than offering a row that does nothing.
+//!
+//! A precondition the webview cannot evaluate is the exception, and it goes in the handler
+//! alone. Guessing it in the clause is how the Git group disappeared; the handler asks, and
+//! answers with a sentence the user can read rather than a filtered-out row they never see.
 //!
 //! A clause here does **not** gate the keyboard, and that is worth stating plainly because
 //! the shape invites the opposite assumption. The key gate resolves a chord through
@@ -79,7 +100,9 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     "closableTab",
     "editorOpen",
     "claudeTarget",
-    "repoOpen",
+    // There is deliberately no `repoOpen`. See the note above the Git group in [`build`]: the
+    // webview cannot answer "does this project contain a git repository" without asking the
+    // disk, and the flag it used to answer it with was permanently false.
     "shellWindow",
     // Host flags: transient chrome that only the React tree knows about.
     "overlayOpen",
@@ -162,11 +185,21 @@ struct Score {
 
 /// Ranking tiers, best first. The palette is judged on whether typing `split` puts `Split
 /// pane right` at the top, so a prefix of the title has to outrank everything else.
-const TIER_TITLE_PREFIX: u8 = 5;
-const TIER_TITLE_WORD: u8 = 4;
-const TIER_TITLE_SUBSTRING: u8 = 3;
-const TIER_ID: u8 = 2;
-const TIER_SUBSEQUENCE: u8 = 1;
+///
+/// The bottom three are the ones that answer "I typed a sentence and got nothing". The five
+/// above them all match the needle *whole* against one string, so a query with a word the
+/// title does not contain scores nothing at all — `create new branch` found neither
+/// `New branch…` nor anything else, and the palette said *No matching commands* about a
+/// command that exists. [`TIER_KEYWORD`] gives a command a vocabulary beyond its label and
+/// [`TIER_ALL_WORDS`] lets the words be typed in any order with extra ones in between. Both
+/// rank below everything that matched a real title, because both are guesses.
+const TIER_TITLE_PREFIX: u8 = 6;
+const TIER_TITLE_WORD: u8 = 5;
+const TIER_TITLE_SUBSTRING: u8 = 4;
+const TIER_ID: u8 = 3;
+const TIER_KEYWORD: u8 = 2;
+const TIER_ALL_WORDS: u8 = 1;
+const TIER_SUBSEQUENCE: u8 = 0;
 
 /// Rank one command against an already-lowercased, already-trimmed needle.
 fn score(command: &Command, needle: &str) -> Option<Score> {
@@ -196,6 +229,25 @@ fn score(command: &Command, needle: &str) -> Option<Score> {
             offset,
         });
     }
+    // A keyword matched at a *word* boundary rather than anywhere inside it: `in files` should
+    // answer to `files`, and `create` should not answer to `eat`. The tier is already the
+    // vaguest kind of hit the palette offers and a substring here would make it noise.
+    if let Some(offset) = command
+        .keywords
+        .iter()
+        .find_map(|word| word_prefix(&word.to_lowercase(), needle))
+    {
+        return Some(Score {
+            tier: TIER_KEYWORD,
+            offset,
+        });
+    }
+    if all_words_match(command, &title, needle) {
+        return Some(Score {
+            tier: TIER_ALL_WORDS,
+            offset: 0,
+        });
+    }
     if is_subsequence(&title, needle) {
         return Some(Score {
             tier: TIER_SUBSEQUENCE,
@@ -203,6 +255,31 @@ fn score(command: &Command, needle: &str) -> Option<Score> {
         });
     }
     None
+}
+
+/// Every whitespace-separated word of `needle` starts a word of the title, a keyword or the id.
+///
+/// Only ever consulted for a needle with two or more words: for a single word this is the
+/// disjunction of three tiers that have already been tried and failed, so it could only ever
+/// answer `false`, and skipping it says that in the code rather than in a comment.
+///
+/// Word-prefix rather than substring per word, for the reason above [`TIER_KEYWORD`] and one
+/// more: with a substring, a two-letter word like `to` matches nearly every row in the table
+/// and the tier stops discriminating. `create new branch` matches `New branch…` — *create*
+/// from its keywords, *new* and *branch* from its title — and matches `Switch branch…` on
+/// nothing, which is the distinction that makes the tier worth having.
+fn all_words_match(command: &Command, title: &str, needle: &str) -> bool {
+    let words: Vec<&str> = needle.split_whitespace().collect();
+    if words.len() < 2 {
+        return false;
+    }
+    let id = command.id.to_lowercase();
+    let keywords: Vec<String> = command.keywords.iter().map(|w| w.to_lowercase()).collect();
+    words.iter().all(|word| {
+        word_prefix(title, word).is_some()
+            || word_prefix(&id, word).is_some()
+            || keywords.iter().any(|k| word_prefix(k, word).is_some())
+    })
 }
 
 /// Offset of `needle` where it starts a word in `haystack`.
@@ -388,18 +465,50 @@ fn build() -> Vec<Command> {
         Command::new("file.save", "Save file", FILE).when("editorFocused"),
         Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
         Command::new("file.reveal", "Reveal file in sidebar", FILE).when("editorFocused"),
-        // Git.
-        Command::new("git.commit", "Commit changes", GIT)
-            .when("repoOpen")
-            // A commit needs a message and a set of paths, and both live in the Git panel's
-            // React state (`useGitPanel`) — there is no store a dispatcher can read them
-            // from. Committing with an empty message and every changed file would not be
-            // this command, it would be a different and much worse one.
-            .unavailable(
-                "needs the Git panel's message and ticked paths, which are not in a store",
-            ),
-        Command::new("git.push", "Push to remote", GIT).when("repoOpen"),
-        Command::new("git.refresh", "Refresh git status", GIT).when("repoOpen"),
+        /*
+         * Git — and the clause here is `projectOpen`, not "a repository is open".
+         *
+         * It *was* `repoOpen`, and that is the whole of the bug this group is being rewritten
+         * for. `repoOpen` was derived in `ui/src/keys/context.ts` from `ProjectRoot::repo`, a
+         * DTO field `cide_core::workspace::project_root` set to `None` and **nothing anywhere
+         * ever set to anything else** — git discovery lives in `cide-git`, which depends on
+         * this crate, and writing a discovered id into `workspace.json` would go stale the
+         * first time anyone ran `git init`. So the flag was false for every user of every
+         * build, this whole group was filtered out of the palette, and `sidebar.git` went with
+         * it. Nothing failed: a flag that is always false is indistinguishable from one that
+         * happens to be false right now, which is exactly what the module header above warns
+         * about and exactly what happened anyway.
+         *
+         * The fix is not a better supplier. There isn't one: whether a project contains a
+         * repository is a fact about the disk that changes when a bash pane runs `git init`,
+         * and any webview-side mirror of it is a cache with no invalidation. `projectOpen` is
+         * the strongest claim this side of the wire can make honestly, and the handlers in
+         * `ui/src/keys/dispatch.ts` ask `git_repos` — real discovery, on the Rust side — and
+         * report when the answer is empty. Precondition in the clause *and* in the handler, as
+         * the header says; the clause simply stops claiming to know something it cannot.
+         *
+         * The cost is a Push row offered in a project that turns out to have no repository,
+         * which reports. The alternative cost was every git row hidden from everybody, for
+         * ever, in silence. `ProjectRoot::repo` no longer exists, so the flag cannot come back
+         * by accident.
+         */
+        // Opens the Git panel with the caret in its message box, rather than committing.
+        //
+        // It was `.unavailable("needs the Git panel's message and ticked paths, which are not
+        // in a store")`, and that reasoning was right about the mechanism and wrong about the
+        // command. A commit needs a message and a set of paths; both live in `useGitPanel`'s
+        // React state, which does not exist while the sidebar is on Files or shut. Lifting
+        // them into a store to let a palette row commit whatever happened to be ticked, with
+        // whatever text happened to be in the box, would be a foot-gun in a build with no
+        // revert surface — and a half-typed commit message is not a mirror of anything Rust
+        // owns, so it does not belong in a store either.
+        //
+        // So it does what the two branch commands one screen down already do for the same
+        // reason: it puts the user in front of the control that asks. The trailing "…" is this
+        // table's mark for that.
+        Command::new("git.commit", "Commit changes…", GIT).when("shellWindow && projectOpen"),
+        Command::new("git.push", "Push to remote", GIT).when("projectOpen"),
+        Command::new("git.refresh", "Refresh git status", GIT).when("projectOpen"),
         // Branches. The two that need a name or a choice open the branch popup
         // (`ui/src/chrome/BranchSelector.tsx`) rather than acting blind; the two network ones
         // take no input at all and run.
@@ -408,17 +517,33 @@ fn build() -> Vec<Command> {
         // rows work in a window whose status bar has not mounted the widget — a palette entry
         // that depends on a control being on screen is a palette entry that sometimes does
         // nothing.
-        Command::new("git.branch.switch", "Switch branch…", GIT).when("repoOpen"),
-        Command::new("git.branch.new", "New branch…", GIT).when("repoOpen"),
-        Command::new("git.fetch", "Fetch from remote", GIT).when("repoOpen"),
+        Command::new("git.branch.switch", "Switch branch…", GIT).when("projectOpen"),
+        Command::new("git.branch.new", "New branch…", GIT)
+            .when("projectOpen")
+            // "create branch" is what a user types when they want this, and none of the five
+            // scoring tiers reaches "New branch…" from it — the needle is longer than the
+            // title, so even the subsequence tier misses. Keywords are the fix; see `search`.
+            .keywords(&["create", "make", "checkout"]),
+        Command::new("git.fetch", "Fetch from remote", GIT)
+            .when("projectOpen")
+            .keywords(&["download", "remote"]),
         // Fast-forward only, and the title says so: cide has no conflict-resolution surface,
         // so a pull that had to merge would leave a working tree nothing in the app can
         // finish. A divergence is reported with both counts. See `cide_git::branch::pull`.
-        Command::new("git.pull", "Pull (fast-forward only)", GIT).when("repoOpen"),
+        Command::new("git.pull", "Pull (fast-forward only)", GIT)
+            .when("projectOpen")
+            .keywords(&["update", "merge", "ff"]),
         Command::new("git.stageSelected", "Stage selected changes", GIT)
-            .when("repoOpen")
-            // Same reason as `git.commit`: "selected" is the panel's tick state.
-            .unavailable("needs the Git panel's selection, which is not in a store"),
+            .when("projectOpen")
+            // Still unavailable, and unlike `git.commit` this one stays that way. "Selected"
+            // names the tick state of the Git panel's tree, and there is no non-blind reading
+            // of it from anywhere else — a row that merely revealed the panel would be lying
+            // about what its own title says it does. The reason names the surface that works
+            // instead, because "not in a store" told the user nothing they could act on.
+            .unavailable(
+                "needs the Git panel's ticked rows — \"selected\" is that tree's own state, and \
+                 nothing outside the panel can read it; stage from the tree or its context menu",
+            ),
         // View.
         Command::new("picker.files", "Go to file", VIEW).when("projectOpen"),
         Command::new("palette.commands", "Show all commands", VIEW),
@@ -429,7 +554,18 @@ fn build() -> Vec<Command> {
         Command::new("settings.keymap", "Open keyboard shortcuts", VIEW).when("projectOpen"),
         // The rail and its sidebar exist in the shell window only; a detached pane has none.
         Command::new("sidebar.files", "Show files sidebar", VIEW).when("shellWindow"),
-        Command::new("sidebar.git", "Show git sidebar", VIEW).when("shellWindow && repoOpen"),
+        // `repoOpen` used to be half of this clause, which is why the palette could not even
+        // open the Git sidebar — the row that would have let a user *look* at the repository
+        // was hidden by the same permanently-false flag as the commands that act on it.
+        Command::new("sidebar.git", "Show git sidebar", VIEW).when("shellWindow && projectOpen"),
+        // The search panel, which had no command at all: it was reachable from the ⌕ button in
+        // the activity rail and from nothing else — no palette row, no binding, and no way to
+        // put the caret in its box without a mouse. `projectOpen` rather than bare
+        // `shellWindow` because `SearchStore.setQuery` returns without asking anything when
+        // there is no project, so the panel would open onto a box that cannot search.
+        Command::new("sidebar.search", "Show search sidebar", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["find", "grep", "in files"]),
     ]
 }
 
@@ -687,10 +823,51 @@ mod tests {
         );
     }
 
+    /// The Git group asks for an open **project**, and nothing anywhere asks for `repoOpen`.
+    ///
+    /// This test used to assert the opposite — `Some("repoOpen")` on every git command — and
+    /// it passed for as long as the bug existed, because it was pinning the clause rather than
+    /// anything about the clause being satisfiable. `repoOpen` was supplied by the frontend
+    /// from `ProjectRoot::repo`, which Rust's one constructor set to `None` and no code ever
+    /// set to anything else, so the flag was false for every user of every build and this
+    /// entire group — plus *Show git sidebar* — was filtered out of the command palette in
+    /// silence. The full account is above the group in [`build`].
+    ///
+    /// Three assertions, failing for three different reasons:
+    ///
+    /// 1. the decision — `projectOpen` is the strongest claim the webview can make honestly,
+    ///    and whether the project *holds* a repository is asked of the disk by the handler
+    ///    (`git_repos`) at the moment the command runs;
+    /// 2. the flag is gone from the vocabulary, so no future clause can name it and quietly
+    ///    become unreachable again;
+    /// 3. and no clause names it, which (2) already implies through
+    ///    `every_when_clause_uses_the_documented_vocabulary` but which is stated here because
+    ///    this is where a reader comes looking for the rule.
     #[test]
-    fn git_commands_require_an_open_repository() {
+    fn git_commands_ask_for_a_project_and_nothing_asks_for_the_dead_repo_flag() {
         for command in registry().iter().filter(|c| c.id.starts_with("git.")) {
-            assert_eq!(command.when.as_deref(), Some("repoOpen"));
+            let when = command.when.as_deref().unwrap_or("<none>");
+            assert!(
+                when.contains("projectOpen"),
+                "{} is gated on `{when}`; the Git group asks for a project and lets the \
+                 handler ask the disk about repositories",
+                command.id
+            );
+        }
+
+        assert!(
+            !CONTEXT_FLAGS.contains(&"repoOpen"),
+            "`repoOpen` was false for every user of every build; nothing may re-add it \
+             without a supplier that reads the disk"
+        );
+
+        for command in registry() {
+            let when = command.when.as_deref().unwrap_or("");
+            assert!(
+                !when.contains("repoOpen"),
+                "{} names repoOpen, which nothing supplies",
+                command.id
+            );
         }
     }
 
@@ -719,6 +896,59 @@ mod tests {
     fn search_is_case_insensitive() {
         assert_eq!(ids(&search("SPLIT")), ids(&search("split")));
         assert_eq!(ids(&search("  SpLiT  ")), ids(&search("split")));
+    }
+
+    /// The phrase from the report, against the shipped table.
+    ///
+    /// `create new branch` matched nothing before [`TIER_KEYWORD`] and [`TIER_ALL_WORDS`]
+    /// existed: the five tiers above them all match the needle *whole* against one string, and
+    /// no title contains the word `create` — so the needle is not a prefix of `New branch…`,
+    /// not one of its words, not a substring, not in the id, and (being longer than the title)
+    /// not even a subsequence of it. The palette said *No matching commands* about a command
+    /// that was right there, which a user cannot tell apart from the command not existing.
+    ///
+    /// Asserted against `registry()` rather than a fixture on purpose: the claim is about the
+    /// keywords this build actually ships, and a fixture would let them be dropped from the
+    /// table with this test still green.
+    #[test]
+    fn the_words_a_user_types_for_a_new_branch_find_the_new_branch_command() {
+        assert_eq!(ids(&search("create new branch")), ["git.branch.new"]);
+        // Order-independent: the tier is a set of words, not a sequence.
+        assert_eq!(ids(&search("branch create")), ["git.branch.new"]);
+        // And on its own, through the keyword tier alone. First rather than only: `create` is
+        // also a subsequence of a couple of unrelated titles, which is the bottom tier doing
+        // exactly its job — the assertion is that a declared keyword outranks an accident.
+        assert_eq!(ids(&search("create"))[0], "git.branch.new");
+    }
+
+    /// A keyword is matched at a word boundary, and only for the command that declares it.
+    ///
+    /// The tier is already the vaguest hit the palette offers — a guess about vocabulary
+    /// rather than a match on anything the user can see — so a substring match inside a
+    /// keyword would turn it into noise. `create` must not answer to `eat`.
+    #[test]
+    fn a_keyword_matches_a_word_and_not_a_fragment_of_one() {
+        assert!(ids(&search("update")).contains(&"git.pull"));
+        assert!(
+            !ids(&search("eat")).contains(&"git.branch.new"),
+            "`eat` is inside `create` and must not reach it"
+        );
+        // The word-boundary rule is what makes a multi-word keyword usable: `in files` is one
+        // keyword on `sidebar.search`, and `files` has to find it.
+        assert!(ids(&search("in files")).contains(&"sidebar.search"));
+    }
+
+    /// Every word of a multi-word query has to land somewhere, or the row is not offered.
+    ///
+    /// A tier that matched "most of the words" would put the whole table under any query with
+    /// one common word in it, which is the opposite of what the palette is for.
+    #[test]
+    fn a_multi_word_query_needs_all_of_its_words() {
+        assert!(ids(&search("switch branch")).contains(&"git.branch.switch"));
+        assert!(
+            !ids(&search("switch zzzz branch")).contains(&"git.branch.switch"),
+            "a word that matches nothing rules the row out"
+        );
     }
 
     #[test]

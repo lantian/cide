@@ -639,7 +639,6 @@ mod tests {
             dot: "var(--accent)".into(),
             roots: vec![ProjectRoot {
                 path: "/home/u/work/cide".into(),
-                repo: None,
                 label: "cide".into(),
             }],
             active_tab: home.id,
@@ -743,7 +742,6 @@ mod tests {
 
         project(&mut ws).roots.push(ProjectRoot {
             path: "/home/u/work/other".into(),
-            repo: None,
             label: "other".into(),
         });
         assert!(line_with(&body(&ws), "~/work/cide").contains("(2 roots)"));

@@ -57,7 +57,14 @@ export interface ChangesDragState {
 export interface UseChangesDragOptions {
   rows: readonly Row[]
   view: StatusView
-  selected: ReadonlySet<string>
+  /**
+   * The row selection resolved for the drag — `rowSelection.ts::carriedIds`.
+   *
+   * Not the ticks. A grab that starts on a selected row carries the whole selection; the
+   * ticks are what a *commit* takes, and widening by them is what used to move a whole
+   * changelist when the user dragged one file out of it. See the header of `dragDrop.ts`.
+   */
+  carried: ReadonlySet<string>
   /** The scrolling box, for the edge auto-scroll. */
   container: React.RefObject<HTMLDivElement | null>
   /**
@@ -83,7 +90,7 @@ export interface ChangesDrag {
 }
 
 export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
-  const { rows, view, selected, container, onMove } = options
+  const { rows, view, carried, container, onMove } = options
   const [state, setState] = useState<ChangesDragState | null>(null)
 
   /*
@@ -92,8 +99,8 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
    * as they were at mousedown would drop onto a changelist that has since moved. Refs rather
    * than dependencies, because re-subscribing window listeners mid-drag loses the capture.
    */
-  const live = useRef({ rows, view, selected, onMove })
-  live.current = { rows, view, selected, onMove }
+  const live = useRef({ rows, view, carried, onMove })
+  live.current = { rows, view, carried, onMove }
   /** Everything about the gesture in flight. `null` between gestures. */
   const gesture = useRef<{
     pointerId: number
@@ -126,8 +133,16 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent, row: Row) => {
-      // Left button only, and never from the checkbox (its own handler stops the event) or
-      // from a modified press, which belongs to whatever selection gesture the tree grows next.
+      /*
+       * Left button only, and never from the checkbox (its own handler stops the event) or
+       * from a modified press.
+       *
+       * A modified press is a *selection* gesture and nothing else: ctrl toggles a row into
+       * the selection, shift extends the range to it (`rowSelection.ts`). Letting one start a
+       * drag would mean ctrl-clicking a fourth file and moving the hand two pixels picked the
+       * four up, which is the behaviour IDEA refuses too. The unmodified press that follows is
+       * what drags them, and by then the press has already made the selection right.
+       */
       if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
       if (gesture.current !== null) return
       // A new press: whatever the previous gesture was, this one is a click until it moves.
@@ -143,7 +158,7 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
        * action between renders is not stuck inert until it remounts.
        */
       if (live.current.onMove === undefined) return
-      if (grab(live.current.view, live.current.selected, row) === null) return
+      if (grab(live.current.view, live.current.carried, row) === null) return
 
       const el = e.currentTarget
       if (!(el instanceof HTMLElement)) return
@@ -156,7 +171,7 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
             Math.abs(ev.clientX - active.from.x) > THRESHOLD
             || Math.abs(ev.clientY - active.from.y) > THRESHOLD
           if (!far) return
-          const started = grab(live.current.view, live.current.selected, active.row)
+          const started = grab(live.current.view, live.current.carried, active.row)
           if (started === null) {
             finish(false)
             return

@@ -384,8 +384,32 @@ body {
    * It would have cost layout time to change nothing.
    */
   font-synthesis: none;
-  /* A desktop chrome that rubber-bands or text-selects on drag reads as a web page. */
+  /*
+   * A desktop chrome that rubber-bands or text-selects on drag reads as a web page.
+   *
+   * **Both spellings, and the prefixed one is not decoration.** WebKitGTK 2.52.3 — the engine
+   * this app runs on, `libwebkit2gtk-4.1.so.0.21.7` — does not implement unprefixed
+   * `user-select` at all. Its CSS parser *drops the declaration*: `CSS.supports('user-select',
+   * 'none')` is `false`, the property is absent from `getComputedStyle`, and a rule written
+   * with it alone comes back out of the CSSOM with an empty `style.cssText`. So this line on
+   * its own was one of a dozen in `ui/src` that had never had any effect, and every one of
+   * them was written by someone reasonably believing it did.
+   *
+   * It looked fine in a release build and only in a release build, which is why it survived
+   * two attempts to fix the symptom in the git tree. `vite.config.ts` sets
+   * `build.target: 'safari18'`, and esbuild lowers `user-select` to the prefixed form — but
+   * lowering happens at *build* time, and `./run.sh` (the documented way to run this app)
+   * serves `ui/src` through the Vite dev server, which lowers nothing. `./run.sh --release`
+   * embeds `ui/dist` and did not have the bug.
+   *
+   * `check:css-prefix` is the gate that keeps the pair together, here and everywhere else.
+   * The ordering matters in the other direction too: an *opt-in* (`user-select: text`, which
+   * five surfaces in this app use so their contents can be copied out) written unprefixed
+   * under a prefixed `none` computes `none` and takes copy-out away. Prefix all of them or
+   * none of them.
+   */
   overflow: hidden;
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -418,6 +442,7 @@ strong {
 
 /* Content areas opt back in. */
 .selectable {
+  -webkit-user-select: text;
   user-select: text;
 }
 

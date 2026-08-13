@@ -374,6 +374,7 @@
   font-size: 11.5px;
   color: var(--text);
   /* Paths are the one thing here worth copying out. */
+  -webkit-user-select: text;
   user-select: text;
 }
 
@@ -406,5 +407,6 @@
   max-height: 88px;
   overflow-y: auto;
   white-space: pre-wrap;
+  -webkit-user-select: text;
   user-select: text;
 }

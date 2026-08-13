@@ -22,6 +22,18 @@ export interface StoryDigest {
   /** One entry per tree row: `L<aria-level>:<aria-checked>`. */
   rows: string[]
   repoRows: number
+  /**
+   * How many rows claim `aria-selected="true"`, and whether the tree claims to be
+   * multi-selectable at all.
+   *
+   * Both exist because the two used to contradict each other: the tree has said
+   * `aria-multiselectable="true"` since it shipped, while `aria-selected` tracked a single
+   * cursor — a claim to assistive tech the app could not honour. They now describe the row
+   * *selection*, which starts empty, so a fresh panel selects nothing while its checkboxes are
+   * already ticked. That gap is the whole point of the feature and it is only visible here.
+   */
+  selectedRows: number
+  multiSelectable: boolean
   guard: string | null
   summary: string | null
   commitEnabled: boolean
@@ -60,6 +72,9 @@ const digests = STORIES.map((story) => {
       (m) => `L${m[1]}:${m[2]}`,
     ),
     repoRows: [...html.matchAll(/data-audit="gitRow" data-kind="repo"/g)].length,
+    selectedRows: [...html.matchAll(/data-audit="gitRow"[^>]*aria-selected="true"/g)].length,
+    multiSelectable: /data-audit="gitTree"/.test(html)
+      && /role="tree"[^>]*aria-multiselectable="true"/.test(html),
     guard: guard === undefined ? null : text(guard),
     summary: /data-audit="gitSummary"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
     commitEnabled: !/data-audit="gitCommit"[^>]*disabled/.test(html),

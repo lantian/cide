@@ -59,6 +59,7 @@ import type {
   PathSelection,
   PushOutcome,
   RepoId,
+  RepoInfo,
   ShelfEntry,
   StashEntry,
   TreeStatusMap,
@@ -378,29 +379,14 @@ export const claude = {
       endLine,
     }).catch(() => {}),
 
-  /**
-   * Put `@path` into one Claude pane's prompt — Ctrl+P's ⌥⏎.
-   *
-   * Addressed, not broadcast: a mention is text the user is about to send in one
-   * conversation, so typing it into every Claude in the project would be wrong. The caller
-   * picks the pane because only it knows which Claude the user was last looking at.
-   *
-   * Lines are 1-based here and 0-based on the wire; omit both to mention the whole file.
+  /*
+   * `mentionFile` used to live here, wrapping a `claude_mention_file` command that no longer
+   * exists. Both were dead: this wrapper ended in `.catch(() => {})` and had **no call site**,
+   * because Ctrl+P's ⌥⏎ deliberately went to `claudeSend.lines` at the bottom of this file
+   * instead — a call that swallows its own failure is indistinguishable from a control wired
+   * to nothing, which is what the whole `ClaudeSendError` type exists to fix. Removed with the
+   * Rust command rather than left as a quieter second route into the same server.
    */
-  mentionFile: (
-    projectId: ProjectId,
-    paneId: PaneId,
-    path: string,
-    lineStart?: number,
-    lineEnd?: number,
-  ) =>
-    invoke<void>('claude_mention_file', {
-      project: projectId,
-      pane: paneId,
-      path,
-      lineStart: lineStart ?? null,
-      lineEnd: lineEnd ?? null,
-    }).catch(() => {}),
 
   /** Answer a diff. `acceptedEdited` carries the buffer the user actually has on screen. */
   answer: (projectId: ProjectId, requestId: string, outcome: DiffAnswer) =>
@@ -796,6 +782,22 @@ export const git = {
    */
   treeStatus: (project: ProjectId) =>
     invoke<TreeStatusMap>('git_tree_status', { project }),
+
+  /**
+   * Which repositories the project actually contains, roots before their submodules.
+   *
+   * The cheapest git question there is — `Repository::discover` per root plus a `submodules()`
+   * walk, no working-tree walk anywhere — which is what makes it callable from a command
+   * handler on the keystroke that runs the command.
+   *
+   * Asked over the wire rather than read off the workspace mirror, and that is the point.
+   * `ProjectRoot` used to carry a `repo` field; Rust never filled it, `keys/target.ts` believed
+   * it, and the resulting `repoOpen` context flag was false for every project ever opened —
+   * which hid the whole Git group from the command palette. Whether a project has a repository
+   * is a fact about the disk that a `git init` in a bash pane changes, so it is asked at the
+   * moment it is needed and never cached.
+   */
+  repos: (project: ProjectId) => invoke<RepoInfo[]>('git_repos', { project }),
 
   branchInfo: (project: ProjectId, repo: RepoId) =>
     invoke<BranchInfo>('git_branch_info', { project, repo }),
@@ -1513,13 +1515,13 @@ export const fsCreate = {
  * a new capability arrives as a block at the end rather than as a field reaching inside an
  * existing object literal. `onSessionAwaiting` directly above says the same thing about events.
  *
- * And `claude.mentionFile` **swallows its result** — `.catch(() => {})`. That is right for what
- * it is (Ctrl+P's ⌥⏎, fired from an overlay that is already closing) and fatal for what this is.
- * The point of this call is the rejection: `claude_send_lines` answers `{kind: 'noServer'}` or
- * `{kind: 'notConnected'}` when nothing is listening, and the call sites deliberately do **not**
- * catch it, so `chrome/Failures.tsx`'s `unhandledrejection` listener puts the reason on screen.
- * A silent no-op is indistinguishable from a control wired to nothing, which is precisely how
- * this feature was reported.
+ * And the `claude.mentionFile` this replaced **swallowed its result** — `.catch(() => {})` —
+ * which is fatal for what this is. The point of this call is the rejection:
+ * `claude_send_lines` answers `{kind: 'noServer'}` or `{kind: 'notConnected'}` when nothing is
+ * listening, and the call sites deliberately do **not** catch it, so `chrome/Failures.tsx`'s
+ * `unhandledrejection` listener puts the reason on screen. A silent no-op is indistinguishable
+ * from a control wired to nothing, which is precisely how this feature was reported. That
+ * command and its wrapper are now deleted; this is the only route.
  */
 export const claudeSend = {
   /**
@@ -1533,7 +1535,16 @@ export const claudeSend = {
    * the protocol's 0-based numbering once at the Rust boundary. Omit both to send the whole
    * file, which is what a caret with no selection means.
    *
-   * Rejects on purpose. Call it as `void claudeSend.lines(…)` and let `Failures` explain.
+   * # `paneId` is a preference, and the answer says what was actually used
+   *
+   * Rust tries `paneId` first and, when that pane's `claude` is not on the IDE server, walks
+   * the project's other Claude panes in `cmd::file::mention_candidates` order. That is not a
+   * detail a caller may ignore: **reveal `result.pane`, never the pane you asked for**, and say
+   * something when `result.fallback` is set. Taking the user to an empty prompt while their
+   * lines sit in a different conversation is worse than the plain error this replaced.
+   *
+   * Rejects on purpose when nothing at all could receive. Call it as `void claudeSend.lines(…)`
+   * and let `Failures` explain.
    */
   lines: (
     projectId: ProjectId,
@@ -1543,7 +1554,7 @@ export const claudeSend = {
     lineStart?: number,
     lineEnd?: number,
   ) =>
-    invoke<void>('claude_send_lines', {
+    invoke<ClaudeSendTarget>('claude_send_lines', {
       project: projectId,
       pane: paneId,
       path,
@@ -1552,6 +1563,12 @@ export const claudeSend = {
       lineEnd: lineEnd ?? null,
     }),
 }
+
+// Appended here rather than reached into the import list at the top of the file, for the reason
+// the `PasteCollision` import below states at length: this file is append-only by house rule.
+// Not re-exported: `export type * from './generated'` near the top already gives every caller
+// `ClaudeSendTarget`, and a second export of the same name is a redeclaration waiting to happen.
+import type { ClaudeSendTarget } from './generated'
 
 // The two generated types this block needs, imported here rather than added to the list at the
 // top of the file. This file is **append-only** by house rule — it has conflicted in five

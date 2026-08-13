@@ -12,18 +12,25 @@
  * One focusable thing per row: a nested `<input>` would make Tab walk two stops per file
  * and leave Space ambiguous between "tick this row" and "tick this box".
  *
- * # Two different things called selection
+ * # Three different things called selection
  *
  * `selected` in this file is the **tick** — the set of files a commit would take. The
- * *current row*, which is what a click moves and what the arrows walk, is `current`, and it
- * is deliberately a different thing: ticking a file is a statement about a commit, and
- * pointing at one is a statement about what you are looking at. Conflating them would mean a
- * click that silently changed what the Commit button does.
+ * **row selection** is `selection`, the set of rows a gesture is about, drawn as the band and
+ * carried by a drag. The **current row** is `current`, one id, what the arrows walk and what
+ * a focus lands on. All three are deliberately separate: ticking a file is a statement about a
+ * commit, selecting one is a statement about what you are pointing at, and the cursor is a
+ * statement about where the keyboard is. Conflating the first two would mean a click that
+ * silently changed what the Commit button does — and conflating them the other way is what the
+ * drag used to do, moving a whole changelist when the user grabbed one file out of it.
  *
- * `current` is a row **id**, not an index. Row ids are stable across refreshes (`fileRowId`
- * is repo plus path) and this panel refreshes constantly — on every `cide://git-status`, on
- * every watcher burst, while Claude is editing. An index would point at a different file
- * every time a group above it gained or lost one.
+ * The rules for all three live where a check script can run them: ticks in `model.ts`, row
+ * selection in `rowSelection.ts`, click meanings in `clickSemantics.ts`. This file wires them
+ * to a DOM and nothing more, because nothing in this repo can execute a DOM.
+ *
+ * `current` is a row **id**, not an index, and so is every id in `selection`. Row ids are
+ * stable across refreshes (`fileRowId` is repo plus path) and this panel refreshes constantly
+ * — on every `cide://git-status`, on every watcher burst, while Claude is editing. An index
+ * would point at a different file every time a group above it gained or lost one.
  *
  * # Dragging rows into another changelist
  *
@@ -56,6 +63,7 @@ import {
   type Row,
 } from './model'
 import { bands, draggedIds, inDrag } from './dragDrop'
+import type { RowSelection, SelectMods } from './rowSelection'
 import { useChangesDrag, type ChangesDragState } from './useChangesDrag'
 import { TriCheckbox } from './TriCheckbox'
 import type { DiffOpenMode, RepoId, StatusView } from './types'
@@ -77,19 +85,34 @@ export interface ChangesTreeProps {
   /**
    * The whole tree, for the drag.
    *
-   * A grab that starts on a ticked row carries every tick in the same repository, and ticks
-   * survive a collapsed group — `rows` holds no file rows for one, so the rows alone would
-   * quietly narrow a multi-file drag to what happens to be on screen. `flatFiles` reads the
-   * view, exactly as commit does.
+   * A grab that starts on a selected row carries the whole selection in the same repository,
+   * and a selected file survives a collapsed group — `rows` holds no file rows for one, so the
+   * rows alone would quietly narrow a multi-file drag to what happens to be on screen.
+   * `flatFiles` reads the view, exactly as commit does.
    */
   view: StatusView
+  /** The **ticks**: what a commit would take. Drawn as the checkboxes. */
   selected: ReadonlySet<string>
+  /** The **row selection**: what a gesture is about. Drawn as the band. */
+  selection: RowSelection
+  /** `selection`, resolved for the drag — see `rowSelection.ts::carriedIds`. */
+  carried: ReadonlySet<string>
   expanded: ReadonlySet<string>
   /** Ids whose file is only partly staged — what turns a `✓` into a `–`. */
   partial: ReadonlySet<string>
-  /** The row the user is pointing at, by id. Not the tick; see the module header. */
+  /** The row the user is pointing at, by id. Neither a tick nor the selection. */
   current: string | null
+  /** Move the cursor and nothing else. What a focus calls. */
   onCurrent: (id: string) => void
+  /** A left press. Returns `true` when its collapse was deferred to the release. */
+  onPress: (id: string, mods: SelectMods) => boolean
+  /** The release of a deferred press, when the gesture was not a drag after all. */
+  onRelease: (id: string) => void
+  /** An arrow, Home or End that has chosen its destination. */
+  onKeyTo: (id: string, mods: SelectMods) => void
+  onSelectAll: () => void
+  /** Escape: back to the cursor's row. */
+  onCollapseSelection: () => void
   /**
    * A git diff tab is open in this project.
    *
@@ -100,6 +123,8 @@ export interface ChangesTreeProps {
   /** Threaded from the panel, never subscribed to per row. Same argument as `FileTree`. */
   iconTheme: IconTheme
   onToggleCheck: (row: Row) => void
+  /** Space over a multi-row selection: tick every selected row at once. */
+  onToggleCheckSelected: () => void
   onToggleExpand: (row: Row) => void
   /**
    * Activate a file row.
@@ -131,13 +156,21 @@ export function ChangesTree({
   rows,
   view,
   selected,
+  selection,
+  carried,
   expanded,
   partial,
   current,
   onCurrent,
+  onPress,
+  onRelease,
+  onKeyTo,
+  onSelectAll,
+  onCollapseSelection,
   diffOpen,
   iconTheme,
   onToggleCheck,
+  onToggleCheckSelected,
   onToggleExpand,
   onOpenDiff,
   onMovePaths,
@@ -145,8 +178,16 @@ export function ChangesTree({
   menu,
 }: ChangesTreeProps) {
   const container = useRef<HTMLDivElement>(null)
-  const drag = useChangesDrag({ rows, view, selected, container, onMove: onMovePaths })
-  const carried = useMemo(
+  const drag = useChangesDrag({ rows, view, carried, container, onMove: onMovePaths })
+  /**
+   * The row whose plain press deferred its collapse, until the mouseup answers for it.
+   *
+   * A ref rather than state: nothing renders differently in between, and a re-render inside a
+   * mousedown handler is a re-render the drag's own threshold logic then has to survive.
+   */
+  const deferred = useRef<string | null>(null)
+  /** The ids in flight right now, for the dimming. Not `carried`, which is the selection. */
+  const inFlight = useMemo(
     () => (drag.state === null ? null : draggedIds(drag.state.drag)),
     [drag.state],
   )
@@ -171,42 +212,83 @@ export function ChangesTree({
   const found = current === null ? -1 : rows.findIndex((row) => row.id === current)
   const at = rows.length === 0 ? 0 : Math.max(0, Math.min(found, rows.length - 1))
 
+  /**
+   * Move the cursor to a row index, taking the selection with it or not as the modifiers say.
+   *
+   * The focus move is imperative and unconditional; what happens to the selection is
+   * `rowSelection.ts::keySelect`'s decision, reached through the model so the pointer and the
+   * keyboard cannot end up with two sets of rules. `mods` is threaded from the keystroke
+   * rather than read off a ref, because shift+↓ and ↓ differ in nothing else.
+   */
   const move = useCallback(
-    (next: number) => {
+    (next: number, mods: SelectMods) => {
       const row = rows[next]
       if (row === undefined) return
-      onCurrent(row.id)
+      onKeyTo(row.id, mods)
       container.current?.querySelector<HTMLElement>(`[data-index="${next}"]`)?.focus()
     },
-    [rows, onCurrent],
+    [rows, onKeyTo],
   )
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent, row: Row, index: number) => {
       const isOpen = expanded.has(row.id)
+      const mods: SelectMods = { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey }
+      const last = rows.length - 1
       switch (e.key) {
         case 'ArrowDown':
-          move(Math.min(index + 1, rows.length - 1))
+          move(Math.min(index + 1, last), mods)
           break
         case 'ArrowUp':
-          move(Math.max(index - 1, 0))
+          move(Math.max(index - 1, 0), mods)
           break
         case 'ArrowRight':
           if (row.expandable && !isOpen) onToggleExpand(row)
-          else move(Math.min(index + 1, rows.length - 1))
+          else move(Math.min(index + 1, last), mods)
           break
         case 'ArrowLeft':
           if (row.expandable && isOpen) onToggleExpand(row)
-          else move(parentOf(rows, index))
+          else move(parentOf(rows, index), mods)
           break
         case 'Home':
-          move(0)
+          move(0, mods)
           break
         case 'End':
-          move(rows.length - 1)
+          move(last, mods)
+          break
+        case 'a':
+        case 'A':
+          /*
+           * Ctrl+A, and only with Ctrl — a bare `a` is a printable character and belongs to
+           * the browser (the `default` arm below). Handled here rather than as a registry
+           * command for the same reason Delete and Ctrl+R are in the file tree: the key gate's
+           * window-capture listener resolves a global binding *before* the event reaches its
+           * target, so `ctrl+a` bound globally would swallow select-all inside the commit
+           * message box, every terminal and CodeMirror. `ui/src/keys/` has no editable-target
+           * guard at all, so there is no version of that binding which is safe today.
+           */
+          if (!mods.ctrl || e.altKey || mods.shift) return
+          onSelectAll()
+          break
+        case 'Escape':
+          /*
+           * Collapse to the cursor. Not `stopPropagation` as well: a drag in flight owns
+           * Escape (`useChangesDrag` listens in the capture phase and stops it there), so by
+           * the time this runs there is no gesture to cancel and the key is free.
+           */
+          onCollapseSelection()
           break
         case ' ':
-          onToggleCheck(row)
+          /*
+           * Space ticks. Over a multi-row selection that includes this row it ticks all of it,
+           * which is the IDEA behaviour and the only reason a keyboard user wants a multi-row
+           * selection in this panel at all. Over anything else it ticks the row under the
+           * cursor — including a row that is *not* in the selection, because the cursor is
+           * what Space has always acted on and a Space that did nothing because the cursor had
+           * drifted out of the selection would be the tree refusing a keystroke silently.
+           */
+          if (selection.ids.size > 1 && selection.ids.has(row.id)) onToggleCheckSelected()
+          else onToggleCheck(row)
           break
         case 'Enter':
           // The keyboard has no second click to wait for, so Enter opens a leaf whether or
@@ -225,7 +307,18 @@ export function ChangesTree({
       // otherwise, and Enter would submit if this tree ever sits inside a form.
       e.preventDefault()
     },
-    [rows, expanded, move, onToggleCheck, onToggleExpand, onOpenDiff],
+    [
+      rows,
+      expanded,
+      move,
+      selection,
+      onCollapseSelection,
+      onSelectAll,
+      onToggleCheck,
+      onToggleCheckSelected,
+      onToggleExpand,
+      onOpenDiff,
+    ],
   )
 
   if (rows.length === 0) {
@@ -243,11 +336,16 @@ export function ChangesTree({
       className={styles.tree}
       role="tree"
       aria-label="Changes"
+      /* True since `rowSelection.ts` landed. It was here before that, on a tree whose
+         `aria-selected` tracked a single cursor — a claim to assistive tech that the app could
+         not honour, which `check:render` now pins from the other end. */
       aria-multiselectable="true"
       data-audit="gitTree"
-      /* One flag for the whole box while a drag is in flight: it turns off the hover wash
-         (which would otherwise follow the pointer *and* the drop outline, two bands saying
-         two different things) and stops the pointer selecting the labels it crosses. */
+      /* One flag for the whole box while a drag is in flight: it turns off the hover wash,
+         which would otherwise follow the pointer *and* the drop outline — two bands saying two
+         different things. Text selection is refused unconditionally on `.tree`, not here; that
+         rule and the two reasons it could never have worked from this attribute are in
+         `ChangesTree.module.css`. */
       {...(drag.state === null ? {} : { 'data-dragging': '' })}
       onContextMenu={onContextMenu}
     >
@@ -255,6 +353,7 @@ export function ChangesTree({
         const state = checkState(row, selected, (id) => partial.has(id))
         const open = expanded.has(row.id)
         const isCurrent = index === found
+        const isSelected = selection.ids.has(row.id)
         return (
           <div
             key={row.id}
@@ -264,7 +363,7 @@ export function ChangesTree({
                `data-drop` says whether the row under the pointer will take it. The verdict is
                drawn on the target as well as on the ghost because the pointer is where the eye
                is, and the ghost is 12px away from it. */
-            {...(carried !== null && inDrag(carried, row) ? { 'data-drag': '' } : {})}
+            {...(inFlight !== null && inDrag(inFlight, row) ? { 'data-drag': '' } : {})}
             {...(drag.state !== null && drag.state.over === row.id
               ? { 'data-drop': drag.state.outcome.kind }
               : {})}
@@ -283,10 +382,14 @@ export function ChangesTree({
             role="treeitem"
             aria-level={row.depth + 1}
             aria-checked={ARIA_CHECKED[state]}
-            aria-selected={isCurrent}
+            /* The row *selection*, not the cursor. It used to be `isCurrent`, which made the
+               tree tell a screen reader that exactly one row was ever selected while claiming
+               `aria-multiselectable` two lines up. `aria-checked` beside it is the tick, and
+               the two now say different things because they are different things. */
+            aria-selected={isSelected}
             {...(row.expandable ? { 'aria-expanded': open } : {})}
             tabIndex={index === at ? 0 : -1}
-            className={rowClass(row, isCurrent)}
+            className={rowClass(row, isCurrent, isSelected)}
             // Indent is a padding rather than a spacer element so the whole 24px row stays
             // one hit target, including the empty space to the left of a deep file.
             //
@@ -313,13 +416,35 @@ export function ChangesTree({
              */
             onMouseDown={(e) => {
               if (e.button !== 0) return
+              /*
+               * Refuse the native text selection at the engine, not only in CSS.
+               *
+               * `.tree` sets `-webkit-user-select: none`, which is the real fix and is why the
+               * drag stopped painting the panel blue. This is the second lock, and it is not
+               * redundant: `preventDefault` on the mousedown is the engine-level "this press
+               * does not begin a selection", it is independent of which spellings of
+               * `user-select` the engine happens to implement, and it is what stops a
+               * *shift*-click from extending a selection that began somewhere else on the page
+               * — the commit message box, a diff pane — which no rule on this subtree can
+               * reach.
+               *
+               * It costs the automatic focus, which the roving tabindex and the `onFocus →
+               * onCurrent` path below both depend on, so the focus is taken by hand. Nothing
+               * else on this row relies on the default action of a press.
+               */
+              e.preventDefault()
+              e.currentTarget.focus()
               const gesture = gestureOf(e.detail)
+              const mods: SelectMods = { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey }
               const action = gitTreeClick({
                 gesture,
                 expandable: row.expandable,
                 diffOpen,
               })
-              if (action.select) onCurrent(row.id)
+              deferred.current = null
+              // `action.select` is false only on the second half of a double-click, whose
+              // first half has already moved the cursor and set the selection.
+              if (action.select && onPress(row.id, mods)) deferred.current = row.id
               /*
                * The gesture, not a second rule. `gitTreeClick` returns `open` for two
                * different reasons — a double-click, or a single click while a diff is
@@ -336,8 +461,15 @@ export function ChangesTree({
                * executed by anything in the repo — it needs a DOM — and an inline ternary here
                * was the one link in the chain from the click rule to `tab_retarget_diff` that
                * no test could reach. `check-git-tree.mjs` runs that function under node.
+               *
+               * Gated on an *unmodified* press, which is new and belongs here rather than in
+               * `gitTreeClick`: that rule is shared with the file tree and the search results,
+               * and neither of those has a multi-row selection to build. A ctrl-click means
+               * "add this row" and a shift-click means "extend to here" — either one also
+               * throwing a diff on screen would open a tab per row while the user assembles a
+               * selection, which is the thirty-tabs bug arriving through a different door.
                */
-              if (action.open) onOpenDiff(row, diffOpenMode(gesture))
+              if (action.open && !mods.ctrl && !mods.shift) onOpenDiff(row, diffOpenMode(gesture))
             }}
             /*
              * Folding happens on *release*, and that is a change with a reason.
@@ -351,10 +483,28 @@ export function ChangesTree({
              * The rule itself is untouched: `gitTreeClick` is asked again, with the same
              * `detail`-derived gesture (a mouseup carries the click count too), so the second
              * half of a double-click still does nothing and a file row still toggles nothing.
-             * Selection and diff-opening stay on the press, where they feel immediate.
+             * Diff-opening stays on the press, where it feels immediate.
+             *
+             * The *selection's* collapse is here for the same reason the fold is, and it is
+             * the detail that makes dragging a multi-row selection possible at all. A plain
+             * press on a row that is already one of several selected must not collapse the
+             * selection to that row on mousedown — the press is also how a drag of the whole
+             * selection begins, and collapsing first would destroy the set before the pointer
+             * had moved a pixel. `drag.dragged()` in the guard above is exactly the signal
+             * needed, and it was already being read one line down for the fold.
              */
             onMouseUp={(e) => {
-              if (e.button !== 0 || drag.dragged()) return
+              if (e.button !== 0) return
+              if (drag.dragged()) {
+                // The gesture became a drag, so the deferred collapse is abandoned: the whole
+                // selection has just been moved and it is still the right selection.
+                deferred.current = null
+                return
+              }
+              if (deferred.current === row.id) {
+                deferred.current = null
+                onRelease(row.id)
+              }
               const action = gitTreeClick({
                 gesture: gestureOf(e.detail),
                 expandable: row.expandable,
@@ -382,6 +532,12 @@ export function ChangesTree({
               /* And the pointer press with it, or a hand that shifts two pixels while ticking
                  a box would pick the row up instead. The box is a control, not a handle. */
               onPointerDown={(e) => e.stopPropagation()}
+              /* The cursor moves, the *selection* does not, and that is the rule the whole
+                 feature rests on: a tick is a statement about a commit and a selection is a
+                 statement about what you are pointing at. A box that also selected its row
+                 would mean ticking a file silently changed what the next drag carries — which
+                 is the bug that made ticks the wrong thing to widen a drag by in the first
+                 place, rebuilt from the other end. */
               onClick={(e) => {
                 e.stopPropagation()
                 onCurrent(row.id)
@@ -435,15 +591,21 @@ function DragGhost({ state }: { state: ChangesDragState }) {
 }
 
 /**
- * Three orthogonal facts about a row, so the ternary chain does not have to nest.
+ * Four orthogonal facts about a row, so the ternary chain does not have to nest.
  *
  * `groupRow` is the `--panel-2` header ground, and a *directory* deliberately does not get it:
  * a folder inside a changelist is part of the list's contents, and painting it like a header
  * would make a changelist look as though it contained several changelists.
+ *
+ * `rowSelected` and `rowCurrent` are two classes because they are two facts, and a multi-row
+ * selection is exactly where they come apart: every selected row gets the band, and only one
+ * of them — the one the arrows would move from — gets the accent rule down its leading edge.
+ * They composed into one class for as long as selection meant "the single row you clicked".
  */
-function rowClass(row: Row, isCurrent: boolean): string {
+function rowClass(row: Row, isCurrent: boolean, isSelected: boolean): string {
   const parts = [styles.row]
   if (row.kind === 'group' || row.kind === 'repo') parts.push(styles.groupRow)
+  if (isSelected) parts.push(styles.rowSelected)
   if (isCurrent) parts.push(styles.rowCurrent)
   return parts.join(' ')
 }

@@ -370,7 +370,13 @@ pub use cide_pty::UNKNOWN_EXIT_CODE;
 /// Registration cannot lose the race, either: a child that is already reaped calls back
 /// immediately rather than never — see [`cide_pty::PtySession::on_exit`].
 pub fn watch_for_exit(app: AppHandle, id: SessionId, session: &Arc<PtySession>) {
-    watch_exit_with(session, move |exit| report_exit(&app, id, &exit));
+    // Captured here rather than looked up in the callback, because the callback runs on the
+    // reaper thread *after* the child is gone and the registry entry deliberately survives
+    // that (see the note at the end of `report_exit`). `child_pid` is a plain field taken at
+    // spawn, so this is the same value either way — reading it now just means the unbind
+    // below cannot depend on the order two teardown steps happen in.
+    let pid = session.child_pid();
+    watch_exit_with(session, move |exit| report_exit(&app, id, pid, &exit));
 }
 
 /// The registration, with the reporting left to the caller.
@@ -395,7 +401,7 @@ fn exit_state(exit: &Exit) -> SessionState {
 }
 
 /// Announce that `id` has ended, on `cide-pty`'s reaper thread.
-fn report_exit(app: &AppHandle, id: SessionId, exit: &Exit) {
+fn report_exit(app: &AppHandle, id: SessionId, pid: Option<u32>, exit: &Exit) {
     // Worth a line, and worth it at `warn`: a session that ended badly is the one the user
     // comes asking about ("it just vanished"), and by then the pane has been closed and the
     // log is the only thing left that can answer. A clean exit is the ordinary case and says
@@ -413,6 +419,28 @@ fn report_exit(app: &AppHandle, id: SessionId, exit: &Exit) {
     // by asking which sessions are live must not be told this one still is.
     if let Some(hooks) = app.try_state::<crate::hooks::HookServer>() {
         hooks.forget(id);
+    }
+
+    // And the IDE server's pid → pane table, for the same "do not answer for a corpse"
+    // reason one rung sideways.
+    //
+    // `IdeServer::unbind_pane` had **no caller anywhere in the workspace** until this line:
+    // it was written, documented with the hazard it prevents, and wired to nothing — so
+    // `pane_of_pid` only ever grew, and every binding the process ever made outlived the
+    // child it described. That is this project's recurring defect, and it is worth naming
+    // where it was found rather than only where it is fixed.
+    //
+    // It is *here* and not in `pane_close`, which is where the doc comment guessed it would
+    // go, and the difference is a real case: closing a pane leaves its child running (the
+    // session is owned by the registry, not by the pane), and `claude.mirror` puts two panes
+    // on one child and therefore one pid. Unbinding when a pane closes would make the
+    // surviving mirror unaddressable and take a working `@`-mention away. A reaped child, by
+    // contrast, can never speak again under that pid — and the instant it is reaped is the
+    // earliest the OS may hand the number to somebody else.
+    if let Some(pid) = pid
+        && let Some(servers) = app.try_state::<crate::ide::IdeServers>()
+    {
+        servers.unbind_pid(pid);
     }
 
     // And the waiting set, for the same reason one rung up: a `claude` killed while it was

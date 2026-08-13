@@ -146,10 +146,11 @@ fn capabilities() -> Capabilities {
 /// knowing which version a session was spawned against is the only way to tell a protocol
 /// change from a bug in this code.
 fn claude_version() -> Option<String> {
-    let output = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("claude");
+    // The CLI is node, and a bundled launch would otherwise hand it this AppImage's
+    // `LD_LIBRARY_PATH`. See `cide_core::child_env`.
+    cide_core::child_env::scrub_command(&mut command);
+    let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }

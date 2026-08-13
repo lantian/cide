@@ -121,6 +121,7 @@
   position: relative;
   overflow: hidden;
   /* The app root sets `user-select: none` so window chrome does not text-select on drag. */
+  -webkit-user-select: text;
   user-select: text;
 }
 

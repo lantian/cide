@@ -224,5 +224,6 @@
   font-size: 11px;
   color: var(--dim);
   overflow-wrap: anywhere;
+  -webkit-user-select: text;
   user-select: text;
 }

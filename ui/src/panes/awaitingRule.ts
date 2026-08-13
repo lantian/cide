@@ -183,29 +183,77 @@ export function adopt(
 export type PaneSession = string | null | undefined
 
 /**
- * How many distinct sessions in one group of panes are waiting on the user.
+ * **The one derivation.** Which of a group of panes' sessions are waiting on the user.
  *
- * **Distinct** is not a detail. A mirrored pane is two panes showing one child, and the pane
- * markers deliberately light up in both — that is one conversation waiting, and a tab that
- * said `2` about it would be counting windows onto a thing rather than the thing.
+ * Every attention surface in the app is a reading of this function over a different pane set,
+ * and that is a requirement rather than tidiness. There are four surfaces — a pane's own
+ * highlight, its tab's badge, its project's badge in the header, and the `Awaiting: N` in the
+ * OS title — and the failure this shape exists to prevent is the obvious implementation:
+ * three booleans set from three places, where acknowledging a pane clears its own mark and
+ * leaves a tab or a header still saying *come back here* for a pane that has been dealt with.
+ * A user who sees that once stops believing the badge, and the whole feature is a badge.
+ *
+ * So the rule is: **no surface holds attention state.** Each one names its panes and reads the
+ * answer out of this table:
+ *
+ * * a pane asks about itself — [`isAwaiting`], one session;
+ * * a tab asks about its panes — [`awaitingIn`], the size of this set;
+ * * a project asks about every pane in every one of its tabs, plus its detached ones;
+ * * a window asks the same question in Rust (`cmd::window::retitle` over `sessions_of`),
+ *   because only Rust knows which panes an OS window is showing.
+ *
+ * They cannot disagree, because there is nothing to disagree with: acknowledging one session
+ * moves one entry in one map, and all four answers are recomputed from it.
+ *
+ * **Distinct** is not a detail either. A mirrored pane is two panes showing one child, and the
+ * pane markers deliberately light up in both — that is one conversation waiting, and a tab
+ * that said `2` about it would be counting windows onto a thing rather than the thing. A
+ * `Set` of sessions is what makes that automatic at every level, including the project one,
+ * where the same session can appear in two tabs.
  *
  * Sessions this window has never heard of contribute nothing rather than defaulting to
  * waiting: `pane.session` survives a restart, so a freshly launched app is full of pane
  * records naming children from a previous process. Absent from the table means "no news",
  * and no news must never read as "come back to this one".
  */
-export function awaitingIn(
+export function awaitingAmong(
   tracks: ReadonlyMap<string, Track>,
   sessions: readonly PaneSession[],
-): number {
-  const counted = new Set<string>()
+): ReadonlySet<string> {
+  const waiting = new Set<string>()
   for (const session of sessions) {
     if (!session) continue
     // `gone` tracks are never `awaiting`, so an exited session drops out here without a
     // second condition — and the caller has usually deleted the entry already.
-    if (tracks.get(session)?.awaiting === true) counted.add(session)
+    if (tracks.get(session)?.awaiting === true) waiting.add(session)
   }
-  return counted.size
+  return waiting
+}
+
+/**
+ * How many distinct sessions in one group of panes are waiting on the user.
+ *
+ * The count a tab or a project badge shows. Expressed over [`awaitingAmong`] rather than
+ * counting for itself, so "this tab says 2" and "these two panes are marked" are the same
+ * statement rather than two implementations of it.
+ */
+export function awaitingIn(
+  tracks: ReadonlyMap<string, Track>,
+  sessions: readonly PaneSession[],
+): number {
+  return awaitingAmong(tracks, sessions).size
+}
+
+/**
+ * Whether one pane's session is waiting on the user.
+ *
+ * The pane highlight, and it goes through the same function as the counts for the reason
+ * above: a pane that draws a highlight its tab does not count is the half-clear this module
+ * is arranged to make impossible. A one-element set is a trivial amount of work for a
+ * guarantee that is otherwise a convention nobody can check.
+ */
+export function isAwaiting(tracks: ReadonlyMap<string, Track>, session: PaneSession): boolean {
+  return awaitingAmong(tracks, [session]).size > 0
 }
 
 /**

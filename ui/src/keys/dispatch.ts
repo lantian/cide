@@ -55,6 +55,7 @@ import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
 import { explain } from '@/chrome/branchModel'
+import { requestFocus } from '@/chrome/focusRequests'
 import {
   branch as branchApi,
   claudeSend,
@@ -67,10 +68,12 @@ import {
   type Direction,
   type PaneId,
   type ProjectId,
+  type RepoId,
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
 import { focusedTabOf, registeredBuffers, saveAll, saveTab } from '@/editor/openBuffers'
+import { revealPane } from '@/editor/revealPane'
 import { startProjectSwitch } from './switcherStore'
 import {
   activeProjectOf,
@@ -78,7 +81,6 @@ import {
   focusTarget,
   focusedFilePath,
   isClosableTab,
-  reposOf,
   windowProjectsOf,
 } from './target'
 
@@ -91,8 +93,14 @@ export interface DispatchDeps {
    * binding naming something that has been deleted. `reportOnly` is a fine value for it.
    */
   fallback: (command: string, args: unknown) => void
-  /** Switch the activity rail's sidebar view, for `sidebar.files` / `sidebar.git`. */
-  showSidebar?: ((view: 'files' | 'git') => void) | undefined
+  /**
+   * Switch the activity rail's sidebar view, for the `sidebar.*` commands and for anything
+   * that has to reveal a panel before acting on it (`file.reveal`, `git.commit`).
+   *
+   * Optional because a detached-pane window has no rail and no sidebar to switch. Every arm
+   * that uses it checks for `undefined` and reports rather than assuming.
+   */
+  showSidebar?: ((view: 'files' | 'git' | 'search') => void) | undefined
   /**
    * Override for which tab `file.save` writes.
    *
@@ -142,6 +150,35 @@ function unmet(command: string, precondition: string): void {
 /** The registry entry's `unavailable` reason, or `null`. */
 function unavailableReason(command: string): string | null {
   return boot()?.commands.find((entry) => entry.id === command)?.unavailable ?? null
+}
+
+/**
+ * Run something over every repository in the active project, asking Rust which those are.
+ *
+ * The question is answered by `git_repos` — real discovery, on the disk — and not by the
+ * workspace mirror, because the mirror cannot answer it. `keys/target.ts::reposOf` used to,
+ * from `ProjectRoot.repo`, a field Rust set to `None` in its one constructor and never filled
+ * anywhere; it therefore returned `[]` for every project ever opened, and the three handlers
+ * that called it bailed at their first line every single time. That is the *second* half of
+ * the bug — the palette hid these rows, and a user who reached them another way (a
+ * hand-written `keymap.json`) got a diagnostic log line and nothing else.
+ *
+ * An empty answer **throws** rather than calling `unmet`. `unmet` writes to the diag log, which
+ * is the right surface for "this command's clause and this handler disagree" and the wrong one
+ * for "your project has no git repository": that is a fact about the user's disk, they asked a
+ * question, and they are owed a sentence. The throw is inside a promise chain nothing catches,
+ * so it lands on `chrome/Failures.tsx` through `unhandledrejection` like every other reported
+ * failure. Silence here is precisely the defect this file keeps being rewritten for.
+ */
+function withRepos(command: string, run: (project: ProjectId, repos: RepoId[]) => void): void {
+  const project = activeProjectOf(boot())
+  if (project === null) return unmet(command, 'no open project')
+  void gitApi.repos(project.id).then((repos) => {
+    if (repos.length === 0) {
+      throw new Error('There is no git repository in this project.')
+    }
+    run(project.id, repos.map((repo) => repo.id))
+  })
 }
 
 /** `args.path` when the caller supplied one — `args` is `unknown` on the wire. */
@@ -340,7 +377,15 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         const path = pathArg(args) ?? focusedFilePath(boot())
         if (to === null) return unmet(command, 'no Claude pane to mention into')
         if (path === null) return unmet(command, 'no file tab focused and no path argument')
-        return void claudeSend.lines(to.project, to.pane, path, '')
+        // `sent.pane`, not `to.pane`: Rust reroutes when the pane named here has no `claude`
+        // on the IDE server — which is the ordinary state of a Claude pane sitting at a
+        // resume splash — and revealing the pane we asked for would show the user an empty
+        // prompt while their mention sat in a different conversation. The reveal is what
+        // makes the destination visible at all from a palette row, which has no editor to
+        // report back into.
+        return void claudeSend
+          .lines(to.project, to.pane, path, '')
+          .then((sent) => revealPane(to.project, sent.pane))
       }
 
       /* ---------------------------------------------------------------------- Terminal */
@@ -444,10 +489,9 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         //
         // Uncaught on purpose, like `claudeSend.lines`: a rejected push — no upstream, no
         // credential helper — is exactly what `chrome/Failures.tsx` exists to put on screen.
-        const project = activeProjectOf(boot())
-        const repos = reposOf(boot())
-        if (project === null || repos.length === 0) return unmet(command, 'no repository open')
-        void Promise.all(repos.map((repo) => gitApi.push(project.id, repo, null, null)))
+        withRepos(command, (project, repos) => {
+          void Promise.all(repos.map((repo) => gitApi.push(project, repo, null, null)))
+        })
         return
       }
 
@@ -459,12 +503,18 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
        * The popup is an overlay (`overlays/store.ts`), not a child of the status bar widget,
        * so these work in a window whose status bar never mounted the widget. That is the
        * whole reason it is built that way.
+       *
+       * No repository check here, deliberately, and unlike the three commands around it. The
+       * popup asks `git_branch_list` itself and draws its own "no repository" state
+       * (`chrome/BranchSelector.tsx`), so a guard here would be a second opinion about the
+       * disk formed one round trip earlier — and the guard it replaces was `reposOf`, which
+       * answered "no repository" for every project in existence and made both of these
+       * commands do nothing at all.
        */
       case 'git.branch.switch':
       case 'git.branch.new': {
         const project = activeProjectOf(boot())
-        const repos = reposOf(boot())
-        if (project === null || repos.length === 0) return unmet(command, 'no repository open')
+        if (project === null) return unmet(command, 'no open project')
         openBranchPopup(command === 'git.branch.new' ? 'new' : 'list')
         return
       }
@@ -483,15 +533,39 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         //
         // One chain per repository rather than `Promise.all`: with four repositories and two
         // failures, `Promise.all` reports the first and marks the rest handled.
-        const project = activeProjectOf(boot())
-        const repos = reposOf(boot())
-        if (project === null || repos.length === 0) return unmet(command, 'no repository open')
         const run = command === 'git.pull' ? branchApi.pull : branchApi.fetch
-        for (const repo of repos) {
-          void run(project.id, repo).catch((error: unknown) => {
-            throw new Error(explain(error))
-          })
-        }
+        withRepos(command, (project, repos) => {
+          for (const repo of repos) {
+            void run(project, repo).catch((error: unknown) => {
+              throw new Error(explain(error))
+            })
+          }
+        })
+        return
+      }
+
+      case 'git.commit': {
+        /*
+         * Reveals the commit box; does not commit.
+         *
+         * The message and the ticked paths live in `useGitPanel`'s React state, which does not
+         * exist while the sidebar is on Files or shut — so there is nothing here to commit
+         * *with*, and lifting a half-typed message into a store to make one would be storing a
+         * gesture rather than mirroring anything Rust owns. `commands.rs` carries the full
+         * argument. What is left is the useful half: put the user in front of the control.
+         *
+         * Shown before focused, the same order and for the same reason as `file.reveal` above
+         * — asking the box for focus while the sidebar is still on Files focuses nothing, and a
+         * command that did nothing is the whole complaint this file exists to answer. The
+         * request is parked in a module-level store because `setView('git')` only mounts the
+         * panel on the *next* React render, and it survives to be picked up by whichever render
+         * sees it first. `unmet` rather than a thrown error for the detached-pane case: that
+         * window has no sidebar and never will, which is a fact about the window and not a
+         * failure the user can act on.
+         */
+        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
+        deps.showSidebar('git')
+        requestFocus('commitMessage')
         return
       }
 
@@ -546,6 +620,26 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       case 'sidebar.git':
         if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
         deps.showSidebar('git')
+        return
+
+      case 'sidebar.search':
+        /*
+         * Reveal *and* focus, and never toggle shut.
+         *
+         * `picker.files` two screens up toggles because Escape is the only other way out of an
+         * overlay. A sidebar panel is not an overlay: the ⌕ button in the activity rail is
+         * right there, and a second Ctrl+Shift+F that closed the panel would take away the one
+         * thing this binding is for, which is landing in the search box with a chord. VS Code
+         * behaves the same way and for the same reason.
+         *
+         * Focusing is not a flourish. The panel had no keyboard path of any kind — no command,
+         * no binding, and no `ref`, `autoFocus` or focus effect on its input, so even the
+         * existing mouse path revealed a panel and left the caret in the terminal. Revealing
+         * without focusing would have been a new command with the old defect.
+         */
+        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
+        deps.showSidebar('search')
+        requestFocus('search')
         return
 
       default:

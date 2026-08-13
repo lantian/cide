@@ -83,6 +83,10 @@ try {
         // check scripts can each hold the rule belonging to their tree; the git tree's is the
         // conditional one, and it is pinned at the foot of this file.
         join(UI, 'src', 'sidebar', 'clickSemantics.ts'),
+        // Which rows a gesture selects — the tree's third concept, and the one `grab` widens
+        // by. Same argument as `dragDrop.ts`: the rules are plain functions precisely so this
+        // script can execute them, because the gesture that drives them needs a pointer.
+        join(UI, 'src', 'sidebar', 'GitPanel', 'rowSelection.ts'),
       ],
     }),
   )
@@ -108,6 +112,14 @@ try {
 
   const m = await import(`file://${join(out, 'sidebar', 'GitPanel', 'model.js')}`)
   const d = await import(`file://${emitted}`)
+  /*
+   * No specifier rewrite for this one, and that is an assertion in itself: `rowSelection.ts`
+   * takes only `type Row` from `model.ts`, so `verbatimModuleSyntax` erases the import and the
+   * emitted file has none at all. If someone adds a value import, this line throws
+   * `ERR_MODULE_NOT_FOUND` rather than quietly pulling half the panel into a check that is
+   * supposed to be running rules.
+   */
+  const s = await import(`file://${join(out, 'sidebar', 'GitPanel', 'rowSelection.js')}`)
 
   let failed = 0
   const eq = (actual, expected, what) => {
@@ -328,6 +340,95 @@ try {
     m.checkState(fixes, m.toggleRow(fixes, none), () => false),
     'checked',
     'a group with every file ticked and no partiality is checked',
+  )
+
+  // --- Space over a multi-row selection --------------------------------------------------
+  //
+  // This is here because the defect it pins was invisible to all 29 gates: the rule lived in
+  // `useGitPanel.ts`, the one file in this panel a check script cannot compile, and it was the
+  // only selection rule not placed where this script could run it.
+  //
+  // The shape of the bug: `Row.files` is a whole subtree, and a selection spanning a folder
+  // ALWAYS holds the folder row *and* the rows beneath it — `between` keeps every selectable
+  // row in a shift band, `selectAll` keeps every row on screen. Folding `toggleRow` over that
+  // visits each file twice, so it lands back where it started, and what survives is the
+  // inverse of the documented rule: any tick anywhere leaves the subtree fully ticked. The
+  // next thing this panel does is `git commit`, so that silently re-ticked files the user had
+  // excluded.
+  // A fixture of its own rather than one of the shared ones: this needs a directory holding
+  // *two* files, and pinning that shape onto `nested` would make an unrelated edit there fail
+  // here for a reason nobody reading it would guess. `walkDir` compacts single-child chains,
+  // so `src/` must hold two entries to survive as a row at all.
+  const dirFixture = m.normalizeStatus({
+    repos: [
+      {
+        ...repo(APP, '/w/app', 'app'),
+        changelists: [
+          {
+            id: 'default',
+            name: 'Changes',
+            comment: '',
+            active: true,
+            changes: [
+              entry('src/keep.rs', 'modified', 'unmodified', 'default'),
+              entry('src/excluded.rs', 'modified', 'unmodified', 'default'),
+            ],
+          },
+        ],
+        unversioned: [],
+        ignored: [],
+      },
+    ],
+  })
+  const rowsD = m.buildRows(dirFixture, openAll(dirFixture))
+  const dirRow = rowsD.find((r) => r.kind === 'dir' && r.files.length > 1)
+  ok(dirRow !== undefined, 'the fixture yields a directory row with several files under it')
+  const kidIds = new Set(dirRow.files)
+  const band = new Set([
+    dirRow.id,
+    ...rowsD.filter((r) => r.kind === 'file' && kidIds.has(r.id)).map((r) => r.id),
+  ])
+  eq(band.size, 3, 'and the band holds the folder as well as both rows under it')
+
+  eq(
+    [...m.toggleRows(rowsD, band, none)].sort(),
+    [...dirRow.files].sort(),
+    'Space over a folder and its children ticks the subtree exactly once, not twice back to nothing',
+  )
+
+  // The commit-safety case, stated as itself rather than as a corollary.
+  const [keep, excluded] = dirRow.files
+  const afterExcluding = m.toggleRows(rowsD, band, new Set([keep]))
+  ok(
+    !afterExcluding.has(excluded),
+    'a file the user deliberately unticked is NOT re-ticked by Space over its folder — the '
+      + 'failure here puts a file into a commit that the user removed from it',
+  )
+  eq(afterExcluding.size, 0, 'any tick in the selection means Space clears, rather than completing')
+
+  // Order independence. A fold's answer depended on whether `walkDir` emitted a directory
+  // before its children, which is a property of the tree builder and not of anything the user
+  // did — so the same selection could mean two things.
+  eq(
+    [...m.toggleRows([...rowsD].reverse(), band, none)].sort(),
+    [...m.toggleRows(rowsD, band, none)].sort(),
+    'the answer does not depend on the order rows happen to be walked in',
+  )
+
+  // One rule, not two: the single-row entry point must be the multi-row one with one row.
+  for (const row of [dirRow, rowsD.find((r) => r.kind === 'file'), changes]) {
+    eq(
+      [...m.toggleRows(row === changes ? rows1 : rowsD, new Set([row.id]), none)].sort(),
+      [...m.toggleRow(row, none)].sort(),
+      `\`toggleRows\` with one ${row.kind} row agrees with \`toggleRow\` — they are one rule`,
+    )
+  }
+
+  // A selection made before a group was folded away must not act on what is no longer shown.
+  eq(
+    m.toggleRows([], band, none).size,
+    0,
+    'a selected id with no row on screen contributes nothing — Space acts on what is visible',
   )
 
   // --- defaults ------------------------------------------------------------------------
@@ -869,57 +970,305 @@ try {
       + 'the collapsing',
   )
 
+  // --- which rows a gesture selects --------------------------------------------------------
+
+  /*
+   * The row selection: the tree's third concept, beside the ticks and the cursor.
+   *
+   * It exists because `grab` used to widen by **ticks**, and the active changelist opens fully
+   * ticked — so dragging one file out of it moved every file in it. Every rule below is one
+   * the pointer and the keyboard now share, which is the other half of the point: shift+↓↓ and
+   * shift-clicking two rows down go through the same function and cannot drift apart.
+   */
+  const sel = (ids, anchor = null) => ({ ids: new Set(ids), anchor })
+  const idsOf = (s) => [...s.ids].sort()
+
+  eq(
+    idsOf(s.pressSelect(rowsE, s.NO_ROWS, rowA.id, { ctrl: false, shift: false }).next),
+    [rowA.id],
+    'a plain press selects the row it landed on and nothing else',
+  )
+  eq(
+    s.pressSelect(rowsE, s.NO_ROWS, rowA.id, { ctrl: false, shift: false }).next.anchor,
+    rowA.id,
+    'and puts the anchor there, so a shift-click after it has somewhere to extend from',
+  )
+  eq(
+    s.pressSelect(rowsE, sel([rowB.id], rowB.id), rowA.id, { ctrl: false, shift: false }).deferred,
+    false,
+    'a plain press on an UNSELECTED row takes effect immediately — this is what makes "a drag '
+      + 'starting on an unselected row selects it first" true without the drag knowing anything '
+      + 'about selection',
+  )
+  eq(
+    s.pressSelect(rowsE, sel([rowA.id, rowB.id], rowA.id), rowB.id, { ctrl: false, shift: false }),
+    { next: sel([rowA.id, rowB.id], rowA.id), deferred: true },
+    'a plain press on a row that is ALREADY one of several selected changes nothing yet and '
+      + 'says so: the press is how a drag of the whole selection begins, and collapsing here '
+      + 'would destroy the set before the pointer had moved a pixel',
+  )
+  eq(
+    s.pressSelect(rowsE, sel([rowA.id], rowA.id), rowA.id, { ctrl: false, shift: false }).deferred,
+    false,
+    'and it is not deferred when that row is the only one selected — there is no set to '
+      + 'preserve, and deferring would leave the anchor stale',
+  )
+  eq(
+    idsOf(s.releaseSelect(rowsE, sel([rowA.id, rowB.id], rowA.id), rowB.id)),
+    [rowB.id],
+    'the release of a deferred press is what finally collapses it. The caller only gets here '
+      + 'when the gesture did NOT become a drag',
+  )
+  eq(
+    idsOf(s.pressSelect(rowsE, sel([rowA.id], rowA.id), rowB.id, { ctrl: true, shift: false }).next),
+    [rowA.id, rowB.id].sort(),
+    'ctrl adds a row to the selection',
+  )
+  eq(
+    idsOf(
+      s.pressSelect(rowsE, sel([rowA.id, rowB.id], rowA.id), rowA.id, { ctrl: true, shift: false })
+        .next,
+    ),
+    [rowB.id],
+    'and ctrl on a row that is in it takes that row back out',
+  )
+  eq(
+    s.pressSelect(rowsE, sel([rowA.id, rowB.id], rowA.id), rowA.id, { ctrl: true, shift: false })
+      .deferred,
+    false,
+    'a ctrl press is never deferred: it is not the start of a drag (`useChangesDrag` refuses a '
+      + 'modified press outright), so there is nothing to wait for',
+  )
+
+  /*
+   * The range. `rowsE` is `Changes / src / b.rs / a.rs / fixes / notes.md / …` with everything
+   * open, so a shift from `b.rs` to `notes.md` crosses two changelist headers and a directory.
+   */
+  const shiftTo = (from, to) =>
+    idsOf(s.pressSelect(rowsE, sel([from], from), to, { ctrl: false, shift: true }).next)
+  eq(
+    shiftTo(rowB.id, rowA.id),
+    [rowA.id, rowB.id].sort(),
+    'shift takes the inclusive band between the anchor and the press',
+  )
+  eq(
+    shiftTo(rowSrc.id, rowA.id).includes(rowSrc.id),
+    true,
+    'a directory row is a member of a range like any other selectable row — it is a drag source '
+      + 'and it names a set of files, which is what every gesture downstream wants',
+  )
+  eq(
+    shiftTo(rowB.id, rowNotes.id).some((id) =>
+      rowsE.some((r) => r.id === id && (r.kind === 'group' || r.kind === 'repo')),
+    ),
+    false,
+    'and a range that crosses a changelist header does NOT pull the header in: a group row is '
+      + 'not a drag source, and carrying it would sweep in its whole list — the exact surprise '
+      + 'the tick-widening used to spring',
+  )
+  eq(
+    s.pressSelect(rowsE, sel([rowB.id], rowB.id), rowA.id, { ctrl: false, shift: true }).next
+      .anchor,
+    rowB.id,
+    'shift leaves the anchor where it was, so a second shift-click re-extends from the same '
+      + 'end rather than from the last one',
+  )
+  eq(
+    idsOf(s.pressSelect(rowsE, s.NO_ROWS, rowA.id, { ctrl: false, shift: true }).next),
+    [rowA.id],
+    'shift with no anchor yet behaves as a plain press rather than selecting nothing',
+  )
+  eq(
+    idsOf(s.pressSelect(rowsE, sel([rowA.id], 'gone'), rowB.id, { ctrl: false, shift: true }).next),
+    [rowB.id],
+    'and so does shift from an anchor whose row is no longer in the tree — a background refresh '
+      + 'can fold a group away mid-gesture, and extending from a row that is off screen would '
+      + 'select a band whose top the user cannot see',
+  )
+
+  const groupRow = (label) => rowsE.find((r) => r.kind === 'group' && r.label === label)
+  eq(
+    idsOf(s.pressSelect(rowsE, sel([rowA.id], rowA.id), groupRow('Changes').id, { ctrl: false, shift: false }).next),
+    [],
+    'a plain press on a changelist header clears the selection — that row folds, it is not a '
+      + 'drag source, and it is the only way left to clear a selection with the pointer',
+  )
+  eq(
+    s.pressSelect(rowsE, sel([rowA.id], rowA.id), groupRow('Changes').id, { ctrl: false, shift: false })
+      .next.anchor,
+    groupRow('Changes').id,
+    'and the anchor still moves there: an anchor is a position, not a member, which is what '
+      + 'lets shift+↓ walk out of a header into the files below it',
+  )
+  eq(
+    idsOf(s.pressSelect(rowsE, sel([rowA.id], rowA.id), groupRow('Changes').id, { ctrl: true, shift: false }).next),
+    [rowA.id],
+    'and a ctrl press on one adds nothing rather than putting an unselectable id in the set',
+  )
+
+  eq(
+    s.isSelectable(rowSrc) && s.isSelectable(rowA) && !s.isSelectable(groupRow('Changes')),
+    true,
+    'files and directories are selectable; repositories and changelists are positions',
+  )
+
+  // --- the keyboard reaches the same rules --------------------------------------------------
+
+  /*
+   * Anchored on the DIRECTORY row, two rows above `a.rs`, so the band has a row in the middle
+   * of it. Anchored on `b.rs` — its immediate neighbour — a "union the endpoints" mistake and a
+   * real range produce the same two ids, and this assertion would hold for both.
+   */
+  eq(
+    idsOf(s.keySelect(rowsE, sel([rowSrc.id], rowSrc.id), rowA.id, { ctrl: false, shift: true })),
+    idsOf(
+      s.pressSelect(rowsE, sel([rowSrc.id], rowSrc.id), rowA.id, { ctrl: false, shift: true }).next,
+    ),
+    'shift+arrow and shift+click produce the SAME set from the same anchor, the rows in the '
+      + 'middle included. Two implementations of "extend the selection" is how a tree ends up '
+      + 'with a keyboard that disagrees with its mouse about what is selected',
+  )
+  eq(
+    idsOf(s.keySelect(rowsE, sel([rowSrc.id], rowSrc.id), rowA.id, { ctrl: false, shift: true })),
+    [rowSrc.id, rowB.id, rowA.id].sort(),
+    'and that set really is the band and not the two ends of it',
+  )
+  eq(
+    idsOf(s.keySelect(rowsE, sel([rowA.id, rowB.id], rowA.id), rowNotes.id, { ctrl: true, shift: false })),
+    [rowA.id, rowB.id].sort(),
+    'ctrl+arrow moves the cursor and leaves the selection completely alone — how a keyboard '
+      + 'user reaches a row to ctrl-Space without losing what they have',
+  )
+  eq(
+    idsOf(s.keySelect(rowsE, sel([rowA.id, rowB.id], rowA.id), rowNotes.id, { ctrl: false, shift: false })),
+    [rowNotes.id],
+    'and a bare arrow takes the selection along, which is what every tree does',
+  )
+  eq(
+    idsOf(s.selectAll(rowsE)),
+    rowsE.flatMap((r) => (s.isSelectable(r) ? [r.id] : [])).sort(),
+    'Ctrl+A takes every selectable row that is on screen, and no header',
+  )
+  eq(
+    idsOf(s.collapseTo(rowA.id)),
+    [rowA.id],
+    'Escape collapses to the row the cursor is on',
+  )
+  eq(idsOf(s.collapseTo(null)), [], 'and clears outright when there is no cursor')
+
+  // --- pruning, and what survives a refresh -------------------------------------------------
+
+  eq(
+    idsOf(s.pruneRowSelection(new Set([rowA.id]), sel([rowA.id, rowB.id], rowA.id))),
+    [rowA.id],
+    'a selected row whose file has been committed away drops out on the next refresh',
+  )
+  eq(
+    s.pruneRowSelection(new Set([rowA.id]), sel([rowA.id, rowB.id], rowB.id)).anchor,
+    rowB.id,
+    'and the anchor is kept even when its own row went: it is a position, a stale one just '
+      + 'makes the next shift-range fall back to the plain rule, and clearing it would lose the '
+      + "range's origin every time an agent touched a file elsewhere in the tree",
+  )
+  eq(
+    s.pruneRowSelection(new Set([rowA.id, rowB.id]), sel([rowA.id, rowB.id], rowA.id)).ids.size,
+    2,
+    'a prune that drops nothing returns the same object, so a refresh that changed nothing does '
+      + 'not re-render the tree',
+  )
+  eq(
+    m.allGroups(withEmptyView).has(rowSrc.id),
+    true,
+    '`allGroups` already enumerates directory rows, which is what lets a selected FOLDER be '
+      + 'pruned against the same set as a selected file with no second walk of the view',
+  )
+
+  // --- the selection, resolved for a drag ---------------------------------------------------
+
+  eq(
+    [...s.carriedIds(rowsE, sel([rowSrc.id], rowSrc.id))].sort(),
+    [rowSrc.id, rowB.id].sort(),
+    'a selected directory resolves to the files under it, and keeps its own id: `grab` asks '
+      + 'both "is the row I started on selected" and "is this file one of ours" of the answer',
+  )
+  eq(
+    [...s.carriedIds(rowsE, sel([rowA.id], rowA.id))],
+    [rowA.id],
+    'a selected file passes straight through',
+  )
+
   // --- what a grab carries ---------------------------------------------------------------
 
   /*
-   * `grab` is `actOn` with the rest of the rows added: it is the one answer to "which files is
-   * this gesture about", read by the context menu *and* by the drag. Two functions answering
-   * that separately is how a menu that moves four files ends up beside a drag that moves one.
+   * `grab` is the one answer to "which files is this gesture about", read by the context menu
+   * *and* by the drag. Two functions answering that separately is how a menu that moves four
+   * files ends up beside a drag that moves one.
+   *
+   * It widens by the **row selection** now. It used to widen by the ticks, and the assertions
+   * below used to pin that; they are rewritten rather than relaxed, and the case that changed
+   * meaning — a directory row — is pinned in both directions.
    */
   const paths = (set) => set?.files.map((f) => f.path) ?? null
+  const carry = (ids, row) => d.grab(withEmptyView, s.carriedIds(rowsE, sel(ids)), row)
   eq(
-    paths(d.grab(withEmptyView, new Set(), rowA)),
+    paths(carry([], rowA)),
     ['a.rs'],
-    'a gesture on an unticked row carries that row alone',
+    'a gesture on an unselected row carries that row alone',
   )
   eq(
-    paths(d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA)),
+    paths(carry([rowA.id, rowB.id], rowA)),
     ['a.rs', 'src/b.rs'],
-    "and the ticks when the row is one of them — IDEA's multi-file move, and the reason the "
-      + 'count goes in the menu label and on the drag ghost',
+    "and the whole selection when the row is part of it — IDEA's multi-file move, and the "
+      + 'reason the count goes in the menu label and on the drag ghost',
   )
   eq(
-    d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA).widened,
+    carry([rowA.id, rowB.id], rowA).widened,
     true,
     'a widened grab says so, because that is the fact the user has to see before they let go',
   )
   eq(
-    d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA).label,
+    carry([rowA.id, rowB.id], rowA).label,
     '2 files',
     'and the ghost says it in words',
   )
   eq(
-    paths(d.grab(withEmptyView, new Set([rowA.id, rowNotes.id]), rowA)),
+    paths(d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowA)),
+    ['a.rs', 'src/b.rs'],
+    'the widening reads the row SELECTION, and the ticks are a different set entirely. This '
+      + 'call passes ids that happen to look alike; the two are told apart by which set the '
+      + 'panel threads in — `git.carried`, never `git.selected`',
+  )
+  eq(
+    paths(carry([rowA.id, rowNotes.id], rowA)),
     ['a.rs'],
-    'an unversioned tick is never swept into a changelist gesture: `status::repo_changes` '
-      + 'builds `live` from paths that are neither Untracked nor Ignored, so filing one is a '
-      + 'write the next status walk undoes',
+    'an unversioned row is never swept into a changelist gesture even when it is selected: '
+      + '`status::repo_changes` builds `live` from paths that are neither Untracked nor '
+      + 'Ignored, so filing one is a write the next status walk undoes',
   )
   eq(
-    paths(d.grab(withEmptyView, new Set([rowNotes.id]), rowNotes)),
+    paths(carry([rowNotes.id], rowNotes)),
     ['notes.md'],
-    'and the widening never returns an empty set, whatever is ticked',
+    'and the widening never returns an empty set, whatever is selected',
   )
   eq(
-    paths(d.grab(withEmptyView, new Set(), rowSrc)),
+    paths(carry([], rowSrc)),
     ['src/b.rs'],
     'a directory row carries every file under it — the whole point of the row',
   )
   eq(
-    paths(d.grab(withEmptyView, new Set([rowA.id, rowB.id]), rowSrc)),
+    paths(carry([rowA.id, rowB.id], rowSrc)),
     ['src/b.rs'],
-    'and never widens to the ticks: the row already names a set, and sweeping in files from '
-      + 'outside it would move what the user cannot see from the row they grabbed',
+    'a directory that is NOT in the selection still carries its own files alone, and changes '
+      + 'neither the selection nor the ticks',
+  )
+  eq(
+    paths(carry([rowSrc.id, rowA.id], rowSrc)),
+    ['a.rs', 'src/b.rs'],
+    'but a directory that IS in the selection carries the rest of it. This is the one rule '
+      + 'that reversed: under the ticks a directory never widened, because a tick is set by a '
+      + 'checkbox somewhere else and may name half the tree. A selection is rows the user just '
+      + 'clicked, drawn with the band — refusing to carry them would make a folder the one row '
+      + 'kind that silently drops the rest of a multi-row drag',
   )
   eq(
     d.grab(withEmptyView, new Set(), rowsE.find((r) => r.label === 'Changes')),
@@ -1062,9 +1411,13 @@ try {
    * assertions: they prove the route is spelled out, not that a keystroke travels it.
    */
   ok(
-    /const carried = grab\(git\.view, git\.selected, row\)/.test(host),
-    'the file-row menu takes its files from `grab` — the same function a drag from that row '
-      + 'uses, so the two routes cannot come to disagree about what the user is pointing at',
+    /const carried = grab\(git\.view, git\.carried, row\)/.test(host)
+      && !/grab\(git\.view, git\.selected/.test(host),
+    'the file-row menu takes its files from `grab`, and from the row SELECTION rather than the '
+      + 'ticks — the same function and the same set a drag from that row uses, so the two '
+      + 'routes cannot come to disagree about what the user is pointing at. `git.selected` '
+      + 'here would put the menu back on the ticks while the drag had moved on, which is worse '
+      + 'than either of them being wrong on its own',
   )
   ok(
     /function dirMenu\([\s\S]{0,900}?git\.moveToChangelist\(row\.repo, paths\)/.test(host),
@@ -1108,7 +1461,7 @@ try {
   const tree2 = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangesTree.tsx'), 'utf8')
   ok(
     /onPointerDown=\{\(e\) => drag\.onPointerDown\(e, row\)\}/.test(tree2)
-      && /useChangesDrag\(\{ rows, view, selected, container, onMove: onMovePaths \}\)/.test(tree2),
+      && /useChangesDrag\(\{ rows, view, carried, container, onMove: onMovePaths \}\)/.test(tree2),
     'every row is a drag source candidate and the tree is wired to the pointer state machine — '
       + 'the rules being right is worth nothing if no gesture reaches them',
   )
@@ -1125,10 +1478,51 @@ try {
       + 'drag, instead of a full gesture whose drop silently does nothing',
   )
   ok(
-    /onMouseUp=\{\(e\) => \{\s*if \(e\.button !== 0 \|\| drag\.dragged\(\)\) return/.test(tree2),
+    /onMouseUp=\{\(e\) => \{\s*if \(e\.button !== 0\) return\s*if \(drag\.dragged\(\)\) \{/.test(tree2),
     'and an expandable row folds on RELEASE, skipped when the press became a drag: a directory '
       + 'row is both a twisty and a drag handle, and folding on the press would take the rows '
       + 'being dragged off the screen at the moment the drag starts',
+  )
+  /*
+   * The deferred collapse. `rowSelection.ts` decides *that* a plain press on an already-selected
+   * row waits; only the component can carry the answer from the press to the release, and if it
+   * drops it on the floor the rule is inert and "drag the four files I selected" is unreachable
+   * — the press would collapse the selection to one row before the pointer had moved.
+   */
+  ok(
+    /if \(action\.select && onPress\(row\.id, mods\)\) deferred\.current = row\.id/.test(tree2)
+      && /if \(deferred\.current === row\.id\) \{\s*deferred\.current = null\s*onRelease\(row\.id\)/
+        .test(tree2),
+    'a press that `rowSelection` deferred is remembered and answered on the mouseup, so a drag '
+      + 'that starts on one of several selected rows still has the whole selection to carry',
+  )
+  /*
+   * And the press refuses the native text selection at the engine as well as in CSS. This is
+   * the half that no stylesheet can do: a *shift*-click extends a selection that began
+   * somewhere else on the page — the commit box, a diff pane — and `user-select` on this
+   * subtree cannot reach it. `preventDefault` costs the automatic focus, which the roving
+   * tabindex depends on, so the focus must be taken by hand in the same breath.
+   */
+  ok(
+    /onMouseDown=\{\(e\) => \{\s*if \(e\.button !== 0\) return[\s\S]{0,1400}?e\.preventDefault\(\)\s*e\.currentTarget\.focus\(\)/
+      .test(tree2),
+    'a row press refuses the default action and takes the focus itself — text selection on a '
+      + 'drag across rows was the report, and CSS alone cannot answer a shift-click that '
+      + 'extends a selection made outside this tree',
+  )
+  /*
+   * `aria-selected` says the row SELECTION, not the cursor.
+   *
+   * It said the cursor for as long as there was no selection, on a tree that has carried
+   * `aria-multiselectable="true"` since it shipped — a promise to a screen reader that exactly
+   * one row could ever be selected, made by markup claiming the opposite two lines up. Pinned
+   * from both ends because the wrong version type-checks, renders, and looks right: a
+   * multi-row selection would simply be invisible to anything that is not a pair of eyes.
+   */
+  ok(
+    /aria-selected=\{isSelected\}/.test(tree2) && !/aria-selected=\{isCurrent\}/.test(tree2),
+    'a row reports the selection to assistive tech, not the cursor — the tree claims '
+      + '`aria-multiselectable` and must be able to honour it',
   )
   ok(
     /className=\{styles\.checkHit\}[\s\S]{0,600}?onPointerDown=\{\(e\) => e\.stopPropagation\(\)\}/

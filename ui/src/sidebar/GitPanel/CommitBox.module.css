@@ -67,6 +67,7 @@
   font-size: 12px;
   line-height: 17px;
   /* The rest of the app forbids text selection; a text field has to opt back in. */
+  -webkit-user-select: text;
   user-select: text;
 }
 

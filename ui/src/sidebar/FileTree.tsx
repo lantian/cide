@@ -38,7 +38,14 @@ import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
 import { useGitStatus } from './gitStatusStore'
 import { letterFor, statusAt } from './treeStatus'
-import { enterOn, fileTreeClick, gestureOf, moveIndex, type RowAction } from './clickSemantics'
+import {
+  enterOn,
+  fileTreeClick,
+  gestureOf,
+  moveIndex,
+  treeKeyAction,
+  type RowAction,
+} from './clickSemantics'
 import { copyText } from './copyText'
 import { isRootPath, relativeTo } from './rowPaths'
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
@@ -54,6 +61,7 @@ import {
   type ClipMode,
 } from './clipboardModel'
 import { fsMessage } from './fsError'
+import { ConfirmDestructive, type ConfirmState } from '@/chrome/ConfirmDestructive'
 import { PasteConfirm } from '@/chrome/PasteConfirm'
 import {
   answerAsk,
@@ -125,6 +133,18 @@ const JUMP_MARGIN = 12
 
 /** A stable empty list, so a project-less panel does not hand `useShallow` a new array. */
 const NO_ROOTS: readonly string[] = []
+
+/*
+ * Why a project root refuses each of the two verbs, in the words the user reads.
+ *
+ * Constants because each sentence now has two surfaces — the context menu greys the row and
+ * shows it as the reason, the key handler prints it into the problem strip after the fact —
+ * and two gestures that refuse the same thing for two differently-worded reasons is a small
+ * lie about there being two rules. `cide_fs::ops::check_not_root` refuses both in Rust as
+ * well; these say it early enough to be useful, which is the only thing they add.
+ */
+const ROOT_NOT_RENAMED = 'A project root is renamed where the project was opened'
+const ROOT_NOT_DELETED = 'A project root is closed, not deleted'
 
 /**
  * Which colour class a status paints the name and the letter with.
@@ -288,6 +308,16 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     readonly ask: PasteAsk
   } | null>(null)
 
+  /**
+   * The pending *Move to Trash*, or `null`.
+   *
+   * State rather than a call straight to `fsApi.delete`, because there are now **two** gestures
+   * that ask for it — the menu item and the Delete key — and they must not be able to disagree
+   * about whether a confirmation appears. Both build this; the dialog is rendered once at the
+   * foot of the panel beside `PasteConfirm`.
+   */
+  const [pendingDelete, setPendingDelete] = useState<ConfirmState | null>(null)
+
   /** Report a rejected file command, in the panel and in the log. */
   const fail = useCallback(
     (what: string) => (error: unknown) => {
@@ -300,6 +330,56 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       void diag.log(`[cide] file tree: ${line}`).catch(() => {})
     },
     [],
+  )
+
+  /**
+   * Ask before moving a row to the trash — the one path both gestures take.
+   *
+   * # Why there is a confirmation now, when there deliberately was not one before
+   *
+   * The menu item shipped without one and the reasoning was sound: `fs_delete` moves to the
+   * freedesktop trash and never unlinks, so the desktop's own undo is one keystroke away, and a
+   * dialog is a second confirmation of a reversible act. That argument is about the *act*, and
+   * it survives. What did not survive is its unstated premise about the *gesture*: right-click,
+   * travel to the bottom of a nine-item menu, click a red row — a sequence nobody performs by
+   * accident.
+   *
+   * Delete is one key, unmodified, sitting a finger away from the arrow keys this same handler
+   * uses to move the selection, in a panel whose whole job is being navigated by keyboard. The
+   * cost of a misfire goes from "impossible by accident" to "trivially likely", and the recovery
+   * is a desktop trash the user has to go and find — which `cide_fs::ops` itself calls "not an
+   * undo anyone wants to need". So the key got a confirmation, and the menu item was routed
+   * through the same one rather than left as it was: two gestures for one act that disagree
+   * about whether it is dangerous teach the user nothing, and the next person to touch either
+   * one has to work out which is right.
+   *
+   * The body says the act is reversible, because it is. A dialog that implies otherwise about
+   * a trash move is the kind of small lie that makes people stop reading dialogs.
+   */
+  const askDelete = useCallback(
+    (row: { path: string; isRoot: boolean }) => {
+      if (project === null) return
+      if (row.isRoot) {
+        setProblem(`${ROOT_NOT_DELETED}.`)
+        return
+      }
+      setProblem(null)
+      setPendingDelete({
+        title: 'Move to Trash?',
+        body:
+          'This goes to the desktop trash, not to nowhere — it can be restored from there. ' +
+          'Nothing is removed from disk.',
+        files: [row.path],
+        confirmLabel: 'Move to Trash',
+        run: () => {
+          void fsApi
+            .delete(project, [row.path])
+            .then(() => useFileTree.getState().refresh())
+            .catch(fail('Move to Trash'))
+        },
+      })
+    },
+    [project, fail],
   )
 
   /**
@@ -532,6 +612,53 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     [virtualizer],
   )
 
+  /**
+   * Dismiss the trash confirmation, run whatever it was confirming, and give the tree back the
+   * caret.
+   *
+   * The last part is the one worth explaining. `ConfirmDestructive` focuses its Cancel button
+   * on mount, so answering it leaves the caret on a button that is about to be unmounted, i.e.
+   * on `<body>` — and Delete is a *repeatable* gesture. Without this, deleting two files in a
+   * row means the second Delete goes nowhere and the tree looks like it stopped listening,
+   * which is the exact "the key does nothing" report this panel is being fixed for. The
+   * scroller is the tree's single tab stop (`role="tree"`, `tabIndex={0}`), so it is the right
+   * thing to hand back to.
+   *
+   * Focused *before* the dialog unmounts, deliberately: moving focus out of an element is safe,
+   * while removing a focused element drops the caret on `<body>` and there is nothing to catch
+   * it. The one ordering that cannot work is `setPendingDelete(null)` and then a `focus()` in
+   * an effect, which is a frame of the tree not answering its own keys.
+   */
+  const closeDelete = useCallback((run: (() => void) | null) => {
+    scrollRef.current?.focus()
+    setPendingDelete(null)
+    run?.()
+  }, [])
+
+  /**
+   * Open the inline rename editor on a row, from either gesture that asks for it.
+   *
+   * `moveTo` before `setRenaming`, and that ordering is the whole of why this is a function
+   * rather than a bare `setRenaming` at each call site. The editor is rendered *by the row*
+   * (`renaming={row.path === renaming}` below), so a selection that has been scrolled out of
+   * the windowed row cache has no row to render it — Ctrl+R would set the state and put nothing
+   * on screen, which is this codebase's signature failure wearing a new hat. `moveTo` fetches
+   * the window around the index and scrolls to it, so by the time the state lands there is a
+   * row to hold the input. It is idempotent for a row already on screen.
+   */
+  const startRename = useCallback(
+    (at: number, row: { path: string; isRoot: boolean }) => {
+      if (row.isRoot) {
+        setProblem(`${ROOT_NOT_RENAMED}.`)
+        return
+      }
+      setProblem(null)
+      if (at >= 0) moveTo(at)
+      setRenaming(row.path)
+    },
+    [moveTo],
+  )
+
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       // While a row is being renamed — or a new one is being named — the `<input>` owns every
@@ -565,9 +692,20 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       // have quietly removed that.
       const clipboardKey = key === 'c' || key === 'x' || key === 'v'
       if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && clipboardKey) {
-        // Rows are ordinary selectable text. When the user has actually dragged a selection
-        // across one, Ctrl+C means *that* — copying the row's path instead would be taking a
-        // gesture the webview already handles correctly.
+        /*
+         * When the user has a live document selection, Ctrl+C means *that* — copying the
+         * row's path instead would be taking a gesture the webview already handles correctly.
+         *
+         * This used to say "rows are ordinary selectable text", which was true only by
+         * accident: `styles/tokens.css` has set `user-select: none` on the body since it was
+         * written, and WebKitGTK dropped the declaration because it was spelled without the
+         * `-webkit-` prefix. With that fixed, the rows of this tree are genuinely unselectable
+         * and this branch is unreachable *from inside them*. It stays, because the check is on
+         * `document`, not on the tree: the caret can be here while a selection is live in an
+         * editor, a diff pane or the commit box, all of which opt back in with
+         * `user-select: text`, and copying a path out from under one of those would be the
+         * same theft in the other direction.
+         */
         const text = typeof document === 'undefined' ? null : document.getSelection()
         if (key === 'c' && text !== null && !text.isCollapsed) return
 
@@ -595,6 +733,53 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         e.preventDefault()
         return
       }
+      /*
+       * Delete and Ctrl+R — rename and move-to-trash on the selected row.
+       *
+       * Both were built, both worked end to end, and both were reachable from exactly one
+       * place: the context menu. There has never been an `F2` anywhere in this repo and no
+       * `tree.*` command in the registry, so a user who pressed the key every other file tree
+       * answers got nothing, which is indistinguishable from the feature not existing.
+       *
+       * Handled here rather than in `crates/cide-core/src/keymap.rs` for the same reason as the
+       * clipboard block above, and it is a sharper case: a global `delete` binding is resolved
+       * by the key gate's *window capture* listener, which runs before the event reaches its
+       * target — so it would swallow Delete inside the rename input two screens down, inside
+       * the draft-name input, inside the commit message box (a bare `<textarea>` with no key
+       * handler of its own), inside CodeMirror, and inside every terminal. `stopPropagation` in
+       * those components cannot help; the capture listener has already run. And Ctrl+R in a
+       * shell or a Claude pane is readline's reverse-i-search, which people use constantly.
+       *
+       * The decision itself — which chords, and which modifier combinations are *not* these
+       * chords — is `treeKeyAction` in `clickSemantics.ts`, where `check-tree-status.mjs` can
+       * hold it. Shift+Delete in particular is left alone rather than treated as a delete.
+       *
+       * Below the `renaming !== null || draft !== null` early return at the top of this
+       * handler, so neither fires while an inline editor owns the keyboard — a Delete in the
+       * rename box must delete a character, not the file being renamed.
+       */
+      const action = treeKeyAction(e.key, {
+        ctrl: e.ctrlKey,
+        meta: e.metaKey,
+        alt: e.altKey,
+        shift: e.shiftKey,
+      })
+      if (action !== null) {
+        // The live row's path when it is resident, the store's remembered selection when it is
+        // not. Unlike Paste, neither of these needs the row's *kind*, so a row evicted by
+        // scrolling is not a reason to refuse — `startRename` scrolls back to it and the
+        // confirmation names the path in full.
+        const path = (at < 0 ? undefined : store.rowAt(at)?.path) ?? store.selected
+        // Nothing selected is not a refusal. The key is genuinely not ours in that state, so
+        // it goes back to the browser rather than being swallowed with a shrug.
+        if (path === null || path === undefined) return
+        const target = { path, isRoot: isRootPath(path, roots) }
+        if (action === 'delete') askDelete(target)
+        else startRename(at, target)
+        e.preventDefault()
+        return
+      }
+
       /*
        * Escape calls off a cut — a *cut*, and only one this panel is currently showing.
        *
@@ -662,7 +847,20 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       }
       e.preventDefault()
     },
-    [apply, count, cursor, draft, moveTo, project, renaming, roots, runPaste, takeClip],
+    [
+      apply,
+      askDelete,
+      count,
+      cursor,
+      draft,
+      moveTo,
+      project,
+      renaming,
+      roots,
+      runPaste,
+      startRename,
+      takeClip,
+    ],
   )
 
   /**
@@ -937,30 +1135,36 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         { id: 'copyPath', label: 'Copy Path', run: () => void copyText(row.path) },
         { id: 'copyRel', label: 'Copy Relative Path', run: () => void copyText(row.rel) },
         { kind: 'separator' },
+        /*
+         * Rename and Move to Trash. Neither acts here: both hand off to the same function the
+         * Delete and Ctrl+R keys call, which is the point.
+         *
+         * These two used to be the *only* way to reach either verb — no key anywhere in the app
+         * renamed or deleted a file — and they still carry no key chip, because a chip is drawn
+         * from resolving a command id through the keymap (`useContextMenu`'s `chipFor`) and
+         * these chords have no command id: they are focus-scoped and handled on the scroller.
+         * That is the same trade Cut/Copy/Paste make three groups up, and it is the accepted
+         * one here; see `treeKeyAction` for why a registry command would be worse.
+         *
+         * The refusals stay `disabledReason` rather than becoming `run` calls that report,
+         * because a menu can grey a row and say why *before* it is clicked. The key path has no
+         * such surface, so it says the same sentence into the problem strip afterwards — same
+         * words, from the same constant, so the two cannot drift into two different rules.
+         */
         {
           id: 'rename',
           label: 'Rename…',
           ...(row.isRoot
-            ? { disabledReason: 'A project root is renamed where the project was opened' }
-            : { run: () => setRenaming(row.path) }),
+            ? { disabledReason: ROOT_NOT_RENAMED }
+            : { run: () => startRename(at ?? -1, row) }),
         },
         {
           id: 'delete',
           label: 'Move to Trash',
           danger: true,
           ...(row.isRoot
-            ? { disabledReason: 'A project root is closed, not deleted' }
-            : {
-                run: () => {
-                  // No confirmation, deliberately: `fs_delete` moves to the freedesktop trash
-                  // and never unlinks, so the desktop's own undo is one keystroke away. A
-                  // dialog here would be a second confirmation of a reversible act.
-                  void fsApi
-                    .delete(project, [row.path])
-                    .then(() => useFileTree.getState().refresh())
-                    .catch(fail('Move to Trash'))
-                },
-              }),
+            ? { disabledReason: ROOT_NOT_DELETED }
+            : { run: () => askDelete(row) }),
         },
       ]
       return entries
@@ -1174,6 +1378,23 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         */}
       {pendingPaste !== null && (
         <PasteConfirm ask={pendingPaste.ask} onAnswer={answerPaste} onCancel={cancelPaste} />
+      )}
+      {/*
+        * The trash confirmation, mounted here for the same reasons the paste one is: this panel
+        * owns both gestures that raise it, and a dialog put here needs no `App.tsx` edit to be
+        * reachable.
+        *
+        * The dialog is `chrome/ConfirmDestructive`, which the Git panel raises for its reverts.
+        * It moved out of `GitPanel/` to be shared rather than being copied: this is a
+        * *safeguard*, and two copies of a safeguard is how one of them quietly stops naming the
+        * paths, or stops focusing Cancel, and nobody notices until it matters.
+        */}
+      {pendingDelete !== null && (
+        <ConfirmDestructive
+          state={pendingDelete}
+          onCancel={() => closeDelete(null)}
+          onConfirm={() => closeDelete(pendingDelete.run)}
+        />
       )}
     </>
   )

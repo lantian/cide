@@ -176,21 +176,20 @@ export interface ChangelistDialogState {
   paths: readonly string[]
 }
 
-/**
- * A confirmation for something that cannot be undone.
+/*
+ * `ConfirmState` used to be declared here and is now in `chrome/ConfirmDestructive.tsx`, with
+ * the dialog that renders it — the file tree raises the same dialog for *Move to Trash*, so
+ * the component moved out of this folder and the state that is its only argument went with it.
+ * A state and the one component that consumes it are a single contract; splitting them across
+ * two features is how the two drift.
  *
- * `files` is every path at stake and the dialog names all of them. A count is not enough:
- * the user is about to lose *specific* files, and "12 files" is not something anyone can
- * check before clicking. Same rule `CloseConfirm` follows, for the same reason.
+ * Not re-exported from here, and that is not an oversight. This module is reached by
+ * `check-git-tree.mjs`, which compiles `model.ts` with a bare `tsc` and **no `--jsx`**; naming
+ * a `.tsx` module here — even in a type-only re-export, which emits nothing — pulls it into
+ * the type graph and fails the compile. `useGitPanel.ts` imports it from its own home instead,
+ * which is one import longer and keeps this module's dependency surface as narrow as the check
+ * script needs it to be. See the note at the foot of this file for the wider rule.
  */
-export interface ConfirmState {
-  title: string
-  body: string
-  files: readonly string[]
-  /** The word on the destructive button, e.g. `Revert 4 files`. */
-  confirmLabel: string
-  run: () => void
-}
 
 /*
  * Nothing in this module has a runtime value, deliberately.

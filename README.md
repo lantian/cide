@@ -218,7 +218,7 @@ them is the point:
 | M8 | File tree, watcher, Ctrl+P, palette, keymap | **partial** | no 100k-file repository is ever walked (largest is 20k); keystroke-to-paint is unmeasured even in the half that needs no window. |
 | M9 | Editor: CodeMirror, minimap, breadcrumbs | **partial** | **zero automated tests.** No check script compiles anything under `ui/src/editor/`. The minimap has never been painted. |
 | M10 | IDEA git commit tool window | **partial** | the 500-case property corpus generates CRLF and trailing-newline only. Binary, submodules and intent-to-add are three hand-written cases, two of which do not make the byte-identical comparison the criterion asks for. |
-| M11 | Settings, headless lane, packaging | **partial** | **rebinding a key cannot work**: `app_get_bootstrap` resolves the keymap against an empty user layer, so `~/.config/cide/keymap.json` never reaches either gate entry point. No AppImage has ever been built — `xtask package` prints a plan. |
+| M11 | Settings, headless lane, packaging | **partial** | **rebinding a key cannot work**: `app_get_bootstrap` resolves the keymap against an empty user layer, so `~/.config/cide/keymap.json` never reaches either gate entry point. The AppImage builds and runs on the reference machine, but the criterion's **clean-VM launch has never been performed**, and ADR 0007 names a specific reason to expect it to fail: the bundle carries `libwebkit2gtk-4.1.so.0` and neither of the two helper processes a web view cannot render without. |
 
 ### The short version
 

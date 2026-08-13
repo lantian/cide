@@ -30,7 +30,7 @@ use cide_git::{
 use cide_ipc::git::{
     BranchInfo, BranchList, ChangesTree, CheckoutMode, CheckoutOutcome, CommitOutcome,
     CommitRequest, DiffSide, FetchOutcome, FileDiff, GitError, PathSelection, PushOutcome,
-    ShelfEntry, StashEntry, TreeStatusMap,
+    RepoInfo, ShelfEntry, StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId};
 use tauri::State;
@@ -114,6 +114,30 @@ pub async fn git_status(
 ) -> Result<ChangesTree> {
     let roots = roots(&state, project)?;
     blocking(move || tree(&roots, include_ignored)).await
+}
+
+/// Which repositories a project actually contains, roots before their submodules.
+///
+/// The cheapest git question there is, and the reason it exists as its own command: it is
+/// `Repository::discover` per root plus a `submodules()` walk — a handful of `stat`s — where
+/// every other read in this file walks a working tree. A caller that only needs to know
+/// *whether* there is a repository, or *which* ids to fan a push out over, was previously
+/// paying for `git_status`.
+///
+/// It exists at all because the frontend used to answer this from `ProjectRoot::repo`, a field
+/// `cide-core` documents as permanently `None` — see `cide_core::workspace::project_root`. That
+/// made `reposOf` return an empty list for every project ever opened, which made the `repoOpen`
+/// context flag permanently false, which filtered every git command out of the palette and made
+/// three of their handlers bail before doing anything. The answer to "which repositories" is a
+/// fact about the disk and belongs on this side of the wire, next to the discovery every other
+/// git handler already uses; see `repo_root` above for the same argument about submodules.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_repos(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Vec<RepoInfo>> {
+    let roots = roots(&state, project)?;
+    blocking(move || Ok(cide_git::repo::discover(&roots))).await
 }
 
 /// Per-path status for the file tree, keyed by absolute path.

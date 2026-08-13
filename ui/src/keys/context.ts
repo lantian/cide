@@ -17,6 +17,22 @@
  * vocabulary) is either derived here or listed in [`HOST_FLAGS`]. A clause naming a flag
  * nobody supplies now fails the build.
  *
+ * # And the second, worse version of the same bug, which that fix did not catch
+ *
+ * `repoOpen` was then *supplied* — from `reposOf`, which read `ProjectRoot.repo`, a mirror
+ * field Rust's one constructor sets to `None` and no code anywhere sets to anything else. So
+ * the flag went from unsupplied-and-false to supplied-and-false, the gate above went green,
+ * and the entire Git group stayed invisible in the palette for exactly the same reason as
+ * before. A check that a flag is *named* by a supplier cannot see that the supplier is a
+ * constant.
+ *
+ * There is no `repoOpen` now. The lesson it left is the rule this module is held to: a flag
+ * here must be derivable from the mirror **as Rust actually fills it**, and a fact that only
+ * the disk knows is not one of those — it is asked over IPC by the handler that needs it, at
+ * the moment it needs it. `check-commands.mjs` now also asserts that its own bootstrap
+ * fixture carries no field the generated DTO does not have, because a hand-written fixture
+ * shaped like a DTO Rust never produces is what kept this green.
+ *
  * # One owner per flag
  *
  * The split is by *kind of fact*, not by who happens to know it: [`DERIVED_FLAGS`] are
@@ -42,7 +58,6 @@ import {
   claudeTargetOf,
   focusTarget,
   isClosableTab,
-  reposOf,
   windowProjectsOf,
 } from './target'
 import type { KeyContext } from './when'
@@ -71,7 +86,6 @@ export const DERIVED_FLAGS = [
   'closableTab',
   'editorOpen',
   'claudeTarget',
-  'repoOpen',
   'shellWindow',
 ] as const
 
@@ -113,7 +127,10 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
     // claim as "something here can save one".
     editorOpen: registeredBuffers().length > 0,
     claudeTarget: claudeTargetOf(boot) !== null,
-    repoOpen: reposOf(boot).length > 0,
+    // There is no `repoOpen`, and its absence is deliberate — see the note at the foot of
+    // `target.ts`. It was derived from `ProjectRoot.repo`, which Rust never filled, so it was
+    // false for every user of every build and it hid the entire Git group from the palette.
+    // Every git command is gated on `projectOpen` now and asks `git_repos` when it runs.
     shellWindow: boot?.role.kind === 'shell',
   }
 }

@@ -89,6 +89,44 @@
   pointer-events: none;
 }
 
+/*
+ * "This session has finished and is waiting for you."
+ *
+ * The pane-level surface, and until now there was none: `data-awaiting` was set on the
+ * *cluster*, so nothing could paint the panel and the whole signal was the 7px dot at the end
+ * of that cluster. The request was for the console to be **highlighted**. A dot in the corner
+ * of a full-screen terminal is not a highlight, and it is invisible at the distance a user is
+ * standing when the point of the feature is that they walked away.
+ *
+ * This is a colour change on a border that is already there, in both focus states, precisely
+ * so it can change colour without resizing the content box (see the note at the top of this
+ * file). No reflow, no terminal refit, no extra element — which is also why the border, and
+ * not a background tint or a glow: a tint would sit under an opaque terminal and be invisible,
+ * and an `inset` box-shadow paints on the frame's own background layer and would be covered by
+ * the same terminal. This is the same reason `.frameFocused::after` is a pseudo-element.
+ *
+ * `--yellow`, not `--accent`. The accent is this app's *here you are* and is spoken for; amber
+ * means *come back here*, and a mark that used the same colour as the focus ring would be
+ * unreadable in the state that matters most.
+ *
+ * # Both states at once is the common case, not the edge case
+ *
+ * A pane is `focused` because the *domain* says so — `tree.focused` — which has nothing to do
+ * with whether anyone is at the machine. The situation this feature exists for is precisely
+ * "the user walked away with a Claude pane focused and its turn has now ended", so focused and
+ * awaiting together is the normal shape of a waiting pane, not a collision to resolve.
+ *
+ * It resolves itself, and pleasantly. This selector is a class *and* an attribute, so it
+ * outranks `.frameFocused` and takes the outer border amber — while `.frameFocused::after`
+ * is untouched and keeps drawing its 1px accent ring immediately inside. The user gets an
+ * amber edge that says come back and, within it, the ring that says this is where you were.
+ * Nothing was traded away, which is why there is no `:not()` here and must not be one: adding
+ * it would make a focused pane silently stop reporting.
+ */
+.frame[data-awaiting='true'] {
+  border-color: var(--yellow);
+}
+
 .body {
   flex: 1;
   min-height: 0;

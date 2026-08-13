@@ -165,6 +165,7 @@
   font-size: 12px;
   line-height: 1.45;
   /* The app root sets `user-select: none`; a diff is text people copy out of. */
+  -webkit-user-select: text;
   user-select: text;
 }
 
@@ -395,12 +396,14 @@
   padding-right: 1ch;
   color: var(--faint);
   text-align: right;
+  -webkit-user-select: none;
   user-select: none;
 }
 
 .sign {
   color: var(--dim);
   text-align: center;
+  -webkit-user-select: none;
   user-select: none;
 }
 

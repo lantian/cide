@@ -128,6 +128,10 @@ fn push_via_binary(
     set_upstream: bool,
 ) -> Result<PushOutcome> {
     let mut command = Command::new("git");
+    // `git` is the child most exposed to a bundled launch after `claude`: it dlopens the
+    // host's libcurl and OpenSSL for the network half, and an AppImage's `LD_LIBRARY_PATH`
+    // puts eleven bundled libraries ahead of them. See `cide_core::child_env`.
+    cide_core::child_env::scrub_command(&mut command);
     command.current_dir(root).arg("push");
     // These commands are synchronous, so a `git` that blocks on a prompt freezes the window
     // with no way to answer it. When cide was started from a terminal, git finds that

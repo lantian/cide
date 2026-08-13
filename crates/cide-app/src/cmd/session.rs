@@ -52,8 +52,17 @@ impl serde::Serialize for SessionError {
 /// The proxy variables are **not** here: they are the user's configuration rather than a
 /// constant of the terminal, so they are a second pass — [`proxy_env`] — applied on top of
 /// this one. Nothing about proxying changes the rule in the paragraph above.
+///
+/// The first pass is [`cide_core::child_env`], which undoes what *our own* launcher did to the
+/// environment before a pane ever sees it. Running from the AppImage, `AppRun` leaves
+/// `PYTHONHOME` pointing inside a bundle that contains no Python, and every stdio MCP server a
+/// pane's `claude` spawns dies on `No module named 'encodings'` before it can speak protocol —
+/// reported by the CLI as `CONNECTION_CLOSED` against a configuration that is perfectly
+/// correct. It runs first so that the explicit settings below are the ones that survive a
+/// collision, and it is a no-op for every non-bundled launch.
 fn base_env(spec: SpawnSpec) -> SpawnSpec {
-    spec.env("TERM", "xterm-256color")
+    apply_env_changes(spec, cide_core::child_env::bundle_scrub())
+        .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env("TERM_PROGRAM", "cide")
         .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
@@ -67,6 +76,23 @@ fn base_env(spec: SpawnSpec) -> SpawnSpec {
         .env_remove("COLUMNS")
         .env_remove("LINES")
         .env_remove("CI")
+}
+
+/// Fold a list of [`cide_core::child_env::EnvChange`]s into a spec.
+///
+/// A separate function only so it can be tested: `bundle_scrub` reads the real process
+/// environment, which a test cannot set up without `unsafe` and a race against every other
+/// thread, but the folding is where an ordering or set-versus-remove mistake would live.
+fn apply_env_changes(
+    spec: SpawnSpec,
+    changes: impl IntoIterator<Item = cide_core::child_env::EnvChange>,
+) -> SpawnSpec {
+    changes
+        .into_iter()
+        .fold(spec, |spec, (name, value)| match value {
+            Some(value) => spec.env(name, value),
+            None => spec.env_remove(name),
+        })
 }
 
 /// The three proxy variables, in the spelling the tooling on this platform expects.
@@ -1007,6 +1033,38 @@ mod tests {
             .iter()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The bundle scrub reaches a child as sets *and* removals, and neither may be dropped.
+    ///
+    /// `cide-core` decides which is which — including the case that matters most, a variable
+    /// whose bundle entries were the only ones it had — and its own tests cover that rule.
+    /// What is only checkable here is that both halves survive the trip into a `SpawnSpec`,
+    /// since a fold that quietly handled one arm would leave `PYTHONHOME` on a pane's child
+    /// and nothing would say so.
+    #[test]
+    fn a_bundle_scrub_reaches_the_spec_as_both_sets_and_removals() {
+        let spec = apply_env_changes(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir()),
+            [
+                ("PYTHONHOME".to_string(), None),
+                ("PATH".to_string(), Some("/usr/bin".to_string())),
+            ],
+        );
+        assert_eq!(value_of(&spec, "PATH"), Some("/usr/bin"));
+        assert!(
+            spec.env_remove.iter().any(|k| k == "PYTHONHOME"),
+            "removed {:?}",
+            spec.env_remove
+        );
+    }
+
+    /// Nothing to scrub must mean nothing added, so a non-bundled launch is byte-identical.
+    #[test]
+    fn an_empty_scrub_leaves_the_spec_alone() {
+        let spec = apply_env_changes(SpawnSpec::new("/bin/sh", std::env::temp_dir()), []);
+        assert!(spec.env.is_empty(), "set {:?}", spec.env);
+        assert!(spec.env_remove.is_empty(), "removed {:?}", spec.env_remove);
     }
 
     fn manual(http: &str, https: &str, all: &str, no_proxy: &str) -> ProxySettings {

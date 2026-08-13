@@ -698,7 +698,6 @@ mod tests {
             dot: "var(--accent)".into(),
             roots: vec![ProjectRoot {
                 path: PathBuf::from(display_path),
-                repo: None,
                 label: name.into(),
             }],
             tabs: vec![home, settings],
@@ -974,6 +973,20 @@ mod tests {
 
         let project = ws.projects.values().next().expect("the project loaded");
         assert_eq!(project.tabs.len(), 2);
+
+        // Every root in this document carries a `"repo": null` that `ProjectRoot` no longer
+        // has a field for — nothing in any build ever wrote anything else into it, and the
+        // frontend derived a permanently-false `repoOpen` flag from it that hid the whole Git
+        // group from the command palette (see `cide_ipc::workspace::ProjectRoot`). This is the
+        // assertion behind the claim that dropping it needed no schema bump: serde ignores the
+        // unknown key and the root loads with its path and label intact.
+        assert!(
+            LEGACY_WORKSPACE.contains(r#""repo": null"#),
+            "the captured document is still the one written with the removed field"
+        );
+        assert_eq!(project.roots.len(), 1);
+        assert_eq!(project.roots[0].label, "cide");
+        assert_eq!(project.roots[0].path, PathBuf::from("~/work/cide"));
         let tree = &project.tabs[0].tree;
 
         // The tree is the shape it was on disk: two *columns* of stacked tiles, ratios and

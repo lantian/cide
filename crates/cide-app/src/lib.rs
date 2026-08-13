@@ -228,6 +228,7 @@ pub fn run() {
             cmd::diag::diag_bench_report,
             cmd::diag::diag_log,
             cmd::git::git_status,
+            cmd::git::git_repos,
             cmd::git::git_tree_status,
             cmd::git::git_branch_info,
             cmd::git::git_branch_list,
@@ -262,7 +263,6 @@ pub fn run() {
             cmd::git::git_stash_pop,
             cmd::git::git_stash_apply,
             cmd::git::git_stash_drop,
-            cmd::file::claude_mention_file,
             cmd::file::claude_selection_changed,
             cmd::file::claude_send_lines,
             cmd::file::file_read,
@@ -348,17 +348,52 @@ pub fn run() {
             cmd::search::search_cancel,
         ])
         .on_window_event(|window, event| {
-            // A close from the window manager — Alt+F4, the compositor's own button — never
-            // reaches a command, and for a detached pane the difference is the pane itself:
-            // it has to go back in its tab rather than disappear with the window that was
-            // showing it, taking a live session out of reach.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event
-                && cmd::window::intercept_close(
-                    window.app_handle(),
-                    &cide_ipc::WindowLabel(window.label().to_string()),
-                )
-            {
-                api.prevent_close();
+            match event {
+                // A close from the window manager — Alt+F4, the compositor's own button —
+                // never reaches a command, and for a detached pane the difference is the pane
+                // itself: it has to go back in its tab rather than disappear with the window
+                // that was showing it, taking a live session out of reach.
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if cmd::window::intercept_close(
+                        window.app_handle(),
+                        &cide_ipc::WindowLabel(window.label().to_string()),
+                    ) {
+                        api.prevent_close();
+                    }
+                }
+
+                /*
+                 * The user came to the window, so it stops demanding them.
+                 *
+                 * This is the other half of `windows::demand_attention` and it is required
+                 * rather than tidy: Tauri's own documentation says a window manager "might not"
+                 * clear the urgency hint when the window receives input, and on the compositors
+                 * this app runs on it frequently does not. Without this line a task entry lit
+                 * once would stay lit until the process ended — a permanent "come back here",
+                 * which is exactly the signal that teaches a user to stop looking at the field.
+                 *
+                 * Deliberately **only the hint**, and not the awaiting set. Coming to a window
+                 * is not "I have read every session in it": a shell holds every tab of every
+                 * project it shows, and clearing those markers on a window focus would wipe the
+                 * pane and project badges for conversations the user has not opened. Those
+                 * clear per pane, on a click or a keystroke into that pane, which is the act
+                 * that actually means someone read it. The hint is about the *window*; the
+                 * markers are about the sessions.
+                 *
+                 * `Focused(false)` is not handled: a window losing focus has not gained a
+                 * reason to shout, and re-raising the hint there would flash every task entry
+                 * every time the user alt-tabbed away. The hint goes back up when the count
+                 * next changes, through `retitle`.
+                 */
+                tauri::WindowEvent::Focused(true) => {
+                    crate::windows::demand_attention(
+                        window.app_handle(),
+                        &cide_ipc::WindowLabel(window.label().to_string()),
+                        false,
+                    );
+                }
+
+                _ => {}
             }
         })
         .setup(move |app| {

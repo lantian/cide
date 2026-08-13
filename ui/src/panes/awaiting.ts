@@ -20,6 +20,32 @@
  * window it cannot see. Rust already holds the tree, so Rust does the arithmetic and sets
  * the titles. A webview cannot rename its own OS window in any case.
  *
+ * # What was actually missing, since the obvious diagnosis is wrong
+ *
+ * This is worth writing down plainly, because "the hook is not installed" is what everyone
+ * guesses and it is not true. The `Stop` hook **is** registered in the inline `--settings`
+ * every `claude` is spawned with (`cide_claude::settings`), the CLI **does** call it, the
+ * `cide-hook` binary **does** deliver it over the UDS, `hooks.rs` turns it into a
+ * `cide://session-state` transition, this module turns that into "waiting", Rust aggregates
+ * it and writes `Awaiting: N` into the OS title. Verified end to end against a real CLI by
+ * `cide-claude`'s own `#[ignore]`d integration test. Every link held.
+ *
+ * What was missing was on the other end: **surfaces**. The signal arrived and had almost
+ * nowhere to be seen —
+ *
+ * * a pane could only show it as a 7px dot, because `data-awaiting` was set on the floating
+ *   control cluster rather than on the pane frame, so no stylesheet could reach the panel;
+ * * a *project* had no surface at all — `useAwaitingInProject` below did not exist, and
+ *   `App.tsx` renders tab strips and pane trees for the active project only, so a background
+ *   project's sessions were counted in the OS title and drawn nowhere;
+ * * and the OS title was set correctly into a task bar that, on the default Plasma layout,
+ *   does not render titles at all — nothing ever asked for the urgency hint that a task bar
+ *   *does* render (`windows::demand_attention`).
+ *
+ * That is this project's recurring defect wearing a slightly different coat: not a feature
+ * that was never built, but a complete one whose output reached no control the user could
+ * see. Diagnose in that direction first.
+ *
  * Reports are per session and idempotent, never "here is my whole set". Three windows all
  * observe the same transitions and all report the same thing, which is harmless; a window
  * that has just opened has observed *nothing* and reports nothing, which is the point — a
@@ -38,6 +64,7 @@ import {
   awaiting as awaitingApi,
   events,
   onSessionAwaiting,
+  type Pane,
   type SessionState,
   type Tab,
 } from '@/ipc/client'
@@ -46,6 +73,7 @@ import {
   UNSEEN,
   adopt,
   awaitingIn,
+  isAwaiting,
   mergeAuthoritative,
   onAcknowledge,
   onState,
@@ -181,12 +209,17 @@ function subscribe(notify: () => void): () => void {
  *
  * Takes the session rather than the pane so a mirrored pane — two panes, one child — lights
  * up in both places, which is what the user sees anyway: one conversation, waiting.
+ *
+ * Goes through `isAwaiting` rather than reading `trackOf(key).awaiting` directly, which is
+ * the same value by two paths and deliberately no longer written twice: the pane highlight,
+ * the tab badge and the project badge are one function over a pane set, and a pane that read
+ * the table its own way is the first step back towards three flags that half-clear. See the
+ * module comment on `awaitingAmong`.
  */
 export function useAwaiting(session: string | null | undefined): boolean {
-  const key = session ?? ''
   return useSyncExternalStore(
     subscribe,
-    () => (key === '' ? false : trackOf(key).awaiting),
+    () => isAwaiting(tracks, session),
     () => false,
   )
 }
@@ -238,5 +271,76 @@ export function useAwaitingInTab(tab: Tab): number {
     () => awaitingIn(tracks, sessionsInTab(tab)),
     () => 0,
   )
+}
+
+/**
+ * How many of one *project's* sessions are waiting on the user.
+ *
+ * # This is the surface that did not exist, and it is the load-bearing one
+ *
+ * `App.tsx` renders `TabStrip` for the **active project only**, and mounts `TabContent` for
+ * the active project only. So for a project the user is not currently in, neither the pane
+ * marker nor the tab badge is painted anywhere at all — both live inside a subtree that is
+ * not on screen. Rust was already putting `Awaiting: N` into the OS title, which is why the
+ * gap was easy to miss from the inside and impossible to miss from the outside: the task bar
+ * said one session wanted attention and nothing in the window said which project it was in.
+ *
+ * The header's project tab is the only element of a background project that is drawn at all,
+ * so it is the only place this answer can go.
+ *
+ * # Detached panes count
+ *
+ * A pane torn into its own window is still this project's conversation, and its window can be
+ * behind the shell or minimized. Its *own* window's title carries it too — `retitle` gives a
+ * `DetachedPane` window its one pane and no more, so nothing is announced twice at the OS
+ * level — but within this window's header the project is the whole project. A user looking at
+ * the header is asking "is anything of mine waiting", not "is anything in this particular
+ * arrangement of windows waiting".
+ *
+ * # Nothing here clears
+ *
+ * Same rule as the tab, one level up and for a stronger reason: activating a project is not
+ * "I have dealt with these", and a project can hold six panes across four tabs with one of
+ * them waiting. The count falls out of the same per-session acknowledgements — a click or a
+ * keystroke into a pane — so it reaches zero exactly when the last waiting pane has been
+ * *seen*, and there is no second piece of state that could disagree with the pane markers or
+ * with the OS title.
+ */
+export function useAwaitingInProject(project: ProjectPanes): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => awaitingIn(tracks, sessionsInProject(project)),
+    () => 0,
+  )
+}
+
+/**
+ * Everywhere a project keeps a pane. Satisfied by the generated `Project`.
+ *
+ * Both fields optional, so `chrome/AppHeader.tsx`'s `ProjectTab` — which a measurement
+ * fixture builds from four scalars — is accepted too and answers zero. A required `tabs`
+ * would make every fixture construct a whole pane tree in order to take a ruler to a 34px
+ * bar, and the alternative that lost was a second, narrower pane type declared here, which is
+ * a hand-written copy of a generated shape and drifts from Rust the first time `Pane` changes.
+ */
+export interface ProjectPanes {
+  tabs?: readonly Tab[] | undefined
+  detached?: Readonly<Record<string, Pane>> | undefined
+}
+
+/**
+ * Every session a project holds, across its tabs and its torn-out panes.
+ *
+ * Reuses `sessionsInTab` verbatim so a project and its own tab strip cannot resolve a pane's
+ * child differently — `awaitingAmong` deduplicates, so a session that appears in two tabs, or
+ * in a tab and in a mirror, is one waiting conversation and not two.
+ */
+function sessionsInProject(project: ProjectPanes): PaneSession[] {
+  return [
+    ...(project.tabs ?? []).flatMap(sessionsInTab),
+    ...Object.values(project.detached ?? {}).map(
+      (pane) => paneSessionId(pane.id) ?? pane.session,
+    ),
+  ]
 }
 

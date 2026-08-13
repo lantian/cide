@@ -236,6 +236,52 @@ try {
   eq(m2(c, 'ArrowDown', 99, 10), 9, 'a stale index — the rows moved under the selection — is '
     + 'clamped rather than trusted')
 
+  // --- rename and delete, the two keystrokes that act on the selected row ----------------
+
+  /*
+   * Both are focus-scoped rather than bound in `crates/cide-core/src/keymap.rs`, so nothing in
+   * `check-key-gate.mjs` can see them: Delete in a terminal is a character the pty must get,
+   * and Ctrl+R in a shell is readline's reverse-i-search. The rule lives in `clickSemantics.ts`
+   * and is pinned here, which is the only place it *can* be pinned.
+   *
+   * The modifier rows are the point. `Delete` deletes and nothing else does; a modified Delete
+   * is a different gesture in every file manager that has one — Shift+Delete is "permanently,
+   * no trash" in Explorer and IDEA, and `fs_delete` has no such mode — so answering it with the
+   * ordinary trash delete would do something other than what was asked, silently.
+   */
+  const mods = (held = {}) => ({
+    ctrl: held.ctrl === true,
+    meta: held.meta === true,
+    alt: held.alt === true,
+    shift: held.shift === true,
+  })
+  const act2 = (key, held) => c.treeKeyAction(key, mods(held))
+
+  eq(act2('Delete'), 'delete', 'a bare Delete moves the selected row to the trash')
+  eq(act2('Delete', { shift: true }), null, 'Shift+Delete is "permanently, no trash" elsewhere '
+    + 'and cide has no such operation — so it is left alone rather than answered with the '
+    + 'ordinary delete, which would do something other than what was asked')
+  eq(act2('Delete', { ctrl: true }), null, 'and no other modifier claims it either')
+  eq(act2('Delete', { alt: true }), null, 'Alt+Delete is not this gesture')
+  eq(act2('Delete', { meta: true }), null, 'nor is ⌘Delete')
+
+  eq(act2('r', { ctrl: true }), 'rename', 'Ctrl+R renames the selected row')
+  eq(act2('R', { ctrl: true }), 'rename', 'and does so with Caps Lock on — `e.key` is the '
+    + 'produced character, so the case is the user\'s keyboard state and not their intent')
+  eq(act2('r', { meta: true }), 'rename', '⌘R is the same chord on macOS, where the default '
+    + 'keymap rewrites every ctrl to meta')
+  eq(act2('r', { ctrl: true, shift: true }), null, 'Ctrl+Shift+R stays free — it is "hard '
+    + 'reload" muscle memory and belongs to nobody here yet')
+  eq(act2('r', { ctrl: true, alt: true }), null, 'and Ctrl+Alt+R is not it')
+  eq(act2('r'), null, 'a bare `r` types an `r`; the tree has no type-ahead to swallow it for')
+
+  eq(act2('F2'), null, 'F2 is the rename key in Explorer and IDEA and is deliberately NOT '
+    + 'claimed: the brief asked for Ctrl+R, and a second undocumented binding for one action '
+    + 'is a decision rather than a freebie')
+  eq(act2('Backspace'), null, 'Backspace is not Delete — on a Mac keyboard it is the key most '
+    + 'people call Delete, which is exactly why answering it would be a surprise')
+  eq(act2('ArrowDown'), null, 'navigation keys are not this function\'s business')
+
   // --- which root a row belongs to, and what "relative" means ----------------------------
 
   /*

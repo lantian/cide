@@ -115,6 +115,10 @@ try {
     { key: 'ctrl+shift+`', command: 'terminal.splitBelow', when: null },
     { key: 'ctrl+p', command: 'picker.files', when: null },
     { key: 'ctrl+shift+p', command: 'palette.commands', when: null },
+    // Find in files. `KeyF` is in the sweep below, so this covers the property that matters
+    // for a chord the terminal would otherwise receive: both entry points must swallow it
+    // identically, or ⌃⇧F opens the panel *and* sends `^F` to whatever pty had focus.
+    { key: 'ctrl+shift+f', command: 'sidebar.search', when: null },
     { key: 'ctrl+w', command: 'tab.close', when: null },
     { key: 'ctrl+s', command: 'file.save', when: null },
     { key: 'ctrl+shift+t', command: 'theme.toggle', when: null },
@@ -155,6 +159,7 @@ try {
     { code: 'KeyT', key: 't' },
     { code: 'KeyC', key: 'c' },
     { code: 'KeyE', key: 'e' },
+    { code: 'KeyF', key: 'f' },
     { code: 'KeyH', key: 'h' },
     { code: 'KeyJ', key: 'j' },
     { code: 'KeyL', key: 'l' },

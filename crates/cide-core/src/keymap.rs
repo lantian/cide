@@ -97,6 +97,16 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+shift+`", "terminal.splitBelow"),
         ("ctrl+p", "picker.files"),
         ("ctrl+shift+p", "palette.commands"),
+        // Find in files. The search panel was built, wired to its Rust engine, and reachable
+        // from exactly one place: the ⌕ button in the activity rail. No command, no binding,
+        // and no way to put the caret in its box without a mouse.
+        //
+        // `ctrl+shift+f` was free in every layer that could have claimed it — nothing else in
+        // this table uses `f` at all, CodeMirror's `searchKeymap` binds `Mod-f` and `F3` but
+        // not `Mod-Shift-f`, and xterm claims nothing. On macOS the rewrite below turns it into
+        // ⇧⌘F, which is the same gesture every editor on that platform uses for the same thing,
+        // so it needs no exception in `keeps_ctrl_on_macos`.
+        ("ctrl+shift+f", "sidebar.search"),
         ("ctrl+w", "tab.close"),
         ("ctrl+s", "file.save"),
         ("ctrl+shift+t", "theme.toggle"),
@@ -865,6 +875,31 @@ mod tests {
     fn the_macos_layer_keeps_the_other_modifiers_of_a_default() {
         let resolved = resolve_layers(&platform_layer(true), &[]);
         assert_eq!(command_for(&resolved, "alt+meta+h"), ["pane.navigate.left"]);
+    }
+
+    /// Find in files lands on ⇧⌘F, which is what a Mac user's fingers already do.
+    ///
+    /// Pinned rather than left to the blanket rewrite, because this is one of the few defaults
+    /// whose macOS spelling is a *claim* and not just a consequence: ⇧⌘F is find-in-files in
+    /// Xcode, VS Code and every editor on the platform, and the comment beside the binding says
+    /// so as the reason it needs no entry in [`keeps_ctrl_on_macos`]. If the rewrite ever grows
+    /// an exception that catches `f`, the chord silently becomes ⌃⇧F on a platform where ⌃ is
+    /// text navigation, and nothing else here would notice.
+    #[test]
+    fn find_in_files_is_the_platform_chord_on_macos_too() {
+        let resolved = resolve_layers(&platform_layer(true), &[]);
+        assert_eq!(
+            command_for(&resolved, "shift+meta+f"),
+            ["sidebar.search"],
+            "⇧⌘F is find-in-files on macOS"
+        );
+        assert!(
+            command_for(&resolved, "ctrl+shift+f").is_empty(),
+            "the ctrl spelling must not survive on macOS, where ⌃ is text navigation"
+        );
+        // And on everything else it stays where it was written.
+        let linux = resolve_layers(&platform_layer(false), &[]);
+        assert_eq!(command_for(&linux, "ctrl+shift+f"), ["sidebar.search"]);
     }
 
     #[test]

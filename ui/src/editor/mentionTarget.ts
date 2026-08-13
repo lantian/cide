@@ -1,10 +1,15 @@
 /**
  * Which Claude the editor's *@-mention this selection* item should type into.
  *
- * `claude.mentionFile` is addressed — it needs a `PaneId` — and only the window knows which
+ * `claudeSend.lines` is addressed — it needs a `PaneId` — and only the window knows which
  * conversation the user was last looking at. `App.tsx` already works that out for Ctrl+P's
  * ⌥⏎ and calls it `mentionTarget`; this is the same rule, derived from the same mirror, for a
  * caller that is not in `App.tsx` and cannot be handed a prop by it.
+ *
+ * What this answers is where the mention is *aimed*, not where it lands. Nothing the webview
+ * can see says whether a Claude pane has a `claude` on cide's IDE server — a pane at a resume
+ * splash looks identical here to one mid-conversation — so `claude_send_lines` treats this as
+ * a preference and answers with the pane it actually used. Callers reveal *that* one.
  *
  * # Why it is derived here rather than threaded down as a prop
  *

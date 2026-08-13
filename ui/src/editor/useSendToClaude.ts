@@ -11,13 +11,17 @@
  *
  * # Why the keyboard half is a CodeMirror binding and not an app command
  *
- * `claude.mention.file` **is** in the command registry (`cide-core::commands`), and running it
- * does nothing: `App.tsx`'s dispatcher has no case for it, so it falls through to
- * `diag.log('command not handled by this window')`. Worse, it is gated `.when("claudePaneFocused")`
- * — and this gesture is made *from an editor*, where by definition no Claude pane is focused,
- * so the palette hides it at the only moment it is wanted. Both of those are one line each in
- * files this change does not own (`App.tsx`, `cide-core/src/commands.rs`); see the note in
- * `codeMenu.tsx`. A CodeMirror keymap entry needs neither and works today.
+ * `claude.mention.file` **is** in the command registry (`cide-core::commands`), and both of the
+ * reasons this file used to give for not routing through it are now out of date — recorded
+ * rather than silently deleted, because the note in `codeMenu.tsx` was written against them:
+ *
+ * * it *is* dispatched, at `keys/dispatch.ts`'s `claude.mention.file` arm; and
+ * * it is gated `editorFocused && claudeTarget`, not `claudePaneFocused`, so the palette offers
+ *   it from an editor — which is the only place the gesture is ever made.
+ *
+ * The CodeMirror binding stays anyway, and not out of inertia: ⌥⏎ has to reach the *view* to
+ * know what is selected, and a registry command is dispatched with no editor in hand — the
+ * dispatcher's arm can only mention the focused file whole. Two entry points, two jobs.
  *
  * The cost is honest and stated: a binding that is not in the app keymap does not appear in the
  * palette, cannot be rebound in settings, and shows no shortcut chip.
@@ -32,6 +36,21 @@
  * nothing, which is the report this feature already answered once in a different disguise.
  * So a send that lands is followed by `revealPane`, and a reveal that cannot happen is said
  * out loud rather than left to be inferred.
+ *
+ * # And the pane that was asked for is not always the pane that got it
+ *
+ * That fallback picks `tabs[0]`'s first Claude pane *in map order*, which asks nothing about
+ * whether that pane has a `claude` running — and in a restored workspace it very often does
+ * not, because only the console's primary Claude pane is spawned eagerly and the rest sit at a
+ * resume splash. So `claude_send_lines` treats the pane named here as a preference and routes
+ * to the best Claude in the project that can actually receive; see `cmd::file`.
+ *
+ * Everything downstream of the send therefore reads the **answer**, not `target.pane`: the
+ * reveal goes to `sent.pane`, the diagnostic line records `sent.pane`, and `sent.fallback` gets
+ * a sentence of its own. Revealing the asked-for pane after delivering somewhere else would put
+ * the user in front of an empty prompt while their selection sat in another conversation —
+ * strictly worse than the error it replaced, and the one genuinely harmful outcome this feature
+ * has.
  *
  * **Focus follows the reveal, keyboard and all**, and that is the decision worth arguing.
  * The gesture is explicit — a menu item the user chose, or a chord they pressed — and its
@@ -73,6 +92,25 @@ export interface SendToClaude {
  */
 function report(message: string): void {
   void Promise.reject(new Error(message))
+}
+
+/**
+ * The sentence for a send that did not go where it was aimed.
+ *
+ * Names the destination rather than the refusal, because the destination is the thing the user
+ * cannot work out for themselves and the refusal is not actionable: the pane they aimed at had
+ * no `claude` on cide's IDE server, which for a Claude pane at a resume splash is not a fault
+ * to fix, it is what a splash *is*. Telling them to run `/ide` there would be advice to start
+ * a session they did not ask for.
+ *
+ * Deliberately one sentence with the conversation's own title in it, so that the reveal that
+ * has just happened and the words on screen agree about which prompt they are looking at.
+ */
+function rerouted(path: string, span: SendRange | null, title: string): string {
+  return (
+    `Sent ${mentionLabel(path, span)} to ‘${title}’ — the pane it was aimed at has no ` +
+    `Claude connected to cide.`
+  )
 }
 
 export function useSendToClaude(): SendToClaude {
@@ -127,7 +165,14 @@ export function useSendToClaude(): SendToClaude {
         span?.lineEnd,
       )
 
-      void sending.then(async () => {
+      void sending.then(async (sent) => {
+        // The resolved pane, and it is logged whether or not the reveal happens. The old line
+        // recorded the pane that was *asked for*, at the moment of asking, whether or not
+        // anything arrived — which is why a real log of this failure read "sent … to
+        // 07565bbd" on the line directly under the server's own "no connected claude in this
+        // pane; dropped". Two lines about one gesture that disagreed with each other.
+        void diag.log(`editor: sent ${mentionLabel(path, span)} to ${sent.pane}`)
+
         /*
          * The user carried on typing while the send was in flight, so they are not waiting
          * to be taken anywhere — and the reveal's last act is to move the keyboard, which
@@ -138,28 +183,45 @@ export function useSendToClaude(): SendToClaude {
          * `view.hasFocus` was the obvious guard and is wrong: the context-menu route runs
          * with focus on the menu item for the whole of its life, so it would refuse the
          * reveal on every single mouse-driven send.
+         *
+         * A reroute is said out loud even here. The user is staying in their buffer by their
+         * own act, but the lines still went somewhere other than where they were aimed, and
+         * that is the one thing about this gesture they cannot find out any other way.
          */
         if (view.state.doc !== doc) {
           void diag.log('editor: not revealing the Claude pane — the buffer moved on')
+          if (sent.fallback) report(rerouted(path, span, sent.title))
           return
         }
-        const stuck = await revealPane(target.project, target.pane)
-        if (stuck === null) return
+        const stuck = await revealPane(target.project, sent.pane)
+        if (stuck !== null) {
+          /*
+           * Sent, but the user is not looking at where it went — the pane closed under us, its
+           * window would not come forward, the project was closed mid-flight. This is the case
+           * the brief asks about and it gets a sentence rather than silence, because a mention
+           * in a prompt nobody can see is exactly as invisible as no mention at all. The
+           * wording names the file and the range, so the user can find the conversation by
+           * hand from what it says — and names the conversation too when it was not the one
+           * asked for, because then "find it by hand" needs to say which hand.
+           */
+          const where = sent.fallback ? `‘${sent.title}’` : 'Claude'
+          report(`Sent ${mentionLabel(path, span)} to ${where} — but ${stuck}.`)
+          return
+        }
         /*
-         * Sent, but the user is not looking at where it went — the pane closed under us, its
-         * window would not come forward, the project was closed mid-flight. This is the case
-         * the brief asks about and it gets a sentence rather than silence, because a mention
-         * in a prompt nobody can see is exactly as invisible as no mention at all. The
-         * wording names the file and the range, so the user can find the conversation by
-         * hand from what it says.
+         * The reveal worked, so the user is now looking at the prompt that got the lines —
+         * which is the strongest possible statement of where they went and is why the
+         * fallback is safe at all. The sentence is still worth saying: the pane they are
+         * looking at is *not* the one they aimed at, and a reveal that quietly moved them
+         * would leave them to notice on their own that this is a different conversation.
          */
-        report(`Sent ${mentionLabel(path, span)} to Claude — but ${stuck}.`)
+        if (sent.fallback) report(rerouted(path, span, sent.title))
       })
 
-      // Logged whether or not it lands. A report of "it did nothing" is answerable from a log
-      // that records the attempt and the pane it was aimed at; one that records only successes
-      // says nothing about the case being reported.
-      void diag.log(`editor: sent ${mentionLabel(path, span)} to ${target.pane}`)
+      // The attempt, logged before the answer and naming the pane the gesture aimed at. A
+      // report of "it did nothing" is answerable from a log that records the attempt; one that
+      // records only successes says nothing at all about the case being reported.
+      void diag.log(`editor: sending ${mentionLabel(path, span)} to ${target.pane}`)
     },
     [target, range],
   )

@@ -1,9 +1,10 @@
 /*
- * The git panel's destructive confirmation. Scrim and card come from `OverlayCard`; this
- * styles only what sits inside, exactly as `chrome/CloseConfirm.module.css` does — the two
- * dialogs are the same gesture in two places and must not drift apart.
+ * The house destructive confirmation — the Git panel's reverts and the file tree's *Move to
+ * Trash*. Scrim and card come from `OverlayCard`; this styles only what sits inside, exactly
+ * as `CloseConfirm.module.css` beside it does — the three dialogs are the same gesture in
+ * three places and must not drift apart.
  *
- * `--red` appears once, on the button that cannot be undone. That is the only thing that
+ * `--red` appears once, on the button that removes something. That is the only thing that
  * colour means in this app.
  */
 

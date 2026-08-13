@@ -169,16 +169,21 @@ export function useCodeMenu({ view, path, readOnly }: CodeMenuOptions): ContextM
           id: 'mention',
           label: sendLabel(toClaude.range(live)),
           /*
-           * **No `command`, and that is a report rather than a preference.**
+           * **Still no `command`, and the reason has changed — which is why the old one is
+           * written out rather than deleted.**
            *
-           * `claude.mention.file` is in the registry, so it draws a chip — and running it does
-           * nothing: `App.tsx`'s dispatcher has no case for it and falls through to
-           * `diag.log('command not handled by this window')`. It is also gated
-           * `.when("claudePaneFocused")`, which is exactly backwards for a gesture made from an
-           * editor. A chip pointing at a dead command is worse than no chip, so it is gone
-           * until those two lines land — one in `App.tsx`, one in `cide-core/src/commands.rs`,
-           * neither of them this change's file. Meanwhile the item and its `Alt-Enter` binding
-           * both work without either.
+           * It used to be that `claude.mention.file` was dispatched by nothing and gated
+           * `.when("claudePaneFocused")`, so a chip here would have pointed at a dead command
+           * that the palette also hid from the only surface it is used on. Both of those were
+           * fixed elsewhere: the arm exists in `keys/dispatch.ts` and the clause is
+           * `editorFocused && claudeTarget`.
+           *
+           * What has not changed is that they are not the same act. The registry command
+           * mentions the *focused file*, whole — it is dispatched with no editor in hand and
+           * cannot see a selection. This item mentions the range under the caret. Wiring the
+           * chip on would advertise a shortcut that quietly drops the user's selection, which
+           * is a worse lie than no chip. `Alt-Enter` in the buffer is the keyboard half of
+           * *this* item and is bound in `EditorSurface`.
            */
           disabledReason: toClaude.unavailable ?? undefined,
           run:

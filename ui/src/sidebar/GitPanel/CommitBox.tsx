@@ -11,7 +11,8 @@
  * the buttons are about to do, so it is also the element the buttons' accessible
  * description points at: a screen reader user pressing Commit hears which files.
  */
-import { useId } from 'react'
+import { useEffect, useId, useRef } from 'react'
+import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import styles from './CommitBox.module.css'
 
 export interface CommitBoxProps {
@@ -34,6 +35,30 @@ export interface CommitBoxProps {
 export function CommitBox(props: CommitBoxProps) {
   const summaryId = useId()
   const messageId = useId()
+
+  /*
+   * The caret, when *Commit changes…* asked for it.
+   *
+   * That command does not commit — the message and the ticked paths are this panel's own React
+   * state and do not exist while the sidebar is elsewhere, and a palette row that committed
+   * whatever happened to be ticked would be a foot-gun in a build with no revert surface. What
+   * it does instead is reveal this panel and ask for this box, which is the part a user can
+   * finish. `commands.rs` carries the full argument.
+   *
+   * The request is parked in a store rather than pushed as a prop because the panel usually
+   * mounts one render *after* the command runs; `chrome/focusRequests.ts` explains the
+   * handshake and why an `autoFocus` cannot do it. No `select()`, unlike the search box: a
+   * half-typed commit message is work, and selecting it would put one keystroke between the
+   * user and losing it.
+   */
+  const message = useRef<HTMLTextAreaElement>(null)
+  const focusWanted = useFocusRequested('commitMessage')
+  useEffect(() => {
+    if (!focusWanted) return
+    message.current?.focus()
+    clearFocusRequest('commitMessage')
+  }, [focusWanted])
+
   const empty = props.message.trim() === ''
   // An empty message is refused here rather than by git: `git commit` with an empty
   // message aborts, and finding that out after the index has been rewritten is a worse
@@ -62,6 +87,7 @@ export function CommitBox(props: CommitBoxProps) {
         Commit message
       </label>
       <textarea
+        ref={message}
         id={messageId}
         className={styles.message}
         data-audit="gitMessage"

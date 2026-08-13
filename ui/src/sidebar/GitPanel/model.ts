@@ -466,13 +466,60 @@ export function checkState(
  * a changelist was ticked by mistake.
  */
 export function toggleRow(row: Row, selected: ReadonlySet<string>): Set<string> {
+  return toggleFiles(row.files, selected)
+}
+
+/**
+ * The rule itself, over a flat set of file ids: if anything in the set is on, clear the set;
+ * otherwise fill it.
+ *
+ * `toggleRow` is this with one row's subtree, and {@link toggleRows} is this with several
+ * rows' subtrees unioned. That is the point of extracting it — there is now exactly one
+ * expression of "partial clears rather than completes" in the panel, and the multi-row case
+ * cannot drift from the single-row one because it is not a second implementation.
+ */
+export function toggleFiles(files: Iterable<string>, selected: ReadonlySet<string>): Set<string> {
   const next = new Set(selected)
-  const anyOn = row.files.some((id) => next.has(id))
-  for (const id of row.files) {
+  const ids = [...files]
+  const anyOn = ids.some((id) => next.has(id))
+  for (const id of ids) {
     if (anyOn) next.delete(id)
     else next.add(id)
   }
   return next
+}
+
+/**
+ * Tick or untick every selected row at once — one action, one outcome.
+ *
+ * **This is not `toggleRow` folded over the selection, and folding is the bug it exists to
+ * prevent.** A row's `files` is its whole subtree, and a selection that spans a folder always
+ * contains both the folder row and the rows under it: `rowSelection.ts`'s `between` keeps every
+ * selectable row in a shift band, and `selectAll` keeps every row on screen. Fold `toggleRow`
+ * over that and each file is visited twice — once via its directory, once as itself — so it
+ * lands back where it started. The net effect was the *inverse* of the documented rule: any
+ * tick anywhere in a subtree left that subtree fully ticked. In a panel whose next action is
+ * `git commit`, that silently re-ticked files the user had deliberately excluded.
+ *
+ * Unioning the subtrees first also removes the order dependency. A fold's answer depended on
+ * whether a directory happened to be walked before its children, which is a property of
+ * `walkDir`, not of anything the user did.
+ *
+ * A selected id with no row in `rows` contributes nothing: Space acts on what is on screen, so
+ * a collapsed group's hidden files are not swept up by a selection made before it was folded.
+ */
+export function toggleRows(
+  rows: readonly Row[],
+  ids: ReadonlySet<string>,
+  selected: ReadonlySet<string>,
+): Set<string> {
+  const files = new Set<string>()
+  for (const row of rows) {
+    if (!ids.has(row.id)) continue
+    for (const id of row.files) files.add(id)
+  }
+  if (files.size === 0) return new Set(selected)
+  return toggleFiles(files, selected)
 }
 
 /**

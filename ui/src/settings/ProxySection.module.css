@@ -110,6 +110,7 @@
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text);
+  -webkit-user-select: text;
   user-select: text;
 }
 

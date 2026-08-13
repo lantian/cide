@@ -216,12 +216,31 @@ export function missing(commands, handled) {
 
 /* --------------------------------------------------------------- the `when` vocabulary */
 
-const CONTEXT_FLAGS = [
-  ...rustBody(commandsRs, 'pub const CONTEXT_FLAGS: &[&str] = &[', 'CONTEXT_FLAGS')
-    .replace('pub const CONTEXT_FLAGS: &[&str] = &[', '')
-    .matchAll(/"([^"]+)"/g),
-].map((m) => m[1])
+/**
+ * The vocabulary, read out of the `const` that declares it.
+ *
+ * Bounded by the array's own `];` and stripped of comments before the string literals are
+ * collected. Both matter and neither used to be true: the reader ran to the next `\n}`, which
+ * is the end of the *function after* the constant, and it kept every quoted word it passed on
+ * the way — so a `//` comment inside the array naming a flag, or merely quoting a phrase,
+ * became a phantom entry in the vocabulary and failed the "supplied by somebody" check below
+ * with a sentence in place of a flag name. A comment explaining why a flag was removed is
+ * exactly the comment that belongs in that array.
+ */
+const CONTEXT_FLAGS = (() => {
+  const opening = 'pub const CONTEXT_FLAGS: &[&str] = &['
+  const start = commandsRs.indexOf(opening)
+  if (start < 0) throw new Error('could not find CONTEXT_FLAGS in commands.rs')
+  const end = commandsRs.indexOf('];', start)
+  if (end < 0) throw new Error('CONTEXT_FLAGS has no closing `];`')
+  const body = stripComments(commandsRs.slice(start + opening.length, end))
+  return [...body.matchAll(/"([^"]+)"/g)].map((m) => m[1])
+})()
 ok(CONTEXT_FLAGS.length >= 10, `read ${CONTEXT_FLAGS.length} context flags — the regex still matches`)
+ok(
+  !CONTEXT_FLAGS.some((flag) => flag.includes(' ')),
+  `every flag read out of CONTEXT_FLAGS is an identifier, not prose: ${JSON.stringify(CONTEXT_FLAGS)}`,
+)
 
 const contextTs = read('../src/keys/context.ts')
 const flagList = (name) => {
@@ -352,6 +371,7 @@ const HOST_FLAGS = flagList('HOST_FLAGS')
     kind: { kind: 'claude' },
     tree: { root: null, focused, maximized: null, panes: Object.fromEntries(panes.map((p) => [p.id, p])) },
   })
+  const root = (path, label) => ({ path, label })
   /** One workspace, three windows onto it. `t1` is the pinned console of `p1`. */
   const boot = (role) => ({
     role,
@@ -365,7 +385,7 @@ const HOST_FLAGS = flagList('HOST_FLAGS')
           id: 'p1',
           name: 'one',
           activeTab: 't1',
-          roots: [{ path: '/a', repo: 'r1' }],
+          roots: [root('/a', 'a')],
           detached: { pD: pane('pD', 'shell') },
           tabs: [tab('t1', [pane('pA', 'claude')], 'pA'), tab('t2', [pane('pB', 'editor')], 'pB')],
         },
@@ -373,13 +393,48 @@ const HOST_FLAGS = flagList('HOST_FLAGS')
           id: 'p2',
           name: 'two',
           activeTab: 't3',
-          roots: [{ path: '/b', repo: null }],
+          roots: [root('/b', 'b')],
           detached: {},
           tabs: [tab('t3', [pane('pC', 'claude')], 'pC')],
         },
       },
     },
   })
+
+  /*
+   * The fixture is hand-written, so check its shape against the DTO Rust actually produces.
+   *
+   * **This is the assertion that was missing.** Every root above used to carry a `repo`, and
+   * `keys/target.ts::reposOf` read it to derive the `repoOpen` context flag that gated every
+   * git command. Rust has never put anything but `None` in that field — the fixture was
+   * describing a `ProjectRoot` no build has ever produced — so the flag was false for every
+   * user, the whole Git group vanished from the palette, and this script stayed green because
+   * every check it ran was fed the same invented shape. A hand-written fixture is a claim
+   * about the wire, and an unchecked claim about the wire is how a permanently-false flag
+   * looks exactly like a working one.
+   *
+   * Both directions are asserted. A field the DTO does not have is the bug above; a field it
+   * has and the fixture omits is a fact `target.ts` could start reading tomorrow with nothing
+   * here exercising it.
+   */
+  {
+    const generated = read('../src/ipc/generated.ts')
+    const at = generated.indexOf('export type ProjectRoot = {')
+    if (at < 0) throw new Error('could not find ProjectRoot in ipc/generated.ts')
+    const end = generated.indexOf('};', at)
+    const declared = [
+      ...stripComments(generated.slice(at, end)).matchAll(/[{,]\s*([A-Za-z_]\w*)\??:/g),
+    ].map((m) => m[1])
+    ok(declared.length >= 2, `read ${declared.length} ProjectRoot fields — the scan still works`)
+    const fixture = Object.keys(root('/a', 'a'))
+    eq(
+      [...fixture].sort(),
+      [...declared].sort(),
+      'the bootstrap fixture builds a real ProjectRoot — every field the generated DTO ' +
+        'declares and no field it does not (a fixture carrying a field Rust never fills is ' +
+        'what let `repoOpen` be permanently false with this script green)',
+    )
+  }
 
   const shell = boot({ kind: 'shell', projects: ['p1', 'p2'], active: 'p1' })
   const detachedPane = boot({ kind: 'detachedPane', project: 'p1', tab: 't1', pane: 'pD' })

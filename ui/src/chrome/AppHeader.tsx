@@ -18,7 +18,9 @@
 import { useEffect, useRef } from 'react'
 import { useContextMenu } from '@/menus'
 import { projectMenu } from '@/ipc/client'
-import type { SplitIntent } from '@/ipc/generated'
+import type { Pane as GeneratedPane, SplitIntent, Tab as GeneratedTab } from '@/ipc/generated'
+import { useAwaitingInProject } from '@/panes/awaiting'
+import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
 import { RowControls } from './RowControls'
@@ -36,6 +38,21 @@ export interface ProjectTab {
   displayPath: string
   /** CSS colour for the tab's dot, typically a `var(--…)` reference. */
   dot: string
+  /**
+   * The project's tabs and its torn-out panes, for the *waiting for you* count.
+   *
+   * **Optional, and that is what keeps the measurement fixture cheap**: `chrome/layoutAudit.ts`
+   * measures this header from a handful of fields, and a required `tabs` would make every
+   * fixture build a whole pane tree to take a ruler to a 34px bar. Absent means "nothing
+   * known", which renders as no badge — the correct answer for a fixture, and unreachable in
+   * the app, where `App.tsx` passes the generated `Project`.
+   *
+   * Typed as the generated shapes rather than a narrowed local one because the count reaches
+   * through `tree.panes` to the session on each pane; a hand-written subset here would be a
+   * second declaration of `Pane` to keep in step with Rust.
+   */
+  tabs?: GeneratedTab[] | undefined
+  detached?: Record<string, GeneratedPane> | undefined
 }
 
 export interface AppHeaderProps {
@@ -196,52 +213,15 @@ export function AppHeader({
           strip.scrollLeft += e.deltaX !== 0 ? e.deltaX : e.deltaY
         }}
       >
-        {projects.map((project) => {
-          const active = project.id === activeProject
-          return (
-            <div
-              key={project.id}
-              className={active ? `${styles.tab} ${styles.tabActive}` : styles.tab}
-              data-audit="projectTab"
-              // How the context menu finds which tab was hit; `items` runs at open time and
-              // reads it back off the DOM rather than one hook closing over each project.
-              data-project-id={project.id}
-              data-active={active ? 'true' : 'false'}
-            >
-              <button
-                type="button"
-                className={styles.tabOpen}
-                title={project.displayPath}
-                // Which project is open is otherwise carried by colour and a 2px rule alone,
-                // neither of which a screen reader reports.
-                aria-current={active}
-                onClick={() => onActivate?.(project.id)}
-              >
-                <span
-                  className={styles.dot}
-                  style={{ background: project.dot }}
-                  data-audit="projectDot"
-                />
-                <span>{project.name}</span>
-                {/* The path is the active tab's alone: the mock keeps inactive tabs to a
-                    name so a full strip still fits. */}
-                {active && (
-                  <span className={styles.path} data-audit="projectPath">
-                    {project.displayPath}
-                  </span>
-                )}
-              </button>
-              <button
-                type="button"
-                className={styles.tabClose}
-                title={`Close ${project.name}`}
-                onClick={() => onClose?.(project.id)}
-              >
-                ×
-              </button>
-            </div>
-          )
-        })}
+        {projects.map((project) => (
+          <ProjectTabItem
+            key={project.id}
+            project={project}
+            active={project.id === activeProject}
+            onActivate={onActivate}
+            onClose={onClose}
+          />
+        ))}
       </div>
 
       {/*
@@ -309,6 +289,116 @@ export function AppHeader({
       {/* Rendered or nothing appears. It portals out of this bar, so the header's own
           `overflow: hidden` on `.tabs` cannot clip it. */}
       {tabMenu.menu}
+    </div>
+  )
+}
+
+interface ProjectTabItemProps {
+  project: ProjectTab
+  active: boolean
+  onActivate?: ((id: string) => void) | undefined
+  onClose?: ((id: string) => void) | undefined
+}
+
+/**
+ * One project's tab, and the only place a *background* project can say it wants attention.
+ *
+ * # Why the tab is its own component now
+ *
+ * Because it holds a hook. `useAwaitingInProject` subscribes per project, so the snapshot is a
+ * number and `Object.is` re-renders one tab when one project's count moves — six open projects
+ * and one `Stop` hook is one re-render, not six. A hook cannot be called inside the `.map` that
+ * used to build these, and hoisting the whole strip's counts into one object handed down as a
+ * prop would be a new identity on every store notification and a re-render of the entire
+ * header for ever. `TabStrip`'s `TabItem` is the same component for the same reason.
+ *
+ * # Why the header carries this at all
+ *
+ * `App.tsx` renders the tab strip and the pane tree for the **active project only**. Every
+ * other project's panes and tabs are not mounted, so their markers and badges are painted
+ * nowhere — while Rust has already put `Awaiting: N` in the OS title, counting them. That gap
+ * is the whole of the reported problem: the task bar said something was waiting and no surface
+ * in the window said what. This tab is the only element of a background project that exists on
+ * screen, so it is the only place the answer can go.
+ *
+ * # The badge, not a recoloured dot
+ *
+ * The project dot is 8×8 and its geometry is pinned by the layout audit; it also already means
+ * something (which project this is), and overloading it would make "waiting" and "this is the
+ * atlas project" the same pixel. A separate box carries a *count*, for the same reason the tab
+ * strip's does: a dot says "something behind here" and leaves the user to hunt, a number says
+ * how many and decrements as each pane is dealt with, which is the only progress signal
+ * available while those panes are not rendered at all.
+ *
+ * Its box is reserved on every tab whether or not it is filled — see the stylesheet. A marker
+ * that took its space on appearing would widen its tab and slide every tab after it sideways,
+ * under a pointer that may be on its way to one of them.
+ */
+function ProjectTabItem({ project, active, onActivate, onClose }: ProjectTabItemProps) {
+  // `tabs`/`detached` are optional on `ProjectTab` so a four-field measurement fixture still
+  // satisfies it, and a header rendered from one simply has nothing waiting. `App.tsx` passes
+  // the generated `Project` straight through, which carries both.
+  const waiting = useAwaitingInProject(project)
+  const badge = awaitingBadge(waiting)
+  const hint = awaitingHint(waiting, 'project')
+
+  return (
+    <div
+      className={active ? `${styles.tab} ${styles.tabActive}` : styles.tab}
+      data-audit="projectTab"
+      // How the context menu finds which tab was hit; `items` runs at open time and
+      // reads it back off the DOM rather than one hook closing over each project.
+      data-project-id={project.id}
+      data-active={active ? 'true' : 'false'}
+      data-awaiting={waiting > 0 ? String(waiting) : 'false'}
+    >
+      <button
+        type="button"
+        className={styles.tabOpen}
+        // The badge is `pointer-events: none` so the tab stays one box the pointer can hit
+        // anywhere, so it cannot carry its own tooltip — the tab's does, and it is also the
+        // only place a user with eleven waiting sessions learns that `9+` means eleven.
+        title={hint ? `${project.displayPath} — ${hint}` : project.displayPath}
+        // Which project is open is otherwise carried by colour and a 2px rule alone,
+        // neither of which a screen reader reports.
+        aria-current={active}
+        onClick={() => onActivate?.(project.id)}
+      >
+        <span className={styles.dot} style={{ background: project.dot }} data-audit="projectDot" />
+        <span>{project.name}</span>
+        {/* The path is the active tab's alone: the mock keeps inactive tabs to a
+            name so a full strip still fits. */}
+        {active && (
+          <span className={styles.path} data-audit="projectPath">
+            {project.displayPath}
+          </span>
+        )}
+      </button>
+      {/*
+       * Inside `.tabOpen`'s row but after it, so the count sits between the name and the close
+       * button and clicking it still activates the project underneath.
+       *
+       * `role` is on the empty box too, and the reason is the same one `TabStrip` states: a
+       * live region that comes into existence at the same moment as its content is not
+       * reliably announced, because nothing was there to be watching. The region exists from
+       * mount and `aria-hidden` is what flips.
+       */}
+      <span
+        className={badge ? `${styles.awaiting} ${styles.awaitingOn}` : styles.awaiting}
+        role="status"
+        aria-label={hint}
+        aria-hidden={badge ? undefined : true}
+      >
+        {badge}
+      </span>
+      <button
+        type="button"
+        className={styles.tabClose}
+        title={`Close ${project.name}`}
+        onClick={() => onClose?.(project.id)}
+      >
+        ×
+      </button>
     </div>
   )
 }

@@ -12,24 +12,25 @@
  *
  * # The three decisions, up front
  *
- * **What a grab carries.** A file row that is *ticked* carries every tick in the same repo and
- * the same list kind — that is `actOn`, which the *Move to Changelist…* menu item has used
- * since M8, and a drag that disagreed with the menu on the same row would be the surprise.
- * A file row that is not ticked carries itself alone and **changes no ticks**: in this panel a
- * tick is what a commit will take, not what the pointer is on (see the header of
- * `ChangesTree.tsx`), so a drag that ticked what it touched would silently change what the
- * Commit button does. A directory row carries the files under it and never widens — the row
- * already names a set, and widening from it would move files that are not under the row the
- * user grabbed.
+ * **What a grab carries.** A row that is part of the **row selection** carries the whole
+ * selection, narrowed to the same repository and the same list kind. A row that is not carries
+ * itself alone — a file, or every file under a directory — and **changes nothing**: not the
+ * ticks, and not the selection either. The press that preceded the drag has already put the
+ * selection where it belongs (`rowSelection.ts::pressSelect` selects an unselected row on
+ * mousedown, which is IDEA's rule and the reason this function never has to write anything).
  *
- * The alternative that lost: IDEA's ctrl-click row multi-selection, separate from the
- * checkboxes, with the drag following *that*. It is the better model and it is what IDEA does
- * — but this panel has no such selection, and inventing one changes what every click in the
- * tree means. Ticks it is, with the count on the drag ghost from the first pixel of movement so
- * a widened drag is never invisible. Note the trap it comes with: the active changelist opens
- * fully ticked, so dragging one of its files carries all of them. The ghost says so, ⎋ cancels,
- * and a changelist move loses nothing — it is the one write in this panel that is undone by
- * dragging back.
+ * This used to widen by **ticks**, and that was the wrong set — the header here argued for it
+ * at length and the argument was wrong in a way worth keeping on the record. It ran: this
+ * panel has no row selection, inventing one changes what every click means, so use the one
+ * multi-row concept that exists. The trap it came with was written down and shipped anyway:
+ * the active changelist opens *fully ticked* (`model.ts::defaultSelection`), so dragging one
+ * file out of it moved every file in it. That is not a rough edge, it is the feature doing
+ * something the user did not ask for, and it was reported as one. A tick is a statement about
+ * a commit; a drag is a statement about what you are pointing at. `rowSelection.ts` is the
+ * third concept, the click meanings are all in it, and `check:git` executes them.
+ *
+ * The count stays on the drag ghost from the first pixel of movement, so a widened drag is
+ * still never invisible.
  *
  * **Which targets accept.** Only a changelist. Any row inside one resolves to the group it is
  * in, so the whole band of a changelist is a target rather than its 24px header; a repository
@@ -82,7 +83,11 @@ export interface DragSet {
  */
 export function grab(
   view: StatusView,
-  selected: ReadonlySet<string>,
+  /**
+   * The row selection, resolved by `rowSelection.ts::carriedIds` — every selected row id plus
+   * every file under a selected directory. Not the ticks; see the header.
+   */
+  carried: ReadonlySet<string>,
   row: Row,
 ): DragSet | null {
   if (row.kind !== 'file' && row.kind !== 'dir') return null
@@ -97,26 +102,34 @@ export function grab(
   })
   if (own.length === 0) return null
 
-  // Widening is for file rows only. A directory row already names its set; sweeping the ticks
-  // in from outside it would move files that are not under the row the user grabbed.
-  const widen = row.kind === 'file' && selected.has(row.id)
+  /*
+   * Directory rows widen now, where under the ticks they deliberately did not.
+   *
+   * The old rule was "a directory already names its set, and sweeping the ticks in from
+   * outside it would move files that are not under the row the user grabbed" — true of ticks,
+   * which are set by a checkbox somewhere else and may name half the tree. It is not true of a
+   * selection: the other rows in it are rows the user just clicked, they are drawn with the
+   * selection band, and refusing to carry them would make a folder the one row kind that
+   * silently drops the rest of a multi-row drag.
+   */
+  const widen = carried.has(row.id)
   const files = widen
     ? all.flatMap((f) =>
-        f.repo === row.repo && f.kind === kind && selected.has(f.id)
+        f.repo === row.repo && f.kind === kind && carried.has(f.id)
           ? [{ id: f.id, path: f.entry.path, changelist: f.changelist }]
           : [],
       )
     : own
-  // `actOn` has the same guard: the widening must never come back empty, or a right-click on a
-  // ticked row would act on nothing at all.
-  const carried = files.length > 0 ? files : own
+  // The widening must never come back empty, or a right-click on a selected row whose
+  // neighbours are all in another repository would act on nothing at all.
+  const load = files.length > 0 ? files : own
   return {
     repo: row.repo,
     kind,
     origin: row.id,
-    files: carried,
-    label: labelFor(row, carried.length, carried.length > own.length),
-    widened: carried.length > own.length,
+    files: load,
+    label: labelFor(row, load.length, load.length > own.length),
+    widened: load.length > own.length,
   }
 }
 

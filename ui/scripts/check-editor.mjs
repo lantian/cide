@@ -2080,7 +2080,45 @@ try {
       'the reveal hangs off the send’s `then` — on `finally` a failed send would still switch ' +
         'tabs, which is the one thing the brief rules out',
     )
-    ok(/revealPane\(target\.project, target\.pane\)/.test(hookSrc), 'and it is the mention target that is revealed')
+    /*
+     * And it is the pane the send ANSWERED with that is revealed, never the one it was aimed
+     * at. This assertion used to read `revealPane(target.project, target.pane)`, which was
+     * right while `claude_send_lines` could only ever deliver to the pane it was given.
+     * It cannot any more: the frontend's rule picks `tabs[0]`'s first Claude pane in map
+     * order without asking whether that pane has a `claude` running — and in a restored
+     * workspace it usually does not, because only the console's primary Claude pane spawns
+     * eagerly and the rest sit at a resume splash. Rust therefore reroutes to a Claude that
+     * can receive and says which one it used.
+     *
+     * So this is strengthened rather than relaxed: revealing `target.pane` after delivering
+     * somewhere else is *worse* than the error it replaced — the user is taken to an empty
+     * prompt while their selection sits in another conversation, and nothing on screen says
+     * so. Both halves are pinned, because dropping either one restores that.
+     */
+    ok(
+      /revealPane\(target\.project, sent\.pane\)/.test(hookSrc),
+      'the pane the send resolved to is the one revealed',
+    )
+    ok(
+      !/revealPane\(target\.project, target\.pane\)/.test(hookSrc),
+      'and never the pane it was aimed at — that pane is a preference, and when it could not ' +
+        'receive, going there shows an empty prompt beside a mention that landed elsewhere',
+    )
+    // `report(rerouted(` and not merely the two names: the helper is defined in this file and
+    // `sent.fallback` is read again for the stuck-reveal wording, so a looser pattern is
+    // satisfied with every call to it deleted. Checked by mutation.
+    ok(
+      /report\(rerouted\(/.test(hookSrc),
+      'a reroute is said out loud. A selection that arrives in conversation B while the user ' +
+        'believes it is in A is the one genuinely harmful outcome this gesture has, and the ' +
+        'reveal alone does not name the conversation',
+    )
+    ok(
+      /diag\.log\(`editor: sent \$\{mentionLabel\(path, span\)\} to \$\{sent\.pane\}`\)/.test(hookSrc),
+      'and the log records the RESOLVED pane. It used to log the asked-for one, unconditionally ' +
+        'and before the answer, so a real log of this failure read “sent … to 07565bbd” on the ' +
+        'line under the server’s own “no connected claude in this pane; dropped”',
+    )
     ok(
       /view\.state\.doc !== doc/.test(hookSrc),
       'guarded on the document, so a user who carried on typing does not have the keyboard ' +

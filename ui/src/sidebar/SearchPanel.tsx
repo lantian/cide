@@ -43,6 +43,7 @@ import {
 import type { SearchRow } from './SearchModel'
 import { gestureOf, moveIndex, searchClick } from './clickSemantics'
 import { copyText } from './copyText'
+import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import { groupDigits } from '@/overlays/format'
 import type { ProjectId } from '@/ipc/client'
 import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
@@ -100,6 +101,31 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
   // tick, so a hook inside a row is a store listener churned per frame.
   const iconTheme = useIconTheme()
 
+  /*
+   * The caret, when a command asked for it.
+   *
+   * `sidebar.search` (Ctrl+Shift+F) reveals this panel and then asks for its box. It cannot
+   * simply focus the input itself: the dispatcher runs inside the key gate's window listener,
+   * one React render before this component exists on the common path — and on the *un*common
+   * path, where the panel is already open, nothing mounts at all, so an `autoFocus` would
+   * answer the first press and silently ignore every one after it. A parked request covers
+   * both, because this effect runs on the mount *and* on the re-render. See
+   * `chrome/focusRequests.ts`.
+   *
+   * `select()` as well as `focus()`: a second press replaces the last query rather than
+   * appending to it, which is what every editor's find-in-files does and what makes the chord
+   * usable as "search for this instead". No `keypress` follows the chord to disturb it — the
+   * gate calls `preventDefault` on every stroke it handles before dispatching.
+   */
+  const input = useRef<HTMLInputElement>(null)
+  const focusWanted = useFocusRequested('search')
+  useEffect(() => {
+    if (!focusWanted) return
+    input.current?.focus()
+    input.current?.select()
+    clearFocusRequest('search')
+  }, [focusWanted])
+
   useEffect(() => {
     useSearch.getState().attach(project)
   }, [project])
@@ -127,6 +153,7 @@ export function SearchPanel({ project, onOpenHit }: SearchPanelProps) {
 
       <div className={styles.controls}>
         <input
+          ref={input}
           className={styles.input}
           data-audit="searchInput"
           type="text"

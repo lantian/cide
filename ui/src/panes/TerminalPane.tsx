@@ -669,9 +669,9 @@ export function TerminalPane({
     const onData = term.onData((data) => {
       const id = getHost(paneId).sessionId
       if (!id) return
-      // Typing at a session is the clearest possible statement that the user has seen it, so
-      // it clears the awaiting marker and this window's contribution to `Awaiting: X`.
-      acknowledge(id)
+      // No `acknowledge` here, and that is a fix rather than an omission — see `onKeyDown`
+      // below, which is where it moved to.
+      //
       // `void` with no `catch` was swallowing the one failure a user cannot diagnose: a
       // keystroke that never reached the child looks exactly like a keystroke the child
       // ignored. Once per pane, because if writes are failing they are failing on every
@@ -709,6 +709,37 @@ export function TerminalPane({
     }
     hostEl.addEventListener('contextmenu', onMenu)
 
+    /*
+     * "The user has seen this session" — on a *keystroke*, not on terminal output.
+     *
+     * This used to hang off `term.onData`, which is wrong in a way that only shows up in the
+     * one situation the whole feature exists for. `onData` is xterm's outbound stream, and the
+     * terminal answers queries on it **by itself**: a Device Attributes report, a cursor
+     * position report, a focus in/out report, a bracketed-paste wrapper. Claude Code probes the
+     * terminal at the end of a turn, so the sequence was reliably: the turn finishes, the
+     * marker goes up, the CLI asks the terminal something, xterm replies on `onData`, and the
+     * marker clears itself half a second later with nobody at the keyboard. Then the user comes
+     * back to a task bar that says nothing is waiting.
+     *
+     * A `keydown` on the pane host cannot be forged by the child: it is the user pressing a
+     * key inside this pane, which is the strongest statement available that they are here and
+     * looking. Bare modifiers are excluded — holding Ctrl to read a chord, or Alt to reach a
+     * menu, is not reading a conversation, and on some layouts a modifier is pressed on the way
+     * to somewhere else entirely.
+     *
+     * Deliberately *not* routed through the key gate. The gate decides what a chord *does*; the
+     * question here is only whether a human touched this pane, and a keystroke the gate swallows
+     * for a global binding is still a human touching this pane.
+     */
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Shift' || ev.key === 'Control' || ev.key === 'Alt' || ev.key === 'Meta') {
+        return
+      }
+      const id = getHost(paneId).sessionId
+      if (id) acknowledge(id)
+    }
+    hostEl.addEventListener('keydown', onKeyDown)
+
     // Exit arrives as an event now. It used to be a `session.hasExited` round trip per pane
     // per second, forever, in every window — twelve panes was twelve IPC calls a second to
     // learn nothing, and it still took up to a second to notice. `cide://session-state` is
@@ -737,10 +768,11 @@ export function TerminalPane({
       disposed = true
       onData.dispose()
       unlistenExit?.()
-      // The host outlives this mount, so the listener has to come off with it — otherwise a
+      // The host outlives this mount, so the listeners have to come off with it — otherwise a
       // pane remounted by a split would accumulate one right-click handler per mount and open
       // as many menus.
       hostEl.removeEventListener('contextmenu', onMenu)
+      hostEl.removeEventListener('keydown', onKeyDown)
       const id = getHost(paneId).sessionId
       // Detach the sink, never the session: the child keeps running and this pane can be
       // re-attached from another window without the process noticing. By pane, so closing

@@ -33,6 +33,7 @@
   letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--dim);
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -62,6 +63,7 @@
   padding: 12px 12px 16px;
   /* Prose, and the explainer is the point of the surface in v1 — it has to be selectable
      and quotable, unlike the chrome around it which sets `user-select: none` globally. */
+  -webkit-user-select: text;
   user-select: text;
 }
 

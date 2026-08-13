@@ -107,6 +107,45 @@ the bundler runs, that the bundler step passes `--config`, that the base config 
 writes. That last one replaces an `ends_with("target/release/cide-hook")` assertion that a
 config entry missing its `../../` also satisfied — green for precisely the drift it named.
 
+### The bundle's environment stops at the bundle
+
+An AppImage is a mount, and `AppRun` — AppImageKit's entry point, four processes above cide —
+rewrites nine environment variables so the bundled binary finds the bundled libraries:
+`PATH`, `LD_LIBRARY_PATH`, `PYTHONHOME`, `PYTHONPATH`, `XDG_DATA_DIRS`, `GSETTINGS_SCHEMA_DIR`,
+`PERLLIB`, `QT_PLUGIN_PATH`, `GST_PLUGIN_SYSTEM_PATH*`, plus `APPDIR`, `APPIMAGE`, `ARGV0`,
+`OWD` and the `linuxdeploy` GTK hook's loader caches. Every one of them is inherited by every
+descendant, and **cide's descendants are the user's programs, not ours.**
+
+The first report was an MCP server that would not start in a pane and started fine in a
+terminal, with identical `~/.claude.json` entries. `uvx yandex-tracker-mcp` spawns Python 3.13,
+which honours the inherited `PYTHONHOME=$APPDIR/usr/` — a prefix inside a bundle that contains
+no Python at all — and dies with `Failed to import encodings module` before it can write one
+byte of protocol. What the user sees is `CONNECTION_CLOSED` against a configuration that is
+correct, two processes below anything cide logs. `LD_LIBRARY_PATH` is the same hazard for any
+child linking one of the 160 libraries in the bundle, and surfaces as a symbol lookup error.
+
+`cide_core::child_env` is the answer, and it is a rule about **values, not variable names**: an
+entry that lives under `$APPDIR` is dropped from a child's environment, a variable left with
+nothing is unset rather than left empty, and everything else is passed through untouched.
+`AppRun` prepends, so filtering restores exactly what the user's session had. A name list would
+have covered AppImageKit 13 and the GTK hook and silently stopped covering the next plugin;
+this covers anything of the same shape. Dropping *empty* entries is part of it — the residue of
+a prepend onto nothing is `PYTHONPATH=:`, and an empty entry means the current directory, so
+passing that on would trade a dead interpreter for one importing out of the pane's cwd.
+
+Four spawn sites take it, which is all of them: `cmd::session::base_env` (every PTY child,
+shells and Claude panes alike, via `SpawnSpec`), `cide_claude::headless` (the one-shot lane),
+`cmd::app::claude_version`, and `cide_git`'s binary route for `push`/`fetch`. Nothing is
+scrubbed when `APPDIR` is unset, so `./run.sh`, the `.deb` and the Flatpak produce byte-identical
+environments to the ones they produced before.
+
+Two things are deliberately **not** rescued. A variable `AppRun` *overwrote* rather than
+prepended to cannot be recovered — `PYTHONHOME` is the only one, and a user who had their own
+loses it, which still beats passing on a path that ceases to exist when cide exits. And
+`GDK_BACKEND=x11`, `GTK_THEME=Adwaita:dark` and `PYTHONDONTWRITEBYTECODE=1` are left alone: they
+name nothing inside the bundle, so nothing distinguishes them from the same variables set by the
+user's own profile, and what they cost a child is cosmetic where the others cost it its life.
+
 ### .deb — a convenience
 
 For people who want their package manager to own the install. It cannot self-update and is
@@ -236,6 +275,15 @@ Its squashfs payload carries `usr/bin/cide` and `usr/bin/cide-hook` side by side
 libsoup 3, GStreamer, and the pixbuf and immodule loaders. Verified with
 `unsquashfs -o 944632 -l`, not by running it.
 
+A later build of the same version — `88,877,560` bytes, 2026-08-12, the copy installed at
+`~/bin/cide_0.1.0_amd64.AppImage` — **has** since been run on the reference machine, launching,
+opening projects and hosting Claude panes. That is what surfaced the environment bug the
+section above is about, and it is worth recording how: not from a log or a test, but from a
+Claude session inside a pane being unable to start one of its own MCP servers. The failure was
+three processes below anything cide instruments, and the artefact itself looked entirely
+healthy while it was happening. The clean-VM run in the milestone's acceptance criterion is
+still outstanding, and the reference machine cannot stand in for it — it is the build host.
+
 That run predates the move of `externalBin` out of the base config, so it was built without
 `--config`. The artefact is unaffected: `tauri-cli` merges the patch into the same configuration
 it would otherwise have read, and the merged value is identical. What has *not* been re-run
@@ -270,6 +318,13 @@ verified one layer down, by putting the same patch in `TAURI_CONFIG` — which i
   helpers actually are. Fixing it needs either a build host whose layout matches the search
   list, or an `AppRun` that exports `WEBKIT_EXEC_PATH` — which `bundle.linux.appimage.files`
   cannot deliver, because only the `usr/` subtree of those files reaches the AppDir.
+- **The environment scrub's rule is unit-tested; the bundled path it exists for is not.**
+  `cide_core::child_env`'s tests pin the decisions against the literal strings a running
+  AppImage produces, and the cure was confirmed at the shell level — the polluted environment
+  kills `python3` with `Failed to import encodings module`, the environment the scrub yields
+  does not. What no check covers is the whole chain: bundle → pane → `claude` → `uvx` → a
+  server that answers. Only a bundled build can run that, so it belongs with the clean-VM
+  acceptance test rather than in CI.
 - Anyone enabling the updater needs to add `plugins.updater` with a public key and endpoints,
   and sign releases with `tauri signer`. Until then the warning in the preflight is accurate
   and should stay.

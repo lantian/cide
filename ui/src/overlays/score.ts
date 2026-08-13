@@ -21,14 +21,23 @@
 export interface Scorable {
   id: string
   title: string
+  /**
+   * Extra words to match on. Required rather than optional even though most commands have
+   * none, so that a `cargo xtask codegen` that renamed the field would stop the palette's
+   * call site compiling — an optional property would simply go quiet and the tier would
+   * never fire again.
+   */
+  keywords: readonly string[]
 }
 
 /** Ranking tiers, best first. Same numbers as the Rust, so a diff between them is visible. */
-const TIER_TITLE_PREFIX = 5
-const TIER_TITLE_WORD = 4
-const TIER_TITLE_SUBSTRING = 3
-const TIER_ID = 2
-const TIER_SUBSEQUENCE = 1
+const TIER_TITLE_PREFIX = 6
+const TIER_TITLE_WORD = 5
+const TIER_TITLE_SUBSTRING = 4
+const TIER_ID = 3
+const TIER_KEYWORD = 2
+const TIER_ALL_WORDS = 1
+const TIER_SUBSEQUENCE = 0
 
 interface Score {
   tier: number
@@ -62,6 +71,30 @@ function isSubsequence(haystack: string, needle: string): boolean {
   return true
 }
 
+/**
+ * Every whitespace-separated word of `needle` starts a word of the title, a keyword or the id.
+ *
+ * Only ever consulted for a needle with two or more words: for a single word this is the
+ * disjunction of three tiers that have already been tried and failed, so it could only answer
+ * `false`, and skipping it says that in the code rather than in a comment.
+ *
+ * Word-prefix rather than substring per word, for the reason above `TIER_KEYWORD` in the Rust
+ * and one more: with a substring, a two-letter word like `to` matches nearly every row in the
+ * table and the tier stops discriminating.
+ */
+function allWordsMatch(command: Scorable, title: string, needle: string): boolean {
+  const words = needle.split(/\s+/).filter((word) => word !== '')
+  if (words.length < 2) return false
+  const id = command.id.toLowerCase()
+  const keywords = command.keywords.map((word) => word.toLowerCase())
+  return words.every(
+    (word) =>
+      wordPrefix(title, word) >= 0 ||
+      wordPrefix(id, word) >= 0 ||
+      keywords.some((keyword) => wordPrefix(keyword, word) >= 0),
+  )
+}
+
 /** `null` when the command does not match at all. */
 function scoreOne(command: Scorable, needle: string): Score | null {
   const title = command.title.toLowerCase()
@@ -76,6 +109,15 @@ function scoreOne(command: Scorable, needle: string): Score | null {
 
   const inId = command.id.toLowerCase().indexOf(needle)
   if (inId >= 0) return { tier: TIER_ID, offset: inId }
+
+  // A keyword matched at a *word* boundary rather than anywhere inside it: `in files` should
+  // answer to `files`, and `create` should not answer to `eat`.
+  for (const keyword of command.keywords) {
+    const at = wordPrefix(keyword.toLowerCase(), needle)
+    if (at >= 0) return { tier: TIER_KEYWORD, offset: at }
+  }
+
+  if (allWordsMatch(command, title, needle)) return { tier: TIER_ALL_WORDS, offset: 0 }
 
   if (isSubsequence(title, needle)) return { tier: TIER_SUBSEQUENCE, offset: 0 }
 

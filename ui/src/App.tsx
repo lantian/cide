@@ -441,13 +441,21 @@ export function App() {
   const focusedSession = focused?.pane.session ?? undefined
 
   /**
-   * The Claude pane a mention should land in.
+   * The Claude pane a mention is *aimed* at.
    *
-   * The focused pane when it is a Claude one; otherwise the project's console — its primary
-   * session, which is the conversation the project is *about*. Falling back to the console
-   * rather than to nothing matters because the common gesture is Ctrl+P from an editor,
-   * where no Claude pane is focused by definition, and a mention that silently went nowhere
-   * would look identical to one that worked.
+   * The focused pane when it is a Claude one; otherwise the project's console — `tabs[0]`'s
+   * first Claude pane in map order. Falling back to the console rather than to nothing
+   * matters because the common gesture is Ctrl+P from an editor, where no Claude pane is
+   * focused by definition, and a mention that silently went nowhere would look identical to
+   * one that worked.
+   *
+   * The comment here used to call that fallback "the console's *primary session*". It is not,
+   * and the difference is load-bearing enough to be worth the correction: this takes the first
+   * Claude pane the map yields, which need not be the primary one — and `Project.primary_session`
+   * is in any case a field written once at project creation that commonly names a session no
+   * pane holds. Neither this rule nor that field asks whether the pane it picks has a `claude`
+   * running, which is why the pane below is a *preference*: `claude_send_lines` reroutes to a
+   * Claude that can actually receive and answers with the pane it used.
    */
   const mentionTarget = (() => {
     if (focused?.pane.kind === 'claude') return focused.pane.id
@@ -835,20 +843,27 @@ export function App() {
                   diag.log(`no Claude pane to mention ${path} into`)
                   return
                 }
-                // `claudeSend.lines` rather than `claude.mentionFile`: the latter ends in
-                // `.catch(() => {})`, so ⌥⏎ against a project whose `claude` never completed
-                // the IDE handshake resolves happily and does nothing — the silent no-op this
-                // whole round exists to end. Empty text and no line numbers is a whole-file
+                // `claudeSend.lines` is the only route now: the `claude.mentionFile` this used
+                // to have as an alternative ended in `.catch(() => {})`, so ⌥⏎ against a
+                // project whose `claude` never completed the IDE handshake resolved happily
+                // and did nothing — the silent no-op this whole round exists to end. It and
+                // its Rust command are deleted. Empty text and no line numbers is a whole-file
                 // mention. Deliberately uncaught: `Failures` turns the rejection into the
                 // sentence saying why nothing was sent.
+                //
                 // …then take the user to the pane that got it. Without this the mention lands
                 // in a prompt that may be in another tab, and Ctrl+P's ⌥⏎ looks exactly like
                 // the silent no-op it used to be — the same complaint in a new disguise. The
                 // reveal is deliberately after the send resolves: nothing should move if the
                 // send failed, and `Failures` is already reporting that.
+                //
+                // `sent.pane`, **not** `mentionTarget`: Rust reroutes when the pane named here
+                // has no `claude` on the IDE server, so revealing what we asked for would show
+                // an empty prompt while the lines sat in another conversation. See
+                // `cmd::file::claude_send_lines`.
                 void claudeSend
                   .lines(activeProjectId, mentionTarget, path, '')
-                  .then(() => revealPane(activeProjectId, mentionTarget))
+                  .then((sent) => revealPane(activeProjectId, sent.pane))
               },
               runCommand: (id) => {
                 closeOverlay()

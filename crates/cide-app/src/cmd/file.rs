@@ -15,8 +15,8 @@ use cide_core::workspace;
 use cide_core::{CoreError, Result};
 use cide_ipc::git::DiffSide;
 use cide_ipc::{
-    DiffOrigin, DiffSpec, FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId, RepoId, TabId,
-    TabKind,
+    ClaudeSendTarget, DiffOrigin, DiffSpec, FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId,
+    RepoId, TabId, TabKind,
 };
 use tauri::{Manager, State};
 
@@ -377,36 +377,17 @@ pub fn claude_selection_changed(
     );
 }
 
-/// Put `@path#L1-2` into a Claude pane's prompt.
-///
-/// The pane is chosen by the caller, not here: the frontend knows which Claude the user was
-/// last looking at, and this layer would have to guess. Lines are 1-based from the caller
-/// and 0-based on the wire, converted once at this boundary — the same convention
-/// `claude_selection_changed` uses, for the same reason.
-///
-/// `None` for both lines mentions the whole file, which is what a Ctrl+P pick means.
-#[tauri::command(rename_all = "camelCase")]
-pub fn claude_mention_file(
-    app: tauri::AppHandle,
-    project: cide_ipc::ProjectId,
-    pane: cide_ipc::PaneId,
-    path: String,
-    line_start: Option<u32>,
-    line_end: Option<u32>,
-) {
-    let Some(servers) = app.try_state::<crate::ide::IdeServers>() else {
-        return;
-    };
-    servers.at_mentioned(
-        project,
-        pane,
-        cide_ide_mcp::AtMentioned {
-            file_path: path,
-            line_start: line_start.map(|l| l.saturating_sub(1)),
-            line_end: line_end.map(|l| l.saturating_sub(1)),
-        },
-    );
-}
+// There used to be a `claude_mention_file` command here, registered in `lib.rs` and named in
+// `contract/commands.json`, whose body was `claude_send_lines`'s second half with the result
+// thrown away. **Nothing called it.** Its one frontend wrapper (`claude.mentionFile` in
+// `ipc/client.ts`) ended in `.catch(() => {})` and had no call sites either: Ctrl+P's ⌥⏎ went
+// to `claudeSend.lines` instead, precisely *because* a command that swallows its own failure
+// is indistinguishable from a control wired to nothing.
+//
+// So it is gone rather than kept as a second, quieter route into the same server — which is
+// the shape this project keeps finding: a complete, correct implementation reachable from no
+// call site, drifting away from the one that ships. Deleting it is a three-file change
+// (`lib.rs`, here, `contract/commands.json`) exactly so a reviewer sees the surface shrink.
 
 /// Why *Send lines to Claude* could not send.
 ///
@@ -429,12 +410,17 @@ pub enum ClaudeSendError {
     )]
     NoServer,
 
-    /// A server is running and the pane's `claude` is not on it.
+    /// A server is running and **no** pane in the project has a `claude` on it.
+    ///
+    /// Not "that pane's `claude` is missing" any more, and the strengthening is the routing:
+    /// [`claude_send_lines`] now walks every Claude pane in the project and stops at the first
+    /// one a notification can actually reach, so getting here means every one of them was
+    /// unreachable.
     ///
     /// The two wordings are deliberately different. Zero connections means the feature has
     /// never been reachable in this project and the user needs to start or connect a session;
-    /// a non-zero count means the plumbing works and *this* pane is the odd one out, which is
-    /// a completely different thing to go looking for.
+    /// a non-zero count means CLIs are attached but not one of them is identified with a pane,
+    /// which is a completely different thing to go looking for.
     #[error("{}", not_connected(*connections))]
     NotConnected { connections: usize },
 }
@@ -455,21 +441,156 @@ pub enum ClaudeSendError {
 /// hunting for a second pane that in that case does not exist. So the count is reported as
 /// what it is (sessions connected to this project) and the advice is the one action that fixes
 /// every variant of the case: `/ide` in the pane they meant.
+///
+/// # The `/ide` advice used to be *usually* right and is now *exactly* right
+///
+/// Before the routing in [`claude_send_lines`], a non-zero count here had two possible
+/// meanings: an unbound connection, or a perfectly good bound `claude` in some *other* pane
+/// that the caller simply had not addressed. Only the first is fixed by `/ide`, and the second
+/// was the common one — it is what the reported bug actually was. Now that every Claude pane
+/// in the project is tried before this error is produced, a non-zero count can only mean that
+/// none of the attached CLIs is identified with a pane, which is precisely the case `/ide`
+/// repairs. The sentence did not have to change to become true; the code around it did.
 fn not_connected(connections: usize) -> String {
     match connections {
         0 => "No Claude session in this project is connected to cide's IDE server. Start a \
               Claude pane (or run /ide inside one) and try again."
             .to_string(),
-        1 => "cide has no Claude bound to that pane. One session in this project is connected \
-              to the IDE server, but nothing identifies it as that pane's — run /ide in the \
-              pane you meant to send to."
+        1 => "cide has no Claude bound to any pane in this project. One session is connected \
+              to the IDE server, but nothing identifies which pane it belongs to — run /ide \
+              in the pane you meant to send to."
             .to_string(),
         n => format!(
-            "cide has no Claude bound to that pane. {n} sessions in this project are connected \
-             to the IDE server, but none of them is identified as that pane's — run /ide in \
-             the pane you meant to send to."
+            "cide has no Claude bound to any pane in this project. {n} sessions are connected \
+             to the IDE server, but nothing identifies which panes they belong to — run /ide \
+             in the pane you meant to send to."
         ),
     }
+}
+
+/// Every Claude pane in a project that a mention could go to, best first.
+///
+/// # Why this list exists at all
+///
+/// The frontend names one pane and four separate call sites derive that name by the same
+/// unwritten rule: *the focused pane if it is a Claude, otherwise `tabs[0]`'s first Claude
+/// pane in map order*. Neither half of that rule asks whether the pane it picks has a `claude`
+/// running, and it routinely picks one that does not: a Claude pane is only spawned eagerly
+/// when it holds the project's primary session or has a transcript to resume
+/// (`lifecycle::restore_for`), so every other Claude pane in a restored project sits at a
+/// **resume splash with no process at all**. `tabs[0]`'s first pane in map order is very often
+/// one of those, and the user's report — *"one session in this project is connected … but
+/// nothing identifies it as that pane's"* — is that error, verbatim, with three live Claude
+/// panes elsewhere in the same tab.
+///
+/// So the caller's pane is treated as a *preference*, not as an address, and the rest of this
+/// list is what to try when the preference cannot receive.
+///
+/// # The order, and why each rung is where it is
+///
+/// 1. **`asked`.** Always first, so nothing changes for a send that was going to work. A
+///    fallback that reordered a working case would be a behaviour change dressed as a fix.
+/// 2. **The active tab's focused pane**, if it is a Claude one. This is the app's only
+///    recency signal and it is a real one: `PaneTree::focused` is Rust-owned and moved by
+///    `pane_focus`, so in an editor tab it names the last Claude pane the user actually
+///    worked in. There is no cross-tab MRU anywhere in this app and none was invented for
+///    this — see the note below.
+/// 3. **Every other tab's focused pane**, `tabs[0]` first. Same signal, one tab further out.
+/// 4. **`tabs[0]`'s [`PaneRole::Primary`] pane.** The project's durable default: `tabs[0]` is
+///    always the pinned console and its primary pane cannot be closed.
+///
+///    Deliberately **not** `Project::primary_session`, which is the field this looks like it
+///    should use. That id is written once when the project is created and never re-pointed
+///    when a pane respawns fresh, so in a workspace that has been used it commonly names a
+///    session **no pane holds and no transcript exists for** — routing to it would address
+///    nothing at all. The pane is the durable thing; the session id on it is not.
+/// 5. **Everything else**, tab order then detached panes, so a project whose console has been
+///    rearranged still finds its remaining conversations.
+///
+/// # What this deliberately is not
+///
+/// Not a most-recently-used *store*. A store would need a subscription, a coalescer and a
+/// staleness window to hold an ordering that `PaneTree::focused` already holds durably and for
+/// free. If a true cross-tab MRU is ever wanted, the one-field version is a
+/// `Project::last_claude_pane` written in `pane_focus` — a DTO field and a codegen run, in the
+/// layer that owns durable state, not a mirror in the webview.
+///
+/// And not a connectivity check: this is a pure function of the workspace so it can be tested
+/// without an `AppHandle`. Which of these panes can actually receive is asked of the IDE
+/// server by the caller, at the moment it sends.
+fn mention_candidates(ws: &cide_ipc::Workspace, project: ProjectId, asked: PaneId) -> Vec<PaneId> {
+    let mut out: Vec<PaneId> = vec![asked];
+    let Ok(p) = workspace::project(ws, project) else {
+        return out;
+    };
+
+    let push = |pane: PaneId, out: &mut Vec<PaneId>| {
+        if !out.contains(&pane) {
+            out.push(pane);
+        }
+    };
+    let is_claude = |tab: &cide_ipc::Tab, pane: &PaneId| {
+        tab.tree
+            .panes
+            .get(pane)
+            .is_some_and(|p| p.kind == PaneKind::Claude)
+    };
+
+    // The focused pane of the active tab, then of every other tab in strip order. `tabs[0]`
+    // is the pinned console and comes first among the rest, which `Vec::contains` above makes
+    // idempotent when the active tab *is* the console.
+    let active = p.tabs.iter().find(|t| t.id == p.active_tab);
+    for tab in active.into_iter().chain(p.tabs.iter()) {
+        if is_claude(tab, &tab.tree.focused) {
+            push(tab.tree.focused, &mut out);
+        }
+    }
+
+    // The console's primary pane: the project's default conversation, named by the pane that
+    // cannot be closed rather than by a session id that may name nothing.
+    if let Some(console) = p.tabs.first()
+        && let Some(primary) = console
+            .tree
+            .panes
+            .values()
+            .find(|pane| pane.kind == PaneKind::Claude && pane.role == PaneRole::Primary)
+    {
+        push(primary.id, &mut out);
+    }
+
+    for tab in &p.tabs {
+        for pane in tab.tree.panes.values() {
+            if pane.kind == PaneKind::Claude {
+                push(pane.id, &mut out);
+            }
+        }
+    }
+    for pane in p.detached.values() {
+        if pane.kind == PaneKind::Claude {
+            push(pane.id, &mut out);
+        }
+    }
+
+    out
+}
+
+/// A pane's title, wherever in the project it lives.
+///
+/// Used only to name the destination in the sentence the frontend shows when a mention did
+/// not go where it was aimed. Falls back to the id — an unreadable but unambiguous name — for
+/// the pane that vanished between the send and this lookup, because a blank in that sentence
+/// would be worse than an ugly one.
+fn pane_title(ws: &cide_ipc::Workspace, project: ProjectId, pane: PaneId) -> String {
+    workspace::project(ws, project)
+        .ok()
+        .and_then(|p| {
+            p.tabs
+                .iter()
+                .find_map(|t| t.tree.panes.get(&pane))
+                .or_else(|| p.detached.get(&pane))
+                .map(|p| p.title.clone())
+        })
+        .unwrap_or_else(|| pane.to_string())
 }
 
 impl serde::Serialize for ClaudeSendError {
@@ -495,7 +616,7 @@ impl serde::Serialize for ClaudeSendError {
 /// 1. `selection_changed`, broadcast, so every connected `claude` in the project has the range
 ///    in its status line and agrees with what is about to be mentioned. Un-debounced, unlike
 ///    [`claude_selection_changed`] — this one is a deliberate act, not a drag.
-/// 2. `at_mentioned`, addressed to `pane`, which is what actually puts `@path#L10-20` into
+/// 2. `at_mentioned`, addressed to one pane, which is what actually puts `@path#L10-20` into
 ///    that conversation's prompt.
 ///
 /// The alternative that lost was pasting the selected *text* into the prompt. It sounds more
@@ -504,31 +625,65 @@ impl serde::Serialize for ClaudeSendError {
 /// gesture the user cannot undo and Claude cannot see the surroundings of. `claudeTasks
 /// ::explainSelection` already exists for the case where the *text* is the point.
 ///
+/// # Which pane it goes to
+///
+/// `pane` is the pane the gesture was *aimed* at, and it is tried first. When its `claude`
+/// is not on the IDE server — most often because that pane is showing a resume splash and has
+/// no process at all — the mention goes to the best other Claude pane in the same project that
+/// can receive it. [`mention_candidates`] is the ordering and states the reasoning; the answer
+/// says which pane was used and whether that was the asked-for one.
+///
+/// # Why a fallback is safe here, and would not be elsewhere
+///
+/// An `at_mentioned` **is not a turn**. It types `@path#L10-20` into a prompt box; nothing is
+/// submitted, nothing is edited, and the user can delete it. Contrast `openDiff`, which blocks
+/// an agent turn on an answer — nothing near that gets a fallback. Four properties keep this
+/// one honest, and removing any of them makes it a bad idea:
+///
+/// * **Same project only.** The IDE server is per project and token-gated, so a fallback
+///   cannot cross into another project's conversations even in principle.
+/// * **The asked-for pane always wins** when it can receive. The fallback only fires where
+///   today's behaviour is a hard error.
+/// * **Only *connected* panes are candidates** — never "some plausible pane". A pane with no
+///   `claude` on the wire is not in the list at all.
+/// * **The user is taken to where it landed and told.** The frontend reveals the returned
+///   pane and, when `fallback` is set, says which conversation got the lines. A selection that
+///   arrives in a prompt the user cannot see is exactly as useful as one that never arrived,
+///   and one that arrives in the *wrong* visible prompt is worse than either.
+///
 /// # Line numbers
 ///
 /// 1-based in, 0-based on the wire, converted here exactly once — the same boundary
-/// [`claude_mention_file`] and [`claude_selection_changed`] use. `None` for both means the
-/// whole file, so the caret sitting in a buffer mentions the file rather than one arbitrary
-/// line. Verified against `cide_ide_mcp::protocol::AtMentioned`, which documents the wire as
-/// 0-based inclusive and omits an absent bound rather than sending `null` (the CLI validates
-/// against a schema where those fields are optional but not nullable).
+/// [`claude_selection_changed`] uses. `None` for both means the whole file, so the caret
+/// sitting in a buffer mentions the file rather than one arbitrary line. Verified against
+/// `cide_ide_mcp::protocol::AtMentioned`, which documents the wire as 0-based inclusive and
+/// omits an absent bound rather than sending `null` (the CLI validates against a schema where
+/// those fields are optional but not nullable).
 ///
 /// # Not `spawn_blocking`
 ///
 /// It does no I/O. Both notifications are a `serde_json::to_string` and a push into an
 /// unbounded in-memory channel that a connection task drains; the socket write happens on the
-/// IDE runtime, not here. `file_read` and `file_write` above are the commands that touch a
-/// disk and they are the ones that go through the pool.
+/// IDE runtime, not here. The workspace snapshot the routing reads is one uncontended lock and
+/// a clone, which is what every other command in this file already does. `file_read` and
+/// `file_write` above are the commands that touch a disk and they are the ones that go through
+/// the pool.
 #[tauri::command(rename_all = "camelCase")]
+// Eight, and every one of them is a value the webview has to send: two managed-state handles,
+// the project, the pane, the path, the text and a line range. A Tauri command's arguments are
+// its wire shape, so grouping them into a struct would be a DTO to keep in step with the
+// frontend for no gain — the same call `pane_split` and `session_spawn` beside it make.
+#[allow(clippy::too_many_arguments)]
 pub fn claude_send_lines(
     app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
     project: cide_ipc::ProjectId,
     pane: cide_ipc::PaneId,
     path: String,
     text: String,
     line_start: Option<u32>,
     line_end: Option<u32>,
-) -> std::result::Result<(), ClaudeSendError> {
+) -> std::result::Result<ClaudeSendTarget, ClaudeSendError> {
     let servers = app
         .try_state::<crate::ide::IdeServers>()
         .ok_or(ClaudeSendError::NoServer)?;
@@ -553,9 +708,24 @@ pub fn claude_send_lines(
         );
     }
 
+    let ws = state.snapshot();
+    let reachable: std::collections::HashSet<String> = servers
+        .addressable_panes(project)
+        .ok_or(ClaudeSendError::NoServer)?
+        .into_iter()
+        .collect();
+
+    // The asked-for pane when nothing is reachable, so the error names the pane the user
+    // actually aimed at and the server's own dropped-notification log line says the same
+    // thing. `at_mentioned` below then produces the connection count that decides the wording.
+    let target = mention_candidates(&ws, project, pane)
+        .into_iter()
+        .find(|candidate| reachable.contains(&candidate.to_string()))
+        .unwrap_or(pane);
+
     match servers.at_mentioned(
         project,
-        pane,
+        target,
         cide_ide_mcp::AtMentioned {
             file_path: path,
             line_start: start,
@@ -566,7 +736,15 @@ pub fn claude_send_lines(
         Some(cide_ide_mcp::Delivery::NoConnection { connections }) => {
             Err(ClaudeSendError::NotConnected { connections })
         }
-        Some(cide_ide_mcp::Delivery::Sent) => Ok(()),
+        // `Sent` from a pane that was not asked for is still reported as success — it is one,
+        // the lines are in a prompt — but the answer carries enough for the caller to reveal
+        // that pane and name it. Losing either half here turns a helpful reroute into a
+        // selection that silently went somewhere else.
+        Some(cide_ide_mcp::Delivery::Sent) => Ok(ClaudeSendTarget {
+            pane: target,
+            title: pane_title(&ws, project, target),
+            fallback: target != pane,
+        }),
     }
 }
 
@@ -876,5 +1054,364 @@ mod tests {
                 "the one action that fixes every variant has to be in the sentence: {message}"
             );
         }
+    }
+
+    // --- where a mention goes when the pane it was aimed at cannot take it ------------------
+
+    /// A Claude pane with a title, so a candidate list is readable when it is wrong.
+    fn claude(title: &str) -> Pane {
+        Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Claude,
+            role: PaneRole::Auxiliary,
+            session: Some(cide_ipc::SessionId::new()),
+            title: title.into(),
+        }
+    }
+
+    fn shell(title: &str) -> Pane {
+        Pane {
+            id: PaneId::new(),
+            kind: PaneKind::Shell,
+            role: PaneRole::Auxiliary,
+            session: Some(cide_ipc::SessionId::new()),
+            title: title.into(),
+        }
+    }
+
+    /// Put `pane` in a tab beside whatever is focused there, and answer its id.
+    ///
+    /// `layout::split` focuses what it creates, so every fixture that cares about focus sets
+    /// it explicitly afterwards rather than relying on the order things were added in.
+    fn add(ws: &mut cide_ipc::Workspace, project: ProjectId, tab: TabId, pane: Pane) -> PaneId {
+        let t = workspace::tab_mut(ws, project, tab).expect("the tab exists");
+        let anchor = t.tree.focused;
+        cide_core::layout::split(
+            &mut t.tree,
+            anchor,
+            cide_ipc::Axis::Col,
+            cide_ipc::Side::After,
+            pane,
+        )
+        .expect("splits")
+    }
+
+    fn focus(ws: &mut cide_ipc::Workspace, project: ProjectId, tab: TabId, pane: PaneId) {
+        let t = workspace::tab_mut(ws, project, tab).expect("the tab exists");
+        cide_core::layout::focus(&mut t.tree, pane).expect("focuses");
+    }
+
+    /// The console pane of a fresh project: `tabs[0]`'s only pane, and the only
+    /// [`PaneRole::Primary`] one anywhere in it.
+    fn console_of(ws: &cide_ipc::Workspace, project: ProjectId) -> (TabId, PaneId) {
+        let p = workspace::project(ws, project).expect("exists");
+        (p.tabs[0].id, p.tabs[0].tree.focused)
+    }
+
+    /// Every pane of the ranking fixture below.
+    struct Ranked {
+        ws: cide_ipc::Workspace,
+        project: ProjectId,
+        console: TabId,
+        /// `tabs[0]`'s primary pane — the project's durable default. Deliberately **last** in
+        /// the console's pane map.
+        primary: PaneId,
+        /// The pane the gesture is aimed at. Named by no other rung.
+        asked: PaneId,
+        /// The console's own `tree.focused`.
+        console_focus: PaneId,
+        /// The active tab's `tree.focused`, in a second Claude tab.
+        tab2_focus: PaneId,
+        /// A console pane no rung names at all. Only the sweep reaches it.
+        unnamed: PaneId,
+    }
+
+    /// A project arranged so that **every rung of [`mention_candidates`] is observable**.
+    ///
+    /// This is the part that is easy to get wrong in a test rather than in the code. The sweep
+    /// at the end of the list reaches every Claude pane in the project, so a fixture where the
+    /// rungs happen to agree with map order produces the same *set* and very nearly the same
+    /// *order* whichever rungs are working — and a test written against it passes with the
+    /// focused-pane rule deleted, which is the rule the whole change is for. Three properties
+    /// are therefore arranged deliberately:
+    ///
+    /// * the console's pane map does **not** start with the primary pane. Real workspaces are
+    ///   like this — `PaneTree::panes` is an `IndexMap` persisted in order, and a project whose
+    ///   panes have been closed and re-added restores in whatever order it was left in — and it
+    ///   is the only arrangement in which the primary rung differs from the sweep.
+    /// * the focused panes are not the first panes in their maps.
+    /// * one pane is named by no rung, so the sweep has something of its own to contribute and
+    ///   the tests can tell "reached by its rung" from "reached at the end anyway".
+    ///
+    /// Console map order: `asked`, `console_focus`, `unnamed`, `primary`.
+    /// A second Claude tab, which is the active one, holds `tab2_focus`.
+    fn ranked() -> Ranked {
+        let (mut ws, project) = bare();
+        let (console, primary) = console_of(&ws, project);
+        let asked = add(
+            &mut ws,
+            project,
+            console,
+            claude("cide : claude — aimed at"),
+        );
+        let console_focus = add(
+            &mut ws,
+            project,
+            console,
+            claude("cide : claude — worked in"),
+        );
+        let unnamed = add(&mut ws, project, console, claude("cide : claude — idle"));
+        focus(&mut ws, project, console, console_focus);
+
+        // The primary pane to the back of the console's map. See the doc comment.
+        {
+            let t = workspace::tab_mut(&mut ws, project, console).expect("the console tab");
+            let at = t
+                .tree
+                .panes
+                .get_index_of(&primary)
+                .expect("the primary pane");
+            t.tree.panes.move_index(at, t.tree.panes.len() - 1);
+        }
+
+        // A second Claude tab, which `open_tab` makes active — so its focused pane is the
+        // "most recently used" one for the purposes of the ranking.
+        let tab2 = workspace::open_tab(
+            &mut ws,
+            project,
+            TabKind::ClaudeFull {
+                title: "review".into(),
+            },
+            claude("cide : claude — review"),
+        )
+        .expect("opens a second claude tab");
+        let tab2_focus = workspace::tab(&ws, project, tab2)
+            .expect("exists")
+            .tree
+            .focused;
+
+        Ranked {
+            ws,
+            project,
+            console,
+            primary,
+            asked,
+            console_focus,
+            tab2_focus,
+            unnamed,
+        }
+    }
+
+    /// The whole ordering, in one assertion, over a fixture where each rung answers something
+    /// the others do not.
+    ///
+    /// A vector rather than five `contains` checks, and that is the point: every rung in this
+    /// function names panes the sweep at the end would reach anyway, so membership proves
+    /// nothing at all. Only the order says which rule produced the answer — and the order is
+    /// the entire content of the function, because the first addressable candidate wins.
+    #[test]
+    fn the_candidate_order_is_asked_then_focused_then_the_projects_default() {
+        let r = ranked();
+        assert_eq!(
+            mention_candidates(&r.ws, r.project, r.asked),
+            vec![r.asked, r.tab2_focus, r.console_focus, r.primary, r.unnamed,],
+            "aimed at, then the pane the user was last in, then the console they were last in, \
+             then the project's default, then whatever is left"
+        );
+    }
+
+    /// The rule that has to keep holding: a send that was going to work is untouched.
+    ///
+    /// The fallback is only ever allowed to fire where the old code produced a hard error, so
+    /// the asked-for pane leads whatever else the project contains — including a pane that
+    /// every other rung would prefer. Anything else is a behaviour change wearing a bug fix's
+    /// clothes.
+    #[test]
+    fn the_pane_the_gesture_named_is_always_tried_first() {
+        let r = ranked();
+        for asked in [r.asked, r.unnamed, r.primary, r.console_focus] {
+            assert_eq!(
+                mention_candidates(&r.ws, r.project, asked).first(),
+                Some(&asked),
+                "whichever pane the gesture named has to be tried before any preference"
+            );
+        }
+    }
+
+    /// The workspace shape from the bug report, reduced to its bones.
+    ///
+    /// The console holds four Claude panes. The one the frontend's rule picks — `tabs[0]`'s
+    /// first in map order — is not the one the user was working in, and in the live workspace
+    /// it was a pane sitting at a **resume splash with no process at all**: a Claude pane is
+    /// spawned eagerly only when it holds the project's primary session or has a transcript to
+    /// resume, so in a restored project most Claude panes have no `claude` behind them. So the
+    /// pane the user last worked in must be tried before anything else, or the fallback walks
+    /// straight past the one conversation they meant.
+    ///
+    /// `PaneTree::focused` is the only recency signal this app has, and it is Rust-owned and
+    /// durable. No MRU store was added; see [`mention_candidates`].
+    #[test]
+    fn the_focused_claude_pane_is_the_first_thing_tried_after_the_asked_for_one() {
+        let r = ranked();
+        let order = mention_candidates(&r.ws, r.project, r.asked);
+        assert_eq!(
+            order.first(),
+            Some(&r.asked),
+            "the asked-for pane is still first"
+        );
+        assert_eq!(
+            order.get(1),
+            Some(&r.tab2_focus),
+            "then the focused pane of the tab the user is in — this is the whole fix: {order:?}"
+        );
+        assert!(
+            order.iter().position(|p| *p == r.console_focus)
+                < order.iter().position(|p| *p == r.unnamed),
+            "and the console's own focused pane outranks a console pane nothing points at: \
+             {order:?}"
+        );
+    }
+
+    /// An editor tab is the ordinary case, and it names no Claude of its own.
+    ///
+    /// The gesture is made *from an editor*, where by definition no Claude pane is focused. So
+    /// the active tab contributes nothing and the console the user last worked in is what the
+    /// send falls back to — which is a different pane from the console's first, and from its
+    /// primary.
+    #[test]
+    fn an_editor_tab_falls_back_to_the_console_the_user_last_worked_in() {
+        let mut r = ranked();
+        workspace::open_tab(
+            &mut r.ws,
+            r.project,
+            TabKind::File {
+                path: PathBuf::from("/repo/src/main.rs"),
+                dirty: false,
+            },
+            Pane {
+                id: PaneId::new(),
+                kind: PaneKind::Editor,
+                role: PaneRole::Auxiliary,
+                session: None,
+                title: "main.rs".into(),
+            },
+        )
+        .expect("opens a file tab");
+
+        let order = mention_candidates(&r.ws, r.project, r.asked);
+        assert_eq!(
+            order.get(1),
+            Some(&r.console_focus),
+            "an editor tab names no Claude, so the console's own focused pane is next: {order:?}"
+        );
+    }
+
+    /// The project's default is a **pane**, not `Project::primary_session`.
+    ///
+    /// That field is written once when the project is created and never re-pointed when a pane
+    /// respawns fresh, so in a used workspace it commonly names a session no pane holds — the
+    /// live workspace this bug was found in is exactly that, and routing to it would address
+    /// nothing at all. `tabs[0]`'s `PaneRole::Primary` pane is the durable default that is
+    /// actually true: `tabs[0]` is always the pinned console and its primary pane cannot be
+    /// closed.
+    #[test]
+    fn the_default_is_the_consoles_primary_pane_and_not_the_session_id_that_names_nothing() {
+        let mut r = ranked();
+        {
+            let p = r.ws.projects.get_mut(&r.project).expect("the project");
+            p.primary_session = cide_ipc::SessionId::new();
+        }
+        let orphan = workspace::project(&r.ws, r.project)
+            .expect("exists")
+            .primary_session;
+        assert!(
+            workspace::project(&r.ws, r.project)
+                .expect("exists")
+                .tabs
+                .iter()
+                .all(|t| t.tree.panes.values().all(|p| p.session != Some(orphan))),
+            "the fixture is only meaningful if primary_session names no pane, as it did live"
+        );
+
+        let order = mention_candidates(&r.ws, r.project, r.asked);
+        assert!(
+            order.iter().position(|p| *p == r.primary) < order.iter().position(|p| *p == r.unnamed),
+            "the console's primary pane is the project's default and is tried before the rest \
+             of the map, however stale `primary_session` is and wherever the pane sits: {order:?}"
+        );
+    }
+
+    /// Shells, editors and diffs are not conversations, and detached panes still are.
+    #[test]
+    fn only_claude_panes_are_candidates_and_a_torn_out_one_still_counts() {
+        let mut r = ranked();
+        let bash = add(&mut r.ws, r.project, r.console, shell("cide : bash"));
+        let torn = add(
+            &mut r.ws,
+            r.project,
+            r.console,
+            claude("cide : claude — detached"),
+        );
+        workspace::detach_pane(&mut r.ws, r.project, r.console, torn).expect("detaches");
+
+        let order = mention_candidates(&r.ws, r.project, r.asked);
+        assert!(
+            !order.contains(&bash),
+            "a shell has no prompt to mention into: {order:?}"
+        );
+        assert!(
+            order.contains(&torn),
+            "a pane torn into its own window is still this project's conversation: {order:?}"
+        );
+        assert_eq!(
+            order.last(),
+            Some(&torn),
+            "and it goes last, behind every docked pane: {order:?}"
+        );
+    }
+
+    /// Every rung names panes the rungs above it may already have named.
+    ///
+    /// Duplicates would be harmless to correctness and actively misleading to read. Pinned
+    /// because the obvious refactor — pushing each rung and deduplicating at the end — loses
+    /// the ordering that is the entire content of this function.
+    #[test]
+    fn a_pane_appears_exactly_once_however_many_rules_name_it() {
+        let r = ranked();
+        // Asking for the primary pane: three rules name it — the asked-for rung, the project
+        // default rung, and the sweep — and exactly one entry may result. The console's own
+        // focused pane is named twice over as well, by rung 3 and by the sweep.
+        let order = mention_candidates(&r.ws, r.project, r.primary);
+        let mut seen = order.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            order.len(),
+            "no pane may appear twice: {order:?}"
+        );
+        assert_eq!(
+            order.first(),
+            Some(&r.primary),
+            "and deduplication must not cost the ordering: the first mention of a pane is the \
+             one that counts, so a later rule naming it again may not move it: {order:?}"
+        );
+    }
+
+    /// A project id this window does not hold answers with the asked-for pane and nothing else.
+    ///
+    /// Reachable: a window can be showing a project that has since been closed, and the send
+    /// then has to end in `NoServer` or `NotConnected` rather than in a panic or an empty list
+    /// that would make the caller address nobody at all.
+    #[test]
+    fn an_unknown_project_still_yields_the_pane_that_was_asked_for() {
+        let (ws, _) = bare();
+        let asked = PaneId::new();
+        assert_eq!(
+            mention_candidates(&ws, ProjectId::new(), asked),
+            vec![asked],
+            "the caller must always have something to address, so the error names the pane \
+             the user actually aimed at"
+        );
     }
 }

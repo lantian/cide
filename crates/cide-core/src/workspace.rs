@@ -1193,13 +1193,15 @@ fn next_dot(ws: &Workspace) -> String {
 
 /// Wrap a path as a project root.
 ///
-/// `repo` stays `None`: git discovery belongs to `cide-git`, and guessing here would make
-/// the workspace file disagree with the repository the moment one is initialised.
+/// A root is a path and a label and nothing else. It used to carry a `repo: Option<RepoId>`
+/// that this function set to `None` and no other code ever set to anything — the frontend
+/// derived a context flag from it and hid every git command behind the result. See
+/// [`ProjectRoot`] for the whole account; the short version is that which repositories a
+/// project contains is a fact about the disk, so `git_repos` asks the disk.
 fn project_root(path: PathBuf) -> ProjectRoot {
     ProjectRoot {
         label: basename(&path),
         path,
-        repo: None,
     }
 }
 

@@ -30,6 +30,7 @@ import type {
 // Types only, fully erased at build time: this component must be renderable from a fixture
 // with no Rust behind it, which is why nothing here imports the `@/ipc` client itself.
 import type { Axis, SplitId } from '@/ipc/generated'
+import { lockBodyForDrag, unlockBodyAfterDrag } from '@/chrome/dragLock'
 import styles from './SplitTree.module.css'
 
 /**
@@ -171,21 +172,17 @@ export function Splitter({
       dragging.current = false
       setActive(false)
       onDragActive?.(false)
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
+      unlockBodyAfterDrag()
       if (commit) onCommit?.(split, live.current)
     },
     [onCommit, onDragActive, split],
   )
 
   // A splitter can be unmounted mid-drag by a snapshot that removes its split. Without this
-  // the body would keep `user-select: none` and a resize cursor for the rest of the session.
+  // the body would keep the selection lock and a resize cursor for the rest of the session.
   useEffect(
     () => () => {
-      if (dragging.current) {
-        document.body.style.cursor = ''
-        document.body.style.userSelect = ''
-      }
+      if (dragging.current) unlockBodyAfterDrag()
     },
     [],
   )
@@ -202,9 +199,10 @@ export function Splitter({
     setActive(true)
     onDragActive?.(true)
     // On the body, not the splitter: the pointer spends the whole drag over the panes, and
-    // without these the cursor flickers to a text caret every time it crosses one.
-    document.body.style.cursor = vertical ? 'col-resize' : 'row-resize'
-    document.body.style.userSelect = 'none'
+    // without this the cursor flickers to a text caret every time it crosses one. Through
+    // `dragLock` because the selection half of it cannot be written as `style.userSelect` in
+    // this engine and silently appears to work — see that module.
+    lockBodyForDrag(vertical ? 'col-resize' : 'row-resize')
   }
 
   const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {

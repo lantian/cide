@@ -101,6 +101,9 @@
  * the computed style; the two buttons reach back over the padding rather than owning it.
  */
 .tab {
+  /* The awaiting badge's reserved box. Named here rather than in `.awaiting` because
+     `.tabOpen` has to reach over it too, and two literals that must agree is one too many. */
+  --awaiting-w: 13px;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -134,6 +137,12 @@
  * its side of the row's padding and re-adds it internally. Net geometry is the mock's
  * 14 | dot | 9 | name | 9 | path | 9 | × | 14, with no dead strip at either end.
  *
+ * It now reaches over the awaiting badge as well, on the right, for exactly the same reason:
+ * the badge is a `span` and not a control, and without this reach the middle 22px of every
+ * project tab would light up on hover and do nothing. The badge is `pointer-events: none` and
+ * comes after this button in DOM order, so it paints on top of this padding and the click
+ * lands on the button underneath.
+ *
  * `letter-spacing: inherit` is not redundant: the UA sheet forces `letter-spacing: normal`
  * on form controls, which would swallow the active tab's .01em before it reached the text.
  */
@@ -143,7 +152,8 @@
   gap: 9px;
   height: 100%;
   margin-left: -14px;
-  padding: 0 0 0 14px;
+  margin-right: calc(-1 * (9px + var(--awaiting-w)));
+  padding: 0 calc(9px + var(--awaiting-w)) 0 14px;
   background: transparent;
   border: 0;
   color: inherit;
@@ -175,6 +185,85 @@
   height: 8px;
   flex: none;
   border-radius: 2px;
+}
+
+/*
+ * "Sessions in this project are waiting for you."
+ *
+ * The surface that did not exist. `App.tsx` renders the tab strip and the pane tree for the
+ * *active* project only, so a background project's pane markers and tab badges are painted
+ * nowhere at all — while Rust has already counted those sessions into the OS window title.
+ * The task bar said something wanted attention and no pixel in the window said which project.
+ * This tab is the only element of a background project that is drawn, so this is the only
+ * place the answer can go.
+ *
+ * # The box is reserved on every tab, filled only when it means something
+ *
+ * The same requirement as the tab strip's badge one level down, and the same reason: a marker
+ * that took its space on appearing would widen its tab and slide every tab after it sideways,
+ * and `.tabs` reflows *under the pointer* — a tab that moves while being aimed at is a tab
+ * that gets clicked wrong. Here the pointer hazard is worse than in the tab strip, because the
+ * strip *scrolls*: a tab widening mid-strip does not merely shift its neighbours, it can push
+ * the tab the user is reaching for out of the visible box entirely.
+ *
+ * The price, since nothing measures it: every project tab is `9px + 13px` = 22px wider, so
+ * roughly one fewer project tab is visible before the strip starts scrolling. The strip has a
+ * wheel handler and scrolls the active tab into view, so that costs reach rather than
+ * reachability — which is the trade the tab strip could not make and this one can.
+ *
+ * # Not the project dot
+ *
+ * Recolouring `.dot` to amber was the cheaper idea and it loses twice. The dot already means
+ * *which project this is* — it is the project's own colour, chosen per project — so painting
+ * attention into it makes one 8px square answer two questions and neither reliably. And 8px
+ * cannot hold a digit, which throws away the thing that makes this useful: a count decrements
+ * as each pane is dealt with, and that is the only progress the user gets while those panes
+ * are not rendered at all. A dot would sit unchanged until the last one and then vanish, which
+ * from the outside is indistinguishable from a stuck dot.
+ *
+ * Fixed width with `flex: none`, mono and `tabular-nums` — a digit's advance must not depend
+ * on the active tab's `font-weight: 500` and `letter-spacing: 0.01em`, or the badge would be a
+ * different size on the tab you are in. `awaitingBadge` caps the text at `9+`, which fits 13px
+ * at 9.5px mono; the tooltip carries the uncapped number.
+ *
+ * `pointer-events: none` keeps the tab one box the pointer can hit anywhere: the click lands
+ * on `.tabOpen` underneath, which reaches over this box the way `.tabClose` reaches over the
+ * padding.
+ */
+.awaiting {
+  flex: none;
+  width: var(--awaiting-w);
+  height: 13px;
+  /* Clip rather than `min-width`: if a fallback font ever makes `9+` wider than the box, a
+     clipped `+` is a cosmetic loss where a grown box moves every tab after it. */
+  overflow: hidden;
+  border-radius: 3px;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  line-height: 13px;
+  text-align: center;
+  letter-spacing: 0;
+}
+
+/*
+ * Filled amber with the background colour as the ink, exactly as the tab strip's badge and the
+ * pane title bar's marker are, so the three levels of one signal read as one signal.
+ *
+ * `--yellow` and not `--accent`: the accent is this app's *here you are* — the active project
+ * tab's own 2px top rule is drawn in it — and a mark meaning "come back to a project you are
+ * **not** in" has to be distinguishable from that at a glance, most of all when both are on
+ * the same 34px bar.
+ *
+ * The inversion is what makes one rule serve both themes; `TabStrip.module.css` states the
+ * contrast measurements, and this uses the identical pair rather than restating them.
+ */
+.awaitingOn {
+  background: var(--yellow);
+  color: var(--panel);
+  font-weight: 600;
 }
 
 .path {

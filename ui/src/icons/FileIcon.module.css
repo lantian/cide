@@ -44,5 +44,6 @@
   display: block;
   /* Dragging a row must not become dragging a picture out of the app. */
   -webkit-user-drag: none;
+  -webkit-user-select: none;
   user-select: none;
 }

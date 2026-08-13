@@ -535,6 +535,9 @@ fn fetch_with(repo: &Repository, root: &Path, remote: &str) -> Result<FetchOutco
     match push::route(repo, remote) {
         push::Route::Binary => {
             let mut command = Command::new("git");
+            // Same reason as `push_via_binary`, and the same one line: a bundled launch must
+            // not lend this `git` the AppImage's loader path. See `cide_core::child_env`.
+            cide_core::child_env::scrub_command(&mut command);
             command.current_dir(root).arg("fetch").arg(remote);
             // Same reason as `push_via_binary`: these commands are synchronous, and a `git`
             // that blocks on a tty prompt the user cannot see freezes the window for ever.

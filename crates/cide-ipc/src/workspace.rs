@@ -188,14 +188,36 @@ pub struct RecentEntry {
 }
 
 /// One root directory within a project.
+///
+/// # There is deliberately no `repo` field
+///
+/// There was one — `repo: Option<RepoId>`, documented as "`None` when the root is not inside a
+/// git repository" — and **nothing ever wrote anything but `None` into it**. Git discovery
+/// belongs to `cide-git`, which depends on `cide-core` and so cannot be called from the one
+/// constructor (`cide_core::workspace::project_root`); writing a discovered id into the
+/// workspace *file* was refused for a second and independent reason, that it would disagree
+/// with the disk the moment anyone ran `git init`.
+///
+/// The frontend trusted it anyway. `keys/target.ts::reposOf` collected the field across a
+/// project's roots, `keys/context.ts` derived the `repoOpen` context flag from the result, and
+/// every git command was gated on that flag — so the whole Git group was filtered out of the
+/// command palette on every platform, for every user, for ever, and three of the handlers bailed
+/// before acting even when reached another way. Nothing failed anywhere: a field that is always
+/// `None` looks exactly like a root that happens not to be in a repository.
+///
+/// A root also cannot *represent* the answer. A submodule has a `RepoId` and no `ProjectRoot`
+/// at all, which is why `cmd/git.rs` resolves every repository through `cide_git::repo::discover`
+/// and always did. So the field was not merely unfilled, it was the wrong shape for the
+/// question; `git_repos` is the right one, and it asks the disk.
+///
+/// Removing it needs no schema bump. `serde` ignores unknown fields, so every `workspace.json`
+/// already on disk — all of which carry `"repo": null` — still loads, and the next save drops it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ProjectRoot {
     #[ts(type = "string")]
     pub path: PathBuf,
-    /// `None` when the root is not inside a git repository.
-    pub repo: Option<RepoId>,
     /// Shown as the top-level tree row when a project has more than one root.
     pub label: String,
 }

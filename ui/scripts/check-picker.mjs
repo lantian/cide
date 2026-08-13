@@ -75,17 +75,22 @@ try {
   /* ----------------------------------------------------------------- palette ranking */
 
   // Six of the seed commands the mock's palette lists, in registry order.
+  //
+  // Every row carries a `keywords` array, empty where the registry's is: the generated
+  // `Command` always has the field, so a fixture without it would exercise a shape the
+  // palette never sees — which is the mistake `check-commands.mjs` now guards against for
+  // `ProjectRoot`, made here.
   const TABLE = [
-    { id: 'pane.split.right', title: 'Split pane right', group: 'Window' },
-    { id: 'pane.split.down', title: 'Split pane down', group: 'Window' },
-    { id: 'claude.split.newSession', title: 'Split: new Claude session', group: 'Claude' },
-    { id: 'pane.promoteToTab', title: 'Promote pane to full tab', group: 'Window' },
-    { id: 'pane.detachToWindow', title: 'Detach pane into window', group: 'Window' },
-    { id: 'terminal.splitBelow', title: 'Split terminal below', group: 'Terminal' },
-    { id: 'theme.toggle', title: 'Toggle light/dark theme', group: 'View' },
+    { id: 'pane.split.right', title: 'Split pane right', group: 'Window', keywords: [] },
+    { id: 'pane.split.down', title: 'Split pane down', group: 'Window', keywords: [] },
+    { id: 'claude.split.newSession', title: 'Split: new Claude session', group: 'Claude', keywords: [] },
+    { id: 'pane.promoteToTab', title: 'Promote pane to full tab', group: 'Window', keywords: [] },
+    { id: 'pane.detachToWindow', title: 'Detach pane into window', group: 'Window', keywords: [] },
+    { id: 'terminal.splitBelow', title: 'Split terminal below', group: 'Terminal', keywords: [] },
+    { id: 'theme.toggle', title: 'Toggle light/dark theme', group: 'View', keywords: [] },
     // Not a seed command. It is here so `new` has a mid-word competitor — without one, the
     // word-start assertion below is satisfied by any implementation that matches at all.
-    { id: 'session.renew', title: 'Renew session', group: 'Claude' },
+    { id: 'session.renew', title: 'Renew session', group: 'Claude', keywords: [] },
   ]
   const ids = (query) => searchCommands(TABLE, query).map((c) => c.id)
 
@@ -134,6 +139,69 @@ try {
   eq(ids('zzz'), [], 'no match is empty')
 
   eq(ids('SPLIT'), ids('split'), 'matching is case-insensitive')
+
+  /* -------------------------------------------- the two tiers below the title/id ones */
+
+  /*
+   * The phrase from the report that started this round, and the two tiers it needed.
+   *
+   * `create new branch` matched **nothing at all**. Every tier above matches the needle
+   * *whole* against one string, and no title contains the word `create` — the needle is not a
+   * prefix of `New branch…`, not one of its words, not a substring, not in the id, and (being
+   * longer than the title) not even a subsequence of it. The palette answered *No matching
+   * commands* about a command that exists, which is indistinguishable from the command not
+   * existing, which is the whole failure class this round is about.
+   *
+   * A separate table from `TABLE` above, deliberately: `New branch…` is a *prefix* match for
+   * `new`, so folding it into that one would have quietly moved the assertion about word-start
+   * beating mid-word onto a different pair of rows.
+   */
+  const GIT = [
+    { id: 'git.branch.switch', title: 'Switch branch…', group: 'Git', keywords: [] },
+    { id: 'git.pull', title: 'Pull (fast-forward only)', group: 'Git', keywords: ['update'] },
+    {
+      id: 'git.branch.new',
+      title: 'New branch…',
+      group: 'Git',
+      keywords: ['create', 'make', 'checkout'],
+    },
+  ]
+  const gitIds = (query) => searchCommands(GIT, query).map((c) => c.id)
+
+  eq(
+    gitIds('create new branch'),
+    ['git.branch.new'],
+    'the reported phrase finds the command it names — every word of it starts a word of the ' +
+      'title, a keyword or the id',
+  )
+  eq(
+    gitIds('create'),
+    ['git.branch.new'],
+    'a keyword matches on its own, and only for the command that declares it',
+  )
+  eq(
+    gitIds('update'),
+    ['git.pull'],
+    'a keyword the title does not contain at all — `Pull (fast-forward only)` is what the app ' +
+      'calls it and `update` is what a user calls it',
+  )
+  eq(
+    gitIds('eat'),
+    [],
+    'a keyword matches at a word boundary, not anywhere inside itself — `create` must not ' +
+      'answer to `eat`, or the tier stops discriminating',
+  )
+  eq(
+    gitIds('branch create'),
+    ['git.branch.new'],
+    'the words may be typed in any order: this tier is a set, not a sequence',
+  )
+  eq(
+    gitIds('switch to branch'),
+    [],
+    'and every word has to land — `to` is in nothing here, so a row that matched two words ' +
+      'out of three is not offered',
+  )
 
   /* ------------------------------------------------------------------------ formatting */
 

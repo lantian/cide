@@ -78,14 +78,27 @@ import {
   repoOf,
   selectedFiles,
   toggleRow,
+  toggleRows,
   viewOf,
   type Row,
 } from './model'
+import {
+  carriedIds,
+  collapseTo,
+  keySelect,
+  pressSelect,
+  pruneRowSelection,
+  releaseSelect,
+  selectAll,
+  NO_ROWS,
+  type RowSelection,
+  type SelectMods,
+} from './rowSelection'
 import { storyFromQuery, type GitStory } from './fixture'
+import type { ConfirmState } from '@/chrome/ConfirmDestructive'
 import type {
   ChangeEntry,
   ChangelistDialogState,
-  ConfirmState,
   DiffOpenMode,
   ShelfRow,
   StatusView,
@@ -133,7 +146,32 @@ export interface GitPanelModel {
   view: StatusView
   rows: Row[]
   shelf: readonly ShelfRow[]
+  /**
+   * The **ticks** — the file rows a commit would take. Not the row selection; the two are
+   * different concepts and the header of `rowSelection.ts` is the table that says how.
+   */
   selected: ReadonlySet<string>
+  /**
+   * The **row selection** — which rows a gesture is about.
+   *
+   * Held here rather than inside `ChangesTree` for three reasons, and only the first is
+   * tidiness. The context menu builds its scope in `GitPanelHost`, one level *above* the view,
+   * so anything the menu and the drag must agree on has to be visible from this hook. The tree
+   * unmounts every time the Shelf tab is opened. And a selection down in the component could
+   * not be pruned against a refresh, which happens several times a second while an agent
+   * edits.
+   */
+  selection: RowSelection
+  /**
+   * The row selection resolved to what a gesture carries — see `rowSelection.ts::carriedIds`.
+   * Memoized here because `grab` is called once per drag *and* once per context menu open.
+   */
+  carried: ReadonlySet<string>
+  /**
+   * The row the user is pointing at, by id — the cursor, which is neither a tick nor the
+   * selection. An id rather than an index; see the header of `ChangesTree`.
+   */
+  current: string | null
   expanded: ReadonlySet<string>
   /** The `ChangeEntry`s behind the ticks, in row order — what the footer counts. */
   picked: ChangeEntry[]
@@ -181,7 +219,29 @@ export interface GitPanelActions {
   refresh: () => void
   /** Re-read every repo's shelf. Called when the Shelf tab opens, and after it changes. */
   refreshShelf: () => void
+  /**
+   * Tick or untick one row's subtree. **Never touches the row selection** — a checkbox is a
+   * statement about a commit, and a click on one that also moved the selection would make
+   * ticking a file silently change what the next drag carries.
+   */
   toggleCheck: (row: Row) => void
+  /** Tick or untick every selected row at once — the Space key. Still no selection change. */
+  toggleCheckSelected: () => void
+  /** Move the cursor, and nothing else. What `onFocus` on a row calls. */
+  setCurrent: (id: string) => void
+  /**
+   * A left press on a row. Returns `true` when the collapse it implies has been **deferred**
+   * to the release — see `rowSelection.ts::PressPlan`.
+   */
+  pressRow: (id: string, mods: SelectMods) => boolean
+  /** The release of a deferred press, when the gesture did not turn out to be a drag. */
+  releaseRow: (id: string) => void
+  /** An arrow/Home/End that has already chosen its destination row. */
+  keyToRow: (id: string, mods: SelectMods) => void
+  /** Ctrl+A on the tree: every selectable row on screen. */
+  selectAllRows: () => void
+  /** Escape on the tree: back to the row the cursor is on. */
+  collapseSelection: () => void
   toggleExpand: (row: Row) => void
   setAllExpanded: (open: boolean) => void
   setMessage: (text: string) => void
@@ -303,6 +363,17 @@ export function useGitPanel(
   const [view, setView] = useState<StatusView>(initial)
   const [shelf, setShelf] = useState<readonly ShelfRow[]>(() => story?.shelf ?? [])
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => defaultSelection(initial))
+  /*
+   * The row selection and the cursor, both empty to begin with.
+   *
+   * Nothing is selected when the panel first paints, and that is the point: `defaultSelection`
+   * above *ticks* the active changelist, because "Claude edited a file, commit it" should be
+   * one click. Selecting those rows as well would mean the first drag in a session carried a
+   * changelist nobody had pointed at — which is precisely the bug that made the ticks the
+   * wrong thing to widen a drag by. The two sets start life disagreeing, deliberately.
+   */
+  const [selection, setSelection] = useState<RowSelection>(NO_ROWS)
+  const [current, setCurrentRow] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => defaultExpanded(initial))
   const [loading, setLoading] = useState(false)
   const [unavailable, setUnavailable] = useState<string | null>(null)
@@ -321,6 +392,7 @@ export function useGitPanel(
 
   const rows = useMemo(() => buildRows(view, expanded), [view, expanded])
   const picked = useMemo(() => selectedFiles(view, selected), [view, selected])
+  const carried = useMemo(() => carriedIds(rows, selection), [rows, selection])
 
   // Written by the diff pane, which is in another subtree of this same window — a module
   // store rather than a prop because the nearest common ancestor is the shell. It reaches no
@@ -453,13 +525,31 @@ export function useGitPanel(
     // and no group was ever opened: the panel painted its rows and then sat there with every
     // changelist shut and Commit disabled. See `model.ts::arrivals`.
     const fresh = arrivals(next, seenFiles.current, seenGroups.current)
+    const groups = allGroups(next)
     seenFiles.current = new Set(live)
-    seenGroups.current = allGroups(next)
+    seenGroups.current = groups
     setSelected((prev) => {
       const kept = pruneSelection(live, prev)
       for (const id of fresh.files) kept.add(id)
       return kept
     })
+    /*
+     * The row selection is pruned and never *added* to, which is the difference between it and
+     * the ticks one line up. A file that arrives in the active changelist is ticked, because a
+     * commit is what the panel is for; selecting it as well would move the drag's load and the
+     * menu's scope under the user's hand while an agent edits, several times a second.
+     *
+     * `groups` is `allGroups`, which already enumerates every expandable row id — repositories,
+     * changelists *and* directory rows — so a selected folder survives here without a second
+     * walk. Only against an authoritative payload, for the same reason `pruneTo` above is:
+     * `refresh` adopts `EMPTY` when `git status` fails, and reading that as "every row is gone"
+     * would clear a selection the user spent four ctrl-clicks building because a bash pane held
+     * an index.lock for a moment.
+     */
+    if (authoritative) {
+      const alive = new Set([...live, ...groups])
+      setSelection((prev) => pruneRowSelection(alive, prev))
+    }
     setExpanded((prev) => {
       // Identity is the bailout: this runs on every payload while an agent edits, and a new
       // Set each time would re-render the whole tree for a refresh that changed nothing.
@@ -589,6 +679,66 @@ export function useGitPanel(
   }, [schedule, story, project, adopt, absorb])
 
   const toggleCheck = useCallback((row: Row) => setSelected((prev) => toggleRow(row, prev)), [])
+
+  /*
+   * Space over a multi-row selection ticks all of it.
+   *
+   * Delegated to `model.ts::toggleRows`, and the delegation is the fix rather than a tidy-up.
+   *
+   * This was a fold — one `toggleRow` per selected row — on the reasoning that `toggleRow`
+   * owns the rule that a partly-ticked subtree *clears* rather than completes, so folding it
+   * avoided a second copy of that rule. The reasoning was right and the fold did not achieve
+   * it: a row's `files` is its whole subtree and a selection spanning a folder contains the
+   * folder *and* its children, so every file was toggled twice and came back unchanged. What
+   * survived was the inverse of the rule — any tick anywhere left the subtree fully ticked —
+   * which in this panel means silently re-ticking a file the user excluded from the commit.
+   *
+   * `toggleRows` unions the subtrees and applies the rule once, so there is genuinely one copy
+   * now. It also lives where `check-git-tree.mjs` can compile and run it; this hook is the one
+   * place the check cannot reach, which is why the defect was invisible to all 29 gates.
+   *
+   * It does not touch the selection, and the selection does not touch the ticks. That is the
+   * whole distinction this feature rests on.
+   */
+  const toggleCheckSelected = useCallback(() => {
+    setSelected((prev) => toggleRows(rows, selection.ids, prev))
+  }, [rows, selection])
+
+  const setCurrent = useCallback((id: string) => setCurrentRow(id), [])
+
+  /**
+   * A left press. The cursor always moves; what happens to the selection is `pressSelect`'s.
+   *
+   * Returns whether the collapse was deferred so the component can hand the same id back on
+   * mouseup — the state that says "a press is pending" belongs to the gesture, which is the
+   * component's, not to the model.
+   */
+  const pressRow = useCallback(
+    (id: string, mods: SelectMods) => {
+      const plan = pressSelect(rows, selection, id, mods)
+      setCurrentRow(id)
+      if (!plan.deferred) setSelection(plan.next)
+      return plan.deferred
+    },
+    [rows, selection],
+  )
+
+  const releaseRow = useCallback(
+    (id: string) => setSelection((prev) => releaseSelect(rows, prev, id)),
+    [rows],
+  )
+
+  const keyToRow = useCallback(
+    (id: string, mods: SelectMods) => {
+      setCurrentRow(id)
+      setSelection((prev) => keySelect(rows, prev, id, mods))
+    },
+    [rows],
+  )
+
+  const selectAllRows = useCallback(() => setSelection(selectAll(rows)), [rows])
+
+  const collapseSelection = useCallback(() => setSelection(collapseTo(current)), [current])
 
   const toggleExpand = useCallback((row: Row) => {
     if (!row.expandable) return
@@ -1323,6 +1473,9 @@ export function useGitPanel(
     rows,
     shelf,
     selected,
+    selection,
+    carried,
+    current,
     expanded,
     picked,
     loading,
@@ -1342,6 +1495,13 @@ export function useGitPanel(
     },
     refreshShelf,
     toggleCheck,
+    toggleCheckSelected,
+    setCurrent,
+    pressRow,
+    releaseRow,
+    keyToRow,
+    selectAllRows,
+    collapseSelection,
     toggleExpand,
     setAllExpanded,
     setMessage,

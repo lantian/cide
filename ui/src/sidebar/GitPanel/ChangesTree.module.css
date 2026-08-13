@@ -10,6 +10,29 @@
   overflow-x: hidden;
   padding: 4px 0;
   background: var(--panel);
+  /*
+   * No text selection in this tree, ever — not only while a drag is in flight.
+   *
+   * It used to be `.tree[data-dragging]`, and that could not have worked even in an engine
+   * that parsed it. `data-dragging` is written from `drag.state`, which `useChangesDrag` sets
+   * only after the press has travelled 4px *and* React has committed; WebKit decides whether a
+   * mousedown may begin a selection at mousedown, from the hit node's computed style
+   * (`mouseDownMayStartSelect`). A rule that appears two frames later neither aborts the
+   * selection already in flight nor clears it — it could only ever have suppressed the second
+   * half of one that had already started. Worse, a *modified* press never set the flag at all
+   * (`useChangesDrag` returns early on Ctrl/Shift/Alt/Meta), so shift-drag — the exact gesture
+   * a user reaches for to select several rows — ran with the default behaviour intact.
+   *
+   * Unconditional is also simply the right rule: a 24px checkbox row is a control, not a
+   * paragraph. Nobody copies text out of this tree; *Copy Path* on the row menu is how a path
+   * leaves it.
+   *
+   * The prefix is load-bearing, not belt-and-braces: WebKitGTK 2.52.3 drops the unprefixed
+   * declaration on the floor. The full argument, and the dev/release asymmetry that hid it, is
+   * in `styles/tokens.css`.
+   */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* The gap is the space between twisty, box and name. */
@@ -75,19 +98,36 @@
    group keeps its own ground and gains the hover on top of it. */
 
 /*
- * The current row — what a click points at, which is *not* what the ticks say will be
- * committed. It has to survive focus leaving the tree (a context menu takes focus, and so
- * does the commit message box), so it cannot be `:focus` alone.
+ * The selection band, and the cursor's leading rule — two rules, because this tree now has
+ * two things to say and a multi-row selection is where they come apart.
  *
- * The same band and the same 2px leading rule the explorer and the search results use, so
- * one selection means one thing in all three sidebars. Both themes define `--sel` and
- * `--accent`; the rule is an inset shadow rather than a border so nothing shifts sideways
- * when a row becomes current.
+ * `.rowSelected` is every row in the selection: the files and folders a drag would carry and
+ * the context menu would act on. `.rowCurrent` is the one row the arrows move from and Space
+ * acts through. They coincide for a single click, which is why one class did for as long as
+ * "selection" meant "the row you clicked".
  *
- * It sits *after* `.groupRow` deliberately: these are single-class selectors of equal
- * specificity, so source order is what decides, and a group row that stayed `--panel-2`
- * while current would be the one row kind with no visible cursor.
+ * Neither is what the *ticks* say will be committed. That is the checkbox column, and keeping
+ * the two legible apart is the reason the band is a ground and not a checkmark.
+ *
+ * The current row has to survive focus leaving the tree (a context menu takes focus, and so
+ * does the commit message box), so this cannot be `:focus` alone.
+ *
+ * The same band and the same 2px leading rule the explorer and the search results use, so one
+ * selection means one thing in all three sidebars. Both themes define `--sel` and `--accent`;
+ * the rule is an inset shadow rather than a border so nothing shifts sideways when a row
+ * becomes current.
+ *
+ * Both sit *after* `.groupRow` deliberately: these are single-class selectors of equal
+ * specificity, so source order is what decides, and a group row that stayed `--panel-2` while
+ * current would be the one row kind with no visible cursor. `.rowCurrent` sits after
+ * `.rowSelected` for the same reason — a current row that is *also* selected takes the band
+ * from one and the rule from the other, and `background` is declared by both.
  */
+.rowSelected,
+.rowSelected:hover {
+  background: var(--sel);
+}
+
 .rowCurrent,
 .rowCurrent:hover {
   background: var(--sel);
@@ -364,14 +404,12 @@
 
 /* While a drag is in flight the hover wash would follow the pointer alongside the drop
    outline — two bands, two claims about what is happening. The row under the pointer is
-   already saying the true one. `user-select` because a drag across labels otherwise selects
-   the text it crosses and leaves it selected afterwards. */
+   already saying the true one. */
 .tree[data-dragging] .row:hover {
   background-image: none;
 }
 
 .tree[data-dragging] {
-  user-select: none;
   cursor: grabbing;
 }
 

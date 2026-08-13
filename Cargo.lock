@@ -619,6 +619,7 @@ dependencies = [
 name = "cide-claude"
 version = "0.1.0"
 dependencies = [
+ "cide-core",
  "cide-ide-mcp",
  "cide-ipc",
  "cide-pty",

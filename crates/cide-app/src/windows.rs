@@ -432,6 +432,56 @@ pub fn set_title(app: &AppHandle, label: &WindowLabel, title: &str) {
     }
 }
 
+/// Ask the desktop to mark one window as wanting the user, or stop asking.
+///
+/// # Why the title was not enough, which is what was actually reported
+///
+/// [`title_with`] and [`set_title`] were already correct and already running: every report,
+/// every detach, every child death recomputes the string and applies it. The report was that
+/// nothing changed *in the task bar*, and both halves of that are true at once — because a
+/// task bar is not obliged to render a window's title. Plasma's default Task Manager is
+/// **Icons-only**, where the title appears in a tooltip and nowhere else; GNOME's overview
+/// shows it only when the window is displayed as a thumbnail. Setting a string is a message to
+/// a surface the user may not have.
+///
+/// The signal a task bar *does* render, in every environment, is the urgency hint —
+/// `_NET_WM_STATE_DEMANDS_ATTENTION` on X11, `xdg_toplevel` activation under Wayland — which
+/// is what makes a task entry light up, bounce, or bold itself. Nothing in this tree ever
+/// asked for it. The note beside [`raise`] shows it was known about and only ever met as an
+/// accident of `set_focus`.
+///
+/// # Why this cannot become a nuisance
+///
+/// `request_user_attention` is documented as **having no effect while the application is
+/// focused**, so the window the user is working in cannot flash at them for a turn they
+/// watched finish. That is the whole of the "do not interrupt someone who is already here"
+/// requirement, and it costs no state of our own to get.
+///
+/// [`UserAttentionType::Informational`] rather than `Critical`: a finished turn is news, not
+/// an emergency. On Windows the difference is flashing the task bar button rather than the
+/// window as well; on Linux the runtime documents both levels as the same hint, so the choice
+/// costs nothing there and says the right thing everywhere else.
+///
+/// # Unsetting is required, not optional
+///
+/// Tauri's own doc: *"Unsetting the request for user attention might not be done automatically
+/// by the WM when the window receives input."* So a hint raised once could otherwise stay lit
+/// on a window the user has read, for the life of the process — a permanent "come back here"
+/// is worse than no signal at all, because it is the signal that teaches people to stop
+/// looking. Two things clear it: this being called with `false` whenever the count reaches
+/// zero, and `WindowEvent::Focused(true)` in `lib.rs`, which is the user answering it.
+pub fn demand_attention(app: &AppHandle, label: &WindowLabel, wanted: bool) {
+    let Some(window) = app.get_webview_window(label.as_str()) else {
+        return;
+    };
+    let request = wanted.then_some(tauri::UserAttentionType::Informational);
+    if let Err(error) = window.request_user_attention(request) {
+        // Same disposition as `set_title` above and for the same reason: this is a courtesy to
+        // the desktop, and a window that closed between the lookup and the call is ordinary.
+        tracing::debug!(%label, %error, wanted, "could not set a window's urgency hint");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BG_DARK, BG_LIGHT};

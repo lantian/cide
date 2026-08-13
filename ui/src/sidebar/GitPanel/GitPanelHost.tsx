@@ -81,15 +81,18 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
 
       const path = entry.path
       /*
-       * Which files this gesture is about — the row alone, or the ticks in the same repo when
-       * the row is one of them. The count goes in the label; see `dragDrop.ts::grab`.
+       * Which files this gesture is about — the row alone, or the whole row selection in the
+       * same repo when the row is part of it. The count goes in the label; see
+       * `dragDrop.ts::grab`.
        *
        * Through `grab`, which is also what a *drag* from this row picks up. The two routes to
        * "move these files" are then the same set by construction rather than by two
        * implementations that agree today: a menu that moved four files where a drag moved one
-       * would be the panel disagreeing with itself about what the user is pointing at.
+       * would be the panel disagreeing with itself about what the user is pointing at. That
+       * is also why `git.carried` is threaded from the model rather than derived here — one
+       * resolution of the selection, read by both routes.
        */
-      const carried = grab(git.view, git.selected, row)
+      const carried = grab(git.view, git.carried, row)
       const scope = { repo: row.repo, paths: carried?.files.map((f) => f.path) ?? [path] }
       const staged = entry.index !== 'unmodified'
       const unstaged = entry.worktree !== 'unmodified'
@@ -187,7 +190,7 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
  * `grab` supplies the files, so the menu moves exactly what a drag from the same row would.
  */
 function dirMenu(row: Row, git: ReturnType<typeof useGitPanel>): MenuEntry[] {
-  const carried = grab(git.view, git.selected, row)
+  const carried = grab(git.view, git.carried, row)
   const paths = carried?.files.map((f) => f.path) ?? []
   const count = paths.length
   const path = row.path ?? row.label

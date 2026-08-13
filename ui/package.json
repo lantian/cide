@@ -9,6 +9,7 @@
     "check:branches": "node scripts/check-branches.mjs",
     "check:close": "node scripts/check-close-confirm.mjs",
     "check:commands": "node scripts/check-commands.mjs",
+    "check:css-prefix": "node scripts/check-css-prefix.mjs",
     "check:diff": "node scripts/check-diff-selection.mjs",
     "check:diff-render": "node scripts/check-diff-render.mjs",
     "check:editor": "node scripts/check-editor.mjs",

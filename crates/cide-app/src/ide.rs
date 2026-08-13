@@ -201,6 +201,36 @@ impl IdeServers {
         }
     }
 
+    /// Forget a reaped child's pane binding, in whichever project holds it.
+    ///
+    /// Not `unbind_pane(project, pid)`, and the missing argument is the point: pids are
+    /// unique across the machine, so the pid alone identifies the binding, and the caller —
+    /// `lifecycle::report_exit`, on `cide-pty`'s reaper thread — has a `SessionId` and no
+    /// project. Threading the project down to it would mean taking the workspace lock on a
+    /// reaper thread to answer a question the pid already answers.
+    ///
+    /// Sweeping every server is the honest shape for that: at most a handful of servers, one
+    /// map removal each, and a pid that is not in a server's map costs a hash lookup.
+    pub fn unbind_pid(&self, pid: u32) {
+        for entry in self.servers.iter() {
+            entry.server.unbind_pane(pid);
+        }
+    }
+
+    /// Which of this project's panes an addressed notification can actually reach.
+    ///
+    /// `None` when the project has no server at all — the same distinction `at_mentioned`
+    /// draws, and for the same reason: "cide could not start an IDE server" and "no `claude`
+    /// is on it" are different sentences and only the caller can put either on screen.
+    ///
+    /// Pane ids as strings, because that is the currency `cide-ide-mcp` deals in; compare
+    /// against `PaneId::to_string()` exactly as [`Self::bind_pane`] produces it.
+    pub fn addressable_panes(&self, project: ProjectId) -> Option<Vec<String>> {
+        self.servers
+            .get(&project)
+            .map(|entry| entry.server.addressable_panes())
+    }
+
     /// Tell every connected `claude` in a project where the editor selection is.
     ///
     /// Returns how many CLIs it reached; `None` when the project has no server at all. The

@@ -145,13 +145,18 @@ export function focusedFilePath(boot: Bootstrap | null): string | null {
   return tab.kind.path
 }
 
-/** Every repository in the project this window is showing, in root order. */
-export function reposOf(boot: Bootstrap | null): string[] {
-  const project = activeProjectOf(boot)
-  if (project === null) return []
-  const seen: string[] = []
-  for (const root of project.roots) {
-    if (root.repo !== null && !seen.includes(root.repo)) seen.push(root.repo)
-  }
-  return seen
-}
+/*
+ * There is deliberately no `reposOf` here any more, and no repository fact of any kind.
+ *
+ * It existed, it collected `ProjectRoot.repo` across a project's roots, and it returned `[]`
+ * for every project any build has ever opened — Rust set that field to `None` in its one
+ * constructor and nowhere else set it at all (see `cide_ipc::workspace::ProjectRoot`, which no
+ * longer has the field). `context.ts` derived `repoOpen` from the length of that list, every
+ * git command was gated on `repoOpen`, and so the whole Git group *and* `sidebar.git` were
+ * filtered out of the command palette for everybody, for ever, with nothing failing anywhere.
+ *
+ * Which repositories a project contains is a question about the disk — `git init` in a bash
+ * pane changes the answer, and no event this side subscribes to reports it — so it is asked
+ * over IPC at the moment a command runs, by `git_repos`. A mirror of it here would be a cache
+ * with no invalidation, which is the same bug again with a fresher-looking value in it.
+ */

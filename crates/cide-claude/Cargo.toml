@@ -7,6 +7,11 @@ license.workspace = true
 
 [dependencies]
 cide-ipc = { workspace = true }
+# For `child_env` only: the one-shot lane spawns `claude` with `std::process::Command`, and a
+# cide launched from its AppImage must not lend that child the bundle's `PYTHONHOME` — it
+# kills every stdio MCP server the run would have loaded. The rule lives in `cide-core`
+# because four spawn sites in three crates need the same answer.
+cide-core = { workspace = true }
 # Two things, both of which would otherwise be copied rather than shared: the ESRCH-only pid
 # liveness rule (`lockfile::pid_is_alive`) that the hook-socket sweep needs, and
 # `protocol::SUPPORTED_CLI`, the verified CLI range `version::check_once` warns outside of.
