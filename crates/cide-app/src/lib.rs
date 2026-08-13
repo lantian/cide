@@ -366,34 +366,50 @@ pub fn run() {
                 }
 
                 /*
-                 * The user came to the window, so it stops demanding them.
+                 * Where the user is, which is half of whether a window should be asking for
+                 * them.
                  *
-                 * This is the other half of `windows::demand_attention` and it is required
-                 * rather than tidy: Tauri's own documentation says a window manager "might not"
-                 * clear the urgency hint when the window receives input, and on the compositors
-                 * this app runs on it frequently does not. Without this line a task entry lit
-                 * once would stay lit until the process ended — a permanent "come back here",
-                 * which is exactly the signal that teaches a user to stop looking at the field.
+                 * **Both directions, and the `false` one is the fix for "i saw it once only".**
+                 * The old arm was `Focused(true)` alone, lowering the urgency hint because
+                 * Tauri documents that a window manager "might not" clear it on input. That
+                 * half is still here and still required. What was missing is that an urgency
+                 * hint on the *active* window is meaningless — KWin's `demandAttention` starts
+                 * `if (isActive()) set = false;` — so the request made the instant a turn
+                 * finished was **dropped** whenever the user happened to be in the window, and
+                 * the old comment here ("the hint goes back up when the count next changes")
+                 * was wrong about the one case that matters: for a session that is already
+                 * waiting, the count never changes again. The user's loop after the first turn
+                 * is come back, read it, type the next thing, stay in the window while it runs
+                 * — so every turn after the first raised a hint into a focused window, had it
+                 * dropped, and nothing re-asked when they walked away.
                  *
-                 * Deliberately **only the hint**, and not the awaiting set. Coming to a window
-                 * is not "I have read every session in it": a shell holds every tab of every
-                 * project it shows, and clearing those markers on a window focus would wipe the
-                 * pane and project badges for conversations the user has not opened. Those
-                 * clear per pane, on a click or a keystroke into that pane, which is the act
-                 * that actually means someone read it. The hint is about the *window*; the
-                 * markers are about the sessions.
+                 * So the hint is a level now, not an edge: `focus_changed` records where the
+                 * user is and re-runs `retitle`, which recomputes both surfaces of every
+                 * window from `windows::announce`. Coming to a window lowers its hint; leaving
+                 * a window that still holds an unread finished turn raises it.
                  *
-                 * `Focused(false)` is not handled: a window losing focus has not gained a
-                 * reason to shout, and re-raising the hint there would flash every task entry
-                 * every time the user alt-tabbed away. The hint goes back up when the count
-                 * next changes, through `retitle`.
+                 * Deliberately **still only the window's own surfaces**, and not the awaiting
+                 * set. Coming to a window is not "I have read every session in it": a shell
+                 * holds every tab of every project it shows, and clearing those markers on a
+                 * window focus would wipe the pane and project badges for conversations the
+                 * user has not opened. Those clear per pane, on a click or a keystroke into
+                 * that pane, which is the act that actually means someone read it. The hint is
+                 * about the *window*; the markers are about the sessions.
                  */
-                tauri::WindowEvent::Focused(true) => {
-                    crate::windows::demand_attention(
+                tauri::WindowEvent::Focused(has_focus) => {
+                    cmd::window::focus_changed(
                         window.app_handle(),
                         &cide_ipc::WindowLabel(window.label().to_string()),
-                        false,
+                        *has_focus,
                     );
+                }
+
+                // A window that has gone takes its focus record with it, so a reused label
+                // can never inherit "the user is already in there" and fall silent for ever.
+                tauri::WindowEvent::Destroyed => {
+                    crate::windows::forget_focused(&cide_ipc::WindowLabel(
+                        window.label().to_string(),
+                    ));
                 }
 
                 _ => {}

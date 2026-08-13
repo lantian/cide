@@ -132,6 +132,76 @@ try {
     'the ordinary loop — reply, wait, finish — raises the marker every time round',
   )
 
+  // --- the loop, driven for real ------------------------------------------------------------
+  //
+  // > "i saw it once only, and after i've focused - nothing more calling me in title, or panel
+  // >  - it seems that after first run it failes to work again"
+  //
+  // The assertions above this line are each one step of that loop. This one drives the whole
+  // thing, several times round, because **one turn is the turn that works** — a feature that
+  // announces itself exactly once passes every single-turn test there is, and this one shipped
+  // with tests that passed. Each round is the complete sequence a real turn produces: the
+  // user's keystroke acknowledges, `UserPromptSubmit` makes it busy, tool calls keep it busy,
+  // `Stop` ends it. The state after every `Stop` is `awaiting`, and it is the *same* state
+  // every time — not merely truthy the first time.
+  let track = replay('spawning', 'idle', 'busy', 'idle') // the first turn has just finished
+  const step = (turn, at) => ({ turn, at, awaiting: track.awaiting, ranATurn: track.ranATurn })
+  const turns = [step(1, 'finished')]
+  for (let turn = 2; turn <= 5; turn++) {
+    track = onAcknowledge(track) // the user clicks into the pane
+    turns.push(step(turn, 'acknowledged'))
+    track = onState(track, 'busy') // UserPromptSubmit: they typed the next thing
+    track = onState(track, 'busy') // PreToolUse / PostToolUse: same state, no news
+    turns.push(step(turn, 'working'))
+    track = onState(track, 'idle') // Stop
+    turns.push(step(turn, 'finished'))
+  }
+  eq(
+    turns.filter((t) => t.at === 'finished' && !t.awaiting),
+    [],
+    'EVERY finished turn raises the marker. A turn that finishes silently after the first is ' +
+      'the whole of the reported bug, and it is invisible to any test that drives one turn',
+  )
+  eq(
+    turns.filter((t) => t.at !== 'finished' && t.awaiting),
+    [],
+    'and nothing else raises it: a marker that never came down would announce a session that ' +
+      'is mid-turn, which is worse than announcing nothing',
+  )
+  eq(
+    turns.filter((t) => !t.ranATurn),
+    [],
+    'the one bit of history the whole rule turns on survives every step of every turn. An ' +
+      'acknowledgement that cleared it would make the next `idle` look like a session that ' +
+      'had never run — the same "announced itself once" symptom by a different road',
+  )
+  eq(
+    track,
+    onState(onState(onAcknowledge(replay('spawning', 'idle', 'busy', 'idle')), 'busy'), 'idle'),
+    'the fifth finished turn is in exactly the state the second one was — the loop has no ' +
+      'residue, so there is nothing that could wear out',
+  )
+  // The same loop with Rust's authoritative set in the middle of it, since that is what the
+  // running app does: the window reports, Rust aggregates, Rust broadcasts, the window merges
+  // the answer back over its own table. A merge that lost `ranATurn` would make the NEXT
+  // `Stop` look like a session that had never run, which is the same one-shot symptom
+  // arriving by a different road.
+  let round = new Map([['s', replay('spawning', 'idle', 'busy', 'idle')]])
+  for (let turn = 1; turn <= 3; turn++) {
+    round = mergeAuthoritative(round, ['s']) // Rust echoes the raise back
+    round.set('s', onAcknowledge(round.get('s'))) // the user reads the pane
+    round = mergeAuthoritative(round, []) // and Rust echoes the clear back
+    eq(awaitingIn(round, ['s']), 0, `turn ${turn}: a session that has been read is not counted`)
+    round.set('s', onState(round.get('s'), 'busy'))
+    round.set('s', onState(round.get('s'), 'idle'))
+    eq(
+      awaitingIn(round, ['s']),
+      1,
+      `turn ${turn}: the next turn ending must raise it again even after a full round trip ` +
+        `through Rust's set — the broadcast carries no history, and the merge must not eat it`,
+    )
+  }
+
   // --- the cross-window merge ---------------------------------------------------------------
   //
   // Rust holds the authoritative set and re-broadcasts it, because a window opened after a
@@ -489,11 +559,31 @@ try {
     )
     failed++
   }
-  if (!rust('crates/cide-app/src/lib.rs').includes('WindowEvent::Focused(true)')) {
+  // 5. …and the hint is a LEVEL, not an edge. This is the fix for "i saw it once only, and
+  //    after i've focused - nothing more calling me in title, or panel". An urgency hint on
+  //    the *active* window is dropped rather than deferred (KWin's `demandAttention` opens
+  //    `if (isActive()) set = false;`), and the toolkit caches the flag, so a raise made while
+  //    the user sits in the window is thrown away AND makes the next raise a no-op. The old
+  //    code asked exactly once, at the instant the waiting count moved, and handled only
+  //    `Focused(true)` — so every turn after the first, which is every turn that finishes
+  //    while the user is in the window, was announced to nobody and never re-announced when
+  //    they walked away. Both halves are pinned: the decision knows about focus, and both
+  //    directions of the focus event reach the recompute.
+  const lib = rust('crates/cide-app/src/lib.rs')
+  if (!body.slice(0, body.indexOf('\n}\n')).includes('windows::announce(')) {
     console.error(
-      'FAIL focusing a window clears its urgency hint\n' +
-        '  lib.rs has no Focused(true) arm. Tauri documents that a window manager MIGHT NOT ' +
-        'clear the hint on input, so a task entry lit once stays lit for the life of the run',
+      'FAIL the urgency hint is decided by `windows::announce`, which knows about focus\n' +
+        '  cmd/window.rs computes it some other way. A bare `count > 0` asks a focused window ' +
+        'to flash, the window manager drops the request, and nothing ever asks again',
+    )
+    failed++
+  }
+  if (lib.includes('WindowEvent::Focused(true) =>') || !lib.includes('focus_changed(')) {
+    console.error(
+      'FAIL both directions of WindowEvent::Focused recompute what a window announces\n' +
+        '  lib.rs handles only the focus ARRIVING. Losing it is the moment a window holding ' +
+        'an unread finished turn has to start calling the user, and it is the only moment ' +
+        'left: a session that is already waiting never moves the count again',
     )
     failed++
   }

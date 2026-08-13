@@ -305,12 +305,21 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
     windows::awaiting_sessions()
 }
 
-/// Recompute every window's title **and its urgency hint** from the workspace and the waiting
-/// set.
+/// Recompute every window's title **and its urgency hint** from the workspace, the waiting
+/// set and the focus.
 ///
-/// Called after a report and after any mutation that moves a pane between windows, because
-/// both change the answer: detaching a waiting pane has to take the `Awaiting: 1` out of the
-/// shell's title and put it in the new window's.
+/// Called after a report, after any mutation that moves a pane between windows, and on every
+/// `WindowEvent::Focused` — all three change the answer. A detach has to take the
+/// `Awaiting: 1` out of the shell's title and put it in the new window's; a focus change has
+/// to move the hint, because a window the user is in must not ask for them and a window they
+/// have just left must, if it is still holding a finished turn they have not read.
+///
+/// **Everything this computes is a level, never an edge.** That is the correction to the
+/// reported bug and the property to preserve: nothing here remembers what it announced last
+/// time, so there is no state to get stuck and no "it already fired" to be wrong about. Every
+/// call recomputes both surfaces for every window from the current facts, and the cost of the
+/// ones that did not move is a `set_title` with the string it already has. See
+/// [`windows::announce`] for why the hint could not stay an edge.
 ///
 /// The two go together deliberately and must stay together. They are one fact — *does this
 /// window hold a session that wants the user* — asked once and applied to the two surfaces the
@@ -334,15 +343,40 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
 ///   windows is the truth rather than a multiple of it.
 pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
     for (label, role) in &ws.windows {
-        let base = title_for(ws, role);
         let count = windows::awaiting_among(&sessions_of(ws, role));
-        windows::set_title(app, label, &windows::title_with(&base, count));
-        // Unconditionally, both ways round. Raising it repeatedly while the count stays
-        // positive is free — the WM already holds the hint and the call is a no-op on a
-        // focused window — while *not* lowering it the moment the count reaches zero would
-        // leave a task entry lit for a window with nothing left to come back to.
-        windows::demand_attention(app, label, count > 0);
+        // One call for both surfaces, so they cannot be computed from two different readings
+        // of the same facts. The focus is read per window: "is the user here" is a question
+        // about one OS window, not about the application.
+        let say = windows::announce(&title_for(ws, role), count, windows::is_focused(label));
+        windows::set_title(app, label, &say.title);
+        windows::demand_attention(app, label, say.attention);
     }
+}
+
+/// The desktop moved the focus into or out of one of our windows.
+///
+/// Both directions, and the `false` one is the fix: a window the user has just walked away
+/// from, still holding a session that finished its turn and has not been read, has to start
+/// asking for them. Nothing else will ever ask on its behalf — the waiting count does not
+/// move again for a session that is already waiting, so before this the only opportunity to
+/// raise the hint was the instant the turn ended, and if the user happened to be in the
+/// window at that instant the request was dropped by the window manager and never remade.
+/// That is "i saw it once only": the first turn is the one you start before walking away, and
+/// every turn after it ends with you sitting right there.
+///
+/// A whole [`retitle`] rather than a poke at one window's hint, because the answer is a level
+/// over facts this does not own and the cheapest correct thing is to recompute it. A focus
+/// change is a human-scale event; the work is a mutex, a few string builds and a `set_title`
+/// per window with the string it already has.
+///
+/// `try_state` because window events are delivered from the moment a window exists, which can
+/// precede `manage` during startup. No workspace means no windows to title.
+pub(crate) fn focus_changed(app: &AppHandle, label: &WindowLabel, has_focus: bool) {
+    windows::set_focused(label, has_focus);
+    let Some(state) = app.try_state::<WorkspaceState>() else {
+        return;
+    };
+    retitle(app, &state.snapshot());
 }
 
 /// The sessions one window is showing.
