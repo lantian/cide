@@ -89,6 +89,60 @@ CIDE_AUDIT_PANES=1 ./target/debug/cide # re-check the pane host registry under c
 CIDE_AUDIT_WINDOWS=1 ./target/debug/cide # re-check detach/re-dock and window modes
 ```
 
+## Verifying the Claude Code CLI
+
+The IDE integration is reverse-engineered from a surface that is undocumented, unversioned and
+self-updating. There is no protocol-generation field anywhere in the CLI, so the only question
+that can be answered is not "which protocol is this" but **"is this a version anybody checked"**.
+
+```sh
+cargo xtask verify-cli              # rebuild, then check the installed CLI
+cargo xtask verify-cli --no-build   # reuse what is already compiled
+```
+
+It preflights before spending anything. `claude` must be on `PATH`, and so must `script(1)`:
+the CLI opens an IDE connection only from its interactive UI — a `-p` run opens no socket at
+all — so the check needs a pty, and `script` is how it gets one. The binary it chose and what
+`claude --version` says are printed *before* the run, so a hang has a version attached to it in
+the scrollback.
+
+Then one test: a real `claude` under a pty, which must find our lockfile, choose the WebSocket
+transport, send the `x-claude-code-ide-authorization` header and complete the MCP handshake.
+**It types no prompt.** No model is called and nothing is billed, which is what lets this be a
+hard failure rather than a skip — the expensive test beside it,
+`the_real_cli_round_trips_a_diff_three_ways`, spends a model turn and skips on anything it does
+not recognise, and a skip-shaped version check is worth nothing.
+
+**The handshake is checked before the version, and that order is load-bearing.** A green version
+check on a build whose protocol had already broken would be a confident lie.
+
+|                      | version in the record                  | version past it                                              |
+| -------------------- | -------------------------------------- | ------------------------------------------------------------ |
+| **handshake OK**     | pass                                   | fail — append the version, with this run as its evidence      |
+| **handshake broken** | fail loudest — the record is a lie      | fail — real drift: read the transcript, fix `protocol.rs`, *then* append |
+
+To record a new version, append it to `SUPPORTED_CLI` in `crates/cide-ide-mcp/src/protocol.rs`
+and put the run's output in the module comment above it. That comment is the evidence trail, and
+it is worth reading before assuming a release is harmless: 2.1.227 changed nothing in the IDE
+protocol but *did* begin rejecting `--resume <id> --session-id <new>`, which broke resume until
+`cide_claude::session` was corrected.
+
+The record is **never enforced**. Refusing to run outside the range would break the app roughly
+every fortnight to protect a feature that mostly keeps working across releases, so the strongest
+thing here is a warning: a protocol change should degrade the diff view, never break the terminal.
+
+### What a user sees
+
+A green test says nothing about *someone else's* machine, and a test that wrote into the app's
+settings would be recording a claim about a developer's laptop into a file a user then reads. So
+the two halves are separate. At runtime the app writes whichever `claude` last completed a real
+IDE handshake **on this machine** to `claude-handshake.json` in the state directory, and Settings
+shows it with a badge saying whether that version is one this build was verified against.
+
+Neither half reads `~/.claude/.credentials.json` and neither sets `ANTHROPIC_API_KEY`. The child
+authenticates by inheriting the environment; that is the only supported path, and injecting a key
+would silently bill a Console org for a user on a subscription.
+
 ## Quitting and coming back
 
 cide runs **no background daemon**: quitting quits its Claude sessions. What survives is the
