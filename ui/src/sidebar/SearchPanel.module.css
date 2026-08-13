@@ -1,10 +1,10 @@
 /*
  * The 252px search panel.
  *
- * The width, the 30px uppercase header and the 21px mono rows are the Explorer's, restated
+ * The width, the 30px uppercase header and the 24px rows are the Explorer's, restated
  * rather than imported: `FileTree.module.css` is that component's private surface, and two
  * panels sharing one module would make every change to the tree a change here. What must not
- * drift is `--w-sidebar-files` and the 21px row, which is why both come from the token and
+ * drift is `--w-sidebar-files` and the 24px row, which is why both come from the token and
  * from a comment naming the file that agrees with them.
  *
  * Every colour is a token from `styles/tokens.css`, so both themes work without a second rule
@@ -134,7 +134,7 @@
   width: 100%;
 }
 
-/* Both row kinds are absolutely positioned by the virtualizer and are 21px tall. */
+/* Both row kinds are absolutely positioned by the virtualizer and are 24px tall. */
 .fileRow,
 .hitRow {
   position: absolute;
@@ -227,15 +227,19 @@
   align-items: center;
   justify-content: center;
   /* Full row height, as in the explorer: a flex item is as tall as its content, and with the
-     glyph gone that is the 5px of the triangle. */
+     glyph gone that is the 4px of the triangle. */
   align-self: stretch;
   font-size: 0;
   color: var(--faint);
 }
 
-/* 5×7 and 7×5 against a 21px row and an 11px box, all odd, so every centring offset is a
-   whole pixel. `clip-path` over a colour block rather than a border triangle, whose apex at
-   this height would need a fractional border on each side.
+/* 5×6 and 7×4 against a 24px row and an 11px box: even heights to centre in the even row,
+   odd widths to centre in the odd box, so every offset is a whole pixel — `(24 − 6) / 2 = 9`,
+   `(24 − 4) / 2 = 10`, `(11 − 5) / 2 = 3`, `(11 − 7) / 2 = 2`. The heights were 7 and 5 while
+   the row was 21 and both axes wanted odd; the row is 24 now, so they went even. The long
+   version is in `FileTree.module.css`, whose rules these still match number for number.
+   `clip-path` over a colour block rather than a border triangle, whose apex at this height
+   would need a fractional border on each side.
 
    `:not(:empty)` matches the file tree's and the git tree's rules character for character,
    and it is inert *today*: `SearchPanel.tsx` fills this span on every `.fileRow` and every
@@ -251,19 +255,19 @@
 
 [aria-expanded='false'] > .twisty:not(:empty)::before {
   width: 5px;
-  height: 7px;
+  height: 6px;
   clip-path: polygon(0 0, 0 100%, 100% 50%);
 }
 
 [aria-expanded='true'] > .twisty:not(:empty)::before {
   width: 7px;
-  height: 5px;
+  height: 4px;
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
 /*
  * There is no `.glyph` here any more, for the same reason `FileTree.module.css` lost its own:
- * the heading draws a `<FileIcon>`, which brings its own 15px box and is an `<img>` — opaque
+ * the heading draws a `<FileIcon>`, which brings its own 16px box and is an `<img>` — opaque
  * to this stylesheet, so a colour rule here would have done nothing while looking like it did
  * something. The 5px flex `gap` still separates it from the name.
  */
@@ -301,14 +305,14 @@
 
 /*
  * The matched substring. `--accent` from the mock, with no background: a highlight block at
- * 11.5px inside a 21px row leaves no room for the descenders, and the accent on its own is
+ * 11.5px inside a 24px row would sit tight under the descenders, and the accent on its own is
  * unambiguous against `--text`.
  *
  * 500, which is the weight `fonts.css` bundles JetBrains Mono at for emphasis. This asked for
  * 600 and the mono family ships 400/500/700, so CSS font matching walked *up* to 700 — the
  * match came out two steps heavier than the row rather than one, and `font-synthesis: none`
  * cannot flag it because 700 is a real face. `check-theme.mjs` cannot flag it either: it
- * checks each weight against the union of both families, and 600 is real in IBM Plex Sans.
+ * checks each weight against the union of both families, and 600 is real in the UI face.
  */
 .match {
   background: transparent;

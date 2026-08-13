@@ -54,9 +54,10 @@ export const SIDEBAR_DEFAULT: Readonly<Record<SidebarPanel, number>> = {
  * The floor, in CSS pixels. Mirrors `SIDEBAR_MIN_WIDTH` in `cide-ipc`.
  *
  * 180 because below it both panels stop being usable rather than merely getting tight: the
- * explorer indents 12px per depth on 21px mono rows, so a file three levels down has about a
- * dozen characters left at 180 and none at 140, and the git panel's 30px header carries a
- * segmented Commit/Shelf control and its counts on one line. There is no "reset width"
+ * explorer indents 19px per depth, so a file three levels down starts 57px in and has only a
+ * few characters left at 180 and none at 140, and the git panel's 30px header carries a
+ * segmented Commit/Shelf control and its counts on one line. The indent was 12px when this
+ * number was picked, so 180 is if anything tighter now than it reads. There is no "reset width"
  * gesture in the chrome, so a panel that can be dragged to a sliver is one a user can lose.
  */
 export const SIDEBAR_MIN = 180

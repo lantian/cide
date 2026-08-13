@@ -2,7 +2,7 @@
  * The 252px explorer.
  *
  * Widths and heights are the mock's: a 252px panel, a 30px uppercase 10.5px header with the
- * meta figure right-aligned in mono, and 21px mono rows indented 12px per depth.
+ * meta figure right-aligned in mono, and 24px proportional rows indented 19px per depth.
  */
 
 .panel {
@@ -99,8 +99,18 @@
    * and JetBrains Mono really loads. Not the bug." That checked the face was *arriving*,
    * which was never in question — the question is whether it is the right face.
    *
+   * The first attempt at that answer was `--font-ui` when the token still meant IBM Plex
+   * Sans, and it drew the same complaint again: right shape, still too faint. Plex's
+   * x-height is 0.5160em against Inter's 0.5459em, so at a shared 13px it puts ~6% less ink
+   * where a filename is actually read. `--font-ui` is Inter now — the face IDEA itself
+   * ships — and this rule did not have to change for that, which is the point of routing it
+   * through the token. See `styles/fonts.css`.
+   *
    * 13px because a proportional face at 11.5 is smaller than it reads: the mono figure was
-   * chosen to fit fixed-width columns into 252px, and that constraint is gone.
+   * chosen to fit fixed-width columns into 252px, and that constraint is gone. Note that
+   * 13px is where it stops — the size is *not* the lever for "it looks small", and raising
+   * it to make Plex match Inter's x-height (13.76px) is the specific mistake this paragraph
+   * exists to head off.
    */
   font-family: var(--font-ui);
   font-size: 13px;
@@ -144,7 +154,7 @@
  * without a second rule because both define `--sel` and `--accent`.
  *
  * `inset` box-shadow rather than a `border-left`: a border would shift every child 2px to the
- * right on selection, and a 21px mono row that jogs sideways when you click it looks broken.
+ * right on selection, and a tree row that jogs sideways when you click it looks broken.
  */
 .rowSelected,
 .rowSelected:hover {
@@ -165,7 +175,10 @@
 .rename {
   flex: 1;
   min-width: 0;
-  height: 17px;
+  /* 18px, not 17: this is centred in the row like every other fixed box here, so its height
+     has to share the row's parity. `(24 − 18) / 2 = 3`; the 17 that suited the old 21px row
+     would land at 3.5 and put a 1px border on a half pixel. */
+  height: 18px;
   padding: 0 3px;
   border: 1px solid var(--accent);
   border-radius: 2px;
@@ -242,8 +255,8 @@
    * `stretch` because this span is a *hit target*, not just a picture: `FileTree.tsx` folds a
    * directory on a single click that `closest()`-es to this class. As a flex item its height
    * is its content, and its content used to be a 9px line box (~12px tall) — with the glyph
-   * gone that would have collapsed to the 5px of the triangle, leaving a quarter of the row's
-   * height to hit. Stretched, the column is the 11×21 the mock's gutter actually is.
+   * gone that would have collapsed to the 4px of the triangle, leaving a sixth of the row's
+   * height to hit. Stretched, the column is the full 11×24 of the gutter.
    */
   align-self: stretch;
   font-size: 0;
@@ -251,11 +264,18 @@
 }
 
 /*
- * The disclosure triangle, sized odd-against-odd so it centres on a whole pixel.
+ * The disclosure triangle, sized so it centres on a whole pixel in both axes.
  *
- * 5×7 and 7×5 rather than one square: the row is 21px and the twisty box 11px, both odd, so an
- * even-sized shape would land on a half pixel exactly as the icon did. `(21 − 5) / 2 = 8`,
- * `(21 − 7) / 2 = 7`, `(11 − 7) / 2 = 2`, `(11 − 5) / 2 = 3` — every offset whole.
+ * The two axes have *different* parity requirements, which is why the shapes are not squares
+ * and not transposes of each other. Vertically the shape is centred in the 24px row, so its
+ * **height must be even**; horizontally it is centred in the 11px twisty box, so its **width
+ * must be odd**. `(24 − 6) / 2 = 9`, `(24 − 4) / 2 = 10`, `(11 − 5) / 2 = 3`,
+ * `(11 − 7) / 2 = 2` — every offset whole.
+ *
+ * The heights were 7 and 5 when the row was 21px and both axes wanted odd. The row is 24 now
+ * (see `sidebar/FileTree.tsx`), so the heights dropped a pixel to stay even; the widths were
+ * already right and did not move, which is why the gutter and the name column are where they
+ * were. A perfect transpose is not available here — 6 wide in an 11px box is `2.5`.
  *
  * `clip-path` over a `currentColor` block rather than the classic border triangle: a border
  * triangle of odd height needs a fractional border-width on each side of the apex, which puts
@@ -273,13 +293,13 @@
 
 [aria-expanded='false'] > .twisty:not(:empty)::before {
   width: 5px;
-  height: 7px;
+  height: 6px;
   clip-path: polygon(0 0, 0 100%, 100% 50%);
 }
 
 [aria-expanded='true'] > .twisty:not(:empty)::before {
   width: 7px;
-  height: 5px;
+  height: 4px;
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
@@ -298,23 +318,37 @@
 }
 
 /*
- * The status letter. Deliberately no `font-size` — it takes the row's 11.5px.
+ * The status letter. Deliberately no `font-size` — it takes the row's 13px.
  *
- * It was 10.5px, which made the `M` beside a filename 9% smaller than the filename, and put
- * it on a different baseline: a flex row centres each child's *box*, so a child's baseline
- * lands at `rowHeight / 2 + 0.36 × fontSize` for JetBrains Mono (hhea 1020/-300 over 1000
- * upem). At 11.5px that is 14.64px from the row top and at 10.5px 14.28px, so the tag column
- * rode a third of a pixel high down the whole tree. One size per row is the only fix that
- * holds — `align-items: baseline` was the alternative, and it would have hung the file icon,
- * which is an `<img>` whose baseline is its bottom edge, 4px above where it belongs.
+ * **`font-family` is stated, and has to be.** This is the one place in the panel where a
+ * column has to line up, which is what the face argument on `.row` says mono is for — but
+ * `.tag` used to get mono by *inheriting* it, and the day `.row` moved to the proportional
+ * face this silently followed it. Nobody saw it because the letter still rendered; what
+ * changed is that it stopped fitting. Measured at the row's 13px:
  *
- * The 9px column stays: a mono glyph at 11.5px advances 6.9px, so the letter still fits with
- * room to spare and the name column does not move.
+ *     JetBrains Mono  M 7.80px   fits the 9px column
+ *     IBM Plex Sans   M 10.56px  overflowed it by 1.6px
+ *     Inter           M 11.74px  overflows it by 2.7px
+ *
+ * A right-aligned 9px box with `overflow: visible` does not clip — it paints the extra to the
+ * left, into the gap before the name. So this was already wrong under the proportional face
+ * and got worse, in a way no rule in either file admitted to. `check-theme.mjs` pins it now,
+ * alongside the mono selectors it already guards in the other two lists.
+ *
+ * It was also once 10.5px, which made the `M` 9% smaller than the filename and put it on a
+ * different baseline: a flex row centres each child's *box*, so a child's baseline lands at
+ * `(row − contentBox) / 2 + ascent`, and two children at different sizes land at different
+ * heights. Stating no size is what fixes that, and it keeps working across the face change —
+ * at a shared 13px in a 24px row the two faces put their baselines at 16.68px (JetBrains
+ * Mono, hhea 1020/−300 over 1000) and 16.73px (Inter, 1984/−494 over 2048), 0.05px apart.
+ * `align-items: baseline` was the alternative, and it would have hung the file icon, which is
+ * an `<img>` whose baseline is its bottom edge, 4px above where it belongs.
  */
 .tag {
   flex: none;
   width: 9px;
   text-align: right;
+  font-family: var(--font-mono);
 }
 
 /* Status colours, from the mock: M blue, A green, D faint and struck through. */

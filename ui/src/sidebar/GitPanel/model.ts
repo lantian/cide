@@ -54,7 +54,7 @@ export type CheckState = 'checked' | 'partial' | 'unchecked'
  */
 export type RowKind = 'repo' | 'group' | 'dir' | 'file'
 
-/** One 23px line in the tree. */
+/** One 24px line in the tree. */
 export interface Row {
   /** Stable across refreshes, which is what lets selection and expansion survive one. */
   id: string
@@ -330,7 +330,8 @@ function dirTree(entries: readonly ChangeEntry[]): DirNode {
  *
  * A chain of directories with one child and no files of its own carries no information per
  * level — three rows and three twisties to reach one file, in a 420px panel where indentation
- * is 14px a level. IDEA compacts the same way. The compacted row keeps the *deepest* path, so
+ * is 19px a level. IDEA compacts the same way, and at 19px it matters more than it did at 14:
+ * four levels now cost 76px of the panel rather than 56. The compacted row keeps the *deepest* path, so
  * its id and the set of files under it are unchanged by the collapsing.
  */
 function compact(node: DirNode): void {

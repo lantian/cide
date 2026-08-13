@@ -242,13 +242,26 @@
    * Fonts are bundled locally in M3. The CSP has no external host in `font-src`, so a
    * Google Fonts <link> would fail silently and leave the app on the fallback stack.
    */
-  --font-ui: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  /*
+   * The UI face is Inter, which is what IDEA ships and what `idea.png` is drawn in. It
+   * replaced IBM Plex Sans rather than joining it: two proportional faces in one 252px rail
+   * is worse than either alone, and `body` below inherits this token, so the one stack
+   * repaints the whole app. The reason it is Inter and not Plex — 0.5459em of x-height
+   * against 0.5160em, ~6% more ink at the size the rail forces — is in `fonts.css`.
+   *
+   * The fallbacks are unchanged and still ordered nearest-first: `system-ui` resolves to the
+   * desktop's own UI face, which is the closest thing to Inter a machine is likely to have.
+   * They are only ever painted if `fonts.css` stops importing the family, since the woff2 is
+   * a same-origin read that beats `font-display: swap`'s 100ms block period.
+   */
+  --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
 
   /*
    * The one bold the UI has.
    *
-   * `fonts.css` ships IBM Plex Sans at 400/500/600 because the mock's UI scale stops at 600.
+   * `fonts.css` ships Inter at 400/500/600 because the mock's UI scale stops at 600 — the
+   * package has a real 700, so this is a weight declined rather than a weight missing.
    * Anything asking for 700 therefore gets a *synthesised* bold smeared out of the 600 face.
    * This token is what a rule uses instead of writing `bold`, so there is one place to look
    * the day a real 700 is bundled.
@@ -357,9 +370,18 @@ body {
    * whereas this is a guarantee that nothing on screen is a smear.
    *
    * `text-rendering: optimizeLegibility` was considered and rejected: all it turns on is
-   * `kern` and `liga`, both of which are already on by default, and both faces carry them
-   * (IBM Plex Sans has `liga`/`ccmp` in GSUB and `kern` in GPOS; JetBrains Mono has
-   * `calt`/`ccmp`). It would have cost layout time to change nothing.
+   * `kern` and `liga`, and read off the shipped woff2s neither face gives it anything to do.
+   *
+   *     Inter          GSUB calt ccmp dnom frac locl numr pnum tnum · GPOS kern mark mkmk
+   *     JetBrains Mono GSUB calt ccmp frac locl                     · GPOS mark
+   *
+   * **Neither has a `liga` table at all**, so that half is a no-op outright. `kern` exists
+   * only in Inter, where it is already on by default, and its absence from JetBrains Mono is
+   * correct rather than a gap — kerning a monospace face would break the fixed advance every
+   * column in the editor and the terminal is aligned on. (This paragraph named IBM Plex Sans
+   * before the swap and got it wrong in passing: Plex did carry `liga`, so the argument then
+   * was "already on by default". Under Inter it is "not there to turn on", which is stronger.)
+   * It would have cost layout time to change nothing.
    */
   font-synthesis: none;
   /* A desktop chrome that rubber-bands or text-selects on drag reads as a web page. */
@@ -378,8 +400,8 @@ body {
  *
  * Normalised here, once, rather than in five CSS modules: the modules that *do* state a
  * weight already state 500 or 600, so this only ever changes elements nobody styled. The
- * alternative that lost was importing `@fontsource/ibm-plex-sans/700.css` — it would make
- * the UA's default look fine while adding a fourth UI weight the mock never uses.
+ * alternative that lost was importing `@fontsource/inter/700.css` — it would make the UA's
+ * default look fine while adding a fourth UI weight the mock never uses.
  *
  * Sizes are deliberately left alone: an `<h2>` that wants to be 14px says so in its module.
  */

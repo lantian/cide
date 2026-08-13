@@ -1,5 +1,5 @@
 /**
- * The virtualized 21px file tree.
+ * The virtualized 24px file tree.
  *
  * Virtualized for the same reason the rows are windowed on the wire: a 100k-file repository
  * has 100k rows, and neither the DOM nor the IPC boundary should ever see more than a screen
@@ -79,14 +79,40 @@ import { useContextMenu, type MenuEntry } from '@/menus'
 import { useWorkspace } from '@/store/workspace'
 import styles from './FileTree.module.css'
 
-/** 21px rows, from the mock. */
-const ROW_HEIGHT = 21
+/**
+ * 24px rows — IDEA's `Tree.rowHeight` at 100% scale, measured off `idea.png`.
+ *
+ * **This deliberately departs from the mock**, which specifies 21px rows, and it is the same
+ * override as the mono→proportional face change two lines below: `Grount IDE.dc.html` is not
+ * the reference for this panel any more, `idea.png` is. Do not "restore the mock" here
+ * without reading that comment first. The 24 is measured, not chosen — IDEA's selection band
+ * is 24px tall and its seven-row `target` subtree tint is exactly 168px.
+ *
+ * Three numbers move together and nothing but this comment enforces it: `SearchPanel.tsx`
+ * uses the same row height for the same reason, `ChangesTree.module.css` states it in CSS
+ * because that tree is not virtualized, and `icons/FileIcon.module.css` sizes the icon box
+ * to centre on a whole pixel *in a row of this parity*. Changing this to an odd number
+ * without revisiting the icon box puts every icon in all three lists back on a half-pixel
+ * grid — see that file, which exists because of exactly that bug.
+ */
+const ROW_HEIGHT = 24
 
 /** The `fs_*` calls the panel makes, in the order the notice should prefer to name them. */
 const PENDING_COMMANDS = ['fs_tree_count', 'fs_tree_rows', 'fs_expand', 'fs_collapse'] as const
 
-/** 12px per depth, from the mock. */
-const INDENT = 12
+/**
+ * 19px per depth, measured off IDEA rather than taken from the mock's 12.
+ *
+ * This was the single clearest miss in the side-by-side, and it is exact rather than
+ * estimated: in `idea.png` the *same* closed-folder glyph at depths 0/1/2 has its ink left
+ * edge at x = 73, 92, 111 — a step of 19, twice — and the chevrons (75→94) and the label ink
+ * (91→110→129) agree to the pixel. At 12px a nested tree reads as a flat list, which is most
+ * of why our explorer looked wrong next to IDEA's even before the face changed.
+ *
+ * `GitPanel/ChangesTree.tsx` uses the same 19. IDEA indents both its trees by one number and
+ * ours used two (12 here, 14 there), which is a difference nobody chose.
+ */
+const INDENT = 19
 
 /**
  * How many rows either side of a keyboard jump are asked for before reading one.
@@ -214,7 +240,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   /**
    * What the draft row is currently saying about the name in it.
    *
-   * Lifted out of the input so it can be drawn at the foot of the panel: the row is 21px of a
+   * Lifted out of the input so it can be drawn at the foot of the panel: the row is 24px of a
    * 252px column and there is no room in it for a sentence, and a refusal the user only meets
    * *after* pressing Enter is the thing this whole module is trying not to be.
    */
@@ -1062,7 +1088,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       {/*
         * What the draft row is about to do, and what is wrong with the name in it.
         *
-        * At the foot of the panel rather than in the row, because the row is 21px of a 252px
+        * At the foot of the panel rather than in the row, because the row is 24px of a 252px
         * column and every one of these sentences is longer than that. It also has to say
         * *where* — a new file's destination is the whole thing the user cannot check by
         * looking at a name box, and in a multi-root project "the project root" is several

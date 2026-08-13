@@ -418,7 +418,7 @@ const CHECKS: readonly Check[] = [
  * is the whole reason the fonts are bundled — so this is a failing row, not a warning.
  */
 const FONTS: readonly { element: string; spec: string }[] = [
-  { element: 'fontUi', spec: '13px "IBM Plex Sans"' },
+  { element: 'fontUi', spec: '13px "Inter"' },
   { element: 'fontMono', spec: '13px "JetBrains Mono"' },
 ]
 

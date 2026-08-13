@@ -445,8 +445,8 @@ try {
   // not error — the engine picks the nearest real face and, unless `font-synthesis` says
   // otherwise, emboldens or shears it. That is the "fonts are ugly" report: `<h3>`, `<b>` and
   // `<strong>` were being fake-bolded out of the 600 face because the UA sheet asks for 700
-  // and IBM Plex Sans ships 400/500/600, and five surfaces asking `font-style: italic` were
-  // getting an obliqued upright because no italic was imported at all.
+  // and the UI face is imported at 400/500/600, and five surfaces asking `font-style: italic`
+  // were getting an obliqued upright because no italic was imported at all.
   //
   // What this proves: the imports in `fonts.css`, the declarations in the modules, and the
   // one rule that normalises the UA's 700 agree with each other. What it cannot prove is what
@@ -463,12 +463,19 @@ try {
   ok(bundled.size === 2, '`fonts.css` still imports exactly two families from @fontsource')
 
   // The map from a package name to the family a stylesheet names. Asserted rather than
-  // assumed: everything below reads `--font-ui`/`--font-mono` as "the IBM Plex Sans stack"
-  // and "the JetBrains Mono stack", and a swapped stack would make every check here vacuous.
+  // assumed: everything below reads `--font-ui`/`--font-mono` as "the Inter stack" and "the
+  // JetBrains Mono stack", and a swapped stack would make every check here vacuous.
+  //
+  // The UI family is Inter because that is what IDEA ships and what the reference capture is
+  // drawn in; it replaced IBM Plex Sans outright rather than joining it, which is why the
+  // count above is still two. `UI_FAMILY` is the single place that name is written down —
+  // the bold check at the bottom reads it too, and hard-coding it twice is how that check
+  // came to assert about a family that was no longer the UI face.
+  const UI_FAMILY = { pkg: 'inter', css: "'Inter'" }
   const stacks = resolveTheme(docRules, 'light', ['--font-ui', '--font-mono'])
   ok(
-    (stacks['--font-ui'] ?? '').startsWith("'IBM Plex Sans'"),
-    '`--font-ui` still leads with the family `fonts.css` imports as `ibm-plex-sans`',
+    (stacks['--font-ui'] ?? '').startsWith(UI_FAMILY.css),
+    `\`--font-ui\` still leads with the family \`fonts.css\` imports as \`${UI_FAMILY.pkg}\``,
   )
   ok(
     (stacks['--font-mono'] ?? '').startsWith("'JetBrains Mono'"),
@@ -520,7 +527,12 @@ try {
   // "the trees are proportional" would pass a change that swept the source preview along
   // with the names, which is the more damaging half of the mistake.
   for (const [file, uiSelectors, monoSelectors] of [
-    ['src/sidebar/FileTree.module.css', ['.row', '.rename'], []],
+    // `.tag` is in the mono list because it was the third way to get this wrong. It stated no
+    // family at all and *inherited* mono from its row, so the day the row went proportional
+    // the status letter followed it silently — and a proportional `M` at the row's 13px is
+    // 11.74px in a 9px right-aligned column, painting over the gap before the name. Inherited
+    // is not stated; that is the whole point of this loop.
+    ['src/sidebar/FileTree.module.css', ['.row', '.rename'], ['.tag']],
     ['src/sidebar/GitPanel/ChangesTree.module.css', ['.fileName', '.dirName'], ['.count']],
     ['src/sidebar/SearchPanel.module.css', ['.fileRow'], ['.lineText', '.lineNo']],
   ]) {
@@ -549,6 +561,56 @@ try {
     }
   }
 
+  // --- the three sidebar lists are one row height, and the icon centres on a whole pixel ---
+  //
+  // Two invariants that had no gate, and both had already been broken once by hand.
+  //
+  // The first is that the row height is written down in three places and nothing connected
+  // them: `FileTree.tsx` and `SearchPanel.tsx` each hand a number to their own virtualizer's
+  // `estimateSize`, and `ChangesTree.module.css` states it in CSS because that tree is not
+  // virtualized. They read 21, 21 and 23 — a disagreement nobody chose, against an IDEA that
+  // uses one height for both its trees.
+  //
+  // The second is the reason the first matters beyond tidiness. All three lists centre a
+  // `<FileIcon>` with `align-items: center`, so it sits at `(row − icon) / 2`, and a half
+  // pixel there softens the 1px horizontal edges the Material set is drawn on — a whole
+  // column of slightly blurred glyphs, which is what `icons/FileIcon.module.css` exists to
+  // document. That parity is a *relationship* between two numbers in different files, so
+  // either one can be edited alone and look locally correct: 15px was right for a 21px row
+  // and wrong for a 24px one, 16px the reverse. Asserting the relationship is the only way
+  // that stays true, and it is why this checks `% 2` rather than pinning either literal.
+  const rowHeights = [
+    ['src/sidebar/FileTree.tsx', /const ROW_HEIGHT = (\d+)/],
+    ['src/sidebar/SearchPanel.tsx', /const ROW_HEIGHT = (\d+)/],
+  ].map(([file, re]) => [file, Number(re.exec(readFileSync(file, 'utf8'))?.[1])])
+  const gitRow = leafRules(readFileSync('src/sidebar/GitPanel/ChangesTree.module.css', 'utf8'))
+    .find((r) => parts(r.selector).includes('.row'))
+  rowHeights.push([
+    'src/sidebar/GitPanel/ChangesTree.module.css',
+    Number(/height:\s*(\d+)px/.exec(gitRow?.body ?? '')?.[1]),
+  ])
+  for (const [file, height] of rowHeights) {
+    ok(Number.isFinite(height), `${file} still states a row height this script can read`)
+  }
+  eq(
+    [...new Set(rowHeights.map(([, h]) => h))],
+    [rowHeights[0][1]],
+    'the explorer, the search panel and the git changes tree are all one row height — '
+      + rowHeights.map(([f, h]) => `${h} in ${f.split('/').pop()}`).join(', '),
+  )
+  const iconBox = Number(
+    /width:\s*(\d+)px/.exec(
+      leafRules(readFileSync('src/icons/FileIcon.module.css', 'utf8'))
+        .find((r) => parts(r.selector).includes('.icon'))?.body ?? '',
+    )?.[1],
+  )
+  ok(Number.isFinite(iconBox), 'icons/FileIcon.module.css still states a width for `.icon`')
+  ok(
+    (rowHeights[0][1] - iconBox) % 2 === 0,
+    `the ${iconBox}px icon box centres on a whole pixel in a ${rowHeights[0][1]}px row — `
+      + `(${rowHeights[0][1]} − ${iconBox}) / 2 = ${(rowHeights[0][1] - iconBox) / 2}`,
+  )
+
   // The specific elements that were muddy. The UA sheet bolds them to 700 and no stylesheet
   // says otherwise, so the normalisation has to be here or it is nowhere.
   const uaBold = leafRules(readFileSync('src/styles/tokens.css', 'utf8')).find((r) =>
@@ -561,11 +623,16 @@ try {
     [],
     'and it covers every one of them — a heading level left out is fake-bolded again',
   )
-  const uiWeights = bundled.get('ibm-plex-sans')?.weights ?? new Set()
+  // Read through `UI_FAMILY` rather than a second hard-coded package name. When this said
+  // `'ibm-plex-sans'` literally, swapping the UI face to Inter left the line *passing* while
+  // asserting about a family the app no longer paints — green, and meaningless. Asserting the
+  // family is bundled at all is what keeps `?? new Set()` from turning a typo into a pass.
+  ok(bundled.has(UI_FAMILY.pkg), `\`fonts.css\` imports the UI family as \`${UI_FAMILY.pkg}\``)
+  const uiWeights = bundled.get(UI_FAMILY.pkg)?.weights ?? new Set()
   const boldToken = resolveTheme(docRules, 'light', ['--w-bold'])['--w-bold']
   ok(
     /var\(--w-bold\)/.test(uaBold?.body ?? '') && uiWeights.has(Number(boldToken)),
-    `\`--w-bold\` (${boldToken}) is a weight the UI family actually ships`,
+    `\`--w-bold\` (${boldToken}) is a weight the UI family (${UI_FAMILY.pkg}) actually ships`,
   )
 
   // The backstop, and the line it replaced. `-webkit-font-smoothing` is implemented against

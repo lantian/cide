@@ -1,5 +1,5 @@
 /**
- * The 23px-row tri-state checkbox tree.
+ * The 24px-row tri-state checkbox tree.
  *
  * # Markup
  *
@@ -287,9 +287,15 @@ export function ChangesTree({
             {...(row.expandable ? { 'aria-expanded': open } : {})}
             tabIndex={index === at ? 0 : -1}
             className={rowClass(row, isCurrent)}
-            // Indent is a padding rather than a spacer element so the whole 23px row stays
+            // Indent is a padding rather than a spacer element so the whole 24px row stays
             // one hit target, including the empty space to the left of a deep file.
-            style={{ paddingLeft: `${8 + row.depth * 14}px` }}
+            //
+            // 19px per depth, measured off IDEA — the same step the explorer uses, and the
+            // reason it is 19 rather than the 14 this shipped with is written out in
+            // `sidebar/FileTree.tsx`. One number across both trees because IDEA has one.
+            // It makes the path compaction in `model.ts` matter more, not less: four levels
+            // now cost 76px of a 420px panel instead of 56.
+            style={{ paddingLeft: `${8 + row.depth * 19}px` }}
             onFocus={() => onCurrent(row.id)}
             /* First, and deliberately separate from the click handling below: a press only
                becomes a drag after 4px of movement, so the click rules keep running exactly as

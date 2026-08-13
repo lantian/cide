@@ -7,16 +7,47 @@
  * and is therefore worse than an obvious break.
  *
  * **The faces below do load.** That was checked on the built output rather than assumed:
- * `dist/assets/` holds the woff2s and `dist/assets/index-*.css` holds 18 `@font-face` blocks
- * per family (3 upright weights + 2 italics × 6 unicode subsets), all pointing at same-origin
- * `/assets/…` URLs that `font-src 'self'` allows. So a missing face is *not* why the app
- * looked wrong; synthesis was — see below.
+ * `dist/assets/` holds the woff2s and `dist/assets/index-*.css` holds **58** `@font-face`
+ * blocks — 28 for Inter (4 styles × 7 subsets) and 30 for JetBrains Mono (5 styles × 6
+ * subsets) — every `src` a relative `./…woff2` that resolves against the stylesheet's own
+ * `/assets/` directory, so they are same-origin and `font-src 'self'` allows them. So a
+ * missing face is *not* why the app looked wrong; synthesis was — see below.
  *
- *   IBM Plex Sans  400 body · 500 active tabs and labels · 600 headings and UI bold
+ *   Inter          400 body · 500 active tabs and labels · 600 headings and UI bold
  *                  400 italic — `ContextMenu`'s reason lines, `ProxySection`'s note
  *   JetBrains Mono 400 code and paths · 500 emphasis · 700 transcript bold and SGR 1
  *                  400 italic — editor comments, `.cide-tk-emphasis`, terminal SGR 3
  *                  700 italic — terminal SGR 1;3, which no upright weight can stand in for
+ *
+ * # Why the UI face is Inter and not IBM Plex Sans
+ *
+ * It was IBM Plex Sans, and the swap is not a matter of taste. IDEA has shipped **Inter** as
+ * its default UI font since 2022.3, and `idea.png` — the target this panel is being measured
+ * against — is Inter throughout: its project tree, its status bar, its chrome. Matching the
+ * reference meant matching the face, not approximating it with another humanist sans.
+ *
+ * The measurable half of the argument is x-height, and it is the reason Plex kept reading as
+ * *thin* in the sidebar however the size was nudged:
+ *
+ *     Inter          sxHeight 1118/2048 = 0.5459em -> 7.10px at 13px
+ *     IBM Plex Sans  sxHeight  516/1000 = 0.5160em -> 6.71px at 13px
+ *
+ * Just under **6% more ink** at the size a 252px rail forces, from the same nominal 13px —
+ * cap height moves with it (0.7275em against 0.6980em). That is where a filename is actually
+ * read, so it is the number that decides whether a tree looks like a list of names or like
+ * fine print. The trap it removes: the obvious fix for "Plex looks small" is to raise
+ * `font-size`, and raising it to match Inter's x-height would need 13.76px — overshooting
+ * IDEA's cap height by 5% and making every row taller for nothing. The family was the bug.
+ *
+ * Inter is 3–8% wider per string than Plex (`rust-toolchain.toml` 116.2px against 112.7px at
+ * 13px), which is affordable: it is still 11% narrower than the JetBrains Mono the trees used
+ * before this, so nothing that fits in the rail today starts ellipsizing.
+ *
+ * **One thing it changes silently.** Plex's digits were tabular by default; Inter's are
+ * proportional, and it carries both `pnum` and `tnum` in GSUB. The dozen
+ * `font-variant-numeric: tabular-nums` declarations in the modules were therefore decorative
+ * under Plex and are **load-bearing** now — a column of figures that does not declare it will
+ * jitter as the digits change. Delete one and the number column it sits in starts dancing.
  *
  * # Why the italics are here now, and why there is no 700 upright
  *
@@ -27,13 +58,16 @@
  * letterforms. In an editor that is every comment in every file, which is a lot of the
  * screen. Real faces cost bundle size; synthesis costs the thing the user actually looks at.
  *
- * There is deliberately **no 700 upright for IBM Plex Sans**. The mock's UI scale stops at
- * 600, so the only things that wanted 700 were elements the UA stylesheet bolds by default
- * (`h1`–`h6`, `b`, `strong`) — and those were being fake-bolded from the 600 face, which is
- * exactly the muddiness the report described. `tokens.css` normalises those elements to 600
- * instead of this file shipping a weight nothing in the design uses. The alternative that
- * lost was importing `700.css`: it would have made the UA's accident look fine and quietly
- * added a fourth UI weight the mock never asks for.
+ * There is deliberately **no 700 upright for Inter**, and the reasoning survived the swap
+ * intact — checked rather than carried over, because it would have been easy to assume. The
+ * package ships 100–900 upright *and* italic, so 700 is a real face that is available and
+ * declined, not one that is missing. The mock's UI scale stops at 600, so the only things
+ * that wanted 700 were elements the UA stylesheet bolds by default (`h1`–`h6`, `b`,
+ * `strong`) — and those were being fake-bolded from the 600 face, which is exactly the
+ * muddiness the report described. `tokens.css` normalises those elements to 600 instead of
+ * this file shipping a weight nothing in the design uses. The alternative that lost was
+ * importing `700.css`: it would have made the UA's accident look fine and quietly added a
+ * fourth UI weight the mock never asks for.
  *
  * `@fontsource` ships woff2 alongside a stylesheet with the right `@font-face` blocks and
  * `font-display: swap`; Vite rewrites the relative `files/` URLs at build time, so the
@@ -43,18 +77,21 @@
  * overriding the descriptor would mean hand-writing all 36 blocks and their unicode-ranges
  * here to change a value that never comes into play.
  *
- * Each weight brings every Unicode subset — latin, latin-ext, cyrillic, cyrillic-ext,
- * greek, vietnamese — which is 30 files per style rather than 6. That is deliberate. Each
- * subset is a separate `@font-face` with its own `unicode-range`, so a browser downloads
- * only the ones it actually has to render; the cost is disk in the bundle, not bandwidth or
- * parse time. Trimming to latin would save a little of the former and silently degrade any
- * pane showing Cyrillic to the fallback stack.
+ * Each style brings every Unicode subset it has — Inter ships seven (latin, latin-ext,
+ * cyrillic, cyrillic-ext, greek, greek-ext, vietnamese), JetBrains Mono six (the same less
+ * greek-ext) — rather than latin alone. That is deliberate. Each subset is a separate
+ * `@font-face` with its own `unicode-range`, so a browser downloads only the ones it actually
+ * has to render; the cost is disk in the bundle, not bandwidth or parse time. Trimming to
+ * latin would save a little of the former and silently degrade any pane showing Cyrillic to
+ * the fallback stack. Inter's extra greek-ext is a subset Plex did not have, so the swap
+ * widens coverage rather than narrowing it — worth stating, because "the new face covers
+ * less" is the one thing that would have made this a bad trade.
  */
 
-@import '@fontsource/ibm-plex-sans/400.css';
-@import '@fontsource/ibm-plex-sans/400-italic.css';
-@import '@fontsource/ibm-plex-sans/500.css';
-@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/400-italic.css';
+@import '@fontsource/inter/500.css';
+@import '@fontsource/inter/600.css';
 
 @import '@fontsource/jetbrains-mono/400.css';
 @import '@fontsource/jetbrains-mono/400-italic.css';

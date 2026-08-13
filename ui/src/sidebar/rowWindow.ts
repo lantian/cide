@@ -15,7 +15,7 @@
 /**
  * Rows per request.
  *
- * 200 matches the ≤200-row frame size the picker's injector uses, and at 21px a row that is
+ * 200 matches the ≤200-row frame size the picker's injector uses, and at 24px a row that is
  * about seven screens of tree — enough that ordinary scrolling stays inside one or two
  * chunks, small enough that the first paint after opening a 100k-file repository fetches
  * 200 rows and not 100,000.

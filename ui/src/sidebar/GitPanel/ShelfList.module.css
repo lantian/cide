@@ -10,7 +10,7 @@
 }
 
 /*
- * Two lines rather than the tree's 23px: a shelf entry is named by a person and its name
+ * Two lines rather than the tree's 24px: a shelf entry is named by a person and its name
  * is a sentence, where a file row is a path. Cramming both onto one line would ellipsize
  * the only thing that tells two shelves apart.
  */

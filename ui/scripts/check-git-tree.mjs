@@ -860,7 +860,7 @@ try {
       ['file', 'types.ts'],
     ],
     'a chain of directories with one child and no files of its own is compacted onto one row: '
-      + 'four twisties to reach one file, at 14px of indent each, in a 420px panel',
+      + 'four twisties to reach one file, at 19px of indent each, in a 420px panel',
   )
   eq(
     m.buildRows(deep, m.allGroups(deep))[1].path,
@@ -1025,7 +1025,7 @@ try {
   )
 
   // Where a drop lands: any row inside a changelist resolves to that changelist, so the target
-  // is the whole band rather than one 23px header that may have scrolled off the top.
+  // is the whole band rather than one 24px header that may have scrolled off the top.
   eq(d.dropTarget(rowsE, rowB.id)?.label, 'Changes', 'a file row resolves to its changelist')
   eq(d.dropTarget(rowsE, rowSrc.id)?.label, 'Changes', 'a directory row does too')
   eq(d.dropTarget(rowsE, group('fixes').id)?.label, 'fixes', 'and a group row is its own target')

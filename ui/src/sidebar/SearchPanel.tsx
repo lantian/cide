@@ -1,7 +1,7 @@
 /**
  * The 252px search panel: the query input, the three toggles, and the results.
  *
- * Same width and the same row metrics as the Explorer — 252px, 21px mono rows — because the
+ * Same width and the same row metrics as the Explorer — 252px, 24px proportional rows — because the
  * two are the same piece of chrome with different contents, and a sidebar that changes width
  * when the rail's selection changes reads as a layout bug. `FileTree.module.css` owns those
  * numbers for the tree; this panel restates them rather than importing that stylesheet,
@@ -49,8 +49,16 @@ import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import styles from './SearchPanel.module.css'
 
-/** 21px rows, from the mock — the same as the file tree's. */
-const ROW_HEIGHT = 21
+/**
+ * 24px rows — the same as the file tree's, and for the same reason.
+ *
+ * Deliberately not the mock's 21: see `FileTree.tsx`, where the number and the argument for
+ * departing from `Grount IDE.dc.html` live. It is restated rather than imported because these
+ * are two virtualizers with two independent `estimateSize` callbacks; the pairing is a claim
+ * about the design, not a dependency. This panel also draws a `<FileIcon>`, so its row shares
+ * the parity constraint `icons/FileIcon.module.css` documents.
+ */
+const ROW_HEIGHT = 24
 
 /**
  * Where a hit is, and what opening it means.

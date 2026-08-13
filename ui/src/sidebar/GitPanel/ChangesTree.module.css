@@ -12,9 +12,22 @@
   background: var(--panel);
 }
 
-/* 23px rows, from the mock. The gap is the space between twisty, box and name. */
+/* The gap is the space between twisty, box and name. */
+/*
+ * 24px, matching the explorer's row rather than sitting 1px under it.
+ *
+ * This tree is not virtualized, so unlike `FileTree.tsx`/`SearchPanel.tsx` the height lives
+ * in CSS — but it is the same number and the same decision, and the argument for departing
+ * from the mock's 21 is in `sidebar/FileTree.tsx`. The two sibling trees disagreed (21 and
+ * 23) where IDEA uses one height for both, which is a difference nobody chose.
+ *
+ * The parity is load-bearing, not incidental: every fixed-size box centred in this row —
+ * the file icon, the twisty's triangle, the checkbox's margin box — is sized so that
+ * `(24 − box) / 2` is a whole pixel. Each of those has a comment saying so. An odd row
+ * height here silently un-does all three.
+ */
 .row {
-  height: 23px;
+  height: 24px;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -101,15 +114,17 @@
   align-items: center;
   justify-content: center;
   /* Full row height, as in the explorer: a flex item is as tall as its content, and with the
-     glyph gone that is the 5px of the triangle. */
+     glyph gone that is the 4px of the triangle. */
   align-self: stretch;
   font-size: 0;
   color: var(--faint);
 }
 
-/* 5×7 and 7×5 against a 23px row and a 9px box: `(23 − 7) / 2 = 8`, `(23 − 5) / 2 = 9`,
-   `(9 − 7) / 2 = 1`, `(9 − 5) / 2 = 2` — every centring offset a whole pixel, which an
-   even-sized shape in an odd box cannot manage. `:not(:empty)` keeps the arrow off the rows
+/* 5×6 and 7×4 against a 24px row and a 9px box: `(24 − 6) / 2 = 9`, `(24 − 4) / 2 = 10`,
+   `(9 − 5) / 2 = 2`, `(9 − 7) / 2 = 1` — every centring offset a whole pixel. The two axes
+   want opposite parities: even heights for the even row, odd widths for the odd box. The
+   heights were 7 and 5 while this row was 23 and both axes wanted odd; the row is 24 now, so
+   they went even, and the widths did not move. `:not(:empty)` keeps the arrow off the rows
    that are not expandable; they render the span empty. */
 [aria-expanded='false'] > .twisty:not(:empty)::before,
 [aria-expanded='true'] > .twisty:not(:empty)::before {
@@ -119,13 +134,13 @@
 
 [aria-expanded='false'] > .twisty:not(:empty)::before {
   width: 5px;
-  height: 7px;
+  height: 6px;
   clip-path: polygon(0 0, 0 100%, 100% 50%);
 }
 
 [aria-expanded='true'] > .twisty:not(:empty)::before {
   width: 7px;
-  height: 5px;
+  height: 4px;
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
@@ -133,26 +148,26 @@
  * The box's hit target, padded out to a comfortable size without changing the 12px the
  * mock draws. Negative margins keep the extra padding from shifting the name.
  *
- * `-6px` at the bottom against `-5px` at the top, and the asymmetry is the whole point: it is
- * the same odd-against-even parity the file icon was resized for, applied to the one box in
- * this row that still had it. `align-items: center` centres a flex item's *margin* box, and
- * with `-5px` on both sides that box was `22 − 5 − 5 = 12` — even, in a 23px row, so it landed
- * at `(23 − 12) / 2 = 5.5` and the 12px checkbox with it. Every tick in the git panel was
- * therefore drawn on a half-pixel grid, which did not matter much while the mark was a glyph
- * (type is antialiased anyway) and matters now that it is a 2px bar and a 1.5px stroke with
- * a 1px border around them: a hard edge on a half pixel is a two-pixel smear.
+ * The margins are symmetric again, and that is a consequence of the row height rather than a
+ * tidy-up. `align-items: center` centres a flex item's *margin* box: the box is `12 + 5 + 5 =
+ * 22` of border box less the negative margins, so with `-5px` top and bottom it is 12 — and
+ * `(24 − 12) / 2 = 6`, whole.
  *
- * Making the margin box *odd* is what fixes it — `22 − 5 − 6 = 11`, so `(23 − 11) / 2 = 6` and
- * the box sits at 6, whole. The alternative that lost was `position: relative; top: -0.5px`:
- * it moves the same distance but leaves a fractional length in the file for the next person to
- * "tidy up", and it needs a containing block this row does not otherwise want. The hit target
- * is unchanged in size — 5px of slop above the box and 5px below it, as before.
+ * It read `margin: -5px -4px -6px` while this row was 23px. That asymmetry was doing real
+ * work: an even 12px margin box in an *odd* 23px row landed at `(23 − 12) / 2 = 5.5`, and the
+ * 12px checkbox with it, so every tick in the git panel was drawn on a half-pixel grid —
+ * which did not matter much while the mark was a glyph (type is antialiased anyway) and
+ * matters now that it is a 2px bar and a 1.5px stroke with a 1px border around them, where a
+ * hard edge on a half pixel is a two-pixel smear. Making the margin box odd (`22 − 5 − 6 =
+ * 11`) fixed it then. The row is 24 now, so even is what centres, and the extra pixel of
+ * bottom margin would put the smear back. The hit target is unchanged in size either way —
+ * 5px of slop above the box and 5px below it.
  */
 .checkHit {
   display: grid;
   place-items: center;
   padding: 5px 4px;
-  margin: -5px -4px -6px;
+  margin: -5px -4px;
   cursor: pointer;
   flex: none;
 }
@@ -291,13 +306,18 @@
 }
 
 /*
- * `13px` leading rather than the `14px` it had, for the parity reason above and not for the
- * type: this is a bordered box, so its height is `line-height + 2` and `14` made that 16 —
- * even, in a 23px row, centred at `(23 − 16) / 2 = 3.5`. A 1px border on a half pixel is the
- * one thing in this row that cannot be antialiased away, because both of its edges are
- * horizontal. 13 makes the box 15 and the offset `(23 − 15) / 2 = 4`.
+ * `14px` leading, for the parity reason above and not for the type: this is a bordered box, so
+ * its height is `line-height + 2`, and a 1px border on a half pixel is the one thing in this
+ * row that cannot be antialiased away, because both of its edges are horizontal.
  *
- * 9.5px of JetBrains Mono needs 12.54px of ascent-plus-descent, so 13 still clears the type.
+ * It was 14, then 13, and is 14 again — each time following the row height rather than
+ * changing its mind. In the old 23px row `14` made the box 16, centred at `(23 − 16) / 2 =
+ * 3.5`, so it went to 13 for a 15px box and a whole `(23 − 15) / 2 = 4`. The row is 24 now
+ * (see `.row` at the top of this file), which wants an *even* box: `(24 − 16) / 2 = 4` from
+ * `14`, while `13` would give the 15px box a half-pixel `4.5`.
+ *
+ * 9.5px of JetBrains Mono needs 12.54px of ascent-plus-descent, so either value clears the
+ * type; parity is the only thing deciding between them.
  */
 .partialTag {
   flex: none;
@@ -307,7 +327,7 @@
   border-radius: 3px;
   font-family: var(--font-mono);
   font-size: 9.5px;
-  line-height: 13px;
+  line-height: 14px;
   color: var(--accent);
 }
 

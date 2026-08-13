@@ -47,8 +47,9 @@
  * not a content box plus borders.
  *
  * Both marks land on whole pixels because `ChangesTree.module.css` puts the 12px box at y=6 in
- * its 23px row; the bar below is `(10 − 2) / 2 = 4` inside it. That was not true before — see
- * the `.checkHit` note there for why a margin is odd.
+ * its 24px row; the bar below is `(10 − 2) / 2 = 4` inside it. y=6 is unchanged from when that
+ * row was 23px, but the margins that get it there are not — see the `.checkHit` note for why
+ * they are symmetric now and were asymmetric then.
  */
 .box[data-state='checked']::after {
   content: '';

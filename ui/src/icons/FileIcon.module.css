@@ -1,22 +1,31 @@
 /*
  * The icon box.
  *
- * 15px, sized so it centres on a whole pixel in both trees. The vendored SVGs have square
- * viewBoxes in four different units (16, 24, 32, 3473 …), so the box is fixed and `object-fit`
- * does the scaling rather than each icon's intrinsic size leaking into the row.
+ * 16px, sized so it centres on a whole pixel in every list that draws one. The vendored SVGs
+ * have square viewBoxes in four different units (16, 24, 32, 3473 …), so the box is fixed and
+ * `object-fit` does the scaling rather than each icon's intrinsic size leaking into the row.
  *
- * It was 16px, and 16 is the wrong parity for the rows it lands in. Both trees centre it with
- * `align-items: center`, so the top offset is `(row − icon) / 2`: in the explorer's 21px row
- * that was `(21 − 16) / 2 = 2.5px` and in the git panel's 23px row `3.5px`. Every icon in both
- * sidebars was therefore rasterised onto a half-pixel grid, which softens exactly the 1px
- * horizontal edges the Material set is drawn on — a whole column of slightly blurred glyphs,
- * which is what a list of them reads as rather than any one of them looking wrong.
+ * **The size is a function of the row height, not a free choice.** All three lists centre the
+ * icon with `align-items: center`, so the top offset is `(row − icon) / 2`, and a half-pixel
+ * there softens exactly the 1px horizontal edges the Material set is drawn on — a whole column
+ * of slightly blurred glyphs, which is what a list of them reads as rather than any one of
+ * them looking wrong. That bug is why this file exists.
  *
- * 15 makes both leftovers even: `(21 − 15) / 2 = 3` and `(23 − 15) / 2 = 4`, whole pixels in
- * each tree from the one number. The alternative that lost was keeping 16 and nudging it with
- * a margin — that needs a *different* nudge per tree, so the icon module would have had to
- * know which list it was in, and a third row height would have been a silent regression.
- * 15px also stays above the ~14px floor where the two-tone folders stop reading as two tones.
+ * It was 15px, and 15 was right for the rows that existed then: the explorer was 21 and the
+ * git panel 23, giving `(21 − 15) / 2 = 3` and `(23 − 15) / 2 = 4`. Both trees have since
+ * moved to IDEA's measured 24px row (see `sidebar/FileTree.tsx`), and 15 is the wrong parity
+ * for an even row — `(24 − 15) / 2 = 4.5`. 16 restores it in all three at once:
+ *
+ *     explorer      (24 − 16) / 2 = 4
+ *     search panel  (24 − 16) / 2 = 4
+ *     git changes   (24 − 16) / 2 = 4
+ *
+ * One number, one offset, because the three row heights now agree — which is the argument for
+ * keeping them agreed. The alternative that lost was keeping 15 and nudging it with a margin:
+ * that reintroduces a per-list constant in a module that has no business knowing which list it
+ * is in. 16 is also what `idea.png` measures for IDEA's own icon box, and it is the native
+ * grid most of the vendored SVGs are drawn on, so the common case is now a 1:1 blit rather
+ * than a downscale.
  *
  * Nothing here recolours anything: an `<img>` is opaque to this stylesheet, and the light
  * theme is served a different *file* instead — see `iconFor.ts`. That is also why there is no
@@ -27,8 +36,8 @@
 
 .icon {
   flex: none;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   object-fit: contain;
   /* The rows are absolutely positioned and translated; an inline image's baseline gap would
      push the icon a pixel low against the mono filename beside it. */

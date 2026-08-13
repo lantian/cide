@@ -32,7 +32,7 @@
  * dragging back.
  *
  * **Which targets accept.** Only a changelist. Any row inside one resolves to the group it is
- * in, so the whole band of a changelist is a target rather than its 23px header; a repository
+ * in, so the whole band of a changelist is a target rather than its 24px header; a repository
  * row, another repository's list, and the three sibling lists (`Unversioned Files`,
  * `Ignored Files`, `Merge Conflicts`) refuse, each with the reason written here and drawn on
  * the ghost. Refusing visibly matters more than usual for the sibling lists, because filing an
@@ -135,7 +135,7 @@ export function plural(n: number): string {
  * The changelist row a drop at `id` would land on, or `null`.
  *
  * Any row inside a group resolves to that group, so the drop target is the whole band of a
- * changelist rather than the one 23px header row — a 420px panel where the header has scrolled
+ * changelist rather than the one 24px header row — a 420px panel where the header has scrolled
  * off the top is exactly where a drop is needed most. A repository row resolves to nothing: it
  * sits *above* its groups, so walking back from it would find the previous repository's last
  * changelist and file the paths into the wrong repo's sidecar.

@@ -115,7 +115,7 @@ pub fn check_name(name: &str) -> Result<()> {
     } else if name.trim().is_empty() {
         "a name cannot be only whitespace"
     } else if name != name.trim() {
-        // A trailing space is legal on Linux and invisible in a 21px row, so a file called
+        // A trailing space is legal on Linux and invisible in a 24px row, so a file called
         // "main.rs " reads as one that is simply missing from every command that names it.
         // The frontend trims before it sends, so this only ever fires on a caller that did not.
         "a name cannot start or end with whitespace"
