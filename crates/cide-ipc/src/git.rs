@@ -498,7 +498,39 @@ pub struct CheckoutOutcome {
     pub restore_failed: Option<String>,
 }
 
+/// One commit a pull brought down.
+///
+/// Deliberately not a `Commit` DTO with a full author record and a body: this exists to be
+/// read in a toast that is four lines high. The short oid is what a user pastes into
+/// `git show`, the summary is what they recognise the change by, and the author is what tells
+/// them whether it is theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PulledCommit {
+    /// Eight hex characters, the same width [`crate::git::BranchRef::tip`] uses.
+    pub short_oid: String,
+    /// The first line of the message, with no trailing newline.
+    pub summary: String,
+    /// The author's name. Not the email — the toast has one line per commit.
+    pub author: String,
+}
+
 /// Result of a fetch or a fast-forward pull.
+///
+/// # Why this carries more than `advanced`
+///
+/// It used to carry `remote`, `shelled_out`, `output` and `advanced`, and the only sentence
+/// anything could build from that was *"Fast-forwarded 7 commits from origin"*. That answers
+/// "did it work"; it does not answer "what did I just take", which is the question a person
+/// asks after pulling into a tree they are about to build. The three answers a pull can give
+/// — *nothing came down*, *this came down*, and *I refused because you have diverged* — must
+/// be told apart at a glance, and the middle one is the one that needs contents.
+///
+/// The fields below the transport half are therefore the pull's own report: which branch
+/// moved, from which commit to which, what the diff between them totals, and the commits
+/// themselves. A plain fetch fills in none of it, because a fetch moves no working tree —
+/// see [`FetchOutcome::fetched`], which says so in one place instead of at every call site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -508,10 +540,61 @@ pub struct FetchOutcome {
     /// same rule [`PushOutcome::shelled_out`] records for pushes.
     pub shelled_out: bool,
     /// git's own text. `Everything up-to-date`, or the transport's complaint, lives here.
+    ///
+    /// **Untrusted on the binary route.** `git fetch`'s stderr carries the server's `remote:`
+    /// sideband lines verbatim, which are written by whoever runs that server. It is shown
+    /// and nothing else: never parsed into an action, never used to decide what the app will
+    /// do next. The frontend collapses it to one line and caps it (`branchModel::oneLine`).
     pub output: String,
     /// How many commits the fast-forward moved `HEAD`. Zero for a plain fetch, and for a
     /// pull that had nothing to take.
     pub advanced: u32,
+    /// The branch the pull moved. Empty for a fetch, which moves none.
+    ///
+    /// Filled in even when `advanced` is zero, so the frontend can say *"main is already up
+    /// to date"* rather than the anonymous *"already up to date"* a fetch gets.
+    pub branch: String,
+    /// Where that branch was before, short. Empty for a fetch.
+    pub old_oid: String,
+    /// Where it is now, short. Equal to `old_oid` when nothing came down.
+    pub new_oid: String,
+    /// `git diff --shortstat` between the two, over the whole fast-forward.
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+    /// The commits taken, newest first, **capped in Rust**.
+    ///
+    /// Capped here and not in the frontend on purpose: a 400-commit pull after a fortnight
+    /// away must not put 400 rows on the IPC wire to have 390 of them dropped by a `slice`
+    /// in a component.
+    pub commits: Vec<PulledCommit>,
+    /// How many more there were beyond `commits`. Zero when the list is complete.
+    pub more_commits: u32,
+}
+
+impl FetchOutcome {
+    /// The answer a plain fetch gives: the transport half filled in, the pull half empty.
+    ///
+    /// A fetch writes remote-tracking refs and moves nothing else, so `branch`, both OIDs,
+    /// the three diff totals and the commit list are genuinely vacant rather than merely
+    /// unset — and they are vacant in one place here instead of being spelled out zero by
+    /// zero at each of the two routes in `cide_git::branch::fetch_with`.
+    pub fn fetched(remote: String, shelled_out: bool, output: String) -> Self {
+        Self {
+            remote,
+            shelled_out,
+            output,
+            advanced: 0,
+            branch: String::new(),
+            old_oid: String::new(),
+            new_oid: String::new(),
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+            commits: Vec::new(),
+            more_commits: 0,
+        }
+    }
 }
 
 // --- shelf and stash --------------------------------------------------------------------
@@ -706,6 +789,24 @@ pub enum GitError {
     NoUpstream {
         branch: String,
     },
+    /// `HEAD` is not on a branch, so there is nothing to fast-forward.
+    ///
+    /// Split out of [`Self::NoUpstream`], which used to swallow it: a detached `HEAD` was
+    /// told *"a1b2c3d4 has no upstream branch to pull from"*, which names a commit as though
+    /// it were a branch and suggests the fix is `--set-upstream`. It is not; the fix is to
+    /// check out a branch. `head` is the short oid, so the sentence can name where you are.
+    DetachedHead {
+        head: String,
+    },
+    /// No remote by that name is configured.
+    ///
+    /// Raised before a route is chosen, because both routes answer this badly on their own:
+    /// libgit2 says `Config: remote 'origin' does not exist` and the `git` binary says
+    /// `'origin' does not appear to be a git repository`. Both are true; neither is the
+    /// sentence for a repository that simply has no remote yet.
+    NoRemote {
+        name: String,
+    },
     /// `git fetch` failed. Same shape as [`Self::Push`] and for the same reason: the
     /// transport's own text is what the user needs.
     Fetch {
@@ -783,6 +884,8 @@ impl std::fmt::Display for GitError {
                 "{branch} is {ahead} ahead and {behind} behind its upstream, so this is not a fast-forward"
             ),
             Self::NoUpstream { branch } => write!(f, "{branch} has no upstream branch"),
+            Self::DetachedHead { head } => write!(f, "HEAD is detached at {head}"),
+            Self::NoRemote { name } => write!(f, "no remote named {name}"),
             Self::Fetch { output } => write!(f, "fetch failed: {output}"),
             Self::Push { output } => write!(f, "push failed: {output}"),
             Self::Io { detail } | Self::Git { detail } => f.write_str(detail),

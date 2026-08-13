@@ -49,9 +49,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
+use cide_core::proxy::ProxyEnv;
 use cide_ipc::git::{
     BranchInfo, BranchList, BranchRef, CheckoutMode, CheckoutOutcome, FetchOutcome, GitError,
-    RepoInfo,
+    PulledCommit, RepoInfo,
 };
 use git2::{BranchType, Commit, Oid, Repository, Status, StatusOptions, Tree};
 
@@ -521,42 +522,69 @@ fn validate_name(name: &str) -> Result<()> {
 // --- network ------------------------------------------------------------------------------------
 
 /// `git fetch`, by the same two routes as [`push::push`].
-pub fn fetch(root: &Path, remote: Option<&str>) -> Result<FetchOutcome> {
+///
+/// `proxy` is what cide will do to the forked `git`'s proxy environment, and it reaches only
+/// the binary route — see [`push`]'s module docs for why that is the whole of it.
+pub fn fetch(root: &Path, remote: Option<&str>, proxy: &ProxyEnv) -> Result<FetchOutcome> {
     let repo = repo_mod::open(root)?;
     let head = status::branch_info(&repo)?;
     let name = match remote {
         Some(name) => name.to_string(),
         None => push::default_remote(&repo, &head.upstream),
     };
-    fetch_with(&repo, root, &name)
+    fetch_with(&repo, root, &name, proxy)
 }
 
-fn fetch_with(repo: &Repository, root: &Path, remote: &str) -> Result<FetchOutcome> {
+fn fetch_with(
+    repo: &Repository,
+    root: &Path,
+    remote: &str,
+    proxy: &ProxyEnv,
+) -> Result<FetchOutcome> {
+    /*
+     * Asked before the route is chosen, so that "you have no remote" is one sentence rather
+     * than two transport-specific ones.
+     *
+     * `push::route` falls through to `Route::Libgit2` for an unknown remote — the url lookup
+     * fails and an empty url reads as local — so a repository with no `origin` used to reach
+     * `find_remote` a few lines below, fail there, and be `wrap()`ed into the catch-all
+     * `GitError::Git`, whose `explain` arm prints libgit2's own `Config: remote 'origin' does
+     * not exist`. That is a true sentence about our internals and a useless one about the
+     * user's repository. With a credential helper configured it was worse: the binary route
+     * answered `'origin' does not appear to be a git repository`, which reads as though the
+     * *local* directory were the problem.
+     */
+    if repo.find_remote(remote).is_err() {
+        return Err(GitError::NoRemote {
+            name: remote.to_string(),
+        });
+    }
     match push::route(repo, remote) {
         push::Route::Binary => {
             let mut command = Command::new("git");
             // Same reason as `push_via_binary`, and the same one line: a bundled launch must
             // not lend this `git` the AppImage's loader path. See `cide_core::child_env`.
             cide_core::child_env::scrub_command(&mut command);
+            // After the bundle scrub, which never touches a proxy name. Same ordering and
+            // same reason as `push_via_binary`.
+            proxy.apply(&mut command);
             command.current_dir(root).arg("fetch").arg(remote);
             // Same reason as `push_via_binary`: these commands are synchronous, and a `git`
             // that blocks on a tty prompt the user cannot see freezes the window for ever.
             command.env("GIT_TERMINAL_PROMPT", "0");
             let output = command.output().wrap()?;
-            let text = format!(
+            // Scrubbed of anything cide put into this child's environment: git's stderr is
+            // shown verbatim, and a credentialed proxy in a `407 after CONNECT` line would
+            // otherwise travel into a toast. See `push_via_binary`.
+            let text = proxy.scrub_output(&format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
-            );
+            ));
             if !output.status.success() {
                 return Err(GitError::Fetch { output: text });
             }
-            Ok(FetchOutcome {
-                remote: remote.to_string(),
-                shelled_out: true,
-                output: text,
-                advanced: 0,
-            })
+            Ok(FetchOutcome::fetched(remote.to_string(), true, text))
         }
         push::Route::Libgit2 => {
             let mut handle = repo.find_remote(remote).wrap()?;
@@ -587,16 +615,15 @@ fn fetch_with(repo: &Repository, root: &Path, remote: &str) -> Result<FetchOutco
              * fetch that really did bring commits.
              */
             let received = handle.stats().received_objects();
-            Ok(FetchOutcome {
-                remote: remote.to_string(),
-                shelled_out: false,
-                output: if received == 0 {
+            Ok(FetchOutcome::fetched(
+                remote.to_string(),
+                false,
+                if received == 0 {
                     String::new()
                 } else {
                     format!("Fetched {received} objects from {remote}")
                 },
-                advanced: 0,
-            })
+            ))
         }
     }
 }
@@ -608,15 +635,25 @@ fn fetch_with(repo: &Repository, root: &Path, remote: &str) -> Result<FetchOutco
 /// working tree with nothing in the app able to finish it. A divergence is reported as
 /// [`GitError::NotFastForward`] with both counts, which is the information needed to choose
 /// between merge and rebase in a terminal that is one keystroke away.
-pub fn pull(root: &Path, remote: Option<&str>) -> Result<FetchOutcome> {
-    let outcome = fetch(root, remote)?;
+pub fn pull(root: &Path, remote: Option<&str>, proxy: &ProxyEnv) -> Result<FetchOutcome> {
+    let outcome = fetch(root, remote, proxy)?;
 
     // Reopened after the fetch on purpose: the fetch wrote refs, and this crate's rule is
     // that no `Repository` handle outlives the operation that opened it.
     let repo = repo_mod::open(root)?;
     let head = status::branch_info(&repo)?;
-    if head.unborn || head.detached {
-        return Err(GitError::NoUpstream { branch: head.head });
+    /*
+     * Three states, three sentences. These used to collapse into `NoUpstream`, which meant a
+     * detached HEAD was told `a1b2c3d4 has no upstream branch to pull from` — a sentence that
+     * calls a commit a branch and points at the wrong fix, since no `--set-upstream` will help
+     * someone who is not on a branch at all. An unborn branch had the same problem in reverse:
+     * there is no commit to fast-forward, which `Unborn` already says in one word.
+     */
+    if head.unborn {
+        return Err(GitError::Unborn);
+    }
+    if head.detached {
+        return Err(GitError::DetachedHead { head: head.head });
     }
     let branch = repo
         .find_branch(&head.head, BranchType::Local)
@@ -632,7 +669,16 @@ pub fn pull(root: &Path, remote: Option<&str>) -> Result<FetchOutcome> {
     };
 
     if local_oid == remote_oid {
-        return Ok(outcome);
+        // Nothing came down — but the branch is still worth naming. *"main is already up to
+        // date with origin"* is a different sentence from a bare fetch's *"already up to
+        // date"*, and in a project with four repositories it is the only thing that says
+        // which of them just answered.
+        return Ok(FetchOutcome {
+            branch: head.head,
+            old_oid: short_oid(local_oid),
+            new_oid: short_oid(local_oid),
+            ..outcome
+        });
     }
     let (ahead, behind) = repo.graph_ahead_behind(local_oid, remote_oid).wrap()?;
     if ahead > 0 {
@@ -654,6 +700,17 @@ pub fn pull(root: &Path, remote: Option<&str>) -> Result<FetchOutcome> {
         });
     }
 
+    /*
+     * The report is built **before** the working tree moves, and that ordering is the design.
+     *
+     * Everything it reads is a local object the fetch already wrote, so it can only fail if
+     * the object database is broken — and in that case failing here leaves the tree exactly
+     * where it was, whereas failing after `checkout_tree` would report an error for a pull
+     * that had actually happened. That is the worse of the two: a user who is told the pull
+     * failed will run it again.
+     */
+    let report = pull_report(&repo, local_oid, remote_oid, behind as u32)?;
+
     let mut builder = git2::build::CheckoutBuilder::new();
     builder.safe();
     repo.checkout_tree(target.as_object(), Some(&mut builder))
@@ -668,7 +725,78 @@ pub fn pull(root: &Path, remote: Option<&str>) -> Result<FetchOutcome> {
 
     Ok(FetchOutcome {
         advanced: behind as u32,
+        branch: head.head,
+        old_oid: short_oid(local_oid),
+        new_oid: short_oid(remote_oid),
+        files_changed: report.files_changed,
+        insertions: report.insertions,
+        deletions: report.deletions,
+        commits: report.commits,
+        more_commits: report.more_commits,
         ..outcome
+    })
+}
+
+/// How many of a fast-forward's commits are described one by one.
+///
+/// Ten, because the surface is a toast: it is the number that fits without the notice
+/// becoming a scrolling panel, and everything past it is still reported as a count. The cap
+/// is here rather than in the frontend so that a fortnight away — four hundred commits —
+/// does not put four hundred rows on the IPC wire for a component to `slice` down to ten.
+const PULL_COMMIT_CAP: usize = 10;
+
+/// What a fast-forward from `local` to `remote` actually contains.
+struct PullReport {
+    files_changed: u32,
+    insertions: u32,
+    deletions: u32,
+    commits: Vec<PulledCommit>,
+    more_commits: u32,
+}
+
+/// Read that report out of the object database. Touches nothing.
+///
+/// `behind` is passed in rather than recomputed: `graph_ahead_behind` has already walked this
+/// exact set of commits, and the revwalk below yields precisely `behind` of them, so the
+/// overflow count is arithmetic rather than a second walk.
+fn pull_report(repo: &Repository, local: Oid, remote: Oid, behind: u32) -> Result<PullReport> {
+    let local_tree = repo.find_commit(local).wrap()?.tree().wrap()?;
+    let remote_tree = repo.find_commit(remote).wrap()?.tree().wrap()?;
+    // The totals across the whole fast-forward, not per commit: the question a pull answers
+    // is "what is different about my tree now", and summing per-commit stats would count a
+    // file touched by three of them three times.
+    let stats = repo
+        .diff_tree_to_tree(Some(&local_tree), Some(&remote_tree), None)
+        .wrap()?
+        .stats()
+        .wrap()?;
+
+    let mut walk = repo.revwalk().wrap()?;
+    walk.push(remote).wrap()?;
+    walk.hide(local).wrap()?;
+
+    let mut commits = Vec::new();
+    for oid in walk.take(PULL_COMMIT_CAP) {
+        let oid = oid.wrap()?;
+        let commit = repo.find_commit(oid).wrap()?;
+        // Both refuse non-UTF-8 bytes rather than mangling them, and an empty string is the
+        // honest rendering of that: the alternative is mojibake in a toast, and the short oid
+        // beside it is still enough to run `git show`. Same `.ok().flatten()` as `collect`
+        // above, which reads the same field for the branch list's subject.
+        let author = commit.author();
+        commits.push(PulledCommit {
+            short_oid: short_oid(oid),
+            summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
+            author: author.name().unwrap_or("").to_string(),
+        });
+    }
+
+    Ok(PullReport {
+        files_changed: stats.files_changed() as u32,
+        insertions: stats.insertions() as u32,
+        deletions: stats.deletions() as u32,
+        more_commits: behind.saturating_sub(commits.len() as u32),
+        commits,
     })
 }
 

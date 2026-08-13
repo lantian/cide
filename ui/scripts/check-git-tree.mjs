@@ -308,9 +308,143 @@ try {
 
   // --- counts --------------------------------------------------------------------------
 
-  eq(rows1.find((r) => r.label === 'Changes').count, 2, "a changelist counts its own files")
-  eq(rowsN[0].count, 6, "a repo's count includes its submodule's files")
-  eq(rows2[0].count, 5, "and a plain repo counts every file under it")
+  /*
+   * There are two different questions here and they must not be answered by one number.
+   *
+   * A **group** row counts its own files, ignored group included: that row exists to say how
+   * many ignored files there are.
+   *
+   * A **repo** row counts *changes*, which excludes them — and this assertion used to say `5`
+   * against a fixture whose fifth file is `ignored: [target]`. That was the bug being pinned
+   * rather than the behaviour: the repo row's number moved when the user opened the Ignored
+   * twisty, because opening it flips `includeIgnored` on the next `git_status` and the panel
+   * summed every group. A count that changes because a twisty was opened is wrong, and once
+   * the same number is on the activity rail it is wrong somewhere nothing explains it.
+   *
+   * So the repo row and the rail are both `countRepoFiles`, and the group rows are their own
+   * `entries.length`. A repo row therefore need not equal the sum of its group rows when the
+   * ignored group is on screen — the two are labelled differently and mean different things.
+   */
+  eq(rows1.find((r) => r.label === 'Changes').count, 2, 'a changelist counts its own files')
+  eq(
+    rows1.find((r) => r.label === 'Ignored Files').count,
+    1,
+    'and so does the ignored group — that row is *about* the ignored files',
+  )
+  eq(rowsN[0].count, 5, "a repo's count includes its submodule's files")
+  eq(rows2[0].count, 4, 'and a plain repo counts every changed file under it, ignored excluded')
+
+  eq(
+    m.counts('ignored'),
+    false,
+    'the one rule, stated once: ignored files are not changes',
+  )
+  for (const kind of ['changelist', 'conflicts', 'unversioned']) {
+    eq(
+      m.counts(kind),
+      true,
+      `${kind} files are — a conflict blocks a commit, so a badge that dropped it would read `
+        + 'low during exactly the merge it should be shouting about',
+    )
+  }
+
+  // --- the activity rail's number, which must be the panel's ------------------------------
+
+  eq(m.countChangedFiles({ repos: [] }), 0, 'no repositories, nothing changed')
+  eq(
+    m.countChangedFiles(two),
+    rows2.filter((r) => r.kind === 'repo').reduce((n, r) => n + r.count, 0),
+    'the rail total IS the sum of the repo rows — not a second walk that agrees, the same '
+      + 'function summed. One badge and a panel disagreeing about how much work is '
+      + 'uncommitted would make both untrustworthy.',
+  )
+  eq(m.countChangedFiles(two), 8, 'two repos of four changed files each')
+  eq(
+    m.countChangedFiles(nested),
+    5,
+    'a submodule is counted through `children`, exactly once',
+  )
+
+  /*
+   * The invariance that motivates all of it: opening the Ignored twisty is what makes the
+   * next payload carry ignored entries, and the badge must not move when it does.
+   */
+  {
+    const clean = { repos: [{ ...repo(APP, '/w/app', 'app'), ignored: [] }] }
+    const loud = {
+      repos: [
+        {
+          ...repo(APP, '/w/app', 'app'),
+          ignored: Array.from({ length: 11000 }, (_, i) => entry(`target/${i}`, 'unmodified', 'ignored', 'default')),
+        },
+      ],
+    }
+    eq(
+      m.countChangedFiles(m.normalizeStatus(loud)),
+      m.countChangedFiles(m.normalizeStatus(clean)),
+      'eleven thousand ignored files do not move the badge by one — the user opened a '
+        + 'twisty, they did not do eleven thousand units of work',
+    )
+  }
+
+  /*
+   * And a repository holding *only* ignored files still draws. `walkRepo` elides a repo with
+   * nothing to show, and "nothing" there has to mean "no rows" rather than "no changes" —
+   * otherwise asking to see a repo's ignored files makes the repo disappear.
+   */
+  {
+    const onlyIgnored = m.normalizeStatus({
+      repos: [
+        { ...repo(APP, '/w/app', 'app'), changelists: [], unversioned: [], conflicts: [] },
+        repo(LIB, '/w/lib', 'lib'),
+      ],
+    })
+    const drawn = m.buildRows(onlyIgnored, openAll(onlyIgnored))
+    ok(
+      drawn.some((r) => r.label === 'Ignored Files' && r.repo === APP),
+      'a repository whose only content is ignored files keeps its rows',
+    )
+    eq(
+      drawn.find((r) => r.kind === 'repo' && r.repo === APP).count,
+      0,
+      'and its repo row honestly says zero changes, which is what it has',
+    )
+  }
+
+  // --- what the badge draws ----------------------------------------------------------------
+
+  /*
+   * `null` and `0` are different facts with the same rendering, and both renderings are
+   * decisions rather than omissions.
+   *
+   * `null` is "no walk has landed yet". Drawing `0` there would be a claim — "your tree is
+   * clean" — made before anything had been looked at, and it would flash on every launch.
+   * `0` is a clean tree, and a zero badge is noise: it is the state the badge exists to
+   * distinguish *from*. `Explorer`'s header withholds its count at zero for the same reason,
+   * and its comment is the one this follows.
+   */
+  eq(m.badgeText(null), null, 'nothing is drawn before the first walk lands')
+  eq(m.badgeText(0), null, 'and nothing is drawn for a clean tree')
+  eq(m.badgeText(1), '1', 'one changed file')
+  eq(m.badgeText(99), '99', 'two digits still fit the 28px button inside a 42px rail')
+  eq(m.badgeText(100), '99+', 'and past that it caps — `1,203` is five glyphs and does not fit')
+  eq(m.badgeText(11803), '99+', 'however far past')
+  eq(
+    m.badgeText(-1),
+    null,
+    'a negative count is not a thing, and rendering `-1` would be worse than rendering nothing',
+  )
+
+  eq(m.badgeLabel(null, ''), undefined, 'a badge that is not drawn adds nothing to the button name')
+  eq(m.badgeLabel(0, '0'), undefined, 'nor does a clean tree')
+  eq(m.badgeLabel(1, '1'), '1 changed file', 'singular')
+  eq(m.badgeLabel(14, '14'), '14 changed files', 'plural')
+  eq(
+    m.badgeLabel(1203, '1,203'),
+    '1,203 changed files',
+    'the exact number reaches the tooltip and the accessible name even though the badge says '
+      + '`99+` — a number nobody can act on precisely belongs where there is room for it',
+  )
 
   // --- tri-state -----------------------------------------------------------------------
 

@@ -168,10 +168,11 @@ fn is_current_schema(value: &Value) -> bool {
 /// build would silently drop on the next save, and a downgrade that quietly discards half
 /// the user's layout is worse than a visible reset.
 ///
-/// A `Value` does not preserve object key order, so a document that passes through here
-/// loses the header tab order. That is why [`load`] only routes documents that actually need
-/// migrating through this function; the first real migration step will want serde_json's
-/// `preserve_order` feature turned on.
+/// Key order **is** preserved through here, and it has to be: `projects` insertion order is
+/// the header tab order, and a plain `serde_json::Value` sorts object keys into a `BTreeMap`.
+/// That is why the workspace's `serde_json` is built with the `preserve_order` feature —
+/// turned on for exactly this, the first migration this ladder has ever run. A user upgrading
+/// into schema 2 keeps their tab strip in the order they left it.
 pub fn migrate(value: Value) -> Result<Workspace> {
     const CURRENT: u64 = Workspace::CURRENT_SCHEMA as u64;
 
@@ -182,10 +183,10 @@ pub fn migrate(value: Value) -> Result<Workspace> {
     };
 
     // A ladder: each supported older schema gets an arm that rewrites the document one step
-    // forward and re-enters here, e.g. `1 => migrate(v1_to_v2(value))`. Adding version 2 is
-    // then an arm, not a restructuring.
+    // forward and re-enters here. Adding version 3 is an arm, not a restructuring.
     match version {
         CURRENT => Ok(serde_json::from_value(value)?),
+        1 => migrate(v1_to_v2(value)),
         v if v > CURRENT => Err(CoreError::Serde(format!(
             "workspace schema {v} is newer than this build's {CURRENT}; refusing to downgrade it"
         ))),
@@ -193,6 +194,59 @@ pub fn migrate(value: Value) -> Result<Workspace> {
             "workspace schema {v} is no longer supported"
         ))),
     }
+}
+
+/// Schema 1 → 2: write down which children the proxy settings reached.
+///
+/// # Why this writes a value that is also the default
+///
+/// Nothing here is needed to make a schema-1 document *load*. `ProxySettings` has
+/// `#[serde(default)]`, and `ProxyScope::default()` is by construction exactly what schema 1
+/// meant: both pane kinds proxied, cide's own `git` left with whatever environment cide itself
+/// has. Deleting this function would change no behaviour today.
+///
+/// It is here for the day the default moves. The scope exists so that a user can say "proxy
+/// `claude` and nothing else", and the obvious next request is for a fresh install to start
+/// that way. The moment `ProxyScope::default()` changes, a document that *relies* on the
+/// default is silently re-scoped — a corporate laptop's `git push` moves onto cide's proxy, or
+/// off it, because of a constant edited for an unrelated reason, with nothing on that user's
+/// disk to explain the change and no error anywhere when it stops working. Writing the value
+/// makes an existing user's scope a fact rather than an inference, so that a later change to
+/// the default is a change to *new installs* and to nothing else.
+///
+/// # What it refuses to touch
+///
+/// A `settings` or `settings.proxy` that is not an object is left exactly as found and allowed
+/// to fail in `from_value` below, with serde's own message. Overwriting it would turn "your
+/// settings block is corrupt" into "your proxy configuration silently became the default",
+/// which is the wrong of the two answers to give someone who hand-edited the file.
+fn v1_to_v2(mut value: Value) -> Value {
+    if let Some(root) = value.as_object_mut() {
+        root.insert("schemaVersion".into(), Value::from(2u32));
+
+        // `entry` rather than a get-or-insert dance, and it creates the intermediate objects:
+        // both keys are legitimately absent from a document written by a user who never opened
+        // Settings, since every field of `Settings` defaults.
+        let settings = root
+            .entry("settings")
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Some(settings) = settings.as_object_mut() {
+            let proxy = settings
+                .entry("proxy")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(proxy) = proxy.as_object_mut() {
+                // Serialized from the type rather than written as a JSON literal here: a
+                // literal is a second spelling of `ProxyScope`'s wire names, and the first
+                // rename would leave this migration writing a key nothing reads — which
+                // deserialises back to the default and looks, from every angle, like it
+                // worked.
+                if let Ok(scope) = serde_json::to_value(cide_ipc::ProxyScope::default()) {
+                    proxy.insert("scope".into(), scope);
+                }
+            }
+        }
+    }
+    value
 }
 
 /// Write `ws` to `path` so that a crash leaves either the old file or the new one, never a
@@ -949,26 +1003,43 @@ mod tests {
   }
 }"#;
 
-    /// Criterion 2 of the rows change: nothing on anybody's disk had to move.
+    /// Criterion 2 of the rows change, now carrying a second job: a real schema-1 document
+    /// off somebody's disk still loads, and everything in it still means what it meant.
     ///
-    /// `CURRENT_SCHEMA` is still 1, so this document takes the fast path in `read_workspace`
-    /// and is never routed through `serde_json::Value` — which would re-sort the header tab
-    /// order. No migration arm runs, no file is rewritten, no quarantine copy appears, and
-    /// every anchor comes back naming the same split it named before.
+    /// It no longer takes the fast path — `CURRENT_SCHEMA` moved to 2 for the proxy scope — so
+    /// this is also the proof that the migration ladder does not damage what it walks past.
+    /// Every assertion below was written when nothing was migrating this document at all, and
+    /// every one of them still has to hold after a round trip through `serde_json::Value`:
+    /// the anchors, the ratios, the split ids, the removed `repo` field, the two tabs.
+    ///
+    /// No quarantine copy appears, and nothing is written beside it: `load` migrates in
+    /// memory, and the file on disk is rewritten only by the next ordinary save.
     #[test]
-    fn a_workspace_written_before_this_change_loads_at_schema_1_untouched() {
+    fn a_schema_1_workspace_off_a_real_disk_migrates_without_losing_anything() {
         let dir = TempDir::new("legacy");
         let path = dir.join("workspace.json");
         fs::write(&path, LEGACY_WORKSPACE).expect("write the captured document");
 
         let ws = load(&path);
 
-        assert_eq!(Workspace::CURRENT_SCHEMA, 1, "no schema bump was needed");
-        assert_eq!(ws.schema_version, 1);
+        assert_eq!(Workspace::CURRENT_SCHEMA, 2);
+        assert_eq!(ws.schema_version, 2, "the ladder ran and stopped at current");
         assert_eq!(
             dir.entries(),
             vec!["workspace.json".to_string()],
             "nothing was quarantined and nothing was written beside it"
+        );
+
+        // The scope this user gets is the behaviour they already had: both pane kinds
+        // proxied, cide's own `git` inheriting whatever cide itself was launched with.
+        // Spelled out rather than compared against `ProxyScope::default()`, because the whole
+        // reason the migration writes it is that the default is expected to move.
+        assert_eq!(ws.settings.proxy.scope.claude, cide_ipc::ProxyTarget::Configured);
+        assert_eq!(ws.settings.proxy.scope.shells, cide_ipc::ProxyTarget::Configured);
+        assert_eq!(
+            ws.settings.proxy.scope.git,
+            cide_ipc::ProxyTarget::Untouched,
+            "schema 1 never put a proxy into cide's own git, and an upgrade must not either"
         );
 
         let project = ws.projects.values().next().expect("the project loaded");
@@ -1571,6 +1642,133 @@ mod tests {
         let value = serde_json::to_value(&workspace).expect("serialise");
 
         assert_eq!(migrate(value).expect("migrate"), workspace);
+    }
+
+    /// **The header tab order survives a migration, and it took a Cargo feature to make that
+    /// true.**
+    ///
+    /// `projects` is an `IndexMap` whose insertion order *is* the order of the tabs across the
+    /// top of the window. A migration necessarily routes the document through a
+    /// `serde_json::Value`, and a stock `serde_json` stores object keys in a `BTreeMap` — so
+    /// without the `preserve_order` feature, the first user to upgrade into schema 2 would
+    /// have found their tabs silently re-sorted by uuid. Nothing would have failed; a
+    /// migration test that only checked the *set* of projects would have passed.
+    ///
+    /// The two ids below are chosen so that insertion order and sorted order disagree: `f…`
+    /// is inserted first and sorts last. A build without `preserve_order` answers `["a…",
+    /// "f…"]` here.
+    #[test]
+    fn a_migration_does_not_re_sort_the_header_tabs() {
+        // Not `fixture()`: this needs two projects whose uuids sort against the order they
+        // were opened in, which is the only shape that can catch the bug.
+        let first = "fedcba98-0000-4000-8000-000000000001";
+        let second = "abcdef01-0000-4000-8000-000000000002";
+
+        // Built from the real constructor and then re-keyed, rather than written out as a
+        // JSON literal: a literal is a second copy of `Project`'s wire shape, and the next
+        // field added to it would break this test for a reason that has nothing to do with
+        // ordering.
+        let at = |id: &str, name: &str| {
+            let mut value = serde_json::to_value(project(name, "~/x", false)).expect("serialise");
+            value["id"] = Value::from(id);
+            value
+        };
+        let mut projects = serde_json::Map::new();
+        projects.insert(first.into(), at(first, "opened first"));
+        projects.insert(second.into(), at(second, "opened second"));
+
+        let document = serde_json::json!({
+            "schemaVersion": 1,
+            "rev": 7,
+            "settings": {},
+            "projects": Value::Object(projects),
+            "windows": {},
+        });
+
+        let ws = migrate(document).expect("a schema 1 document migrates");
+
+        let order: Vec<&str> = ws.projects.values().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["opened first", "opened second"],
+            "the tab strip came back sorted by uuid — serde_json's `preserve_order` feature \
+             is what stops that, and this document is shaped so the two orders disagree"
+        );
+    }
+
+    /// The migration writes the scope down rather than leaning on the serde default, so that
+    /// a later change to `ProxyScope::default()` cannot re-scope a live configuration.
+    ///
+    /// Asserted on the *document*, not on the loaded struct: a struct-level assertion passes
+    /// identically whether the value was written or defaulted, which is exactly the two cases
+    /// this exists to tell apart.
+    #[test]
+    fn the_migration_records_the_scope_in_the_document_rather_than_defaulting_it() {
+        let v1 = serde_json::json!({
+            "schemaVersion": 1,
+            "rev": 0,
+            "settings": { "proxy": { "mode": "manual", "http": "http://proxy.corp:3128" } },
+            "projects": {},
+            "windows": {},
+        });
+
+        let migrated = v1_to_v2(v1);
+
+        assert_eq!(migrated["schemaVersion"], serde_json::json!(2));
+        assert_eq!(
+            migrated["settings"]["proxy"]["scope"],
+            serde_json::json!({ "claude": "configured", "shells": "configured", "git": "untouched" }),
+            "the value has to be in the document; a default is an inference, and inferences \
+             change when the constant does"
+        );
+        // And the user's own configuration is not disturbed on the way past.
+        assert_eq!(
+            migrated["settings"]["proxy"]["http"],
+            serde_json::json!("http://proxy.corp:3128")
+        );
+    }
+
+    /// A document that never had a `settings` block still gets one, because the alternative
+    /// is a migration that records nothing for the users who never opened Settings — which is
+    /// most of them.
+    #[test]
+    fn a_document_with_no_settings_block_still_gets_a_recorded_scope() {
+        let v1 = serde_json::json!({
+            "schemaVersion": 1, "rev": 0, "projects": {}, "windows": {},
+        });
+
+        let migrated = v1_to_v2(v1);
+        assert_eq!(
+            migrated["settings"]["proxy"]["scope"]["git"],
+            serde_json::json!("untouched")
+        );
+        // And it still loads, which is the point of writing into a document at all.
+        let ws: Workspace = serde_json::from_value(migrated).expect("the result deserialises");
+        assert_eq!(ws.settings.proxy.scope, cide_ipc::ProxyScope::default());
+    }
+
+    /// A hand-broken `settings` is left alone and allowed to fail with serde's own message.
+    ///
+    /// Overwriting it would turn "your settings block is corrupt" into "your proxy
+    /// configuration silently became the default", which is the wrong answer to give somebody
+    /// who has been editing the file by hand.
+    #[test]
+    fn a_settings_block_that_is_not_an_object_is_not_rewritten() {
+        let v1 = serde_json::json!({
+            "schemaVersion": 1, "rev": 0,
+            "settings": "this is not a settings block",
+            "projects": {}, "windows": {},
+        });
+
+        let migrated = v1_to_v2(v1);
+        assert_eq!(
+            migrated["settings"],
+            serde_json::json!("this is not a settings block")
+        );
+        assert!(
+            migrate(migrated).is_err(),
+            "and it is refused rather than half-understood"
+        );
     }
 
     #[test]

@@ -460,7 +460,21 @@ pub async fn claude_headless(
     request: HeadlessRequest,
 ) -> Result<HeadlessResult, HeadlessError> {
     let cwd = project_root(&state, project)?;
-    run_headless(cwd, request).await
+    run_headless(cwd, request, claude_proxy(&state)).await
+}
+
+/// The proxy environment a `claude` one-shot is spawned with.
+///
+/// Reads `ProxyScope::claude`, deliberately: the scope has three columns and a one-shot is a
+/// `claude`, not a shell and not cide's own `git`. A user who takes `claude` out of scope
+/// means both lanes, and a one-shot that read `shells` would be answering a question about a
+/// pane nobody opened.
+///
+/// Read here rather than inside `run_headless` so the lock is taken at the point that owns the
+/// `State`, and released before the `await`.
+fn claude_proxy(state: &WorkspaceState) -> cide_core::proxy::ProxyEnv {
+    let proxy = state.with(|ws| ws.settings.proxy.clone());
+    cide_core::proxy::ProxyEnv::for_target(&proxy, proxy.scope.claude)
 }
 
 /// The project's first root, which is the directory a one-shot runs in.
@@ -489,6 +503,7 @@ fn project_root(state: &WorkspaceState, project: ProjectId) -> Result<PathBuf, H
 async fn run_headless(
     cwd: PathBuf,
     request: HeadlessRequest,
+    proxy: cide_core::proxy::ProxyEnv,
 ) -> Result<HeadlessResult, HeadlessError> {
     // Latched, so this is a probe on the first one-shot of the process and free afterwards.
     // Worth doing here rather than only at startup: a user whose CLI self-updated mid-session
@@ -498,7 +513,13 @@ async fn run_headless(
     // The bare name, resolved by `PATH` — the same thing every pane spawns. Resolving it
     // ourselves would pin whichever version was on `PATH` at launch, and the CLI updates
     // itself underneath a running app.
-    let run = cide_claude::Headless::new(request, cwd);
+    //
+    // The proxy is resolved by the caller, not here, and it is `ProxyScope::claude` that
+    // decides it: a one-shot *is a claude*, and a user who takes `claude` out of scope means
+    // both lanes. Until this argument existed the one-shot lane read no proxy setting at all
+    // — it inherited cide's raw environment — so a corporate user whose panes worked got a
+    // commit-message generation that hung.
+    let run = cide_claude::Headless::new(request, cwd).proxy(proxy);
     tauri::async_runtime::spawn_blocking(move || {
         cide_claude::headless::run(Path::new(CLAUDE_PROGRAM), &run)
     })
@@ -604,7 +625,7 @@ pub async fn claude_commit_message(
     }
 
     let request = cide_claude::prompt::commit_message(&diff, branch.as_deref());
-    Ok(run_headless(root, request).await?)
+    Ok(run_headless(root, request, claude_proxy(&state)).await?)
 }
 
 /// The patch text a commit would record, and the branch it would land on.
@@ -673,7 +694,7 @@ pub async fn claude_explain_selection(
         end_line,
         &text,
     );
-    run_headless(cwd, request).await
+    run_headless(cwd, request, claude_proxy(&state)).await
 }
 
 // --- the CLI version check ----------------------------------------------------------------
@@ -695,6 +716,25 @@ pub struct ClaudeCliSupport {
     /// says "everything is fine" on every launch is a note nobody reads on the launch it
     /// matters.
     pub warning: Option<String>,
+    /// The last `claude` to complete the IDE handshake **on this machine**.
+    ///
+    /// # A different question from every other field here
+    ///
+    /// The three above are all derived from `SUPPORTED_CLI` and `claude --version`: a property
+    /// of the *source tree* measured against a probe of `PATH`. They answer "has anyone
+    /// checked this version of the protocol", and a version-string comparison against a
+    /// constant verifies nothing about protocol drift — it verifies that a human typed a
+    /// number.
+    ///
+    /// This is a *per-machine observation*: a real CLI read our lockfile, chose the WebSocket
+    /// transport, presented the auth header, and had its `initialize` reply accepted, here.
+    /// It is the only thing on this screen that can honestly be shown as evidence, precisely
+    /// because it does not claim anything about anybody else's machine.
+    ///
+    /// `None` before anything has ever connected — a fresh install, or a machine where the
+    /// IDE integration has never worked, which are different situations the screen words
+    /// differently. See `cide_core::handshake`.
+    pub handshake: Option<cide_core::handshake::Handshake>,
 }
 
 /// Whether the installed CLI is one this build's IDE protocol was ever checked against.
@@ -722,6 +762,7 @@ pub async fn claude_cli_support() -> ClaudeCliSupport {
             version: None,
             verified_range: cide_claude::version::verified_range(),
             warning: None,
+            handshake: None,
         })
 }
 
@@ -729,10 +770,36 @@ pub async fn claude_cli_support() -> ClaudeCliSupport {
 /// without an async runtime, and so the command body is only the threading decision.
 fn cli_support() -> ClaudeCliSupport {
     let support = cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM));
+    let handshake = cide_core::handshake::load(&cide_core::handshake::handshake_path());
+    verdict(support, handshake)
+}
+
+/// Build the answer from a verdict and a record, without touching `PATH` or the disk.
+///
+/// # This split exists to make a test possible that was not
+///
+/// What stood here was one function reading `check_once`, and its test asserted
+/// `support.warning.is_some() == check_once(...).is_warning()` — the same latched value on
+/// both sides of an equals sign. It could not fail: not on a machine with no `claude`, not on
+/// one with a CLI five releases past the range, not if this function had returned
+/// `warning: None` unconditionally. A test that cannot fail is worse than no test, because it
+/// occupies the place where the real one would go.
+///
+/// With the inputs handed in, every branch is drivable: a `Support::Newer` really does produce
+/// a warning, a `Support::Verified` really does produce none, and a record from an older build
+/// really does keep its own range rather than being relabelled with this one's.
+fn verdict(
+    support: &cide_claude::version::Support,
+    handshake: Option<cide_core::handshake::Handshake>,
+) -> ClaudeCliSupport {
     ClaudeCliSupport {
         version: support.version().map(str::to_string),
         verified_range: cide_claude::version::verified_range(),
         warning: support.is_warning().then(|| support.message()),
+        // Passed through exactly as stored, range included. Overwriting the stored range with
+        // this build's would erase the one signal that says the record is from a different
+        // build — which is the case the screen has its own sentence for.
+        handshake,
     }
 }
 
@@ -1129,15 +1196,92 @@ mod tests {
         );
     }
 
+    /// **This replaces a test that could not fail.**
+    ///
+    /// What was here asserted `support.warning.is_some() == check_once(...).is_warning()` —
+    /// and both sides were the same `OnceLock`. It was true on a machine with no `claude`, on
+    /// a machine five releases past the range, and would have been true if `cli_support` had
+    /// returned `warning: None` unconditionally. Driving `verdict` with a constructed
+    /// `Support` is what makes each branch a real assertion.
     #[test]
-    fn the_cli_support_verdict_carries_the_range_and_warns_only_when_there_is_news() {
-        // `claude` may or may not be installed on the machine running this, so the assertion
-        // is on the invariants rather than on a version: the range is always populated, and a
-        // warning is present exactly when the verdict is one.
+    fn a_warning_is_produced_exactly_when_the_verdict_is_one() {
+        use cide_claude::version::Support;
+
+        let newer = Support::Newer {
+            version: "9.9.9".into(),
+        };
+        let answer = verdict(&newer, None);
+        assert_eq!(answer.version.as_deref(), Some("9.9.9"));
+        let warning = answer.warning.expect("a CLI past the range is news");
+        assert!(warning.contains("9.9.9"), "{warning}");
+        assert!(
+            warning.contains(&answer.verified_range),
+            "the message has to name both numbers or it is unactionable: {warning}"
+        );
+
+        // Verified: no note. One that reads "everything is fine" on every launch is one
+        // nobody reads on the launch it matters.
+        let verified = Support::Verified {
+            version: "2.1.226".into(),
+        };
+        assert_eq!(verdict(&verified, None).warning, None);
+
+        // Missing: also no *protocol* warning. "claude is not installed" is a different
+        // message and the screen's own heading already says it.
+        assert_eq!(verdict(&Support::Missing, None).warning, None);
+        assert_eq!(verdict(&Support::Missing, None).version, None);
+
+        // The range is always populated, whatever the verdict.
+        for support in [&newer, &verified, &Support::Missing] {
+            assert!(!verdict(support, None).verified_range.is_empty());
+        }
+    }
+
+    /// A record written by an older build keeps the range it was written against.
+    ///
+    /// That disagreement is the whole reason the range is stored beside the version: it is
+    /// what lets the screen say "this was recorded against an older build" rather than
+    /// silently presenting a stale observation as though it were about this one.
+    #[test]
+    fn a_stored_handshake_keeps_its_own_range_rather_than_being_relabelled() {
+        let stored = cide_core::handshake::Handshake {
+            version: Some("2.1.227".into()),
+            at_unix_ms: 1_700_000_000_000,
+            verified_range: "an older build's range".into(),
+        };
+        let answer = verdict(
+            &cide_claude::version::Support::Verified {
+                version: "2.1.227".into(),
+            },
+            Some(stored.clone()),
+        );
+
+        let carried = answer.handshake.expect("the record is carried through");
+        assert_eq!(carried, stored);
+        assert_ne!(
+            carried.verified_range, answer.verified_range,
+            "the two ranges are allowed to differ, and the screen needs to be able to see it"
+        );
+    }
+
+    /// And the real one still assembles on whatever machine this runs on.
+    ///
+    /// Kept as a smoke test rather than as the assertion: it reads `PATH` and the state
+    /// directory, so the only things it can honestly claim are the invariants that hold
+    /// either way.
+    #[test]
+    fn the_real_verdict_assembles_with_a_range_whatever_is_installed() {
         let support = cli_support();
         assert!(!support.verified_range.is_empty());
-        let expected = cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM)).is_warning();
-        assert_eq!(support.warning.is_some(), expected);
+        assert_eq!(
+            support.warning.is_some(),
+            support.version.is_some()
+                && !matches!(
+                    cide_claude::version::support_of(support.version.as_deref()),
+                    cide_claude::version::Support::Verified { .. }
+                ),
+            "a warning appears exactly when the parsed version is outside the range"
+        );
     }
 
     #[test]

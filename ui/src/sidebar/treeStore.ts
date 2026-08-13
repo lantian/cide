@@ -48,6 +48,17 @@ import {
 } from '@/ipc/client'
 import { isNoIndex } from '@/store/fileIndex'
 import { CHUNK_CAP, CHUNK_ROWS, chunkOf, chunkRequest, chunksFor, chunksToEvict } from './rowWindow'
+import {
+  applyRange,
+  collapseTo,
+  keySelect,
+  NO_PATHS,
+  pressSelect,
+  rangeRefusal,
+  type SelectMods,
+  type SelectPlan,
+  type TreeSelection,
+} from './treeSelection'
 
 /**
  * A tree command, with "the index is not built yet" separated from "there is no such
@@ -118,6 +129,23 @@ interface FileTreeStore {
    */
   selectedIndex: number
   /**
+   * Every selected row, and where a Shift-range starts from. The rules are `treeSelection.ts`.
+   *
+   * A **second** concept beside [`selected`], not a replacement for it, and the git panel keeps
+   * the same two apart for the same reason (`rowSelection.ts`, `useGitPanel::current`):
+   *
+   * | | what it means |
+   * | --- | --- |
+   * | [`selected`] | the cursor — where the arrows move from, and the row Rename, Open and Reveal act on |
+   * | `selection` | what is highlighted, and what Cut, Copy and Move to Trash act on |
+   *
+   * They coincide for a plain click, which is why one field did for as long as a selection was
+   * one row. Ctrl-clicking a highlighted row off is where they come apart: the cursor stays
+   * where the gesture landed and the row is no longer in `selection`, so a cursor that doubled
+   * as the scope would delete a file with nothing on screen marking it.
+   */
+  selection: TreeSelection
+  /**
    * The unnamed row the user is typing a new file or folder into, or `null`.
    *
    * **An inline editor row, not a dialog**, and the choice is worth stating because the
@@ -172,8 +200,38 @@ interface FileTreeStore {
    * case in which `selectedIndex` is the better answer, not a case worth an IPC call for.
    */
   indexOf: (path: string) => number | null
-  /** Select a row. `index` is a hint for the arrows; see `selectedIndex`. */
+  /**
+   * Select exactly one row, collapsing whatever else was selected. `index` is a hint for the
+   * arrows; see `selectedIndex`.
+   *
+   * The unmodified gesture, and still the one most callers want: a reveal, a paste landing, a
+   * freshly created file. [`pressRow`] is the one that reads Ctrl and Shift.
+   */
   select: (path: string, index: number) => void
+  /**
+   * A left press on a row, with modifiers — the mouse half of the multi-selection.
+   *
+   * Resolves to a sentence for the problem strip when the gesture was refused (a Shift-range
+   * wider than `RANGE_ROWS`), and to `null` when it was carried out. Asynchronous because a
+   * band whose rows are not all resident has to be asked for; the *cursor* moves before the
+   * await either way, so nothing about it waits on IPC.
+   */
+  pressRow: (path: string, index: number, mods: SelectMods) => Promise<string | null>
+  /** The same, for an arrow that has already decided which row it is moving to. */
+  keyToRow: (path: string, index: number, mods: SelectMods) => Promise<string | null>
+  /** Write a selection worked out elsewhere — the right-click rule; see `pressMenu`. */
+  setSelection: (next: TreeSelection, lead: string | null, index: number) => void
+  /** Nothing selected, and no cursor. What a delete leaves behind. */
+  clearSelection: () => void
+  /**
+   * Ctrl+A: every row in the flattened tree, or a refusal when there are too many.
+   *
+   * Every row, not every *visible* one — unlike the git panel's, whose `rows` array only ever
+   * holds what is on screen. A folded folder here contributes no row at all, so this is already
+   * "what the tree is showing" in the only sense the flattening has. The cursor is left where
+   * it is: Ctrl+A changes what is selected, not where you are.
+   */
+  selectAll: () => Promise<string | null>
   /** Expand or collapse a directory row. */
   toggle: (row: TreeRow) => Promise<void>
   /** Expand ancestors until `path` is visible, then scroll to it. */
@@ -310,6 +368,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   revealTo: null,
   selected: null,
   selectedIndex: 0,
+  selection: NO_PATHS,
   draft: null,
 
   async attach(project) {
@@ -328,6 +387,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       revealTo: null,
       selected: null,
       selectedIndex: 0,
+      selection: NO_PATHS,
       draft: null,
     })
     if (project === null) return
@@ -375,12 +435,51 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   },
 
   select(path, index) {
-    const { selected, selectedIndex } = get()
+    const { selected, selectedIndex, selection } = get()
     // Guarded because a click on the already-selected row is the common case (it is the first
     // half of every double-click), and an unconditional `set` would re-render every visible
     // row to draw exactly what it is drawing.
-    if (selected === path && selectedIndex === index) return
-    set({ selected: path, selectedIndex: index })
+    //
+    // The selection is part of the test and not an afterthought: a plain click on the row the
+    // cursor is already on has to *collapse* a multi-row selection built around it, and the
+    // two-field version of this guard bailed out before it could — the highlight stayed on
+    // five rows after a click that meant "just this one".
+    const alone = selection.paths.size === 1 && selection.paths.has(path)
+    if (selected === path && selectedIndex === index && alone) return
+    set({ selected: path, selectedIndex: index, selection: collapseTo(path) })
+  },
+
+  async pressRow(path, index, mods) {
+    return runPlan(pressSelect(get().selection, path, mods), path, index, set, get)
+  },
+
+  async keyToRow(path, index, mods) {
+    return runPlan(keySelect(get().selection, path, mods), path, index, set, get)
+  },
+
+  setSelection(next, lead, index) {
+    set({ selection: next, selected: lead, selectedIndex: index })
+  },
+
+  clearSelection() {
+    const { selection, selected } = get()
+    if (selection.paths.size === 0 && selected === null) return
+    set({ selection: NO_PATHS, selected: null, selectedIndex: 0 })
+  },
+
+  async selectAll() {
+    const { count } = get()
+    if (count === 0) return null
+    const refusal = rangeRefusal(count)
+    if (refusal !== null) return refusal
+    const before = get().selection
+    const paths = await bandPaths(0, count - 1, get)
+    // The identity check is the whole guard against a stale write: the fetch above can take a
+    // frame or two, and anything the user did to the selection in between — a click, an arrow,
+    // an Escape — must outrank a Ctrl+A they have already moved on from.
+    if (paths === null || paths.length === 0 || get().selection !== before) return null
+    set({ selection: { paths: new Set(paths), anchor: paths[0] ?? null } })
+    return null
   },
 
   async toggle(row) {
@@ -425,7 +524,17 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // A reveal scrolls to a row the user was not looking at, so it also selects it: landing
     // on a screenful of rows with nothing marked leaves them to find the file again by eye,
     // which is the whole thing `file.reveal` was supposed to do for them.
-    set({ count, chunks: new Map(), revealTo: index, selected: path, selectedIndex: index })
+    set({
+      count,
+      chunks: new Map(),
+      revealTo: index,
+      selected: path,
+      selectedIndex: index,
+      // Exactly one row. A reveal is an answer to "where is this file", and leaving a
+      // multi-row selection standing around the row it just jumped to would make the next
+      // Delete act on rows from wherever the user was before.
+      selection: collapseTo(path),
+    })
   },
 
   clearReveal() {
@@ -570,10 +679,131 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // Selected, **not** opened. Creating a file is not opening it — the same rule a single
     // click follows. `reveal` would scroll as well, and `refresh` has already kept the
     // viewport where the draft was, which is where this row is.
-    set({ selected: created, selectedIndex: at })
+    set({ selected: created, selectedIndex: at, selection: collapseTo(created) })
     return created
   },
 }))
+
+/**
+ * Carry out what `treeSelection` decided, resolving a Shift-band if that is what it asked for.
+ *
+ * Outside the store rather than a method on it because both entry points ([`pressRow`] and
+ * [`keyToRow`]) run the identical second half, and the only thing they disagree about is which
+ * rule produced the plan.
+ *
+ * Resolves to the sentence the panel should show, or `null`.
+ */
+async function runPlan(
+  plan: SelectPlan,
+  to: string,
+  index: number,
+  set: (partial: Partial<FileTreeStore>) => void,
+  get: () => FileTreeStore,
+): Promise<string | null> {
+  if (plan.kind === 'set') {
+    set({ selection: plan.next, selected: to, selectedIndex: index })
+    return null
+  }
+
+  const from = get().indexOf(plan.from)
+  if (from === null) {
+    // The anchor has no resident row, so the band has no top. `applyRange` degrades to the
+    // plain rule; see its comment for the two ordinary ways this happens.
+    set({ selection: applyRange(get().selection, null, to), selected: to, selectedIndex: index })
+    return null
+  }
+
+  const lo = Math.min(from, index)
+  const hi = Math.max(from, index)
+  const refusal = rangeRefusal(hi - lo + 1)
+  // Refused *before* the cursor moves. A Shift-click that reports "too many rows" and also
+  // silently relocates the anchor would leave the next Shift-click extending from somewhere the
+  // user never put it.
+  if (refusal !== null) return refusal
+
+  // The resident case is answered in one write, without ever awaiting. It is also the common
+  // one — Shift+↓ extends by a row that is on screen by definition — and the write has to be
+  // single: splitting it would move the cursor a microtask before the band caught up, so a held
+  // arrow key would draw the leading rule ahead of the ground it sits on.
+  const resident = residentBand(get().chunks, lo, hi)
+  if (resident !== null) {
+    set({
+      selection: applyRange(get().selection, resident, to),
+      selected: to,
+      selectedIndex: index,
+    })
+    return null
+  }
+
+  // Only when the band has to be fetched: the cursor first, the rows when they land. An arrow
+  // key whose cursor waits on IPC is an arrow key that feels broken, and nothing else in this
+  // handler depends on the paths having arrived.
+  const before = get().selection
+  set({ selected: to, selectedIndex: index })
+  const paths = await fetchBand(lo, hi, get)
+  // Anything the user did to the selection while the rows were in flight outranks them.
+  if (paths === null || get().selection !== before) return null
+  set({ selection: applyRange(before, paths, to) })
+  return null
+}
+
+/**
+ * The paths of rows `[lo, hi]`, from the cache when it holds them and from Rust when it does
+ * not. `null` when the tree was re-flattened under the fetch.
+ *
+ * `runPlan` deliberately does **not** call this — it needs the resident case to be a synchronous
+ * write, so it asks [`residentBand`] itself and falls through to [`fetchBand`]. This is the
+ * combined form for Ctrl+A, which has no cursor to keep in step and where the whole tree is
+ * resident only on a small repository anyway.
+ */
+async function bandPaths(
+  lo: number,
+  hi: number,
+  get: () => FileTreeStore,
+): Promise<string[] | null> {
+  return residentBand(get().chunks, lo, hi) ?? (await fetchBand(lo, hi, get))
+}
+
+/**
+ * Ask Rust for the paths of rows `[lo, hi]`. `null` when the tree moved under the request.
+ *
+ * Separate from the cache lookup because the caller that matters branches on which one it got:
+ * a band already in the cache is answered without a microtask, and one that is not costs a
+ * round trip. `RANGE_ROWS` (10 000) is under `CHUNK_CAP * CHUNK_ROWS` (12 800), so even a band
+ * at the cap *can* be answered entirely from the cache.
+ */
+async function fetchBand(
+  lo: number,
+  hi: number,
+  get: () => FileTreeStore,
+): Promise<string[] | null> {
+  const project = get().project
+  if (project === null) return null
+  const mine = generation
+  const rows = await tree(
+    'fs_tree_rows',
+    () => fsApi.treeRows(project, lo, hi - lo + 1),
+    [] as TreeRow[],
+  )
+  // The same guard every other read in this file carries: an expand, a collapse or a watcher
+  // burst that landed while this was in flight has renumbered the rows these paths came from.
+  if (generation !== mine || get().project !== project) return null
+  // Deliberately whatever came back rather than the length that was asked for. A tree that
+  // shrank under the request answers short, and selecting the rows that do exist is a better
+  // answer than refusing the gesture.
+  return rows.map((row) => row.path)
+}
+
+/** Paths for `[lo, hi]` out of the resident chunks, or `null` if a single row is missing. */
+function residentBand(chunks: Map<number, TreeRow[]>, lo: number, hi: number): string[] | null {
+  const paths: string[] = []
+  for (let i = lo; i <= hi; i++) {
+    const row = chunks.get(chunkOf(i))?.[i % CHUNK_ROWS]
+    if (row === undefined) return null
+    paths.push(row.path)
+  }
+  return paths
+}
 
 /**
  * How many rows one sibling scan reads.

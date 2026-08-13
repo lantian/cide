@@ -24,6 +24,7 @@ import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { projectTabEntries } from './menuModel'
 import { ProjectMenu } from './ProjectMenu'
 import { RowControls } from './RowControls'
+import { currentUserAgent, windowControlLayout } from './windowControls'
 import styles from './AppHeader.module.css'
 
 /**
@@ -165,34 +166,7 @@ export function AppHeader({
   // CSS Module class names are hashed at build time, so nothing outside can select on them.
   return (
     <div className={styles.header} data-audit="header">
-      {/*
-       * Window behaviour belongs to the window-frame agent. These carry `data-window-button`
-       * so it can bind close/minimize/zoom without this file knowing about `@tauri-apps/api`,
-       * which only `ipc/client.ts` may import.
-       */}
-      <div className={styles.lights}>
-        <button
-          type="button"
-          className={`${styles.light} ${styles.close}`}
-          data-window-button="close"
-          data-audit="trafficLight"
-          title="Close window"
-        />
-        <button
-          type="button"
-          className={`${styles.light} ${styles.minimize}`}
-          data-window-button="minimize"
-          data-audit="trafficLight"
-          title="Minimize window"
-        />
-        <button
-          type="button"
-          className={`${styles.light} ${styles.zoom}`}
-          data-window-button="zoom"
-          data-audit="trafficLight"
-          title="Zoom window"
-        />
-      </div>
+      {CONTROLS.side === 'left' ? <WindowLights /> : null}
 
       <div
         ref={tabsRef}
@@ -286,9 +260,56 @@ export function AppHeader({
         </button>
       </div>
 
+      {CONTROLS.side === 'right' ? <WindowLights /> : null}
+
       {/* Rendered or nothing appears. It portals out of this bar, so the header's own
           `overflow: hidden` on `.tabs` cannot clip it. */}
       {tabMenu.menu}
+    </div>
+  )
+}
+
+/*
+ * Resolved once, at module load, rather than per render: the platform cannot change while the
+ * app is running, and a value that is stable by construction cannot make the buttons jump
+ * between sides on a re-render.
+ */
+const CONTROLS = windowControlLayout(currentUserAgent())
+
+/** Per-button styling and label, keyed by the id `WindowFrame.tsx` binds behaviour to. */
+const LIGHTS = {
+  close: { variant: 'close', title: 'Close window' },
+  minimize: { variant: 'minimize', title: 'Minimize window' },
+  zoom: { variant: 'zoom', title: 'Zoom window' },
+} as const
+
+/**
+ * Close, minimize and zoom, on the side this platform puts them.
+ *
+ * Window behaviour belongs to the window-frame agent. These carry `data-window-button` so it
+ * can bind close/minimize/zoom without this file knowing about `@tauri-apps/api`, which only
+ * `ipc/client.ts` may import.
+ *
+ * Rendered by the header at one end or the other — `windowControls.ts` decides which, and
+ * gives the paint order with it, because close belongs at the window's outer corner on both
+ * layouts and that is a different end of the cluster on each. One component invoked from two
+ * places rather than two copies: the three buttons and their audit hooks are the same markup
+ * either way, and the layout audit's `trafficLight` measurements would otherwise have two
+ * sources to drift between.
+ */
+function WindowLights() {
+  return (
+    <div className={`${styles.lights} ${CONTROLS.side === 'right' ? styles.lightsRight : ''}`}>
+      {CONTROLS.order.map((id) => (
+        <button
+          key={id}
+          type="button"
+          className={`${styles.light} ${styles[LIGHTS[id].variant]}`}
+          data-window-button={id}
+          data-audit="trafficLight"
+          title={LIGHTS[id].title}
+        />
+      ))}
     </div>
   )
 }

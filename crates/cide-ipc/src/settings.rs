@@ -372,6 +372,109 @@ pub enum ProxyMode {
     Direct,
 }
 
+/// What the settings above are allowed to do to one kind of child.
+///
+/// # Why a third state, and why it is the interesting one
+///
+/// [`ProxyMode`] answers *what the proxy is*. This answers *who gets it*, and the two are
+/// genuinely different questions: "use this proxy for `claude` but let `git push` reach the
+/// network the way it always has" is one configuration, not a mode.
+///
+/// The trap is that "cide does not add a proxy for git" and "git does not use a proxy" are
+/// **not the same sentence**. `std::process::Command` inherits this process's environment
+/// wholesale, and `cide_core::child_env::scrub_command` filters by value prefix against
+/// `$APPDIR` — a proxy URL never points inside an AppImage, so it survives untouched. A cide
+/// launched from a shell that exports `HTTPS_PROXY` therefore *already* sends every
+/// `git push` through that proxy, and a two-state switch could only ever decide whether cide
+/// adds one on top. So there are three states and the middle one is the default:
+///
+/// * [`Self::Configured`] — the mode and addresses above decide this child's environment.
+/// * [`Self::Untouched`] — cide sets nothing and removes nothing. Whatever cide itself was
+///   launched with reaches the child. This is what every child except a pane does today.
+/// * [`Self::Direct`] — every proxy variable is removed, whatever the mode says and whatever
+///   cide inherited. The only state that can promise a child is off the proxy.
+///
+/// One honesty limit, stated on screen as well as here: `Direct` empties git's *environment*.
+/// `git` still honours `http.proxy` in `~/.gitconfig`, and cide does not edit the user's
+/// gitconfig — the same rule that keeps the Claude hooks in an inline `--settings` payload
+/// rather than in `~/.claude/settings.json`. The guarantee is "cide puts no proxy in this
+/// child's environment", never "this child will not find one elsewhere".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ProxyTarget {
+    /// [`ProxySettings::mode`] and the addresses beside it decide the child's environment.
+    #[default]
+    Configured,
+    /// cide neither sets nor removes a proxy variable for this child.
+    ///
+    /// Nearly [`ProxyMode::Inherit`], and *not* identical to it: `Inherit` still merges the
+    /// loopback exemption into `NO_PROXY` when something was inherited, because cide's IDE
+    /// integration is a loopback MCP server that a proxy would silently swallow. `Untouched`
+    /// does not even do that, which is right for a child that has no business knowing cide
+    /// has a loopback port at all.
+    Untouched,
+    /// Every proxy variable, in both spellings, is removed from the child.
+    Direct,
+}
+
+/// Which children the proxy settings reach.
+///
+/// # The default is today's behaviour, exactly, and that is the whole requirement
+///
+/// The population that has configured a proxy at all is, by construction, people for whom the
+/// current arrangement works. Flipping any of these three would break one of them silently —
+/// a proxy failure surfaces as a hang or a timeout with nothing on screen naming cide — so the
+/// new capability is opt-in and the defaults reproduce the shipped behaviour: panes proxied,
+/// cide's own `git` left exactly as it was.
+///
+/// `Default` is therefore **hand-written**. `#[derive(Default)]` would give
+/// `ProxyTarget::Configured` for all three, which silently puts every existing user's `git`
+/// onto cide's proxy — the one change this type exists to make impossible by accident.
+///
+/// And the defaults are not the only guard: `cide_core::persist` migrates a schema-1
+/// `workspace.json` by **writing this object into the document**, rather than letting the
+/// serde default supply it. The difference matters the day somebody decides a fresh install
+/// should default to claude-only: with the value on disk that is a change to new installs,
+/// and with it defaulted it is a silent re-scoping of every live configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ProxyScope {
+    /// `claude` panes **and** the headless one-shot lane (commit messages, explanations).
+    ///
+    /// One field for both because they are one thing to a user: a `claude` cide started. The
+    /// one-shot lane never read the proxy setting at all before this field existed — it built
+    /// its own `std::process::Command` and inherited cide's raw environment — which is why
+    /// this doc names it explicitly rather than leaving it to be discovered.
+    pub claude: ProxyTarget,
+    /// `$SHELL` panes.
+    ///
+    /// The case the request did not name, so the choice is stated rather than assumed: a
+    /// shell pane is the *user's shell*, and a `git pull` typed into one follows this setting
+    /// rather than [`Self::git`]. Defaulting it to anything but `Configured` would break the
+    /// corporate user who opens a shell pane to run `npm install` through their proxy today.
+    pub shells: ProxyTarget,
+    /// cide's own `git` shell-outs: the Push and Fetch/Pull buttons, and nothing else.
+    ///
+    /// **`Untouched` by default and it has to be.** See [`ProxyTarget`]: today git inherits
+    /// cide's environment, `Configured` would move it onto cide's proxy instead, and `Direct`
+    /// would take a working corporate push away. Only "leave it alone" reproduces what is
+    /// already on people's machines.
+    pub git: ProxyTarget,
+}
+
+impl Default for ProxyScope {
+    fn default() -> Self {
+        Self {
+            claude: ProxyTarget::Configured,
+            shells: ProxyTarget::Configured,
+            // Not `Configured`. See the field.
+            git: ProxyTarget::Untouched,
+        }
+    }
+}
+
 /// Proxy configuration, applied to every child cide spawns — `$SHELL` panes and `claude`
 /// alike.
 ///
@@ -394,6 +497,17 @@ pub enum ProxyMode {
 #[ts(export)]
 pub struct ProxySettings {
     pub mode: ProxyMode,
+    /// Which children [`Self::mode`] and the addresses below actually reach.
+    ///
+    /// Deliberately a second field rather than more [`ProxyMode`] variants. Crossing "what
+    /// the proxy is" with "who gets it" yields nine variants of which several are
+    /// meaningless, and it would break `ProxyMode.ts` — which `ui/scripts/check-proxy.mjs`
+    /// asserts against as the list of modes the readout branches on.
+    ///
+    /// Also deliberately not a `HashMap<Target, _>`: an open map has no natural answer for a
+    /// key added by a later build, puts an unbounded shape into `workspace.json`, and turns
+    /// the Settings screen into a matrix editor.
+    pub scope: ProxyScope,
     /// `HTTP_PROXY`/`http_proxy`. Empty means the variable is not set.
     pub http: String,
     /// `HTTPS_PROXY`/`https_proxy`. Empty **falls back to [`Self::http`]**, because one
@@ -425,8 +539,16 @@ impl ProxySettings {
 
 impl fmt::Debug for ProxySettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every field is named explicitly, and that is the hazard this impl carries: a field
+        // added above and forgotten here vanishes from every debug print in the app rather
+        // than failing to compile. `a_debug_print_names_every_field` below is the guard, and
+        // it reads the field list off the *serialized* value so it cannot forget either.
         f.debug_struct("ProxySettings")
             .field("mode", &self.mode)
+            // Booleans and three named states. No secret, and nothing to redact — but it has
+            // to be here, because which children got the proxy is half of any answer to "why
+            // did this child not reach the network".
+            .field("scope", &self.scope)
             .field("http", &redact_proxy_url(&self.http))
             .field("https", &redact_proxy_url(&self.https))
             .field("all", &redact_proxy_url(&self.all))
@@ -498,6 +620,7 @@ mod tests {
     fn a_password_does_not_survive_debug() {
         let proxy = ProxySettings {
             mode: ProxyMode::Manual,
+            scope: ProxyScope::default(),
             http: "http://alice:hunter2@proxy.corp:3128".into(),
             https: "http://alice:hunter2@proxy.corp:3128".into(),
             all: "socks5://alice:hunter2@socks.corp:1080".into(),
@@ -513,6 +636,90 @@ mod tests {
             assert!(!printed.contains("alice"), "username leaked: {printed}");
             // The host is what makes the line worth logging at all.
             assert!(printed.contains("proxy.corp:3128"), "host lost: {printed}");
+        }
+    }
+
+    /// A `Debug` impl written by hand is a list that can fall behind the struct, and the
+    /// failure is silent: the missing field simply stops appearing in every log line.
+    ///
+    /// Read off `serde_json` rather than restated, so this cannot fall behind either.
+    #[test]
+    fn a_debug_print_names_every_field() {
+        let printed = format!("{:?}", ProxySettings::default());
+        let value = serde_json::to_value(ProxySettings::default()).expect("serializes");
+        let fields = value.as_object().expect("a struct");
+        assert!(!fields.is_empty());
+        for name in fields.keys() {
+            // The `Debug` impl uses Rust's own names, `serde` the camelCase wire ones. Only
+            // `no_proxy`/`noProxy` differ, and comparing on the lower-cased letters alone is
+            // enough to catch a field that is absent altogether.
+            let flattened: String = name.chars().filter(char::is_ascii_alphanumeric).collect();
+            let haystack: String = printed
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_lowercase();
+            assert!(
+                haystack.contains(&flattened.to_lowercase()),
+                "`{name}` is a field of ProxySettings and does not appear in {printed}"
+            );
+        }
+    }
+
+    /// The one that would ship the bug: `#[derive(Default)]` on [`ProxyScope`] puts every
+    /// existing user's `git push` onto cide's proxy on the launch after an upgrade.
+    #[test]
+    fn the_default_scope_is_todays_behaviour_and_not_the_derived_one() {
+        let scope = ProxyScope::default();
+        assert_eq!(scope.claude, ProxyTarget::Configured);
+        assert_eq!(scope.shells, ProxyTarget::Configured);
+        assert_eq!(
+            scope.git,
+            ProxyTarget::Untouched,
+            "git inherits cide's own environment today; Configured would move it onto cide's \
+             proxy and Direct would take a working corporate push away"
+        );
+        // And the derived answer, which is what a future `#[derive(Default)]` would give.
+        assert_ne!(
+            scope.git,
+            ProxyTarget::default(),
+            "ProxyTarget's own default is Configured, so ProxyScope's Default must stay \
+             hand-written"
+        );
+    }
+
+    /// A settings document written before this field existed still proxies both pane kinds.
+    ///
+    /// The serde default is the second line of defence — `persist::migrate` writes the object
+    /// into the document explicitly — but it is the one that runs for a `ProxySettings`
+    /// deserialized anywhere other than through a full workspace load.
+    #[test]
+    fn a_document_predating_the_scope_field_keeps_both_pane_kinds_proxied() {
+        let older: ProxySettings = serde_json::from_str(
+            r#"{"mode":"manual","http":"http://proxy.corp:3128","https":"","all":"",
+                "noProxy":"corp.internal"}"#,
+        )
+        .expect("a proxy configuration predating `scope` still deserialises");
+
+        assert_eq!(older.mode, ProxyMode::Manual);
+        assert_eq!(older.scope, ProxyScope::default());
+        assert_eq!(older.no_proxy, "corp.internal");
+    }
+
+    /// Three named states on the wire, in camelCase, because the frontend branches on them.
+    #[test]
+    fn the_three_targets_survive_the_wire_under_their_camel_case_names() {
+        for (target, wire) in [
+            (ProxyTarget::Configured, "\"configured\""),
+            (ProxyTarget::Untouched, "\"untouched\""),
+            (ProxyTarget::Direct, "\"direct\""),
+        ] {
+            let json = serde_json::to_string(&target).expect("serialize");
+            assert_eq!(json, wire);
+            assert_eq!(
+                serde_json::from_str::<ProxyTarget>(wire).expect("deserialize"),
+                target
+            );
         }
     }
 

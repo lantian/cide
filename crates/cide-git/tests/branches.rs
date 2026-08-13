@@ -22,6 +22,16 @@ use cide_git::repo as repo_mod;
 use cide_ipc::git::{CheckoutMode, GitError};
 use support::TempRepo;
 
+/// The proxy environment these tests spawn `git` with: none at all.
+///
+/// `ProxyTarget::Untouched` resolved, which is cide's default for its own `git` children and
+/// the behaviour every one of these tests had before `ProxyScope` existed — the child gets
+/// this process's environment unaltered. Named rather than inlined as `Default::default()` so
+/// the reader of a `pull` call can see *which* of the three answers is being exercised.
+fn untouched() -> cide_core::proxy::ProxyEnv {
+    cide_core::proxy::ProxyEnv::default()
+}
+
 /// `main` with `shared.txt` and `only-main.txt`, plus a `feature` branch that rewrites
 /// `only-main.txt` and adds `only-feature.txt`. Left on `main`.
 ///
@@ -505,7 +515,7 @@ fn a_fast_forward_pull_advances_head_and_says_by_how_much() {
     origin.write("a.txt", b"two\n");
     origin.commit_all("second");
 
-    let outcome = branch::pull(&work.root, None).expect("pull");
+    let outcome = branch::pull(&work.root, None, &untouched()).expect("pull");
     assert_eq!(outcome.remote, "origin");
     assert!(
         !outcome.shelled_out,
@@ -515,8 +525,207 @@ fn a_fast_forward_pull_advances_head_and_says_by_how_much() {
     assert_eq!(work.read("a.txt"), b"two\n");
 
     // Running it again has nothing to take and says so with zero rather than an error.
-    let again = branch::pull(&work.root, None).expect("second pull");
+    let again = branch::pull(&work.root, None, &untouched()).expect("second pull");
     assert_eq!(again.advanced, 0);
+    assert_eq!(
+        again.branch, "main",
+        "an up-to-date pull still names the branch it looked at — in a project with four \
+         repositories that is the only thing that says which one answered"
+    );
+    assert_eq!(
+        again.old_oid, again.new_oid,
+        "and reports the same commit on both sides rather than an empty pair"
+    );
+}
+
+/// A pull's answer has to be *readable*, not merely successful.
+///
+/// The whole of `FetchOutcome` used to be `{remote, shelled_out, output, advanced}`, and the
+/// only sentence anything could build out of that was "Fast-forwarded 7 commits from origin".
+/// A person who has just pulled into a tree they are about to build is asking what changed,
+/// and that shape could not answer. So the contents are asserted here — the counts, the diff
+/// totals and the commits themselves — because they are the feature and not a decoration.
+#[test]
+fn a_fast_forward_pull_reports_what_it_brought_down() {
+    let origin = TempRepo::new("pull-report-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+    let work = clone_of(&origin, "pull-report-work");
+    let before = work.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+    // Two commits, touching two files, so files-changed cannot be confused with commit count.
+    origin.write("a.txt", b"one\ntwo\n");
+    origin.commit_all("add a line to a");
+    origin.write("b.txt", b"new\n");
+    origin.commit_all("add b");
+
+    let outcome = branch::pull(&work.root, None, &untouched()).expect("pull");
+    assert_eq!(outcome.advanced, 2);
+    assert_eq!(outcome.branch, "main");
+    assert_eq!(
+        outcome.old_oid,
+        before[..8],
+        "the pull says where the branch was, so the user can `git show` the range"
+    );
+    assert_eq!(outcome.new_oid, work.git(&["rev-parse", "HEAD"]).trim()[..8]);
+
+    // Totals across the whole fast-forward, not summed per commit: `a.txt` was touched once
+    // and `b.txt` created, which is two files and two insertions.
+    assert_eq!(
+        (
+            outcome.files_changed,
+            outcome.insertions,
+            outcome.deletions
+        ),
+        (2, 2, 0)
+    );
+
+    let subjects: Vec<&str> = outcome.commits.iter().map(|c| c.summary.as_str()).collect();
+    assert_eq!(
+        subjects,
+        vec!["add b", "add a line to a"],
+        "newest first — the tip is what the build about to run will contain"
+    );
+    assert_eq!(outcome.more_commits, 0, "nothing was left out");
+    assert_eq!(
+        outcome.commits[0].author, "cide tests",
+        "the author is what tells a user whether the change is theirs"
+    );
+    assert_eq!(
+        outcome.commits[0].short_oid.len(),
+        8,
+        "the short oid is what gets pasted into `git show`"
+    );
+}
+
+/// The cap lives in Rust, and the overflow is counted rather than dropped.
+///
+/// A fortnight away is hundreds of commits. Sending them all so a component can `slice` ten
+/// out is a wire cost paid for nothing, and *silently* sending ten would make a 400-commit
+/// pull and a 10-commit pull look identical in the one surface that reports either.
+#[test]
+fn a_long_pull_caps_the_commit_list_and_counts_the_rest() {
+    let origin = TempRepo::new("pull-cap-origin");
+    origin.write("a.txt", b"0\n");
+    origin.commit_all("first");
+    let work = clone_of(&origin, "pull-cap-work");
+
+    for i in 1..=14 {
+        origin.write("a.txt", format!("{i}\n").as_bytes());
+        origin.commit_all(&format!("commit {i}"));
+    }
+
+    let outcome = branch::pull(&work.root, None, &untouched()).expect("pull");
+    assert_eq!(outcome.advanced, 14, "every commit is still counted");
+    assert_eq!(outcome.commits.len(), 10, "only ten are described");
+    assert_eq!(
+        outcome.more_commits, 4,
+        "and the remainder is reported, so 14 cannot read as 10"
+    );
+    assert_eq!(
+        outcome.commits[0].summary, "commit 14",
+        "the ten kept are the newest ten"
+    );
+    assert_eq!(
+        outcome.commits.len() as u32 + outcome.more_commits,
+        outcome.advanced,
+        "the two halves account for the whole fast-forward"
+    );
+}
+
+/// A fetch fills in none of the pull half, and says so honestly rather than by omission.
+#[test]
+fn a_fetch_reports_no_branch_and_no_commits() {
+    let origin = TempRepo::new("fetch-empty-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+    let work = clone_of(&origin, "fetch-empty-work");
+    origin.write("a.txt", b"two\n");
+    origin.commit_all("second");
+
+    let outcome = branch::fetch(&work.root, None, &untouched()).expect("fetch");
+    assert_eq!(
+        outcome.branch, "",
+        "a fetch moves no branch, so it names none — which is what lets the frontend print \
+         the transport's own line instead of inventing a branch sentence"
+    );
+    assert!(outcome.commits.is_empty());
+    assert_eq!(
+        (
+            outcome.files_changed,
+            outcome.insertions,
+            outcome.deletions,
+            outcome.more_commits
+        ),
+        (0, 0, 0, 0)
+    );
+}
+
+/// A repository with no remote gets a sentence about *that*, not about libgit2.
+///
+/// `push::default_remote` falls back to `origin` when nothing else names a remote, and
+/// `push::route` reads a missing remote's url as empty and therefore local — so this used to
+/// reach `find_remote`, fail, and arrive at the UI as libgit2's `Config: remote 'origin' does
+/// not exist`. True, and useless to someone who has simply not run `git remote add`.
+#[test]
+fn a_repository_with_no_remote_says_so() {
+    let solo = TempRepo::new("no-remote");
+    solo.write("a.txt", b"one\n");
+    solo.commit_all("first");
+
+    assert_eq!(
+        branch::fetch(&solo.root, None, &untouched()),
+        Err(GitError::NoRemote {
+            name: "origin".to_string()
+        })
+    );
+    assert_eq!(
+        branch::pull(&solo.root, None, &untouched()),
+        Err(GitError::NoRemote {
+            name: "origin".to_string()
+        })
+    );
+}
+
+/// A detached HEAD is not a branch without an upstream, and must not be told it is one.
+///
+/// Both states used to collapse into `NoUpstream { branch: head.head }`, which for a detached
+/// HEAD reads as "a1b2c3d4 has no upstream branch to pull from" — it calls a commit a branch
+/// and points at `--set-upstream`, which cannot help. The fix is to check out a branch, and
+/// the sentence has to be able to say so.
+#[test]
+fn a_detached_head_is_told_it_is_detached() {
+    let origin = TempRepo::new("pull-detached-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+    let work = clone_of(&origin, "pull-detached-work");
+    let tip = work.git(&["rev-parse", "HEAD"]).trim().to_string();
+    work.git(&["checkout", "-q", "--detach", "HEAD"]);
+
+    match branch::pull(&work.root, None, &untouched()) {
+        Err(GitError::DetachedHead { head }) => {
+            assert!(tip.starts_with(&head), "the sentence names where you are: {head}");
+        }
+        other => panic!("expected DetachedHead, got {other:?}"),
+    }
+}
+
+/// An unborn branch has no commit to fast-forward, which `Unborn` already says in one word.
+#[test]
+fn an_unborn_branch_cannot_be_pulled() {
+    let origin = TempRepo::new("pull-unborn-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+
+    let work = TempRepo::new("pull-unborn-work");
+    work.git(&[
+        "remote",
+        "add",
+        "origin",
+        origin.root.to_str().expect("utf-8 path"),
+    ]);
+
+    assert_eq!(branch::pull(&work.root, None, &untouched()), Err(GitError::Unborn));
 }
 
 #[test]
@@ -534,7 +743,7 @@ fn a_divergent_pull_reports_both_counts_instead_of_merging() {
     // cide has no conflict-resolution surface, so it refuses with the numbers a user needs to
     // choose between merge and rebase rather than dropping them into a conflicted tree.
     assert_eq!(
-        branch::pull(&work.root, None),
+        branch::pull(&work.root, None, &untouched()),
         Err(GitError::NotFastForward {
             branch: "main".to_string(),
             ahead: 1,
@@ -556,7 +765,7 @@ fn a_pull_refuses_rather_than_overwriting_a_local_change() {
     work.write("a.txt", b"work in progress\n");
 
     assert_eq!(
-        branch::pull(&work.root, None),
+        branch::pull(&work.root, None, &untouched()),
         Err(GitError::CheckoutWouldOverwrite {
             branch: "main".to_string(),
             paths: vec!["a.txt".to_string()],
@@ -574,7 +783,7 @@ fn a_branch_with_no_upstream_cannot_be_pulled() {
     work.git(&["checkout", "-q", "-b", "solo"]);
 
     assert_eq!(
-        branch::pull(&work.root, None),
+        branch::pull(&work.root, None, &untouched()),
         Err(GitError::NoUpstream {
             branch: "solo".to_string()
         })
@@ -591,7 +800,7 @@ fn a_fetch_updates_the_remote_row_without_moving_the_working_tree() {
     origin.write("a.txt", b"two\n");
     origin.commit_all("second");
 
-    let outcome = branch::fetch(&work.root, None).expect("fetch");
+    let outcome = branch::fetch(&work.root, None, &untouched()).expect("fetch");
     assert_eq!(outcome.advanced, 0, "a fetch never moves HEAD");
     assert_eq!(work.read("a.txt"), b"one\n");
 
@@ -621,7 +830,7 @@ fn a_fetch_reports_a_sentence_and_not_a_progress_meter() {
     let work = clone_of(&origin, "fetch-says-work");
 
     // Nothing new: silence, which is what makes the UI say "already up to date".
-    let quiet = branch::fetch(&work.root, None).expect("fetch");
+    let quiet = branch::fetch(&work.root, None, &untouched()).expect("fetch");
     assert!(
         !quiet.shelled_out,
         "a path remote stays on the libgit2 side"
@@ -631,7 +840,7 @@ fn a_fetch_reports_a_sentence_and_not_a_progress_meter() {
     origin.write("a.txt", b"two\n");
     origin.commit_all("second");
 
-    let outcome = branch::fetch(&work.root, None).expect("fetch");
+    let outcome = branch::fetch(&work.root, None, &untouched()).expect("fetch");
     assert!(
         !outcome.output.is_empty(),
         "a fetch that brought commits must not read as 'already up to date'"

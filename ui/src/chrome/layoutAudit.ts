@@ -233,8 +233,20 @@ const CHECKS: readonly Check[] = [
     selector: hook('railIcon'),
     measure: siblingGap(hook('railIcon'), 'y'),
   },
-  { element: 'gitBadge', property: 'width', expected: 6, selector: hook('gitBadge'), measure: boxWidth },
-  { element: 'gitBadge', property: 'height', expected: 6, selector: hook('gitBadge'), measure: boxHeight },
+  /*
+   * The git badge used to be a 6x6 dot and is now a numeric pill, so these two numbers moved
+   * with it rather than being dropped: an absent element measures `NaN` here and fails, which
+   * is the property that makes this file worth having, and deleting the rows would have made
+   * an unhooked badge indistinguishable from a correct one.
+   *
+   * 18x14 is the pill's `min-width` and `height`, both stated in `ActivityRail.module.css`.
+   * The min-width sits above the width of two digits on purpose, so this number is a fact
+   * about that stylesheet rather than about JetBrains Mono's advance width — which is what
+   * lets it be asserted at all. `AUDIT_GIT_CHANGES` only has to stay under the `99+` cap,
+   * which widens the box to about 22px.
+   */
+  { element: 'gitBadge', property: 'width', expected: 18, selector: hook('gitBadge'), measure: boxWidth },
+  { element: 'gitBadge', property: 'height', expected: 14, selector: hook('gitBadge'), measure: boxHeight },
 
   // Console tab strip.
   { element: 'tabStrip', property: 'height', expected: 30, selector: hook('tabStrip'), measure: boxHeight },

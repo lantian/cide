@@ -8,12 +8,24 @@
 }
 
 /* Traffic lights. A macOS motif, but the window ships without WM decorations, so there is
-   no system close button to fall back on. */
+   no system close button to fall back on.
+
+   Which end of the header this cluster sits at is `windowControls.ts`'s decision, taken from
+   the platform; the header renders this box before the project strip or after the actions
+   accordingly. Only the padding differs between the two, below — the 12px edge always faces
+   the window corner, so the cluster keeps the same distance from the frame either way. */
 .lights {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 0 14px 0 12px;
+}
+
+/* Trailing-edge placement: the padding mirrors, nothing else. `flex: none` because this box
+   now follows `.filler`, which would otherwise be free to squash it. */
+.lightsRight {
+  flex: none;
+  padding: 0 12px 0 14px;
 }
 
 .light {

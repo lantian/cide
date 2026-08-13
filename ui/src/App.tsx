@@ -21,7 +21,8 @@ import {
 import { TabStrip } from '@/chrome/TabStrip'
 import { WindowFrame } from '@/chrome/WindowFrame'
 import { auditMode, formatAuditReport, runLayoutAudit } from '@/chrome/layoutAudit'
-import { AUDIT_ACTIVE_TAB, AUDIT_TABS } from '@/chrome/auditFixture'
+import { AUDIT_ACTIVE_TAB, AUDIT_GIT_CHANGES, AUDIT_TABS } from '@/chrome/auditFixture'
+import { useGitChangeCount } from '@/chrome/gitCountStore'
 import { auditPanesMode, formatPaneAudit, runPaneAudit } from '@/layout/paneAudit'
 import { createAppPaneDriver } from '@/layout/appPaneDriver'
 import { auditWindowsMode, formatWindowAudit, runWindowAudit } from '@/layout/windowAudit'
@@ -36,6 +37,7 @@ import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
+import { notifyFailure } from '@/chrome/notices'
 import { ProjectSwitcher } from '@/chrome/ProjectSwitcher'
 import { SidebarSplitter } from '@/chrome/SidebarSplitter'
 import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
@@ -424,6 +426,22 @@ export function App() {
         : boot.role.project
   const activeProject = activeProjectId ? (boot?.workspace.projects[activeProjectId] ?? null) : null
 
+  /*
+   * The activity rail's changed-file count.
+   *
+   * Subscribed here rather than inside `ActivityRail` because every component in `chrome/` is
+   * a pure render target that reads nothing from a store — that is the property
+   * `chrome/auditFixture.ts` depends on, and the rail would have been the first exception.
+   *
+   * `null` for a detached-pane window, which returns below without ever rendering a rail:
+   * walking its repositories would produce a number nothing draws. Passed as a value rather
+   * than skipping the call, because the rule React enforces is that the hook order never
+   * changes — not that hooks are only called when they are useful.
+   */
+  const gitChanged = useGitChangeCount(
+    boot?.role.kind === 'detachedPane' ? null : activeProjectId,
+  )
+
   /**
    * The tab and pane the user is looking at.
    *
@@ -564,6 +582,55 @@ export function App() {
     ? formatClaude(statusBySession[focusedSession])
     : undefined
 
+  /**
+   * Ctrl+click on a file path in a terminal pane's output.
+   *
+   * Curried by project because the two windows this component renders show different ones: the
+   * shell window's active project, and the one owning a detached pane. Everything else is
+   * identical, and one handler is the point — two copies is how the detached window ends up with
+   * the reveal and not the open, or the other way round.
+   *
+   * The order is the same as the search panel's click and is a design rather than a preference:
+   * the editor for this path usually does not exist yet, so the reveal is *parked* and spent by
+   * the mount `openFromTerminal` causes. Requesting it afterwards would deliver it to nobody and
+   * the file would open at line 1 — which, for a click on `src/main.rs:270:13`, has not gone
+   * where the user pointed. `endColumn` is `column + 1`: this is a caret, not a range, and the
+   * producer never said how long the thing at that column is.
+   *
+   * `openFromTerminal` and not `open`, and that is the whole security story in one word — see
+   * `cmd::file::terminal_open_path`. A refusal is a sentence in the notice stack, because a
+   * ctrl+click that silently does nothing is indistinguishable from a link wired to nothing.
+   */
+  const openTerminalPath = useCallback(
+    (project: ProjectId) =>
+      (path: string, at: { line: number; column: number } | null): void => {
+        if (at !== null) {
+          /*
+           * KNOWN GAP, and it is written here rather than left to be rediscovered: this lands
+           * the caret only when the tab opens in *this* window.
+           *
+           * `revealRequest` is a module-level map, and a detached pane (`pane:<uuid>`) is a
+           * separate webview with its own module instances. `terminal_open_path` is a workspace
+           * mutation, so the tab and its editor mount in the shell window — which never sees
+           * the request parked here, and the caret sits at line 1 while the file itself opens
+           * correctly.
+           *
+           * Not fixed in passing, deliberately. Carrying a caret across windows needs the
+           * target to be durable state Rust owns, and no such field exists — there is no cursor
+           * in `EditorViewState` for this to ride on. Inventing one at the end of a batch is
+           * precisely how the previous batch nearly shipped a commit-corrupting bug, so it is
+           * named as a gap instead of being half-built.
+           */
+          requestReveal(path, { line: at.line, column: at.column, endColumn: at.column + 1 })
+        }
+        void fileApi
+          .openFromTerminal(project, path)
+          .then(() => hydrate())
+          .catch(notifyFailure)
+      },
+    [hydrate],
+  )
+
   // A `pane:<uuid>` window shows exactly one pane. It shares the workspace mirror with the
   // shell window but none of its chrome: no project tabs, no rail, no status bar.
   if (boot?.role.kind === 'detachedPane') {
@@ -581,6 +648,11 @@ export function App() {
           pane={detachedPane}
           cwd={owner.roots[0]?.path ?? PROJECT_ROOT}
           project={project}
+          roots={owner.roots.map((r) => r.path)}
+          // A torn-out pane opens tabs in the shell window, which is correct and needs no
+          // special case: `terminal_open_path` is a workspace mutation, so it broadcasts
+          // `cide://workspace-changed` and the shell picks the tab up like any other.
+          onOpenPath={openTerminalPath(project)}
           onRedock={() => void redockPane(boot.window)}
         />
         {/*
@@ -626,11 +698,17 @@ export function App() {
         />
 
         <div className={styles.body}>
-          {/* The badge only renders on a dirty tree, so the audit has to ask for one or it
-              measures a state the chrome never shows it. */}
+          {/*
+            * The badge is withheld at zero — a clean tree needs no ornament — so the audit has
+            * to ask for a count or it measures a state the chrome never shows it. That flag
+            * used to be the *only* thing feeding this prop: `gitDirty={auditMode()}` wired the
+            * badge to a query parameter and to nothing else, so outside `?audit=1` it never
+            * appeared in any repository state. The count is now real and the fixture is the
+            * override, which is the way round every other audit-driven surface here works.
+            */}
           <ActivityRail
             active={view}
-            gitDirty={auditMode()}
+            changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
             onSelect={(next) => {
               // The rail's ⚙ is the only gesture that reaches Settings until the command
               // palette lands, and Settings is a workspace tab rather than a sidebar view —
@@ -800,6 +878,8 @@ export function App() {
                               : undefined
                           }
                           restore={restorePlan.get(paneNode.id)}
+                          roots={activeProject.roots.map((r) => r.path)}
+                          onOpenPath={openTerminalPath(activeProject.id)}
                           onSessionBound={(session) =>
                             void bindSession(activeProject.id, tab.id, paneNode.id, session)
                           }

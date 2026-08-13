@@ -4,9 +4,16 @@
  * The rail behaves like a vertical tablist — one selection at a time, each button swapping
  * the sidebar's contents — so it is marked up as one rather than as a toolbar. The items are
  * a data array rather than five hand-written blocks because later milestones add entries and
- * per-item adornments (the git dot here, counts later) without disturbing the layout rules.
+ * per-item adornments (the git count here) without disturbing the layout rules.
+ *
+ * Every value it draws is a prop and it reads no store, which is the rule for every component
+ * in `chrome/`: it is what lets `chrome/layoutAudit.ts` drive each surface with fixed props
+ * and measure the result. The git count is subscribed in `App.tsx` and passed down for that
+ * reason and no other.
  */
 import { Fragment } from 'react'
+import { badgeLabel, badgeText } from '@/sidebar/GitPanel/model'
+import { groupDigits } from '@/overlays/format'
 import styles from './ActivityRail.module.css'
 
 export type ActivityView = 'files' | 'git' | 'search' | 'problems' | 'settings'
@@ -35,18 +42,37 @@ const SPACER_AT = ITEMS.findIndex((item) => item.bottom === true)
 
 export interface ActivityRailProps {
   active: ActivityView | null
-  gitDirty?: boolean | undefined
+  /**
+   * Changed files across every repository in the project — `null` while none has been counted
+   * yet, which is not the same as `0` and is drawn the same way for a different reason.
+   *
+   * A number rather than the `gitDirty` boolean this replaced. That boolean had exactly one
+   * call site and it was `gitDirty={auditMode()}`: the badge was wired to the layout-audit
+   * query flag and to nothing else, so in a normal launch it never rendered in any repository
+   * state. See `chrome/gitCountStore.ts` for where the number now comes from.
+   */
+  changed?: number | null | undefined
   onSelect?: ((view: ActivityView) => void) | undefined
 }
 
-export function ActivityRail({ active, gitDirty, onSelect }: ActivityRailProps) {
+export function ActivityRail({ active, changed, onSelect }: ActivityRailProps) {
   /*
-   * Keyed by view id so the loop stays layout-only; more entries land here, not in JSX. The
-   * value doubles as the badge's wording, because a 6px dot is invisible to a screen reader
-   * unless it reaches the button's accessible name.
+   * Keyed by view id so the loop stays layout-only; more entries land here, not in JSX.
+   *
+   * Two values per entry, because the badge and its wording are no longer the same string: at
+   * a hundred changed files the pill says `99+` and the button is still named "Git — 1,203
+   * changed files". Both come from `GitPanel/model.ts` — the same module the panel's own repo
+   * rows count with — so the rail and the panel cannot disagree about a number they both show.
+   * The comma is this component's only contribution, because `model.ts` may not import
+   * `groupDigits` and stay standalone-compilable for `check-git-tree.mjs`.
    */
-  const badges: Record<string, string | undefined> = {
-    git: gitDirty === true ? 'uncommitted changes' : undefined,
+  const count = changed ?? null
+  const badges: Record<string, { pill: string; name: string } | undefined> = {
+    git: (() => {
+      const pill = badgeText(count)
+      const name = count === null ? undefined : badgeLabel(count, groupDigits(count))
+      return pill === null || name === undefined ? undefined : { pill, name }
+    })(),
   }
 
   return (
@@ -60,7 +86,7 @@ export function ActivityRail({ active, gitDirty, onSelect }: ActivityRailProps) 
       {ITEMS.map((item, i) => {
         const selected = item.id === active
         const badge = badges[item.id]
-        const name = badge === undefined ? item.label : `${item.label} — ${badge}`
+        const name = badge === undefined ? item.label : `${item.label} — ${badge.name}`
         return (
           <Fragment key={item.id}>
             {/* Hidden from the accessibility tree: a tablist should own nothing but tabs,
@@ -81,7 +107,18 @@ export function ActivityRail({ active, gitDirty, onSelect }: ActivityRailProps) 
               <span aria-hidden="true" style={{ fontSize: `${item.size}px` }}>
                 {item.glyph}
               </span>
-              {badge !== undefined && <span className={styles.badge} data-audit="gitBadge" />}
+              {badge !== undefined && (
+                /*
+                 * `aria-hidden`, and it is not cosmetic. The badge used to be a 6px dot with
+                 * no text, so it needed hiding from nothing; it now has content, and without
+                 * this a screen reader reads the button as "Git — 3 changed files, 3" — and
+                 * at the cap as "Git — 1,203 changed files, 99+", which is the one rendering
+                 * of that number that means nothing at all. The name above is the wording.
+                 */
+                <span className={styles.badge} data-audit="gitBadge" aria-hidden="true">
+                  {badge.pill}
+                </span>
+              )}
             </button>
           </Fragment>
         )

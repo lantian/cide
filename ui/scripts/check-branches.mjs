@@ -65,7 +65,29 @@ try {
     ['BranchRef', ['name', 'remote', 'current', 'upstream', 'ahead', 'behind', 'tip', 'subject']],
     ['BranchInfo', ['head', 'detached', 'upstream', 'ahead', 'behind', 'operation', 'unborn']],
     ['CheckoutOutcome', ['branch', 'createdFromRemote', 'stashed', 'restoreFailed']],
-    ['FetchOutcome', ['remote', 'shelledOut', 'output', 'advanced']],
+    // The second half of `FetchOutcome` is the pull's own report, and it is pinned field by
+    // field for the reason the header gives: `branchModel.ts` declares the shape structurally
+    // (it may not import the generated types and stay standalone-compilable), so a rename in
+    // `crates/cide-ipc/src/git.rs` would typecheck on both sides and produce `undefined` in a
+    // toast. This is the join that catches it.
+    [
+      'FetchOutcome',
+      [
+        'remote',
+        'shelledOut',
+        'output',
+        'advanced',
+        'branch',
+        'oldOid',
+        'newOid',
+        'filesChanged',
+        'insertions',
+        'deletions',
+        'commits',
+        'moreCommits',
+      ],
+    ],
+    ['PulledCommit', ['shortOid', 'summary', 'author']],
   ]) {
     const body = shape(type)
     ok(body !== '', `${type} exists in generated.ts`)
@@ -280,7 +302,7 @@ try {
 
   // --- every failure becomes a sentence --------------------------------------------------------
 
-  const said = (error) => m.explain(error)
+  const said = (error, op) => (op === undefined ? m.explain(error) : m.explain(error, op))
   for (const [error, needle, what] of [
     [refusal, 'src/a.rs', 'a refusal names the files even outside the panel'],
     [{ kind: 'branchExists', detail: { name: 'main' } }, 'main', 'branchExists names the branch'],
@@ -304,9 +326,56 @@ try {
     [{ kind: 'operationInProgress', detail: { operation: 'rebase' } }, 'rebase', 'the operation is named'],
     [{ kind: 'fetch', detail: { output: 'could not read Username' } }, 'Username', "the transport's own text survives"],
     [{ kind: 'unborn' }, 'no commits', 'a payload-free variant still says something'],
+    [
+      { kind: 'detachedHead', detail: { head: 'a1b2c3d4' } },
+      'check out a branch',
+      // Folded into `noUpstream` until now, which told a detached HEAD that "a1b2c3d4 has no
+      // upstream branch to pull from" — a sentence that calls a commit a branch and points at
+      // `--set-upstream`, which cannot help. The sentence has to name the fix that can.
+      'a detached HEAD is told what is actually wrong',
+    ],
+    [
+      { kind: 'noRemote', detail: { name: 'origin' } },
+      'git remote add',
+      // This used to arrive as libgit2's own `Config: remote 'origin' does not exist`, via
+      // the catch-all `git` variant. True, and useless to someone who has not added a remote.
+      'a repository with no remote is told how to get one',
+    ],
   ]) {
     ok(said(error).includes(needle), `${what} — got ${JSON.stringify(said(error))}`)
   }
+
+  /*
+   * The same refusal, two gestures.
+   *
+   * `CheckoutWouldOverwrite` is raised by a pull as well as by a checkout — both move the
+   * working tree onto another commit and both use `blockers()` to decide. Reported to someone
+   * who pressed Ctrl+T with the checkout wording it read "Switching to main would overwrite
+   * local changes", which names a switch nobody asked for and names the branch they are
+   * standing on as the destination.
+   */
+  ok(
+    said(refusal, 'checkout').startsWith('Switching to feature'),
+    'a checkout still says "switching"',
+  )
+  ok(
+    said(refusal, 'pull').startsWith('Fast-forwarding feature'),
+    'a pull says what a pull does, not what a checkout does',
+  )
+  ok(
+    said(refusal, 'pull').includes('src/a.rs'),
+    'and either way the files that block are still named — that is the whole variant',
+  )
+  eq(
+    said(refusal),
+    said(refusal, 'checkout'),
+    'the operation defaults to checkout, so every existing caller is unmoved',
+  )
+  eq(
+    said({ kind: 'noUpstream', detail: { branch: 'solo' } }, 'pull'),
+    said({ kind: 'noUpstream', detail: { branch: 'solo' } }),
+    'and no other variant is operation-sensitive',
+  )
 
   eq(
     said({ kind: 'somethingNew', detail: {} }),
@@ -349,23 +418,35 @@ try {
     'a failed restore wins over every other note — it is the only one that needs acting on',
   )
 
+  /*
+   * A whole `FetchOutcome`. The fetch half is what the *Fetch* button gets; the pull half is
+   * empty here and each pull case fills in what it is about, so the difference between a
+   * fetch's sentence and a pull's is visible in the fixture rather than buried in a flag.
+   */
+  const fetched = (over = {}) => ({
+    remote: 'origin',
+    advanced: 0,
+    output: '',
+    branch: '',
+    oldOid: '',
+    newOid: '',
+    filesChanged: 0,
+    insertions: 0,
+    deletions: 0,
+    commits: [],
+    moreCommits: 0,
+    ...over,
+  })
+
   eq(
-    m.fetchNote({ remote: 'origin', advanced: 0, output: '' }),
+    m.fetchNote(fetched()),
     'Already up to date with origin',
-    'a pull with nothing to take still answers — the user asked for network and waited',
+    'a fetch with nothing to take still answers — the user asked for network and waited',
   )
+  eq(m.fetchNote(fetched({ advanced: 1 })), 'Fast-forwarded 1 commit from origin', 'singular')
+  eq(m.fetchNote(fetched({ advanced: 4 })), 'Fast-forwarded 4 commits from origin', 'plural')
   eq(
-    m.fetchNote({ remote: 'origin', advanced: 1, output: '' }),
-    'Fast-forwarded 1 commit from origin',
-    'singular',
-  )
-  eq(
-    m.fetchNote({ remote: 'origin', advanced: 4, output: '' }),
-    'Fast-forwarded 4 commits from origin',
-    'plural',
-  )
-  eq(
-    m.fetchNote({ remote: 'origin', advanced: 0, output: ' From /tmp/x\n' }),
+    m.fetchNote(fetched({ output: ' From /tmp/x\n' })),
     'From /tmp/x',
     "git's own text is shown when there is any",
   )
@@ -376,26 +457,152 @@ try {
    * for asking to fetch.
    */
   eq(
-    m.fetchNote({
-      remote: 'origin',
-      advanced: 0,
-      output: 'From /srv/thing\n   abc1234..def5678  main       -> origin/main\n',
-    }),
+    m.fetchNote(
+      fetched({ output: 'From /srv/thing\n   abc1234..def5678  main       -> origin/main\n' }),
+    ),
     'From /srv/thing · abc1234..def5678  main       -> origin/main',
     'multi-line transport output is joined, not printed with newlines in a one-line bar',
   )
   eq(
-    m.fetchNote({
-      remote: 'origin',
-      advanced: 0,
-      output: 'Counting objects 1\rCounting objects 3\r\nCompressing objects: 100% (3/3), done\n',
-    }),
+    m.fetchNote(
+      fetched({
+        output: 'Counting objects 1\rCounting objects 3\r\nCompressing objects: 100% (3/3), done\n',
+      }),
+    ),
     'Counting objects 1 · Counting objects 3 · Compressing objects: 100% (3/3), done',
     'carriage returns are line breaks here too — a progress meter never reaches the bar intact',
   )
   ok(
-    m.fetchNote({ remote: 'origin', advanced: 0, output: 'x'.repeat(400) }).length <= 160,
+    m.fetchNote(fetched({ output: 'x'.repeat(400) })).length <= 160,
     'a fetch of forty branches is truncated rather than pushing the list off the popup',
+  )
+
+  // --- what a *pull* says, which is the half that had nowhere to be said -----------------------
+
+  /*
+   * The three answers a pull can give have to be distinguishable, because they call for three
+   * different next actions: rebuild, do nothing, or go and merge in a terminal. The third is a
+   * `GitError` and is covered above; these are the first two.
+   *
+   * Before this, `FetchOutcome` carried `{remote, shelledOut, output, advanced}` and the best
+   * sentence obtainable was "Fast-forwarded 7 commits from origin" — which cannot tell a
+   * person whether their build is stale.
+   */
+  const pulled = (over = {}) =>
+    fetched({ branch: 'main', oldOid: 'a1b2c3d4', newOid: 'e5f6a7b8', ...over })
+
+  eq(
+    m.fetchNote(pulled()),
+    'main is already up to date with origin',
+    'a pull that took nothing names its branch — with four repositories in a project that is '
+      + 'the only thing that says which one just answered',
+  )
+  eq(
+    m.fetchNote(
+      pulled({ advanced: 7, filesChanged: 12, insertions: 230, deletions: 41 }),
+    ),
+    'Fast-forwarded main 7 commits from origin · 12 files +230 −41',
+    'a pull that took something says what it took — the counts are the feature',
+  )
+  eq(
+    m.fetchNote(pulled({ advanced: 1, filesChanged: 1, insertions: 3, deletions: 0 })),
+    'Fast-forwarded main 1 commit from origin · 1 file +3',
+    'singular throughout, and a side with nothing on it is left out rather than printed as −0',
+  )
+  eq(
+    m.fetchNote(pulled({ advanced: 2 })),
+    'Fast-forwarded main 2 commits from origin',
+    'a fast-forward of pure merges changes no files, and says so by saying nothing',
+  )
+  eq(
+    m.fetchNote(pulled({ advanced: 3, output: 'From /srv/thing' })),
+    'Fast-forwarded main 3 commits from origin',
+    "the transport's chatter never displaces the answer in the headline — it goes in the body",
+  )
+
+  const commit = (oid, summary, author = 'Ada') => ({ shortOid: oid, summary, author })
+
+  eq(
+    m.fetchDetail(pulled({ advanced: 2, commits: [commit('e5f6a7b8', 'Add the thing'), commit('c3d4e5f6', 'Fix the other', 'Grace')] })),
+    'e5f6a7b8  Add the thing — Ada\nc3d4e5f6  Fix the other — Grace',
+    'the body is one line per commit: the oid to paste into `git show`, the subject to '
+      + 'recognise it by, the author to tell whether it is yours',
+  )
+  eq(
+    m.fetchDetail(pulled({ advanced: 14, commits: [commit('e5f6a7b8', 'Newest')], moreCommits: 13 })),
+    'e5f6a7b8  Newest — Ada\n… and 13 commits more',
+    'the overflow is reported rather than dropped — Rust caps the list, so 14 must not read as 1',
+  )
+  eq(
+    m.fetchDetail(pulled({ commits: [], output: 'Fetched 5 objects from origin' })),
+    'Fetched 5 objects from origin',
+    'with no commits the transport gets the space: "your branch did not move but other refs did"',
+  )
+  eq(m.fetchDetail(pulled()), '', 'and with nothing at all to add there is no disclosure to draw')
+  eq(
+    m.fetchDetail(pulled({ advanced: 1, commits: [commit('e5f6a7b8', '', '')] })),
+    'e5f6a7b8  (no summary)',
+    'a commit whose message is not UTF-8 arrives with empty strings — the row still has to '
+      + 'render as something a person can read',
+  )
+
+  // --- one gesture, one answer, however many repositories ---------------------------------------
+
+  const repoFetch = (name, over = {}) => ({ name, outcome: pulled(over) })
+
+  eq(
+    m.pullReport([repoFetch('app', { advanced: 2, filesChanged: 3, insertions: 9, deletions: 1 })]),
+    {
+      text: 'Fast-forwarded main 2 commits from origin · 3 files +9 −1',
+      detail: '',
+    },
+    'with one repository the report is exactly the single-repo sentence — the multi-root '
+      + 'machinery is invisible in the common case',
+  )
+  eq(
+    m.pullReport([repoFetch('app'), repoFetch('vendor/zlib'), repoFetch('docs')]),
+    {
+      text: 'All 3 repositories are already up to date',
+      detail:
+        'app: main is already up to date with origin\n'
+        + 'vendor/zlib: main is already up to date with origin\n'
+        + 'docs: main is already up to date with origin',
+    },
+    /*
+     * The dedupe hazard, pinned. `notices.admit` collapses by identical text, so three
+     * submodules each notifying "main is already up to date with origin" would have shown ONE
+     * toast and silently spoken for three. One aggregated notice is why that cannot happen,
+     * and every repository is named in the body even though none of them moved.
+     */
+    'several repositories that all did nothing produce one notice that names all of them',
+  )
+  eq(
+    m.pullReport([
+      repoFetch('app', { advanced: 2, filesChanged: 3, insertions: 9, deletions: 1 }),
+      repoFetch('vendor/zlib'),
+      repoFetch('docs', { advanced: 5, filesChanged: 7, insertions: 40, deletions: 2 }),
+    ]).text,
+    'Fast-forwarded 2 of 3 repositories · 7 commits · 10 files +49 −3',
+    'the totals are summed across the repositories that moved, and the ones that did not are '
+      + 'counted in the denominator rather than hidden',
+  )
+  ok(
+    m.pullReport([
+      repoFetch('app', { advanced: 2 }),
+      repoFetch('vendor/zlib'),
+    ]).detail.includes('vendor/zlib: main is already up to date'),
+    'a repository that took nothing is still listed — leaving it out would read as skipped',
+  )
+  eq(
+    m.pullReport([repoFetch('app', { advanced: 1 }), repoFetch('lib', { advanced: 1 })]).text,
+    'Fast-forwarded all 2 repositories · 2 commits',
+    '"all N" rather than "N of N", which reads as though something had been left out',
+  )
+  eq(
+    m.pullReport([]),
+    { text: '', detail: '' },
+    'no results is not a sentence — `dispatch.ts` never notifies for it, and this pins that '
+      + 'calling it anyway cannot produce an empty toast with a bullet in it',
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

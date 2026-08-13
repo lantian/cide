@@ -92,6 +92,14 @@ async function refresh(): Promise<void> {
  * Maximize the window if it is restored, restore it if it is maximized.
  *
  * Stable identity across renders, so it is safe in a dependency array.
+ *
+ * This needs `core:window:allow-toggle-maximize` in every capability file, and it is a
+ * *separate* permission from `allow-maximize` and `allow-unmaximize` — holding both of those
+ * does not imply it. Without it the call is rejected in the webview with `Command
+ * plugin:window|toggle_maximize not allowed by …`, which is how the zoom button and
+ * double-click-to-maximize both shipped inert: Tauri's own injected drag script
+ * (`src/window/scripts/drag.js`) invokes the same command for its double-click, so one missing
+ * line took out both gestures at once and neither of them logs anywhere the user looks.
  */
 export async function toggleMaximize(): Promise<void> {
   await getCurrentWindow().toggleMaximize()

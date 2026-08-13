@@ -68,8 +68,12 @@ export function ProjectSwitcher() {
         })}
       </ul>
       {/* Spelled out because the gesture is not discoverable: nothing on screen says that
-          holding the modifier is what keeps this open. */}
-      <div className={styles.hint}>Hold Ctrl · Tab / Shift+Tab to move · release to switch</div>
+          holding the modifier is what keeps this open. The release is named first and names
+          the key — the earlier wording led with the two Tab strokes, and read as a demand for
+          one more keypress rather than as "you are already holding the thing that ends it". */}
+      <div className={styles.hint}>
+        Release Ctrl to switch · Tab / Shift+Tab to move · Esc cancels
+      </div>
     </div>
   )
 }

@@ -63,11 +63,11 @@ export function Explorer({ project, onOpenFile, onOpenFileToSide }: ExplorerProp
     let cancelled = false
     let unlisten: (() => void) | null = null
     /*
-     * `events.onFsChanged` rather than `fsEvents.onChanged`: the two listen to the same event,
-     * but the second reads `payload.paths`, and the wire carries `payload.change.paths` (see
-     * `emit::FsChanged`) — so its `paths` argument is `undefined` for every burst. Nothing here
-     * read it, which is why it went unnoticed; using the helper that matches the wire keeps it
-     * that way. The stale one is reported rather than deleted — `ipc/client.ts` is not ours.
+     * `events.onFsChanged` is the helper that matches the wire: the payload carries
+     * `payload.change.paths` (see `emit::FsChanged`). A second helper, `fsEvents.onChanged`,
+     * read `payload.paths` and so handed every caller `undefined`. This comment used to end
+     * "reported rather than deleted"; it has since been deleted, because the next caller to
+     * reach for it by name got a listener that threw on every burst and failed silently.
      *
      * The burst itself is deliberately not inspected. Whether a row moved is a question about
      * the *index*, which applies its own ignore rules to these paths and skips the git files

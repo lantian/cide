@@ -11,6 +11,7 @@
 import { useEffect, useRef } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
 import { getHost, openTerminal } from '@/layout/paneHosts'
+import { setPathLinkEnv } from '@/terminal/pathLinks'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import { exitMarkerBytes, markFor, spawnFailureBytes, spawnFailureText } from './exitMarker'
@@ -68,6 +69,23 @@ export interface TerminalPaneProps {
    * `SessionId` no process has ever heard of and sat there blank.
    */
   restore?: PaneRestore | undefined
+  /**
+   * The project's roots, for resolving a file path printed in this pane.
+   *
+   * Separate from `cwd` — which is only `roots[0]` — because resolution tries every root: a
+   * multi-root project prints paths relative to whichever one the tool was run in. Absent means
+   * this pane offers no file links at all, which is the honest state for a pane with no project.
+   */
+  roots?: readonly string[] | undefined
+  /**
+   * Ctrl+click on a file path in this pane's output.
+   *
+   * The pane knows the path and the line; it deliberately does not know what "open" means. That
+   * is the caller's, because opening is a workspace mutation plus a caret request, and both of
+   * those live above the pane tree. Absent means the links are inert — they will not even be
+   * offered, because `pathLinks.ts` needs the whole environment or none of it.
+   */
+  onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
   onSessionBound?: ((session: string) => void) | undefined
   className?: string | undefined
@@ -365,6 +383,8 @@ export function TerminalPane({
   project,
   primarySession,
   restore,
+  roots,
+  onOpenPath,
   onSessionBound,
   className,
   onExit,
@@ -384,6 +404,14 @@ export function TerminalPane({
   kindRef.current = pane.kind
   const primaryRef = useRef(primarySession)
   primaryRef.current = primarySession
+  // Refs, like every other prop here, and for the reason at the foot of the effect: the effect
+  // is keyed on the pane and its session alone, so anything read from inside it has to be read
+  // *late*. A root list or an open handler captured at mount would keep answering with the
+  // project this pane was first rendered under.
+  const rootsRef = useRef(roots)
+  rootsRef.current = roots
+  const openPathRef = useRef(onOpenPath)
+  openPathRef.current = onOpenPath
   // A ref, not a dependency: the plan is read once at launch and never refreshed, so its
   // identity changing means the parent re-rendered, not that this pane should respawn.
   const restoreRef = useRef(restore)
@@ -501,6 +529,37 @@ export function TerminalPane({
     let disposed = false
     const handle = openTerminal(paneId)
     const { term, fit } = handle
+
+    /*
+     * What a file path printed in this pane means, handed to the link provider `openTerminal`
+     * just attached.
+     *
+     * Getters rather than captured values, because this object is read at *hover* time and this
+     * effect runs once per pane: a project switched under a parked pane, or a root added, has to
+     * be visible to the next hover and not to the next remount. The provider itself is on the
+     * host and outlives every mount, which is exactly why the two are registered separately.
+     *
+     * A pane with no project, no roots or no handler registers all the same and simply offers
+     * nothing — `pathLinks.ts` refuses to provide a link unless the whole environment is there,
+     * which is what stops a pane from ever resolving a path against a project it is not in.
+     */
+    setPathLinkEnv(paneId, {
+      get project() {
+        return projectRef.current ?? ''
+      },
+      get roots() {
+        return rootsRef.current ?? []
+      },
+      get cwd() {
+        return cwdRef.current
+      },
+      // `null` rather than a no-op closure when the pane was given no handler: `pathLinks.ts`
+      // refuses to offer a link it could not act on, and a closure that quietly returns would
+      // look identical to one that works right up until somebody clicked it.
+      get open() {
+        return openPathRef.current ?? null
+      },
+    })
 
     const restoreEntry = restoreRef.current
 
@@ -768,6 +827,11 @@ export function TerminalPane({
       disposed = true
       onData.dispose()
       unlistenExit?.()
+      // The provider stays on the host — it belongs to the terminal, not to this mount — so
+      // what has to go is the environment it reads. Without this, a pane unmounted from a
+      // closing project would keep resolving paths against that project's roots and opening
+      // tabs in it.
+      setPathLinkEnv(paneId, null)
       // The host outlives this mount, so the listeners have to come off with it — otherwise a
       // pane remounted by a split would accumulate one right-click handler per mount and open
       // as many menus.

@@ -235,6 +235,59 @@ pub async fn fs_reveal(
     .await
 }
 
+/// The most paths one existence probe will answer.
+///
+/// A hovered line in a terminal yields a handful of candidates and each candidate a handful of
+/// bases, so a real request is single digits. This is the clamp for a frontend bug, and it
+/// answers `None` past the cap rather than erroring: the caller is a mouse hover, and the
+/// honest degradation there is "no link", not a toast.
+const MAX_PROBE: usize = 128;
+
+/// What the index holds at each of these paths — the oracle behind terminal file links.
+///
+/// # Why this is a batch, and why it touches no disk
+///
+/// It is asked from `provideLinks` while the pointer crosses a line of output, so the two costs
+/// that matter are round trips and syscalls. One call per hovered *line* answers every
+/// candidate on it, and every answer comes from [`cide_fs::Index::kind_of`] — a hash lookup
+/// against the tree that has already been walked. A `stat` per candidate would be correct and
+/// would put filesystem latency on a mouse move.
+///
+/// `with_index` and not `with_index_mut`, which rules out [`fs_reveal`] as the probe it
+/// otherwise resembles: that one *expands directories* as a side effect, so using it to ask
+/// whether a path exists would silently unfold the user's file tree under their pointer.
+///
+/// # What it deliberately cannot see
+///
+/// The index is gitignore-filtered and does not descend through symlinked directories, so
+/// `target/debug/…` and `node_modules/…` answer `None` and never light up. That is the policy
+/// and not a gap: index membership is what makes an *offered* link contained by construction.
+/// The click is re-checked in Rust regardless — see `cmd::file::terminal_open_path` — because
+/// this answer travelled through the webview and comes back as a claim, not as evidence.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_paths_exist(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<Option<cide_ipc::TreeRowKind>>, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_paths_exist", move || {
+        fs.with_index(|index| {
+            paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    if i >= MAX_PROBE {
+                        return None;
+                    }
+                    index.kind_of(path)
+                })
+                .collect()
+        })
+    })
+    .await
+}
+
 /// Show a path in the desktop file manager. Returns the directory that was opened.
 ///
 /// The file tree's context menu offers *Reveal*, and without this that item could only ever

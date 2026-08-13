@@ -146,20 +146,42 @@
 }
 
 /*
- * The selected row.
+ * The selection band, and the cursor's leading rule — two rules, because this tree now has two
+ * things to say and a multi-row selection is where they come apart. `ChangesTree.module.css`
+ * splits the identical pair for the identical reason; the two panels are one rail icon apart
+ * and a selection has to mean one thing in both.
  *
- * Selection is now distinct from "what is open", so it has to be legible against the hover
- * band that sits one shade away from it — `--sel` alone reads as a slightly warmer hover in
- * the light theme, which is exactly the state a user cannot tell apart at a glance. The 2px
- * accent rule down the leading edge is what makes it unambiguous, and it works in both themes
- * without a second rule because both define `--sel` and `--accent`.
+ * `.rowSelected` is every row in the selection: what Cut, Copy and Move to Trash act on.
+ * `.rowCurrent` is the one row the arrows move from and Rename acts on. A plain click makes a
+ * row both, so **this is not a visual change to the ordinary case** — one class used to carry
+ * both declarations and a single selection still draws exactly what it drew before.
+ *
+ * Selection is distinct from "what is open", so it has to be legible against the hover band
+ * that sits one shade away from it — `--sel` alone reads as a slightly warmer hover in the
+ * light theme, which is exactly the state a user cannot tell apart at a glance. The 2px accent
+ * rule down the leading edge is what makes it unambiguous, and it works in both themes without
+ * a second rule because both define `--sel` and `--accent`.
  *
  * `inset` box-shadow rather than a `border-left`: a border would shift every child 2px to the
  * right on selection, and a tree row that jogs sideways when you click it looks broken.
+ *
+ * The two declare **different properties**, which is the one place this departs from
+ * `ChangesTree`: the band is `background` and the cursor is `box-shadow`, so they compose
+ * instead of competing and neither needs to out-order the other. It also draws the one state
+ * the git panel gets wrong — Ctrl-clicking the only selected row *off* leaves the cursor on a
+ * row that is no longer in the selection, and a cursor that carried the band would go on
+ * looking selected while every verb in the menu had stopped acting on it. Here that row keeps
+ * the 2px rule and loses the ground, which is what it now means.
+ *
+ * No `:hover` twin for `.rowCurrent`: `.row:hover` only writes `background`, so the rule
+ * survives a hover untouched.
  */
 .rowSelected,
 .rowSelected:hover {
   background: var(--sel);
+}
+
+.rowCurrent {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 

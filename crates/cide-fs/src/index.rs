@@ -239,7 +239,30 @@ impl Index {
 
     /// Whether a path is in the index at all.
     pub fn contains(&self, path: &Path) -> bool {
-        self.by_path.contains_key(path)
+        self.kind_of(path).is_some()
+    }
+
+    /// What the index holds at a path: a file, a directory, or nothing.
+    ///
+    /// The oracle behind terminal file links, and the reason it answers a *kind* rather than a
+    /// bool is that `Compiling cide-app v0.1.0 (/home/…/cide)` is an ordinary, frequent line —
+    /// a real, existing path that must not become a link, because opening a directory in a text
+    /// editor is a link that does nothing.
+    ///
+    /// It answers from the walked tree and touches no disk, which is what makes it affordable
+    /// on a mouse hover: one hash lookup per candidate rather than a `stat` per candidate.
+    ///
+    /// # Membership here is also the containment argument
+    ///
+    /// The index is built from the project's roots, filtered by the same gitignore rules the
+    /// tree and the watcher use, and it does not descend through symlinked directories. So a
+    /// path this answers `Some` for is inside a root by construction — `target/debug/…`,
+    /// `node_modules/…`, `/etc/shadow` and `~/.claude/.credentials.json` are all simply absent.
+    /// That is the *first* of two locks, not the only one: the click re-checks in Rust, because
+    /// an answer the frontend was given earlier is not evidence about the path it sends back.
+    pub fn kind_of(&self, path: &Path) -> Option<TreeRowKind> {
+        let id = *self.by_path.get(path)?;
+        Some(self.nodes[id as usize].kind)
     }
 
     // --- construction ---------------------------------------------------------------
@@ -974,6 +997,38 @@ mod tests {
         assert!(!index.contains(&dir.join("target")));
         assert!(!index.contains(&dir.join("target/debug/binary")));
         assert!(index.contains(&dir.join("src/main.rs")));
+    }
+
+    /// The oracle terminal file links resolve against, and the two answers it must keep apart.
+    ///
+    /// A directory and a file are both "present", and a link that opens a directory in a text
+    /// editor is a link that does nothing — `Compiling cide-app v0.1.0 (/home/…/cide)` is a real
+    /// line that every cargo build prints, so this is not a hypothetical.
+    #[test]
+    fn the_index_says_whether_a_path_is_a_file_a_directory_or_nothing() {
+        let dir = scratch("index-kind");
+        tree(&dir);
+        let index = build(&dir);
+        assert_eq!(index.kind_of(&dir.join("src/main.rs")), Some(TreeRowKind::File));
+        assert_eq!(index.kind_of(&dir.join("src")), Some(TreeRowKind::Dir));
+        assert_eq!(index.kind_of(&dir), Some(TreeRowKind::Dir), "a root is a row too");
+        assert_eq!(index.kind_of(&dir.join("src/nothing.rs")), None);
+    }
+
+    /// Index membership is the containment argument, so the ignored half must stay absent.
+    ///
+    /// Everything a link may be offered for comes from here, and this is what makes an offered
+    /// link inside a project root by construction: `target/` was walked past, so a build log
+    /// naming `target/debug/binary` cannot light up, and neither can anything outside the roots,
+    /// because nothing outside them was ever walked.
+    #[test]
+    fn a_gitignored_path_has_no_kind_either() {
+        let dir = scratch("index-kind-ignored");
+        tree(&dir);
+        let index = build(&dir);
+        assert_eq!(index.kind_of(&dir.join("target")), None);
+        assert_eq!(index.kind_of(&dir.join("target/debug/binary")), None);
+        assert_eq!(index.kind_of(Path::new("/etc/shadow")), None);
     }
 
     #[test]

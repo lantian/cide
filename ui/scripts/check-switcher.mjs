@@ -12,7 +12,11 @@
  *      words;
  *   3. **Escape leaves the order untouched** — cancelling is not a quiet commit;
  *   4. **a lost keyup cancels** — alt-tabbing away while Ctrl is down must not leave a popup
- *      up for ever swallowing every Tab afterwards.
+ *      up for ever swallowing every Tab afterwards;
+ *   5. **the release commits on the keyup this app really receives** — WebKitGTK reports Ctrl
+ *      as still down in the event that releases it, so every release below is driven in that
+ *      shape as well as the browser one. Getting this wrong is not subtle: the switcher opens,
+ *      the user lets go, and nothing happens.
  *
  * `src/keys/switcher.ts` is written so that all four are arithmetic: the walk holds a frozen
  * list and an index, and `commit` is the only function in it that produces a new stack. So the
@@ -83,6 +87,7 @@ try {
     begin,
     capture,
     commit,
+    endsHold,
     holdOf,
     reconcile,
     restack,
@@ -93,13 +98,23 @@ try {
 
   /* ------------------------------------------------------------------ the harness */
 
-  /** Every modifier down, as a `KeyboardEvent`-shaped thing. */
-  const held = (mods = {}) => ({
-    ctrlKey: mods.ctrl !== false,
+  /**
+   * One keyup, as a `KeyboardEvent`-shaped thing: the key that came *up*, and the modifier
+   * flags the event reports as still down.
+   *
+   * They are given separately because on WebKitGTK they contradict each other — see
+   * `endsHold`. `up('Control', { ctrl: true })` is not a nonsense event, it is literally what
+   * the shipped app receives when the user lets go of Ctrl.
+   */
+  const up = (key, mods = {}) => ({
+    key,
+    ctrlKey: mods.ctrl === true,
     altKey: mods.alt === true,
     metaKey: mods.meta === true,
   })
-  const released = { ctrlKey: false, altKey: false, metaKey: false }
+
+  /** Letting go of Ctrl, in the shape this app's own webview delivers it. */
+  const released = up('Control', { ctrl: true })
 
   /**
    * One switcher session, driven the way the app drives it.
@@ -155,8 +170,8 @@ try {
       },
 
       /** The release watcher's keyup branch. */
-      keyup(state) {
-        if (walk !== null && !stillHeld(walk.hold, state)) end(true)
+      keyup(ev) {
+        if (walk !== null && endsHold(walk.hold, ev)) end(true)
       },
 
       /** Its `blur` / `visibilitychange` branch — the lost keyup. */
@@ -301,6 +316,45 @@ try {
     eq(s.order(), STACK, 'with no reordering')
   }
 
+  /* --------------------------------------- 5. the release, in both platform shapings */
+
+  {
+    /*
+     * The bug this section exists for, in one gesture: press Ctrl+Tab, let go of Ctrl, and the
+     * selected project opens.
+     *
+     * It read as a freeze — the popup stayed up, the hint went on offering Tab and Shift+Tab,
+     * and only Escape or a click got rid of it — because the release watcher asked
+     * `!stillHeld(hold, ev)` and WebKitGTK reports `ctrlKey === true` in the very keyup that
+     * releases Ctrl (GDK's state is the mask from *before* the event, and WebKit only patches
+     * the press side of that). Both shapings are driven here so neither platform's answer can
+     * be the accidental one.
+     */
+    const gtk = session(STACK)
+    gtk.press(1, 'ctrl+tab')
+    gtk.keyup(up('Control', { ctrl: true }))
+    eq(gtk.activated, ['beta'], 'WebKitGTK: the Ctrl keyup commits even though it claims Ctrl is down')
+    eq(gtk.walk(), null, 'and the popup goes away with it')
+
+    const web = session(STACK)
+    web.press(1, 'ctrl+tab')
+    web.keyup(up('Control'))
+    eq(web.activated, ['beta'], 'Chrome/Firefox: the same keyup with honest flags commits too')
+
+    const walking = session(STACK)
+    walking.press(1, 'ctrl+tab')
+    walking.keyup(up('Tab', { ctrl: true }))
+    eq(walking.activated, [], 'the Tab coming up mid-walk activates nothing')
+    eq(walking.walk() === null, false, 'and leaves the popup where it is')
+
+    // The fallback still earns its place: a hold released while the window was not listening,
+    // revealed by the flags on some later keyup that is not a modifier at all.
+    const late = session(STACK)
+    late.press(1, 'ctrl+tab')
+    late.keyup(up('a'))
+    eq(late.activated, ['beta'], 'a keyup that reveals the hold is gone commits as well')
+  }
+
   {
     /*
      * A rebound multi-modifier hold. The rule is "every modifier named by the opening chord is
@@ -312,17 +366,28 @@ try {
     s.press(1, 'ctrl+alt+tab')
     eq(s.selected(), 'beta', 'a rebound ctrl+alt+tab opens the same walk')
     eq(holdOf('ctrl+alt+tab'), { ctrl: true, alt: true, meta: false }, 'and holds both modifiers')
-    s.keyup(held({ ctrl: true, alt: true }))
-    eq(s.walk() === null, false, 'with both still down, a keyup commits nothing')
-    s.keyup(held({ ctrl: true, alt: false }))
+    s.keyup(up('Tab', { ctrl: true, alt: true }))
+    eq(s.walk() === null, false, 'the Tab coming up is not a release: both modifiers are still down')
+    // Alt is the one let go of, and the flags — WebKitGTK's, from before the event — still
+    // claim it is down. The key that came up is what decides.
+    s.keyup(up('Alt', { ctrl: true, alt: true }))
     eq(s.activated, ['beta'], 'letting go of either of them commits')
   }
 
   {
     // Shift is the direction, never part of the hold: letting go of it mid-walk must not
     // commit, or Ctrl+Shift+Tab could never be followed by Ctrl+Tab.
-    eq(holdOf('ctrl+shift+tab'), { ctrl: true, alt: false, meta: false }, 'shift is not held')
-    eq(stillHeld({ ctrl: true, alt: false, meta: false }, held()), true, 'ctrl alone is enough')
+    const hold = { ctrl: true, alt: false, meta: false }
+    eq(holdOf('ctrl+shift+tab'), hold, 'shift is not held')
+    eq(stillHeld(hold, up('Shift', { ctrl: true })), true, 'ctrl alone is enough')
+    eq(endsHold(hold, up('Shift', { ctrl: true })), false, 'so releasing Shift is not a release')
+
+    const s = session(STACK)
+    s.press(-1, 'ctrl+shift+tab')
+    s.keyup(up('Shift', { ctrl: true }))
+    eq(s.activated, [], 'the walk survives it')
+    eq(s.selected(), 'delta', 'still on the same project')
+    eq(s.stroke('ctrl+tab').consumed, true, 'and Tab still walks forwards from there')
   }
 
   /* ------------------------------------------------- the palette, and the degenerate cases */
@@ -439,8 +504,9 @@ try {
       'switcherStore resolves no chords — the release watcher is a modifier latch, not an entry point',
     )
     ok(
-      code.includes('stillHeld(walk.hold, ev)'),
-      'and decides purely, through `stillHeld`, rather than hard-coding `ev.ctrlKey`',
+      code.includes('endsHold(walk.hold, ev)'),
+      'and decides purely, through `endsHold`, rather than hard-coding `ev.ctrlKey` — or ' +
+        'reverting to `!stillHeld`, which never fires on WebKitGTK',
     )
 
     // 3. Cancelling writes nothing. The whole point of committing on release.

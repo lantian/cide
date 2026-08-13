@@ -39,6 +39,22 @@ use crate::workspace_state::WorkspaceState;
 
 type Result<T> = std::result::Result<T, GitError>;
 
+/// The proxy environment cide's own `git` children are spawned with.
+///
+/// Reads `ProxyScope::git`, whose default is `Untouched` — an empty [`ProxyEnv`], meaning the
+/// forked `git` inherits cide's environment exactly as it always has. That default is not
+/// timidity: a corporate laptop whose `git push` works today works because cide's own
+/// environment carries the proxy, and either of the other two answers would change that
+/// silently for someone.
+///
+/// Read here rather than inside `cide-git`, which takes no configuration and must not learn
+/// what a `WorkspaceState` is. Read *outside* [`blocking`] for the usual reason: the
+/// workspace lock is `parking_lot` and must not be held across an await.
+fn git_proxy(state: &WorkspaceState) -> cide_core::proxy::ProxyEnv {
+    let proxy = state.with(|ws| ws.settings.proxy.clone());
+    cide_core::proxy::ProxyEnv::for_target(&proxy, proxy.scope.git)
+}
+
 /// Every root of an open project.
 fn roots(state: &WorkspaceState, project: ProjectId) -> Result<Vec<PathBuf>> {
     state.with(|ws| {
@@ -344,9 +360,16 @@ pub async fn git_push(
     set_upstream: bool,
 ) -> Result<PushOutcome> {
     let roots = roots(&state, project)?;
+    let proxy = git_proxy(&state);
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        push::push(&root, remote.as_deref(), refspec.as_deref(), set_upstream)
+        push::push(
+            &root,
+            remote.as_deref(),
+            refspec.as_deref(),
+            set_upstream,
+            &proxy,
+        )
     })
     .await
 }
@@ -522,9 +545,10 @@ pub async fn git_fetch(
     remote: Option<String>,
 ) -> Result<FetchOutcome> {
     let roots = roots(&state, project)?;
+    let proxy = git_proxy(&state);
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        let outcome = branch::fetch(&root, remote.as_deref())?;
+        let outcome = branch::fetch(&root, remote.as_deref(), &proxy)?;
         // Nothing in the working tree moved, but every branch row's behind-count did.
         let _ = refreshed(&app, &roots, project);
         Ok(outcome)
@@ -543,9 +567,10 @@ pub async fn git_pull(
     remote: Option<String>,
 ) -> Result<FetchOutcome> {
     let roots = roots(&state, project)?;
+    let proxy = git_proxy(&state);
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        let outcome = branch::pull(&root, remote.as_deref())?;
+        let outcome = branch::pull(&root, remote.as_deref(), &proxy)?;
         let _ = refreshed(&app, &roots, project);
         Ok(outcome)
     })

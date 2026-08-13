@@ -233,6 +233,21 @@ export function refusalOf(error: unknown): Refusal | null {
 }
 
 /**
+ * Which gesture the failure belongs to.
+ *
+ * Exactly one variant reads differently depending on the answer, and it is the one a user is
+ * most likely to hit: `checkoutWouldOverwrite` is raised by a pull as well as by a checkout,
+ * because both move the working tree onto another commit. Told to someone who pressed Ctrl+T
+ * it used to read *"Switching to main would overwrite local changes"* — which names no switch
+ * they asked for, and names the branch they are already standing on as the destination.
+ *
+ * A parameter rather than a second error variant in Rust: the refusal is genuinely the same
+ * refusal, computed by the same `blockers()`, and splitting it in the crate would make
+ * `cide-git` carry a fact about which button was pressed.
+ */
+export type GitOp = 'checkout' | 'pull'
+
+/**
  * A `GitError` as a sentence, for everything the popup does not have a dedicated panel for.
  *
  * Written out per variant rather than falling back to `String(error)` because the wire form
@@ -240,7 +255,7 @@ export function refusalOf(error: unknown): Refusal | null {
  * control ends up appearing to do nothing at all. Anything genuinely unrecognised is still
  * shown — with its tag — rather than swallowed.
  */
-export function explain(error: unknown): string {
+export function explain(error: unknown, op: GitOp = 'checkout'): string {
   const parsed = wire(error)
   if (parsed === null) return error instanceof Error ? error.message : String(error)
 
@@ -257,7 +272,12 @@ export function explain(error: unknown): string {
     case 'checkoutWouldOverwrite': {
       const refusal = refusalOf(error)
       const paths = refusal === null ? '' : `: ${refusal.paths.join(', ')}`
-      return `Switching to ${name('branch')} would overwrite local changes${paths}`
+      // Only files that genuinely differ between the two trees are in `paths` — a dirty file
+      // the pull does not touch comes along untouched — so the sentence may not say "the tree
+      // is dirty". It says what would be lost, which is the thing the user decides about.
+      return op === 'pull'
+        ? `Fast-forwarding ${name('branch')} would overwrite local changes${paths}`
+        : `Switching to ${name('branch')} would overwrite local changes${paths}`
     }
     case 'branchExists':
       return `A branch named ${name('name')} already exists`
@@ -276,6 +296,13 @@ export function explain(error: unknown): string {
       return `${name('branch')} is ${count('ahead')} ahead and ${count('behind')} behind its upstream. cide only fast-forwards; merge or rebase in a terminal.`
     case 'noUpstream':
       return `${name('branch')} has no upstream branch to pull from`
+    case 'detachedHead':
+      // Not "has no upstream", which is what this used to be folded into. A detached HEAD is
+      // not a branch missing a setting; `git branch --set-upstream-to` cannot help, and the
+      // sentence has to point at the fix that can.
+      return `HEAD is detached at ${name('head')} — check out a branch before pulling`
+    case 'noRemote':
+      return `This repository has no remote named ${name('name')} — add one with \`git remote add\``
     case 'operationInProgress':
       return `A ${name('operation')} is in progress. Finish or abort it first.`
     case 'unborn':
@@ -339,19 +366,167 @@ function oneLine(text: string): string {
 }
 
 /**
+ * A `FetchOutcome`, structurally.
+ *
+ * Declared rather than imported so this module keeps the property its foot-note states: no
+ * value imports, and — because `verbatimModuleSyntax` is on — no import of the generated
+ * types either, since `check-branches.mjs` compiles this one file with `types: []`. The check
+ * pins the field names against `ui/src/ipc/generated.ts` instead, which is the same guarantee
+ * arrived at from the other side.
+ */
+export interface FetchReport {
+  remote: string
+  advanced: number
+  output: string
+  branch: string
+  oldOid: string
+  newOid: string
+  filesChanged: number
+  insertions: number
+  deletions: number
+  commits: readonly { shortOid: string; summary: string; author: string }[]
+  moreCommits: number
+}
+
+/** `1 commit` / `4 commits`, so every sentence here agrees on the wording. */
+function commits(n: number): string {
+  return `${n} ${n === 1 ? 'commit' : 'commits'}`
+}
+
+/** `1 file` / `12 files`. */
+function files(n: number): string {
+  return `${n} ${n === 1 ? 'file' : 'files'}`
+}
+
+/**
+ * The diff totals as ` · 12 files +230 −41`, or `''` when there is nothing to total.
+ *
+ * A leading separator rather than a field the caller joins, so that a pull whose stats came
+ * back empty produces no dangling `·`. `−` is U+2212, not a hyphen: this is a quantity, and
+ * the same reasoning put `↑`/`↓` in `headLabel` rather than `^`/`v`.
+ */
+function shortstat(changed: number, insertions: number, deletions: number): string {
+  if (changed === 0) return ''
+  const plus = insertions > 0 ? ` +${insertions}` : ''
+  const minus = deletions > 0 ? ` −${deletions}` : ''
+  return ` · ${files(changed)}${plus}${minus}`
+}
+
+/**
  * What a fetch or a fast-forward pull has to say. Never empty: the user asked for network.
+ *
+ * Three answers, and they must be told apart at a glance, because they call for three
+ * different next actions:
+ *
+ *   * **something came down** — `Fast-forwarded main 7 commits from origin · 12 files +230 −41`.
+ *     The counts are the point: a person who has just pulled into a tree they are about to
+ *     build wants to know whether to rebuild, and "ok" does not answer that.
+ *   * **nothing came down** — `main is already up to date with origin`. The branch is named
+ *     even though nothing moved, because with four repositories in a project that is the only
+ *     thing saying which one just answered.
+ *   * **it was refused** — not here at all. That is a `GitError` and `explain` is its sentence.
+ *
+ * A *fetch* names no branch (`branch` is empty; `cide_git::branch::fetch_with` fills in none of
+ * the pull half) and keeps the older behaviour: git's own text, or "already up to date".
  *
  * `output` is trusted to be a *message*, which is why `cide_git::branch::fetch_with` no longer
  * forwards libgit2's sideband stream: that is a progress meter full of carriage returns, and
  * it used to arrive here and be printed verbatim as the one sentence a successful fetch got.
+ * On the binary route it is also the *remote server's* text, so it stays inside `oneLine` —
+ * shown, capped, and never parsed into anything.
  */
-export function fetchNote(outcome: { remote: string; advanced: number; output: string }): string {
+export function fetchNote(outcome: FetchReport): string {
   if (outcome.advanced > 0) {
-    const commits = outcome.advanced === 1 ? '1 commit' : `${outcome.advanced} commits`
-    return `Fast-forwarded ${commits} from ${outcome.remote}`
+    const moved = outcome.branch === '' ? '' : `${outcome.branch} `
+    const stat = shortstat(outcome.filesChanged, outcome.insertions, outcome.deletions)
+    return `Fast-forwarded ${moved}${commits(outcome.advanced)} from ${outcome.remote}${stat}`
+  }
+  if (outcome.branch !== '') {
+    // A pull that took nothing. The transport may still have said something — other refs
+    // moved — and that goes in the detail below rather than in the headline, where it would
+    // displace the one fact the user asked about.
+    return `${outcome.branch} is already up to date with ${outcome.remote}`
   }
   const said = oneLine(outcome.output)
   return said === '' ? `Already up to date with ${outcome.remote}` : said
+}
+
+/**
+ * The body under `fetchNote` — what actually arrived, one commit per line.
+ *
+ * `''` when there is nothing to expand, which is what tells the surface not to draw the
+ * disclosure at all.
+ *
+ * The list is already capped by Rust (`PULL_COMMIT_CAP`), so the overflow line reports a
+ * number this side never had the rows for. That is deliberate: the alternative was putting
+ * four hundred commits on the wire to drop three hundred and ninety here.
+ *
+ * When no commits came down the transport's own text takes the space instead — for a pull
+ * that was already up to date, `Fetched 5 objects from origin` is the difference between
+ * "nothing happened" and "your branch did not move but other refs did".
+ */
+export function fetchDetail(outcome: FetchReport): string {
+  if (outcome.commits.length === 0) return oneLine(outcome.output)
+  const lines = outcome.commits.map((c) => {
+    const summary = c.summary === '' ? '(no summary)' : c.summary
+    const author = c.author === '' ? '' : ` — ${c.author}`
+    return `${c.shortOid}  ${summary}${author}`
+  })
+  if (outcome.moreCommits > 0) lines.push(`… and ${commits(outcome.moreCommits)} more`)
+  return lines.join('\n')
+}
+
+/** One repository's answer, labelled. */
+export interface RepoFetch {
+  /** `RepoInfo.name`. Ignored when there is only one repository. */
+  name: string
+  outcome: FetchReport
+}
+
+/**
+ * Several repositories' pulls as **one** notice.
+ *
+ * Aggregated rather than reported one toast per repository, for two reasons. One gesture
+ * deserves one answer: Ctrl+T names no repository, so it acts on every one in the project
+ * (the same argument `git.push` makes), and five toasts for one keystroke is noise. And the
+ * failure mode of not aggregating is worse than noise — the notice surface collapses toasts
+ * by identical text, so five submodules all answering *"Already up to date with origin"*
+ * would have shown **one** toast and silently under-reported four repositories.
+ *
+ * With one repository this is exactly `fetchNote` / `fetchDetail`, so the common case reads
+ * as though the multi-root machinery were not there.
+ */
+export function pullReport(results: readonly RepoFetch[]): { text: string; detail: string } {
+  const first = results[0]
+  if (results.length === 1 && first !== undefined) {
+    return { text: fetchNote(first.outcome), detail: fetchDetail(first.outcome) }
+  }
+  if (first === undefined) return { text: '', detail: '' }
+
+  const moved = results.filter((r) => r.outcome.advanced > 0)
+  const total = (pick: (o: FetchReport) => number): number =>
+    results.reduce((n, r) => n + pick(r.outcome), 0)
+
+  // Every repository is listed, moved or not. A repository that was already up to date is an
+  // answer to the question that was asked, and leaving it out would make the notice look like
+  // the command had skipped it.
+  const detail = results.map((r) => `${r.name}: ${fetchNote(r.outcome)}`).join('\n')
+
+  if (moved.length === 0) {
+    return { text: `All ${results.length} repositories are already up to date`, detail }
+  }
+  const stat = shortstat(
+    total((o) => o.filesChanged),
+    total((o) => o.insertions),
+    total((o) => o.deletions),
+  )
+  const where = moved.length === results.length
+    ? `all ${results.length} repositories`
+    : `${moved.length} of ${results.length} repositories`
+  return {
+    text: `Fast-forwarded ${where} · ${commits(total((o) => o.advanced))}${stat}`,
+    detail,
+  }
 }
 
 /*

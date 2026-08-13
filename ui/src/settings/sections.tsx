@@ -31,6 +31,7 @@ import {
   Segmented,
   ToggleRow,
 } from './controls'
+import { badge, handshakeNote, sentence } from './cliHandshake'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
 import { ProxySection } from './ProxySection'
@@ -178,6 +179,30 @@ function ProjectsAndWindows({ settings, patch, setWindowMode }: SectionProps) {
   )
 }
 
+/**
+ * What the last `claude` to complete the IDE handshake on this machine was.
+ *
+ * # Why this row is worth a control's space
+ *
+ * `SUPPORTED_CLI` is a property of the source tree: it says a human recorded a version, and
+ * `cargo xtask verify-cli` is what produces that record. Nothing in it is about the machine
+ * the app is running on. This row is the other half — a per-machine observation that a real
+ * CLI got through the whole discovery chain here — and it is the only thing on this screen
+ * that is evidence rather than a claim about the world.
+ *
+ * Every sentence comes from `handshakeNote`, in `./cliHandshake`, which imports nothing and is
+ * compiled and driven standalone by `ui/scripts/check-handshake.mjs`. This component is a
+ * `switch` over the answer and holds no rule: five states, two of which look identical from a
+ * distance and mean opposite things, is exactly the shape that ships inverted when it lives in
+ * JSX.
+ */
+function CliHandshakeRow({ support }: { support: ClaudeCliSupport }) {
+  const note = handshakeNote(support, Date.now())
+  return (
+    <Row label="Last handshake" hint={sentence(note)} control={<span>{badge(support)}</span>} />
+  )
+}
+
 function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: SectionProps) {
   const claude = settings.claude
   const set = (next: Partial<ClaudeSettings>) => patch({ claude: { ...claude, ...next } })
@@ -200,6 +225,17 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
           selection — is spoken over an undocumented protocol with no version field, so it can
           only be right or wrong, never negotiated. The terminal itself is unaffected.
         </Note>
+      )}
+
+      {/* A `Group` of readout weight, not a `Note`, and deliberately: this is the *good* news
+          case as often as not, and a coloured panel that says "everything is fine" on every
+          launch is one nobody reads on the launch it matters. The `Note tone="warn"` above
+          stays reserved for the drift case. The wording is `cliHandshake.ts`'s, so it can be
+          driven by a check script. */}
+      {cliSupport != null && (
+        <Group title="IDE protocol">
+          <CliHandshakeRow support={cliSupport} />
+        </Group>
       )}
 
       <Group title="Environment">

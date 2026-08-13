@@ -46,6 +46,7 @@ import {
   type ProjectId,
   type RepoId,
 } from '@/ipc/client'
+import { noteChangeCount } from '@/chrome/gitCountStore'
 import { diffPaneAvailable } from './diffHost'
 import {
   clearAllPartials,
@@ -580,7 +581,7 @@ export function useGitPanel(
   }, [])
 
   /**
-   * `viewOf`, plus the one fact in a tree that outlives the panel.
+   * `viewOf`, plus the two facts in a tree that outlive the panel.
    *
    * Every `ChangesTree` names the absolute work tree of every repo in it, and the diff pane
    * needs exactly that to tell a tool call that touched *its* file from one that touched a
@@ -589,13 +590,23 @@ export function useGitPanel(
    * here — so noting it in passing costs nothing and saves the pane a `git_status` of its own.
    * See `repoRoots.ts`.
    *
+   * The activity rail's badge is the second, and it is the same trade for the same reason.
+   * `chrome/gitCountStore` is always live because the badge has to be right with the sidebar
+   * on Files or shut — but while this panel *is* open, both would otherwise walk the work tree
+   * on every burst, twice, to produce a number the first walk already contained. See
+   * `noteChangeCount`.
+   *
    * Not folded into `viewOf`: `model.ts` is compiled on its own by `check-git-tree.mjs`, and a
    * side effect in a pure mapping is not the sort of thing that stays in one place.
    */
-  const absorb = useCallback((tree: ChangesTree): StatusView => {
-    noteRepoRoots(tree)
-    return viewOf(tree)
-  }, [])
+  const absorb = useCallback(
+    (tree: ChangesTree): StatusView => {
+      noteRepoRoots(tree)
+      if (project !== null) noteChangeCount(project, tree)
+      return viewOf(tree)
+    },
+    [project],
+  )
 
   const refresh = useCallback(async () => {
     if (story) return

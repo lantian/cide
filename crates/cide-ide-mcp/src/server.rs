@@ -87,6 +87,26 @@ pub enum ServerEvent {
     Connected {
         connection: u64,
         pid: u32,
+        /// What the CLI called itself in `initialize`: `clientInfo.version`.
+        ///
+        /// # The only version cide has that names the binary that actually connected
+        ///
+        /// `cide_claude::version::check_once` runs `claude --version` and latches the answer
+        /// for the life of the process — deliberately, because re-probing would mean
+        /// re-warning — so it describes whichever binary was on `PATH` at the first Claude
+        /// spawn. The CLI self-updates underneath a running app. This names the build that
+        /// read our lockfile, chose the WebSocket transport, presented the auth header and
+        /// accepted our `initialize` reply, at the moment it did so.
+        ///
+        /// It was already on the wire and already parsed — `initialize_result` read
+        /// `protocolVersion` out of the same `params` and discarded the rest — and recording
+        /// it costs one field. `cide_app::ide` writes it to `cide_core::handshake`, and the
+        /// Settings screen shows it.
+        ///
+        /// `Option`, because a client that omits `clientInfo` is a client we still serve. A
+        /// missing version is "we do not know", which is a different answer from a version
+        /// outside the range and must not be reported as one.
+        client_version: Option<String>,
     },
     Disconnected {
         connection: u64,
@@ -117,6 +137,15 @@ struct Conn {
     /// From `ide_connected`. `None` until the CLI sends it, which is a window of a few
     /// milliseconds in practice but is not zero.
     pid: Option<u32>,
+    /// From `initialize`'s `clientInfo.version`. See [`ServerEvent::Connected`].
+    ///
+    /// Recorded on the connection rather than passed straight through, because the two frames
+    /// are separate: `initialize` is a request and `ide_connected` is a notification that
+    /// arrives afterwards. In the real capture the order is `initialize`, then
+    /// `notifications/initialized`, then `ide_connected` — so by the time there is a pid to
+    /// announce, this is already set. If a future CLI reversed them the field would simply be
+    /// `None` and the record would say "unknown", which is the honest degradation.
+    client_version: Option<String>,
 }
 
 #[derive(Default)]
@@ -167,7 +196,14 @@ impl Inner {
         }
         c.next_id += 1;
         let id = c.next_id;
-        c.open.insert(id, Conn { out, pid: None });
+        c.open.insert(
+            id,
+            Conn {
+                out,
+                pid: None,
+                client_version: None,
+            },
+        );
         Some(id)
     }
 
@@ -179,6 +215,21 @@ impl Inner {
         if let Some(conn) = self.conns.lock().open.get_mut(&connection) {
             conn.pid = Some(pid);
         }
+    }
+
+    /// Record what the client called itself in `initialize`.
+    ///
+    /// A blank or absent version is stored as `None` rather than as `Some("")`: an empty
+    /// string would travel all the way to the Settings screen and be drawn as a version.
+    fn set_client_version(&self, connection: u64, version: Option<&str>) {
+        let version = version.map(str::trim).filter(|v| !v.is_empty());
+        if let Some(conn) = self.conns.lock().open.get_mut(&connection) {
+            conn.client_version = version.map(str::to_string);
+        }
+    }
+
+    fn client_version(&self, connection: u64) -> Option<String> {
+        self.conns.lock().open.get(&connection)?.client_version.clone()
     }
 
     fn pane_for(&self, connection: u64) -> Option<String> {
@@ -784,10 +835,12 @@ async fn notification(inner: &Arc<Inner>, connection: u64, incoming: &Incoming) 
         match serde_json::from_value::<protocol::IdeConnected>(incoming.params.clone()) {
             Ok(hello) => {
                 inner.set_pid(connection, hello.pid);
+                let client_version = inner.client_version(connection);
                 inner
                     .emit(ServerEvent::Connected {
                         connection,
                         pid: hello.pid,
+                        client_version,
                     })
                     .await;
             }
@@ -809,7 +862,14 @@ async fn notification(inner: &Arc<Inner>, connection: u64, incoming: &Incoming) 
 
 async fn request(inner: &Arc<Inner>, connection: u64, incoming: &Incoming, id: Value) -> Response {
     match incoming.method.as_str() {
-        "initialize" => Response::ok(id, initialize_result(&incoming.params)),
+        "initialize" => {
+            // Read for the record before the reply is built. `initialize_result` deliberately
+            // still echoes only `protocolVersion` — inventing one ends the handshake, see its
+            // own comment — so this is a side effect on the connection rather than anything
+            // the client is told about.
+            inner.set_client_version(connection, client_version_of(&incoming.params));
+            Response::ok(id, initialize_result(&incoming.params))
+        }
         "tools/list" => Response::ok(id, json!({ "tools": tools::descriptors() })),
         "tools/call" => call_tool(inner, connection, &incoming.params, id).await,
         "ping" => Response::ok(id, json!({})),
@@ -822,6 +882,20 @@ async fn request(inner: &Arc<Inner>, connection: u64, incoming: &Incoming, id: V
             Response::err(id, METHOD_NOT_FOUND, format!("no such method: {other}"))
         }
     }
+}
+
+/// `clientInfo.version` out of an `initialize`'s params.
+///
+/// A free function with its own test rather than a chain inline at the call site: the path is
+/// two levels deep into untrusted-shaped JSON, and every way of getting it wrong — the wrong
+/// key, a number instead of a string, a `clientInfo` that is not an object — produces `None`,
+/// which is indistinguishable from a client that did not send one. That is the right failure
+/// mode and precisely why it needs to be checked rather than eyeballed.
+fn client_version_of(params: &Value) -> Option<&str> {
+    params
+        .get("clientInfo")?
+        .get("version")
+        .and_then(Value::as_str)
 }
 
 fn initialize_result(params: &Value) -> Value {
@@ -928,8 +1002,13 @@ mod live {
             // Reaching this means the CLI got through the WebSocket handshake with our token
             // and subprotocol, accepted our `initialize` reply, read `tools/list`, and then
             // announced itself. Nothing short of the whole chain produces this event.
-            Ok(Some(ServerEvent::Connected { pid, .. })) => {
-                eprintln!("a real claude connected and named pid {pid}");
+            Ok(Some(ServerEvent::Connected {
+                pid, client_version, ..
+            })) => {
+                eprintln!(
+                    "a real claude connected and named pid {pid}, version {}",
+                    client_version.as_deref().unwrap_or("<none reported>")
+                );
             }
             other => panic!(
                 "no ide_connected from a real claude: {other:?}\n\
@@ -1023,6 +1102,149 @@ mod tests {
             "the server agrees with the client's version rather than proposing its own"
         );
         assert!(answer["result"]["capabilities"]["tools"].is_object());
+    }
+
+    /// The version the CLI names itself with survives from `initialize` to `Connected`.
+    ///
+    /// This is the wire fact behind the whole runtime half of the version record, and it is
+    /// the join that nothing else covers: `initialize` is a *request* and `ide_connected` is a
+    /// *notification* that arrives afterwards, so the version has to be parked on the
+    /// connection in between. A build that read it into a local and dropped it would still
+    /// pass every other test in this file.
+    ///
+    /// The `clientInfo` block is the one from the real 2.1.226 capture in
+    /// `tests/real_cli.rs`, fields and all, rather than a minimal `{"version": "…"}`: what is
+    /// being checked is that the right key is picked out of the shape the CLI actually sends.
+    #[tokio::test]
+    async fn the_version_the_cli_names_itself_with_reaches_the_connected_event() {
+        let server = server().await;
+        let mut events = server.events();
+
+        let mut ws = connect(server.port(), TOKEN)
+            .await
+            .expect("the CLI connects");
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25",
+                "capabilities":{"roots":{"listChanged":true},"elicitation":{}},
+                "clientInfo":{
+                    "name":"claude-code",
+                    "title":"Claude Code",
+                    "version":"2.1.226",
+                    "description":"Anthropic's agentic coding tool",
+                    "websiteUrl":"https://claude.com/claude-code"
+                }
+            }}),
+        )
+        .await;
+        let _ = reply(&mut ws).await;
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":6001}}),
+        )
+        .await;
+
+        match events.recv().await {
+            Some(ServerEvent::Connected {
+                pid, client_version, ..
+            }) => {
+                assert_eq!(pid, 6001);
+                assert_eq!(
+                    client_version.as_deref(),
+                    Some("2.1.226"),
+                    "the version was on the wire, was parsed, and did not survive the two                      frames between arriving and being announced"
+                );
+            }
+            other => panic!("expected a Connected event, got {other:?}"),
+        }
+
+        server.shutdown().await;
+    }
+
+    /// A client that names no version is served, and says "unknown" rather than a version.
+    ///
+    /// `None` and "a version outside the range" are different answers with different
+    /// remedies, and an empty string would be drawn on the Settings screen as though it were
+    /// a version — which is why the setter filters blanks rather than storing what it got.
+    #[tokio::test]
+    async fn a_client_that_names_no_version_still_connects_and_reports_none() {
+        let server = server().await;
+        let mut events = server.events();
+
+        let mut ws = connect(server.port(), TOKEN)
+            .await
+            .expect("the CLI connects");
+        // Three shapes of nothing: no `clientInfo` at all, one without a `version`, and one
+        // whose `version` is blank. All three have to answer `None`.
+        for (id, params) in [
+            (1, json!({"protocolVersion":"2025-06-18","capabilities":{}})),
+            (
+                2,
+                json!({"protocolVersion":"2025-06-18","clientInfo":{"name":"someone"}}),
+            ),
+            (
+                3,
+                json!({"protocolVersion":"2025-06-18","clientInfo":{"name":"x","version":"  "}}),
+            ),
+        ] {
+            send(
+                &mut ws,
+                json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":params}),
+            )
+            .await;
+            let _ = reply(&mut ws).await;
+        }
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","method":"ide_connected","params":{"pid":6002}}),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                events.recv().await,
+                Some(ServerEvent::Connected {
+                    pid: 6002,
+                    client_version: None,
+                    ..
+                })
+            ),
+            "a client with no usable version must connect and report None, not an empty string"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn the_version_is_read_out_of_the_shape_the_cli_actually_sends() {
+        // Verbatim from the 2.1.226 capture.
+        let real = json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"roots": {"listChanged": true}, "elicitation": {}},
+            "clientInfo": {
+                "name": "claude-code",
+                "title": "Claude Code",
+                "version": "2.1.226",
+                "description": "Anthropic's agentic coding tool",
+                "websiteUrl": "https://claude.com/claude-code"
+            }
+        });
+        assert_eq!(client_version_of(&real), Some("2.1.226"));
+
+        // Every way of not being there answers the same `None`, which is why this needs a
+        // test: the failures are all silent and all identical.
+        for absent in [
+            json!({}),
+            json!({"clientInfo": {}}),
+            json!({"clientInfo": null}),
+            json!({"clientInfo": "claude-code"}),
+            json!({"clientInfo": {"version": 2}}),
+            // The neighbouring key, which is the plausible confusion.
+            json!({"protocolVersion": "2025-11-25"}),
+        ] {
+            assert_eq!(client_version_of(&absent), None, "{absent}");
+        }
     }
 
     #[tokio::test]

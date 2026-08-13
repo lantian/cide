@@ -222,7 +222,9 @@ function walkRepo(
   depth: number,
   expanded: ReadonlySet<string>,
 ): void {
-  if (countRepoFiles(repo) === 0) return
+  // Drawable, not changed: see `countDrawableFiles`. A repository holding nothing but ignored
+  // files still gets its rows once the user has asked to see them.
+  if (countDrawableFiles(repo) === 0) return
   const inner = depth + 1
   if (depth >= 0) {
     const id = repoRowId(repo.id)
@@ -425,10 +427,100 @@ function repoFileIds(repo: RepoView): string[] {
   return [...own, ...repo.children.flatMap(repoFileIds)]
 }
 
-/** Files at or below a repository, its submodules included. The number the mock right-aligns. */
+/**
+ * Whether a group's files are *changes*. The one rule the repo rows and the activity rail
+ * share, so that the two numbers cannot disagree about the same thing.
+ *
+ * Only the ignored group is excluded, and it has to be excluded **explicitly** rather than by
+ * luck. `git_status(project, false)` returns `ignored: []`, so summing every group happens to
+ * give the right answer — right up until the user opens the Ignored twisty, at which point
+ * `useGitPanel` flips `includeIgnored` and the very next payload carries a `target/` with
+ * eleven thousand files in it. A repo row that trebles because a twisty was opened is wrong;
+ * a rail badge that does is worse, because nothing on screen connects the two.
+ *
+ * Conflicts *are* counted: a conflict is a change that blocks a commit, and leaving it out
+ * would make the badge read low exactly during a merge. Unversioned files are counted too,
+ * which is what VS Code's badge does and what the repo rows already did.
+ */
+export function counts(kind: GroupKind): boolean {
+  // The literal, not `IGNORED_GROUP`: that constant is the group's *id*, and the two being
+  // the same word is a coincidence `sidecarGroup` spells out at its one call site.
+  return kind !== 'ignored'
+}
+
+/**
+ * Changed files at or below a repository, its submodules included. The number the mock
+ * right-aligns on a repo row, and — summed by {@link countChangedFiles} — the number on the
+ * activity rail's badge.
+ */
 export function countRepoFiles(repo: RepoView): number {
-  const own = repo.groups.reduce((n, g) => n + g.entries.length, 0)
+  const own = repo.groups.reduce((n, g) => (counts(g.kind) ? n + g.entries.length : n), 0)
   return repo.children.reduce((n, c) => n + countRepoFiles(c), own)
+}
+
+/**
+ * Everything a repository has rows for, ignored included — the *elision* question, which is
+ * not the counting question.
+ *
+ * `walkRepo` drops a repository with nothing under it, and "nothing" there has to mean "no
+ * rows to draw". If it meant "no changes" instead, a repository whose only content is ignored
+ * files would vanish from the panel the moment the user asked to see its ignored files, which
+ * is the opposite of what the gesture means.
+ */
+function countDrawableFiles(repo: RepoView): number {
+  const own = repo.groups.reduce((n, g) => n + g.entries.length, 0)
+  return repo.children.reduce((n, c) => n + countDrawableFiles(c), own)
+}
+
+/**
+ * Every changed file in the project — the number the activity rail's badge shows.
+ *
+ * Literally the sum of the repo rows, by construction rather than by agreement: one badge and
+ * a panel that disagreed about how much work is uncommitted would make both untrustworthy,
+ * and the only way to be sure is for both to be this function and `countRepoFiles`.
+ *
+ * `StatusView.repos` is already re-nested, so submodules are reached through `children` and
+ * are counted exactly once.
+ */
+export function countChangedFiles(view: StatusView): number {
+  return view.repos.reduce((n, repo) => n + countRepoFiles(repo), 0)
+}
+
+/**
+ * What the badge prints, or `null` for a badge that must not be drawn at all.
+ *
+ * Three cases and each is a decision:
+ *
+ *   * **`null`** — no walk has landed yet. Nothing is drawn, because a `0` here would be a
+ *     claim ("your tree is clean") made before anything had been looked at.
+ *   * **`0`** — a clean tree. Nothing is drawn either. A zero badge is noise: it is the state
+ *     the badge exists to distinguish *from*, and `Explorer`'s header already withholds its
+ *     count at zero for the same reason.
+ *   * **`≥ 100`** — `99+`. The rail is 42px wide and the badge is absolutely positioned
+ *     inside a 28px button; `1,203` is five glyphs and does not fit. The exact number is not
+ *     lost — it goes to {@link badgeLabel}, which is the tooltip and the accessible name, and
+ *     which is where a number nobody can act on precisely belongs.
+ */
+export function badgeText(count: number | null): string | null {
+  if (count === null || count <= 0) return null
+  return count > 99 ? '99+' : String(count)
+}
+
+/**
+ * The rail button's accessible name and tooltip: `14 changed files`, or `undefined` when the
+ * badge is not drawn and the button is just *Git*.
+ *
+ * `digits` is the count already spelled by the caller, which is how `1,203` reaches the
+ * tooltip while the badge shows `99+`. Two arguments rather than one because `groupDigits`
+ * lives in `overlays/format.ts` and this module may not import it: `check-git-tree.mjs`
+ * compiles this file on its own and loads the emitted JavaScript in node, where a `@/…`
+ * specifier does not resolve. The rule — the noun, its plural, and the fact that a hidden
+ * badge has no name at all — stays here where the check can drive it; only the comma is the
+ * component's business.
+ */
+export function badgeLabel(count: number | null, digits: string): string | undefined {
+  if (badgeText(count) === null) return undefined
+  return `${digits} changed file${count === 1 ? '' : 's'}`
 }
 
 /**

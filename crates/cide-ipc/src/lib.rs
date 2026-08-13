@@ -20,9 +20,9 @@ pub use ids::*;
 pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
 pub use settings::{
     ClaudeSettings, DEFAULT_CODE_FONT_SIZE, EditorSettings, GraphicsSettings, MAX_CODE_FONT_SIZE,
-    MIN_CODE_FONT_SIZE, ProxyMode, ProxySettings, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings,
-    SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size, normalize_proxy_url,
-    redact_proxy_url,
+    MIN_CODE_FONT_SIZE, ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH, Settings, SidebarSettings, TerminalRenderer, TerminalSettings,
+    clamp_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,

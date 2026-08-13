@@ -60,12 +60,47 @@
   flex: 1;
 }
 
+/*
+ * The git count.
+ *
+ * Was a 6px dot, and the dot could only ever say "something is uncommitted" — which is the
+ * one thing a user standing in their own repository already knows. The number is what makes
+ * it worth drawing.
+ *
+ * Absolutely positioned, so it cannot widen the rail whatever it says. The arithmetic, since
+ * `chrome/layoutAudit.ts` asserts this box to ±2px: the rail is `var(--h-rail)` = 42px with a
+ * 28px button centred in it, so the button spans 7px…35px and `right: -2px` puts the pill's
+ * right edge at 37px. At `min-width: 18px` a one- or two-digit pill starts at 19px and a
+ * three-glyph `99+` — 3 × 9px monospace plus 6px of padding, about 22px — starts at 15px.
+ * Both are inside the rail with room to spare, and `model.badgeText` caps the text at three
+ * glyphs precisely so that stays true.
+ *
+ * `min-width` is 18px rather than the 14px the height suggests for a reason worth stating: it
+ * is above the width of two digits at this size, so **one and two digits measure the same
+ * box**. That makes the audited dimension a property of this stylesheet rather than of
+ * JetBrains Mono's advance width, and a font swap can therefore not turn a layout assertion
+ * red for a layout that did not change.
+ *
+ * `--on-accent` exists for ink on an accent fill and its contrast is documented against it in
+ * both palettes; `check:theme` is what keeps that true.
+ */
 .badge {
   position: absolute;
-  top: 2px;
-  right: 1px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
+  top: 0;
+  right: -2px;
+  min-width: 18px;
+  height: 14px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border-radius: 7px;
   background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  /* The line box is the pill: matching `height` centres the digits with no flex container. */
+  line-height: 14px;
+  text-align: center;
+  /* Digits are the whole content, so a tracked-out font would shift the box between 9 and 10
+     changed files. Monospace plus zero tracking keeps one- and two-digit pills stable. */
+  letter-spacing: 0;
 }

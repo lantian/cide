@@ -133,6 +133,34 @@ pub fn defaults() -> Vec<Binding> {
         // are simply not what Ctrl+Tab means any more.
         ("ctrl+tab", "project.switcher.next"),
         ("ctrl+shift+tab", "project.switcher.prev"),
+        // Pull, asked for by name: "need hotkey CTRL+T for git pull".
+        //
+        // # What it costs, precisely
+        //
+        // Ctrl+T is not free. It is readline's `transpose-chars`, it is **fzf**'s default
+        // file-widget trigger, and it is vim's tag-jump — and a binding here kills all three
+        // in **every pane, in every window, unconditionally**, including inside the Claude
+        // pane. The gate's window listener resolves the chord before xterm is offered the
+        // event at all (`ui/src/keys/gate.ts`), so nothing reaches the pty: this is not
+        // scoped to bash line editing and there is no arrangement in which it is.
+        //
+        // That trade is already made three times over in the table above, and unconditionally
+        // each time: `ctrl+p` takes readline's previous-history, `ctrl+w` takes
+        // unix-word-rubout (the most severe of the four), `ctrl+s` takes terminal XOFF flow
+        // control. There is not one `.when()` in this function. A `when("!terminalFocused")`
+        // was considered and is the worst of both here — the flag exists and works, but it
+        // would make the hotkey dead exactly where a terminal-centric app puts the user's
+        // hands, while still costing the reader a conditional to understand.
+        //
+        // It stays rebindable, which is the whole answer to the cost: a line of
+        // `~/.config/cide/keymap.json` — `{"key":"ctrl+t","command":"-git.pull"}` — puts
+        // transpose-chars back. `cide_app::cmd::app::user_keymap` reads that file and
+        // `resolve` applies the removal.
+        //
+        // On macOS `platform_layer` below unbinds `ctrl+t` and binds `⌘T` instead, which is
+        // right for Cocoa's own transpose and wrong for every user's "new tab" reflex. No
+        // code covers that; it is a known cost of the blanket rewrite, not of this line.
+        ("ctrl+t", "git.pull"),
         ("ctrl+alt+h", "pane.navigate.left"),
         ("ctrl+alt+l", "pane.navigate.right"),
         ("ctrl+alt+k", "pane.navigate.up"),
@@ -900,6 +928,35 @@ mod tests {
         // And on everything else it stays where it was written.
         let linux = resolve_layers(&platform_layer(false), &[]);
         assert_eq!(command_for(&linux, "ctrl+shift+f"), ["sidebar.search"]);
+    }
+
+    /// Ctrl+T pulls, and the escape hatch that pays for it actually works.
+    ///
+    /// The binding is a deliberate trade — it shadows readline's `transpose-chars`, fzf's
+    /// file widget and vim's tag-jump in every pane — and the whole justification for making
+    /// it is that one line of `~/.config/cide/keymap.json` takes it back. An escape hatch
+    /// nobody exercises is a claim, so this exercises it: with the removal in place the chord
+    /// resolves to nothing, which is what makes the gate pass the keystroke through to the
+    /// pty (`ui/src/keys/gate.ts` answers `passThrough` for an unbound chord).
+    ///
+    /// `ctrl+shift+t` is asserted beside it because the two are one keystroke apart and a
+    /// resolver that folded shift away would silently swap the theme on every pull.
+    #[test]
+    fn ctrl_t_pulls_and_can_be_given_back_to_the_terminal() {
+        let shipped = resolve(&[]);
+        assert_eq!(command_for(&shipped, "ctrl+t"), ["git.pull"]);
+        assert_eq!(command_for(&shipped, "ctrl+shift+t"), ["theme.toggle"]);
+
+        let freed = resolve(&[Binding::new("ctrl+t", "-git.pull")]);
+        assert!(
+            command_for(&freed, "ctrl+t").is_empty(),
+            "the documented one-liner has to actually restore transpose-chars"
+        );
+        assert_eq!(
+            command_for(&freed, "ctrl+shift+t"),
+            ["theme.toggle"],
+            "and it must not take the neighbouring chord with it"
+        );
     }
 
     #[test]

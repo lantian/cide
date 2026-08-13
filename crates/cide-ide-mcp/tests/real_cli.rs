@@ -1,6 +1,6 @@
-//! Two checks on the same server, at two different prices.
+//! Three checks on the same server, at three different prices.
 //!
-//! # Why there are two of them
+//! # Why there are three of them
 //!
 //! The IDE protocol is undocumented and unversioned (see `protocol.rs`), so the only thing
 //! that can tell us it still works is the shipped `claude` binary. But a test that needs the
@@ -13,13 +13,20 @@
 //! * [`the_frames_the_cli_sends_get_the_replies_it_expects`] drives the server with frames
 //!   copied byte-for-byte from a real CLI session. It needs nothing but a loopback socket,
 //!   runs in under a second, and is what actually guards the code.
-//! * [`the_real_cli_round_trips_a_diff_three_ways`] is `#[ignore]`d and spawns the real
-//!   binary. It is the periodic check that the frames above are still the frames the CLI
-//!   sends. Run it with `cargo test -p cide-ide-mcp -- --ignored`.
+//! * [`the_installed_cli_is_one_this_build_has_checked`] is `#[ignore]`d and spawns the real
+//!   binary, but types **no prompt**: it waits for the discovery-and-handshake chain to
+//!   complete and then judges the version that completed it against `SUPPORTED_CLI`. No model
+//!   turn, so it costs nothing to run and can therefore be a hard failure rather than a skip.
+//!   `cargo xtask verify-cli` drives it and prints the edit its failure asks for.
+//! * [`the_real_cli_round_trips_a_diff_three_ways`] is `#[ignore]`d, spawns the real binary
+//!   *and* asks it for an edit. It is the periodic check that the frames above are still the
+//!   frames the CLI sends. Run it with `cargo test -p cide-ide-mcp -- --ignored`.
 //!
-//! The first is worthless without the second: hand-written frames only prove the server
-//! answers *us*. The second is unusable as the first: a test that fails because a model
-//! phrased an edit differently gets disabled within a week and then guards nothing.
+//! The first is worthless without the third: hand-written frames only prove the server
+//! answers *us*. The third is unusable as the first: a test that fails because a model
+//! phrased an edit differently gets disabled within a week and then guards nothing — which is
+//! why its skip policy is so permissive, and why the version verdict is in the middle one
+//! instead, where a permissive policy would have swallowed it.
 //!
 //! # Provenance of the frames below
 //!
@@ -62,7 +69,9 @@ use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use cide_ide_mcp::protocol::{AUTH_HEADER, DiffOutcome, SUBPROTOCOL};
+use cide_ide_mcp::protocol::{
+    AUTH_HEADER, DiffOutcome, SUBPROTOCOL, SUPPORTED_CLI, Support, support_of, verified_range,
+};
 use cide_ide_mcp::server::{IdeServer, ServerEvent};
 
 /// The file every test edits, and the word the prompt asks for.
@@ -407,6 +416,267 @@ async fn the_real_cli_round_trips_a_diff_three_ways() {
             Err(reason) => eprintln!("SKIP {answer:?}: {reason}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The version check: cheap, and the only thing that actually verifies `SUPPORTED_CLI`.
+// ---------------------------------------------------------------------------------------
+
+/// The line `cargo xtask verify-cli` parses out of this test's output.
+///
+/// A machine-readable marker on an otherwise human-readable run, the same shape as
+/// `bench-ipc`'s `GO`/`NO-GO`. It is printed **before** any assertion fires, so a failing run
+/// still tells the tool what it saw — which is the whole point, since the failing runs are the
+/// ones with something to do about them.
+const VERDICT_MARKER: &str = "VERIFY-CLI:";
+
+/// **Does the CLI installed here still speak the protocol this build transcribes — and is it
+/// a version anybody has checked?**
+///
+/// # Why a version comparison alone verifies nothing
+///
+/// `SUPPORTED_CLI` is a list of strings a human typed. Comparing `claude --version` against it
+/// tells you whether somebody typed that number; it tells you nothing whatsoever about whether
+/// the *protocol* still works, which is the risk the constant exists to guard. Until this test
+/// existed nothing in the repository produced the record: the two tests that looked as though
+/// they checked it were tautologies, and no test anywhere failed when the installed CLI moved
+/// past the range.
+///
+/// So the verification is the handshake, and the version comparison comes **after** it. That
+/// ordering is load-bearing: a green version check on a build whose protocol had broken would
+/// be a confident lie, and it is the shape the constant had for its whole life.
+///
+/// # The 2×2, because the four cells want four different things from a human
+///
+/// |                       | version ∈ range                | version > range                                    |
+/// |-----------------------|--------------------------------|----------------------------------------------------|
+/// | **handshake OK**      | pass                           | **fail** — append the version, with this run as its evidence |
+/// | **handshake broken**  | **fail loudest** — the record is a lie | **fail** — real drift: read the transcript, fix `protocol.rs`, *then* append |
+///
+/// # Why this is not the expensive test beside it
+///
+/// [`the_real_cli_round_trips_a_diff_three_ways`] needs a model turn, costs money, and skips
+/// on anything that is not `WRONG FILE` — a policy that exists so a differently-phrased edit
+/// cannot get the whole test disabled, and which would swallow a version verdict whole. This
+/// one types **no prompt**: it waits for `ide_connected` and stops. No model is called and
+/// nothing is billed, which is what lets it be a hard failure rather than a skip.
+///
+/// # What it must never do
+///
+/// Never read `~/.claude/.credentials.json`, never set `ANTHROPIC_API_KEY`. The child
+/// authenticates by inheriting the environment, and the real `HOME` is deliberate — see
+/// [`run_one_turn`]. Nothing here writes to the user's settings either: the machine-local
+/// record is `cide_core::handshake`'s, written by the running app from the same event this
+/// test waits for, and a test that wrote it would be recording a claim about a developer's
+/// machine into a file the app then shows a user.
+#[tokio::test]
+#[ignore = "spawns the real claude binary: needs it on PATH and the user's Claude \
+            authentication. No model turn, so it costs nothing to run. \
+            Run with: cargo xtask verify-cli"]
+async fn the_installed_cli_is_one_this_build_has_checked() {
+    let Some(claude) = on_path("claude") else {
+        eprintln!("{VERDICT_MARKER} skipped=no-claude-on-path");
+        eprintln!("SKIP: no `claude` on PATH, so there is nothing to check the protocol against");
+        return;
+    };
+    if on_path("script").is_none() {
+        eprintln!("{VERDICT_MARKER} skipped=no-script");
+        eprintln!(
+            "SKIP: no `script(1)`. The CLI only opens an IDE connection from its interactive \
+             UI — a `-p` run opens no socket at all — so this test needs a pty and script is \
+             how it gets one."
+        );
+        return;
+    }
+    eprintln!("using {}", claude.display());
+
+    let workspace = Scratch::new("cide-verify-cli");
+    // The real `HOME`, for the same reason `run_one_turn` uses it: the child authenticates by
+    // inheriting the environment and reads the lockfile from under its own `HOME`, which is
+    // the directory the server writes to. Faking either breaks the pair.
+    let server = IdeServer::start(vec![workspace.path().to_path_buf()])
+        .await
+        .expect("the IDE server binds a loopback port and publishes a lockfile");
+    let port = server.port();
+    let mut events = server.events();
+
+    let lock_path = home_dir()
+        .expect("HOME")
+        .join(".claude")
+        .join("ide")
+        .join(format!("{port}.lock"));
+    assert!(
+        lock_path.exists(),
+        "no lockfile at {} — the CLI has nothing to find",
+        lock_path.display()
+    );
+
+    let transcript = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut child =
+        spawn_under_pty(&claude, workspace.path(), port, &transcript).expect("script spawns");
+    let mut stdin = child.stdin.take().expect("the child has stdin");
+
+    // One carriage return, and no prompt at all. A fresh directory raises the workspace-trust
+    // question and Enter takes its default; if the question does not appear this submits an
+    // empty prompt, which the CLI ignores. Nothing after this asks the model for anything.
+    let typed = async {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        stdin.write_all(b"\r").await?;
+        stdin.flush().await
+    }
+    .await;
+
+    // Budget from `server::live`, which measured the same wait: boot, lockfile discovery and
+    // the MCP handshake, with no model call in it.
+    let connected = timeout(Duration::from_secs(45), next_connection(&mut events)).await;
+
+    reap(&mut child, &mut stdin).await;
+    let _ = server.shutdown().await;
+
+    if let Err(e) = typed {
+        eprintln!("{VERDICT_MARKER} skipped=pty-write-failed");
+        eprintln!("SKIP: could not type into the pty: {e}");
+        return;
+    }
+
+    // --- cell 1 of the 2x2: did it connect at all -----------------------------------------
+
+    let Ok(Some(client_version)) = connected else {
+        eprintln!("{VERDICT_MARKER} handshake=broken version=unknown");
+        panic!(
+            "no `ide_connected` from a real claude within 45s.\n\n\
+             This is the failure the whole file exists to catch: something in the discovery \
+             chain no longer works. In order, the links are — our lockfile is found and \
+             parsed; `transport` reads `\"ws\"` (anything else sends the CLI to \
+             http://127.0.0.1:<port>/sse, which this crate does not serve); the auth header \
+             `{AUTH_HEADER}` is accepted; the `{SUBPROTOCOL}` subprotocol is negotiated; our \
+             `initialize` reply is accepted (inventing a `protocolVersion` the SDK does not \
+             know ends the handshake here); `ide_connected` is sent.\n\n\
+             Fix `crates/cide-ide-mcp/src/protocol.rs` before adding any version to \
+             SUPPORTED_CLI.\n\n\
+             --- pty transcript ---\n{}",
+            tail(&transcript)
+        );
+    };
+
+    // --- cell 2: and is the version that did it one anybody recorded ----------------------
+    //
+    // `clientInfo.version` in preference to `claude --version`, and the difference is real:
+    // this is the build that actually completed the chain above, self-reported, rather than
+    // whatever answers a probe on `PATH`. The fallback exists because a client is allowed to
+    // omit `clientInfo`, and "we could not tell" must not be reported as "out of range".
+    let reported = match client_version {
+        Some(version) => {
+            eprintln!("the CLI that connected calls itself {version}");
+            version
+        }
+        None => {
+            let probed = cide_claude_version_probe(&claude);
+            eprintln!(
+                "the CLI named no version in `initialize`; falling back to `claude --version`: {}",
+                probed.as_deref().unwrap_or("<nothing>")
+            );
+            match probed {
+                Some(version) => version,
+                None => {
+                    eprintln!("{VERDICT_MARKER} handshake=ok version=unknown verdict=unreadable");
+                    eprintln!(
+                        "SKIP: the protocol works here, but nothing would say which version \
+                         did it — neither `clientInfo.version` nor `claude --version`. There \
+                         is no number to record, so there is nothing to assert."
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    let support = support_of(Some(&reported));
+    let range = verified_range();
+    let verdict = match &support {
+        Support::Verified { .. } => "verified",
+        Support::Newer { .. } => "newer",
+        Support::Older { .. } => "older",
+        Support::Unreadable { .. } => "unreadable",
+        Support::Missing => "missing",
+    };
+    eprintln!("{VERDICT_MARKER} handshake=ok version={reported} range={range} verdict={verdict}");
+
+    let version = support.version().unwrap_or(&reported).to_string();
+    match support {
+        Support::Verified { .. } => {
+            eprintln!(
+                "PASS: claude {version} completed the whole discovery-and-handshake chain, and \
+                 it is inside the recorded range {range}."
+            );
+        }
+        // The cell this test was written for, and the one with a one-line fix.
+        Support::Newer { .. } => panic!(
+            "the IDE protocol still works on claude {version}, and nothing records that.\n\n\
+             The handshake completed — lockfile, ws transport, auth header, subprotocol, \
+             `initialize`, `ide_connected` — so this run *is* the evidence a new entry needs. \
+             Append it:\n\n    \
+             crates/cide-ide-mcp/src/protocol.rs, SUPPORTED_CLI:\n    \
+             pub const SUPPORTED_CLI: &[&str] = &[{}, \"{version}\"];\n\n\
+             The list must stay ascending and duplicate-free; `protocol::tests::\
+             the_recorded_range_is_ordered` enforces that.",
+            SUPPORTED_CLI
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Support::Older { .. } => panic!(
+            "claude {version} is older than the recorded range {range}, and the protocol works \
+             on it.\n\n\
+             Either this machine's CLI was downgraded, or SUPPORTED_CLI's lower bound was set \
+             from a version nobody had actually checked. Prepend {version:?} if the former."
+        ),
+        Support::Unreadable { reported } => panic!(
+            "the protocol works here, but {reported:?} is not a version \
+             `protocol::parse` can read, so it cannot be compared against {range}.\n\n\
+             If the CLI has changed how it names itself, `parse` is the thing to fix — it is \
+             deliberately intolerant of a leading token, because guessing would be worse."
+        ),
+        // Unreachable: `support_of` only answers `Missing` for `None`, and there is a version
+        // in hand by this point. Stated rather than `unreachable!()` so a future change to
+        // `support_of` produces a sentence instead of a panic with no context.
+        Support::Missing => panic!("a version was reported and read as missing: {reported:?}"),
+    }
+}
+
+/// The pid and self-reported version of the first `claude` to announce itself.
+///
+/// Skips the connection bookkeeping in between, the same way [`next_diff`] does. Answers
+/// `Some(version)` — where the inner `Option` is the CLI's own `clientInfo.version` — so that
+/// "no connection" and "connected but unnamed" stay distinguishable; they mean opposite things
+/// about whether the protocol works.
+async fn next_connection(events: &mut Receiver<ServerEvent>) -> Option<Option<String>> {
+    while let Some(event) = events.recv().await {
+        if let ServerEvent::Connected {
+            pid, client_version, ..
+        } = event
+        {
+            eprintln!("a real claude connected and named pid {pid}");
+            return Some(client_version);
+        }
+    }
+    None
+}
+
+/// `claude --version`, trimmed.
+///
+/// A local copy of `cide_claude::version::probe` rather than a dev-dependency on `cide-claude`,
+/// which depends on *this* crate: Cargo permits dev-dependency cycles, but adding one so a
+/// test can run a subprocess would point the graph backwards for four lines. This is only the
+/// fallback; the answer that matters comes off the wire.
+fn cide_claude_version_probe(claude: &Path) -> Option<String> {
+    let output = std::process::Command::new(claude).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 async fn run_one_turn(claude: &Path, answer: Answer) -> Result<(), String> {

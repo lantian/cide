@@ -38,9 +38,9 @@ import {
   begin,
   capture,
   commit,
+  endsHold,
   holdOf,
   selection,
-  stillHeld,
   type Walk,
 } from './switcher'
 
@@ -60,8 +60,12 @@ let disarm: (() => void) | null = null
  * All three listeners are on `window`/`document` in the capture phase and all three are
  * removed together, because the failure this guards is a walk that outlives its own gesture:
  *
- * * **keyup** — the ordinary path. Committed when the last held modifier is up. Read off
- *   `ev` rather than counted, so a chord like `ctrl+alt+tab` needs both released.
+ * * **keyup** — the ordinary path, and the one the user actually performs: let go of Ctrl and
+ *   the highlighted project opens. Whether the hold is over is `endsHold`'s decision, off the
+ *   event alone — the key that came *up* first, and only then the modifier flags, because
+ *   WebKitGTK still reports Ctrl as down in the very event that releases it. Read its note
+ *   before simplifying this back to `!stillHeld`; that spelling leaves the popup up for ever
+ *   on the platform this ships on.
  * * **blur** — Alt+Tab to another application while Ctrl is down. The keyup is delivered to
  *   whatever took focus and never arrives here, so without this the popup stays up for ever
  *   and the capture eats every Tab the user types afterwards.
@@ -78,7 +82,7 @@ function armRelease(): void {
   const onKeyUp = (ev: KeyboardEvent): void => {
     const walk = useSwitcher.getState().walk
     if (walk === null) return
-    if (!stillHeld(walk.hold, ev)) commitWalk()
+    if (endsHold(walk.hold, ev)) commitWalk()
   }
   const onLost = (): void => {
     if (useSwitcher.getState().walk !== null) cancelWalk()

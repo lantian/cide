@@ -43,6 +43,7 @@ import type {
   SplitOutcome,
   TabId,
   TreeRow,
+  TreeRowKind,
   UnsavedTab,
   WindowMode,
   Workspace,
@@ -437,6 +438,23 @@ export const fs = {
   reveal: (projectId: ProjectId, path: string) =>
     invoke<number | null>('fs_reveal', { project: projectId, path }),
 
+  /**
+   * What the index holds at each path: `'file'`, `'dir'`, or `null` for nothing.
+   *
+   * The oracle behind terminal file links, and a batch because it is asked from a mouse hover:
+   * one call answers every candidate on the line the pointer just entered. It touches no disk —
+   * the answer is a hash lookup against the walked tree — so a hover costs one round trip and
+   * no `stat`s.
+   *
+   * `null` means "not in the index", which is a stronger statement than "not on disk": the
+   * index is gitignore-filtered and does not descend through symlinked directories, so
+   * `target/…`, `node_modules/…` and everything outside the project's roots answer `null` and
+   * never become links. Rejects while the project has no index yet; the caller treats that as
+   * "nothing lights up", not as an error worth showing.
+   */
+  pathsExist: (projectId: ProjectId, paths: string[]) =>
+    invoke<Array<TreeRowKind | null>>('fs_paths_exist', { project: projectId, paths }),
+
   readFile: (projectId: ProjectId, path: string) =>
     invoke<string>('fs_read_file', { project: projectId, path }),
 
@@ -610,6 +628,22 @@ export const session = {
 
   /** The byte sequence that reconstructs the current screen. Send this before live bytes. */
   scrollback: (id: SessionId) => invoke<ArrayBuffer>('session_scrollback', { session: id }),
+
+  /**
+   * Where this pane's child is **now**, or `null`.
+   *
+   * `null` covers every uninteresting case at once — no such session, no pid, no `/proc`, a
+   * deleted directory, and a cwd outside the project's roots. The last of those is a refusal
+   * and not an absence: the child chooses its own cwd and is not trusted, so one that has
+   * `chdir`-ed out of the project must not become a base for resolving that same child's
+   * output. See `cmd/session.rs`.
+   *
+   * Asked while hovering a path in a terminal, so the caller caches it briefly rather than
+   * asking per line; it is a `read_link`, not a walk, but a hover is not a place for a round
+   * trip per row.
+   */
+  cwd: (project: ProjectId, id: SessionId) =>
+    invoke<string | null>('session_cwd', { project, session: id }),
 
   inAlternateScreen: (id: SessionId) =>
     invoke<boolean>('session_in_alternate_screen', { session: id }),
@@ -930,6 +964,27 @@ export const file = {
   open: (projectId: ProjectId, path: string) =>
     invoke<TabId>('tab_open_file', { project: projectId, path }),
 
+  /**
+   * Open a file a **terminal pane** named. Same tab list, entirely different trust.
+   *
+   * A separate command rather than an argument to `open`, because the difference is not a flag
+   * — it is who chose the path. Every caller of `open` hands back a path the backend itself
+   * produced (the tree, the picker, the git panel), and `tab_open_file` enforces nothing at
+   * all. This one's argument was parsed out of a pane's bytes, which are a repository's build
+   * output, a file some tool printed, a tool result — attacker-influenced by definition.
+   *
+   * So Rust checks, on every call: inside a project root, no `..`, canonicalised and contained
+   * again so a symlink cannot point out, a regular file (not a directory, not a device, and
+   * above all not a FIFO), and under the editor's size limit *before* a tab exists. It rejects
+   * with a typed `{kind, message}` the notice stack shows verbatim — a refusal the user cannot
+   * see is indistinguishable from a link wired to nothing.
+   *
+   * There is no line argument: the caret is `editor/revealRequest.ts`'s job and is requested
+   * on this side, before this call, for the reason written there.
+   */
+  openFromTerminal: (projectId: ProjectId, path: string) =>
+    invoke<TabId>('terminal_open_path', { project: projectId, path }),
+
   /** Record whether a file tab has unsaved edits. This is what draws the tab's dirty dot. */
   setDirty: (projectId: ProjectId, id: TabId, dirty: boolean) =>
     invoke<{ rev: number }>('tab_set_dirty', { project: projectId, tab: id, dirty }),
@@ -951,11 +1006,19 @@ export const file = {
  * shadows the generated type it was standing in for.
  * ------------------------------------------------------------------------------------ */
 export const fsEvents = {
-  /** Debounced 300 ms in Rust. 5,000 touched files arrive as one event, not 5,000. */
-  onChanged: (handler: (project: ProjectId, paths: string[]) => void) =>
-    listen<{ project: ProjectId; paths: string[] }>('cide://fs-changed', (e) =>
-      handler(e.payload.project, e.payload.paths),
-    ),
+  /*
+   * `onChanged` used to live here and is deliberately gone. It listened to `cide://fs-changed`
+   * and read `e.payload.paths`, but `emit::FsChanged` puts them at `payload.change.paths`, so
+   * its `paths` argument was `undefined` for every burst. `events.onFsChanged` above is the
+   * one that matches the wire.
+   *
+   * It survived a long time because nothing called it. The moment something did — the terminal
+   * link cache — the destructuring threw inside the listener, and because `listen()`'s promise
+   * had already resolved, the `.catch` guarding that call site never ran and the failure was
+   * silent for the life of the window. `Explorer.tsx` had found the trap earlier and chose to
+   * document it rather than remove it; a comment on the *correct* helper cannot stop someone
+   * reaching for the wrong one by name, and one caller later that is exactly what happened.
+   */
 
   /** Walk progress, for the picker's `Indexing…` state and the explorer's meta counter. */
   onIndexProgress: (handler: (project: ProjectId, indexed: number, total: number) => void) =>
@@ -1065,6 +1128,27 @@ export interface ClaudeCliSupport {
   verifiedRange: string
   /** One sentence, or null when there is nothing worth saying. */
   warning: string | null
+  /**
+   * The last `claude` to complete the IDE handshake **on this machine**, or null if none has.
+   *
+   * A different question from the three fields above, which are all a property of the source
+   * tree measured against a probe of `PATH`. This is a per-machine observation: a real CLI
+   * read our lockfile, chose the WebSocket transport, presented the auth header and had its
+   * `initialize` reply accepted, here. It is the only thing on the Settings screen that is
+   * evidence rather than a record of what somebody typed into a constant.
+   *
+   * Mirrors `cide_core::handshake::Handshake`. Hand-mirrored like the rest of this interface,
+   * because `ClaudeCliSupport` is a plain `serde::Serialize` local to `cmd/settings.rs` rather
+   * than a `cide-ipc` ts-rs DTO — so nothing generates it and it moves with the Rust by hand.
+   */
+  handshake: {
+    /** What the CLI called itself in `initialize`; null when it named no version. */
+    version: string | null
+    /** Unix milliseconds. */
+    atUnixMs: number
+    /** The verified range as it stood when this was recorded, so a stale record reads stale. */
+    verifiedRange: string
+  } | null
 }
 
 /**
@@ -1115,7 +1199,7 @@ export const claudeTasks = {
     pendingCommand<ClaudeCliSupport>(
       'claude_cli_support',
       () => invoke<ClaudeCliSupport>('claude_cli_support'),
-      { version: null, verifiedRange: 'unknown', warning: null },
+      { version: null, verifiedRange: 'unknown', warning: null, handshake: null },
     ),
 }
 

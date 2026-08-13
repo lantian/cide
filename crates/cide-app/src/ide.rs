@@ -387,8 +387,28 @@ async fn pump(
                 // already resolved the request; this only takes the tab off the screen.
                 close_diff_tab_by_name(&app, project, &tab_name);
             }
-            ServerEvent::Connected { pid, .. } => {
-                tracing::debug!(%project, pid, "a claude connected to the IDE server");
+            ServerEvent::Connected {
+                pid, client_version, ..
+            } => {
+                tracing::debug!(
+                    %project,
+                    pid,
+                    version = client_version.as_deref().unwrap_or("unknown"),
+                    "a claude connected to the IDE server"
+                );
+                // **The record is written here and nowhere else.**
+                //
+                // Reaching this arm means a real `claude` completed the entire chain — read
+                // our lockfile, chose the WebSocket transport, presented the auth header and
+                // the `mcp` subprotocol, accepted our `initialize` reply and announced itself.
+                // Nothing short of that produces this event, which is exactly what makes it
+                // worth recording: a version compared against a constant proves that a human
+                // typed a number, and this proves the protocol still works on this machine.
+                //
+                // Every rule about *whether* to write is in `cide_core::handshake::record` —
+                // this event fires once per Claude pane, in an app that may have four open,
+                // and a debounce written inline here would be a rule no test could reach.
+                record_handshake(client_version);
             }
             ServerEvent::Disconnected { .. } => {}
             ServerEvent::OpenFile {
@@ -401,6 +421,32 @@ async fn pump(
             }
         }
     }
+}
+
+/// Store what the CLI that just connected called itself, if it is news.
+///
+/// # Why this is a function and not three lines in the arm above
+///
+/// Two reasons, and the second is the one that matters. The first is that it does file I/O
+/// inside an async task: `record` reads, decides and possibly writes, which is a handful of
+/// microseconds on a state directory and is why it is called at most once an hour rather than
+/// once per pane — but it is still I/O and it deserves a name.
+///
+/// The second is that this is the exact place this project has repeatedly stopped. The
+/// milestone before this one shipped three features whose backends were complete and whose
+/// call sites did not exist; `Capabilities::ide_protocol` sits three lines from
+/// `claude_version()` hardcoded `false` with the comment "Wired in M6" long after M6 shipped.
+/// A `Connected` arm that logged a version and did nothing with it would have been another.
+/// The write is the feature; the event is only where it starts.
+fn record_handshake(client_version: Option<String>) {
+    let record = cide_core::handshake::Handshake::now(
+        client_version,
+        // The range as *this build* understands it, stored beside the version so a record
+        // written by an older build is legible as stale rather than mistaken for a claim
+        // about this one.
+        cide_claude::version::verified_range(),
+    );
+    let _ = cide_core::handshake::record(&cide_core::handshake::handshake_path(), record);
 }
 
 /// Open the diff tab for a blocked `openDiff`, or reject it.

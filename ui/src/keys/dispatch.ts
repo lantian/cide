@@ -54,7 +54,9 @@ import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
-import { explain } from '@/chrome/branchModel'
+import { explain, pullReport, type RepoFetch } from '@/chrome/branchModel'
+import { notify } from '@/chrome/notices'
+import { useGitCount } from '@/chrome/gitCountStore'
 import { requestFocus } from '@/chrome/focusRequests'
 import {
   branch as branchApi,
@@ -68,7 +70,7 @@ import {
   type Direction,
   type PaneId,
   type ProjectId,
-  type RepoId,
+  type RepoInfo,
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
@@ -170,14 +172,17 @@ function unavailableReason(command: string): string | null {
  * so it lands on `chrome/Failures.tsx` through `unhandledrejection` like every other reported
  * failure. Silence here is precisely the defect this file keeps being rewritten for.
  */
-function withRepos(command: string, run: (project: ProjectId, repos: RepoId[]) => void): void {
+function withRepos(command: string, run: (project: ProjectId, repos: RepoInfo[]) => void): void {
   const project = activeProjectOf(boot())
   if (project === null) return unmet(command, 'no open project')
   void gitApi.repos(project.id).then((repos) => {
     if (repos.length === 0) {
       throw new Error('There is no git repository in this project.')
     }
-    run(project.id, repos.map((repo) => repo.id))
+    // The whole `RepoInfo`, not just the id it used to hand over. A command that acts on
+    // every repository has to be able to *name* them when it reports back — "already up to
+    // date" four times over says nothing about which four.
+    run(project.id, repos)
   })
 }
 
@@ -490,7 +495,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // Uncaught on purpose, like `claudeSend.lines`: a rejected push — no upstream, no
         // credential helper — is exactly what `chrome/Failures.tsx` exists to put on screen.
         withRepos(command, (project, repos) => {
-          void Promise.all(repos.map((repo) => gitApi.push(project, repo, null, null)))
+          void Promise.all(repos.map((repo) => gitApi.push(project, repo.id, null, null)))
         })
         return
       }
@@ -521,25 +526,67 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
 
       case 'git.fetch':
       case 'git.pull': {
-        // Every repository in the project, like `git.push` directly above — the command names
-        // none of them, and in a superproject picking one would be a guess.
-        //
-        // The rejection still reaches `chrome/Failures.tsx` through `unhandledrejection`, but
-        // it may not reach it as a raw `GitError`: that is `{kind, detail}` with no `message`
-        // field at all, and `Failures.describe` falls through to `kind` — so a divergent pull
-        // used to toast the bare word `notFastForward`, with the two counts that are the whole
-        // point of refusing sitting unread in `detail`. `explain` is the sentence. Rethrown
-        // rather than reported here, so the one window listener stays the only surface.
-        //
-        // One chain per repository rather than `Promise.all`: with four repositories and two
-        // failures, `Promise.all` reports the first and marks the rest handled.
-        const run = command === 'git.pull' ? branchApi.pull : branchApi.fetch
+        /*
+         * Every repository in the project, like `git.push` directly above — the command names
+         * none of them, and in a superproject picking one would be a guess.
+         *
+         * # The failures
+         *
+         * The rejection still reaches `chrome/Failures.tsx` through `unhandledrejection`, but
+         * it may not reach it as a raw `GitError`: that is `{kind, detail}` with no `message`
+         * field at all, and `notices.describe` falls through to `kind` — so a divergent pull
+         * used to toast the bare word `notFastForward`, with the two counts that are the whole
+         * point of refusing sitting unread in `detail`. `explain` is the sentence. Rethrown
+         * rather than reported here, so the one window listener stays the only surface.
+         *
+         * One chain per repository rather than `Promise.all`: with four repositories and two
+         * failures, `Promise.all` reports the first and marks the rest handled.
+         *
+         * # The successes, which is the half that was missing
+         *
+         * `void run(project, repo).catch(…)` reported every way this can fail and **discarded
+         * the value when it worked**. That is the recurring defect of this project with the
+         * sign flipped: not "implemented and nothing calls it" but "called, and the answer
+         * dropped on the floor". A user who pressed the key and got silence has been given
+         * the same evidence a dead key would give them.
+         *
+         * `allSettled` over the *same* promises collects the answers without disturbing the
+         * failure path: attaching a handler marks the original promise handled, but the
+         * derived promise from each `.catch(… throw …)` above is still unhandled and is what
+         * fires `unhandledrejection`. So both halves report, independently, and a project
+         * where two of four repositories fail shows two failures and one report of the other
+         * two — rather than `Promise.all`'s single failure and nothing else.
+         *
+         * Aggregated into one notice by `pullReport` rather than one toast per repository:
+         * one gesture, one answer, and — see `notices.admit` — five identical "already up to
+         * date" texts would collapse into one toast that silently spoke for five.
+         */
+        const pulling = command === 'git.pull'
+        const run = pulling ? branchApi.pull : branchApi.fetch
         withRepos(command, (project, repos) => {
-          for (const repo of repos) {
-            void run(project, repo).catch((error: unknown) => {
-              throw new Error(explain(error))
+          const attempts = repos.map((repo) => run(project, repo.id))
+          for (const attempt of attempts) {
+            void attempt.catch((error: unknown) => {
+              // The operation only changes one variant's wording, and only on the pull side:
+              // a fetch moves no working tree, so it cannot raise `checkoutWouldOverwrite` at
+              // all and the argument is unreachable for it.
+              throw new Error(explain(error, pulling ? 'pull' : 'checkout'))
             })
           }
+          void Promise.allSettled(attempts).then((settled) => {
+            const done: RepoFetch[] = []
+            settled.forEach((result, i) => {
+              const repo = repos[i]
+              if (result.status === 'fulfilled' && repo !== undefined) {
+                done.push({ name: repo.name, outcome: result.value })
+              }
+            })
+            // Every repository failed. They each have a toast of their own already, and a
+            // report of nothing on top of them would be a second surface saying less.
+            if (done.length === 0) return
+            const report = pullReport(done)
+            notify(report.text, { kind: 'info', detail: report.detail })
+          })
         })
         return
       }
@@ -570,15 +617,22 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       }
 
       case 'git.refresh': {
-        // The per-path status behind the file tree's tags. The Git *panel* keeps its own
-        // tree and refreshes off `cide://git-status` and `cide://session-tool`, neither of
-        // which a read-only `git_status` broadcasts — so this cannot reach it from here, and
-        // pretending otherwise by calling `git_status` and dropping the answer would be a
-        // command that looks like it worked.
+        // The per-path status behind the file tree's tags, and the activity rail's count.
+        // The Git *panel* keeps its own tree and refreshes off `cide://git-status` and
+        // `cide://session-tool`, neither of which a read-only `git_status` broadcasts — so
+        // this cannot reach it from here, and pretending otherwise by calling `git_status` and
+        // dropping the answer would be a command that looks like it worked.
+        //
+        // The rail's count is a second store with the same problem and the same answer: it is
+        // event-driven and correct on its own, but *Refresh git status* has to move every
+        // number the phrase covers. A refresh that visibly updated the file tree's tags and
+        // left the badge on its old figure would look like the badge was the stale one.
         const project = activeProjectOf(boot())
         if (project === null) return unmet(command, 'no open project')
         const status = useGitStatus.getState()
         void (status.project === project.id ? status.refresh() : status.attach(project.id))
+        const count = useGitCount.getState()
+        void (count.project === project.id ? count.refresh() : count.attach(project.id))
         return
       }
 

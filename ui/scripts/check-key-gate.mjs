@@ -122,6 +122,13 @@ try {
     { key: 'ctrl+w', command: 'tab.close', when: null },
     { key: 'ctrl+s', command: 'file.save', when: null },
     { key: 'ctrl+shift+t', command: 'theme.toggle', when: null },
+    // Git pull. `KeyT` is already in the sweep below, so this covers the property that
+    // matters for a chord the terminal would otherwise get: both entry points must swallow
+    // it identically. If they disagree, Ctrl+T pulls *and* sends `^T` to the pty — which is
+    // readline's transpose-chars, so the user's line would be silently scrambled by the
+    // keystroke that pulled. The sweep also pins that `ctrl+shift+t` still reaches
+    // `theme.toggle` beside it rather than being shadowed by the shorter chord.
+    { key: 'ctrl+t', command: 'git.pull', when: null },
     // Ctrl+Tab is in the sweep's key list, so these two also cover the case that matters
     // most for a Tab binding: both entry points must swallow it identically, or the stroke
     // that switched projects also inserts a tab character into whatever had focus.

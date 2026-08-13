@@ -72,8 +72,13 @@ function settle(ms = 0): Promise<void> {
 }
 
 /**
- * What `FileTree` subscribes to, and with which equality. One entry per `useFileTree(...)` /
- * `useGitStatus(...)` call in the component.
+ * What `FileTree` subscribes to that a **refresh** can move, and with which equality.
+ *
+ * Not every `useFileTree(...)` call in the component: `selected`, `selection` and `draft` are
+ * subscribed there too and are deliberately absent here, because `refresh` never writes them.
+ * This list exists to answer one question — did a watcher burst re-render the tree — so a
+ * selector the burst cannot touch would only be a row of the digest that is always `false`.
+ * A field that *starts* being written by `refresh` belongs here on the same commit.
  */
 const SELECTORS: Array<{ name: string; read: () => unknown; equal: (a: unknown, b: unknown) => boolean }> = [
   { name: 'count', read: () => useFileTree.getState().count, equal: Object.is },

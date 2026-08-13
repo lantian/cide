@@ -45,6 +45,21 @@ export const AUDIT_TABS: Tab[] = [
 export const AUDIT_ACTIVE_TAB = 'audit-console'
 
 /**
+ * The changed-file count the activity rail draws under `?audit=1`.
+ *
+ * Fixed rather than read from git, for the same reason the tab list above is fixed: the audit
+ * has to measure a state the chrome must get right, not whatever the machine it runs on
+ * happens to have uncommitted. A clean checkout would draw no badge at all — it is withheld
+ * at zero — and `chrome/layoutAudit.ts` reports an absent element as `NaN` and fails.
+ *
+ * The only constraint on the value is that it stays **under 100**: past that `badgeText` caps
+ * it at `99+`, which is three glyphs and a wider box than the one the audit asserts. One or
+ * two digits measure the same 18px pill, so twelve is a realistic number rather than a
+ * load-bearing one.
+ */
+export const AUDIT_GIT_CHANGES = 12
+
+/**
  * A single-leaf tree. The audit never looks inside a pane — the pane grid is M4's surface —
  * so this only has to satisfy the type.
  */

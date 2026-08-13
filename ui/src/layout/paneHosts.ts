@@ -28,6 +28,7 @@
  */
 import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from '@/terminal/xterm'
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
+import { attachPathLinks } from '@/terminal/pathLinks'
 import { diag } from '@/ipc/client'
 
 export interface PaneHost {
@@ -244,6 +245,23 @@ export function openTerminal(paneId: string): TerminalHandle {
     attachInputProbe(handle, host.el, paneId, (line) => void diag.log(line).catch(() => {})),
   )
   host.cleanup.push(attachInputRouting(handle, host.el))
+
+  /*
+   * File links, third and last on this element. Its `mousedown` listener is also in capture and
+   * also relies on being an ancestor of everything xterm owns, but it touches no keyboard event
+   * and the two above touch no mouse event, so the order between them is free.
+   *
+   * `session` is read through the host rather than captured: the pane may not have spawned yet
+   * when this runs, and a pane that respawns holds a different id by the time somebody hovers a
+   * path in it. What the *project* is, and what a click should do, arrive separately from React
+   * through `setPathLinkEnv` — those are props, and props change without the host changing.
+   */
+  host.cleanup.push(
+    attachPathLinks(handle, host.el, {
+      paneId,
+      session: () => getHost(paneId).sessionId ?? null,
+    }),
+  )
 
   promoteWebgl(handle)
   return handle

@@ -203,6 +203,67 @@ export function stillHeld(hold: Hold, state: ModifierState): boolean {
   return true
 }
 
+/**
+ * One keyup, structurally: the modifier flags the event reports, plus the key that came *up*.
+ *
+ * The two are separate fields for the reason [`endsHold`] exists — on this app's own platform
+ * they disagree about the single event the whole gesture is waiting for.
+ */
+export interface KeyRelease extends ModifierState {
+  readonly key: string
+}
+
+/**
+ * `KeyboardEvent.key` for each modifier a [`Hold`] can name, folded onto the flag it sets.
+ *
+ * Shift is deliberately absent, as it is from `Hold`: it is the direction, and letting go of it
+ * mid-walk must not commit.
+ */
+const RELEASED_MODIFIER: Readonly<Record<string, keyof Hold>> = {
+  Control: 'ctrl',
+  Alt: 'alt',
+  AltGraph: 'alt',
+  Meta: 'meta',
+  OS: 'meta',
+  Super: 'meta',
+  Hyper: 'meta',
+}
+
+/**
+ * Does this keyup end the hold? The commit condition — and deliberately **not** `!stillHeld`.
+ *
+ * # WebKitGTK reports the modifier state from *before* the release
+ *
+ * `!stillHeld(hold, ev)` was the first implementation and on the platform this app ships on it
+ * is false for ever, which made the released Ctrl do nothing: the popup stayed up asking for
+ * more Tabs, and the only ways out were Escape or clicking away.
+ *
+ * GDK fills a key event's `state` with the modifier mask as it was *immediately before* the
+ * event, and WebKit's GTK/WPE ports hand that mask straight to the DOM for a key **release**.
+ * Their `modifiersForKeyboardEvent` compensates for presses only — it was added to fix
+ * `ctrlKey` being false in the keydown of Ctrl itself (WebKit r272489 for GTK, r272771 for WPE)
+ * and returns early when `!event->pressed`. So the keyup of Ctrl arrives here with
+ * `ctrlKey === true` and `stillHeld` answers "still down". Chromium and Firefox do compensate,
+ * which is exactly why the naive version passes in a browser and fails in the shipped app.
+ *
+ * So the name of the key that came up is the primary signal, and the reported flags are only
+ * the fallback:
+ *
+ * * `key` names a modifier this walk is holding → the hold is over, whatever the flags claim;
+ * * otherwise the flags decide, which is what still catches a hold released while we were not
+ *   listening and revealed by some later, unrelated keyup.
+ *
+ * The cost is one edge: holding *both* Control keys and letting go of one commits, where a
+ * browser would wait for the second. That is the same trade [`stillHeld`] already makes across
+ * a multi-modifier hold, and it is the right way round — a popup that outlives the release of
+ * the key the user was visibly holding is the bug they can see.
+ */
+export function endsHold(hold: Hold, ev: KeyRelease): boolean {
+  const released = RELEASED_MODIFIER[ev.key]
+  if (released !== undefined && hold[released]) return true
+  return !stillHeld(hold, ev)
+}
+
 /** [`stillHeld`] against a parsed chord rather than an event. */
 function chordHolds(hold: Hold, chord: Chord): boolean {
   return stillHeld(hold, { ctrlKey: chord.ctrl, altKey: chord.alt, metaKey: chord.meta })

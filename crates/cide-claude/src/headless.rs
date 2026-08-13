@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use cide_core::proxy::ProxyEnv;
 use cide_ipc::{HeadlessError, HeadlessRequest, HeadlessResult};
 
 /// How long a one-shot may run before it is killed.
@@ -79,6 +80,22 @@ pub struct Headless {
     pub cwd: PathBuf,
     pub tools: ToolAccess,
     pub timeout: Duration,
+    /// The proxy environment this one-shot is spawned with.
+    ///
+    /// # This lane had no proxy at all until it had this field
+    ///
+    /// `ProxySettings` was described in its own doc as applying to "every child cide spawns",
+    /// and it did not: the only production caller of the proxy pass was `session_spawn`. This
+    /// lane builds its own [`Command`] and inherited cide's raw environment, so a corporate
+    /// user whose panes worked through a configured proxy got a commit-message generation
+    /// that tried to reach the API directly and hung. Not "not implemented" — the rule was a
+    /// pure function the whole time — but never wired, which is the same outcome.
+    ///
+    /// Handed in as a resolved [`ProxyEnv`] rather than as `ProxySettings`, because this crate
+    /// must not have an opinion about who is in scope. The caller reads
+    /// `ProxyScope::claude` — a one-shot **is a claude**, and a user who takes `claude` out of
+    /// scope means both — and this applies whatever it is given.
+    pub proxy: ProxyEnv,
 }
 
 impl Headless {
@@ -88,11 +105,22 @@ impl Headless {
             cwd: cwd.into(),
             tools: ToolAccess::default(),
             timeout: DEFAULT_TIMEOUT,
+            // Empty: cide sets nothing and removes nothing. The same default the pane lane
+            // has for a workspace it cannot read, and the behaviour this lane had before the
+            // field existed — so a caller that forgets to set it is no worse off than before,
+            // rather than silently direct.
+            proxy: ProxyEnv::default(),
         }
     }
 
     pub fn tools(mut self, tools: ToolAccess) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// The proxy environment for this run. See [`Self::proxy`].
+    pub fn proxy(mut self, proxy: ProxyEnv) -> Self {
+        self.proxy = proxy;
         self
     }
 
@@ -171,6 +199,10 @@ pub fn run(program: &Path, run: &Headless) -> Result<HeadlessResult, HeadlessErr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_env(&mut command);
+    // After `scrub_env`, so a scrub cannot undo the proxy the user asked for. The two passes
+    // answer different questions and only overlap on nothing: `scrub_env` removes cide's own
+    // interactive variables, and none of them is a proxy name.
+    run.proxy.apply(&mut command);
     // A one-shot outliving a `SIGKILL`ed cide is a `claude` nobody can see, spending money
     // against a prompt nobody will read the answer to. `arm` requires that the thread doing
     // the spawn outlives the child, which this function satisfies by construction rather than

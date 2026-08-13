@@ -46,11 +46,19 @@ import {
   treeKeyAction,
   type RowAction,
 } from './clickSemantics'
+import {
+  actionScope,
+  collapseTo,
+  NO_MODS,
+  pressMenu,
+  type SelectMods,
+} from './treeSelection'
 import { copyText } from './copyText'
 import { isRootPath, relativeTo } from './rowPaths'
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
 import { useFileClipboard } from './fileClipboard'
 import {
+  clipboardText,
   copyLabel,
   escapeCancels,
   isCutPending,
@@ -196,6 +204,11 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   const degraded = useFileTree((s) => s.degraded)
   const revealTo = useFileTree((s) => s.revealTo)
   const selected = useFileTree((s) => s.selected)
+  /**
+   * Every highlighted row. `selected` above is the *cursor* — see the two fields in
+   * `treeStore`, which are one thing for a plain click and two the moment Ctrl is held.
+   */
+  const selection = useFileTree((s) => s.selection)
   /**
    * The unnamed row being typed into, or `null`. See `treeStore`'s field for why it is a row
    * in the list rather than a dialog over it.
@@ -357,29 +370,40 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    * a trash move is the kind of small lie that makes people stop reading dialogs.
    */
   const askDelete = useCallback(
-    (row: { path: string; isRoot: boolean }) => {
-      if (project === null) return
-      if (row.isRoot) {
+    (paths: readonly string[]) => {
+      if (project === null || paths.length === 0) return
+      // One root anywhere in the selection refuses the whole gesture rather than quietly
+      // deleting the rest around it. `fs_delete` would refuse that one path and report a
+      // `PartialDelete` *after* the others were already in the trash, which is a confirmation
+      // dialog that named more files than it acted on — the one thing this dialog exists to
+      // rule out.
+      if (paths.some((path) => isRootPath(path, roots))) {
         setProblem(`${ROOT_NOT_DELETED}.`)
         return
       }
       setProblem(null)
       setPendingDelete({
-        title: 'Move to Trash?',
+        title: paths.length > 1 ? `Move ${paths.length} items to Trash?` : 'Move to Trash?',
         body:
           'This goes to the desktop trash, not to nowhere — it can be restored from there. ' +
           'Nothing is removed from disk.',
-        files: [row.path],
-        confirmLabel: 'Move to Trash',
+        files: [...paths],
+        confirmLabel: paths.length > 1 ? `Move ${paths.length} items` : 'Move to Trash',
         run: () => {
           void fsApi
-            .delete(project, [row.path])
-            .then(() => useFileTree.getState().refresh())
+            .delete(project, [...paths])
+            .then(() => {
+              // The selection named these rows and these rows are gone. Left standing it would
+              // be a set of dead paths that the next Ctrl+X or Delete would send to Rust, which
+              // is the one refusal the user has no way to act on.
+              useFileTree.getState().clearSelection()
+              return useFileTree.getState().refresh()
+            })
             .catch(fail('Move to Trash'))
         },
       })
     },
-    [project, fail],
+    [project, roots, fail],
   )
 
   /**
@@ -391,17 +415,20 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    * exchange — by then the user has forgotten what they cut.
    */
   const takeClip = useCallback(
-    (mode: ClipMode, row: { path: string; isRoot: boolean }) => {
-      if (project === null) return
-      if (mode === 'cut' && row.isRoot) {
+    (mode: ClipMode, paths: readonly string[]) => {
+      if (project === null || paths.length === 0) return
+      // Same all-or-nothing rule as the delete above: a Cut that silently dropped the root out
+      // of a five-row selection would move four files and leave the fifth, with the strip
+      // claiming five.
+      if (mode === 'cut' && paths.some((path) => isRootPath(path, roots))) {
         setProblem('A project root is closed, not moved.')
         return
       }
       setProblem(null)
       setNote(null)
-      useFileClipboard.getState().take(mode, project, [row.path])
+      useFileClipboard.getState().take(mode, project, paths)
     },
-    [project],
+    [project, roots],
   )
 
   /**
@@ -573,15 +600,40 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     useFileTree.getState().clearReveal()
   }, [revealTo, virtualizer])
 
+  /**
+   * Show a refused selection gesture, or say nothing.
+   *
+   * Every selection call resolves to a sentence or to `null`, because the one thing that can go
+   * wrong is a band wider than `RANGE_ROWS` — and a Shift-click that quietly selected nothing
+   * would be indistinguishable from a Shift-click the tree ignored.
+   */
+  const reported = useCallback((refusal: string | null) => {
+    if (refusal !== null) setProblem(refusal)
+  }, [])
+
   /** Perform whatever `clickSemantics` decided, on a row we already have in hand. */
   const apply = useCallback(
-    (action: RowAction, row: TreeRow, index: number) => {
+    (action: RowAction, row: TreeRow, index: number, mods: SelectMods = NO_MODS) => {
       const store = useFileTree.getState()
+      if (action.select && (mods.ctrl || mods.shift)) {
+        /*
+         * A modified press assembles a selection and does **nothing else** — no fold, no open —
+         * which is the same gate `ChangesTree` puts on its own diff-opening press.
+         *
+         * The folding half is the sharper of the two. Rows here are addressed by *index* while
+         * a Shift-band is being resolved, and expanding a folder re-flattens everything below
+         * it: a Ctrl-click that landed on a twisty would renumber the rows the next Shift-click
+         * measures against, so the band would cover files nobody pointed at. The opening half is
+         * merely obvious — Ctrl+double-click on four files should not leave four tabs open.
+         */
+        void store.pressRow(row.path, index, mods).then(reported)
+        return
+      }
       if (action.select) store.select(row.path, index)
       if (action.toggle && row.kind === 'dir') void store.toggle(row)
       if (action.open && row.kind === 'file') onOpen?.(row.path)
     },
-    [onOpen],
+    [onOpen, reported],
   )
 
   /**
@@ -599,17 +651,22 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   }, [])
 
   const moveTo = useCallback(
-    (index: number) => {
+    (index: number, mods: SelectMods = NO_MODS) => {
       const store = useFileTree.getState()
       // A jump lands where nothing has been fetched. Ask first, then read — an unfetched row
       // cannot be named, and a selection that silently refuses to move on `End` is worse
       // than a frame's delay.
       store.ensure(Math.max(0, index - JUMP_MARGIN), index + JUMP_MARGIN + 1)
       const row = store.rowAt(index)
-      if (row !== undefined) store.select(row.path, index)
+      if (row !== undefined) {
+        // Shift extends the band from the anchor and Ctrl moves the cursor without touching
+        // what is highlighted; `keySelect` owns both rules, so this only has to hand them over.
+        if (mods.ctrl || mods.shift) void store.keyToRow(row.path, index, mods).then(reported)
+        else store.select(row.path, index)
+      }
       virtualizer.scrollToIndex(index, { align: 'auto' })
     },
-    [virtualizer],
+    [virtualizer, reported],
   )
 
   /**
@@ -726,10 +783,31 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           return
         }
 
-        const path = row?.path ?? store.selected
-        if (path !== null && path !== undefined) {
-          takeClip(key === 'x' ? 'cut' : 'copy', { path, isRoot: isRootPath(path, roots) })
-        }
+        // Everything that is highlighted, which for a single click is the one row and after a
+        // Ctrl- or Shift-click is the set. The row under the cursor is deliberately not a
+        // fallback — see `actionScope`: the cursor can sit on a row that is *not* selected, and
+        // cutting one of those would move a file with nothing on screen marking it.
+        takeClip(key === 'x' ? 'cut' : 'copy', actionScope(store.selection))
+        e.preventDefault()
+        return
+      }
+
+      /*
+       * Ctrl+A — select every row in the tree.
+       *
+       * Handled here rather than as a `tree.selectAll` command in the registry, for the reason
+       * the block above and `treeKeyAction` both give, and this is the case where it matters
+       * most: the key gate resolves global bindings on a *window capture* listener, so a
+       * registry `ctrl+a` would be swallowed before it reached the commit message box, the
+       * rename input, CodeMirror or any terminal — every place where Ctrl+A means "select all
+       * of this text" or "go to the start of the line". `ChangesTree` reached the same
+       * conclusion for the same tree one panel over.
+       *
+       * `!e.shiftKey` leaves `ctrl+shift+a` free; it is IDEA's "Find Action" and belongs to
+       * nobody here yet.
+       */
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && key === 'a') {
+        void store.selectAll().then(reported)
         e.preventDefault()
         return
       }
@@ -765,17 +843,28 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         shift: e.shiftKey,
       })
       if (action !== null) {
-        // The live row's path when it is resident, the store's remembered selection when it is
-        // not. Unlike Paste, neither of these needs the row's *kind*, so a row evicted by
-        // scrolling is not a reason to refuse — `startRename` scrolls back to it and the
-        // confirmation names the path in full.
+        if (action === 'delete') {
+          // Every highlighted row, which is what the confirmation then names one per line.
+          // Nothing selected is not a refusal: the key is genuinely not ours in that state, so
+          // it goes back to the browser rather than being swallowed with a shrug.
+          const scope = actionScope(store.selection)
+          if (scope.length === 0) return
+          askDelete(scope)
+          e.preventDefault()
+          return
+        }
+        /*
+         * Rename is the one verb in this panel that cannot take a list — there is one inline
+         * `<input>` and one new name — so it acts on the **cursor** even when several rows are
+         * highlighted, which is what every editor does with F2 over a multi-selection.
+         *
+         * The live row's path when it is resident, the store's remembered selection when it is
+         * not. Unlike Paste, neither of these needs the row's *kind*, so a row evicted by
+         * scrolling is not a reason to refuse — `startRename` scrolls back to it.
+         */
         const path = (at < 0 ? undefined : store.rowAt(at)?.path) ?? store.selected
-        // Nothing selected is not a refusal. The key is genuinely not ours in that state, so
-        // it goes back to the browser rather than being swallowed with a shrug.
         if (path === null || path === undefined) return
-        const target = { path, isRoot: isRootPath(path, roots) }
-        if (action === 'delete') askDelete(target)
-        else startRename(at, target)
+        startRename(at, { path, isRoot: isRootPath(path, roots) })
         e.preventDefault()
         return
       }
@@ -797,24 +886,47 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
        * cancelled is a trap, and one that eats Escape for the rest of the app is a different
        * trap.
        */
-      if (e.key === 'Escape' && escapeCancels(useFileClipboard.getState().clip, project)) {
-        useFileClipboard.getState().clear()
-        e.preventDefault()
-        return
+      if (e.key === 'Escape') {
+        if (escapeCancels(useFileClipboard.getState().clip, project)) {
+          useFileClipboard.getState().clear()
+          e.preventDefault()
+          return
+        }
+        /*
+         * Then, and only then, collapse a multi-row selection back to the cursor.
+         *
+         * Second in line deliberately: the cut is the thing this panel is visibly *announcing*
+         * — a strip at the foot and a row of faded rows — so Escape answers that first and the
+         * selection on the press after it. Both are one keystroke away, and the order matches
+         * what the user can see.
+         *
+         * `> 1` keeps the ordinary state out of it. Escape with one row selected is not a
+         * gesture anyone makes, and swallowing it there would take Escape away from whatever
+         * wants it next — the same argument the cut branch above already makes.
+         */
+        if (store.selection.paths.size > 1) {
+          store.setSelection(collapseTo(store.selected), store.selected, store.selectedIndex)
+          e.preventDefault()
+          return
+        }
       }
+
+      // Ctrl moves the cursor and leaves the selection alone; Shift extends the band from the
+      // anchor. `moveTo` hands both to `keySelect`, which is the same rule the mouse takes.
+      const mods: SelectMods = { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey }
 
       if (at < 0) {
         // Nothing selected. Any navigation key means "start at the top" — `moveIndex` from a
         // notional -1 would answer 0 for Home and 1 for ArrowDown, which skips a row.
         if (moveIndex(e.key, 0, count) === null) return
-        moveTo(0)
+        moveTo(0, mods)
         e.preventDefault()
         return
       }
 
       const next = moveIndex(e.key, at, count)
       if (next !== null) {
-        moveTo(next)
+        moveTo(next, mods)
         e.preventDefault()
         return
       }
@@ -827,7 +939,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           break
         case 'ArrowRight':
           if (row.kind === 'dir' && !row.expanded) void store.toggle(row)
-          else moveTo(Math.min(at + 1, count - 1))
+          else moveTo(Math.min(at + 1, count - 1), mods)
           break
         case 'ArrowLeft':
           /*
@@ -840,7 +952,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
            * parent for the common case (the first child) and never stalls.
            */
           if (row.kind === 'dir' && row.expanded) void store.toggle(row)
-          else moveTo(Math.max(at - 1, 0))
+          else moveTo(Math.max(at - 1, 0), mods)
           break
         default:
           return
@@ -856,6 +968,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       moveTo,
       project,
       renaming,
+      reported,
       roots,
       runPaste,
       startRename,
@@ -997,8 +1110,6 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         expanded: el.dataset['rowExpanded'] === 'true',
         /** A project root: `fs_rename` and `fs_delete` both refuse one, so the menu does too. */
         isRoot: isRootPath(path, roots),
-        /** What *Copy Relative Path* copies. See `rowPaths.ts` for why it is not inline. */
-        rel: relativeTo(path, roots),
       }
     },
     [roots],
@@ -1075,10 +1186,21 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
 
       const store = useFileTree.getState()
       const at = store.indexOf(row.path)
-      // Right-click selects too. The menu reads the DOM and does not need it, but a menu that
-      // acts on a row the tree is not visibly pointing at is a menu the user cannot check
-      // before clicking.
-      if (at !== null) store.select(row.path, at)
+      /*
+       * Right-click selects too. The menu reads the DOM and does not need it, but a menu that
+       * acts on a row the tree is not visibly pointing at is a menu the user cannot check
+       * before clicking.
+       *
+       * `pressMenu` is what makes that true for more than one row: a right-click *inside* an
+       * existing selection keeps it, and anywhere else collapses to the row under the pointer.
+       * The plain `select` that used to be here destroyed the selection with the very gesture
+       * that opens the menu meant to act on it, so *Move 5 items to Trash* could not be reached.
+       */
+      const marked = pressMenu(store.selection, row.path)
+      store.setSelection(marked, row.path, at ?? store.selectedIndex)
+      /** The rows this menu's verbs act on: exactly what the tree is now showing as selected. */
+      const scope = actionScope(marked)
+      const many = scope.length > 1
 
       const openLabel = row.isDir ? (row.expanded ? 'Collapse' : 'Expand') : 'Open'
       const entries: MenuEntry[] = [
@@ -1119,21 +1241,45 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
          * this one — the files — because that is what Ctrl+C means in every other list of
          * files a user has ever met.
          */
-        { id: 'cut', label: copyLabel('cut', 1), ...cutAction(row.isRoot, row.path, takeClip) },
+        {
+          id: 'cut',
+          label: copyLabel('cut', scope.length),
+          ...cutAction(scope, roots, takeClip),
+        },
         {
           id: 'copy',
-          label: copyLabel('copy', 1),
-          run: () => takeClip('copy', { path: row.path, isRoot: row.isRoot }),
+          label: copyLabel('copy', scope.length),
+          run: () => takeClip('copy', scope),
         },
         paste,
         { kind: 'separator' },
         {
+          // The one verb here that is about a *place* rather than a set of files. A file
+          // manager is asked to show one directory, so it gets the row that was clicked even
+          // when several are selected — opening five windows is not what anyone means.
           id: 'reveal',
           label: 'Reveal in File Manager',
           run: () => void fsReveal.showInManager(project, row.path).catch(fail('Reveal')),
         },
-        { id: 'copyPath', label: 'Copy Path', run: () => void copyText(row.path) },
-        { id: 'copyRel', label: 'Copy Relative Path', run: () => void copyText(row.rel) },
+        /*
+         * The two that copy *names* rather than files, and they follow the selection: with
+         * four rows highlighted, a *Copy Paths* that handed over one of them would be a menu
+         * item that quietly ignored the other three.
+         *
+         * One absolute path per line, from the same `clipboardText` that Copy already puts on
+         * the system clipboard — so the text a Copy leaves behind and the text these two write
+         * are the same shape, and pasting either into a terminal works.
+         */
+        {
+          id: 'copyPath',
+          label: many ? `Copy ${scope.length} Paths` : 'Copy Path',
+          run: () => void copyText(clipboardText(scope)),
+        },
+        {
+          id: 'copyRel',
+          label: many ? `Copy ${scope.length} Relative Paths` : 'Copy Relative Path',
+          run: () => void copyText(clipboardText(scope.map((path) => relativeTo(path, roots)))),
+        },
         { kind: 'separator' },
         /*
          * Rename and Move to Trash. Neither acts here: both hand off to the same function the
@@ -1152,6 +1298,8 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
          * words, from the same constant, so the two cannot drift into two different rules.
          */
         {
+          // Always the row that was clicked, never the set: there is one inline `<input>` and
+          // one new name. See the Ctrl+R branch in `onKeyDown`, which makes the same choice.
           id: 'rename',
           label: 'Rename…',
           ...(row.isRoot
@@ -1160,11 +1308,14 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         },
         {
           id: 'delete',
-          label: 'Move to Trash',
+          label: many ? `Move ${scope.length} Items to Trash` : 'Move to Trash',
           danger: true,
-          ...(row.isRoot
+          // A root anywhere in the selection greys the item, not just a root under the pointer
+          // — `askDelete` refuses the same set for the same reason, and the two must agree or
+          // the menu enables something the handler then declines.
+          ...(scope.some((path) => isRootPath(path, roots))
             ? { disabledReason: ROOT_NOT_DELETED }
-            : { run: () => askDelete(row) }),
+            : { run: () => askDelete(scope) }),
         },
       ]
       return entries
@@ -1207,6 +1358,9 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
          */
         role="tree"
         aria-label="Files"
+        /* Ctrl- and Shift-click build a set here, so the tree has to say so: a screen reader
+           reads `aria-selected` on several rows as a bug in a tree that claims single select. */
+        aria-multiselectable={true}
         tabIndex={0}
         onKeyDown={onKeyDown}
         onContextMenu={onContextMenu}
@@ -1248,7 +1402,8 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
                 iconTheme={iconTheme}
                 top={item.start}
                 height={item.size}
-                selected={row.path === selected}
+                selected={selection.paths.has(row.path)}
+                current={row.path === selected}
                 cut={isCutPending(clip, row.path)}
                 renaming={row.path === renaming}
                 project={project}
@@ -1467,7 +1622,10 @@ function DraftRow({
 
   return (
     <div
-      className={`${styles.row} ${styles.rowSelected}`}
+      // Both classes: the draft is the one row the user is working in, so it takes the band
+      // *and* the cursor's leading rule — which is what a selected row looked like before the
+      // two were split apart for multi-selection.
+      className={`${styles.row} ${styles.rowSelected} ${styles.rowCurrent}`}
       data-audit="fileTreeDraftRow"
       data-depth={depth}
       role="treeitem"
@@ -1552,12 +1710,14 @@ function sideAction(
  * thing to want.
  */
 function cutAction(
-  isRoot: boolean,
-  path: string,
-  take: (mode: ClipMode, row: { path: string; isRoot: boolean }) => void,
+  scope: readonly string[],
+  roots: readonly string[],
+  take: (mode: ClipMode, paths: readonly string[]) => void,
 ): { disabledReason: string } | { run: () => void } {
-  if (isRoot) return { disabledReason: 'A project root is closed, not moved' }
-  return { run: () => take('cut', { path, isRoot }) }
+  if (scope.some((path) => isRootPath(path, roots))) {
+    return { disabledReason: 'A project root is closed, not moved' }
+  }
+  return { run: () => take('cut', scope) }
 }
 
 interface RowProps {
@@ -1568,12 +1728,21 @@ interface RowProps {
   iconTheme: IconTheme
   top: number
   height: number
+  /** In the selection: drawn with the band, and acted on by Cut, Copy and Move to Trash. */
   selected: boolean
+  /**
+   * The cursor row — where the arrows move from.
+   *
+   * Drawn with the 2px leading rule on top of the band, exactly as `ChangesTree` draws its own,
+   * so one selection means one thing in both sidebars. A single click makes a row both, which
+   * is why this looked like one state for as long as a selection was one row.
+   */
+  current: boolean
   /** On the clipboard for a **cut**: drawn faded, because it is about to move. */
   cut: boolean
   renaming: boolean
   project: ProjectId | null
-  onAct: (action: RowAction, row: TreeRow, index: number) => void
+  onAct: (action: RowAction, row: TreeRow, index: number, mods: SelectMods) => void
   onEndRename: () => void
   /** Where a rejected `fs_rename` goes. See `problem` in the panel. */
   onFail: (error: unknown) => void
@@ -1587,6 +1756,7 @@ function Row({
   top,
   height,
   selected,
+  current,
   cut,
   renaming,
   project,
@@ -1608,9 +1778,14 @@ function Row({
   const hasTwisty = isDir && row.hasChildren
   const twisty = hasTwisty ? (row.expanded ? '▾' : '▸') : ''
 
-  // Composed rather than a ternary chain: a row can be selected *and* pending a cut, which is
-  // the ordinary case — Ctrl+X acts on the selection.
-  const rowClass = [styles.row, selected ? styles.rowSelected : null, cut ? styles.rowCut : null]
+  // Composed rather than a ternary chain: a row can be selected, be the cursor *and* be pending
+  // a cut all at once, which is the ordinary case — Ctrl+X acts on the selection.
+  const rowClass = [
+    styles.row,
+    selected ? styles.rowSelected : null,
+    current ? styles.rowCurrent : null,
+    cut ? styles.rowCut : null,
+  ]
     .filter((name) => name !== undefined && name !== null)
     .join(' ')
 
@@ -1662,6 +1837,9 @@ function Row({
           }),
           row,
           index,
+          // Ctrl on Linux and Windows, ⌘ on macOS — folded here so nothing downstream has to
+          // know which platform it is on. `apply` gates the fold and the open on these.
+          { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey },
         )
       }}
     >

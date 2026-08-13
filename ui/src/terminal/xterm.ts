@@ -18,6 +18,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
+import { notify } from '@/chrome/notices'
 import { terminalKeyGate } from '@/keys/gate'
 import { terminalKeyBytes } from './keys'
 import { imeFiltered, InputGuard } from './inputRouting'
@@ -83,6 +84,18 @@ function readTheme(style: CSSStyleDeclaration): Record<string, string> {
 function metric(style: CSSStyleDeclaration, name: string, fallback: number): number {
   const parsed = Number.parseFloat(style.getPropertyValue(name))
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+/**
+ * A string the child chose, made fit to sit in one line of a toast.
+ *
+ * Control characters out and a length cap, because the only thing between an OSC 8 URI and the
+ * notice stack is this function, and the URI came from a program's output. It is shown and
+ * never parsed, never followed, and never handed to anything that could act on it.
+ */
+function oneLine(text: string): string {
+  const flat = text.replace(/[\u0000-\u001f\u007f]/g, ' ')
+  return flat.length > 120 ? `${flat.slice(0, 119)}…` : flat
 }
 
 export function createTerminal(): TerminalHandle {
@@ -157,6 +170,41 @@ export function createTerminal(): TerminalHandle {
      * theme also had to stop painting ANSI 7 and 15 near-black; see `styles/tokens.css`.
      */
     minimumContrastRatio: TERMINAL_MIN_CONTRAST,
+    /*
+     * OSC 8 hyperlinks, and the reason this option is not optional.
+     *
+     * xterm 6 registers `OscLinkProvider` in the terminal's own constructor
+     * (`CoreBrowserTerminal.ts:160`) — it is always on, it cannot be turned off, and it outranks
+     * every provider an embedder adds. When no `linkHandler` is set, clicking one of its links
+     * runs `defaultActivate` (`OscLinkProvider.ts:114`): a `confirm()` followed by
+     * `window.open()` **inside this app's own webview**.
+     *
+     * So until this line existed, any program in any pane could emit `ESC ] 8 ;; https://… ST`
+     * and a single click on the text it wrapped would navigate part of the application to a URL
+     * that program chose. Terminal output is untrusted data; that was a click-to-navigate path
+     * out of it, and nothing in this repository had ever named it.
+     *
+     * The handler refuses, and says so. Refusing *silently* was the tempting version and is the
+     * defect this project keeps finding: a link that underlines, takes a click and does nothing
+     * is indistinguishable from one wired to nothing. Opening it for real is a separate decision
+     * with a separate threat model — it would have to go through Rust and `tauri_plugin_opener`,
+     * because the JS opener command is capability-gated per window and a detached-pane window
+     * deliberately has no `opener` permission, so a JS-side open would work in the shell window
+     * and silently do nothing in a torn-out pane.
+     *
+     * `allowNonHttpProtocols` is left at its default of `false`, which is what makes
+     * `OscLinkProvider` drop `file:`, `javascript:` and everything else before it ever gets
+     * here. File paths in output are a different mechanism entirely — see `pathLinks.ts`, which
+     * resolves them against the project and opens a tab, never a URL.
+     */
+    linkHandler: {
+      activate: (_event, uri) => {
+        notify(`cide does not open web links from terminal output: ${oneLine(uri)}`, {
+          kind: 'info',
+          hint: 'Copy the address and open it in a browser.',
+        })
+      },
+    },
     cursorBlink: true,
     cursorStyle: 'block',
     scrollback: 5000,

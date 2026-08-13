@@ -1,12 +1,14 @@
 /*
- * Toasts for failed commands. See `Failures.tsx` for why they exist at all.
+ * Toasts for the outcome of a command — failed or done. See `Failures.tsx` for why they exist
+ * at all, and `notices.ts` for why one stack carries both.
  *
  * Bottom-right and above the status bar, which is the one strip of chrome that never holds
- * content the user is reading. Deliberately *not* centred over the workspace: a failure here
+ * content the user is reading. Deliberately *not* centred over the workspace: a notice here
  * is informational, and a modal treatment would interrupt a turn the user is watching.
  *
  * Every colour is a token, so both themes work. `--red` is the semantic error colour in both
- * palettes and is checked against `--panel` by `check:theme`.
+ * palettes and is checked against `--panel` by `check:theme`; `--accent` is the same for the
+ * report variant.
  */
 
 .stack {
@@ -31,11 +33,26 @@
   padding: 10px 10px 10px 12px;
   background: var(--panel);
   border: 1px solid var(--border);
-  /* The one saturated edge, so a failure reads as a failure at a glance without the whole
-     card being alarming. */
-  border-left: 3px solid var(--red);
+  /* The one saturated edge, so the kind reads at a glance without the whole card being
+     alarming. Which colour it is, is the `.failed` / `.info` pair below — the edge itself is
+     declared once here so the two variants cannot drift in width. */
+  border-left: 3px solid var(--border);
   border-radius: 6px;
   box-shadow: var(--shadow);
+}
+
+.failed {
+  border-left-color: var(--red);
+}
+
+/*
+ * A report gets the accent, not a green: the app has no semantic "success" token, and
+ * inventing one for a single edge would put a colour in `tokens.css` that nothing else could
+ * justify. The accent already means "this is cide talking" everywhere else in the chrome, and
+ * it is contrast-checked against `--panel` in both themes by `check:theme`.
+ */
+.info {
+  border-left-color: var(--accent);
 }
 
 .body {
@@ -60,6 +77,62 @@
   font-size: 11.5px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+/*
+ * The disclosure under a report. Collapsed it is one 11.5px word; open it is the commit list.
+ *
+ * `max-height` with a scroll rather than an unbounded body: ten commits at 15px is 150px,
+ * which is already a third of a short window, and a toast that grows past its own corner is
+ * worse than one that scrolls.
+ */
+.more {
+  margin: 2px 0 0;
+}
+
+.summary {
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+  cursor: pointer;
+  /* The marker is the affordance; without a list-style reset Chromium draws a bullet too. */
+  list-style: none;
+}
+
+.summary::-webkit-details-marker {
+  display: none;
+}
+
+.summary::before {
+  content: "▸ ";
+}
+
+.more[open] .summary::before {
+  content: "▾ ";
+}
+
+.summary:hover {
+  color: var(--text);
+}
+
+.summary:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+.detail {
+  margin: 4px 0 0;
+  padding: 0;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  /* Wrapped, not clipped: a commit subject is prose and the toast is 420px wide. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow-y: auto;
 }
 
 .dismiss {

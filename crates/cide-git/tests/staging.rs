@@ -16,6 +16,16 @@ use cide_ipc::git::{
 };
 use support::{Rng, TempRepo, binary_blob};
 
+/// The proxy environment these tests spawn `git` with: none at all.
+///
+/// `ProxyTarget::Untouched` resolved, which is cide's default for its own `git` children and
+/// the behaviour every one of these tests had before `ProxyScope` existed — the child gets
+/// this process's environment unaltered. Named rather than inlined as `Default::default()` so
+/// the reader of a `pull` call can see *which* of the three answers is being exercised.
+fn untouched() -> cide_core::proxy::ProxyEnv {
+    cide_core::proxy::ProxyEnv::default()
+}
+
 /// Fifteen lines, edited at line 1 and line 15: far enough apart that three lines of context
 /// leave two separate hunks, which is what the hunk-level tests are about.
 const BASE_15: &[u8] = b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\n";
@@ -927,7 +937,7 @@ fn a_local_remote_is_pushed_by_libgit2_and_https_is_shelled_out() {
     assert_eq!(push::route(&git_repo, "origin"), push::Route::Libgit2);
     drop(git_repo);
 
-    let outcome = push::push(&repo.root, None, None, true).expect("push");
+    let outcome = push::push(&repo.root, None, None, true, &untouched()).expect("push");
     assert!(!outcome.shelled_out);
     let remote_log = std::process::Command::new("git")
         .arg("--git-dir")
@@ -946,6 +956,77 @@ fn a_local_remote_is_pushed_by_libgit2_and_https_is_shelled_out() {
     drop(git_repo);
 
     let _ = std::fs::remove_dir_all(&bare);
+}
+
+/// **libgit2 never carries network traffic in cide, and this is the assertion behind that.**
+///
+/// It is load-bearing for the proxy scope, not a curiosity. `ProxyTarget` promises that
+/// cide's influence over git's proxying is entirely a matter of the child's *environment* —
+/// and that promise is only true because every remote that could reach a network forks the
+/// `git` binary. libgit2 in this process reads no proxy environment (its `lookup_proxy`
+/// returns early for `GIT_PROXY_NONE`, which is the default this crate never moves off; see
+/// `push.rs`'s module docs for the file and line), so a URL that reached the git2 route
+/// *would* be a URL cide could not scope — silently, and only for the user whose remote
+/// happened to be spelled that way.
+///
+/// So the shapes are enumerated rather than the two obvious ones being spot-checked.
+#[test]
+fn every_remote_that_could_reach_a_network_forks_the_binary() {
+    let repo = TempRepo::new("route-shapes");
+    repo.write("f.txt", b"a\n");
+    repo.commit_all("base");
+
+    // Each of these has a transport behind it that a proxy could sit in front of, or that
+    // needs an interactive credential libgit2 cannot supply.
+    let networked = [
+        ("https", "https://example.invalid/x.git"),
+        ("http", "http://example.invalid/x.git"),
+        ("ssh-url", "ssh://git@example.invalid/x.git"),
+        ("scp-like", "git@example.invalid:x.git"),
+        ("git-proto", "git://example.invalid/x.git"),
+        // A host that merely looks local is still not a path.
+        ("host-colon", "example.invalid:x.git"),
+    ];
+    for (name, url) in networked {
+        repo.git(&["remote", "add", name, url]);
+    }
+    // And the shapes that genuinely are a directory on this machine, which is the whole set
+    // libgit2 is allowed to keep.
+    for (name, url) in [
+        ("local-abs", "/srv/git/x.git"),
+        ("local-file", "file:///srv/git/x.git"),
+        ("local-rel", "../x.git"),
+    ] {
+        repo.git(&["remote", "add", name, url]);
+    }
+
+    let git_repo = git2::Repository::open(&repo.root).unwrap();
+    for (name, url) in networked {
+        assert_eq!(
+            push::route(&git_repo, name),
+            push::Route::Binary,
+            "{url} would have gone through libgit2, which reads no proxy environment — so \
+             `ProxyScope::git` would silently not apply to it"
+        );
+    }
+    for name in ["local-abs", "local-file", "local-rel"] {
+        assert_eq!(
+            push::route(&git_repo, name),
+            push::Route::Libgit2,
+            "{name} is a path on this machine; forking a process for it buys nothing"
+        );
+    }
+
+    // The fallthrough, which is what makes the list above safe to be incomplete: a URL shape
+    // nobody anticipated is *not* handed to libgit2.
+    repo.git(&["remote", "add", "novel", "quic+git://example.invalid/x.git"]);
+    let git_repo2 = git2::Repository::open(&repo.root).unwrap();
+    assert_eq!(
+        push::route(&git_repo2, "novel"),
+        push::Route::Binary,
+        "an unrecognised scheme has to fall through to the binary, or the next transport git \
+         gains is one cide cannot scope"
+    );
 }
 
 #[test]

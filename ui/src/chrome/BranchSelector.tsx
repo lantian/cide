@@ -66,6 +66,7 @@ import {
   primaryRepo,
   refusalOf,
   visibleBranches,
+  type GitOp,
   type Refusal,
 } from './branchModel'
 import styles from './BranchSelector.module.css'
@@ -102,8 +103,15 @@ interface BranchStore {
   load: (project: ProjectId | null, force?: boolean) => Promise<void>
   pick: (repo: RepoId) => void
   say: (note: string | null) => void
-  /** Run a mutation, put its message in `note`, and reload. Never throws. */
-  run: (work: () => Promise<string>) => Promise<void>
+  /**
+   * Run a mutation, put its message in `note`, and reload. Never throws.
+   *
+   * `op` is which gesture the failure belongs to, and it exists for exactly one variant:
+   * `CheckoutWouldOverwrite` is raised by *Pull* as well as by a checkout, and told to
+   * someone who pressed Pull the checkout wording reads "Switching to main would overwrite
+   * local changes" — a switch nobody asked for, to the branch they are already on.
+   */
+  run: (work: () => Promise<string>, op?: GitOp) => Promise<void>
 }
 
 /**
@@ -162,7 +170,7 @@ export const useBranches = create<BranchStore>((set, get) => ({
     set({ note })
   },
 
-  async run(work) {
+  async run(work, op = 'checkout') {
     set({ busy: true, note: null })
     try {
       const note = await work()
@@ -170,7 +178,7 @@ export const useBranches = create<BranchStore>((set, get) => ({
     } catch (error) {
       // `explain` turns the tagged wire error into a sentence. `String(error)` would print
       // `[object Object]`, which is how an action ends up looking like it did nothing.
-      set({ note: explain(error) })
+      set({ note: explain(error, op) })
     } finally {
       set({ busy: false })
       await get().load(get().project, true)
@@ -311,11 +319,11 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
    * `disabled` prop tempts you into — makes the one path where the project closes mid-click
    * into a runtime `undefined` inside an `invoke`.
    */
-  const act = (work: (project: ProjectId, repo: RepoId) => Promise<string>) => {
+  const act = (work: (project: ProjectId, repo: RepoId) => Promise<string>, op: GitOp = 'checkout') => {
     if (project === null || repo === null) return
     setMode({ kind: 'list' })
     setOpenRow(null)
-    void useBranches.getState().run(() => work(project, repo))
+    void useBranches.getState().run(() => work(project, repo), op)
   }
 
   /*
@@ -433,7 +441,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   className={styles.action}
                   // Without an upstream this only ever fails, so it is not offered.
                   disabled={busy || !canPull(list?.head ?? null)}
-                  onClick={() => act(async (p, r) => fetchNote(await branchApi.pull(p, r)))}
+                  onClick={() => act(async (p, r) => fetchNote(await branchApi.pull(p, r)), 'pull')}
                   title="Fetch and fast-forward. cide never merges for you."
                 >
                   Pull

@@ -140,3 +140,21 @@
   font-size: 11px;
   color: var(--text);
 }
+
+/* --- one readout per target --- */
+
+/*
+ * A named heading above each readout rather than a `Row` label beside it: the readout is a
+ * block of monospace lines and putting it in a `Row`'s right-hand control column would give
+ * a long proxy URL half the width it needs. Stacked, each block is as wide as the pane.
+ */
+.target + .target {
+  margin-top: 14px;
+}
+
+.targetName {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}

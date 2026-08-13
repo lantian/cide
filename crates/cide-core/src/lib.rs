@@ -21,9 +21,11 @@ pub mod child_env;
 pub mod commands;
 pub mod document;
 pub mod error;
+pub mod handshake;
 pub mod keymap;
 pub mod layout;
 pub mod persist;
+pub mod proxy;
 pub mod workspace;
 
 pub use error::{CoreError, Result};

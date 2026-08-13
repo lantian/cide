@@ -13,6 +13,10 @@
 //!   gate. It needs a display, and it needs a frontend for the binary to load — a Vite dev
 //!   server on :1420 for the debug profile, a built `ui/dist` for `--release`. See
 //!   `BENCH.md`.
+//! * `verify-cli`         — check that the installed `claude` still completes the IDE
+//!   handshake, and that `SUPPORTED_CLI` records the version that did. **Not a CI gate** and
+//!   must never be added to one: it needs the CLI installed and a working login. See
+//!   [`verify_cli`].
 //! * `package`            — preflight the Linux packaging and print the plan; `--write`
 //!   regenerates the Flatpak files and `--check` gates them. It builds nothing unless asked
 //!   with `--run`. See `package.rs` and `docs/adr/0007`.
@@ -39,6 +43,9 @@ cargo xtask <task>
 Tasks:
   codegen [--check]        regenerate ui/src/ipc/generated.ts from cide-ipc
   contract-check [--write] diff the live command/event surface against contract/*.json
+  verify-cli [--no-build]  check that the installed `claude` still speaks the IDE protocol
+                             and that SUPPORTED_CLI records it. Spawns the real CLI under a
+                             pty; no model turn, so it costs nothing. Not a CI gate.
   bench-ipc [--release]    measure IPC throughput (M0 GO/NO-GO gate). Builds cide-app,
             [--no-build]     runs it under CIDE_BENCH=1, prints the report and fails on
                              NO-GO. Needs a display. The debug profile also needs the Vite
@@ -87,6 +94,9 @@ fn main() -> ExitCode {
         "codegen" => flags(&rest, &["--check"]).and_then(|f| codegen(f.contains("--check"))),
         "contract-check" => {
             flags(&rest, &["--write"]).and_then(|f| contract_check(f.contains("--write")))
+        }
+        "verify-cli" => {
+            flags(&rest, &["--no-build"]).and_then(|f| verify_cli(!f.contains("--no-build")))
         }
         "bench-ipc" => flags(&rest, &["--release", "--no-build"])
             .and_then(|f| bench_ipc(f.contains("--release"), !f.contains("--no-build"))),
@@ -653,6 +663,159 @@ fn bench_verdict(report: &str) -> Option<Verdict> {
     })
 }
 
+/// The marker `real_cli.rs` prints so this task can read the verdict off an ordinary test run.
+const VERIFY_MARKER: &str = "VERIFY-CLI:";
+
+/// Check that the installed `claude` still speaks the IDE protocol, and that
+/// `SUPPORTED_CLI` records the version that proved it.
+///
+/// # Why this is a task and not just a test
+///
+/// The assertion belongs in a `#[test]`: the handshake needs a WebSocket client, a `script(1)`
+/// pty, the diff broker and the process-group reaping that `tests/real_cli.rs` already
+/// contains, and re-implementing that here would be a second copy of the most fragile code in
+/// the repository.
+///
+/// But *telling a developer* "run `cargo test -p cide-ide-mcp -- --ignored` and then edit
+/// `protocol.rs:45`" is not a gate. This repository has already made that argument once, about
+/// this exact shape: `bench_ipc` used to `bail!` with the command to type, and the note on it
+/// says why that was changed — "that is not a gate — it fails identically on a fast machine
+/// and a slow one". Same here. So the front door does the preflight, drives the test, and
+/// prints the one-line edit the outcome asks for.
+///
+/// # It must never be added to `ci.yml`
+///
+/// `.github/workflows/ci.yml` says `--ignored` "is deliberately NOT passed, and must not be
+/// added", and this needs the same three things a CI runner does not have: the CLI installed,
+/// a logged-in account, and network access. Unlike its neighbour in that file it needs no
+/// money — the test types no prompt and calls no model — but the first three are enough.
+///
+/// # What it does *not* do
+///
+/// It does not edit `protocol.rs`. The whole point of `SUPPORTED_CLI` is that a version is in
+/// it because somebody looked at the evidence; a task that appended the version automatically
+/// would restore exactly the property this work removed — a record nothing produced.
+fn verify_cli(build: bool) -> anyhow::Result<()> {
+    let root = workspace_root()?;
+
+    // Preflight first, so an absent CLI costs a second rather than a full test build, and is
+    // reported as itself rather than as a mysterious skip buried in test output.
+    let Some(claude) = on_path("claude") else {
+        bail!(
+            "no `claude` on PATH. This task checks the installed CLI against the protocol \
+             this build transcribes; without one there is nothing to check."
+        );
+    };
+    if on_path("script").is_none() {
+        bail!(
+            "no `script(1)` on PATH. The CLI only opens an IDE connection from its \
+             interactive UI — a `-p` run opens no socket at all — so the check needs a pty, \
+             and `script` is how it gets one."
+        );
+    }
+    eprintln!("xtask: using {}", claude.display());
+    if let Some(version) = probe_version(&claude) {
+        // Printed before the run, so a hang has a version attached to it in the scrollback.
+        eprintln!("xtask: `claude --version` says {version}");
+    }
+
+    let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cargo.current_dir(&root).args([
+        "test",
+        "-p",
+        "cide-ide-mcp",
+        "--test",
+        "real_cli",
+        "the_installed_cli_is_one_this_build_has_checked",
+        "--",
+        "--ignored",
+        "--nocapture",
+        // One at a time: the test spawns a real `claude` that writes a lockfile into the
+        // user's `~/.claude/ide`, and two of those racing for the same directory is the one
+        // way this can fail for a reason that is about the harness.
+        "--test-threads=1",
+    ]);
+    if !build {
+        // `--no-run` would defeat the point; this only skips the *rebuild* by relying on
+        // whatever is already compiled, which is what a developer iterating wants.
+        cargo.env("CARGO_INCREMENTAL", "1");
+    }
+
+    // stderr to a file rather than a pipe, and stdout inherited: the test's own narration —
+    // which version connected, what the transcript said — is the part a human reads live,
+    // while the marker line has to be recoverable afterwards. A pipe would have to be drained
+    // concurrently or the child blocks once the buffer fills.
+    let log = root.join("target").join("verify-cli.out");
+    fs::create_dir_all(log.parent().unwrap_or(&root))?;
+    let sink = fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
+    let tee = sink.try_clone()?;
+
+    let status = cargo
+        .stdout(Stdio::from(sink))
+        .stderr(Stdio::from(tee))
+        .status()
+        .context("running the real-CLI check")?;
+
+    let output = fs::read_to_string(&log).with_context(|| format!("reading {}", log.display()))?;
+    print!("{output}");
+
+    let verdict = verify_verdict(&output);
+    match verdict.as_deref() {
+        Some(line) => eprintln!("xtask: {line}"),
+        // The marker is printed before any assertion fires, so its absence means the test did
+        // not reach the point of having an opinion — a compile failure, a panic in setup, a
+        // harness that never ran it. That is a failed check, not a passed one. Silence is the
+        // answer `bench_ipc` used to give by accident, and it is the same mistake here.
+        None => bail!(
+            "the run produced no `{VERIFY_MARKER}` line — see {}. The check never reached a \
+             verdict, which is not the same as passing it.",
+            log.display()
+        ),
+    }
+
+    if !status.success() {
+        bail!(
+            "the installed CLI did not pass. The failure message above names the exact edit; \
+             full output in {}.",
+            log.display()
+        );
+    }
+    eprintln!("xtask: full output written to {}", log.display());
+    Ok(())
+}
+
+/// The last `VERIFY-CLI:` line of a run, which is the verdict.
+///
+/// Last rather than first, so a rerun in the same log answers about the rerun.
+fn verify_verdict(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rfind(|line| line.trim_start().starts_with(VERIFY_MARKER))
+        .map(|line| line.trim().to_string())
+}
+
+/// The first `program` on `PATH`.
+///
+/// The same three lines as the four copies in the real-CLI tests. Not shared with them: this
+/// crate is not in that dependency graph and adding it to one so a preflight can find a binary
+/// would be the wrong direction for four lines.
+fn on_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `claude --version`, for the preflight line only. The verdict comes off the wire.
+fn probe_version(claude: &Path) -> Option<String> {
+    let output = Command::new(claude).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Run the M0 GO/NO-GO gate: build the app, run it under `CIDE_BENCH=1`, judge the report.
 ///
 /// This used to `bail!` with the command to type. That is not a gate — it fails identically
@@ -800,6 +963,62 @@ fn bench_ipc(release: bool, build: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verdict parser, which is the only part of `verify-cli` that has a rule in it.
+    ///
+    /// Everything else in that task is preflight and process handling; this is where a
+    /// mistake would be silent, because the failure mode is answering `None` for a run that
+    /// did produce a verdict — which `verify_cli` correctly reports as a failure, so the
+    /// silent half is the *other* direction: reading a stale verdict from an earlier run in
+    /// the same log and calling the check passed.
+    #[test]
+    fn the_last_verdict_line_wins_and_absence_is_not_a_pass() {
+        assert_eq!(verify_verdict(""), None);
+        assert_eq!(
+            verify_verdict("running 1 test\nsome narration\ntest result: ok\n"),
+            None,
+            "a run that never reached a verdict has not passed one"
+        );
+
+        // A rerun appended to the same log: the second answer is the one about this run.
+        let log = "VERIFY-CLI: handshake=ok version=2.1.227 range=2.1.224–2.1.227 verdict=verified\n\
+                   ... a later run ...\n\
+                   VERIFY-CLI: handshake=ok version=2.1.231 range=2.1.224–2.1.227 verdict=newer\n";
+        assert_eq!(
+            verify_verdict(log).as_deref(),
+            Some("VERIFY-CLI: handshake=ok version=2.1.231 range=2.1.224–2.1.227 verdict=newer")
+        );
+
+        // `--nocapture` output arrives indented under the test harness's own framing.
+        assert_eq!(
+            verify_verdict("    VERIFY-CLI: skipped=no-claude-on-path\n").as_deref(),
+            Some("VERIFY-CLI: skipped=no-claude-on-path")
+        );
+
+        // The broken-handshake cell still produces a line, because the test prints it before
+        // it panics — a failing run is exactly the one with something to do about it.
+        assert_eq!(
+            verify_verdict("VERIFY-CLI: handshake=broken version=unknown\n").as_deref(),
+            Some("VERIFY-CLI: handshake=broken version=unknown")
+        );
+    }
+
+    /// The marker is one string in two crates, and a rename in either is silent: the test
+    /// stops being parsed and `verify_cli` reports "no verdict" for a run that produced one.
+    #[test]
+    fn the_marker_is_the_one_the_test_prints() {
+        let source = fs::read_to_string(
+            workspace_root()
+                .expect("a workspace root")
+                .join("crates/cide-ide-mcp/tests/real_cli.rs"),
+        )
+        .expect("the real-CLI test is readable");
+        assert!(
+            source.contains(&format!("const VERDICT_MARKER: &str = \"{VERIFY_MARKER}\";")),
+            "`{VERIFY_MARKER}` is not what tests/real_cli.rs prints, so verify-cli would \
+             report every run as verdictless"
+        );
+    }
 
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()

@@ -42,7 +42,27 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub const CURRENT_SCHEMA: u32 = 1;
+    /// # 1 → 2: the proxy scope
+    ///
+    /// Bumped when [`crate::ProxyScope`] arrived, and **not** because serde would have failed
+    /// without it — `ProxySettings` carries `#[serde(default)]`, so a schema-1 document
+    /// deserialises perfectly well and gets `ProxyScope::default()`, which is by construction
+    /// exactly what schema 1 meant.
+    ///
+    /// The bump is for the day after. `Default` is the answer for a *fresh install*, and the
+    /// whole point of the scope is that somebody will eventually want a fresh install to
+    /// default to something narrower. On that day, a defaulted field silently re-scopes every
+    /// existing user's live proxy configuration — a corporate laptop's `git push` moves onto
+    /// cide's proxy, or off it, because of a constant edited for an unrelated reason, with no
+    /// diff on anyone's disk to explain it. `persist::migrate` therefore *writes* the scope
+    /// into the document, so what an upgraded user has is a fact on disk rather than a
+    /// consequence of a constant.
+    ///
+    /// This is the first migration this ladder has ever run, and it is what
+    /// `serde_json`'s `preserve_order` feature was turned on for: without it a migrated
+    /// document goes through a `serde_json::Value` whose object keys are sorted, and
+    /// `projects` insertion order **is** the header tab order.
+    pub const CURRENT_SCHEMA: u32 = 2;
 }
 
 impl Default for Workspace {

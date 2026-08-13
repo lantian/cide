@@ -36,6 +36,14 @@ export interface DetachedPaneWindowProps {
    * without `CLAUDE_CODE_SSE_PORT` would bind to whichever lockfile it happened to find.
    */
   project?: string | undefined
+  /**
+   * The project's roots and the open gesture, for file links in this pane's output.
+   *
+   * Passed through untouched, exactly like `cwd` and `project`: a detached pane is the same
+   * pane, and a path printed in it means the same file it would have meant in the tab.
+   */
+  roots?: readonly string[] | undefined
+  onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
   /** Put the pane back in its home tab and close this window. */
   onRedock?: (() => void) | undefined
 }
@@ -63,6 +71,8 @@ export function DetachedPaneWindow({
   pane,
   cwd,
   project,
+  roots,
+  onOpenPath,
   onRedock,
 }: DetachedPaneWindowProps): ReactNode {
   // A pane can only be detached after it has spawned, so this is the state that should not
@@ -111,7 +121,13 @@ export function DetachedPaneWindow({
             {orphaned ? (
               <p className={styles.orphan}>This pane has no session. Redock it to start one.</p>
             ) : (
-              <TerminalPane pane={pane} cwd={cwd} project={project} />
+              <TerminalPane
+                pane={pane}
+                cwd={cwd}
+                project={project}
+                roots={roots}
+                onOpenPath={onOpenPath}
+              />
             )}
           </PaneFrame>
         </div>
