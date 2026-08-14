@@ -18,6 +18,12 @@ key: string,
 command: string, 
 /**
  * Context expression, e.g. `terminalFocused && !overlayOpen`. `None` means always.
+ *
+ * Skipped when absent, and that is about the *file* rather than the wire: Settings →
+ * Keymap rewrites `keymap.json` whole on every edit, and without this every entry a user
+ * had hand-written would come back decorated with `"when": null, "args": null`. The wire
+ * is unaffected — `ts-rs` types this from the Rust type, not from the serde attribute, so
+ * `codegen --check` stays green and the frontend still reads `when` as `string | null`.
  */
 when: string | null, 
 /**

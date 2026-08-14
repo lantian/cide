@@ -6,7 +6,7 @@
  * That shell is a *search* surface: a full-width field, a match counter, a scrolling list and a
  * footer of hints, docked 96px from the top of the window because a list needs the height. This
  * takes one short number and shows at most one sentence, and a 620px card with nine characters in
- * it reads as a dialog that failed to load. `chrome/ProjectSwitcher.module.css` already made this
+ * it reads as a dialog that failed to load. `chrome/Switcher.module.css` already made this
  * exact call for the Ctrl+Tab popup — its header says "deliberately *not* the 620px
  * `OverlayCard`" — and the geometry here is that one's, with a scrim added back.
  *

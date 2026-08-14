@@ -406,13 +406,72 @@ fn build() -> Vec<Command> {
         Command::new("tab.close", "Close tab", WINDOW).when("closableTab"),
         Command::new("tab.next", "Next tab", WINDOW).when("multipleTabs"),
         Command::new("tab.prev", "Previous tab", WINDOW).when("multipleTabs"),
+        /*
+         * The *tab* switcher, and the same split the Project group makes one screen down: an
+         * immediate walk along the strip (`tab.next` / `tab.prev`, positional) and a
+         * held-modifier walk in most-recently-used order (these two). Ctrl+Tab is the second
+         * one, which is what every browser and every IDE means by that chord.
+         *
+         * It walks **tabs**, not files, and the title says so. The pinned Claude console, a
+         * `ClaudeFull` tab, a file tab, a diff tab and the settings tab all live in one `Vec`,
+         * and excluding the console would make the most common return trip in this app — from
+         * the file you were reading back to the conversation about it — the one thing Ctrl+Tab
+         * could not do. `tab.console` below is the direct route to the same place.
+         *
+         * `multipleTabs` and `shellWindow`. The strip lives in the shell window; a detached-tab
+         * window shows exactly one tab and a detached-pane window shows none, and activating a
+         * tab from either would move the *shell* window's active tab — the latent issue
+         * `tab.next` / `tab.prev` above still have, which is worth naming and is not this
+         * change's to fix. The default bindings carry `shellWindow` as well, so the chord is not
+         * merely inert in those windows, it is not taken from them at all.
+         */
+        Command::new(
+            "tab.switcher.next",
+            "Switch tab (most recently used)",
+            WINDOW,
+        )
+        .when("shellWindow && multipleTabs")
+        .keywords(&["mru", "recent", "cycle", "file", "buffer"]),
+        Command::new(
+            "tab.switcher.prev",
+            "Switch tab (least recently used)",
+            WINDOW,
+        )
+        .when("shellWindow && multipleTabs")
+        .keywords(&["mru", "recent", "cycle", "file", "buffer"]),
+        /*
+         * Ctrl+1 — the pinned console, by name rather than by position.
+         *
+         * The id is `tab.console` and not `tab.select.1`, because **ids are API**: a user's
+         * `keymap.json` names them and they are never renamed. `tabs[0]` is a stable identity
+         * that Rust enforces — `open_tab` refuses a second `ClaudeHome` and `close_tab` refuses
+         * index 0 — so "the Claude console" is a thing this command can honestly promise, where
+         * "tab 1" would be a position. If Ctrl+2..9 ever ship they arrive as `tab.select.2..9`
+         * beside this, with nothing renamed.
+         *
+         * `shellWindow && projectOpen`: the console belongs to a project, and the tab strip
+         * belongs to the shell window. The handler re-checks both — a clause gates the palette
+         * and never the keyboard — and it goes through `revealPane`, so the gesture ends with
+         * the caret in the prompt rather than in whatever the user was typing in.
+         */
+        Command::new("tab.console", "Go to Claude console", WINDOW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["home", "chat", "prompt", "agent", "first"]),
         // Project. Two families, and the split is the point rather than duplication.
         //
-        // The *switcher* is Ctrl+Tab: hold the modifier, tab through a popup in
-        // most-recently-used order, release to commit. That is what the user asked for by
-        // name, and `keymap::defaults` carries the argument for why the hold is not optional.
-        // Running it from the palette holds no modifier, so it degenerates to "switch to the
-        // most recently used project" — one keystroke, terminating, and the titles say so.
+        // The *switcher* is Ctrl+` — the key left of `1`, which is what a keyboard reports as
+        // `Backquote` on every layout: hold the modifier, walk a popup in most-recently-used
+        // order, release to commit. It was Ctrl+Tab until the tab switcher above took that
+        // chord, and `keymap::defaults` carries both the move and the argument for why the hold
+        // is not optional. Running it from the palette holds no modifier, so it degenerates to
+        // "switch to the most recently used project" — one keystroke, terminating, and the
+        // titles say so.
+        //
+        // `project.switcher.prev` ships **unbound**: its natural reverse chord,
+        // `ctrl+shift+backquote`, is already `terminal.splitBelow`. It is reachable from the
+        // palette, and — the way a user will actually reach it — by holding Shift while the
+        // popup is up, because the switcher's capture owns its own opening key for as long as
+        // it is open. See `keys/switcher.ts::capture`.
         Command::new(
             "project.switcher.next",
             "Switch project (most recently used)",
@@ -641,6 +700,29 @@ fn build() -> Vec<Command> {
         Command::new("navigate.definition", "Go to definition", NAVIGATE)
             .when("editorFocused")
             .keywords(&["declaration", "jump", "resolve", "symbol", "source"]),
+        /*
+         * Find usages — IDEA's Alt+F7. (M14)
+         *
+         * A command of its own rather than a mode of the one above, and the separation is
+         * load-bearing rather than tidy. **Ctrl+click** is the combined gesture: it asks the server
+         * where the thing under the pointer is declared and, if the answer is "right here", lists
+         * usages instead of jumping. That discriminator is a heuristic — `fn fmt` inside
+         * `impl Display for Foo` resolves to the *trait's* `fn fmt`, so Ctrl+click on it jumps
+         * rather than listing — and a heuristic needs an escape hatch that skips it entirely.
+         * This id is that hatch, and it is why guessing wrong costs one keystroke rather than
+         * leaving the user with no way to ask the question they meant.
+         *
+         * It also works from a *reference*, unlike the click's declaration branch: LSP answers
+         * references from any occurrence, so Alt+F7 on a call site lists the call's siblings.
+         *
+         * `editorFocused` and nothing weaker, like every other member of this group.
+         */
+        Command::new("navigate.usages", "Find usages", NAVIGATE)
+            .when("editorFocused")
+            // "references" is what the protocol calls it, "callers" and "uses" are what a person
+            // types, and none of the five title/id scoring tiers reaches "Find usages" from any
+            // of them.
+            .keywords(&["references", "callers", "uses", "who", "used", "search"]),
         // Back / Forward — the mouse's thumb buttons, and the only two commands in this group
         // that are *not* `editorFocused`.
         //
@@ -734,6 +816,27 @@ fn build() -> Vec<Command> {
         Command::new("settings.keymap", "Open keyboard shortcuts", VIEW).when("projectOpen"),
         // The rail and its sidebar exist in the shell window only; a detached pane has none.
         Command::new("sidebar.files", "Show files sidebar", VIEW).when("shellWindow"),
+        /*
+         * F4 — hide the left panel, or bring back the last one that was open.
+         *
+         * The *hidden* state has existed since M3 and shipped reachable by mouse only: clicking
+         * the lit rail button already sets the view to `null`, `ActivityRail::active` has always
+         * been nullable, all four panel branches are `view === '…' &&` guards and the splitter
+         * is withheld with them. There was no command, no binding and no palette row — the
+         * sixteenth instance of this project's signature defect, and the only new *behaviour*
+         * here is remembering which panel to restore.
+         *
+         * `shellWindow` alone. Hiding the panel is meaningful with no project open (the tree is
+         * empty and the workspace still wants the width), which is why this matches
+         * `sidebar.files` above rather than the `&& projectOpen` its neighbours carry.
+         *
+         * The settings view counts as *closed*, because it is: ⚙ opens a workspace tab and has
+         * no panel, so F4 with it lit opens the last real panel and un-lights the gear. Treating
+         * it as open would make the key look broken exactly once per session.
+         */
+        Command::new("sidebar.toggle", "Toggle the left panel", VIEW)
+            .when("shellWindow")
+            .keywords(&["hide", "show", "close", "panel", "explorer", "collapse"]),
         // `repoOpen` used to be half of this clause, which is why the palette could not even
         // open the Git sidebar — the row that would have let a user *look* at the repository
         // was hidden by the same permanently-false flag as the commands that act on it.
@@ -986,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn the_switcher_owns_ctrl_tab_and_the_header_walk_stays_registered_and_unbound() {
+    fn the_switchers_own_their_chords_and_the_header_walk_stays_registered_and_unbound() {
         // Two families that answer different questions, and the way this goes wrong is that
         // one of them quietly becomes unreachable. So both halves are pinned here.
         for id in [
@@ -999,16 +1102,48 @@ mod tests {
             assert_eq!(command.when.as_deref(), Some("multipleProjects"), "{id}");
             assert_eq!(command.unavailable, None, "{id} must be runnable");
         }
+        for id in ["tab.switcher.next", "tab.switcher.prev"] {
+            let command = by_id(id).unwrap_or_else(|| panic!("{id} is registered"));
+            assert_eq!(
+                command.when.as_deref(),
+                Some("shellWindow && multipleTabs"),
+                "{id}"
+            );
+            assert_eq!(command.unavailable, None, "{id} must be runnable");
+        }
 
-        let bound: Vec<String> = crate::keymap::defaults()
+        /*
+         * The *whole* tab-keyed set, exactly, and that exactness is the point.
+         *
+         * The mistake this closes is adding `ctrl+backquote → project.switcher.next` while
+         * forgetting to delete the `ctrl+tab` line: two keys naming one command is not a
+         * conflict, `the_default_keymap_has_no_conflicts` stays green, and nothing else in this
+         * workspace notices that Ctrl+Tab is still the project switcher. Pinning the list rather
+         * than asserting a membership is what makes the deletion verifiable.
+         */
+        let on_tab: Vec<String> = crate::keymap::defaults()
             .iter()
             .filter(|b| b.key.contains("tab"))
             .map(|b| b.command.clone())
             .collect();
         assert_eq!(
-            bound,
-            ["project.switcher.next", "project.switcher.prev"],
-            "Ctrl+Tab is the held-modifier switcher; the header walk is palette-only"
+            on_tab,
+            ["tab.switcher.next", "tab.switcher.prev"],
+            "Ctrl+Tab is the tab switcher and nothing else is bound on that key"
+        );
+
+        // …and the key the project switcher moved to, from the other side. `backquote` is what
+        // the browser reports for the key left of `1`; the table writes the literal, and
+        // `normalize_key` renames nothing, so this looks for the literal.
+        let on_backquote: Vec<String> = crate::keymap::defaults()
+            .iter()
+            .filter(|b| b.key.ends_with('`'))
+            .map(|b| b.command.clone())
+            .collect();
+        assert_eq!(
+            on_backquote,
+            ["terminal.splitBelow", "project.switcher.next"],
+            "Ctrl+` switches project, one Shift away from splitting a terminal below"
         );
     }
 

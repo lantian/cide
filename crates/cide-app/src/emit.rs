@@ -206,6 +206,47 @@ pub fn fs_status(app: &AppHandle, project: cide_ipc::ProjectId, status: &cide_ip
     }
 }
 
+// --- the keymap ---------------------------------------------------------------------------
+
+/// The user's keybindings changed. Sent to **every** window after Settings → Keymap writes.
+///
+/// # Why this is not `workspace_changed`
+///
+/// The keymap is not in the workspace. `app_get_bootstrap` resolves it from
+/// `~/.config/cide/keymap.json` on every call, which is what makes a hand-edited file take
+/// effect in the next window that hydrates for any reason at all — and there are three dozen
+/// reasons. But `store/workspace.ts::applySnapshot` builds `{ ...current, workspace }`, so it
+/// keeps the *old* `keymap` array: `cide://workspace-changed`, the one thing already broadcast
+/// to every window, is precisely the path that cannot refresh a binding. Without this event a
+/// rebind reaches the window that made it and no other, and the second window keeps the old
+/// chord until something makes it hydrate — which is the "my keybinding does nothing, with no
+/// visible cause" failure `cide_core::keymap` exists to prevent, arriving a window later.
+///
+/// Carries the whole resolved table rather than a signal to re-fetch, on `workspace_changed`'s
+/// own argument: it is a few kilobytes, the round trip is already paid for, and a window that
+/// answered by re-reading would be resolving a file that may have changed again. The array
+/// identity matters as much as its contents — `keys/gate.ts` caches its indexed keymap against
+/// the identity of what `bindings()` returns, so a fresh array is what makes it rebuild.
+///
+/// No `rev`: the keymap is not the tree, and a revision here would make every window
+/// re-hydrate its whole workspace because somebody changed a shortcut.
+pub const KEYMAP_CHANGED: &str = "cide://keymap-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeymapChanged {
+    keymap: Vec<cide_ipc::ResolvedBinding>,
+}
+
+pub fn keymap_changed(app: &AppHandle, keymap: &[cide_ipc::ResolvedBinding]) {
+    let payload = KeymapChanged {
+        keymap: keymap.to_vec(),
+    };
+    if let Err(error) = app.emit(KEYMAP_CHANGED, payload) {
+        tracing::debug!(%error, "keymap broadcast reached no window");
+    }
+}
+
 // --- git events ---------------------------------------------------------------------------
 
 /// The changes tree for one project was recomputed.

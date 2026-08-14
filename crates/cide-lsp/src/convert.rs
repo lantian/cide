@@ -257,6 +257,50 @@ mod tests {
     }
 }
 
+/// One `Location`, whole, in cide's units: 1-based lines, 1-based UTF-16 columns.
+///
+/// The end is carried because two callers need it and neither can reconstruct it. `probe` compares
+/// the caret against the returned range to decide *"is the caret already on the declaration"*, and
+/// a usage row selects the occurrence it sends you to rather than poking a bare caret at it. The
+/// end used to be thrown away here — see [`location`], which still does, deliberately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loc {
+    pub path: PathBuf,
+    pub line: u32,
+    pub column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+}
+
+/// One `Location` value — not an array — in cide's units.
+///
+/// Every dead end is a `None`: a missing `uri`, a URI naming no local file, a missing `range` (what
+/// a `LocationLink` looks like from here), or a number that does not fit a `u32`.
+fn one_location(one: &serde_json::Value) -> Option<Loc> {
+    let path = uri_to_path(one.get("uri")?.as_str()?)?;
+    let range = one.get("range")?;
+    // 0-based on the wire, 1-based everywhere in cide. The column stays a UTF-16 code-unit offset
+    // for the reason the module header gives — the consumer is CodeMirror.
+    let point = |at: &serde_json::Value| -> Option<(u32, u32)> {
+        let line = u32::try_from(at.get("line")?.as_u64()?)
+            .ok()?
+            .wrapping_add(1);
+        let column = u32::try_from(at.get("character")?.as_u64()?)
+            .ok()?
+            .wrapping_add(1);
+        Some((line, column))
+    };
+    let (line, column) = point(range.get("start")?)?;
+    let (end_line, end_column) = point(range.get("end")?)?;
+    Some(Loc {
+        path,
+        line,
+        column,
+        end_line,
+        end_column,
+    })
+}
+
 /// One `Location` from a `textDocument/definition` reply, in cide's units.
 ///
 /// # Why this parses `Value` rather than taking an `lsp_types::Location`
@@ -271,26 +315,50 @@ mod tests {
 /// `LocationLink`. This reads `range` only and does not look at `targetSelectionRange`; if that
 /// capability is ever flipped, this function is the second place that has to change, and
 /// `the_handshake_declares_what_the_client_actually_does` is the test that says so.
+///
+/// Deliberately still `(path, line, column)` and not a [`Loc`]. Go to definition puts a *bare
+/// caret* on the target and says why (`goToDefinition.ts`: the meaning of a definition's `range.end`
+/// varies by server — rust-analyzer sends the whole item for some kinds and the name for others),
+/// so widening this return would hand every caller an end that only one of them may believe.
 pub fn location(value: &serde_json::Value) -> Option<(PathBuf, u32, u32)> {
-    // `Location[]` — take the first. A server may offer several (a trait method with many impls);
-    // picking the first is what an editor with no disambiguation UI can honestly do, and it is
-    // what the caller's comment about "one answer" depends on.
+    let one = first_location(value)?;
+    Some((one.path, one.line, one.column))
+}
+
+/// The first `Location` of a `Location | Location[] | null` reply, end included.
+///
+/// A server may offer several (a trait method with many impls); picking the first is what an editor
+/// with no disambiguation UI can honestly do, and it is what the caller's comment about "one
+/// answer" depends on.
+pub fn first_location(value: &serde_json::Value) -> Option<Loc> {
     let one = if value.is_array() {
         value.as_array()?.first()?
     } else {
         value
     };
-    let path = uri_to_path(one.get("uri")?.as_str()?)?;
-    let start = one.get("range")?.get("start")?;
-    // 0-based on the wire, 1-based everywhere in cide. The column stays a UTF-16 code-unit offset
-    // for the reason the module header gives — the consumer is CodeMirror.
-    let line = u32::try_from(start.get("line")?.as_u64()?)
-        .ok()?
-        .wrapping_add(1);
-    let column = u32::try_from(start.get("character")?.as_u64()?)
-        .ok()?
-        .wrapping_add(1);
-    Some((path, line, column))
+    one_location(one)
+}
+
+/// Every `Location` of a `textDocument/references` reply.
+///
+/// # Why the failures are per-location here and whole-reply in [`location`]
+///
+/// A definition has one answer, so a shape we cannot read means "no answer" and the honest result
+/// is `None`. A references reply is a *list*, and rust-analyzer routinely mixes `rust-analyzer://`
+/// targets (a macro expansion, a std item with no local source) into a list of perfectly ordinary
+/// files. Failing the batch on one of those would turn "41 usages, one of them in a place you
+/// cannot open" into "no usages", which is the confident-empty-list failure the whole diagnostics
+/// surface is built to avoid. So each entry is dropped on its own and the rest ship.
+///
+/// `null` and `[]` are **not** the same and the caller must keep them apart: `null` is "there is no
+/// symbol under the caret", `[]` is "this symbol is used nowhere". `None` here means the first;
+/// `Some(vec![])` means the second.
+pub fn locations(value: &serde_json::Value) -> Option<Vec<Loc>> {
+    if value.is_null() {
+        return None;
+    }
+    let array = value.as_array()?;
+    Some(array.iter().filter_map(one_location).collect())
 }
 
 #[cfg(test)]
@@ -352,5 +420,47 @@ mod location_tests {
                        "end": { "line": 1, "character": 2 } },
         });
         assert!(location(&value).is_none());
+    }
+
+    #[test]
+    fn the_first_location_carries_the_end_the_triple_throws_away() {
+        // What the declaration-or-reference discriminator runs on. Without the end there is no
+        // containment test and the whole gesture falls back to guessing.
+        let one = first_location(&loc(41, 8)).expect("parsed");
+        assert_eq!((one.line, one.column), (42, 9));
+        assert_eq!((one.end_line, one.end_column), (42, 13));
+    }
+
+    #[test]
+    fn a_references_reply_of_null_is_not_an_empty_list() {
+        // The distinction the popup's two sentences are built on. `null` is "there is no symbol
+        // under the caret"; `[]` is "this symbol is used nowhere". Collapsing them tells a user
+        // who clicked a keyword that their function is unused.
+        assert!(locations(&json!(null)).is_none());
+        assert_eq!(locations(&json!([])), Some(Vec::new()));
+    }
+
+    #[test]
+    fn one_unreadable_location_does_not_lose_the_whole_list() {
+        // rust-analyzer mixes `rust-analyzer://` targets into an otherwise ordinary list when a
+        // usage sits inside a macro expansion. Failing the batch would turn "41 usages" into "no
+        // usages", which is the confident-empty-list failure this crate exists to avoid.
+        let value = json!([
+            loc(0, 0),
+            { "uri": "rust-analyzer:///std/vec.rs",
+              "range": { "start": { "line": 1, "character": 1 },
+                         "end": { "line": 1, "character": 2 } } },
+            loc(9, 4),
+        ]);
+        let rows = locations(&value).expect("a list");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1].line, 10);
+    }
+
+    #[test]
+    fn a_references_reply_that_is_not_a_list_at_all_is_no_answer() {
+        // A server answering with a bare object where the spec says `Location[] | null`. Reading
+        // it as an empty list would print "used nowhere" about a reply we did not understand.
+        assert!(locations(&loc(1, 1)).is_none());
     }
 }

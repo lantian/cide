@@ -19,12 +19,12 @@
 use std::fmt;
 use std::path::Path;
 
-use cide_ipc::{Binding, KeymapLayer, ResolvedBinding};
+use cide_ipc::{Binding, KeymapEdit, KeymapLayer, ResolvedBinding};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{CoreError, Result};
+use crate::{CoreError, Result, persist};
 
 /// One keystroke: a set of modifiers plus a key name.
 ///
@@ -156,29 +156,6 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+w", "tab.close"),
         ("ctrl+s", "file.save"),
         ("ctrl+shift+t", "theme.toggle"),
-        // Switching projects, asked for by name: "a hotkey with default CTRL+TAB to switch
-        // between opened projects" — and then, when asked whether the cycle should be header
-        // order or most-recently-used, answered precisely: "most-recently-used, but until
-        // CTRL is pressed and pressing TAB twice - should follow to iteration between whole
-        // list".
-        //
-        // That is the Windows / IDEA / browser switcher and nothing else: **hold** Ctrl, and
-        // the popup that appears selects the previously used project, so one press-and-release
-        // is the two-item toggle everyone expects; each further Tab with Ctrl still down walks
-        // one further down the whole MRU list; the release commits.
-        //
-        // An earlier round shipped header order here, and its stated reason was that this gate
-        // resolves on keydown and has no key-up path, so MRU without a hold would degenerate
-        // into a toggle between two projects with the third unreachable for ever. The premise
-        // was right and the conclusion was the wrong way round: the fix is the hold, not a
-        // different order. It is built — `ui/src/keys/switcher.ts` is the walk, and the
-        // release is watched by a modifier latch that resolves no chords, so the gate is still
-        // keydown-only at both of its entry points.
-        //
-        // `project.next` / `project.prev` still exist and still walk the header strip. They
-        // are simply not what Ctrl+Tab means any more.
-        ("ctrl+tab", "project.switcher.next"),
-        ("ctrl+shift+tab", "project.switcher.prev"),
         // Pull, asked for by name: "need hotkey CTRL+T for git pull".
         //
         // # What it costs, precisely
@@ -212,9 +189,14 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+alt+k", "pane.navigate.up"),
         ("ctrl+alt+j", "pane.navigate.down"),
         ("ctrl+comma", "settings.open"),
-        // M12. `ctrl+f12` is IDEA's own File Structure chord, and no f-key is bound anywhere else
-        // in this workspace; `ctrl+alt+shift+n` is free in every layer (`ctrl+shift+n` is
-        // `claude.split.newSession`, and the two normalise to different keys).
+        // M12. `ctrl+f12` is IDEA's own File Structure chord; `ctrl+alt+shift+n` is free in every
+        // layer (`ctrl+shift+n` is `claude.split.newSession`, and the two normalise to different
+        // keys).
+        //
+        // This comment used to claim that no f-key was bound anywhere else in this workspace.
+        // `f4` is, in the `when`-carrying block below, and the claim is kept here as a *pointer*
+        // rather than deleted: `f3` and `shift+f3` are still the find bar's and still forbidden
+        // outright by `nothing_binds_the_find_bars_f_keys`.
         ("ctrl+f12", "structure.file"),
         ("ctrl+alt+shift+n", "picker.symbols"),
         // The mouse's thumb buttons, as keys. (M12)
@@ -258,9 +240,18 @@ pub fn defaults() -> Vec<Binding> {
     ]
     .into_iter()
     .map(|(key, command)| Binding::new(key, command))
-    // Bindings that carry a `when`, and the first ones in this table that do.
+    // Bindings that carry a `when`, and the only ones in this table that do.
     //
-    // # Why these two need a clause when nothing above does
+    // Two different reasons live in this block and mixing them up would be easy, so they are
+    // named once here. `editorFocused` (the M12 group) is about *taking a key away from a
+    // terminal*: the gate is a window capture listener, so an unscoped chord is swallowed in
+    // every pane in every window, and `ctrl+b` is tmux's prefix and `ctrl+g` is readline's
+    // abort. `shellWindow` (the M14 group) is about *a window that has nowhere to put the
+    // gesture*: a detached pane or tab window has no rail, no sidebar and no project strip, and
+    // `App.tsx` installs the gate before it branches on the role — so without the clause those
+    // chords are swallowed there in exchange for a diagnostic log line.
+    //
+    // # Why alt+up / alt+down need a clause when nothing above does
     //
     // `alt+up` / `alt+down` are IDEA's *Previous/Next Method*. Unconditionally bound they would
     // also fire in a terminal pane, where the gesture would move a caret the user cannot see —
@@ -294,6 +285,29 @@ pub fn defaults() -> Vec<Binding> {
             // On macOS `platform_layer` rewrites this to ⌘B, which is IDEA's mac binding for the
             // same action — correct by luck rather than by exception, but correct.
             ("ctrl+b", "navigate.definition", "editorFocused"),
+            /*
+             * Find usages — IDEA's own chord, unchanged. (M14)
+             *
+             * # What it costs, checked rather than assumed
+             *
+             * * **In `defaults()`**: nothing else uses an F-key but `f4` (the panel toggle), and
+             *   nothing else uses Alt with one. Free.
+             * * **In CodeMirror**: `defaultKeymap`, `historyKeymap`, `searchKeymap` and
+             *   `closeBracketsKeymap` bind no F-key above F3, and none of them binds Alt with an
+             *   F-key at all. Free.
+             * * **In xterm**: F7 encodes as `ESC [ 18 ~` and Alt+F7 as `ESC ESC [ 18 ~`, so this
+             *   *is* a byte a terminal application could want — `mc` puts its menu bar on the F
+             *   keys. Which is exactly why the clause below is not optional.
+             *
+             * `editorFocused`, for the reason `ctrl+b` above states at length: the gate is a
+             * window **capture** listener, so an unscoped chord is swallowed in every terminal
+             * pane in every window, for a command that needs a caret to mean anything. With the
+             * clause, a terminal keeps Alt+F7 and the buffer gets Find usages.
+             *
+             * macOS: `platform_layer` rewrites Ctrl to Meta and leaves Alt alone, so this stays
+             * ⌥F7 — which is IDEA's mac binding for the same action, correctly and by luck.
+             */
+            ("alt+f7", "navigate.usages", "editorFocused"),
             // Go to line, on IDEA's and VS Code's chord for it.
             //
             // # What it costs, named rather than discovered later
@@ -324,6 +338,121 @@ pub fn defaults() -> Vec<Binding> {
             // platform exception here would need a matching one in `keeps_ctrl_on_macos` and
             // would be the only entry in that list not justified by the OS eating the chord.
             ("ctrl+g", "navigate.line", "editorFocused"),
+            /*
+             * M14. Ctrl+Tab is the **tab** switcher, and this is a move rather than an addition:
+             * `project.switcher.next` / `.prev` were bound here and are not any more.
+             *
+             * The user asked for both — "ctrl+tab over opened files", "ctrl+~ for projects" —
+             * and the second half is what makes the first possible. Ctrl+Tab means "the thing
+             * inside this window" in every browser and every IDE, and projects are the outer
+             * ring; putting the inner ring on the chord everyone's fingers already know is the
+             * whole point of the swap.
+             *
+             * **A user's `keymap.json` needs no migration and gets what they asked for**, by
+             * two different mechanisms depending on what they wrote. `apply_layer` overrides on
+             * (normalised key, normalised `when`), and this default now carries a clause, so a
+             * user line naming `ctrl+tab` with no clause does not replace it — the two coexist,
+             * which is deliberate and correct here: within a layer stack the *last applicable*
+             * binding wins, the user's layer is last, and their unconditional line therefore
+             * beats this one in a shell window and is the only one that applies anywhere else.
+             * They keep the project switcher on Ctrl+Tab, the tab switcher is unreachable by key
+             * for them, and `conflicts` reports nothing, because the two clauses differ.
+             *
+             * The one case that changes under such a user is an *unbind* of the old default. A
+             * removal matches on (key, command, `when`), so a line unbinding
+             * `project.switcher.next` from `ctrl+tab` now matches nothing: it is reported as
+             * `RemovalMatchedNothing` in Settings → Keymap, and Ctrl+Tab starts running the tab
+             * switcher they never asked for. That is the release note.
+             *
+             * `shellWindow`, unlike the unconditional binding this replaces. The strip is the
+             * shell window's; a detached-pane window has no tabs and a detached-tab window has
+             * one, and there activating a tab would move the *shell* window's active tab. With
+             * the clause the chord is not merely inert in those windows, it is left alone — and
+             * Tab in a torn-out terminal goes back to being Tab.
+             */
+            ("ctrl+tab", "tab.switcher.next", "shellWindow"),
+            ("ctrl+shift+tab", "tab.switcher.prev", "shellWindow"),
+            /*
+             * Ctrl+` — the project switcher, on the key left of `1`.
+             *
+             * **`backquote`, never the literal tilde**, and this is the whole of why the request
+             * for "ctrl+~" is not spelled the way it was asked for. `ui/src/keys/chords.ts`
+             * derives a stroke from `KeyboardEvent.code` first, and that key is `Backquote` on
+             * every layout whatever `key` reports — `` ` `` unshifted, `~` with Shift on a US
+             * layout, something else elsewhere. `normalize_key` here deliberately renames no
+             * keys, and the frontend's alias table folds `` ` ``, `tilde` and `grave` onto
+             * `backquote`. So a binding written as the literal tilde would normalise to a key
+             * that `strokeFromEvent` can never produce: silently inert, which is the exact
+             * failure `chords.ts` exists to prevent. (`~` has been added to that alias table, so
+             * a user who writes what the request said still gets what they meant.)
+             *
+             * Two more reasons the literal is wrong even if it worked: it requires Shift, so the
+             * *whole walk* would be a Ctrl+Shift hold; and the capture reads Shift as the walk's
+             * direction, so a shifted opener would collide with its own reverse.
+             *
+             * # What it costs, measured
+             *
+             * The pty: **nothing**. xterm encodes a control byte for plain Ctrl only for
+             * keyCodes 65-90, 32, 51-55, 56, 219, 220 and 221; Backquote is 192 and is not in
+             * that set. CodeMirror: nothing — no `Mod-` backquote binding exists in any of the
+             * installed keymaps. The keymap: nothing — no default used the unshifted key.
+             *
+             * What it does cost is legibility, and it is written here rather than discovered:
+             * Ctrl+` switches project while Ctrl+Shift+` splits a terminal below, which are
+             * unrelated acts one Shift apart. And Ctrl+` is VS Code's toggle-terminal chord, so
+             * somebody arriving from there will press it expecting a panel.
+             *
+             * `project.switcher.prev` gets no chord of its own: `ctrl+shift+backquote` is taken
+             * by `terminal.splitBelow`, and moving a shipped binding nobody complained about to
+             * make room is a worse trade than leaving the reverse to the palette — and to Shift
+             * *during* the walk, which the capture claims for as long as the popup is up. That
+             * shadows `terminal.splitBelow` for the few hundred milliseconds Ctrl is held, which
+             * is the same trade `ctrl+shift+tab` has always made.
+             */
+            ("ctrl+`", "project.switcher.next", "shellWindow"),
+            /*
+             * Ctrl+1 — the pinned Claude console.
+             *
+             * Free in every layer, measured rather than assumed: no default binds any digit;
+             * xterm's plain-Ctrl encode set does not contain keyCode 49, so no byte is taken
+             * from any shell; and no `@codemirror` package binds a `Mod-` digit anywhere.
+             *
+             * **Ctrl+2..9 are deliberately not shipped.** They are the browser convention and
+             * they read consistently with this one, and all three arguments against them are
+             * real: the user asked for one chord and not a family; `tabs[1..]` are positional
+             * and shift under the user as tabs open and close, where `tabs[0]` is an identity
+             * Rust enforces; and Ctrl+3..8 are *not* free — they encode ESC, FS, GS, RS, US and
+             * DEL — so the family would cost every terminal in every window six control codes
+             * for a gesture nobody asked for. The precedents diverge too: IDEA uses Alt+1..9 for
+             * tool windows and has no Ctrl+digit tab selection at all.
+             */
+            ("ctrl+1", "tab.console", "shellWindow"),
+            /*
+             * F4 — hide the left panel, or bring back the last one that was open.
+             *
+             * Free in every layer: `ctrl+f12` above is the only other f-key in this table,
+             * CodeMirror binds no `F4` in any installed keymap, and Alt+F4 belongs to the
+             * compositor while bare F4 is untouched by it.
+             *
+             * # What it costs a terminal, precisely
+             *
+             * xterm *encodes* F4: bare, it sends `ESC O S`, and modified `ESC [ 1 ; m S`. That
+             * is a real key to `mc` (Edit), to `htop` (Filter) and to any curses TUI, and the
+             * gate is a window capture listener — so this binding takes those bytes from every
+             * pane in the shell window, unconditionally. The same trade `ctrl+t` makes above,
+             * and the same escape hatch pays for it: one line of `keymap.json` naming `f4` with
+             * a leading `-` on the command gives F4 back, and the `when` has to be repeated on
+             * that line or the removal matches nothing.
+             *
+             * `when("!terminalFocused")` was the obvious alternative and it loses for the reason
+             * `ctrl+t` states by name: it would make the hotkey dead exactly where a
+             * terminal-centric app puts the user's hands. `shellWindow` is the clause that earns
+             * its place — a detached-pane window has no rail and no sidebar, ever.
+             *
+             * macOS needs no exception: `ctrl_to_meta` only rewrites chords containing `ctrl`,
+             * so a bare f-key passes through untouched.
+             */
+            ("f4", "sidebar.toggle", "shellWindow"),
         ]
         .into_iter()
         .map(|(key, command, when)| Binding::new(key, command).when(when)),
@@ -374,14 +503,28 @@ fn platform_layer(macos: bool) -> Vec<Binding> {
 /// Chords that stay on `ctrl` even on macOS.
 ///
 /// The blanket ctrl→meta rewrite is right for `⌘P`, `⌘S` and the rest, and wrong for exactly
-/// one thing: **Tab**. `⌘⇥` is the system application switcher — macOS consumes it before any
-/// app sees it — so rewriting `ctrl+tab` there would not move the binding, it would delete
-/// it, and Ctrl+Tab is what switches tabs on macOS in Safari, Chrome and VS Code anyway. This
-/// is the whole exception list; it is a function rather than a `const` array so the rule is
-/// stated where the reason is.
+/// two keys, both for the same reason: **macOS eats the ⌘ spelling itself**, so rewriting
+/// would not move the binding, it would delete it.
+///
+/// * **Tab.** `⌘⇥` is the system application switcher, consumed before any app sees it. Ctrl+Tab
+///   is what switches tabs on macOS in Safari, Chrome and VS Code anyway.
+/// * **Backquote.** `⌘\`` is *move focus to the next window in this application* and `⇧⌘\`` the
+///   previous one — a system shortcut in the same class. That covers both defaults on this key:
+///   `project.switcher.next` and `terminal.splitBelow`.
+///
+/// This is the whole exception list; it is a function rather than a `const` array so the rule is
+/// stated where the reason is. The key names are matched as `parse_chord` produces them, which
+/// means the *written* spelling: `normalize_key` deliberately renames no keys, so a binding
+/// written with a literal backtick has key `` ` `` and one written `backquote` has key
+/// `backquote`. Both are listed rather than one of them being assumed, because the table above
+/// uses the literal and a rewrite that missed it would be silent.
 fn keeps_ctrl_on_macos(key: &str) -> bool {
     parse_chord(key)
-        .map(|chords| chords.iter().any(|chord| chord.key == "tab"))
+        .map(|chords| {
+            chords
+                .iter()
+                .any(|chord| matches!(chord.key.as_str(), "tab" | "`" | "backquote"))
+        })
         .unwrap_or(false)
 }
 
@@ -543,6 +686,245 @@ pub fn load_user(path: &Path) -> Result<Vec<Binding>> {
     Ok(serde_json::from_str(&text)?)
 }
 
+// --- editing the user layer ----------------------------------------------------------------
+//
+// Everything below turns a gesture on the Settings → Keymap screen into entries in
+// `keymap.json`. It is here rather than in `cide-app` for the reason the whole crate exists:
+// it is arithmetic over a `Vec<Binding>`, it needs no filesystem and no `AppHandle`, and the
+// traps it has to avoid are already pinned by tests a few hundred lines down.
+//
+// # The three rules that decide every function here
+//
+// 1. **The file is a diff.** Defaults are compiled in, so an edit writes what the user
+//    *changed* and never what the resolved table currently says. A screen that saved its own
+//    contents would freeze today's defaults into the user's file for ever.
+// 2. **One gesture is usually two entries.** Moving a command off a default chord needs a
+//    removal on the old key and an add on the new one; leaving the removal out binds the
+//    command twice, and `conflicts` then reports a conflict the editor itself manufactured.
+// 3. **A removal matches on (key, command, `when`) — all three.** So the `when` written into a
+//    removal has to be the one the binding being removed actually carries. It is copied from
+//    the resolved binding rather than reconstructed, because a reconstructed one that differs
+//    by a word matches nothing, changes nothing, and reports `RemovalMatchedNothing` to a user
+//    who is looking at a screen that says the key is now free.
+//
+// The fourth rule is a consequence of the first three: **strip before you append**. Within a
+// layer duplicates deliberately coexist (see the module note), so appending an override on top
+// of the user's own earlier override leaves both alive and produces a `Conflict`. Every editor
+// below therefore removes the user entries it supersedes first, and only then works out what
+// the layers underneath still need suppressing.
+
+/// What one [`apply_edit`] did to the user layer.
+///
+/// Counted rather than inferred from the file's length, because the interesting outcome is the
+/// one where nothing happened: a *Restore default* that matched no entry — the `when` trap
+/// above, arriving through the reset door — looks exactly like a successful one on screen
+/// unless the answer says `removed: 0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EditOutcome {
+    /// Entries deleted from the user's file.
+    pub removed: usize,
+    /// Entries appended to it, removals included.
+    pub added: usize,
+}
+
+/// Apply one edit to a user layer, in place.
+///
+/// Pure: `user` goes in as the file's parsed contents and comes out as what should be written
+/// back. Nothing here touches the disk, so the whole surgery is testable without one — the
+/// same split `cide_app::cmd::settings::apply_patch` already makes.
+pub fn apply_edit(user: &mut Vec<Binding>, edit: &KeymapEdit) -> EditOutcome {
+    match edit {
+        KeymapEdit::ResetAll => {
+            let removed = user.len();
+            user.clear();
+            EditOutcome { removed, added: 0 }
+        }
+        KeymapEdit::Reset { command, when } => EditOutcome {
+            removed: strip(user, command, when.as_deref()),
+            added: 0,
+        },
+        KeymapEdit::Unbind { command, when } => {
+            let removed = strip(user, command, when.as_deref());
+            // Nothing kept: every key the layers below still put this command on has to be
+            // taken away, or "unbound" would mean "unbound unless a default says otherwise".
+            let added = suppress(user, command, when.as_deref(), None);
+            EditOutcome { removed, added }
+        }
+        KeymapEdit::Rebind { command, when, key } => {
+            // Taking, not just counting: the entry being replaced may carry `args`, and the
+            // replacement below has to carry them forward. See `strip_taking`.
+            let taken = strip_taking(user, command, when.as_deref());
+            let removed = taken.len();
+            let args = taken.into_iter().find_map(|binding| binding.args);
+            let target = normalize_key(key);
+            let mut added = suppress(user, command, when.as_deref(), Some(&target));
+
+            // Asked of the resolution rather than of `defaults()`, and after the removals have
+            // been appended, so this reads the table as it will actually be. When the answer is
+            // yes the file gets no entry at all: rebinding a command back onto its own default
+            // chord *is* a reset, and writing the default in would freeze it.
+            let when = normalize_when(when.as_deref());
+            let standing = resolve(user)
+                .into_iter()
+                .any(|r| r.key == target && r.command == *command && r.when == when);
+            if !standing {
+                user.push(Binding {
+                    key: target,
+                    command: command.clone(),
+                    when,
+                    args,
+                });
+                added += 1;
+            }
+            EditOutcome { removed, added }
+        }
+    }
+}
+
+/// May this batch of edits be written over a `keymap.json` that could not be parsed?
+///
+/// Only **Reset all**, on its own. A file with a stray comma — or with the `//` comment a user
+/// assumed was legal, this being VS Code's *shape* and not its JSONC parser — reads as *no
+/// overrides*, so applying an ordinary edit to it and saving would replace everything the user
+/// had written with the one line they just recorded, and report success. Refusing is the only
+/// honest answer, and *Reset all* is the exception because it is the one gesture that already
+/// means "throw away what is in there" — which also makes it the way out for a user who would
+/// rather not go and find the file.
+///
+/// A predicate rather than three lines inside the command handler, because a rule that lives
+/// in a handler is a rule no test can reach.
+pub fn may_replace_unreadable(edits: &[KeymapEdit]) -> bool {
+    edits == [KeymapEdit::ResetAll]
+}
+
+/// Delete every user entry aimed at (`command`, `when`) — adds and removals alike.
+///
+/// Matches on the *target* command, so the `-picker.files` removal an earlier rebind wrote is
+/// dropped alongside the `picker.files` add that came with it. That pairing is why *Restore
+/// default* is a deletion and not a write: the two entries together are what a rebind is, and
+/// removing both is what lets the compiled-in default reappear underneath.
+fn strip(user: &mut Vec<Binding>, command: &str, when: Option<&str>) -> usize {
+    strip_taking(user, command, when).len()
+}
+
+/// [`strip`], but hands back what it removed.
+///
+/// Exists so a rebind can **carry the old entry's `args` forward**. `strip` deletes the whole
+/// binding and the replacement used to be pushed with `args: None`, so a hand-authored
+/// `{"key":"ctrl+alt+o","command":"file.reveal","args":{"path":"…"}}` — a shape `dispatch.ts`
+/// documents by name and really does honour — came back on the new chord with its payload gone.
+/// The binding still existed and quietly did something else, which is worse than losing it: the
+/// user sees their command on the key they chose and no sign that half of it was dropped.
+fn strip_taking(user: &mut Vec<Binding>, command: &str, when: Option<&str>) -> Vec<Binding> {
+    let when = normalize_when(when);
+    let mut taken = Vec::new();
+    user.retain(|binding| {
+        let hit =
+            binding.target_command() == command && normalize_when(binding.when.as_deref()) == when;
+        if hit {
+            taken.push(binding.clone());
+        }
+        !hit
+    });
+    taken
+}
+
+/// Append the removals that take (`command`, `when`) off every key the layers below still put
+/// it on, except `keep`.
+///
+/// Call **after** [`strip`], never before: it asks `resolve` what is standing, and a user entry
+/// for the same command that has not been stripped yet would answer for the defaults.
+///
+/// The key each removal names is the one `resolve` reports, which is already normalised — the
+/// third rule at the top of this section, applied to the other half of the identity. Writing
+/// the key the *caller* typed would work for every chord a user spells canonically and fail
+/// silently for the ones they do not.
+fn suppress(
+    user: &mut Vec<Binding>,
+    command: &str,
+    when: Option<&str>,
+    keep: Option<&str>,
+) -> usize {
+    let when = normalize_when(when);
+    let mut keys: Vec<String> = Vec::new();
+    for binding in resolve(user) {
+        if binding.command != command || binding.when != when {
+            continue;
+        }
+        if Some(binding.key.as_str()) == keep || keys.contains(&binding.key) {
+            continue;
+        }
+        keys.push(binding.key);
+    }
+
+    let added = keys.len();
+    for key in keys {
+        user.push(Binding {
+            key,
+            command: format!("-{command}"),
+            when: when.clone(),
+            args: None,
+        });
+    }
+    added
+}
+
+/// Write the user layer to `path`, keeping the previous contents beside it as `.bak`.
+///
+/// # What this does to a file somebody wrote by hand
+///
+/// It reflows it. The vector is re-serialised with `to_vec_pretty`, so indentation, line
+/// breaks and key order inside each entry become serde's rather than the author's, and any
+/// field `Binding` does not know about — a `"note"` a user added to remind themselves why —
+/// is gone, because it was never parsed. Entry *order* survives, and has to: `apply_layer`
+/// walks the file in sequence and a removal only matches what is already accumulated, so
+/// rebuilding the file from a sorted or regrouped copy would change what it means.
+///
+/// The `.bak` is the honest answer to the reflow rather than an apology for it. It is written
+/// before every save, not once, so the copy is always the state immediately before the last
+/// edit — the thing a user actually wants back when a click did something they did not expect.
+/// Through [`persist::write_atomic`] as well, so the backup gets the same 0600 and the same
+/// crash safety as the file it is protecting.
+///
+/// # Two things it changes about the file itself, both deliberate
+///
+/// * **The mode becomes 0600.** `write_atomic` publishes by renaming a private temp file over
+///   the target, and the mode travels with the inode. For a file that may hold nothing more
+///   secret than `ctrl+t` that is stricter than it needs to be; it is also the one part of
+///   that function nobody should be re-deciding per call site, which is exactly why it is
+///   `pub` (read its doc comment for the 0644 leak that made it so).
+/// * **A symlink is followed, not replaced.** `keymap.json` symlinked into a dotfiles
+///   repository is how a hand-authored one usually gets onto a machine, and a plain rename
+///   would quietly replace the link with a regular file and strand the repository copy. So an
+///   existing path is canonicalised first and the write lands on the real file. Canonicalising
+///   only when the file exists, because the fresh-install case is precisely the one where
+///   there is nothing to resolve.
+pub fn save_user(path: &Path, bindings: &[Binding]) -> Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    if let Ok(previous) = std::fs::read(&target) {
+        // A failed backup is not a reason to refuse the edit — the user asked for a keybinding,
+        // not for a backup — but it is worth a line, because the next paragraph of the UI
+        // promises the file is there.
+        if let Err(error) = persist::write_atomic(&backup_path(&target), &previous) {
+            tracing::warn!(%error, "keymap.json backup could not be written");
+        }
+    }
+
+    let mut json = serde_json::to_vec_pretty(bindings)?;
+    // A trailing newline, because this is a file a user reads and edits in the editor of their
+    // choice, and half of them will append to it.
+    json.push(b'\n');
+    persist::write_atomic(&target, &json)
+}
+
+/// `keymap.json` → `keymap.json.bak`, beside it.
+fn backup_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
 /// Groups resolved bindings that fight over the same keystroke in the same context.
 ///
 /// Bindings whose `when` clauses differ are not in conflict; that is the mechanism by which
@@ -558,6 +940,35 @@ pub fn conflicts(resolved: &[ResolvedBinding]) -> Vec<Conflict> {
         // The same command bound twice on one key is redundant, not contested.
         if !commands.contains(&binding.command) {
             commands.push(binding.command.clone());
+        }
+    }
+
+    // An UNSCOPED binding applies everywhere, so it contests every scoped binding on the same
+    // key rather than sitting in a group beside it.
+    //
+    // Grouping by `(key, when)` alone cannot see that: `when: None` and `when: Some("shellWindow")`
+    // are two different tuples, so a user who bound a command to F4 with no context got no
+    // conflict reported at all — while the gate's last-applicable-wins quietly took the panel
+    // toggle away. The keymap editor exists to prevent exactly that, and it was the one collision
+    // it could not see.
+    //
+    // Folded in afterwards rather than by widening the key, because the scoped groups are still
+    // the right *report*: the user wants to be told which context they are contesting.
+    let unscoped: Vec<(String, Vec<String>)> = groups
+        .iter()
+        .filter(|((_, when), _)| when.is_none())
+        .map(|((key, _), commands)| (key.clone(), commands.clone()))
+        .collect();
+    for (key, commands) in unscoped {
+        for ((other_key, when), scoped) in groups.iter_mut() {
+            if when.is_none() || *other_key != key {
+                continue;
+            }
+            for command in &commands {
+                if !scoped.contains(command) {
+                    scoped.push(command.clone());
+                }
+            }
         }
     }
 
@@ -920,7 +1331,15 @@ mod tests {
             "pane.navigate.down",
             "settings.open",
             "project.switcher.next",
-            "project.switcher.prev",
+            // M14. `project.switcher.prev` was in this list and is deliberately gone: its
+            // reverse chord `ctrl+shift+backquote` is `terminal.splitBelow`, so it ships
+            // palette-only and is reached by holding Shift during a walk. Listing it here
+            // would be asserting a binding that does not exist.
+            "tab.switcher.next",
+            "tab.switcher.prev",
+            "tab.console",
+            "sidebar.toggle",
+            "navigate.usages",
         ] {
             assert!(
                 resolved.iter().any(|r| r.command == command),
@@ -1130,24 +1549,147 @@ mod tests {
     }
 
     #[test]
-    fn the_macos_layer_leaves_ctrl_tab_alone() {
-        // `⌘⇥` is the system app switcher: macOS never delivers it, so rewriting this one
-        // would silently *remove* project switching on the platform rather than move it.
+    fn the_macos_layer_leaves_ctrl_tab_and_ctrl_backquote_alone() {
+        // Both keys are eaten by macOS in their ⌘ spelling — `⌘⇥` is the application switcher
+        // and `⌘\`` / `⇧⌘\`` walk an application's windows — so rewriting either would
+        // silently *remove* the switcher on that platform rather than move it.
         let resolved = resolve_layers(&platform_layer(true), &[]);
-        assert_eq!(
-            command_for(&resolved, "ctrl+tab"),
-            ["project.switcher.next"]
-        );
+        assert_eq!(command_for(&resolved, "ctrl+tab"), ["tab.switcher.next"]);
         assert_eq!(
             command_for(&resolved, "ctrl+shift+tab"),
-            ["project.switcher.prev"]
+            ["tab.switcher.prev"]
         );
         assert!(
             command_for(&resolved, "meta+tab").is_empty(),
             "nothing may be bound to the macOS application switcher"
         );
+
+        assert_eq!(
+            command_for(&resolved, "ctrl+`"),
+            ["project.switcher.next"],
+            "⌘` is macOS's own next-window shortcut, so the project switcher keeps ⌃"
+        );
+        assert_eq!(
+            command_for(&resolved, "ctrl+shift+`"),
+            ["terminal.splitBelow"],
+            "and its neighbour on the same physical key keeps ⌃ for the same reason"
+        );
+        for eaten in ["meta+`", "shift+meta+`"] {
+            assert!(
+                command_for(&resolved, eaten).is_empty(),
+                "{eaten} is a macOS window shortcut and must stay unbound"
+            );
+        }
+
         // And the exception is narrow: everything else still moves to ⌘.
         assert_eq!(command_for(&resolved, "meta+w"), ["tab.close"]);
+        assert_eq!(command_for(&resolved, "meta+1"), ["tab.console"]);
+    }
+
+    /// F4 is the panel toggle, and the one-line escape hatch the README prints actually works.
+    ///
+    /// The binding costs every terminal pane in the shell window the `ESC O S` xterm sends for
+    /// F4 — a real key to `mc`, `htop` and any curses TUI — and the whole justification for
+    /// making that trade is that a user can take it back. An escape hatch nobody exercises is a
+    /// claim, so this exercises it, including the `when`, which is the half a user will leave
+    /// out: removal matches on (key, command, `when`), so the unscoped line reads correctly and
+    /// does nothing.
+    ///
+    /// `f3` is asserted beside it because the two are one key apart and `f3` is find-next inside
+    /// the editor — a resolver that folded f-keys together would take the find bar's last chord.
+    #[test]
+    fn f4_toggles_the_panel_and_can_be_given_back_to_the_terminal() {
+        let shipped = resolve(&[]);
+        assert_eq!(command_for(&shipped, "f4"), ["sidebar.toggle"]);
+        assert!(command_for(&shipped, "f3").is_empty());
+
+        let scoped = resolve(&[Binding::new("f4", "-sidebar.toggle").when("shellWindow")]);
+        assert!(
+            command_for(&scoped, "f4").is_empty(),
+            "the documented one-liner has to actually give ESC O S back to the pty"
+        );
+
+        let unscoped = resolve(&[Binding::new("f4", "-sidebar.toggle")]);
+        assert_eq!(
+            command_for(&unscoped, "f4"),
+            ["sidebar.toggle"],
+            "a removal that forgets the `when` matches nothing — the README must not print it"
+        );
+    }
+
+    /// Ctrl+Tab is the tab switcher; the project switcher moved to Ctrl+` and took no migration.
+    ///
+    /// The interesting half is what happens to a `keymap.json` that already named the old
+    /// default, because that file is the reason ids are never renamed. Two lines, two outcomes,
+    /// and only one of them is a surprise:
+    ///
+    /// * a **rebind** — `ctrl+tab` naming `project.switcher.next` — overrides on (key, `when`),
+    ///   so the user keeps exactly the behaviour they configured and the tab switcher is simply
+    ///   unbound for them. No conflict, no diagnostic, nothing to migrate.
+    /// * an **unbind** — the same key with a leading `-` — matches on (key, command, `when`) and
+    ///   now matches nothing, so it is reported as `RemovalMatchedNothing` *and* Ctrl+Tab starts
+    ///   running a command they never asked for. That is the one behaviour change worth a
+    ///   release note, and it is asserted rather than described.
+    #[test]
+    fn ctrl_tab_switches_tabs_and_an_old_keymap_json_still_wins() {
+        let shipped = resolve(&[]);
+        assert_eq!(command_for(&shipped, "ctrl+tab"), ["tab.switcher.next"]);
+        assert_eq!(command_for(&shipped, "ctrl+`"), ["project.switcher.next"]);
+        assert_eq!(command_for(&shipped, "ctrl+1"), ["tab.console"]);
+        assert!(
+            command_for(&shipped, "ctrl+shift+`").contains(&"terminal.splitBelow".to_owned()),
+            "the reverse project chord is taken, which is why `.prev` ships unbound"
+        );
+
+        // The old default's `when` is `shellWindow`, and a user line with no clause is a
+        // *different* binding — so both survive and the user's, being last, wins the resolve.
+        // Asserted as the whole list rather than as "theirs is in there", because a shadowed
+        // default that still fires in some other context would be the silent half of this.
+        let rebound = resolve(&[Binding::new("ctrl+tab", "project.switcher.next")]);
+        let mut on_tab = command_for(&rebound, "ctrl+tab");
+        on_tab.sort();
+        assert_eq!(on_tab, ["project.switcher.next", "tab.switcher.next"]);
+        // ...and that IS a conflict, which this test used to assert it was not.
+        //
+        // The old assertion read "different `when`, no conflict", which is true of two *scoped*
+        // bindings and false here: the user's line carries no clause, so it applies in every
+        // context including `shellWindow`, and in a shell window Ctrl+Tab now has two applicable
+        // commands with theirs winning on layer order. A keymap editor whose whole purpose is to
+        // surface contested keys reported nothing about the one key this release moved — the
+        // user would have found the new tab switcher simply absent, with no row explaining why.
+        //
+        // Reported against the scoped group, because naming the context is what makes the report
+        // actionable: it says *where* the two overlap.
+        assert_eq!(
+            conflicts(&rebound),
+            vec![Conflict {
+                key: "ctrl+tab".to_owned(),
+                commands: vec![
+                    "tab.switcher.next".to_owned(),
+                    "project.switcher.next".to_owned()
+                ],
+                when: Some("shellWindow".to_owned()),
+            }],
+            "an unscoped user binding contests every scoped binding on the same key, and this is \
+             the release that made that reachable"
+        );
+
+        let unbound = resolve(&[Binding::new("ctrl+tab", "-project.switcher.next")]);
+        assert_eq!(
+            command_for(&unbound, "ctrl+tab"),
+            ["tab.switcher.next"],
+            "an unbind of the old command no longer matches anything"
+        );
+        let (_, diags) =
+            resolve_with_diagnostics(&[Binding::new("ctrl+tab", "-project.switcher.next")]);
+        assert!(
+            diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::RemovalMatchedNothing { command, .. }
+                    if command == "project.switcher.next"
+            )),
+            "and the user is told, in Settings → Keymap, rather than left guessing: {diags:?}"
+        );
     }
 
     #[test]
@@ -1254,6 +1796,40 @@ mod tests {
         );
     }
 
+    /// Find usages answers ⌥F7, and only where there is a caret. (M14)
+    ///
+    /// The clause is the whole test. F7 is a real byte to a terminal application — `mc` puts its
+    /// menu on the F keys — and the gate is a window *capture* listener, so an unscoped binding
+    /// would swallow ⌥F7 in every terminal pane in every window for a command that needs a caret
+    /// to mean anything. The escape hatch is asserted here for the same reason ⌃G's is: so the
+    /// README cannot print a line that matches nothing.
+    #[test]
+    fn alt_f7_finds_usages_and_only_where_a_caret_is() {
+        let shipped = resolve(&[]);
+        assert_eq!(command_for(&shipped, "alt+f7"), ["navigate.usages"]);
+        assert!(
+            shipped
+                .iter()
+                .any(|r| r.command == "navigate.usages"
+                    && r.when.as_deref() == Some("editorFocused")),
+            "unscoped, this takes ⌥F7 from every terminal in the app"
+        );
+        // Nothing else in the table wants an F-key with Alt, so nothing is being displaced.
+        assert_eq!(command_for(&shipped, "f7"), Vec::<String>::new());
+
+        let scoped = resolve(&[Binding::new("alt+f7", "-navigate.usages").when("editorFocused")]);
+        assert!(
+            command_for(&scoped, "alt+f7").is_empty(),
+            "the documented one-liner has to actually give ⌥F7 back"
+        );
+        let unscoped = resolve(&[Binding::new("alt+f7", "-navigate.usages")]);
+        assert_eq!(
+            command_for(&unscoped, "alt+f7"),
+            ["navigate.usages"],
+            "a removal that forgets the `when` matches nothing — the README must not print it"
+        );
+    }
+
     #[test]
     fn the_thumb_buttons_are_bound_here_like_any_other_key() {
         let shipped = resolve(&[]);
@@ -1352,6 +1928,624 @@ mod tests {
             Binding::new("ctrl+alt+p", "picker.files"),
         ];
         assert_eq!(conflicts(&resolve(&user)), Vec::new());
+    }
+
+    // --- editing the user layer ---------------------------------------------------------
+    //
+    // The traps these cover are the ones already documented a few hundred lines up: a removal
+    // matches on (key, command, `when`) and does nothing at all when any of the three is
+    // wrong; duplicates within a layer coexist rather than shadowing; and the file is a diff
+    // against compiled-in defaults, so anything an editor writes that is not a change is a
+    // default frozen into a user's file.
+
+    /// The one-line summary of a `keymap.json`, for asserting on its *contents* rather than
+    /// on what it resolves to. `key command when` per entry, in file order.
+    fn spell(user: &[Binding]) -> Vec<String> {
+        user.iter()
+            .map(|b| match &b.when {
+                Some(when) => format!("{} {} when {when}", b.key, b.command),
+                None => format!("{} {}", b.key, b.command),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rebinding_a_default_writes_a_removal_and_an_add_and_nothing_else() {
+        let mut user = Vec::new();
+        let outcome = apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "picker.files".into(),
+                when: None,
+                key: "ctrl+shift+o".into(),
+            },
+        );
+
+        // Two entries, and the removal first: the add is on a different key, so the order does
+        // not decide the outcome — but a file a user reads should say "take this away, put it
+        // there" in that order.
+        assert_eq!(
+            spell(&user),
+            ["ctrl+p -picker.files", "ctrl+shift+o picker.files"]
+        );
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 0,
+                added: 2
+            }
+        );
+
+        let resolved = resolve(&user);
+        assert_eq!(command_for(&resolved, "ctrl+shift+o"), ["picker.files"]);
+        assert!(
+            command_for(&resolved, "ctrl+p").is_empty(),
+            "leaving the default in place is how one command ends up bound twice"
+        );
+        assert_eq!(conflicts(&resolved), Vec::new());
+    }
+
+    #[test]
+    fn rebinding_copies_the_when_of_the_binding_it_moves() {
+        // `tab.console` carries `shellWindow`, and the clause is the whole of its manners: a
+        // detached-pane window has no tab strip, and an unscoped chord would be swallowed
+        // there for a diagnostic log line. An editor that dropped the clause would silently
+        // widen every scoped binding it touched.
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "tab.console".into(),
+                when: Some("shellWindow".into()),
+                key: "ctrl+0".into(),
+            },
+        );
+
+        assert_eq!(
+            spell(&user),
+            [
+                "ctrl+1 -tab.console when shellWindow",
+                "ctrl+0 tab.console when shellWindow",
+            ]
+        );
+
+        let resolved = resolve(&user);
+        let moved = resolved
+            .iter()
+            .find(|r| r.command == "tab.console")
+            .expect("still bound");
+        assert_eq!(moved.key, "ctrl+0");
+        assert_eq!(moved.when.as_deref(), Some("shellWindow"));
+        assert!(command_for(&resolved, "ctrl+1").is_empty());
+    }
+
+    #[test]
+    fn a_second_rebind_replaces_the_first_instead_of_stacking_on_it() {
+        // The sharp edge of "duplicates within a layer coexist": appending without stripping
+        // leaves the previous override alive, and `conflicts` then reports a fight the editor
+        // itself started. Three rebinds, two entries.
+        let mut user = Vec::new();
+        for key in ["ctrl+shift+o", "alt+o", "ctrl+alt+o"] {
+            apply_edit(
+                &mut user,
+                &KeymapEdit::Rebind {
+                    command: "picker.files".into(),
+                    when: None,
+                    key: key.into(),
+                },
+            );
+        }
+
+        assert_eq!(
+            spell(&user),
+            ["ctrl+p -picker.files", "ctrl+alt+o picker.files"]
+        );
+        let resolved = resolve(&user);
+        assert_eq!(command_for(&resolved, "ctrl+alt+o"), ["picker.files"]);
+        assert_eq!(conflicts(&resolved), Vec::new());
+    }
+
+    #[test]
+    fn rebinding_back_onto_the_default_chord_leaves_no_override_at_all() {
+        // Not "write the default in again". The default is compiled in and reappears the
+        // moment nothing in the user layer stands on it, and an entry saying `ctrl+p
+        // picker.files` would freeze *today's* default into the file — the exact failure the
+        // overrides-only format exists to avoid.
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "picker.files".into(),
+                when: None,
+                key: "ctrl+shift+o".into(),
+            },
+        );
+        let outcome = apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "picker.files".into(),
+                when: None,
+                key: "Ctrl+P".into(),
+            },
+        );
+
+        assert_eq!(user, Vec::new(), "a rebind back to the default is a reset");
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 2,
+                added: 0
+            }
+        );
+        assert_eq!(command_for(&resolve(&user), "ctrl+p"), ["picker.files"]);
+    }
+
+    #[test]
+    fn unbinding_writes_exactly_the_one_liner_the_readme_prints() {
+        // F4 costs every terminal pane in the shell window the `ESC O S` xterm sends for it,
+        // and the whole justification for that trade is a line of `keymap.json` that takes it
+        // back — including the `when`, which is the half a user leaves out. The screen has to
+        // produce that line and not the one that reads correctly and does nothing.
+        let mut user = Vec::new();
+        let outcome = apply_edit(
+            &mut user,
+            &KeymapEdit::Unbind {
+                command: "sidebar.toggle".into(),
+                when: Some("shellWindow".into()),
+            },
+        );
+
+        assert_eq!(spell(&user), ["f4 -sidebar.toggle when shellWindow"]);
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 0,
+                added: 1
+            }
+        );
+        assert!(
+            command_for(&resolve(&user), "f4").is_empty(),
+            "F4 has to actually reach the pty again"
+        );
+        let (_, diags) = resolve_with_diagnostics(&user);
+        assert!(
+            diags.is_empty(),
+            "and the removal has to match something: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unbinding_a_command_the_user_had_already_moved_leaves_one_removal() {
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "git.pull".into(),
+                when: None,
+                key: "ctrl+alt+t".into(),
+            },
+        );
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Unbind {
+                command: "git.pull".into(),
+                when: None,
+            },
+        );
+
+        // The add is gone and the default is still suppressed — not two removals, and not a
+        // removal aimed at the key the user had chosen, which would match nothing.
+        assert_eq!(spell(&user), ["ctrl+t -git.pull"]);
+        let resolved = resolve(&user);
+        assert!(command_for(&resolved, "ctrl+t").is_empty());
+        assert!(command_for(&resolved, "ctrl+alt+t").is_empty());
+    }
+
+    #[test]
+    fn reset_deletes_the_pair_and_the_default_comes_back() {
+        let mut user = vec![Binding::new("ctrl+shift+u", "some.other.command")];
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "file.save".into(),
+                when: None,
+                key: "ctrl+alt+s".into(),
+            },
+        );
+        assert_eq!(user.len(), 3);
+
+        let outcome = apply_edit(
+            &mut user,
+            &KeymapEdit::Reset {
+                command: "file.save".into(),
+                when: None,
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 2,
+                added: 0
+            }
+        );
+        assert_eq!(
+            spell(&user),
+            ["ctrl+shift+u some.other.command"],
+            "a reset touches this command's entries and nobody else's"
+        );
+        assert_eq!(command_for(&resolve(&user), "ctrl+s"), ["file.save"]);
+    }
+
+    #[test]
+    fn a_reset_that_matches_nothing_says_so() {
+        // The `when` trap arriving through the reset door. `file.save` is unconditional, so a
+        // reset scoped to a context matches none of its entries — and a screen that reported
+        // success here would be describing a file it had not changed.
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "file.save".into(),
+                when: None,
+                key: "ctrl+alt+s".into(),
+            },
+        );
+        let outcome = apply_edit(
+            &mut user,
+            &KeymapEdit::Reset {
+                command: "file.save".into(),
+                when: Some("editorFocused".into()),
+            },
+        );
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 0,
+                added: 0
+            }
+        );
+        assert_eq!(user.len(), 2, "and it changed nothing");
+    }
+
+    #[test]
+    fn reset_all_truncates_and_counts_what_it_threw_away() {
+        let mut user = vec![
+            Binding::new("ctrl+p", "-picker.files"),
+            Binding::new("ctrl+shift+o", "picker.files"),
+            Binding::new("f4", "-sidebar.toggle").when("shellWindow"),
+        ];
+        let outcome = apply_edit(&mut user, &KeymapEdit::ResetAll);
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 3,
+                added: 0
+            }
+        );
+        assert_eq!(user, Vec::new());
+        // And the compiled-in table is exactly what is left, untouched by any of it.
+        assert_eq!(resolve(&user), resolve(&[]));
+    }
+
+    #[test]
+    fn an_edit_leaves_the_users_other_lines_where_they_were() {
+        // Order in this file is semantic — `apply_layer` walks it in sequence and a removal
+        // only matches what is already accumulated — so an editor that rebuilt it from a
+        // sorted or regrouped copy would change what it means. Asserted as the whole file,
+        // in order, because "my line is still in there somewhere" is not the property.
+        let mut user = vec![
+            Binding::new("ctrl+w", "-tab.close").when("tabPinned"),
+            Binding::new("alt+z", "theme.toggle"),
+        ];
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "git.pull".into(),
+                when: None,
+                key: "ctrl+alt+p".into(),
+            },
+        );
+        assert_eq!(
+            spell(&user),
+            [
+                "ctrl+w -tab.close when tabPinned",
+                "alt+z theme.toggle",
+                "ctrl+t -git.pull",
+                "ctrl+alt+p git.pull",
+            ]
+        );
+    }
+
+    /// **Every default can be moved to a free chord without manufacturing a conflict.**
+    ///
+    /// The sweep the individual cases above are examples of. For each shipped binding: rebind
+    /// its command onto a key nothing uses, and demand three things of the result — the
+    /// command answers to the new chord and only the new chord, the old chord is free, and
+    /// `conflicts` is silent. A rebind that forgot the removal passes the first, fails the
+    /// second and reports a conflict on the third; one that dropped the `when` passes all
+    /// three for the unconditional bindings and fails for the scoped ones, which is why this
+    /// walks the whole table rather than a hand-picked binding.
+    #[test]
+    fn every_default_binding_can_be_moved_without_leaving_the_old_one_behind() {
+        for binding in defaults() {
+            let mut user = Vec::new();
+            let target = "ctrl+alt+shift+meta+F9";
+            apply_edit(
+                &mut user,
+                &KeymapEdit::Rebind {
+                    command: binding.command.clone(),
+                    when: binding.when.clone(),
+                    key: target.into(),
+                },
+            );
+
+            let resolved = resolve(&user);
+            let keys: Vec<&str> = resolved
+                .iter()
+                .filter(|r| r.command == binding.command)
+                .map(|r| r.key.as_str())
+                .collect();
+            assert_eq!(
+                keys,
+                [normalize_key(target)],
+                "{} should answer to one chord after a rebind",
+                binding.command
+            );
+            assert_eq!(
+                conflicts(&resolved),
+                Vec::new(),
+                "rebinding {} manufactured a conflict",
+                binding.command
+            );
+            let (_, diags) = resolve_with_diagnostics(&user);
+            assert!(
+                diags.is_empty(),
+                "rebinding {} wrote a removal that matched nothing: {diags:?}",
+                binding.command
+            );
+
+            // …and *Restore default* puts it back exactly as it shipped.
+            apply_edit(
+                &mut user,
+                &KeymapEdit::Reset {
+                    command: binding.command.clone(),
+                    when: binding.when.clone(),
+                },
+            );
+            assert_eq!(user, Vec::new(), "reset must empty the file it filled");
+            assert_eq!(resolve(&user), resolve(&[]));
+        }
+    }
+
+    /// Every default can be unbound, and unbinding is the only thing it does.
+    #[test]
+    fn every_default_binding_can_be_given_back_to_whatever_is_underneath() {
+        for binding in defaults() {
+            let mut user = Vec::new();
+            apply_edit(
+                &mut user,
+                &KeymapEdit::Unbind {
+                    command: binding.command.clone(),
+                    when: binding.when.clone(),
+                },
+            );
+            let resolved = resolve(&user);
+            assert!(
+                !resolved.iter().any(|r| r.command == binding.command),
+                "{} is still bound after an unbind",
+                binding.command
+            );
+            let (_, diags) = resolve_with_diagnostics(&user);
+            assert!(
+                diags.is_empty(),
+                "unbinding {} matched nothing: {diags:?}",
+                binding.command
+            );
+            // Exactly one line per unbind, so a user's file stays readable.
+            assert_eq!(user.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_command_with_no_default_is_bound_by_a_single_line() {
+        // Roughly half the registry ships unbound — `file.saveAll` among them — and those are
+        // the rows a keymap editor exists for. There is nothing underneath to suppress, so
+        // there is nothing to remove.
+        let mut user = Vec::new();
+        let outcome = apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "file.saveAll".into(),
+                when: None,
+                key: "ctrl+alt+shift+s".into(),
+            },
+        );
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 0,
+                added: 1
+            }
+        );
+        assert_eq!(spell(&user), ["ctrl+alt+shift+s file.saveAll"]);
+        assert_eq!(
+            command_for(&resolve(&user), "ctrl+alt+shift+s"),
+            ["file.saveAll"]
+        );
+    }
+
+    #[test]
+    fn a_key_is_stored_normalised_however_it_was_written() {
+        // The screen sends what the recorder captured, which is canonical — but the command is
+        // reachable from anywhere and `keymap.json` is compared on normalised keys, so an
+        // edit that stored `Shift+Ctrl+P` would produce an override that never shadows the
+        // default it was aimed at.
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "file.saveAll".into(),
+                when: None,
+                key: "Shift+CTRL+Alt+S".into(),
+            },
+        );
+        assert_eq!(spell(&user), ["ctrl+alt+shift+s file.saveAll"]);
+    }
+
+    /// The one asymmetry between the two normalisers, pinned rather than discovered.
+    ///
+    /// `normalize_key` here deliberately renames no keys, and the frontend's `chords.ts` folds
+    /// `` ` ``, `~`, `tilde` and `grave` onto `backquote`. So a chord recorded in the webview
+    /// arrives spelled `ctrl+backquote` while the default it is displacing is written
+    /// `` ctrl+` ``, and to *this* module those are two different keys. The rebind still comes
+    /// out right — the removal names the key the resolution reports, not the one the caller
+    /// typed — and this pins that, because the shape of the file is surprising enough to be
+    /// mistaken for a bug: it names both spellings.
+    #[test]
+    fn a_chord_recorded_in_the_webview_still_displaces_the_default_it_lands_on() {
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "picker.files".into(),
+                when: None,
+                key: "ctrl+backquote".into(),
+            },
+        );
+        assert_eq!(
+            spell(&user),
+            ["ctrl+p -picker.files", "ctrl+backquote picker.files"]
+        );
+
+        let resolved = resolve(&user);
+        assert!(command_for(&resolved, "ctrl+p").is_empty());
+        assert_eq!(command_for(&resolved, "ctrl+backquote"), ["picker.files"]);
+        // The project switcher is still on its own spelling of the same physical key, and
+        // this module cannot see that they are the same key. `ui/src/keys/keymapModel.ts`
+        // can, and warns before the write — which is why the warning lives there.
+        assert_eq!(
+            command_for(&resolved, "ctrl+`"),
+            ["project.switcher.next"],
+            "Rust compares written spellings; the alias table is the frontend's"
+        );
+    }
+
+    #[test]
+    fn only_a_lone_reset_all_may_overwrite_a_file_that_does_not_parse() {
+        let reset = KeymapEdit::ResetAll;
+        let rebind = KeymapEdit::Rebind {
+            command: "file.save".into(),
+            when: None,
+            key: "ctrl+alt+s".into(),
+        };
+
+        assert!(may_replace_unreadable(std::slice::from_ref(&reset)));
+        assert!(!may_replace_unreadable(&[]));
+        assert!(!may_replace_unreadable(std::slice::from_ref(&rebind)));
+        // Not even smuggled in beside one: the batch is applied to a vector that would have
+        // started empty, so the rebind's own removals would be aimed at nothing and the
+        // user's other lines would be gone.
+        assert!(!may_replace_unreadable(&[
+            KeymapEdit::ResetAll,
+            rebind.clone()
+        ]));
+        assert!(!may_replace_unreadable(&[rebind, KeymapEdit::ResetAll]));
+    }
+
+    #[test]
+    fn save_user_round_trips_through_load_user() {
+        let dir = TempDir::new();
+        let path = dir.0.join("keymap.json");
+        let mut user = Vec::new();
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "sidebar.toggle".into(),
+                when: Some("shellWindow".into()),
+                key: "f6".into(),
+            },
+        );
+        // An **unconditional** rebind beside the scoped one, and that is the half that
+        // measures anything: `when` and `args` are `Option`, and a file whose every entry
+        // happens to carry a `when` cannot tell whether the empty ones are being skipped.
+        apply_edit(
+            &mut user,
+            &KeymapEdit::Rebind {
+                command: "file.save".into(),
+                when: None,
+                key: "ctrl+alt+s".into(),
+            },
+        );
+
+        save_user(&path, &user).expect("write");
+        assert_eq!(load_user(&path).expect("read back"), user);
+
+        // No `"when": null, "args": null` on every line: this is a file people read.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains("null"),
+            "a rewritten file should stay legible:\n{text}"
+        );
+        assert!(text.ends_with("]\n"), "and end with a newline:\n{text}");
+    }
+
+    #[test]
+    fn save_user_keeps_the_previous_contents_beside_the_file() {
+        // The honest half of "saving reflows your file": whatever was there is one `mv` away.
+        let dir = TempDir::new();
+        let path = dir.write(
+            "keymap.json",
+            "[{\"key\":\"ctrl+t\",\"command\":\"-git.pull\"}]",
+        );
+        save_user(&path, &[Binding::new("f6", "sidebar.toggle")]).expect("write");
+
+        let backup = std::fs::read_to_string(dir.0.join("keymap.json.bak")).expect("backup");
+        assert_eq!(backup, "[{\"key\":\"ctrl+t\",\"command\":\"-git.pull\"}]");
+        assert_eq!(
+            load_user(&path).expect("read"),
+            vec![Binding::new("f6", "sidebar.toggle")]
+        );
+    }
+
+    #[test]
+    fn save_user_creates_the_file_and_its_directory() {
+        let dir = TempDir::new();
+        let path = dir.0.join("nested").join("keymap.json");
+        save_user(&path, &[]).expect("write into a directory that does not exist yet");
+        assert_eq!(load_user(&path).expect("read"), Vec::new());
+        assert!(
+            !dir.0.join("nested").join("keymap.json.bak").exists(),
+            "there was nothing to back up"
+        );
+    }
+
+    /// A `keymap.json` symlinked into a dotfiles repository stays a symlink.
+    ///
+    /// That arrangement is how a hand-authored keymap usually reaches a machine, and a plain
+    /// rename over the link would replace it with a regular file — leaving the repository copy
+    /// stale and the user's next `git status` clean while their edits went somewhere else.
+    #[cfg(unix)]
+    #[test]
+    fn save_user_writes_through_a_symlink_rather_than_replacing_it() {
+        let dir = TempDir::new();
+        let real = dir.write("dotfiles-keymap.json", "[]");
+        let link = dir.0.join("keymap.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        save_user(&link, &[Binding::new("f6", "sidebar.toggle")]).expect("write");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the link must survive the write"
+        );
+        assert_eq!(
+            load_user(&real).expect("read the real file"),
+            vec![Binding::new("f6", "sidebar.toggle")]
+        );
     }
 
     #[test]

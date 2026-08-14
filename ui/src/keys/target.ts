@@ -124,6 +124,25 @@ export function claudeTargetOf(boot: Bootstrap | null): { project: ProjectId; pa
   const focused = tab === null ? undefined : tab.tree.panes[tab.tree.focused]
   if (focused?.kind === 'claude') return { project: project.id, pane: focused.id }
 
+  return consolePaneOf(boot)
+}
+
+/**
+ * The project console's Claude pane — `tabs[0]`'s, unconditionally.
+ *
+ * The fallback branch of [`claudeTargetOf`], lifted out because `tab.console` (Ctrl+1) wants
+ * *only* that branch: "go to the Claude console" means the console whether or not some other
+ * Claude pane happens to have focus, where a mention means "the conversation I am in, or failing
+ * that the project's". Two questions, one of which is a special case of the other, and the way
+ * that goes wrong is a second copy of `tabs[0]` and the pane walk drifting from this one.
+ *
+ * `tabs[0]` is the pinned console by invariant — `open_tab` refuses a second `ClaudeHome`,
+ * `close_tab` refuses index 0, and `close_pane` refuses its primary pane — so the `undefined`
+ * arms below are the ones that fire only while a window has no project.
+ */
+export function consolePaneOf(boot: Bootstrap | null): { project: ProjectId; pane: PaneId } | null {
+  const project = activeProjectOf(boot)
+  if (project === null) return null
   const console = project.tabs[0]
   if (console === undefined) return null
   const pane = Object.values(console.tree.panes).find((p) => p.kind === 'claude')
@@ -172,10 +191,19 @@ export function focusedFilePath(boot: Bootstrap | null): string | null {
  *
  * # What this is the *only* honest source for
  *
- * There is no most-recently-used file here and there must not be one. `Project` carries
- * `active_tab` and nothing else — no focus history — so a "last file tab" fallback would be a
- * webview-side cache with no invalidation, which is verbatim the `repoOpen` mistake recorded at
- * the foot of this file. A tab that is not about a file answers `null`, and the handler says so.
+ * There is no most-recently-used file **here**, and there must not be one: a "last file tab"
+ * fallback in this function would be a webview-side cache with no invalidation, which is
+ * verbatim the `repoOpen` mistake recorded at the foot of this file. A tab that is not about a
+ * file answers `null`, and the handler says so.
+ *
+ * The rule is about *caches*, not about the idea of an order, and M14 drew the line where it
+ * belongs. `store/workspace.ts` now keeps a per-project tab MRU stack, and it is admissible for
+ * precisely the reason the sentence above is not: it is re-derived from **every**
+ * `cide://workspace-changed` snapshot and reconciled against `project.tabs`, over
+ * `Project::active_tab` — a field Rust writes on every open, every activation and every close.
+ * That is the invalidation this note demands. `ProjectRoot::repo`, by contrast, was a constant.
+ * Deriving a *file* answer from it here would still be wrong, because the question this function
+ * answers is "what is the tab in front of me about", which has one honest source.
  */
 export function focusedTabPath(boot: Bootstrap | null): string | null {
   const tab = activeTabOf(boot)

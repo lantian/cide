@@ -66,6 +66,8 @@ import { useContextMenu, type ContextMenuHandle, type MenuEntry } from '@/menus'
 import { copyUnavailable, pasteUnavailable, readClipboard, writeClipboard } from './clipboard'
 import { levelFor, setLevel } from './highlightLevel'
 import { goToDefinition } from './goToDefinition'
+import { findUsages } from './codeIntel'
+import { wordTargetAt } from './ctrlLink'
 import { sendLabel } from './sendToClaude'
 import { useSendToClaude } from './useSendToClaude'
 
@@ -314,6 +316,46 @@ export function useCodeMenu({
                   // 1-based line, and a 1-based UTF-16 column — `from - line.from` is already a
                   // UTF-16 offset because that is what a CodeMirror document position is.
                   goToDefinition(project, path, line.number, from - line.from + 1)
+                },
+        },
+        {
+          id: 'findUsages',
+          label: 'Find usages',
+          command: 'navigate.usages',
+          /*
+           * The mouse route for ⌥F7, and beside Go to definition on purpose: they are the two
+           * halves of what a Ctrl+click decides between, and a user who does not trust the
+           * discriminator's guess needs both named in one place.
+           *
+           * Unconditional where the buffer is in a project, exactly like its neighbour — the
+           * search runs from a reference as happily as from a declaration, so there is no
+           * precondition to test beyond having something to resolve against.
+           *
+           * `disabledReason` must **not** be set alongside `run`, for the reason the item above
+           * spells out: `menus/model.ts` resolves `run: enabled ? (entry.run ?? null) : null`, so
+           * an item carrying both looks wired and is dead.
+           */
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is nothing to resolve against'
+              : undefined,
+          run:
+            project === undefined
+              ? undefined
+              : () => {
+                  const { from } = live.state.selection.main
+                  const line = live.state.doc.lineAt(from)
+                  // The same normaliser the Ctrl gestures use, so the menu and the mouse cannot
+                  // disagree about where the word under the caret starts. `null` when the caret is
+                  // on punctuation — the popup says "the symbol" rather than refusing.
+                  const word = wordTargetAt(live, from)
+                  findUsages(
+                    project,
+                    path,
+                    line.number,
+                    from - line.from + 1,
+                    word?.text ?? null,
+                  )
                 },
         },
         { kind: 'separator' },

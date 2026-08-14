@@ -63,7 +63,21 @@ interface Claim {
   line: number
   column: number
   lines: number
+  word: WordReader | null
 }
+
+/**
+ * Reads the identifier the caret is sitting in, on demand.
+ *
+ * **A getter and not a field**, and that is the whole point: the word could ride along on every
+ * `set` like the line and column do, but `set` runs on every selection change — thirty times a
+ * second under a held arrow key, on the path this module's header goes out of its way to keep off
+ * React. Extracting a word per keystroke to answer a question asked once, when ⌥F7 fires, is the
+ * wrong way round.
+ *
+ * `null` when the caret is not in a word — whitespace, punctuation, an empty line.
+ */
+export type WordReader = () => string | null
 
 /**
  * Newest last, so the top of the stack is the editor the user is in.
@@ -81,16 +95,37 @@ export function focusedCaret(): CaretPosition | null {
 }
 
 /**
+ * The identifier the caret is in, or `null`.
+ *
+ * Find usages is the caller. ⌥F7 fires from `keys/dispatch.ts`, which has no `EditorView` and
+ * cannot get one — the same predicament [`focusedCaret`] exists for — and without a name the popup
+ * would be headed *"Usages of the symbol"* and the empty-result notice would say *"No usages
+ * found"* about nothing in particular. That is the difference between a report and a shrug.
+ *
+ * `null` is a legitimate answer and every caller must render it: a detached window holds no editor,
+ * and a caret on punctuation is in no word.
+ */
+export function focusedWord(): string | null {
+  const top = claims.at(-1)
+  if (top === undefined || top.word === null) return null
+  return top.word()
+}
+
+/**
  * Claim the slot for an editor showing `path`.
  *
  * Mounting claims it, because a freshly opened file is the one being looked at — the same rule
  * `claimStatusReadout` follows, and the two are claimed and released together.
+ *
+ * `word` is optional so a caller that has no cheap way to answer it — a fixture, a check script —
+ * still gets a working claim; [`focusedWord`] then answers `null`, which every caller already has
+ * to handle.
  */
-export function claimCaret(path: string): CaretSlot {
+export function claimCaret(path: string, word?: WordReader): CaretSlot {
   // `lines: 1` rather than 0, because "an empty document is one empty line" is CodeMirror's own
   // arithmetic and this value is read before the first `set` arrives. A 0 here would let Go to
   // line report a file with no lines in it for one frame after a split opens.
-  const claim: Claim = { path, line: 1, column: 1, lines: 1 }
+  const claim: Claim = { path, line: 1, column: 1, lines: 1, word: word ?? null }
   claims.push(claim)
 
   let released = false

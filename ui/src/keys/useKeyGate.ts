@@ -21,6 +21,7 @@ import { useEffect, useRef } from 'react'
 import { installKeyGate, mouseNavGate } from './gate'
 import { mergeContext } from './context'
 import { switcherCapture } from './switcherStore'
+import { recorderCapture } from './recorderStore'
 import { events } from '@/ipc/client'
 import type { KeyBinding, KeyContext } from './keymap'
 
@@ -56,15 +57,26 @@ export function useKeyGate(wiring: KeyGateWiring): void {
         run: (command, args) => live.current.run(command, args),
         onPending: (sequence) => live.current.onPending?.(sequence),
         /*
-         * The project switcher's claim on Tab and Escape while its popup is up.
+         * The two stateful claims on a stroke, in the one hook the gate offers.
          *
-         * Wired here rather than through `KeyGateWiring` on purpose: the switcher is global
-         * to the window and owns its own listeners (`keys/switcherStore.ts`), so a host that
-         * passes nothing gets a working gesture. Making it a prop would mean every window
-         * that installs a gate has to remember to pass it, and the one that forgot would
-         * leave a popup swallowing nothing while Tab reached the shell underneath it.
+         * Wired here rather than through `KeyGateWiring` on purpose: both are global to the
+         * window and own their own state (`keys/switcherStore.ts`, `keys/recorderStore.ts`),
+         * so a host that passes nothing gets working gestures. Making it a prop would mean
+         * every window that installs a gate has to remember to pass it, and the one that
+         * forgot would leave a popup swallowing nothing while Tab reached the shell
+         * underneath it.
+         *
+         * **The recorder first, and the order is not arbitrary.** It is modal: while Settings
+         * → Keymap is waiting for a chord it consumes every stroke, because a chord being
+         * recorded must not also run. A switcher walk cannot legitimately be open behind it —
+         * `startRecording` cancels one — so the second claim is only ever consulted when the
+         * first is closed, and `||` short-circuits to exactly that.
+         *
+         * `check-key-gate.mjs` sweeps the whole modifier × key space three times, once with
+         * nothing armed and once with each of these, and holds both of the gate's keyboard
+         * entry points to the same verdict every time.
          */
-        capture: switcherCapture,
+        capture: (stroke) => recorderCapture(stroke) || switcherCapture(stroke),
       }),
     [],
   )

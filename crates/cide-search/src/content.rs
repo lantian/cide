@@ -504,7 +504,12 @@ pub fn hits_in_text(
 /// never point past the text that ships. The cost is that a match beyond the clip is not
 /// reported at all — which is the honest outcome: a hit at column 40 000 of a minified bundle
 /// cannot be shown, and reporting it with a range the panel cannot use would be worse.
-fn clip(line: &str, max: usize) -> &str {
+/// The first `max` bytes of `line`, cut back to a `char` boundary.
+///
+/// Public because Find usages needs the *same* clip a search hit gets: both ship a source line to
+/// the same row renderer, and two definitions of "a few hundred bytes of a line" would be two
+/// places for the byte offsets that index into it to be computed against a different string.
+pub fn clip(line: &str, max: usize) -> &str {
     if line.len() <= max {
         return line;
     }

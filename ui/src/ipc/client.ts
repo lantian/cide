@@ -26,12 +26,16 @@ import type {
   GraphicsStatus,
   HeadlessRequest,
   HeadlessResult,
+  KeymapEdit,
+  KeymapEditResult,
   KeymapReport,
+  ResolvedBinding,
   FileDoc,
   PaneId,
   PaneRestore,
   PickerFrame,
   PickerItem,
+  ProbeAnswer,
   SymbolFrame,
   SymbolIndexStatus,
   ProjectId,
@@ -51,6 +55,7 @@ import type {
   TreeRow,
   TreeRowKind,
   UnsavedTab,
+  UsagesAnswer,
   ViewPosition,
   WindowMode,
   Workspace,
@@ -623,6 +628,63 @@ export const diagnostics = {
   definition: (projectId: ProjectId, path: string, line: number, column: number) =>
     invoke<DefinitionAnswer>('diagnostics_definition', { project: projectId, path, line, column }),
 
+  /**
+   * Which action a Ctrl+click at this position would take: jump, or list usages.
+   *
+   * The discriminator behind the Ctrl gesture, and the *only* thing the Ctrl-hover underline has
+   * to ask. It runs `textDocument/definition` and compares the answer against the position it was
+   * asked about — so on a reference it costs exactly what Go to definition already cost, and on a
+   * declaration it says so **without** searching for any references. A hover that could start a
+   * whole-workspace search would be a hover that can wedge the language server.
+   *
+   * `timeoutMs` is clamped server-side to `[100 ms, 5 s]`. The hover passes 600 and means it: an
+   * underline that arrives five seconds after the pointer stopped has been wrong for four of them.
+   * Absent, it waits as long as Go to definition does.
+   *
+   * Never rejects, for the reason `definition` above states.
+   */
+  probe: (
+    projectId: ProjectId,
+    path: string,
+    line: number,
+    column: number,
+    timeoutMs?: number,
+  ) =>
+    invoke<ProbeAnswer>('diagnostics_probe', {
+      project: projectId,
+      path,
+      line,
+      column,
+      timeoutMs: timeoutMs ?? null,
+    }),
+
+  /**
+   * Every place the symbol at this position is used.
+   *
+   * Waits up to **twenty** seconds, which is four times what the definition path allows and is
+   * about the gesture rather than the plumbing: a references search on a widely-used trait method
+   * against a cold rust-analyzer legitimately takes tens of seconds, and the user has a popup in
+   * front of them saying so. Cancel it with [`usagesCancel`] rather than letting it run.
+   *
+   * `Found { rows: [] }` and `notFound` are different answers and the caller must keep them apart:
+   * the first is "used nowhere", the second is "there is no symbol here".
+   */
+  usages: (projectId: ProjectId, path: string, line: number, column: number) =>
+    invoke<UsagesAnswer>('diagnostics_usages', { project: projectId, path, line, column }),
+
+  /**
+   * Withdraw the outstanding Find usages for this project.
+   *
+   * Genuinely cancels: it releases the blocked thread *and* sends `$/cancelRequest`, so the server
+   * stops searching. Without the second half, "Escape cancelled it" and "Escape stopped showing
+   * it" would be indistinguishable on screen and only the second would be true.
+   *
+   * A no-op when nothing is outstanding, which is most calls — the popup cancels on unmount
+   * without checking whether the answer already landed.
+   */
+  usagesCancel: (projectId: ProjectId) =>
+    invoke<void>('diagnostics_usages_cancel', { project: projectId }),
+
   /** Restart one analyser after it gave up. The panel's only recovery gesture. */
   restart: (projectId: ProjectId, source: DiagnosticSourceId) =>
     invoke<void>('diagnostics_restart', { project: projectId, source }),
@@ -654,6 +716,20 @@ export const settings = {
 
   /** The resolved keymap, its conflicts, and anything wrong in the user's overrides file. */
   keymap: () => invoke<KeymapReport>('keymap_report'),
+
+  /**
+   * Change `keymap.json` and get the keymap as it now stands.
+   *
+   * A **list** of edits because one gesture on the screen is often two of them — bind this
+   * chord, and take it off the command that had it — and those must be one file write, or a
+   * failure between them leaves a keymap with the chord bound twice. See `KeymapEdit` for why
+   * the wire carries the change rather than the file.
+   *
+   * Every window is told through `cide://keymap-changed`, this one included, so the answer is
+   * for drawing the screen and not for installing the new bindings.
+   */
+  keymapEdit: (edits: readonly KeymapEdit[]) =>
+    invoke<KeymapEditResult>('keymap_edit', { edits }),
 
   /**
    * The Linux graphics ladder: what is stored, and what this process actually got.
@@ -837,6 +913,19 @@ export const events = {
   onWorkspaceChanged: (handler: (workspace: Workspace) => void) =>
     listen<{ rev: number; workspace: Workspace }>('cide://workspace-changed', (e) =>
       handler(e.payload.workspace),
+    ),
+
+  /**
+   * The user's keybindings changed, in this window or in another one.
+   *
+   * Needed *because* `onWorkspaceChanged` exists and does not carry it: the keymap is not part
+   * of the workspace, and `applySnapshot` rebuilds `boot` around a new `workspace` while
+   * keeping the old `keymap` array. So the one thing already broadcast to every window is
+   * exactly the path that cannot refresh a binding.
+   */
+  onKeymapChanged: (handler: (keymap: ResolvedBinding[]) => void) =>
+    listen<{ keymap: ResolvedBinding[] }>('cide://keymap-changed', (e) =>
+      handler(e.payload.keymap),
     ),
 
   /**

@@ -69,6 +69,14 @@ pub struct Session {
     next_id: i64,
     /// The last status handed out, so a redundant one is not re-emitted on every message.
     last_status: Option<SourceStatus>,
+    /// `result.capabilities` from the handshake, verbatim.
+    ///
+    /// Kept because the alternative to asking is *finding out by timing out*: a server with no
+    /// `referencesProvider` answers `MethodNotFound` at best and nothing at all at worst, and a
+    /// twenty-second wait that ends in "it is probably still indexing" is a lie about a feature
+    /// that was never going to arrive. The whole value rather than a handful of booleans, so the
+    /// next question anybody asks of it costs a reader and not a field.
+    capabilities: Value,
 }
 
 impl Session {
@@ -83,6 +91,7 @@ impl Session {
             initialize_id: 1,
             next_id: 2,
             last_status: None,
+            capabilities: Value::Null,
         };
         let request = json!({
             "jsonrpc": "2.0",
@@ -112,6 +121,15 @@ impl Session {
                 && self.phase == Phase::Initializing
             {
                 self.phase = Phase::Running;
+                // The one moment this arrives. `initialize` is answered once per life of the
+                // server and the result is never repeated, so a client that does not read it here
+                // cannot read it at all — which is why `capabilities` was `Value::Null` for
+                // everybody until Find usages needed to know whether asking was worth a wait.
+                self.capabilities = message
+                    .get("result")
+                    .and_then(|result| result.get("capabilities"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 effects.push(Effect::Send(json!({
                     "jsonrpc": "2.0",
                     "method": "initialized",
@@ -240,6 +258,24 @@ impl Session {
     /// retrying fixes. See `server::supervise`.
     pub fn ever_handshook(&self) -> bool {
         self.phase != Phase::Initializing
+    }
+
+    /// Does this server answer `textDocument/references`?
+    ///
+    /// `referencesProvider` is `boolean | ReferenceOptions` in the spec — an object being the shape
+    /// a server uses when it wants to attach work-done-progress support — so **both** count, and
+    /// reading only the boolean would report "gopls cannot find usages" on any release that
+    /// switched to the object form.
+    ///
+    /// `false` before the handshake completes, which is the honest answer: nothing has said yet.
+    /// The caller must not turn that into a refusal — see `LspHandle::supports_references`, which
+    /// is where the racing-against-startup case is decided.
+    pub fn supports_references(&self) -> bool {
+        match self.capabilities.get("referencesProvider") {
+            Some(Value::Bool(yes)) => *yes,
+            Some(Value::Object(_)) => true,
+            _ => false,
+        }
     }
 
     fn status(&self) -> SourceStatus {
@@ -391,6 +427,21 @@ fn initialize_params(roots: &[std::path::PathBuf]) -> Value {
                 // line 1. Declared explicitly, and pinned by the handshake test, so that turning it
                 // on has to be a deliberate edit in two places rather than a one-word change here.
                 "definition": { "linkSupport": false },
+                /*
+                 * Find usages. (M14)
+                 *
+                 * Note the asymmetry with the line above, because it is the one thing that makes
+                 * this reply *simpler* than definition's: `textDocument/references` has **no
+                 * `linkSupport` analogue**. Its result is `Location[] | null` and nothing else, so
+                 * the `LocationLink` hazard `convert::location` guards against cannot arise here
+                 * and `convert::locations` needs no equivalent refusal.
+                 *
+                 * `dynamicRegistration: false` is stated rather than omitted, for the same reason
+                 * `linkSupport` is: an absent capability and a capability declared false are the
+                 * same thing to a server and very different things to the next person reading
+                 * this list.
+                 */
+                "references": { "dynamicRegistration": false },
             },
         },
     })
@@ -446,6 +497,14 @@ mod tests {
             caps["textDocument"]["definition"]["linkSupport"],
             json!(false)
         );
+        // Find usages asks for nothing beyond existing, and that is the point: `references` has no
+        // `linkSupport` analogue, so the reply shape is fixed at `Location[] | null` and
+        // `convert::locations` needs no refusal branch. Declaring the capability at all is what
+        // makes a server that gates the method behind client support answer it.
+        assert_eq!(
+            caps["textDocument"]["references"]["dynamicRegistration"],
+            json!(false)
+        );
         // We answer `workspace/configuration`, so we must say we can.
         assert_eq!(caps["workspace"]["configuration"], json!(true));
         assert_eq!(
@@ -474,6 +533,46 @@ mod tests {
         let effects =
             session.on_message(&json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}}));
         assert_eq!(sent(&effects)[0]["method"], "initialized");
+    }
+
+    #[test]
+    fn the_servers_own_capabilities_survive_the_handshake() {
+        // They were parsed and dropped on the floor for two milestones — `on_message` read the
+        // result only to flip the phase — so there was no way for any caller to ask "does this
+        // server do references?" at all. That is what turns a `MethodNotFound` into a
+        // twenty-second wait ending in "it is probably still indexing".
+        let mut session = started();
+        session.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "referencesProvider": true } },
+        }));
+        assert!(session.supports_references());
+    }
+
+    #[test]
+    fn a_reference_provider_declared_as_options_still_counts() {
+        // `referencesProvider` is `boolean | ReferenceOptions`. A server that wants work-done
+        // progress on the method sends the object form, and reading only the boolean would report
+        // "this server cannot find usages" about one that can.
+        let mut session = started();
+        session.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "referencesProvider": { "workDoneProgress": true } } },
+        }));
+        assert!(session.supports_references());
+    }
+
+    #[test]
+    fn a_server_that_offers_no_references_says_so_rather_than_being_assumed_able() {
+        let mut session = started();
+        session.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "definitionProvider": true } },
+        }));
+        assert!(!session.supports_references());
+        // And before the handshake there is nothing to read, which must be `false` and not a
+        // panic. The caller decides what to do with "nobody has said yet" — see `LspHandle`.
+        assert!(!started().supports_references());
     }
 
     #[test]

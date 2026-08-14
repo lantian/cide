@@ -190,12 +190,12 @@ function syncFileIndex(workspace: Workspace): void {
   }
 }
 
-/* ------------------------------------------------------------------------ the MRU stack */
+/* ----------------------------------------------------------------------- the MRU stacks */
 
 /**
  * Where the project MRU order lives, and why it is not in Rust.
  *
- * Ctrl+Tab walks *most-recently-used* order (`keys/switcher.ts`), so something has to
+ * Ctrl+` walks *most-recently-used* order (`keys/switcher.ts`), so something has to
  * remember the order the user visited projects in. There were two places it could go and the
  * choice is not a toss-up:
  *
@@ -281,6 +281,124 @@ function mruFor(previous: readonly ProjectId[], boot: Bootstrap | null): readonl
   return next
 }
 
+/* ---------------------------------------------------------------- and the same for tabs */
+
+/**
+ * One MRU stack per project, over that project's tabs. What Ctrl+Tab walks.
+ *
+ * # There was no per-tab focus history anywhere, and two comments said so
+ *
+ * `Tab` is `{ id, kind, tree }` — no timestamp, no ordinal. `Project::active_tab` holds one
+ * value, the current tab, with no history behind it. `p.tabs` is a `Vec` in *insertion* order
+ * (`open_tab` pushes), which is what the strip draws, and `close_tab` picks the **left
+ * neighbour** rather than the previous tab, which is itself a symptom of there being nothing to
+ * consult. Both `cide_ipc::workspace`'s note on `TabKind::Diff.preview` and `keys/target.ts`'s
+ * note at the foot of the file record the absence deliberately.
+ *
+ * That second note reads as forbidding this, and it has been amended rather than left to be
+ * cited against the code below. What it forbids is a **cache with no invalidation** — the
+ * `repoOpen` mistake, a webview-side mirror of a fact Rust never fills. This is not that: it is
+ * *derived from every snapshot* and reconciled against `project.tabs`, which is exactly the
+ * invalidation the note demands, and `active_tab` is a field Rust writes on every open, every
+ * activation and every close.
+ *
+ * # Why it is not in Rust, and the honest version of that argument
+ *
+ * The same two reasons as the project stack — a keystroke that bumped `rev` would broadcast
+ * `cide://workspace-changed` to every window, and a new field on `Tab` is a schema migration —
+ * but the argument is **weaker** here and saying so is the point. "The order I visited things
+ * in is not domain state" is a clean line for projects; for tabs, `active_tab` is *already* in
+ * the workspace, so a Rust-side history would be less of an outlier than it looks. What decides
+ * it is the broadcast cost and the migration, not domain purity.
+ *
+ * # And what it actually contains
+ *
+ * Tabs, not files. The pinned Claude console, `ClaudeFull` tabs, file tabs, diff tabs and the
+ * settings tab all live in one `Vec` and all appear here. Including the console is the whole
+ * value of the gesture: one Ctrl+Tab from a file gets you back to the conversation about it.
+ *
+ * `TabId` is a persisted UUID written into `workspace.json`, so a remembered order survives a
+ * relaunch — which is the same reason the project stack's `localStorage` half is not optional.
+ */
+const TAB_MRU_CACHE_KEY = 'cide.tabMru'
+
+/** Per-project tab stacks, as they are held in the store and on disk. */
+type TabStacks = Readonly<Record<string, readonly string[]>>
+
+/** Shared by every project with nothing remembered yet, so "unchanged" compares by identity. */
+const NO_STACK: readonly string[] = []
+
+/** The remembered stacks, or `{}` when there is nothing readable there. */
+function loadTabMru(): TabStacks {
+  try {
+    const raw = globalThis.localStorage?.getItem(TAB_MRU_CACHE_KEY)
+    if (raw === null || raw === undefined) return {}
+    const parsed: unknown = JSON.parse(raw)
+    // Validated rather than cast, for the reason `loadMru` gives: this is data from disk that a
+    // user can edit, and a malformed entry would otherwise reach `tab_activate` as a tab id.
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
+    const out: Record<string, readonly string[]> = {}
+    for (const [project, stack] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(stack)) continue
+      out[project] = stack.filter((id): id is string => typeof id === 'string')
+    }
+    return out
+  } catch {
+    // A quota error, a private-mode throw, or a half-written line. An empty record degrades to
+    // strip order on the first press, which is worse than the feature and better than a window
+    // that fails to boot over a cache.
+    return {}
+  }
+}
+
+function saveTabMru(stacks: TabStacks): void {
+  try {
+    globalThis.localStorage?.setItem(TAB_MRU_CACHE_KEY, JSON.stringify(stacks))
+  } catch {
+    // Same argument as above, and the write is the half that can genuinely fail on quota.
+  }
+}
+
+/**
+ * The tab stacks this snapshot implies: one [`restack`] per project, keyed by project id.
+ *
+ * Snapshot-driven for the same reason [`nextMru`] is, and more so: a tab becomes active in five
+ * ways — opened, clicked in the strip, committed from the switcher, left behind by a close, or
+ * activated in *another* window — and `cide://workspace-changed` is the one path all five share.
+ *
+ * Projects that have closed drop out, because the record is rebuilt from the snapshot rather
+ * than patched. Returns the same object identity when nothing moved, so subscribers do not
+ * re-render on every snapshot and nothing is written back for a no-op.
+ */
+function nextTabMru(previous: TabStacks, boot: Bootstrap | null): TabStacks {
+  const projects = boot?.workspace.projects
+  if (projects === undefined) return previous
+
+  let moved = false
+  const next: Record<string, readonly string[]> = {}
+  for (const project of Object.values(projects)) {
+    const remembered = previous[project.id] ?? NO_STACK
+    const stack = restack(
+      remembered,
+      project.tabs.map((tab) => tab.id),
+      project.activeTab,
+    )
+    next[project.id] = stack
+    if (stack !== remembered) moved = true
+  }
+  // The key count catches the other half: a project that closed, and a project seen for the
+  // first time whose single tab left `restack` returning the empty stack unchanged.
+  if (!moved && Object.keys(next).length === Object.keys(previous).length) return previous
+  return next
+}
+
+/** [`nextTabMru`], writing the cache whenever a stack actually moved. */
+function tabMruFor(previous: TabStacks, boot: Bootstrap | null): TabStacks {
+  const next = nextTabMru(previous, boot)
+  if (next !== previous) saveTabMru(next)
+  return next
+}
+
 interface WorkspaceStore {
   /** Null until the first `app.getBootstrap` resolves. */
   boot: Bootstrap | null
@@ -295,6 +413,14 @@ interface WorkspaceStore {
    */
   mru: readonly ProjectId[]
   /**
+   * Tabs in most-recently-used order, per project — what Ctrl+Tab walks.
+   *
+   * Read the note on [`TAB_MRU_CACHE_KEY`] for what it holds and why it is not in Rust. Never
+   * written by a component: it is derived from every snapshot by [`nextTabMru`], so it cannot
+   * drift from the set of tabs that actually exist.
+   */
+  tabMru: TabStacks
+  /**
    * Record the order the switcher committed to, before the activation round trip lands.
    *
    * The snapshot recomputes exactly this a moment later — [`nextMru`] puts the active project
@@ -305,6 +431,8 @@ interface WorkspaceStore {
    * activated, which is the double-tap doing nothing.
    */
   rememberMru: (order: readonly ProjectId[]) => void
+  /** [`rememberMru`] for one project's tab stack, and for exactly the same reason. */
+  rememberTabMru: (project: ProjectId, order: readonly TabId[]) => void
 
   hydrate: () => Promise<void>
   /** Start following `cide://workspace-changed`. Returns an unlisten function. */
@@ -408,13 +536,21 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   theme: globalThis.document?.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
 
   // Read from the cache at module load, before any snapshot has arrived, so the very first
-  // Ctrl+Tab of a session has a real order to walk. It is reconciled against the live project
+  // Ctrl+` of a session has a real order to walk. It is reconciled against the live project
   // list on the first snapshot, so a stale id never survives to reach `project_activate`.
   mru: loadMru() as readonly ProjectId[],
+  // The same, one level down, for Ctrl+Tab. Reconciled against `project.tabs` on the first
+  // snapshot, so a tab closed in the previous session never reaches `tab_activate`.
+  tabMru: loadTabMru(),
 
   hydrate: async () => {
     const boot = await appApi.getBootstrap()
-    set({ boot, theme: boot.workspace.settings.theme, mru: mruFor(get().mru, boot) })
+    set({
+      boot,
+      theme: boot.workspace.settings.theme,
+      mru: mruFor(get().mru, boot),
+      tabMru: tabMruFor(get().tabMru, boot),
+    })
     // After the state is set, not before: the explorer and the picker read the project from
     // the store, and an index that started against a project the window has not adopted yet
     // would race the components that are about to ask it questions.
@@ -432,7 +568,30 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     const unlisten = await events.onWorkspaceChanged((workspace) => {
       get().applySnapshot(workspace)
     })
-    return unlisten
+    /*
+     * The keymap is a second subscription because it is not in the workspace.
+     *
+     * `applySnapshot` builds `{ ...current, workspace }` and keeps everything else, `keymap`
+     * included — which is correct for a tree mutation and is exactly why a rebind cannot ride
+     * along on one. Without this line, Settings → Keymap in one window changes that window's
+     * bindings (it re-reads them itself) and no other window's until something there happens
+     * to call `hydrate`, which is the "my keybinding does nothing" failure with a window's
+     * worth of distance between cause and symptom.
+     *
+     * A **new array** is what lands in `boot.keymap`, and that matters as much as its
+     * contents: `keys/gate.ts` caches its indexed keymap against the identity of what
+     * `bindings()` returns, so an in-place mutation would leave the gate resolving against the
+     * table it built on the first keystroke.
+     */
+    const unlistenKeymap = await events.onKeymapChanged((keymap) => {
+      const boot = get().boot
+      if (boot === null) return
+      set({ boot: { ...boot, keymap } })
+    })
+    return () => {
+      unlisten()
+      unlistenKeymap()
+    }
   },
 
   // Every mutation re-reads the whole tree rather than patching the mirror locally. The
@@ -626,9 +785,9 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     // dropped rather than winding the UI backwards.
     if (workspace.rev < current.workspace.rev) return
     const boot = { ...current, workspace }
-    // The MRU stack follows the snapshot, not the action: a project activated, opened or
-    // closed in another window reaches this one only here. See `nextMru`.
-    set({ boot, mru: mruFor(get().mru, boot) })
+    // Both MRU stacks follow the snapshot, not the action: a project or a tab activated, opened
+    // or closed in another window reaches this one only here. See `nextMru`, `nextTabMru`.
+    set({ boot, mru: mruFor(get().mru, boot), tabMru: tabMruFor(get().tabMru, boot) })
     // A project opened or closed in *another* window reaches this one only here. Without
     // this line the second window's tree and picker stay empty until something in it happens
     // to call `hydrate`.
@@ -638,6 +797,12 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   rememberMru: (order) => {
     saveMru(order)
     set({ mru: order })
+  },
+
+  rememberTabMru: (project, order) => {
+    const stacks = { ...get().tabMru, [project]: order }
+    saveTabMru(stacks)
+    set({ tabMru: stacks })
   },
 
   setTheme: (theme) => set({ theme }),

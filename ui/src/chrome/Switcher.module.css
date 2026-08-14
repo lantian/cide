@@ -1,5 +1,5 @@
 /*
- * The Ctrl+Tab popup.
+ * The held-modifier switcher popup — Ctrl+Tab over tabs, Ctrl+` over projects, one component.
  *
  * Deliberately *not* the 620px `OverlayCard`. That shell owns a scrim, a search field it
  * focuses on mount, and Escape-to-dismiss wiring — and every one of those is wrong here: the
@@ -51,8 +51,8 @@
   color: var(--faint);
 }
 
-/* Scrolls rather than growing: a dozen open projects would otherwise put the highlight off
-   the bottom of the window, and the highlight is the only thing this popup is for. */
+/* Scrolls rather than growing: a dozen open tabs would otherwise put the highlight off the
+   bottom of the window, and the highlight is the only thing this popup is for. */
 .list {
   flex: 1;
   min-height: 0;
@@ -102,6 +102,28 @@
 .name {
   flex: none;
   font-weight: 500;
+}
+
+/*
+ * A tab's marker, where a project draws its coloured dot. A glyph rather than a second dot: a
+ * tab has no per-tab colour to carry, and the four marks — console, session, file, diff — are
+ * the only thing distinguishing two rows whose titles can legitimately be identical.
+ *
+ * Sized and boxed to the dot's own footprint so the names in a project list and a tab list
+ * start at the same x, which is what stops the two popups looking like different widgets.
+ */
+.mark {
+  flex: none;
+  align-self: center;
+  width: 7px;
+  text-align: center;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--faint);
+}
+
+.selected .mark {
+  color: var(--dim);
 }
 
 /* Truncates from the left of the box but keeps the tail: the interesting half of

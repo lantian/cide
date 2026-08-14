@@ -24,11 +24,13 @@ use cide_core::{CoreError, persist, workspace};
 use cide_ipc::git::DiffSide;
 use cide_ipc::{
     GraphicsRung, GraphicsSettings, GraphicsStatus, HeadlessError, HeadlessRequest, HeadlessResult,
-    KeymapConflict, KeymapProblem, KeymapReport, Pane, PaneId, PaneKind, PaneRole, ProjectId,
-    RepoId, Settings, SettingsPatch, SettingsSection, TabId, TabKind,
+    KeymapConflict, KeymapEdit, KeymapEditResult, KeymapProblem, KeymapReport, Pane, PaneId,
+    PaneKind, PaneRole, ProjectId, RepoId, Settings, SettingsPatch, SettingsSection, TabId,
+    TabKind,
 };
 use tauri::{AppHandle, Manager, State};
 
+use crate::emit;
 use crate::windows;
 use crate::workspace_state::WorkspaceState;
 
@@ -232,16 +234,107 @@ pub fn keymap_report() -> KeymapReport {
     // exactly the failure this screen exists to end.
     let (user, parse_problem) = match keymap::load_user(&path) {
         Ok(user) => (user, None),
-        Err(error) => (
-            Vec::new(),
-            Some(KeymapProblem {
-                key: String::new(),
-                command: String::new(),
-                message: format!("{} could not be read: {error}", path.display()),
-            }),
-        ),
+        Err(error) => (Vec::new(), Some(unreadable(&path, &error.to_string()))),
     };
 
+    let readable = parse_problem.is_none();
+    report_for(&path, user, parse_problem, readable)
+}
+
+/// Apply edits to `keymap.json` and answer with the keymap as it now stands.
+///
+/// # Why this is one command taking a list
+///
+/// A single gesture on the screen is often two edits — *bind Ctrl+P to this, and take it off
+/// whatever had it* — and those must be one file write. Two commands would leave a window in
+/// which the chord is bound twice, broadcast that state to every window, and lose the second
+/// half outright if the process died between them.
+///
+/// # The lock
+///
+/// Read-modify-write on a file, from a command handler, in an app that can have Settings open
+/// in two windows at once. Nothing else serialises this: `WorkspaceState` guards the tree and
+/// knows nothing about `keymap.json`, and Tauri runs command handlers on a thread pool. Two
+/// saves a moment apart would both read the same file and the second would write a vector that
+/// never saw the first one's entries. A process-global lock rather than managed state because
+/// the thing being protected is a path, not a value — a second `State` would have to be
+/// threaded through every future caller to mean anything, and the one that forgot would be
+/// exactly as unserialised as no lock at all.
+static KEYMAP_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn keymap_edit(app: AppHandle, edits: Vec<KeymapEdit>) -> Result<KeymapEditResult, CoreError> {
+    // Poisoning would mean a previous edit panicked mid-write. The data behind this lock is a
+    // file, re-read from scratch below, so there is no invariant a panic could have left
+    // broken and nothing to recover — taking the guard is strictly better than refusing every
+    // subsequent edit for the rest of the session.
+    let _guard = KEYMAP_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let path = persist::keymap_path();
+    let mut user = match keymap::load_user(&path) {
+        Ok(user) => user,
+        Err(error) => {
+            /*
+             * **A file we cannot parse is a file we must not rewrite.**
+             *
+             * `load_user` answers `Err` for a `keymap.json` with a stray comma — or with the
+             * `//` comment a user assumed was legal, since this is VS Code's *shape* and not
+             * its JSONC parser. Treating that as "no overrides" and saving would replace
+             * everything they had written with the one line they just recorded, and the
+             * screen would report success.
+             *
+             * The exception is **Reset all**, alone, which is the one gesture that means
+             * "throw away what is in there" — and it is the escape hatch out of this refusal
+             * for a user who does not want to go and find the file. Anything else refuses and
+             * names the file, which is what the screen puts on the button it disables.
+             */
+            if !keymap::may_replace_unreadable(&edits) {
+                return Err(CoreError::Serde(format!(
+                    "{} could not be read ({error}), so it will not be rewritten — fix it by \
+                     hand, or use Reset all to replace it",
+                    path.display()
+                )));
+            }
+            Vec::new()
+        }
+    };
+
+    let mut removed = 0usize;
+    let mut added = 0usize;
+    for edit in &edits {
+        let outcome = keymap::apply_edit(&mut user, edit);
+        removed += outcome.removed;
+        added += outcome.added;
+    }
+
+    keymap::save_user(&path, &user)?;
+
+    // Resolved once and used twice: the windows get it as an event, the caller gets it inside
+    // the report. Emitting before the return so the window that made the edit is refreshed by
+    // the same path as every other window rather than by its own answer — one mechanism, so a
+    // rebind cannot work in the tab you are looking at and nowhere else.
+    let resolved = keymap::resolve(&user);
+    emit::keymap_changed(&app, &resolved);
+
+    Ok(KeymapEditResult {
+        removed: removed as u32,
+        added: added as u32,
+        report: report_for(&path, user, None, true),
+    })
+}
+
+/// Everything Settings → Keymap draws, for a user layer that has already been read.
+///
+/// Shared by [`keymap_report`] and [`keymap_edit`] so the screen is looking at the same
+/// arithmetic whichever way it got there — and so an edit answers from the vector it just
+/// wrote rather than by re-reading the file it wrote it to, which is a second chance for the
+/// answer to disagree with the action.
+fn report_for(
+    path: &Path,
+    user: Vec<cide_ipc::Binding>,
+    parse_problem: Option<KeymapProblem>,
+    readable: bool,
+) -> KeymapReport {
     let (bindings, diagnostics) = keymap::resolve_with_diagnostics(&user);
     let conflicts = keymap::conflicts(&bindings)
         .into_iter()
@@ -259,7 +352,27 @@ pub fn keymap_report() -> KeymapReport {
         bindings,
         conflicts,
         problems,
+        overrides: user,
+        readable,
         path: path.display().to_string(),
+    }
+}
+
+/// The problem line for a `keymap.json` that could not be parsed at all.
+///
+/// Worth more than the `tracing::error!` `app_get_bootstrap` logs beside it: a file with one
+/// stray comma contributes **zero** overrides, so every binding the user set is silently gone
+/// and the only visible symptom is that their keymap stopped working.
+fn unreadable(path: &Path, error: &str) -> KeymapProblem {
+    KeymapProblem {
+        key: String::new(),
+        command: String::new(),
+        message: format!(
+            "{} could not be read: {error}. None of your overrides are in effect, and the \
+             editor below will not overwrite the file until it parses. Note that this is \
+             strict JSON, not JSONC — a `//` comment fails the whole file.",
+            path.display()
+        ),
     }
 }
 

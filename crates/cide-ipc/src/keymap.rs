@@ -30,8 +30,16 @@ pub struct Binding {
     /// contributed by an earlier layer, which is how a user disables a default.
     pub command: String,
     /// Context expression, e.g. `terminalFocused && !overlayOpen`. `None` means always.
+    ///
+    /// Skipped when absent, and that is about the *file* rather than the wire: Settings →
+    /// Keymap rewrites `keymap.json` whole on every edit, and without this every entry a user
+    /// had hand-written would come back decorated with `"when": null, "args": null`. The wire
+    /// is unaffected — `ts-rs` types this from the Rust type, not from the serde attribute, so
+    /// `codegen --check` stays green and the frontend still reads `when` as `string | null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
     /// Opaque payload handed to the command.
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(type = "unknown")]
     pub args: Option<serde_json::Value>,
 }
@@ -60,6 +68,59 @@ impl Binding {
     pub fn target_command(&self) -> &str {
         self.command.strip_prefix('-').unwrap_or(&self.command)
     }
+}
+
+/// One change Settings → Keymap wants made to `keymap.json`.
+///
+/// # Why an edit and not a file
+///
+/// The obvious command shape is "here is the new `Vec<Binding>`, write it". It is also the one
+/// that loses this file its whole purpose. `keymap.json` holds **overrides only** — the
+/// defaults are compiled in and layered underneath — so a screen that serialised what it is
+/// showing would write every shipped binding into the user's file, and from that moment
+/// every future change to a default would be frozen out for anyone who had ever touched a
+/// binding. Naming the *change* is what keeps the file a diff.
+///
+/// The second reason is arithmetic. One gesture is routinely two file entries: moving a
+/// command off a default chord needs a removal on the old key **and** an add on the new one,
+/// and the removal has to carry the `when` of the binding it is removing or it matches
+/// nothing (`cide_core::keymap::apply_layer`). Working that out is `cide_core::keymap`'s job,
+/// where it is a pure function over a `Vec<Binding>` with tests; a frontend that assembled the
+/// entries itself would be a second implementation of layering.
+///
+/// Applied in order to one loaded vector and written once, so "bind this and unbind whatever
+/// held the chord" is a single atomic edit rather than two saves with a broken state between.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+#[ts(export)]
+pub enum KeymapEdit {
+    /// Put `command` on `key` in context `when`, taking it off whatever it was on.
+    ///
+    /// `when` is copied verbatim from the row the user clicked — never re-derived. A resolved
+    /// binding already carries its normalised context, and that string *is* the recipe: a
+    /// removal matches on (key, command, `when`), so a `when` that is reconstructed rather
+    /// than copied is how an edit silently removes nothing.
+    Rebind {
+        command: String,
+        when: Option<String>,
+        key: String,
+    },
+    /// Take `command` off the keyboard in context `when`, leaving it palette-only.
+    Unbind {
+        command: String,
+        when: Option<String>,
+    },
+    /// Drop every user entry targeting `command` in context `when`.
+    ///
+    /// Not "write the default back in": the default is compiled in and re-appears the moment
+    /// nothing in the user layer is standing on it. Writing it in would freeze today's default
+    /// into the user's file, which is the same mistake as writing the whole table.
+    Reset {
+        command: String,
+        when: Option<String>,
+    },
+    /// Truncate the file to `[]`. The one destructive gesture on the screen.
+    ResetAll,
 }
 
 /// Which layer a resolved binding came from. Surfaced in Settings → Keymap so a user can

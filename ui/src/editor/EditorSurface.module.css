@@ -256,6 +256,31 @@
   font-style: italic;
 }
 
+/*
+ * Ctrl+hover's underline. (M14)
+ *
+ * Here rather than in a CSS module of its own for the same reason the `.cide-tk-*` block above is:
+ * the class is assigned by a `Decoration.mark` in `ctrlLink.ts`, and a module-scoped name would
+ * mean that TypeScript file importing a stylesheet only so it could hash a class it writes by
+ * hand. `check:editor` asserts this rule exists, because a mark whose class nobody styles is an
+ * invisible affordance and nothing else would notice.
+ *
+ * `var(--blue)` and not a literal: it is the call/function colour in this palette, which is what
+ * makes the underline read as "this is a thing that resolves". A literal would still be blue after
+ * the user switched theme — the argument the token block above is built on.
+ *
+ * `cursor: pointer` on the mark rather than on `contentAttributes`, which is what
+ * `crosshairCursor` uses: that one wants the whole content area to change, and this must be a hand
+ * **only over the underlined word**, which is what IDEA does and what tells the user where the
+ * click will land.
+ */
+.body :global(.cide-ctrl-link) {
+  text-decoration: underline;
+  text-decoration-color: var(--blue);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
 .body :global(.cm-matchingBracket) {
   background: var(--chrome-hi);
   outline: 1px solid var(--accent-dim);

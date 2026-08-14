@@ -43,6 +43,14 @@ export type OverlayKind =
   | 'goto'
   /** The *New scratch file…* type picker (`overlays/ScratchType.tsx`). */
   | 'scratch'
+  /**
+   * Find usages (`overlays/UsagesPopup.tsx`).
+   *
+   * Opened from outside React twice over — a CodeMirror `mousedown` and the key gate — so its rows
+   * arrive through `overlays/usagesStore.ts` rather than as props, the same arrangement `branches`
+   * uses and for the same reason.
+   */
+  | 'usages'
 
 interface OverlayStore {
   open: OverlayKind | null

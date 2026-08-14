@@ -238,6 +238,34 @@ export function missing(commands, handled) {
   }
 }
 
+{
+  /*
+   * ...and a `case` that shows the user the thing they asked for but leaves the keyboard
+   * somewhere else is three quarters of a dispatcher. Same defect again, one layer further out.
+   *
+   * `tab.console` is Ctrl+1 — *go to the Claude console* — and `ws.activateTab` alone makes the
+   * tab visible while the caret stays in whatever the user was typing in, which for a command
+   * whose entire purpose is "put me in the prompt" is the half that matters. `revealPane` is the
+   * one function that activates the project, activates the tab, drops a maximize that would hide
+   * the pane, moves the domain's focus and *then* focuses the terminal, in the order that works.
+   * The same rule the tab switcher's commit follows, for the same reason.
+   */
+  const console_ = HANDLERS.find((h) => h.id === 'tab.console')
+  ok(console_ !== undefined, 'tab.console still has a case in dispatch.ts')
+  if (console_) {
+    ok(
+      /revealPane\(/.test(console_.body),
+      'tab.console goes through revealPane rather than activating a tab and stopping there — a ' +
+        'console the user is looking at but cannot type into is half the command',
+    )
+    ok(
+      /consolePaneOf\(/.test(console_.body),
+      'and names the console by identity (`tabs[0]`) rather than reusing the mention target, ' +
+        'which prefers whichever Claude pane happens to have focus',
+    )
+  }
+}
+
 /* --------------------------------------------------------------- the `when` vocabulary */
 
 /**

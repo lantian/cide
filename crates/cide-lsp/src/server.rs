@@ -113,6 +113,12 @@ pub enum LspEvent {
 pub enum RequestError {
     /// The deadline passed with no reply. The server is alive but busy — almost always indexing.
     Timeout,
+    /// The caller withdrew: the popup was dismissed, or a second request superseded this one.
+    ///
+    /// Distinguished from [`RequestError::Timeout`] because **nothing should be said about it**.
+    /// A timeout is news ("still indexing, try again"); a cancellation is the user's own doing and
+    /// a sentence about it would be the app narrating a key they just pressed.
+    Cancelled,
     /// The server stopped, or never started, while this request was outstanding.
     ServerGone,
     /// The outbound queue was full, so the request was never written. Distinguished from
@@ -128,6 +134,7 @@ impl std::fmt::Display for RequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout => write!(f, "the language server did not answer in time"),
+            Self::Cancelled => write!(f, "the request was cancelled"),
             Self::ServerGone => write!(f, "the language server stopped"),
             Self::Queue => write!(f, "the outbound queue to the language server was full"),
             Self::Failed(message) => write!(f, "{message}"),
@@ -184,12 +191,32 @@ impl Requester {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, RequestError> {
+        self.request_tracked(method, params, timeout, |_| {})
+    }
+
+    /// [`Self::request`], with the request's id handed to `announce` before the wait begins.
+    ///
+    /// The id is what [`Self::cancel`] needs, and the only place it exists is inside this function
+    /// — the allocator is private and the caller cannot predict the number. `announce` runs on this
+    /// thread, before the send, so a cancel arriving the instant after the request was queued still
+    /// finds a registered waiter to release.
+    ///
+    /// Do anything cheap in `announce` — it runs while nothing is locked, but the request has not
+    /// been written yet, so a slow one delays the server hearing about it.
+    pub fn request_tracked(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        announce: impl FnOnce(i64),
+    ) -> Result<Value, RequestError> {
         let id = self
             .next_id
             .fetch_add(1, Ordering::Relaxed)
             .max(REQUEST_ID_BASE);
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.pending.lock().insert(id, tx);
+        announce(id);
 
         let message = serde_json::json!({
             "jsonrpc": "2.0",
@@ -214,10 +241,58 @@ impl Requester {
             // The sender was dropped without answering — the pending map was drained because the
             // server's life ended. `RecvTimeoutError::Timeout` is the real deadline.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(RequestError::ServerGone),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(RequestError::Timeout),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                /*
+                 * Tell the server to stop, as well as giving up on it.
+                 *
+                 * Without this line a timed-out request leaves rust-analyzer computing an answer
+                 * nobody will ever read — which for `textDocument/references` on a widely-used
+                 * symbol is a whole-workspace search, and for a user who hovered three
+                 * identifiers in a row is three of them at once, each one starving the one they
+                 * actually want. The leak existed on the five-second definition path too; it was
+                 * small enough there to go unnoticed, which is exactly why it is fixed at the one
+                 * place every request passes through rather than at the new caller.
+                 */
+                self.notify_cancel(id);
+                Err(RequestError::Timeout)
+            }
         };
         self.pending.lock().remove(&id);
         answer
+    }
+
+    /// Withdraw an outstanding request: release its waiter *and* tell the server to stop.
+    ///
+    /// Both halves, because they answer two different questions and only doing one is the state
+    /// that reads as working and is not:
+    ///
+    /// * releasing the waiter is what stops a blocking-pool thread sitting out a twenty-second
+    ///   deadline for an answer the user has already dismissed;
+    /// * `$/cancelRequest` is what stops the *server* doing the work. Without it "Escape cancelled
+    ///   it" and "Escape stopped showing it" are indistinguishable on screen and only the second
+    ///   would be true.
+    ///
+    /// Safe to call with an id that has already been answered, or was never issued: the waiter is
+    /// simply not there, and `$/cancelRequest` for an unknown id is explicitly a no-op in the
+    /// protocol.
+    pub fn cancel(&self, id: i64) {
+        if let Some(waiter) = self.pending.lock().remove(&id) {
+            let _ = waiter.try_send(Err(RequestError::Cancelled));
+        }
+        self.notify_cancel(id);
+    }
+
+    /// `$/cancelRequest`, best effort.
+    ///
+    /// A notification, so a full outbox drops it rather than blocking — the same trade
+    /// [`LspHandle::send`] makes, and the right one here: failing to cancel costs the server some
+    /// wasted work, while blocking would cost the caller's thread.
+    fn notify_cancel(&self, id: i64) {
+        let _ = self.outbox.try_send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": id },
+        }));
     }
 }
 
@@ -270,6 +345,38 @@ fn cancel_pending(pending: &Pending, error: RequestError) {
     }
 }
 
+/// What the running server said it can do, as far as anyone outside the supervisor needs to know.
+///
+/// # Why an atomic and not a field
+///
+/// The live [`Session`] is owned by `run_once`, on the supervisor thread, and never leaves it —
+/// `cide-app` builds *throwaway* sessions for the pure document builders and has no way to reach
+/// the real one. A channel would work and would mean the diagnostics pump has to notice and store
+/// a new event kind; a mutex around a struct would mean a lock on a path that is polled. One
+/// integer, written once per life of the server and read once per gesture, is the whole
+/// requirement.
+///
+/// **Three states, not two.** "Nobody has answered `initialize` yet" is not "this server cannot do
+/// it": a Find usages pressed 200 ms after launch would be refused outright by a two-state flag,
+/// and refused with the one sentence that is certainly wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Capability {
+    Unknown = 0,
+    Yes = 1,
+    No = 2,
+}
+
+impl Capability {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Yes,
+            2 => Self::No,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A running (or permanently stopped) language server.
 ///
 /// Dropping it runs the shutdown ladder.
@@ -280,6 +387,8 @@ pub struct LspHandle {
     stop: Arc<AtomicBool>,
     next_id: Arc<std::sync::atomic::AtomicI64>,
     pending: Pending,
+    /// See [`Capability`]. Written by the supervisor, read by whoever is about to ask.
+    references: Arc<std::sync::atomic::AtomicU8>,
     supervisor: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -299,14 +408,20 @@ impl LspHandle {
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<LspEvent>();
         let stop = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let references = Arc::new(std::sync::atomic::AtomicU8::new(Capability::Unknown as u8));
 
         let supervisor = {
             let stop = Arc::clone(&stop);
             let roots = roots.clone();
             let pending = Arc::clone(&pending);
+            let references = Arc::clone(&references);
             std::thread::Builder::new()
                 .name(format!("cide-lsp-{}", server.binary()))
-                .spawn(move || supervise(server, binary, roots, outbox_rx, event_tx, stop, pending))
+                .spawn(move || {
+                    supervise(
+                        server, binary, roots, outbox_rx, event_tx, stop, pending, references,
+                    )
+                })
                 .map_err(|error| LspError::Spawn {
                     binary: server.binary().to_string(),
                     message: error.to_string(),
@@ -320,8 +435,27 @@ impl LspHandle {
             stop,
             next_id: Arc::new(std::sync::atomic::AtomicI64::new(REQUEST_ID_BASE)),
             pending,
+            references,
             supervisor: Some(supervisor),
         })
+    }
+
+    /// Does this server answer `textDocument/references`? `None` while it is still starting.
+    ///
+    /// The `None` is load-bearing and must not be folded into `false` by the caller: a Find usages
+    /// pressed a moment after launch would otherwise be told "this server cannot find usages"
+    /// about one that is merely still shaking hands — the one sentence that is certainly wrong.
+    /// Ask anyway on `None`; the deadline is the answer.
+    ///
+    /// `Some(false)` is worth the fifteen lines behind it exactly once: it turns a twenty-second
+    /// wait ending in *"probably still indexing"* into an immediate, true sentence. Both shipped
+    /// servers answer `true`, so today this only ever prevents a lie in the future.
+    pub fn supports_references(&self) -> Option<bool> {
+        match Capability::from_u8(self.references.load(Ordering::Acquire)) {
+            Capability::Unknown => None,
+            Capability::Yes => Some(true),
+            Capability::No => Some(false),
+        }
     }
 
     /// A cloneable sender for request/response traffic.
@@ -413,6 +547,7 @@ fn start_failure_reason(server: Server, stderr: &str) -> String {
 }
 
 /// The supervisor thread: spawn, pump, restart, give up.
+#[allow(clippy::too_many_arguments)]
 fn supervise(
     server: Server,
     binary: PathBuf,
@@ -421,8 +556,18 @@ fn supervise(
     events: Sender<LspEvent>,
     stop: Arc<AtomicBool>,
     pending: Pending,
+    references: Arc<std::sync::atomic::AtomicU8>,
 ) {
-    supervise_lives(server, binary, roots, &outbox, &events, &stop, &pending);
+    supervise_lives(
+        server,
+        binary,
+        roots,
+        &outbox,
+        &events,
+        &stop,
+        &pending,
+        &references,
+    );
     /*
      * The last word on every waiter, wherever the supervisor exited.
      *
@@ -441,6 +586,7 @@ fn supervise(
     cancel_pending(&pending, RequestError::ServerGone);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn supervise_lives(
     server: Server,
     binary: PathBuf,
@@ -449,6 +595,7 @@ fn supervise_lives(
     events: &Sender<LspEvent>,
     stop: &Arc<AtomicBool>,
     pending: &Pending,
+    references: &Arc<std::sync::atomic::AtomicU8>,
 ) {
     let mut crashes: Vec<Instant> = Vec::new();
 
@@ -457,10 +604,23 @@ fn supervise_lives(
             return;
         }
 
+        /*
+         * Back to "nobody has said yet" before every life, not only the first.
+         *
+         * A new `Session` is built per life, so its capabilities start empty — and a flag left at
+         * the previous life's answer would be a claim about a process that has been replaced.
+         * That matters in exactly the direction that hurts: a crash-restart into a *different*
+         * binary (the toolchain moved, the user installed a build without the feature) would keep
+         * answering `Yes` from the corpse of the old one.
+         */
+        references.store(Capability::Unknown as u8, Ordering::Release);
+
         // Every exit inside `run_once` ends this life, so the waiters go here — once, around the
         // call, rather than at each of its four exits, which is how one of them gets missed.
         // `supervise` above repeats it for the paths that never reach this line at all.
-        let outcome = run_once(server, &binary, &roots, outbox, events, stop, pending);
+        let outcome = run_once(
+            server, &binary, &roots, outbox, events, stop, pending, references,
+        );
         cancel_pending(pending, RequestError::ServerGone);
         match outcome {
             Ok(()) => return,
@@ -548,6 +708,7 @@ fn supervise_lives(
 }
 
 /// One life of one server. `Ok(())` means an orderly stop; `Err` means it died.
+#[allow(clippy::too_many_arguments)]
 fn run_once(
     server: Server,
     binary: &PathBuf,
@@ -556,6 +717,7 @@ fn run_once(
     events: &Sender<LspEvent>,
     stop: &AtomicBool,
     pending: &Pending,
+    references: &Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<(), Failure> {
     let mut command = Command::new(binary);
     command
@@ -699,7 +861,22 @@ fn run_once(
                     if take_reply(pending, &message) {
                         continue;
                     }
+                    let handshook_before = session.ever_handshook();
                     let effects = session.on_message(&message);
+                    // Published on the one transition, rather than on every message: the answer
+                    // cannot change within a life, and re-reading a JSON object per
+                    // `publishDiagnostics` during a burst of hundreds is work for an answer
+                    // nobody asked a second time.
+                    if !handshook_before && session.ever_handshook() {
+                        references.store(
+                            if session.supports_references() {
+                                Capability::Yes as u8
+                            } else {
+                                Capability::No as u8
+                            },
+                            Ordering::Release,
+                        );
+                    }
                     if let Err(reason) = write(&mut stdin, effects, &mut ready_at) {
                         break Err(Failure { reason, ever_handshook: session.ever_handshook() });
                     }
@@ -992,6 +1169,7 @@ mod tests {
                 events,
                 stop,
                 Arc::clone(&pending),
+                Arc::new(std::sync::atomic::AtomicU8::new(Capability::Unknown as u8)),
             );
 
             assert_eq!(
@@ -1000,6 +1178,106 @@ mod tests {
                 "the waiter was left to time out on a server that never ran"
             );
             assert!(pending.lock().is_empty());
+        }
+
+        /// Every message the outbox is holding, drained.
+        fn drained(rx: &Receiver<Value>) -> Vec<Value> {
+            rx.try_iter().collect()
+        }
+
+        #[test]
+        fn a_timeout_also_tells_the_server_to_stop() {
+            // Without this the server keeps computing an answer nobody will read. On the
+            // five-second definition path that was a small leak; on a twenty-second
+            // whole-workspace references search it is the difference between one wasted search
+            // and one per identifier the user hovered on the way here.
+            let (requester, _pending, rx) = parts();
+            assert_eq!(
+                requester.request(
+                    "textDocument/references",
+                    json!({}),
+                    Duration::from_millis(50)
+                ),
+                Err(RequestError::Timeout)
+            );
+            let sent = drained(&rx);
+            let asked = sent[0]["id"].as_i64().expect("an id");
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert_eq!(sent[1]["method"], "$/cancelRequest");
+            assert_eq!(sent[1]["params"]["id"], asked);
+            assert!(sent[1].get("id").is_none(), "a cancel is a notification");
+        }
+
+        #[test]
+        fn cancelling_releases_the_waiter_at_once_and_tells_the_server() {
+            // Both halves. Only releasing the waiter leaves rust-analyzer searching a workspace
+            // for a popup that is gone; only sending the notification leaves a blocking-pool
+            // thread parked for the rest of a twenty-second deadline.
+            let (requester, pending, rx) = parts();
+            let waiter = {
+                let requester = requester.clone();
+                std::thread::spawn(move || {
+                    requester.request_tracked(
+                        "textDocument/references",
+                        json!({}),
+                        Duration::from_secs(30),
+                        |_| {},
+                    )
+                })
+            };
+            let id = rx.recv_timeout(Duration::from_secs(5)).expect("written")["id"]
+                .as_i64()
+                .expect("an id");
+            let started = Instant::now();
+            requester.cancel(id);
+            assert_eq!(waiter.join().expect("joined"), Err(RequestError::Cancelled));
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "it waited out its deadline instead of being released"
+            );
+            assert!(pending.lock().is_empty());
+            let sent = drained(&rx);
+            assert_eq!(sent[0]["method"], "$/cancelRequest");
+            assert_eq!(sent[0]["params"]["id"], id);
+        }
+
+        #[test]
+        fn a_cancellation_is_not_a_timeout() {
+            // Two variants and not one, because the caller renders them differently and must:
+            // a timeout is news the user should read, a cancellation is a key they just pressed.
+            assert_ne!(RequestError::Cancelled, RequestError::Timeout);
+        }
+
+        #[test]
+        fn the_id_reaches_the_caller_before_the_wait_starts() {
+            // The whole reason `request_tracked` exists. The allocator is private, so a caller
+            // that wants to cancel has no other way to learn the number — and learning it *after*
+            // the reply would be learning it too late.
+            let (requester, _pending, rx) = parts();
+            let seen: Arc<parking_lot::Mutex<Option<i64>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+            let recorder = Arc::clone(&seen);
+            let _ = requester.request_tracked(
+                "test/x",
+                json!({}),
+                Duration::from_millis(20),
+                move |id| *recorder.lock() = Some(id),
+            );
+            let written = rx.recv_timeout(Duration::from_secs(5)).expect("written")["id"]
+                .as_i64()
+                .expect("an id");
+            assert_eq!(*seen.lock(), Some(written));
+        }
+
+        #[test]
+        fn cancelling_an_id_nobody_is_waiting_on_is_harmless() {
+            // The dismissed-after-the-answer-landed race, which happens whenever a user hits
+            // Escape as the rows arrive. `$/cancelRequest` for an unknown id is a no-op in the
+            // protocol, so the notification still goes and nothing panics.
+            let (requester, pending, rx) = parts();
+            requester.cancel(4242);
+            assert!(pending.lock().is_empty());
+            assert_eq!(drained(&rx)[0]["params"]["id"], 4242);
         }
 
         #[test]
@@ -1108,6 +1386,19 @@ mod tests {
             READY_SETTLE > Duration::from_millis(100),
             "the pump's idle tick must be able to release a settled Ready"
         );
+    }
+
+    #[test]
+    fn an_unstarted_server_says_it_does_not_know_rather_than_no() {
+        // Three states, not two. A Find usages pressed 200 ms after launch must not be refused
+        // with "this server cannot find usages" about a server that is merely still shaking
+        // hands — the caller asks anyway on `None` and lets the deadline be the answer.
+        assert_eq!(Capability::from_u8(0), Capability::Unknown);
+        assert_eq!(Capability::from_u8(1), Capability::Yes);
+        assert_eq!(Capability::from_u8(2), Capability::No);
+        // Anything else is "we have not been told", which is the only safe reading of a byte
+        // written by a future version of the line above.
+        assert_eq!(Capability::from_u8(9), Capability::Unknown);
     }
 
     #[test]

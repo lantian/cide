@@ -20,7 +20,7 @@ pub mod workspace;
 
 pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
-pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
+pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
 pub use positions::ViewPosition;
 pub use settings::{
     ClaudeSettings, DEFAULT_CODE_FONT_SIZE, EditorSettings, GraphicsSettings, HighlightLevel,
@@ -30,7 +30,8 @@ pub use settings::{
     TerminalSettings, clamp_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
-    GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,
+    GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,
+    SettingsPatch,
 };
 pub use workspace::{
     DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, LayoutNode, MAX_RATIO,
@@ -62,7 +63,7 @@ pub mod symbols;
 
 pub use diagnostics::{
     DefinitionAnswer, Diagnostic, DiagnosticKind, DiagnosticSourceId, DiagnosticsSnapshot,
-    Severity, SourceReport, SourceStatus,
+    ProbeAnswer, Severity, SourceReport, SourceStatus, Usage, UsagesAnswer,
 };
 pub use symbols::{
     FileOutline, Symbol, SymbolFrame, SymbolIndexStatus, SymbolKind, SymbolRow, SymbolSpan,

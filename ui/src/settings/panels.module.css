@@ -13,12 +13,21 @@
   white-space: nowrap;
 }
 
+/* The filter and the one destructive button, on one line: the button is hard right so it is
+   nowhere near the pointer's path to the rows. */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
 .filter {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   max-width: 320px;
   height: 26px;
   padding: 0 9px;
-  margin-bottom: 12px;
   border: 1px solid var(--border);
   border-radius: 5px;
   background: var(--panel-2);
@@ -100,6 +109,166 @@
   color: var(--faint);
   margin-top: 16px;
   word-break: break-all;
+}
+
+/* The prose under the table. Not `.path`, which is mono and `break-all` because it holds a
+   filesystem path — a sentence set that way is unreadable. */
+.footnote {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--faint);
+  margin-top: 6px;
+}
+
+/* --- the keymap editor --- */
+
+.rowTitle {
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* The id under the title, because the id is what a `keymap.json` names and the title is what
+   the palette shows. A user reading this screen to write the file by hand needs both. */
+.rowId {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  margin-top: 1px;
+}
+
+.rowNote {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.actions {
+  /* Right-aligned and narrow: the buttons are the least important thing in the row until the
+     pointer is already on it. */
+  text-align: right;
+  white-space: nowrap;
+}
+
+.action {
+  height: 22px;
+  padding: 0 8px;
+  margin-left: 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.action:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.primary {
+  height: 22px;
+  padding: 0 10px;
+  margin-left: 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.primary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/*
+ * The recorder and the confirm box: `overlays/GoToLine.module.css`'s geometry, which is
+ * `chrome/Switcher.module.css`'s with a scrim added back. Deliberately not the 620px
+ * `OverlayCard`, which is a search surface — a card that wide holding one chord reads as a
+ * dialog that failed to load.
+ */
+.scrim {
+  position: fixed;
+  inset: 0;
+  /* The overlay layer: above the panes and the status bar, below context menus at 80. */
+  z-index: 60;
+  background: var(--scrim, rgba(0, 0, 0, 0.42));
+}
+
+.popup {
+  position: fixed;
+  /* Centred with a transform rather than by flexing the scrim, so the box does not move when
+     the hint under it grows a sentence. */
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+
+  width: 400px;
+  max-width: calc(100vw - 48px);
+  display: flex;
+  flex-direction: column;
+
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* The same uppercase label the switcher and Go to line use, so the small popups read as
+   siblings. */
+.head {
+  flex: none;
+  padding: 9px 14px 7px;
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/*
+ * The chord as it is captured. Big, centred, and its height reserved, so the box does not
+ * resize between "Press a shortcut…" and `⌃⇧O` — a popup that grows under the pointer is how a
+ * click aimed at Save lands on nothing.
+ */
+.capture {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52px;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 18px;
+  color: var(--text);
+}
+
+.hint {
+  padding: 0 14px 10px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--faint);
+}
+
+.buttons {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 10px 12px;
 }
 
 /* --- the graphics ladder --- */

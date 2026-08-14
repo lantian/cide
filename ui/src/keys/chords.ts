@@ -145,6 +145,14 @@ const ALIASES: Readonly<Record<string, string>> = {
   bslash: 'backslash',
   tilde: 'backquote',
   grave: 'backquote',
+  // The *shifted* face of the same physical key, and the one a user is most likely to write:
+  // the project switcher was asked for as "ctrl+~". `strokeFromEvent` reads `code` first, so no
+  // keystroke ever produces the token `~` and a binding spelled with it would be inert —
+  // exactly the silent failure this table exists to prevent. Folding it here is what makes the
+  // literal spelling mean the chord the user meant. It also means a `keymap.json` cannot
+  // distinguish Ctrl+` from Ctrl+Shift+` by writing the tilde; Shift is a modifier here and is
+  // written as one.
+  '~': 'backquote',
 }
 
 /** Fold one key name onto its canonical spelling. Total: unknown names pass through lowercased. */

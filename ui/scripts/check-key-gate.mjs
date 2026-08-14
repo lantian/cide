@@ -98,9 +98,12 @@ try {
       'src/keys/when.ts',
       'src/keys/keymap.ts',
       'src/keys/gate.ts',
-      // The switcher's capture is the gate's one stateful claim on a stroke, so the sweep
-      // below has to drive the real one rather than a stand-in that agrees with itself.
+      // The two stateful claims on a stroke, so the sweeps below drive the real rules rather
+      // than a stand-in that agrees with itself. The recorder is the modal one: while Settings
+      // → Keymap is waiting for a chord it consumes *everything*, which is a much stronger
+      // claim than the switcher's and therefore worth measuring at both entry points.
       'src/keys/switcher.ts',
+      'src/keys/recorder.ts',
       '--outDir', out,
       '--rootDir', 'src',
       '--module', 'commonjs',
@@ -122,6 +125,7 @@ try {
   const { chipLabel, normalizeSequence, strokeFromEvent } = require(join(out, 'keys/chords.js'))
   const { evaluateWhen } = require(join(out, 'keys/when.js'))
   const switcher = require(join(out, 'keys/switcher.js'))
+  const recorder = require(join(out, 'keys/recorder.js'))
 
   /* ------------------------------------------------------------------ the fixture keymap */
 
@@ -162,11 +166,23 @@ try {
     // keystroke that pulled. The sweep also pins that `ctrl+shift+t` still reaches
     // `theme.toggle` beside it rather than being shadowed by the shorter chord.
     { key: 'ctrl+t', command: 'git.pull', when: null },
-    // Ctrl+Tab is in the sweep's key list, so these two also cover the case that matters
-    // most for a Tab binding: both entry points must swallow it identically, or the stroke
-    // that switched projects also inserts a tab character into whatever had focus.
-    { key: 'ctrl+tab', command: 'project.switcher.next', when: null },
-    { key: 'ctrl+shift+tab', command: 'project.switcher.prev', when: null },
+    // M14. Ctrl+Tab is the *tab* switcher now, and the project switcher moved to Ctrl+`.
+    // `Tab`, `Backquote` and `Digit1` are all in the sweep's key list below, so these four
+    // cover the case that matters most for a walk binding: both entry points must swallow the
+    // chord identically, or the stroke that switched tabs also inserts a tab character into
+    // whatever had focus.
+    //
+    // All four carry `shellWindow`, which is why `CONTEXTS` below has a shell-window entry: a
+    // `when` nothing in the sweep satisfies is a binding the sweep never actually exercises.
+    { key: 'ctrl+tab', command: 'tab.switcher.next', when: 'shellWindow' },
+    { key: 'ctrl+shift+tab', command: 'tab.switcher.prev', when: 'shellWindow' },
+    { key: 'ctrl+`', command: 'project.switcher.next', when: 'shellWindow' },
+    { key: 'ctrl+1', command: 'tab.console', when: 'shellWindow' },
+    // M14. F4 toggles the left panel. xterm *encodes* F4 as `ESC O S`, so this is the one
+    // binding in the table whose whole cost is measured by the sweep below: both entry points
+    // must swallow it in a shell window and pass it through in a detached one, or `mc` and
+    // `htop` see a key press the user did not make.
+    { key: 'f4', command: 'sidebar.toggle', when: 'shellWindow' },
     { key: 'ctrl+alt+h', command: 'pane.navigate.left', when: null },
     { key: 'ctrl+alt+l', command: 'pane.navigate.right', when: null },
     { key: 'ctrl+alt+k', command: 'pane.navigate.up', when: null },
@@ -201,6 +217,11 @@ try {
     // It was missing from this fixture for a whole milestone because `rustDefaults()` above
     // could not see a 3-tuple — see the note there.
     { key: 'ctrl+b', command: 'navigate.definition', when: 'editorFocused' },
+    // M14. Find usages, on IDEA's chord. Scoped for the same reason ⌃B is, and it is not
+    // theoretical here: F7 encodes as `ESC [ 18 ~` and Alt+F7 as `ESC ESC [ 18 ~`, so an
+    // unconditional binding would take a key `mc` puts a menu on, in every terminal pane in every
+    // window. `F7` is in the sweep below, so both entry points are held to agreeing about it.
+    { key: 'alt+f7', command: 'navigate.usages', when: 'editorFocused' },
     // Go to line. Scoped for the same reason ⌃B is, and one sharper: `^G` is readline's abort,
     // so an unconditional binding would take the cancel key of every shell in every pane.
     // `KeyG` is in the sweep below, so both entry points are held to agreeing about it — and to
@@ -314,6 +335,15 @@ try {
     { code: 'KeyU', key: 'u' },
     // F3 is find-next inside CodeMirror, in the buffer and in the find field both. Unbound here.
     { code: 'F3', key: 'F3' },
+    // F4 is the panel toggle and its neighbour is not, which is the pair worth sweeping
+    // together: xterm encodes both, and a resolver that folded f-keys would take find-next from
+    // the find bar in exchange for a panel that already has a button.
+    { code: 'F4', key: 'F4' },
+    // M14. ⌥F7 is Find usages inside an editor and `ESC ESC [ 18 ~` — a key `mc` puts a menu on
+    // — everywhere else, so it is swept for exactly the reason ⌃B and ⌃G are: the claim worth
+    // measuring is that the *other fifteen* modifier combinations on this key are left alone, and
+    // that the one that is bound is passed through in a terminal.
+    { code: 'F7', key: 'F7' },
     { code: 'Digit1', key: '1' },
     { code: 'ArrowUp', key: 'ArrowUp' },
     { code: 'ArrowDown', key: 'ArrowDown' },
@@ -335,6 +365,19 @@ try {
     { editorFocused: true },
     { editorFocused: true, overlayOpen: true },
     { claudePaneFocused: true, repoOpen: true },
+    /*
+     * A shell window with a terminal focused, which is where every M14 binding is both
+     * *applicable* and *expensive*.
+     *
+     * Without a context that sets `shellWindow`, the five bindings that carry it would be swept
+     * only in states where their clause is false — so the sweep would prove that the two entry
+     * points agree about passing them through, and nothing at all about the state the binding
+     * exists for. `terminalFocused` beside it is the half that makes the claim worth having:
+     * F4 is `ESC O S` to a pty and Ctrl+Tab is a tab character, so "both entry points swallow
+     * them here, and neither swallows them in the `{}` context above" is the whole of what a
+     * user of `mc` in a detached pane is relying on.
+     */
+    { shellWindow: true, terminalFocused: true },
   ]
 
   const event = (spec) => ({
@@ -356,15 +399,20 @@ try {
   })
 
   /**
-   * A live project-switcher walk, wired the way `keys/switcherStore.ts` wires one.
+   * A live switcher walk, wired the way `keys/switcherStore.ts` wires one.
    *
    * The store's `switcherCapture` is four lines over `switcher.capture`, and those four lines
    * are reproduced here rather than imported because the store pulls in zustand, the IPC
    * client and the workspace mirror. What is *not* reproduced is the decision itself — that
    * comes from the compiled module, so a change to the capture rules is felt here.
+   *
+   * `key` is the walk's own opening key and defaults to Tab. It is a parameter because the
+   * capture compares against it rather than against the literal `'tab'` — which is what makes
+   * one implementation serve Ctrl+Tab and Ctrl+` — and because a walk built without it would
+   * quietly claim nothing at all.
    */
-  const walking = (order, hold) => {
-    let walk = { order, index: 1, hold }
+  const walking = (order, hold, key = 'tab') => {
+    let walk = { order, index: 1, hold, key }
     return {
       state: () => walk,
       capture: (stroke) => {
@@ -373,6 +421,42 @@ try {
         if (action.kind === 'advance') walk = switcher.advance(walk, action.step)
         else if (action.kind === 'cancel') walk = null
         return action.consumed
+      },
+    }
+  }
+
+  /**
+   * A live keystroke recorder, wired the way `keys/recorderStore.ts` wires one.
+   *
+   * Same arrangement as `walking` above and for the same reason: the four lines of the store
+   * are reproduced here because the store pulls in zustand and the workspace mirror, while the
+   * *decision* comes from the compiled module, so a change to the recorder's rules is felt in
+   * the sweep below.
+   *
+   * `armed` is what the popup being open corresponds to. Escape and Enter close it, which is
+   * why the sweep builds a fresh one per stroke.
+   */
+  const recording = (armedNow = true) => {
+    let armed = armedNow
+    let state = recorder.EMPTY
+    let saved = null
+    return {
+      state: () => (armed ? state : null),
+      saved: () => saved,
+      /** The click on *Edit*, as it would be without `startRecording`'s prefix reset. */
+      arm: () => {
+        armed = true
+      },
+      capture: (stroke) => {
+        if (!armed) return false
+        const action = recorder.capture(state, stroke)
+        if (action.kind === 'record') state = action.next
+        else if (action.kind === 'cancel') armed = false
+        else if (action.kind === 'commit') {
+          saved = recorder.sequenceOf(state)
+          armed = false
+        }
+        return true
       },
     }
   }
@@ -690,6 +774,185 @@ try {
     'swept the whole modifier × key space again with a walk open',
   )
 
+  /* ------------------------------- and a third time, with the keystroke recorder armed */
+
+  /*
+   * **While Settings → Keymap is recording, nothing else in the app may hear a keystroke.**
+   *
+   * This is the property the whole recorder design turns on, and it is the one a plausible
+   * implementation gets wrong: a dialog that listened for its own `keydown` would never see
+   * Ctrl+P at all, because the gate is a window **capture** listener and would have opened the
+   * file picker before the event reached the box asking the user to press a shortcut. So the
+   * recorder is the gate's `capture`, and while it is armed the claim is total.
+   *
+   * Total is exactly what is measured: over the whole modifier × key space, in every context,
+   * at both entry points — pass-through is always false, `preventDefault` is always called, and
+   * **no command is ever dispatched**. `ctrl+p` in the sweep below is the file picker not
+   * opening; `f4` is the sidebar not toggling; `ctrl+tab` is the tab switcher not opening
+   * behind the popup.
+   */
+  let recordedCompared = 0
+  for (const ctx of CONTEXTS) {
+    for (const spec of KEYS) {
+      for (let bits = 0; bits < 16; bits++) {
+        const mods = {
+          ctrl: (bits & 1) !== 0,
+          alt: (bits & 2) !== 0,
+          shift: (bits & 4) !== 0,
+          meta: (bits & 8) !== 0,
+        }
+        const label = `recorder armed: ${JSON.stringify(mods)} ${spec.code} in ${JSON.stringify(ctx)}`
+
+        const a = makeGate(ctx, recording())
+        const b = makeGate(ctx, recording())
+        const evA = event({ ...spec, ...mods })
+        const evB = event({ ...spec, ...mods })
+
+        const viaWindow = a.gate.windowHandler(evA)
+        const viaTerminal = b.gate.terminalHandler(evB)
+
+        recordedCompared += 1
+        if (viaWindow !== viaTerminal) {
+          fail(`entry points disagree on pass-through: ${label}`, `window=${viaWindow} terminal=${viaTerminal}`)
+        }
+        if (viaWindow !== false) {
+          fail(`a stroke escaped the recorder: ${label}`)
+        }
+        if (a.dispatched.length !== 0 || b.dispatched.length !== 0) {
+          fail(
+            `a command ran while a chord was being recorded: ${label}`,
+            `window=${JSON.stringify(a.dispatched)} terminal=${JSON.stringify(b.dispatched)}`,
+          )
+        }
+        if (JSON.stringify(a.walk.state()) !== JSON.stringify(b.walk.state())) {
+          fail(
+            `entry points left the recorder in different states: ${label}`,
+            `window=${JSON.stringify(a.walk.state())} terminal=${JSON.stringify(b.walk.state())}`,
+          )
+        }
+        if (evA.prevented === 0) fail(`window entry did not preventDefault: ${label}`)
+        if (evB.prevented === 0) fail(`terminal entry did not preventDefault: ${label}`)
+        if (evB.stopped !== 0) fail(`terminal entry called stopPropagation: ${label}`)
+      }
+    }
+  }
+  ok(
+    recordedCompared === CONTEXTS.length * KEYS.length * 16,
+    'swept the whole modifier × key space a third time with the recorder armed',
+  )
+
+  /* What the recorder does with the four strokes that are not simply data. */
+  {
+    // Ctrl+P is recorded rather than opening the picker — the whole point.
+    const g = makeGate({ terminalFocused: true }, recording())
+    eq(
+      g.gate.terminalHandler(event({ code: 'KeyP', key: 'p', ctrl: true })),
+      false,
+      'ctrl+p is captured before the pty and before the keymap',
+    )
+    eq(g.dispatched.length, 0, 'and the file picker does not open')
+    eq(g.walk.state().strokes.join(' '), 'ctrl+p', 'it was recorded')
+
+    // A fumbled second chord replaces; it does not silently become a two-stroke sequence.
+    g.gate.terminalHandler(event({ code: 'KeyO', key: 'o', ctrl: true, shift: true }))
+    eq(g.walk.state().strokes.join(' '), 'ctrl+shift+o', 'a second press replaces the first')
+  }
+  {
+    // …unless a second stroke was asked for, which is what makes `ctrl+k ctrl+s` recordable.
+    const g = makeGate({}, recording())
+    g.gate.windowHandler(event({ code: 'KeyK', key: 'k', ctrl: true }))
+    eq(g.gate.pending(), null, 'a recorded ctrl+k does not arm the gate’s own prefix machine')
+    const extended = recorder.extend(g.walk.state())
+    eq(extended.extending, true, 'the “+ second stroke” button opens the slot')
+    eq(
+      recorder.record(extended, 'ctrl+s').strokes.join(' '),
+      'ctrl+k ctrl+s',
+      'and the next stroke extends',
+    )
+  }
+  {
+    // Escape closes and is swallowed, so it never reaches a terminal as `^[`.
+    const g = makeGate({ terminalFocused: true }, recording())
+    eq(
+      g.gate.terminalHandler(event({ code: 'Escape', key: 'Escape' })),
+      false,
+      'escape during a recording is swallowed',
+    )
+    eq(g.walk.state(), null, 'and closes the recorder')
+    eq(g.saved, undefined, 'writing nothing')
+  }
+  {
+    // Enter saves what is there; Enter with nothing recorded does nothing at all.
+    const empty = makeGate({}, recording())
+    eq(empty.gate.windowHandler(event({ code: 'Enter', key: 'Enter' })), false, 'enter is ours')
+    ok(
+      empty.walk.state() !== null,
+      'and an empty recording is not saveable — the popup stays up rather than writing nothing',
+    )
+    eq(empty.walk.state()?.strokes.length ?? -1, 0, 'with nothing recorded')
+    eq(empty.walk.saved(), null, 'so nothing was written')
+
+    const full = makeGate({}, recording())
+    full.gate.windowHandler(event({ code: 'KeyO', key: 'o', ctrl: true, shift: true }))
+    full.gate.windowHandler(event({ code: 'Enter', key: 'Enter' }))
+    eq(full.walk.saved(), 'ctrl+shift+o', 'enter saves the chord')
+    eq(full.walk.state(), null, 'and closes')
+  }
+  {
+    // The modified spellings stay recordable, which is what keeps the cost of the two above
+    // bounded: only *bare* Enter and *bare* Escape are unreachable from this screen.
+    for (const spec of [
+      { code: 'Escape', key: 'Escape', shift: true },
+      { code: 'Enter', key: 'Enter', ctrl: true },
+      { code: 'Tab', key: 'Tab' },
+      { code: 'Space', key: ' ' },
+    ]) {
+      const g = makeGate({ shellWindow: true }, recording())
+      g.gate.windowHandler(event(spec))
+      ok(
+        g.walk.state() !== null && g.walk.state().strokes.length === 1,
+        `${spec.code}${spec.shift === true ? '+shift' : ''}${spec.ctrl === true ? '+ctrl' : ''} is data, not a verb`,
+      )
+      eq(g.dispatched.length, 0, 'and ran no command')
+    }
+  }
+  {
+    /*
+     * **An armed prefix outranks the recorder, which is why arming has to reset it.**
+     *
+     * The gate's documented order is `an armed prefix > the capture > the keymap`, and it is
+     * right: a half-typed `ctrl+k` is a sequence the user has already started. The consequence
+     * for this feature is the hole reproduced here — a `ctrl+k` typed *before* the click on
+     * *Edit* is still armed when the popup opens, so the first stroke the user means to record
+     * completes somebody else's sequence and runs a command instead.
+     *
+     * The gate is not the place to fix it (changing that order would strand a half-typed
+     * sequence), so `startRecording` calls `currentKeyGate()?.reset()` and
+     * `check-keymap.mjs` pins that line. This block is the proof that the line is load-bearing:
+     * it arms a recorder the way a click would *without* the reset, and watches the stroke go
+     * somewhere else.
+     */
+    const claim = recording(false)
+    const g = makeGate({}, claim)
+    eq(g.gate.windowHandler(event({ code: 'KeyK', key: 'k', ctrl: true })), false, 'ctrl+k arms')
+    eq(g.gate.pending(), 'ctrl+k', 'the prefix is live')
+    claim.arm()
+    eq(g.gate.windowHandler(event({ code: 'KeyS', key: 's', ctrl: true })), false, 'the second stroke completes')
+    eq(g.dispatched[0]?.command, 'settings.keymap', 'and runs the sequence rather than being recorded')
+    eq(claim.state().strokes.length, 0, 'the recorder never saw it — hence the reset on arm')
+
+    // With the prefix cleared first, which is what the store actually does, the same stroke is
+    // recorded and nothing runs.
+    const clean = recording(false)
+    const h = makeGate({}, clean)
+    h.gate.windowHandler(event({ code: 'KeyK', key: 'k', ctrl: true }))
+    h.gate.reset()
+    clean.arm()
+    h.gate.windowHandler(event({ code: 'KeyS', key: 's', ctrl: true }))
+    eq(h.dispatched.length, 0, 'nothing ran')
+    eq(clean.state().strokes.join(' '), 'ctrl+s', 'and the stroke was recorded')
+  }
+
   /* The specific things the capture must and must not do. */
   {
     // Tab, with the hold down, is the switcher's — swallowed, and the keymap never sees it,
@@ -779,9 +1042,12 @@ try {
     g.gate.windowHandler(event({ code: 'KeyP', key: 'p', ctrl: true }))
     eq(currentStroke(), null, 'no stroke is published outside a dispatch')
 
+    // `shellWindow`, because the switcher bindings carry that clause since M14 and a gate whose
+    // context does not satisfy it dispatches nothing at all — which would leave this block
+    // asserting that an empty log equals an empty log.
     const publishing = createKeyGate({
       bindings: () => BINDINGS,
-      context: () => ({}),
+      context: () => ({ shellWindow: true }),
       run: () => seenDuring.push(currentStroke()),
     })
     publishing.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true }))
@@ -794,7 +1060,7 @@ try {
     // invocation believe a modifier was being held.
     const throwing = createKeyGate({
       bindings: () => BINDINGS,
-      context: () => ({}),
+      context: () => ({ shellWindow: true }),
       run: () => {
         throw new Error('handler blew up')
       },
@@ -811,13 +1077,130 @@ try {
 
   {
     // A gate with no capture at all behaves exactly as it did before this feature existed.
-    const bare = makeGate({})
+    const bare = makeGate({ shellWindow: true })
     eq(
       bare.gate.windowHandler(event({ code: 'Tab', key: 'Tab', ctrl: true })),
       false,
       'with no walk open, ctrl+tab is an ordinary binding',
     )
-    eq(bare.dispatched[0]?.command, 'project.switcher.next', 'and it opens the switcher')
+    eq(bare.dispatched[0]?.command, 'tab.switcher.next', 'and it opens the tab switcher')
+  }
+
+  /* ------------------------------------------------ the M14 chords, and what each one costs */
+
+  {
+    /*
+     * **Ctrl+` is the project switcher, and Ctrl+Shift+` still splits a terminal.**
+     *
+     * The two are one Shift apart and mean unrelated things, which is exactly the pair a
+     * resolver gets wrong by folding Shift away — and the failure is silent in the worst
+     * direction: the switcher would split a terminal every time somebody walked backwards.
+     * `Backquote` is already in the sweep above, so agreement between the entry points is
+     * measured; this pins *which way* they agree.
+     *
+     * The `key: '~'` on the shifted press is not decoration. That is what a US layout actually
+     * reports for Shift and this key, and reading `code` rather than `key` is the whole reason
+     * the shipped `terminal.splitBelow` binding works at all.
+     */
+    const shell = makeGate({ shellWindow: true, terminalFocused: true })
+    eq(
+      shell.gate.terminalHandler(event({ code: 'Backquote', key: '`', ctrl: true })),
+      false,
+      'ctrl+` is claimed in a shell window, before the pty',
+    )
+    eq(shell.dispatched[0]?.command, 'project.switcher.next', 'and it opens the project switcher')
+
+    const split = makeGate({ shellWindow: true, terminalFocused: true })
+    split.gate.windowHandler(event({ code: 'Backquote', key: '~', ctrl: true, shift: true }))
+    eq(split.dispatched[0]?.command, 'terminal.splitBelow', 'and one Shift away still splits')
+
+    // A user's `keymap.json` may spell the same key as the literal tilde — which is what the
+    // request for this chord said — and `ALIASES` folds it onto the same token the event
+    // produces. Without that entry the binding would be inert with nothing reporting it.
+    eq(normalizeSequence('ctrl+~'), 'ctrl+backquote', 'a written tilde folds onto the named key')
+    eq(normalizeSequence('ctrl+tilde'), 'ctrl+backquote', 'as do the two spellings beside it')
+    eq(normalizeSequence('ctrl+grave'), 'ctrl+backquote')
+  }
+
+  {
+    /*
+     * **A project walk is opened by Ctrl+`, so Ctrl+` is what walks it — including backwards.**
+     *
+     * This is the assertion the capture's parameterisation exists for. With the walk key
+     * hard-coded to `'tab'`, a second Ctrl+` would fall through to the keymap (and work by
+     * accident, as one more dispatch) while `ctrl+shift+` resolved to `terminal.splitBelow` —
+     * so walking a project switcher backwards would split a terminal, mid-gesture, in the
+     * window the user is looking at.
+     */
+    const g = makeGate(
+      { shellWindow: true, terminalFocused: true },
+      walking(['p1', 'p2', 'p3'], CTRL, 'backquote'),
+    )
+    eq(
+      g.gate.terminalHandler(event({ code: 'Backquote', key: '`', ctrl: true })),
+      false,
+      'ctrl+` during a project walk is swallowed before the pty',
+    )
+    eq(g.walk.state().index, 2, 'and advances the walk')
+    eq(
+      g.gate.terminalHandler(event({ code: 'Backquote', key: '~', ctrl: true, shift: true })),
+      false,
+      'ctrl+shift+` is the switcher’s too, for as long as the popup is up',
+    )
+    eq(g.walk.state().index, 1, 'and walks back')
+    eq(g.dispatched.length, 0, 'nothing was dispatched — no terminal was split')
+
+    // …and Tab is not the project walk's key, so it goes to the keymap as usual.
+    eq(
+      g.gate.terminalHandler(event({ code: 'Tab', key: 'Tab', ctrl: true })),
+      false,
+      'ctrl+tab during a project walk resolves through the keymap',
+    )
+    eq(g.dispatched[0]?.command, 'tab.switcher.next', 'to the tab switcher')
+  }
+
+  {
+    /*
+     * **F4 toggles the panel in a shell window and reaches the pty everywhere else.**
+     *
+     * The clause is the whole of this binding's manners. xterm encodes F4 as `ESC O S`, and the
+     * gate is a window capture listener, so an unscoped binding would take the key from `mc` and
+     * `htop` in a torn-out terminal window that has no sidebar to toggle in the first place.
+     *
+     * Ctrl+1 is asserted in the same shape beside it, and F3 below it: F3 is find-next inside
+     * CodeMirror and is bound by nothing, so "the neighbouring f-key still reaches the buffer"
+     * is measured rather than assumed.
+     */
+    for (const [spec, command] of [
+      [{ code: 'F4', key: 'F4' }, 'sidebar.toggle'],
+      [{ code: 'Digit1', key: '1', ctrl: true }, 'tab.console'],
+    ]) {
+      const shell = makeGate({ shellWindow: true, terminalFocused: true })
+      eq(
+        shell.gate.terminalHandler(event(spec)),
+        false,
+        `${command} claims its chord in a shell window`,
+      )
+      eq(shell.dispatched[0]?.command, command, `and runs ${command}`)
+
+      const detached = makeGate({ terminalFocused: true })
+      const ev = event(spec)
+      eq(
+        detached.gate.terminalHandler(ev),
+        true,
+        `and reaches the pty in a window with no sidebar (${command})`,
+      )
+      eq(ev.prevented, 0, 'keeping its default action')
+      eq(detached.dispatched.length, 0, 'and running nothing')
+    }
+
+    for (const ctx of CONTEXTS) {
+      const w = makeGate(ctx)
+      const t = makeGate(ctx)
+      eq(w.gate.windowHandler(event({ code: 'F3', key: 'F3' })), true, 'F3 stays the find bar’s')
+      eq(t.gate.terminalHandler(event({ code: 'F3', key: 'F3' })), true, 'at both entry points')
+      eq(w.dispatched.length + t.dispatched.length, 0, 'and runs no command')
+    }
   }
 
   /* ------------------------------------------------------------------ specific claims */
@@ -919,6 +1302,36 @@ try {
     eq(term.gate.terminalHandler(ev), true, 'ctrl+g reaches the pty with a terminal focused')
     eq(ev.prevented, 0, 'and keeps its default action — ^G is readline abort')
     eq(term.dispatched.length, 0, 'nothing ran')
+  }
+
+  /*
+   * **⌥F7 finds usages in an editor and reaches the pty everywhere else.** (M14)
+   *
+   * Same shape as ⌃B and ⌃G above, and it earns its own block for the same reason theirs do: the
+   * sweep proves the two entry points *agree*, and only this pins which way. F7 is a byte a
+   * terminal application genuinely wants — `mc` puts its menu on the F keys — so an unscoped
+   * binding would take it in every terminal pane in every window, and the failure would be
+   * invisible to anyone not running one.
+   *
+   * The bare F7 assertion is the other half: nothing in the table binds it, so the gate must leave
+   * find-next-style F-key traffic alone rather than folding F7 onto ⌥F7.
+   */
+  {
+    const spec = { code: 'F7', key: 'F7', alt: true }
+    const editor = makeGate({ editorFocused: true })
+    eq(editor.gate.windowHandler(event(spec)), false, 'alt+f7 is claimed with an editor focused')
+    eq(editor.dispatched[0]?.command, 'navigate.usages', 'and it runs Find usages')
+
+    const term = makeGate({ terminalFocused: true })
+    const ev = event(spec)
+    eq(term.gate.terminalHandler(ev), true, 'alt+f7 reaches the pty with a terminal focused')
+    eq(ev.prevented, 0, 'keeping its default action — ESC ESC [ 18 ~ is a key mc reads')
+    eq(term.dispatched.length, 0, 'nothing ran')
+
+    const bare = makeGate({ editorFocused: true })
+    const plain = event({ code: 'F7', key: 'F7' })
+    eq(bare.gate.windowHandler(plain), true, 'bare F7 is bound to nothing and passes through')
+    eq(bare.dispatched.length, 0, 'and dispatches nothing')
   }
 
   // One event object seen by both entry points dispatches once, not twice.
@@ -1163,8 +1576,9 @@ try {
     process.exit(1)
   }
   console.log(
-    `check-key-gate: ok (${compared + capturedCompared} chords through the keyboard entry ` +
-      `points, ${capturedCompared} of them with a switcher walk open; ${mouseSwept} thumb-button ` +
+    `check-key-gate: ok (${compared + capturedCompared + recordedCompared} chords through the ` +
+      `keyboard entry points, ${capturedCompared} of them with a switcher walk open and ` +
+      `${recordedCompared} with the keystroke recorder armed; ${mouseSwept} thumb-button ` +
       'presses through the third)',
   )
 } finally {

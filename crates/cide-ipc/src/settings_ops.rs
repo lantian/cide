@@ -117,6 +117,11 @@ pub struct KeymapProblem {
     pub message: String,
 }
 
+/// `serde(default)` for [`KeymapReport::readable`]. A bare `true` is not a path serde accepts.
+fn yes() -> bool {
+    true
+}
+
 /// Everything Settings → Keymap draws.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -129,9 +134,54 @@ pub struct KeymapReport {
     pub conflicts: Vec<KeymapConflict>,
     /// Lines in the user's file that did not do what they look like they do.
     pub problems: Vec<KeymapProblem>,
+    /// The user's `keymap.json`, verbatim and in file order.
+    ///
+    /// [`bindings`](Self::bindings) is the *result* of layering and cannot answer "what has
+    /// this user changed", because the most interesting override produces no resolved binding
+    /// at all: a `-command` entry removes a default and then appears nowhere. Without this
+    /// field a user who unbound Ctrl+T has an override that is invisible on the screen that
+    /// exists to show it, and no row to press *Restore default* on.
+    ///
+    /// In file order because order is semantically load-bearing — `apply_layer` walks entries
+    /// in sequence and a removal only matches what is already accumulated — so an editor that
+    /// rebuilt the file from a sorted copy of this would change what it means.
+    pub overrides: Vec<crate::Binding>,
+    /// Whether `keymap.json` could be read at all.
+    ///
+    /// **Not derivable from [`overrides`](Self::overrides), and that gap disabled the one control
+    /// that could fix an unreadable file.** A parse failure resolves to an empty override list so
+    /// the screen still shows every default — which makes "the file does not parse" and "this is a
+    /// fresh install" the same value. *Reset all* was greyed out on an empty list, so a user whose
+    /// file had one stray comment was told by `keymap_edit` to "use Reset all to replace it" and
+    /// then found it disabled: every route to repair closed, on the screen that exists to repair.
+    ///
+    /// Defaulted to `true` so an older persisted report deserialises as readable, which is the
+    /// state that was previously assumed everywhere.
+    #[serde(default = "yes")]
+    pub readable: bool,
     /// Where the overrides file lives, so the screen can name it. It need not exist — a
     /// fresh install has no overrides, which is not an error.
     pub path: String,
+}
+
+/// What one `keymap_edit` call did, and the state of the keymap afterwards.
+///
+/// The counts are the whole reason this is not just a [`KeymapReport`]. The failure a keymap
+/// editor has to be loud about is the edit that *matched nothing* — a *Restore default* whose
+/// `when` did not line up with the entries it was aimed at changes no file, resolves to the
+/// same table, and is indistinguishable on screen from one that worked. `removed: 0` is the
+/// difference, and it is the same argument `resolve_with_diagnostics` makes for reporting a
+/// recovery rather than performing it silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KeymapEditResult {
+    /// Entries deleted from `keymap.json`.
+    pub removed: u32,
+    /// Entries appended to it, the `-command` removals included.
+    pub added: u32,
+    /// The keymap as it now stands, so the screen never has to re-fetch to draw what it did.
+    pub report: KeymapReport,
 }
 
 /// One rung of the Linux graphics ladder.

@@ -15,8 +15,10 @@ import { GoToLine } from './GoToLine'
 import { ScratchType } from './ScratchType'
 import { StructurePicker } from './StructurePicker'
 import { SymbolPicker } from './SymbolPicker'
+import { UsagesPopup } from './UsagesPopup'
 import { focusedCaret } from '@/editor/caretTrack'
 import { useOverlays } from './store'
+import { useUsages } from './usagesStore'
 import type { KeyContext, Keymap } from '@/keys/keymap'
 import type { Command, ProjectId } from '@/ipc/client'
 
@@ -69,6 +71,11 @@ export interface OverlayHostProps {
   actions: OverlayActions
 }
 
+/** Which project the live Find usages belongs to, read outside React for the guard effect. */
+function usagesProject(): string | null {
+  return useUsages.getState().project
+}
+
 export function OverlayHost({ project, commands, keymap, context, actions }: OverlayHostProps) {
   const open = useOverlays((s) => s.open)
   const close = useOverlays((s) => s.close)
@@ -100,6 +107,17 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
     // without one. Closed rather than rendered `null`, for the reason above: a store left open
     // with nothing on screen makes `overlayOpen()` lie, and the next ⇧⌥S toggles a phantom shut.
     if (open === 'scratch' && project === null) close()
+    /*
+     * Find usages needs a project to have been searched against, and `usagesStore` only holds one
+     * while a search is live or its rows are up. Closed rather than rendered empty, for the reason
+     * above — a store left open with nothing on screen makes `overlayOpen()` lie, and every
+     * `!overlayOpen` binding is silently gated off behind an invisible modal.
+     *
+     * This is also the arm that catches a project closing under a running search: the popup
+     * unmounts, and its unmount effect cancels the request rather than leaving rust-analyzer
+     * searching a workspace nobody is looking at.
+     */
+    if (open === 'usages' && (project === null || usagesProject() === null)) close()
   }, [open, project, close])
 
   if (open === null) return null
@@ -150,6 +168,15 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
     // note in the effect.
     if (focusedCaret() === null) return null
     return <GoToLine onDismiss={close} onGoTo={actions.goToLine} />
+  }
+
+  if (open === 'usages') {
+    // Until the effect above runs. One frame, and it draws nothing.
+    if (project === null) return null
+    // `goToSymbol`, deliberately: a usage jump and a symbol jump are the same gesture — reveal
+    // with a selection over the identifier, then open — and the reveal flags (`focus`, `align`)
+    // are decisions this popup has no business making differently from the other three pickers.
+    return <UsagesPopup onDismiss={close} onGoTo={actions.goToSymbol} />
   }
 
   return (

@@ -81,6 +81,14 @@ impl DiagnosticsRegistry {
     }
 }
 
+/// The Find usages request that is in flight for this project, if any.
+///
+/// **One per project, so no id has to cross the IPC boundary.** A second Find usages supersedes the
+/// first — the popup only shows one list — and Escape cancels whatever is outstanding, so the
+/// webview never needs to name a request. Handing an id to the frontend would mean the frontend
+/// holding a number whose only valid use is passing it straight back.
+type Outstanding = Mutex<Option<(cide_lsp::Requester, i64)>>;
+
 /// One project's servers and store.
 pub struct ProjectDiagnostics {
     project: ProjectId,
@@ -89,6 +97,7 @@ pub struct ProjectDiagnostics {
     handles: Arc<Mutex<Vec<LspHandle>>>,
     stop: Arc<AtomicBool>,
     pump: Mutex<Option<std::thread::JoinHandle<()>>>,
+    usages_in_flight: Outstanding,
 }
 
 impl ProjectDiagnostics {
@@ -150,6 +159,7 @@ impl ProjectDiagnostics {
             handles,
             stop,
             pump: Mutex::new(pump),
+            usages_in_flight: Mutex::new(None),
         }
     }
 
@@ -219,39 +229,16 @@ impl ProjectDiagnostics {
     ) -> cide_ipc::DefinitionAnswer {
         use cide_ipc::DefinitionAnswer;
 
-        let Some(server) = server_for(path) else {
-            return DefinitionAnswer::Unavailable {
-                reason:
-                    "cide has no language server for this file type. Rust and Go are supported."
-                        .to_string(),
-            };
+        let (server, requester) = match self.requester_for(path) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                return DefinitionAnswer::Unavailable {
+                    reason: missing.sentence("Go to definition"),
+                };
+            }
         };
 
-        let requester = {
-            let handles = self.handles.lock();
-            handles
-                .iter()
-                .find(|handle| handle.server() == server)
-                .map(cide_lsp::LspHandle::requester)
-        };
-        let Some(requester) = requester else {
-            return DefinitionAnswer::Unavailable {
-                reason: format!(
-                    "{} is not running for this project. Go to definition needs it.",
-                    server.binary()
-                ),
-            };
-        };
-
-        // 0-based on the wire, and the column stays UTF-16 — the same conversion `to_lsp` makes,
-        // `saturating_sub` included, because a caret at column 1 must not underflow to u32::MAX.
-        let params = serde_json::json!({
-            "textDocument": { "uri": cide_lsp::convert::path_to_uri(path) },
-            "position": {
-                "line": line.saturating_sub(1),
-                "character": column.saturating_sub(1),
-            },
-        });
+        let params = position_params(path, line, column);
 
         match requester.request("textDocument/definition", params, timeout) {
             Ok(value) => match cide_lsp::convert::location(&value) {
@@ -276,6 +263,333 @@ impl ProjectDiagnostics {
             Err(error) => DefinitionAnswer::Unavailable {
                 reason: format!("{}: {error}", server.binary()),
             },
+        }
+    }
+
+    /// Is the caret on a declaration or on a reference? What a Ctrl+click is about to do.
+    ///
+    /// **Blocks for up to `timeout`.** Same rules as [`Self::definition`]: blocking pool only, and
+    /// the handles lock is taken to clone a `Requester` and then dropped.
+    ///
+    /// # The discriminator, and what it costs when it is wrong
+    ///
+    /// *"The definition is where I already am."* Ask `textDocument/definition` — the request
+    /// Ctrl+click already made — and compare the reply against the position asked about. Same file,
+    /// and the caret inside the returned range, means the caret **is** the declaration.
+    ///
+    /// That is VS Code's rule verbatim (`DefinitionAction` falls through to
+    /// `editor.gotoLocation.alternativeDefinitionCommand`, whose default is `goToReferences`), and
+    /// it is right for both servers this app ships: rust-analyzer resolves a declaring identifier
+    /// to its own position, and gopls maps a declaring ident to its own object position.
+    ///
+    /// Cost profile, which is the reason it beats the alternatives: **on a reference — the common
+    /// case — it is free**, because it is the one request that was already being made. Only on a
+    /// declaration is anything extra paid, and there the extra is a definition round trip in front
+    /// of a references search that dwarfs it.
+    ///
+    /// Wrong in each direction, honestly:
+    ///
+    /// * **"Declaration" when it was a reference.** Needs a server to answer a non-declaration with
+    ///   the caret's own position; neither shipped server does that short of a bug. Cost: a usages
+    ///   popup instead of a jump. One Escape, nothing moved.
+    /// * **"Reference" when it was a declaration.** Real and reachable: `fn fmt` inside
+    ///   `impl Display for Foo` resolves to the *trait's* `fn fmt`, so Ctrl+click on it jumps to
+    ///   the trait rather than listing implementations. Cost: a jump the user did not ask for —
+    ///   which is why the jump goes on the Back stack, and why `navigate.usages` exists as its own
+    ///   bindable command that skips this function entirely. That command is not optional; it is
+    ///   the only honest answer to "the discriminator guessed wrong".
+    ///
+    /// # Why this is in Rust and not in the webview
+    ///
+    /// The containment test needs the reply's `range.end`, and `convert::location` deliberately
+    /// throws the end away. Doing it above would mean widening `DefinitionAnswer` with an end that
+    /// `goToDefinition` must not believe, and re-implementing path canonicalisation in TypeScript.
+    pub fn probe(
+        &self,
+        path: &std::path::Path,
+        line: u32,
+        column: u32,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::ProbeAnswer {
+        use cide_ipc::ProbeAnswer;
+
+        let (server, requester) = match self.requester_for(path) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                return ProbeAnswer::Unavailable {
+                    reason: missing.sentence("Go to definition"),
+                };
+            }
+        };
+
+        let params = position_params(path, line, column);
+
+        match requester.request("textDocument/definition", params, timeout) {
+            Ok(value) => match cide_lsp::convert::first_location(&value) {
+                Some(target) => {
+                    if same_file(&target.path, path) && contains(&target, line, column) {
+                        ProbeAnswer::Declaration
+                    } else {
+                        ProbeAnswer::Definition {
+                            path: target.path.to_string_lossy().to_string(),
+                            line: target.line,
+                            column: target.column,
+                        }
+                    }
+                }
+                // `null`, `[]`, or a `rust-analyzer://` URI with no file behind it — a keyword, a
+                // comment, punctuation. Not a malfunction; the hover simply draws nothing.
+                None => ProbeAnswer::NotFound,
+            },
+            // A cancellation is the caller's own doing, so it says nothing the user has to read —
+            // but it must not be reported as "no declaration here" either, or a superseded hover
+            // would poison the cache with a wrong answer.
+            Err(cide_lsp::RequestError::Cancelled) => ProbeAnswer::Unavailable {
+                reason: "The lookup was cancelled.".to_string(),
+            },
+            Err(cide_lsp::RequestError::Timeout) => ProbeAnswer::Unavailable {
+                reason: format!(
+                    "{} did not answer in time — it is probably still indexing. Try again in a moment.",
+                    server.binary()
+                ),
+            },
+            Err(error) => ProbeAnswer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
+    /// Every place the symbol at this position is used.
+    ///
+    /// **Blocks for up to `timeout`**, which for this one is tens of seconds — see
+    /// `cmd::diagnostics::USAGES_TIMEOUT`. Blocking pool only, and the handles lock is dropped
+    /// before the wait, which matters far more here than on the definition path: holding it would
+    /// freeze the project's diagnostics for twenty seconds and hard-deadlock a concurrent restart.
+    ///
+    /// The request is registered in [`Self::usages_in_flight`] before the wait, so
+    /// [`Self::cancel_usages`] can release this thread *and* stop the server. A second call
+    /// supersedes the first for the same reason the popup shows one list.
+    pub fn usages(
+        &self,
+        path: &std::path::Path,
+        line: u32,
+        column: u32,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::UsagesAnswer {
+        use cide_ipc::UsagesAnswer;
+
+        let (server, requester) = match self.requester_for(path) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                return UsagesAnswer::Unavailable {
+                    reason: missing.sentence("Find usages"),
+                };
+            }
+        };
+
+        /*
+         * The one case worth refusing outright.
+         *
+         * `Some(false)` means the server answered `initialize` and did not offer
+         * `referencesProvider`. Asking anyway would spend the whole deadline and then report
+         * "probably still indexing" about a feature that was never going to arrive — precisely
+         * the lie `RequestError`'s three variants exist to prevent, one layer up.
+         *
+         * `None` — the handshake has not finished — is deliberately **not** refused. A Find usages
+         * pressed a moment after launch would otherwise be told the server cannot do it, which is
+         * the one sentence that is certainly wrong. Ask; let the deadline answer.
+         */
+        let known = {
+            let handles = self.handles.lock();
+            handles
+                .iter()
+                .find(|handle| handle.server() == server)
+                .and_then(cide_lsp::LspHandle::supports_references)
+        };
+        if known == Some(false) {
+            return UsagesAnswer::Unavailable {
+                reason: format!(
+                    "{} does not offer Find usages. It answered the handshake without \
+                     `referencesProvider`.",
+                    server.binary()
+                ),
+            };
+        }
+
+        let mut params = position_params(path, line, column);
+        /*
+         * `includeDeclaration: false`, **and** the origin is filtered out of the reply below.
+         *
+         * Belt and braces on purpose: gopls has historically returned the declaration whatever the
+         * flag said, and a list whose first row is "where you already are" is the one row that is
+         * certainly useless — the user is looking at it.
+         */
+        params["context"] = serde_json::json!({ "includeDeclaration": false });
+
+        // Superseding: whatever was outstanding is cancelled before this one is registered. The
+        // lock is taken inside `announce` and released there — never held across the wait.
+        self.cancel_usages();
+        let slot = &self.usages_in_flight;
+        let mine = std::cell::Cell::new(0i64);
+        let answer = requester.request_tracked("textDocument/references", params, timeout, |id| {
+            mine.set(id);
+            *slot.lock() = Some((requester.clone(), id));
+        });
+        /*
+         * Clear the slot, but only if it is still ours.
+         *
+         * A blind `take()` here is the race that matters: a second Find usages started while this
+         * one was waiting has already cancelled us, put *its* id in the slot, and is now blocked —
+         * and our cleanup would forget it, leaving Escape with nothing to cancel and the server
+         * searching the workspace with nobody able to stop it.
+         */
+        {
+            let mut in_flight = slot.lock();
+            if in_flight.as_ref().map(|(_, id)| *id) == Some(mine.get()) {
+                *in_flight = None;
+            }
+        }
+
+        match answer {
+            Ok(value) => match cide_lsp::convert::locations(&value) {
+                Some(rows) => {
+                    let (rows, truncated) = self.rows_from(rows, path, line, column);
+                    UsagesAnswer::Found { rows, truncated }
+                }
+                // `null`: there is no symbol at this position at all. Different from an empty
+                // list, and the popup says a different sentence for each.
+                None => UsagesAnswer::NotFound,
+            },
+            // Dismissed, or superseded. The caller drops it silently — narrating a key the user
+            // just pressed is not a report.
+            Err(cide_lsp::RequestError::Cancelled) => UsagesAnswer::Unavailable {
+                reason: "The search was cancelled.".to_string(),
+            },
+            Err(cide_lsp::RequestError::Timeout) => UsagesAnswer::Unavailable {
+                reason: format!(
+                    "{} did not answer in time — it is probably still indexing. Try again in a moment.",
+                    server.binary()
+                ),
+            },
+            Err(error) => UsagesAnswer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
+    /// Withdraw the outstanding Find usages, if there is one. Escape, and a superseding request.
+    ///
+    /// Releases the blocked thread *and* sends `$/cancelRequest`. Both, because "Escape cancelled
+    /// it" and "Escape stopped showing it" are indistinguishable on screen and only one of them
+    /// would otherwise be true — rust-analyzer would carry on searching a whole workspace for a
+    /// popup that is gone.
+    pub fn cancel_usages(&self) {
+        let outstanding = self.usages_in_flight.lock().take();
+        if let Some((requester, id)) = outstanding {
+            requester.cancel(id);
+        }
+    }
+
+    /// Turn LSP locations into rows the popup can draw, reading each file once.
+    ///
+    /// Capped at [`MAX_USAGES`] rows over [`MAX_USAGE_FILES`] files, because the alternative is
+    /// reading four thousand files because somebody Ctrl+clicked `fn new`.
+    ///
+    /// No `check_within` guard, unlike `cmd::symbols::outline_of`: these paths come from the
+    /// *server*, not from the webview, so there is no untrusted input to contain — and Go to
+    /// definition has opened `~/.cargo/registry` sources since M12.
+    fn rows_from(
+        &self,
+        locations: Vec<cide_lsp::convert::Loc>,
+        origin_path: &std::path::Path,
+        origin_line: u32,
+        origin_column: u32,
+    ) -> (Vec<cide_ipc::Usage>, bool) {
+        let mut kept: Vec<cide_lsp::convert::Loc> = Vec::new();
+        let mut truncated = false;
+        for one in locations {
+            // The origin itself, whatever `includeDeclaration` did. See `usages`.
+            if same_file(&one.path, origin_path) && contains(&one, origin_line, origin_column) {
+                continue;
+            }
+            if kept.len() >= MAX_USAGES {
+                truncated = true;
+                break;
+            }
+            kept.push(one);
+        }
+
+        // Grouped by path so each file is read once, and sorted so the popup's order is stable
+        // rather than whatever order the server happened to walk its index in.
+        kept.sort_by(|a, b| {
+            (a.path.as_path(), a.line, a.column).cmp(&(b.path.as_path(), b.line, b.column))
+        });
+
+        let mut rows: Vec<cide_ipc::Usage> = Vec::with_capacity(kept.len());
+        let mut current: Option<(PathBuf, Vec<String>)> = None;
+        let mut files = 0usize;
+        for one in kept {
+            let lines = match &current {
+                Some((path, lines)) if path == &one.path => lines,
+                _ => {
+                    if files >= MAX_USAGE_FILES {
+                        truncated = true;
+                        break;
+                    }
+                    files += 1;
+                    // A file that cannot be read yields no text and the rows still ship — a usage
+                    // you cannot preview is still a usage, and dropping it would under-report the
+                    // count with nothing on screen to say why.
+                    let text = std::fs::read_to_string(&one.path).unwrap_or_default();
+                    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    current = Some((one.path.clone(), lines));
+                    &current.as_ref().expect("just set").1
+                }
+            };
+            let source = lines
+                .get(one.line.saturating_sub(1) as usize)
+                .map(String::as_str)
+                .unwrap_or("");
+            let (text, start, end) = preview(source, one.column, one.end_column);
+            rows.push(cide_ipc::Usage {
+                rel: relative(&self.roots, &one.path.to_string_lossy()),
+                path: one.path.to_string_lossy().to_string(),
+                line: one.line,
+                column: one.column,
+                end_column: one.end_column,
+                text,
+                start,
+                end,
+            });
+        }
+        (rows, truncated)
+    }
+
+    /// The server that owns this path and a `Requester` for it, or why there is neither.
+    ///
+    /// Extracted so the three request paths cannot drift on *which* server owns a file or on the
+    /// take-the-lock-then-drop-it rule. The sentence is the caller's, because "Go to definition
+    /// needs it" and "Find usages needs it" name different gestures.
+    fn requester_for(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(Server, cide_lsp::Requester), Missing> {
+        let Some(server) = server_for(path) else {
+            return Err(Missing::NoLanguage);
+        };
+        // Cloned out from under the lock, and the guard dies at the end of this block. Waiting
+        // with it alive would stall the project's diagnostics for the whole timeout and deadlock
+        // against a concurrent restart — see the type-level note on `cide_lsp::Requester`.
+        let requester = {
+            let handles = self.handles.lock();
+            handles
+                .iter()
+                .find(|handle| handle.server() == server)
+                .map(cide_lsp::LspHandle::requester)
+        };
+        match requester {
+            Some(requester) => Ok((server, requester)),
+            None => Err(Missing::NotRunning(server)),
         }
     }
 
@@ -318,6 +632,131 @@ impl Drop for ProjectDiagnostics {
         self.handles.lock().clear();
     }
 }
+
+/// Rows a single Find usages will carry. Beyond this the answer says it was truncated.
+///
+/// Not a politeness limit: without it, Ctrl+clicking `fn new` in a large workspace reads a few
+/// thousand files off disk inside one blocking-pool thread to build a list nobody scrolls past the
+/// first screen of. Two hundred is well past what anyone reads and far short of what hurts.
+const MAX_USAGES: usize = 200;
+/// And the files those rows may come from. The second half of the same budget: two hundred usages
+/// spread one-per-file is two hundred `read_to_string` calls.
+const MAX_USAGE_FILES: usize = 100;
+
+/// Why there is no server to ask.
+///
+/// A type rather than a string because the *sentence* differs per gesture ("Go to definition needs
+/// it" versus "Find usages needs it") while the *condition* does not, and three copies of the
+/// condition is how one of them ends up naming the wrong binary.
+enum Missing {
+    /// Nothing owns this file type. Permanent for this buffer.
+    NoLanguage,
+    /// The server that owns it is not running for this project. Until a restart.
+    NotRunning(Server),
+}
+
+impl Missing {
+    fn sentence(&self, gesture: &str) -> String {
+        match self {
+            Self::NoLanguage => {
+                "cide has no language server for this file type. Rust and Go are supported."
+                    .to_string()
+            }
+            Self::NotRunning(server) => format!(
+                "{} is not running for this project. {gesture} needs it.",
+                server.binary()
+            ),
+        }
+    }
+}
+
+/// `textDocument` + `position`, in LSP's units.
+///
+/// 0-based on the wire, and the column stays UTF-16 — the same conversion `to_lsp` makes,
+/// `saturating_sub` included, because a caret at column 1 must not underflow to `u32::MAX`.
+fn position_params(path: &std::path::Path, line: u32, column: u32) -> serde_json::Value {
+    serde_json::json!({
+        "textDocument": { "uri": cide_lsp::convert::path_to_uri(path) },
+        "position": {
+            "line": line.saturating_sub(1),
+            "character": column.saturating_sub(1),
+        },
+    })
+}
+
+/// Are these the same file on disk?
+///
+/// `canonicalize` first, because the two paths reach here by different routes: one is the path the
+/// webview holds for the open buffer, the other came back from the server as a `file:` URI it
+/// resolved itself. A project opened through a symlink — `~/work/cide` → `/mnt/…` — makes those two
+/// spellings of one file, and the discriminator would then call every declaration a reference and
+/// Ctrl+click would jump the user to the line they are already on.
+///
+/// Falls back to a plain comparison when either side cannot be canonicalised, which is the right
+/// failure: a file deleted since the server indexed it is not the file under the caret.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Is `(line, column)` inside this location's range? Half-open: `[start, end)`.
+///
+/// Half-open and not closed, and the difference is a real misfire rather than pedantry. Both Ctrl
+/// gestures ask about the **start of the word under the pointer**, and a declaration's range starts
+/// at exactly that column — so an inclusive start is what makes the common case work. An inclusive
+/// *end* would additionally match a range that ends where we asked, i.e. the token immediately
+/// before the caret, and call an unrelated identifier's declaration our own.
+fn contains(at: &cide_lsp::convert::Loc, line: u32, column: u32) -> bool {
+    (line, column) >= (at.line, at.column) && (line, column) < (at.end_line, at.end_column)
+}
+
+/// A source line as a usage row carries it: clipped, with the occurrence's byte offsets in it.
+///
+/// # The units trap, converted once and here
+///
+/// LSP hands out a **UTF-16 column**; the row renderer wants a **byte offset** into the string it
+/// is drawing, because that is `SearchHit`'s convention and `splitHighlight` is shared verbatim
+/// with the search panel. The two agree for ASCII and diverge for everything else — one emoji
+/// before the identifier moves the highlight two characters, one accented word moves it one — and
+/// the divergence is silent. Converting in the webview would mean a second implementation of this
+/// against a string that has already been clipped.
+///
+/// Offsets are clamped into the clipped line rather than trusted: an occurrence past the clip
+/// point becomes an empty highlight at the end, which is a row that reads as truncated instead of
+/// a `String::slice` that panics inside a render.
+fn preview(source: &str, column: u32, end_column: u32) -> (String, u32, u32) {
+    /// Byte offset of a 1-based UTF-16 column in `text`, clamped to its length.
+    fn byte_of(text: &str, column: u32) -> usize {
+        let want = column.saturating_sub(1) as usize;
+        let mut units = 0usize;
+        for (offset, ch) in text.char_indices() {
+            if units >= want {
+                return offset;
+            }
+            units += ch.len_utf16();
+        }
+        text.len()
+    }
+
+    let start = byte_of(source, column);
+    let end = byte_of(source, end_column).max(start);
+    let clipped = cide_search::content::clip(source, PREVIEW_BYTES);
+    let start = start.min(clipped.len());
+    let end = end.min(clipped.len());
+    (clipped.to_string(), start as u32, end as u32)
+}
+
+/// How much of a usage's line is carried.
+///
+/// `cide_search::content::Limits::max_line_bytes`'s number, deliberately: both surfaces draw a
+/// source line in the same row shape, and one of them clipping at a different width would be
+/// visible as two different-looking lists of the same file.
+const PREVIEW_BYTES: usize = 512;
 
 /// Which server owns a path, by extension.
 fn server_for(path: &std::path::Path) -> Option<Server> {
@@ -613,6 +1052,172 @@ mod tests {
         use cide_ide_mcp::DiagnosticSource;
         let files = McpDiagnostics::new(store).diagnostics(None);
         assert_eq!(files[0].diagnostics.len(), 2);
+    }
+
+    fn loc(line: u32, column: u32, end_column: u32) -> cide_lsp::convert::Loc {
+        cide_lsp::convert::Loc {
+            path: PathBuf::from("/repo/src/a.rs"),
+            line,
+            column,
+            end_line: line,
+            end_column,
+        }
+    }
+
+    #[test]
+    fn a_caret_on_the_declarations_own_name_is_inside_its_range() {
+        // The whole discriminator. Both Ctrl gestures ask about the *start* of the word under the
+        // pointer, and a declaration's range starts at exactly that column — so the start has to
+        // be inclusive or Ctrl+click on a declaration would jump to the line it is already on.
+        assert!(contains(&loc(10, 8, 14), 10, 8), "the first character");
+        assert!(contains(&loc(10, 8, 14), 10, 11), "the middle");
+    }
+
+    #[test]
+    fn the_range_is_half_open_so_the_token_before_the_caret_is_not_ours() {
+        // Closed at the end would additionally match a range that *ends* where we asked — the
+        // identifier immediately before the caret — and call an unrelated declaration our own.
+        assert!(!contains(&loc(10, 8, 14), 10, 14), "one past the end");
+        assert!(!contains(&loc(10, 8, 14), 10, 7), "one before the start");
+        assert!(!contains(&loc(10, 8, 14), 9, 99), "the line above");
+        assert!(!contains(&loc(10, 8, 14), 11, 1), "the line below");
+    }
+
+    #[test]
+    fn a_multi_line_range_contains_a_column_the_first_line_would_reject() {
+        // rust-analyzer returns whole-item ranges for some kinds, so the comparison has to be on
+        // the (line, column) pair and not on each axis separately — column 2 on line 11 is inside
+        // a range that starts at column 8 on line 10.
+        let mut item = loc(10, 8, 4);
+        item.end_line = 12;
+        assert!(
+            contains(&item, 11, 2),
+            "a column on a middle line must not be compared against the first line's column"
+        );
+        assert!(!contains(&item, 12, 4), "still half-open at the end");
+    }
+
+    #[test]
+    fn a_preview_reports_byte_offsets_and_not_utf16_columns() {
+        // The silent one. LSP counts UTF-16 units, `splitHighlight` slices bytes, and the two
+        // agree only for ASCII — one emoji before the identifier moves the highlight by two.
+        let source = "let 🦀 = target();";
+        // `target` starts at UTF-16 column 10: `let ` (4) + the crab (2 units) + ` = ` (3) = 9.
+        let (text, start, end) = preview(source, 10, 16);
+        assert_eq!(text, source);
+        assert_eq!(&text[start as usize..end as usize], "target");
+    }
+
+    #[test]
+    fn an_ascii_preview_is_the_columns_minus_one() {
+        let (text, start, end) = preview("    target()", 5, 11);
+        assert_eq!((start, end), (4, 10));
+        assert_eq!(&text[start as usize..end as usize], "target");
+    }
+
+    #[test]
+    fn a_preview_of_a_line_that_could_not_be_read_is_empty_rather_than_absent() {
+        // The row still ships — a usage you cannot preview is still a usage. Empty text with
+        // clamped offsets, never a panic inside a render.
+        let (text, start, end) = preview("", 5, 11);
+        assert_eq!(text, "");
+        assert_eq!((start, end), (0, 0));
+    }
+
+    #[test]
+    fn an_occurrence_past_the_clip_point_clamps_instead_of_panicking() {
+        // A minified bundle: one line of megabytes with the identifier three hundred thousand
+        // bytes in. The row reads as truncated; the alternative is a `String::slice` out of range
+        // inside a render, which unmounts the popup.
+        let source = format!("{}target", "x".repeat(PREVIEW_BYTES * 2));
+        let (text, start, end) = preview(
+            &source,
+            PREVIEW_BYTES as u32 * 2 + 1,
+            PREVIEW_BYTES as u32 * 2 + 7,
+        );
+        assert_eq!(text.len(), PREVIEW_BYTES);
+        assert_eq!((start, end), (PREVIEW_BYTES as u32, PREVIEW_BYTES as u32));
+    }
+
+    #[test]
+    fn a_preview_never_cuts_a_character_in_half() {
+        // `clip` backs up to a boundary; without that the `String::from_utf8` behind
+        // `to_string()` would be operating on a partial code point.
+        let source = format!("{}日本語", "x".repeat(PREVIEW_BYTES - 1));
+        let (text, _, _) = preview(&source, 1, 2);
+        assert!(text.len() <= PREVIEW_BYTES);
+        assert!(source.starts_with(&text));
+    }
+
+    #[test]
+    fn each_gesture_names_itself_in_the_no_server_sentence() {
+        // One condition, two sentences. Three copies of the condition is how one of them ends up
+        // naming the wrong binary.
+        let missing = Missing::NotRunning(Server::Gopls);
+        assert!(
+            missing
+                .sentence("Find usages")
+                .contains("gopls is not running")
+        );
+        assert!(
+            missing
+                .sentence("Find usages")
+                .contains("Find usages needs it")
+        );
+        assert!(
+            missing
+                .sentence("Go to definition")
+                .contains("Go to definition needs it")
+        );
+        // And the permanent one says what *is* supported rather than naming a binary that would
+        // not help.
+        assert!(
+            Missing::NoLanguage
+                .sentence("Find usages")
+                .contains("Rust and Go are supported")
+        );
+    }
+
+    #[test]
+    fn a_file_is_the_same_file_as_itself_by_spelling_alone() {
+        // The fast path, and the only one a unit test can assert without touching the disk:
+        // `canonicalize` needs a real file, so the symlink case is covered by the fallback below
+        // rather than by a fixture.
+        assert!(
+            same_file(
+                std::path::Path::new("/repo/src/a.rs"),
+                std::path::Path::new("/repo/src/a.rs")
+            ),
+            "one spelling of one path is one file"
+        );
+        // Two paths that do not exist and do not match are not the same file. `canonicalize` fails
+        // on both, and the fallback must be `false` — a `true` here would make the discriminator
+        // call every definition a declaration.
+        assert!(
+            !same_file(
+                std::path::Path::new("/repo/src/a.rs"),
+                std::path::Path::new("/repo/src/b.rs")
+            ),
+            "two paths that neither match nor canonicalise are not the same file — a `true` here \
+             makes the discriminator call every definition a declaration"
+        );
+    }
+
+    #[test]
+    fn the_usage_caps_are_a_budget_and_not_a_politeness() {
+        // Both halves of it: two hundred usages spread one per file is two hundred file reads, so
+        // capping only the rows would leave the expensive axis unbounded.
+        // `const` blocks, because clippy is right that a comparison of two literals is decided at
+        // compile time — which is the point: this is a guard against somebody editing one of the
+        // two numbers, and it should fail the build rather than a test run.
+        const { assert!(MAX_USAGES > 0 && MAX_USAGE_FILES > 0) };
+        const { assert!(MAX_USAGE_FILES <= MAX_USAGES) };
+        // The same clip width the search panel uses, so one file does not read as two different
+        // lists in two surfaces.
+        assert_eq!(
+            PREVIEW_BYTES,
+            cide_search::content::Limits::default().max_line_bytes
+        );
     }
 
     #[test]

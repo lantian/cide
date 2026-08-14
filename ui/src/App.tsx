@@ -11,7 +11,15 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AppHeader } from '@/chrome/AppHeader'
-import { ActivityRail, type ActivityView } from '@/chrome/ActivityRail'
+import { ActivityRail } from '@/chrome/ActivityRail'
+import {
+  SIDEBAR_INITIAL,
+  isPanelOpen,
+  selectView,
+  showPanel,
+  toggleSidebar,
+  type SidebarState,
+} from '@/chrome/sidebarView'
 import { StatusBar } from '@/chrome/StatusBar'
 import {
   formatClaude,
@@ -40,7 +48,7 @@ import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
 import { notify, notifyFailure } from '@/chrome/notices'
-import { ProjectSwitcher } from '@/chrome/ProjectSwitcher'
+import { Switcher } from '@/chrome/Switcher'
 import { SidebarSplitter } from '@/chrome/SidebarSplitter'
 import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
 import { TransportNotice } from '@/ipc/TransportNotice'
@@ -193,14 +201,15 @@ export function App() {
   const redockPane = useWorkspace((st) => st.redockPane)
 
   /**
-   * Which sidebar view the rail has lit, or `null` for none — the sidebar hidden.
+   * Which sidebar view the rail has lit, whether a panel is showing, and which one comes back.
    *
-   * `null` is a real state rather than an oversight: clicking the lit rail button hides its
-   * panel, so the workspace can have the full window width without dragging the splitter to
-   * the edge. `ActivityRail` has always typed `active` as nullable; nothing produced the
-   * value until now.
+   * `view: null` is a real state and always was: clicking the lit rail button hides its panel,
+   * so the workspace can have the full window width without dragging the splitter to the edge.
+   * What it had no way to be was *reached without a mouse*, and no memory of what to restore —
+   * see `chrome/sidebarView.ts`, which owns every rule about this value so that a check script
+   * can compile them. Nothing here is persisted; that module says why.
    */
-  const [view, setView] = useState<ActivityView | null>('files')
+  const [sidebar, setSidebar] = useState<SidebarState>(SIDEBAR_INITIAL)
   /**
    * Which overlay is up, if any. `null` is the ordinary state.
    *
@@ -592,8 +601,8 @@ export function App() {
     // Gates `claude.fork`, `claude.mirror` and `claude.split.newSession` — all three act on
     // the focused session, so none of them means anything without a Claude pane to act on.
     claudePaneFocused: focused?.pane.kind === 'claude',
-    sidebarFiles: view === 'files',
-    sidebarGit: view === 'git',
+    sidebarFiles: sidebar.view === 'files',
+    sidebarGit: sidebar.view === 'git',
   }
 
   /*
@@ -642,7 +651,13 @@ export function App() {
           return diag.log(`command not handled by this window: ${command}`)
       }
     },
-    showSidebar: (next) => setView(next),
+    showSidebar: (next) => setSidebar((s) => showPanel(s, next)),
+    /*
+     * F4. The function is handed to `setSidebar` unwrapped because it *is* a state updater —
+     * `(prev) => next`, closing over nothing — which is what keeps the decision about which
+     * panel comes back in a module a check script can run rather than in this file.
+     */
+    toggleSidebar: () => setSidebar(toggleSidebar),
     /*
      * Which tab `file.save` writes. The buffer lives in a CodeMirror state inside the pane,
      * reachable only through the saver `editor/openBuffers.ts` holds for its tab — and the
@@ -848,25 +863,19 @@ export function App() {
             * override, which is the way round every other audit-driven surface here works.
             */}
           <ActivityRail
-            active={view}
+            active={sidebar.view}
             changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
             errors={statusBarCounts(diagnostics.snapshot)?.errors ?? null}
             onSelect={(next) => {
-              // The rail's ⚙ is the only gesture that reaches Settings until the command
-              // palette lands, and Settings is a workspace tab rather than a sidebar view —
-              // so this one entry opens (or re-activates) the project's tab. It is also the
-              // one entry the toggle below skips: it has no panel to hide, and a second
-              // click on it is the user asking for that tab back, not asking for nothing.
-              if (next === 'settings') {
-                setView('settings')
-                if (activeProjectId) {
-                  void settingsApi.openTab(activeProjectId).then(() => hydrate())
-                }
-                return
+              // What a click means — the lit one toggles shut, any other switches, ⚙ has no
+              // panel to hide — is `selectView`'s, in `chrome/sidebarView.ts`, along with the
+              // memory of which panel F4 restores. What is left here is the side effect only
+              // this component can perform: Settings is a workspace *tab* rather than a
+              // sidebar view, so choosing it also opens (or re-activates) the project's tab.
+              setSidebar((s) => selectView(s, next))
+              if (next === 'settings' && activeProjectId) {
+                void settingsApi.openTab(activeProjectId).then(() => hydrate())
               }
-              // Clicking the lit button hides its panel; clicking any other one switches to
-              // it, whether or not the sidebar is currently hidden.
-              setView((current) => (current === next ? null : next))
             }}
           />
 
@@ -880,7 +889,7 @@ export function App() {
             * nothing does not read as "not built" — it reads as broken. A dead control is
             * worse than either a real panel or an absent one.
             */}
-          {view === 'files' && (
+          {sidebar.view === 'files' && (
             <Explorer
               project={activeProjectId}
               /*
@@ -905,8 +914,8 @@ export function App() {
               }}
             />
           )}
-          {view === 'git' && <GitPanel project={activeProjectId} />}
-          {view === 'search' && (
+          {sidebar.view === 'git' && <GitPanel project={activeProjectId} />}
+          {sidebar.view === 'search' && (
             <SearchPanel
               project={activeProjectId}
               onOpenHit={(path, line, column, endColumn) => {
@@ -926,7 +935,7 @@ export function App() {
               }}
             />
           )}
-          {view === 'problems' && (
+          {sidebar.view === 'problems' && (
             <ProblemsPanel
               project={activeProjectId}
               snapshot={diagnostics.snapshot}
@@ -946,8 +955,8 @@ export function App() {
               `--w-sidebar-git` sizes git. Absent under `settings`, which has no panel, and
               while the sidebar is hidden: a handle with nothing to its left is a grab that
               resizes something the user cannot see. */}
-          {view !== null && view !== 'settings' && (
-            <SidebarSplitter panel={view === 'git' ? 'git' : 'files'} />
+          {isPanelOpen(sidebar) && (
+            <SidebarSplitter panel={sidebar.view === 'git' ? 'git' : 'files'} />
           )}
 
           <div className={styles.content}>
@@ -1199,7 +1208,7 @@ export function App() {
                 void fsApi.scratchNew(activeProjectId, ext).then(async (path) => {
                   await fileApi.open(activeProjectId, path)
                   hydrate()
-                  setView('files')
+                  setSidebar((s) => showPanel(s, 'files'))
                   const shown = await useFileTree.getState().reveal(path)
                   if (!shown) {
                     notify('The scratch file was created but has no row in the tree yet.', {
@@ -1235,13 +1244,14 @@ export function App() {
         <OutsideOpenGate />
 
         {/*
-          * The Ctrl+Tab popup. No props and no keyboard handling: the walk, its claim on Tab
-          * and Escape, and the release watcher all live in `keys/switcherStore.ts`, so the
-          * gesture already works without this line — mounting it is what makes it *visible*.
-          * Without it Ctrl+Tab switches projects silently, which is the same "did anything
-          * happen?" failure this session has now fixed nine times.
+          * The switcher popup — one component for Ctrl+Tab (tabs) and Ctrl+` (projects). No
+          * props and no keyboard handling: the walk, its claim on the walk key and on Escape,
+          * and the release watcher all live in `keys/switcherStore.ts`, so the gesture already
+          * works without this line — mounting it is what makes it *visible*. Without it a
+          * switcher switches silently, which is the same "did anything happen?" failure this
+          * project has now fixed a dozen times.
           */}
-        <ProjectSwitcher />
+        <Switcher />
 
         {pendingClose && (
           <CloseConfirm

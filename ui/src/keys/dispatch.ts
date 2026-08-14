@@ -75,18 +75,20 @@ import {
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
-import { focusedCaret } from '@/editor/caretTrack'
+import { focusedCaret, focusedWord } from '@/editor/caretTrack'
 import { goToDefinition } from '@/editor/goToDefinition'
+import { findUsages } from '@/editor/codeIntel'
 import { navigate } from '@/editor/jump'
 import { memberStep } from '@/editor/memberNav'
 import { symbolsOf } from '@/editor/outlineStore'
 import { requestReveal } from '@/editor/revealRequest'
 import { focusedTabOf, registeredBuffers, saveAll, saveTab } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
-import { startProjectSwitch } from './switcherStore'
+import { startProjectSwitch, startTabSwitch } from './switcherStore'
 import {
   activeProjectOf,
   claudeTargetOf,
+  consolePaneOf,
   focusTarget,
   focusedFilePath,
   focusedTabPath,
@@ -111,6 +113,19 @@ export interface DispatchDeps {
    * that uses it checks for `undefined` and reports rather than assuming.
    */
   showSidebar?: ((view: 'files' | 'git' | 'search' | 'problems') => void) | undefined
+  /**
+   * Hide the left panel, or bring back the last one that was open. F4, and the palette row.
+   *
+   * Separate from [`showSidebar`] rather than an extra value it accepts, because the two are
+   * different questions: `showSidebar` names a panel and always reveals it, and this one names
+   * none and depends on what was showing. Which panel comes back is `chrome/sidebarView.ts`'s
+   * arithmetic, not this module's — that is a rule with cases in it, and a rule that lives in a
+   * React state updater is a rule no check script can compile.
+   *
+   * Optional for the same reason as `showSidebar`: a detached-pane window has no rail and no
+   * sidebar to toggle.
+   */
+  toggleSidebar?: (() => void) | undefined
   /**
    * Override for which tab `file.save` writes.
    *
@@ -329,16 +344,62 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return void ws.activateTab(project.id, next)
       }
 
+      /*
+       * Ctrl+Tab / Ctrl+Shift+Tab — the held-modifier switcher over this project's **tabs**, in
+       * most-recently-used order. The same gesture the project switcher below makes, one ring
+       * in, and the same implementation: `keys/switcher.ts` is the arithmetic and
+       * `keys/switcherStore.ts` holds the one open walk and the one release latch, whichever of
+       * the two opened it.
+       *
+       * `tab.next` / `tab.prev` directly above are the *positional* walk and are deliberately
+       * kept: this one matches the order the user works in, that one matches the strip on
+       * screen. Neither is bound to the other's chord.
+       *
+       * Running it from the palette holds no modifier, so it switches immediately to the most —
+       * or least — recently used tab, which is a perfectly good terminating thing for a row to
+       * do. See `begin` in `keys/switcher.ts`.
+       */
+      case 'tab.switcher.next':
+      case 'tab.switcher.prev':
+        return startTabSwitch(command === 'tab.switcher.next' ? 1 : -1)
+
+      /*
+       * Ctrl+1 — the pinned Claude console, by identity rather than by position.
+       *
+       * `revealPane` and not `ws.activateTab`, which is the whole difference between showing the
+       * console and *arriving in the prompt*: it activates the project, activates the tab, drops
+       * a maximize that would hide the pane, moves the domain's focus and then puts the caret in
+       * the terminal, in the one order that works. `claude.mention.file` already ends the same
+       * way, for the same reason.
+       *
+       * `consolePaneOf` and not `claudeTargetOf`: this command names `tabs[0]`'s Claude pane
+       * unconditionally, where a mention prefers the focused conversation. Both preconditions
+       * are re-checked here — a `Command::when` gates the palette and never the keyboard.
+       */
+      case 'tab.console': {
+        if (boot()?.role.kind !== 'shell') return unmet(command, 'this window has no tab strip')
+        const console = consolePaneOf(boot())
+        if (console === null) return unmet(command, 'no open project')
+        return void revealPane(console.project, console.pane).then((refusal) => {
+          if (refusal !== null) void diag.log(`[cide] ${command}: ${refusal}`)
+        })
+      }
+
       /* ---------------------------------------------------------------------- Projects */
 
       /*
-       * Ctrl+Tab / Ctrl+Shift+Tab — the held-modifier switcher, in most-recently-used order.
+       * Ctrl+` — the held-modifier switcher over **projects**, in most-recently-used order.
        *
-       * The whole gesture is in `keys/switcher.ts` (pure) and `keys/switcherStore.ts` (the
-       * open walk and its release watcher); this arm only names the direction. Running either
-       * from the command palette is a legitimate, terminating thing to do and switches
-       * immediately to the most — or least — recently used project, because no modifier is
-       * being held for the popup to wait on. See `begin` in `keys/switcher.ts`.
+       * It was Ctrl+Tab until the tab switcher above took that chord; `cide_core::keymap` holds
+       * the argument for the move and for why `backquote` and never the literal tilde. The
+       * whole gesture is in `keys/switcher.ts` (pure) and `keys/switcherStore.ts` (the one open
+       * walk and its release watcher); this arm only names the direction.
+       *
+       * `project.switcher.prev` has no default chord — `ctrl+shift+backquote` is
+       * `terminal.splitBelow` — so this row and holding Shift during a walk are its two routes,
+       * which is why it is still registered. Running either from the palette holds no modifier,
+       * so it switches immediately to the most — or least — recently used project, because there
+       * is no release for the popup to wait on. See `begin` in `keys/switcher.ts`.
        */
       case 'project.switcher.next':
       case 'project.switcher.prev':
@@ -895,6 +956,32 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      case 'navigate.usages': {
+        /*
+         * ⌥F7, and the escape hatch for the day Ctrl+click's discriminator guesses wrong.
+         *
+         * Same shape as `navigate.definition` above and for the same reason: a `when` gates the
+         * palette and never the keyboard, so this has to refuse with a sentence rather than run
+         * against a caret that does not exist.
+         *
+         * This one **skips the discriminator entirely** — it searches for references whatever the
+         * caret is on. That is deliberate and is most of the point: `fn fmt` inside an
+         * `impl Display` resolves to the *trait's* declaration, so Ctrl+click on it jumps rather
+         * than listing, and without an unconditional command there would be no way to ask the
+         * question the user actually meant. It also works from a plain reference — LSP answers
+         * references from any occurrence — so ⌥F7 on a call site lists that call's siblings.
+         *
+         * `focusedWord()` may answer `null` (a caret on punctuation, a window with no editor); the
+         * popup and the notice both degrade to "the symbol" rather than refusing.
+         */
+        const caret = focusedCaret()
+        if (caret === null) return unmet(command, 'no editor focused')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        findUsages(project.id, caret.path, caret.line, caret.column, focusedWord())
+        return
+      }
+
       case 'navigate.back':
       case 'navigate.forward': {
         /*
@@ -1002,6 +1089,27 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       case 'sidebar.files':
         if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
         deps.showSidebar('files')
+        return
+
+      /*
+       * F4 — hide the panel, or bring back the last one that was open.
+       *
+       * The *hidden* state is not new: clicking the lit rail button has set the view to `null`
+       * since M3, `ActivityRail::active` has always been nullable, and the four panel branches
+       * and the splitter are all guarded on it. What was missing was any way to reach it without
+       * a mouse, and any memory of which panel to restore. Both live in
+       * `chrome/sidebarView.ts`; this arm only routes.
+       *
+       * `unmet` rather than a notice, unlike `file.reveal` two screens up. That one refuses over
+       * *facts about the user's situation that they just asked a question about*; this one
+       * refuses only in a window that has no sidebar and never will, which the binding's
+       * `shellWindow` clause and the command's already keep the gesture out of. Reaching this
+       * line means the gate and the palette disagree, which is exactly what the diagnostic log
+       * is for.
+       */
+      case 'sidebar.toggle':
+        if (deps.toggleSidebar === undefined) return unmet(command, 'this window has no sidebar')
+        deps.toggleSidebar()
         return
 
       case 'sidebar.git':

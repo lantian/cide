@@ -385,3 +385,130 @@ pub enum DefinitionAnswer {
     /// Nobody could be asked. `reason` is shown to the user verbatim.
     Unavailable { reason: String },
 }
+
+/// What a **Ctrl+click** is about to do, decided before anything expensive runs.
+///
+/// # Why the gesture needs a third command at all
+///
+/// IDEA's Ctrl+click is two actions wearing one chord: on a *reference* it jumps to the
+/// declaration, on a *declaration* it lists the usages. Deciding which is a question only the
+/// language server can answer, so it is a round trip — and the Ctrl-hover underline has to make
+/// the same decision, on pointer motion, without ever running the expensive half.
+///
+/// So the discriminator is its own answer. [`Self::Declaration`] says "the caret is already on the
+/// declaration, so the click means Find usages" **without** having searched for any, which is what
+/// makes the underline affordable: hovering a declaration costs one `textDocument/definition`, not
+/// a whole-workspace reference search.
+///
+/// The hover and the click consume this same value, from the same cache entry. That is the whole
+/// guarantee that the underline never promises something the click will not do — see
+/// `ui/src/editor/codeIntel.ts`.
+///
+/// Four variants and never a rejected promise, for the reason [`DefinitionAnswer`] states one type
+/// up: "still indexing" and "there is nothing here" are different answers and a rejection carries
+/// neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum ProbeAnswer {
+    /// The caret is on a **reference**, and this is what it refers to. The click jumps here.
+    ///
+    /// Same units and same absoluteness as [`DefinitionAnswer::Found`], and deliberately carrying
+    /// no end: `goToDefinition.ts` writes out why a definition's `range.end` may not be believed.
+    Definition {
+        path: String,
+        line: u32,
+        column: u32,
+    },
+    /// The caret is on the **declaration itself**. The click shows usages.
+    ///
+    /// Carries nothing, on purpose: the position is the one the caller asked about, and echoing it
+    /// back would be a second copy of a fact the caller already holds — one that could disagree.
+    Declaration,
+    /// The server answered, and its answer was "there is no symbol here".
+    ///
+    /// A keyword, a comment, a string body, punctuation. Not a failure: the hover stays silent and
+    /// the click says one sentence.
+    NotFound,
+    /// Nobody could be asked. `reason` is shown to the user verbatim — and never by the hover.
+    Unavailable { reason: String },
+}
+
+/// One place a symbol is used.
+///
+/// Three fields are copied from [`crate::SearchHit`] with their contracts intact, and each copy has
+/// a reason:
+///
+/// * `rel` is named the way the search panel, the file picker and the symbol picker name a file,
+///   so one file reads the same in all four surfaces.
+/// * `text` plus **byte** `start`/`end` is `SearchHit`'s convention *specifically so
+///   `ui/src/sidebar/SearchModel.ts::splitHighlight` can be reused verbatim*. The units trap is
+///   real and silent: LSP hands out a UTF-16 column, the row wants a byte offset into a clipped
+///   line, and the two agree only for ASCII. The conversion happens once, in Rust, at the point
+///   the line is read.
+/// * the line is clipped to a few hundred bytes for the same reason a search hit is — a minified
+///   bundle has single lines of megabytes and none of them belongs on the IPC channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Usage {
+    /// Absolute. A usage is regularly outside the project — `~/.cargo/registry`, `$GOMODCACHE` —
+    /// and Go to definition has opened such files since M12.
+    pub path: String,
+    /// Root-relative, root-label-prefixed in a multi-root project. Falls back to the absolute path
+    /// when the file is under no root, which is the common case for the two directories above.
+    pub rel: String,
+    /// 1-based.
+    pub line: u32,
+    /// 1-based, UTF-16 — the units a caret is placed with.
+    pub column: u32,
+    /// 1-based and exclusive, so the jump *selects* the identifier rather than poking at it.
+    ///
+    /// Believable here in a way a definition's end is not: a references reply's range is the
+    /// occurrence itself, not an enclosing item, so selecting it is what makes "this is the usage
+    /// I sent you to" visible.
+    pub end_column: u32,
+    /// The source line, without its terminator, clipped.
+    ///
+    /// Empty for a file that could not be read. The row still ships: a usage you cannot preview is
+    /// still a usage, and dropping it would under-report the count with nothing to say why.
+    pub text: String,
+    /// Byte offset of the occurrence **within `text`**. See the type's docs for why bytes.
+    pub start: u32,
+    /// Exclusive end, same units.
+    pub end: u32,
+}
+
+/// Every place a symbol is used — or why cide cannot say.
+///
+/// # `NotFound` and `Found { rows: [] }` are different, and the popup says different things
+///
+/// `textDocument/references` answers `null` for "there is no symbol at this position" and `[]` for
+/// "this symbol is used nowhere". Collapsing them would tell a user who clicked a keyword that
+/// their function is unused, which is the confident-empty-list failure the whole diagnostics
+/// surface is built to avoid. `convert::locations` keeps them apart and this type carries the
+/// distinction to the screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum UsagesAnswer {
+    /// The usages, declaration excluded. Possibly empty — see the type's docs.
+    Found {
+        rows: Vec<Usage>,
+        /// The server offered more than the cap. The popup says so rather than quietly lying
+        /// about a count.
+        truncated: bool,
+    },
+    /// There is no symbol under the caret at all.
+    NotFound,
+    /// Nobody could be asked, or the wait ran out. `reason` is shown verbatim.
+    Unavailable { reason: String },
+}

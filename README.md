@@ -89,6 +89,302 @@ CIDE_AUDIT_PANES=1 ./target/debug/cide # re-check the pane host registry under c
 CIDE_AUDIT_WINDOWS=1 ./target/debug/cide # re-check detach/re-dock and window modes
 ```
 
+## Switching, and the panel toggle (M14), and what is not done
+
+Four keys, and one of them is a chord that moved.
+
+| key | what it does |
+| --- | --- |
+| **Ctrl+Tab** / **Ctrl+Shift+Tab** | walk the active project's **tabs**, most-recently-used |
+| **Ctrl+`** | walk this window's **projects**, most-recently-used (was Ctrl+Tab) |
+| **Ctrl+1** | go to the pinned Claude console |
+| **F4** | hide the left panel, or bring back the last one that was open |
+
+**The two switchers are one implementation.** `ui/src/keys/switcher.ts` is the arithmetic over
+opaque id strings — hold the modifier, press the key to walk, release to commit, Escape to cancel —
+and `ui/src/keys/switcherStore.ts` holds *one* open walk, *one* capture-phase keyup latch and a
+`SwitchTarget` that says what is being walked. That is not tidiness: the key gate has exactly one
+`capture` hook, so a second store would give two walks of which only one could ever be consulted,
+and the loser's popup would be immortal — swallowing nothing, closing never, while the winner ate
+Tab for the rest of the session. `check:switcher` counts the `keyup` registrations and fails at two,
+and it runs its whole scenario table twice, once per walk key.
+
+**Ctrl+` is bound as `backquote`, not as the literal tilde**, although the tilde is what was asked
+for. `ui/src/keys/chords.ts` derives a stroke from `KeyboardEvent.code`, and the key left of `1` is
+`Backquote` on every layout whatever `key` reports — so a binding spelled `ctrl+~` would normalise to
+a key no keystroke can produce and would be silently inert. `~` has been added to the alias table, so
+a `keymap.json` that writes it still means the chord. Two more reasons the literal is wrong: it needs
+Shift, so the whole walk would be a Ctrl+Shift hold, and the capture reads Shift as the walk's
+*direction*. **`project.switcher.prev` ships unbound** — `ctrl+shift+`` is `terminal.splitBelow` —
+and is reached from the palette, or by holding Shift while the popup is up.
+
+**The tab order is a real MRU stack and it survives a restart.** There was no per-tab focus history
+anywhere: `Tab` has no timestamp, `p.tabs` is insertion order, and `close_tab` picks the *left
+neighbour*. `ui/src/store/workspace.ts` now derives one per project from every
+`cide://workspace-changed` snapshot, over `Project::active_tab`, and mirrors it to
+`localStorage` under `cide.tabMru` beside the project stack. It is *not* in Rust, and the honest
+version of that argument is in the code: a keystroke that bumped `rev` would repaint every other
+window, and it would be a schema migration — the domain-purity argument is weaker here than it is
+for projects, because `active_tab` is already workspace state. The list contains **tabs**, console
+and settings included, which is the point: one Ctrl+Tab from a file gets you back to the
+conversation about it.
+
+**What Ctrl+Tab costs a user who already rebound it.** Nothing, and no migration: their
+`{"key":"ctrl+tab","command":"project.switcher.next"}` has no `when` and the new default has one, so
+the two coexist and the *last applicable* binding — theirs — wins everywhere. The one case that
+changes is an **unbind**: `{"key":"ctrl+tab","command":"-project.switcher.next"}` now matches
+nothing, is reported as `RemovalMatchedNothing` in Settings → Keymap, and Ctrl+Tab starts running
+the tab switcher. `ctrl_tab_switches_tabs_and_an_old_keymap_json_still_wins` asserts both.
+
+**F4 was the sixteenth thing built and reachable from nothing.** Hiding the sidebar has worked since
+M3 — clicking the lit rail button does it — with no command, no binding and no palette row; the
+mouse was the only way in and the only way back out. The new fact is *which panel comes back*, and
+it lives in `ui/src/chrome/sidebarView.ts`, import-free so `check:sidebar` can execute it. The
+settings view counts as **closed** (⚙ opens a workspace tab and has no panel), so F4 with it lit
+opens the last real panel; `last` is never `settings`, or "bring back the last panel" would bring
+back a state with nothing in it.
+
+**It is not remembered across a restart, deliberately.** Every launch still opens on Files with the
+panel showing, bit for bit as before. `Settings` is global and rides every snapshot to *every*
+window, so a persisted "hidden" would mean F4 in one window closing another's sidebar in
+`perProject` mode; and a Rust-owned flag arrives an IPC round trip after first paint, so the panel
+would render and then be yanked away — the exact jump `chrome/sidebarWidth.ts` writes thirty lines
+about avoiding. The two widths beside it stay persisted.
+
+**What these keys cost, named rather than discovered.** All five bindings carry `when: shellWindow`,
+so a detached pane or tab window keeps them — that is a small improvement on the old unconditional
+`ctrl+tab`. In the shell window they are unconditional and the gate is a window *capture* listener,
+so:
+
+* **F4** takes `ESC O S` from every terminal pane. That is a real key to `mc` (Edit), `htop`
+  (Filter) and any curses TUI. `{"key":"f4","command":"-sidebar.toggle","when":"shellWindow"}` in
+  `~/.config/cide/keymap.json` gives it back — the `when` is not optional on that line, and the test
+  named after it says why.
+* **Ctrl+`** costs the pty nothing (xterm encodes no control byte for keyCode 192) and CodeMirror
+  nothing. It costs legibility: Ctrl+` switches project and Ctrl+Shift+` splits a terminal below,
+  one Shift apart, and it is VS Code's toggle-terminal chord.
+* **Ctrl+1** costs nothing either — keyCode 49 is not in xterm's plain-Ctrl encode set.
+* **Ctrl+2..9 are not shipped.** They are the browser convention and were not asked for; `tabs[1..]`
+  are positional and shift under the user, where `tabs[0]` is an identity Rust enforces; and
+  Ctrl+3..8 are *not* free, encoding ESC, FS, GS, RS, US and DEL. IDEA uses Alt+1..9 for tool
+  windows and has no Ctrl+digit tab selection at all.
+
+**Not done.** None of it has been confirmed on screen — the gesture needs a held modifier, KDE will
+not raise a shell-launched window and the Wayland compositor exposes no capture protocol; the
+coverage is `check:switcher`, `check:keys`, `check:sidebar` and `check:commands`. `tab.next` /
+`tab.prev` still have the latent issue the new commands avoid: they carry no `shellWindow` clause,
+so from a detached-tab window they would move the *shell* window's active tab. The palette's key
+chip prints `f4` lowercase, because `chipLabel` upper-cases single characters only and has no f-key
+glyph — `ctrl+f12` has always rendered `⌃f12`.
+
+## Editing the keymap from Settings (M14), and what is not done
+
+Settings → Keymap could read the keymap and nothing else. There was no write path anywhere in
+the workspace — `keymap_report` was the only keymap command on the wire, and the only non-test
+writer of `keymap.json` in `crates/` was a test helper. Genuinely absent, not the usual "built and
+reachable from nothing".
+
+**Every command has a row now, not every binding.** The screen used to map `report.bindings`, the
+*resolved table*: 32 rows for a registry of 63 commands, so half the app was unbindable
+from the screen whose job is binding — not disabled, not explained, simply absent. Rows are built
+from `Bootstrap.commands` left-joined onto the bindings, in `ui/src/settings/keymapModel.ts`, which
+is import-free so `check:keymap` can compile it and drive every rule.
+
+**The file is still a diff, and that is the whole design.** An edit names a command, a context and
+a key; `cide_core::keymap::apply_edit` works out the entries. Saving what the screen shows would
+write every shipped binding into the user's file and freeze out every future change to a default
+for anyone who had ever touched a shortcut. One gesture is routinely two entries:
+
+```json
+[{"key":"ctrl+p","command":"-picker.files"},
+ {"key":"ctrl+shift+o","command":"picker.files"}]
+```
+
+…and the removal has to carry the `when` of the binding it removes, or it matches nothing and
+reports `RemovalMatchedNothing` to a user looking at a screen that says the key is now free. The
+`when` is therefore **copied from the row**, never re-derived, and never from `Command::when` — that
+one gates the palette, and writing it into a binding would silently scope a chord the user asked to
+be unconditional. Unbinding F4 produces exactly the one-liner this README prints two sections up,
+`when` included; there is a test named after that.
+
+**Restore default deletes, it never writes the default in.** Both halves of the rebind above go, and
+the compiled-in binding reappears underneath. Rebinding a command back onto its own default chord
+therefore empties the file rather than filling it.
+
+**Conflicts warn; they never block.** `keymap.rs` states the policy — which of two commands should
+win is a judgement only the user can make — and blocking would stop a user halfway through a
+legitimate two-step edit. The box says what holds the chord, and *which kind* of collision it is:
+over a **default** the new binding silently shadows it and nothing will be reported afterwards; over
+another **user** entry both survive and the conflict banner will appear. It offers "bind and unbind
+the other" as one atomic edit, because writing that removal by hand is the part a user cannot get
+right. It also catches the two silent ones — binding `ctrl+k` when `ctrl+k ctrl+s` exists (the new
+binding could never fire) and the reverse.
+
+The preview is the one place the frontend knows something Rust does not. `normalize_key` renames no
+keys by design, so `` ctrl+` `` and `ctrl+backquote` are two keys to it; `ui/src/keys/chords.ts`
+folds them, and `clashesFor` compares through it. `conflicts()` still cannot see that pair.
+
+**Recording a chord means owning the keyboard.** The key gate is a window *capture* listener, so a
+dialog with its own `keydown` would never see Ctrl+P — the gate would have opened the file picker on
+top of the box asking for a shortcut. So the recorder is the gate's `capture`, ranked above the
+keymap, and while it is armed **every** stroke is consumed. `check:keys` sweeps the whole
+modifier × key space a third time with it armed and asserts no command is ever dispatched.
+
+What that costs, named rather than discovered: **bare Enter saves and bare Escape cancels**, so
+those two spellings cannot be recorded from this screen (VS Code makes the same trade). Every
+modified spelling still can, and a *bare* Enter or Escape is a binding this app must not have
+anyway — the capture gate would swallow it in every text field and every terminal. A fumbled second
+chord **replaces**; a two-stroke sequence is asked for with the "+ second stroke" button, so
+`⌃⇧P ⌃⇧O` is never what a mistake produces. There is no live "⌃⇧…" preview while modifiers are
+still held: bare modifiers never reach the capture, and the only way to get one would be a second
+keydown/keyup listener beside the gate.
+
+**Two-stroke sequences have never run in production and now can.** `defaults()` contains no
+multi-stroke binding — `ctrl+k ctrl+s` appears only in a doc comment and a test fixture — so the
+prefix machine has only ever been exercised by `check:keys`. It stays that way by default:
+**`settings.keymap` is deliberately still unbound.** Binding it to `ctrl+k ctrl+s` would arm a
+prefix on Ctrl+K globally, and Ctrl+K is readline's kill-to-end-of-line in every terminal pane in
+every window. The recorder is what makes sequences reachable without cide taking that from
+everybody.
+
+**What happens to a `keymap.json` somebody wrote by hand.** Saying it plainly, because half of it is
+a loss:
+
+* **Comments were never legal and are not lost by this.** `load_user` is `serde_json::from_str` —
+  strict JSON, not JSONC — so a `//` comment has always made the *whole file* fail to parse, and a
+  file that fails to parse contributes **zero** overrides. That used to be a `tracing::error!`
+  nobody reads; it is now a problem line on the screen that says the file is strict JSON.
+* **A file that does not parse is never rewritten.** The edit command refuses and names the file.
+  The one exception is **Reset all**, alone, which is the gesture that already means "throw away
+  what is in there" and is the way out for someone who does not want to go and find it.
+* **Formatting is lost. Entry order is kept.** The vector is re-serialised with `to_vec_pretty`, so
+  indentation and the order of fields inside an entry become serde's. Order *between* entries is
+  semantic — `apply_layer` walks the file in sequence and a removal only matches what is already
+  accumulated — so the file is mutated in place and never rebuilt from the resolved table.
+* **Unknown fields are dropped.** `{"key":…,"command":…,"note":"why I did this"}` parses today and
+  the `note` is gone on the first rewrite. Nothing warns, because nothing parsed it.
+* **The previous contents are kept as `keymap.json.bak`, on every write**, through the same
+  `write_atomic` as the file itself. That is the answer to the two points above rather than an
+  apology for them, and the screen says so under the table.
+* **The mode becomes 0600** (`write_atomic` publishes by renaming a private temp file) and **a
+  symlink is followed rather than replaced** — `keymap.json` symlinked into a dotfiles repository is
+  how a hand-authored one usually arrives, and a plain rename would strand the repository copy.
+
+**Every window is told.** A new `cide://keymap-changed` carries the resolved table, because
+`applySnapshot` builds `{ ...current, workspace }` and keeps the old `keymap` — so
+`cide://workspace-changed`, the one thing already broadcast to every window, is precisely the path
+that cannot refresh a binding. The array identity matters as much as its contents: `gate.ts` caches
+its indexed keymap against what `bindings()` returns.
+
+**Not done.** None of it has been confirmed on screen; the coverage is `check:keymap`, `check:keys`,
+`check:switcher` and the Rust suite, plus `./target/debug/cide-headless keymap` for the file itself.
+The recorder caps a sequence at two strokes (a UI cap — the format has no limit). A command bound to
+two chords in the *same* context is representable by hand and the screen shows two lines for it, but
+*Restore default* on either line deletes both, because a reset matches on (command, `when`). Rust's
+`conflicts()` still cannot see that `` ctrl+` `` and `ctrl+backquote` are one key; only the
+pre-save preview can. There is no undo beyond `keymap.json.bak` and *Restore default*.
+
+## Ctrl+hover and Find usages (M14), and what is not done
+
+Hold Ctrl over an identifier and it underlines; click it and you go to the declaration — or, when
+you are already **on** the declaration, you get its usages. IDEA's arrangement. `Alt+F7` and a
+*Find usages* item in the code pane's context menu run the search unconditionally, from a reference
+as happily as from a declaration.
+
+**The underline is a promise about what the click will do**, so the two are one gesture and are kept
+in agreement structurally rather than carefully. `ui/src/editor/codeIntel.ts::resolveWord` is the
+only caller of `diagnostics_probe` in the app and both gestures go through it; both normalise the
+pointer to the same word range, so both compute the same cache key and hit the same entry; both ask
+`intent()` what the answer means, and `underlines()` is *derived* from `intent()` rather than being
+a second list. Both handlers live in one file, `ctrlLink.ts`, on one CodeMirror extension — the
+Ctrl+click that used to sit in `EditorSurface.tsx` moved there for exactly that reason. `check:editor`
+counts the probe call sites and asserts the other three files never reach past it.
+
+**The discriminator is "the definition is where I already am."** Ask `textDocument/definition` —
+the request Ctrl+click already made — and compare the reply against the position asked about: same
+file, caret inside the returned range, means the caret *is* the declaration. VS Code's rule verbatim.
+On a reference, the common case, it is **free**: it is the one request that was already being made.
+Only on a declaration is anything extra paid, and there it is a definition round trip in front of a
+references search that dwarfs it.
+
+Wrong in each direction, because it will be:
+
+* **"Declaration" when it was a reference** needs a server to answer a non-declaration with the
+  caret's own position. Neither shipped server does that short of a bug. Cost: a usages popup
+  instead of a jump. One Escape, nothing moved.
+* **"Reference" when it was a declaration** is real and reachable — `fn fmt` inside
+  `impl Display for Foo` resolves to the *trait's* `fn fmt`, so Ctrl+click on it jumps to the trait
+  rather than listing implementations. Cost: a jump nobody asked for. Which is why the jump goes on
+  the Back stack, and why `navigate.usages` ships as its own bindable command that skips the
+  discriminator entirely. **That command is not optional**; it is the only honest answer to "the
+  guess was wrong".
+
+**What a drag costs, measured.** `hoverPlan` is a pure function precisely so the budget can be
+driven headlessly, and `check:editor` replays a synthetic drag through it with a clock. One second
+of pointer motion across a line of eight identifiers — 120 samples at 8 ms — is **zero requests**;
+stopping is **one**; a there-and-back drag over six identifiers is **one**, not one per identifier,
+because the cache is keyed on the *word range* and not the pointer position; and a pointer that
+settles on a comment, a keyword or punctuation is **zero**, because the local CodeMirror token
+answers that without asking anybody. A naive `mousemove → invoke` would be 60–120 requests a second.
+
+That budget is not politeness. `diagnostics_probe` is `spawn_blocking`, so a blocking thread is
+parked per in-flight hover, and the outbound queue to a language server is `bounded(256)` and
+**drops notifications** when it is full — a hover flood would drop a `didChange` and desync
+rust-analyzer's copy of the buffer permanently, which is the exact failure `docSync.ts` exists to
+prevent.
+
+**One usage jumps, with no popup**, through `jumpTo` so it lands on the Back stack. Zero usages is a
+sentence in the notice stack (`info`, not an error — "used nowhere" is a *result*), and it is a
+different sentence from "there is no declaration under the caret": `textDocument/references` answers
+`null` for the second and `[]` for the first, and collapsing them would tell a user who clicked a
+keyword that their function is unused. Two or more opens the 620px card after a 150 ms grace, so a
+fast answer never flashes a popup and a slow one says *"Finding usages of ‘parse’…"* with
+rust-analyzer's own progress detail appended, rather than appearing empty and reading as "none".
+
+**Escape genuinely cancels.** `Requester::cancel` releases the blocked thread *and* sends
+`$/cancelRequest`, so rust-analyzer stops searching rather than merely being ignored — without the
+second half, "Escape cancelled it" and "Escape stopped showing it" are indistinguishable on screen
+and only one is true. A timeout now cancels too, which fixes a small pre-existing leak on the
+five-second definition path.
+
+**Nothing gates the request on a source being `Ready`.** That is the trap this repository has
+already shipped once: rust-analyzer's indexing is a *sequence* of progress tokens and "nothing in
+flight" is true in every gap between them — against this workspace it flapped eight times in the
+first 0.9 s — which is what `READY_SETTLE` exists for. The status is used for the popup's prose and
+nothing else; the timeout is the readiness answer. `check:editor` asserts the orchestrator never
+reads a readiness flag.
+
+**Ctrl+B is unchanged.** `navigate.definition` still means Go to definition, exactly, and so does the
+menu item that carries its chip. Only the *mouse* gesture is the smart one. Making Ctrl+B also
+switch behaviour would have left a command called "Go to definition" that sometimes does not, which
+is a worse trade than one chord that does one thing.
+
+**What is not done.**
+
+* **No preview pane.** IDEA's Find Usages tool window has one; here it would be a second CodeMirror
+  instance inside a modal, for a surface that exists to be dismissed in under two seconds. The
+  preview is the row: the source line, clipped in Rust, with the occurrence marked through the same
+  `splitHighlight` the search panel uses.
+* **The list is capped** at 200 usages across 100 files and says so when it hits the cap. The
+  alternative is reading four thousand files because somebody Ctrl+clicked `fn new`.
+* **No usages panel**, and no grouping controls: the popup does not collapse groups, because a fold
+  state nothing can save is a control that only ever costs a click.
+* **The hover needs a focused editor to react to a Ctrl *keydown*.** `mousemove` carries the
+  modifier, so the ordinary case needs no keyboard listener at all — but a pointer parked over an
+  *unfocused* pane before Ctrl goes down gets its underline on the first pixel of movement instead.
+  Fixing it means a window-level keydown listener beside the key gate, and this feature does not
+  need one.
+* **`supports_references()` is dead weight today.** Both shipped servers advertise the capability,
+  so the fifteen lines that read it only ever prevent a future lie — a server built without the
+  method would otherwise spend the whole twenty-second deadline and then be reported as "probably
+  still indexing".
+* **Read-only buffers opened outside the project** (`~/.cargo/registry`, `$GOMODCACHE`) were never
+  `didOpen`ed unless a pane mounted them, so what rust-analyzer answers about them is whatever its
+  own index holds. Unverified either way.
+* **`Requester::cancel` is not reachable for the probe path**, only for usages. A superseded hover is
+  dropped on arrival by a generation counter and the server finishes the work — which is acceptable
+  because the ladder means there is almost never more than one in flight.
+
 ## Dragging rows into a folder (M13), and what is not done
 
 Press a row, move four pixels, and the file tree picks it up — the whole selection when the row is
@@ -229,10 +525,11 @@ wrapped. `Ctrl+G` is Go to line, which **takes find-next away from that chord in
 back. The `when` is not optional in that line and the test named after it says why.
 
 **Verified against real servers.** `cargo test -p cide-lsp -- --ignored` drives the real binaries;
-**CI does not run it**, so run it by hand after touching that crate. All six pass — `gopls`
+**CI does not run it**, so run it by hand after touching that crate. All seven pass — `gopls`
 reporting on a module, rust-analyzer indexing this workspace and reporting an introduced type
-error, the shutdown ladder actually stopping a server, the on-disk-edit test below, and a real
-`textDocument/definition` resolving a reference to its declaration.
+error, the shutdown ladder actually stopping a server, the on-disk-edit test below, a real
+`textDocument/definition` resolving a reference to its declaration, and (M14) a real
+`textDocument/references` listing the call site of a declaration and *not* the declaration itself.
 
 Verified in the app, too, once: with a type error planted in `cide-core` *after* the build, a
 launched binary logged `published … child_env.rs n=2 "mismatched types: expected u32, found &str"`

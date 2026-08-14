@@ -18,9 +18,14 @@
 //! file is read, no lock is held for longer than a map lookup. That is the same argument
 //! `claude_send_lines` writes out under its own "Not `spawn_blocking`" note.
 //!
-//! Two exceptions, both of which really do wait: [`diagnostics_restart`] spawns a process, and
-//! [`diagnostics_definition`] blocks on a reply from one. Both go to the blocking pool, because a
-//! command polled on the main thread holds the GTK loop and freezes every window in the app.
+//! The exceptions are the ones that really do wait: [`diagnostics_restart`] spawns a process, and
+//! [`diagnostics_definition`], [`diagnostics_probe`] and [`diagnostics_usages`] each block on a
+//! reply from one. All four go to the blocking pool, because a command polled on the main thread
+//! holds the GTK loop and freezes every window in the app.
+//!
+//! [`diagnostics_usages_cancel`] is deliberately *not* among them: it takes a mutex and pushes one
+//! notification, and making it wait would defeat its whole purpose, since the thing it races is a
+//! twenty-second wait.
 
 use cide_ipc::{DiagnosticSourceId, DiagnosticsSnapshot, ProjectId};
 use tauri::State;
@@ -165,6 +170,109 @@ pub async fn diagnostics_definition(
     .unwrap_or(cide_ipc::DefinitionAnswer::Unavailable {
         reason: "The lookup did not finish.".to_string(),
     }))
+}
+
+/// The shortest a caller may ask this to wait, and the longest.
+///
+/// The floor exists because a webview that passed `0` would turn every hover into an instant
+/// `Timeout` and cache a wrong answer; the ceiling because a `timeoutMs` is a number crossing an
+/// IPC boundary and a mistyped one must not park a blocking-pool thread for an hour.
+const PROBE_TIMEOUT_FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Which action a Ctrl+click at this position would take: jump, or list usages.
+///
+/// The discriminator, and — because the Ctrl-hover underline consumes the same answer — the *only*
+/// thing that has to be asked to know whether to draw an underline. Deliberately does not search
+/// for references: a hover must not be able to start a whole-workspace search.
+///
+/// `timeoutMs` is optional and clamped to `[100 ms, DEFINITION_TIMEOUT]`. The hover passes a short
+/// one and means it: five seconds is right behind a keystroke and wrong behind a pointer, where an
+/// underline that arrives five seconds later has been wrong for four of them and the thread is held
+/// the whole time. Absent, it is [`DEFINITION_TIMEOUT`], so the click behaves exactly like Go to
+/// definition.
+///
+/// Never `Err`, for the reason [`cide_ipc::ProbeAnswer`] gives.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_probe(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    path: std::path::PathBuf,
+    line: u32,
+    column: u32,
+    timeout_ms: Option<u32>,
+) -> Result<cide_ipc::ProbeAnswer, ()> {
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(cide_ipc::ProbeAnswer::Unavailable {
+            reason: "No language server is running for this project. Rust needs rust-analyzer \
+                     and Go needs gopls on PATH."
+                .to_string(),
+        });
+    };
+    let timeout = timeout_ms
+        .map(|ms| std::time::Duration::from_millis(u64::from(ms)))
+        .unwrap_or(DEFINITION_TIMEOUT)
+        .clamp(PROBE_TIMEOUT_FLOOR, DEFINITION_TIMEOUT);
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        diagnostics.probe(&path, line, column, timeout)
+    })
+    .await
+    .unwrap_or(cide_ipc::ProbeAnswer::Unavailable {
+        reason: "The lookup did not finish.".to_string(),
+    }))
+}
+
+/// How long Find usages waits before saying so.
+///
+/// Four times [`DEFINITION_TIMEOUT`], and the difference is the gesture rather than the plumbing.
+/// Go to definition is behind a keystroke and five seconds of nothing reads as a freeze; a
+/// references search is a *search* — the user has a popup in front of them saying so — and on a
+/// widely-used trait method against a cold rust-analyzer it legitimately takes tens of seconds.
+/// Finite for the same reason as its neighbour: a server mid-index never answers at all.
+const USAGES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Every place the symbol at this position is used.
+///
+/// `spawn_blocking` and never `Err`, same as its neighbours. Cancellable through
+/// [`diagnostics_usages_cancel`] — which is not decoration: twenty seconds is long enough that the
+/// user *will* dismiss the popup first, and without the cancel the server keeps searching a whole
+/// workspace for a list nobody will read.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_usages(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    path: std::path::PathBuf,
+    line: u32,
+    column: u32,
+) -> Result<cide_ipc::UsagesAnswer, ()> {
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(cide_ipc::UsagesAnswer::Unavailable {
+            reason: "No language server is running for this project. Rust needs rust-analyzer \
+                     and Go needs gopls on PATH."
+                .to_string(),
+        });
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        diagnostics.usages(&path, line, column, USAGES_TIMEOUT)
+    })
+    .await
+    .unwrap_or(cide_ipc::UsagesAnswer::Unavailable {
+        reason: "The search did not finish.".to_string(),
+    }))
+}
+
+/// Withdraw the outstanding Find usages. Escape in the popup, and closing it.
+///
+/// **Not** `spawn_blocking`: it takes a mutex, clones a `Requester` and pushes one notification
+/// into a bounded channel — the same argument the module docs make for the document notifications.
+/// Making it wait would defeat the point, since the thing it is racing is a twenty-second wait.
+///
+/// A no-op when nothing is outstanding, which is most calls: the popup cancels on unmount and does
+/// not track whether the answer already landed. Being cheap enough not to care is the design.
+#[tauri::command(rename_all = "camelCase")]
+pub fn diagnostics_usages_cancel(registry: State<'_, DiagnosticsRegistry>, project: ProjectId) {
+    if let Some(diagnostics) = registry.get(project) {
+        diagnostics.cancel_usages();
+    }
 }
 
 /// Restart one analyser after it gave up.

@@ -44,6 +44,9 @@ try {
       'src/overlays/format.ts',
       'src/overlays/listKeys.ts',
       'src/overlays/gotoLine.ts',
+      // M14. The Find usages popup's four indistinguishable-looking empty states, its filter
+      // predicate and its file count. Import-free for exactly this reason.
+      'src/overlays/usagesModel.ts',
       'src/sidebar/rowWindow.ts',
       'src/store/fileIndex.ts',
       '--outDir', out,
@@ -69,6 +72,7 @@ try {
   )
   const { listAction, PAGE_ROWS } = require(join(out, 'overlays/listKeys.js'))
   const { canGo, gotoNote, parseGoto } = require(join(out, 'overlays/gotoLine.js'))
+  const usages = require(join(out, 'overlays/usagesModel.js'))
   const { chunkOf, chunkRequest, chunksFor, chunksToEvict } = require(
     join(out, 'sidebar/rowWindow.js'),
   )
@@ -424,6 +428,116 @@ try {
   eq(isNoIndex('no file index for this project'), false, 'the prose alone is not the tag')
   eq(isNoIndex(null), false, 'null is not NoIndex')
   eq(isNoIndex(undefined), false, 'undefined is not NoIndex')
+
+  /* ------------------------------------------------------------------------------------ */
+  /* Find usages: the popup's arithmetic and its sentences. (M14)                          */
+  /* ------------------------------------------------------------------------------------ */
+
+  /*
+   * Two things live here and both are invisible on a screenshot.
+   *
+   * The **filter** is a substring test and not `score.ts`'s fuzzy ranking, deliberately: that
+   * scorer is a port of a command-title matcher, and run over source lines it produces confident
+   * nonsense, because almost any subsequence of characters occurs somewhere in forty lines of code.
+   *
+   * The **statuses** are four different facts rendered as one grey line, and getting two of them
+   * the wrong way round reads fine in review and misleads in use — in particular "still searching"
+   * and "found nothing", where a popup that appears empty and then fills claims *no usages* for as
+   * long as a cold rust-analyzer takes.
+   */
+  const ok = (condition, what) => {
+    if (!condition) {
+      failed += 1
+      console.error(`FAIL ${what}`)
+    }
+  }
+
+  eq(usages.subject(null), 'the symbol', 'a caret on punctuation still gets a sentence')
+  eq(usages.subject('parse'), '‘parse’', 'and a named one gets its name')
+  eq(usages.usagesLabel('parse'), 'Usages of ‘parse’', 'which heads the dialog')
+
+  const row = (rel, text) => ({ rel, text })
+  ok(usages.matchesUsage(row('src/a.rs', 'let x = parse()'), 'a.rs'), 'the path is searched')
+  ok(usages.matchesUsage(row('src/a.rs', 'let x = parse()'), 'LET'), 'and the line, case-blind')
+  ok(
+    !usages.matchesUsage(row('src/a.rs', 'let x = parse()'), 'rs let'),
+    'but not across the two — a query straddling them must not match by accident',
+  )
+  ok(usages.matchesUsage(row('src/a.rs', 'x'), '  '), 'an empty query keeps everything')
+  eq(
+    usages.filterUsages([row('a.rs', 'one'), row('b.rs', 'two')], 'b').length,
+    1,
+    'and the filter is the predicate applied, not a second implementation of it',
+  )
+
+  /*
+   * Counted by consecutive run, the same way `groupHits` groups. A count derived from a Set of
+   * paths would disagree with the number of headings drawn the moment a path appeared twice, and
+   * "12 usages in 3 files" over four headings is the kind of wrong only noticed by someone who
+   * already distrusts it.
+   */
+  eq(
+    usages.fileCount([{ path: '/w/a' }, { path: '/w/a' }, { path: '/w/b' }, { path: '/w/a' }]),
+    3,
+    'a path that comes back later is a third group, because that is how it is drawn',
+  )
+  eq(usages.fileCount([]), 0, 'and nothing is no files')
+
+  const status = (over) =>
+    usages.usagesStatus({
+      searching: false,
+      detail: null,
+      failed: null,
+      total: 3,
+      shown: 3,
+      truncated: false,
+      name: 'parse',
+      query: '',
+      ...over,
+    })
+  eq(status({}), null, 'rows draw instead of a status')
+  // Read defensively from here on. A mutation that makes one of these branches return `null`
+  // would otherwise die with a TypeError inside the check rather than printing which claim broke,
+  // and an unreadable failure is a failure nobody acts on.
+  const say = (over) => status(over) ?? '(no status at all)'
+  ok(
+    say({ searching: true }).startsWith('Finding usages of ‘parse’…'),
+    'a running search SAYS it is running — a popup that appears empty and fills reads as "no ' +
+      'usages" for as long as the search takes',
+  )
+  ok(
+    say({ searching: true, detail: 'Indexing' }).includes('Indexing'),
+    'and carries the server’s own word for what it is doing, so a 20-second wait is explained',
+  )
+  ok(
+    say({ total: 0, shown: 0 }).includes('No usages of ‘parse’'),
+    'used nowhere says so',
+  )
+  ok(
+    say({ shown: 0, query: 'zzz' }).includes('zzz'),
+    'while a filter that hides every row blames the filter — saying "no usages" there would be ' +
+      'the app disowning a state the user just created',
+  )
+  eq(
+    status({ failed: 'gopls is not running for this project.' }),
+    'gopls is not running for this project.',
+    'and the server’s own sentence outranks all of them, verbatim',
+  )
+  ok(say({ truncated: true }).includes('cap'), 'a capped list says so rather than lying')
+  // The two that must never be confused: `null` from the protocol means "no symbol here", `[]`
+  // means "used nowhere". Rendering the first as the second tells a user who pressed ⌥F7 on a
+  // keyword that their function is unused.
+  ok(
+    /declaration/.test(usages.noSymbolSentence()) &&
+      !/No usages/.test(usages.noSymbolSentence()),
+    'no declaration and no usages are two different sentences — the protocol distinguishes them ' +
+      '(`null` versus `[]`) and collapsing them tells a user who pressed ⌥F7 on a keyword that ' +
+      'their function is unused',
+  )
+  ok(
+    usages.noUsagesSentence(null).includes('the symbol'),
+    'and both survive not knowing the identifier’s name',
+  )
 
   if (failed > 0) {
     console.error(`\ncheck-picker: ${failed} failure(s)`)

@@ -10,7 +10,7 @@
  * there is nothing worth fuzzy-matching in `Rust`, `Go`, `JSON`. A 620px card holding them
  * reads as a dialog that failed to load.
  *
- * So the geometry is `GoToLine`'s, which is `chrome/ProjectSwitcher.module.css`'s with a scrim
+ * So the geometry is `GoToLine`'s, which is `chrome/Switcher.module.css`'s with a scrim
  * added back. The CSS module is **duplicated** rather than extracted, deliberately: two users
  * is where extraction is a guess and three is where it is a fact, and doing it in the same
  * change as the feature would make a regression in Go to line indistinguishable from a bug in

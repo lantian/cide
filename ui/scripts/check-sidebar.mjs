@@ -1,6 +1,7 @@
 /**
- * Checks `src/chrome/sidebarWidth.ts` — the decisions a sidebar resize is made of — and pins
- * its constants against the three other files that hold the same numbers.
+ * Checks the two import-free modules the left sidebar's behaviour lives in — `sidebarWidth.ts`
+ * (how wide it is) and `sidebarView.ts` (whether it is showing at all, and which panel) — and
+ * pins the width constants against the three other files that hold the same numbers.
  *
  * This exists because both halves of the feature fail *silently*. A clamp that lets a width
  * through gives a panel that swallows the workspace, with no error anywhere; a persistence
@@ -53,6 +54,10 @@ try {
     [
       'node_modules/typescript/bin/tsc',
       'src/chrome/sidebarWidth.ts',
+      // Compiled beside it and for the same reason: F4's "which panel comes back" is a rule
+      // with cases in it, and a rule that lives in a React state updater is a rule no check
+      // script can run. Both files are import-free precisely so this one `tsc` can take them.
+      'src/chrome/sidebarView.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -83,6 +88,96 @@ try {
     encodeWidths,
     decodeWidths,
   } = await import(`file://${join(out, 'sidebarWidth.js')}`)
+
+  const { SIDEBAR_INITIAL, isPanelOpen, selectView, showPanel, toggleSidebar } = await import(
+    `file://${join(out, 'sidebarView.js')}`
+  )
+
+  // --- hiding the panel, and what comes back ---------------------------------------------
+  //
+  // The hidden state has shipped since M3 and was reachable by mouse only; F4 is what reaches
+  // it from the keyboard, and `last` — which panel comes back — is the only genuinely new fact.
+  // Both halves are decided by these four functions and by nothing in `App.tsx`.
+
+  eq(SIDEBAR_INITIAL, { view: 'files', last: 'files' }, 'a shell window opens on Files, showing')
+  ok(isPanelOpen(SIDEBAR_INITIAL), 'and that counts as open')
+
+  // The rail: the lit button toggles its own panel shut, any other switches to it.
+  eq(selectView(SIDEBAR_INITIAL, 'files'), { view: null, last: 'files' }, 'the lit button hides')
+  eq(selectView(SIDEBAR_INITIAL, 'git'), { view: 'git', last: 'git' }, 'another switches')
+  eq(
+    selectView({ view: null, last: 'git' }, 'search'),
+    { view: 'search', last: 'search' },
+    'and a click while hidden opens the one clicked, not the one remembered',
+  )
+
+  // A command that names a panel always reveals it — never toggles. `keys/dispatch.ts` argues
+  // it under `sidebar.search`: the rail button is right there, and a second Ctrl+Shift+F that
+  // closed the panel would take away the one thing the binding is for.
+  eq(
+    showPanel({ view: 'search', last: 'search' }, 'search'),
+    { view: 'search', last: 'search' },
+    'showPanel on the panel already showing leaves it showing',
+  )
+  eq(showPanel({ view: null, last: 'git' }, 'files'), { view: 'files', last: 'files' })
+
+  // F4 itself.
+  eq(toggleSidebar(SIDEBAR_INITIAL), { view: null, last: 'files' }, 'F4 hides the open panel')
+  eq(
+    toggleSidebar({ view: null, last: 'problems' }),
+    { view: 'problems', last: 'problems' },
+    'and brings back the last one that was open, not a hard-coded Files',
+  )
+  eq(
+    toggleSidebar(toggleSidebar({ view: 'git', last: 'git' })),
+    { view: 'git', last: 'git' },
+    'so F4 twice is a round trip',
+  )
+
+  /*
+   * `settings` is a view with no panel, and it counts as **closed**. Two assertions, because
+   * both halves are easy to get wrong and both are visible to the user:
+   *
+   *  - F4 with ⚙ lit must open `last` rather than doing nothing, or the key looks broken
+   *    exactly once per session — right after somebody clicks the gear;
+   *  - `last` must never become `settings`, or "bring back the last panel" brings back a state
+   *    with nothing in it and F4 stops being a toggle at all.
+   */
+  ok(!isPanelOpen({ view: 'settings', last: 'git' }), 'the settings view is not a panel')
+  eq(
+    toggleSidebar({ view: 'settings', last: 'git' }),
+    { view: 'git', last: 'git' },
+    'F4 from the settings view opens the last real panel',
+  )
+  eq(
+    selectView({ view: 'files', last: 'files' }, 'settings'),
+    { view: 'settings', last: 'files' },
+    'and choosing ⚙ remembers the panel it replaced',
+  )
+  for (const from of [
+    { view: 'files', last: 'files' },
+    { view: null, last: 'search' },
+    { view: 'settings', last: 'problems' },
+  ]) {
+    let start = from
+    for (const step of [
+      (s) => selectView(s, 'settings'),
+      (s) => selectView(s, 'git'),
+      (s) => selectView(s, 'git'),
+      (s) => toggleSidebar(s),
+      (s) => showPanel(s, 'problems'),
+      (s) => toggleSidebar(s),
+      (s) => selectView(s, 'settings'),
+      (s) => toggleSidebar(s),
+    ]) {
+      start = step(start)
+      ok(start.last !== 'settings', `\`last\` is never the panel-less view: ${JSON.stringify(start)}`)
+      ok(start.last !== null, '…and is never null, so there is always something to restore')
+    }
+    ok(isPanelOpen(start), 'a sequence ending in a toggle from settings leaves a panel showing')
+  }
+
+  ok(!isPanelOpen({ view: null, last: 'files' }), 'and a hidden sidebar is not open')
 
   // --- the clamp -------------------------------------------------------------------------
 

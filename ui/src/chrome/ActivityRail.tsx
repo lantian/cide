@@ -14,9 +14,17 @@
 import { Fragment } from 'react'
 import { badgeLabel, badgeText } from '@/sidebar/GitPanel/model'
 import { groupDigits } from '@/overlays/format'
+import type { ActivityView } from './sidebarView'
 import styles from './ActivityRail.module.css'
 
-export type ActivityView = 'files' | 'git' | 'search' | 'problems' | 'settings'
+/*
+ * The type moved to `chrome/sidebarView.ts` in M14 and is re-exported here so the half-dozen
+ * existing import sites did not have to move with it. It lives there because the *rules* about
+ * it do — which view has a panel, which one can be restored, what a click means — and that
+ * module is import-free so `check-sidebar.mjs` can compile and execute them. This component
+ * still only draws.
+ */
+export type { ActivityView }
 
 interface RailItem {
   id: ActivityView

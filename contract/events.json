@@ -5,6 +5,7 @@
   "cide://fs-status",
   "cide://git-status",
   "cide://ipc-degraded",
+  "cide://keymap-changed",
   "cide://mouse-nav",
   "cide://session-awaiting",
   "cide://session-state",

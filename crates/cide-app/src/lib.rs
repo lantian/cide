@@ -335,6 +335,7 @@ pub fn run() {
             cmd::settings::settings_set,
             cmd::settings::tab_open_settings,
             cmd::settings::keymap_report,
+            cmd::settings::keymap_edit,
             cmd::settings::graphics_status,
             cmd::settings::claude_headless,
             cmd::settings::claude_commit_message,
@@ -383,6 +384,9 @@ pub fn run() {
             cmd::diagnostics::diagnostics_did_save,
             cmd::diagnostics::diagnostics_did_close,
             cmd::diagnostics::diagnostics_definition,
+            cmd::diagnostics::diagnostics_probe,
+            cmd::diagnostics::diagnostics_usages,
+            cmd::diagnostics::diagnostics_usages_cancel,
             cmd::diagnostics::diagnostics_restart,
         ])
         .on_window_event(|window, event| {

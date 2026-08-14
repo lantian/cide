@@ -316,3 +316,67 @@
   font-size: 11px;
   font-style: italic;
 }
+
+/*
+ * Find usages. (M14)
+ *
+ * A file heading and then its usages, which is the search panel's shape — the two lists show the
+ * same thing (a source line with an occurrence in it) and looking different would be an
+ * inconsistency the user has no way to explain.
+ *
+ * The heading is drawn with `.path` and `.group`, which already exist and already ellipsise from
+ * the right end; only the height and the ground differ, and both are here.
+ */
+.usageFile {
+  background: var(--chrome);
+  cursor: default;
+}
+
+/* The line number. Fixed width so the source lines start on one column — the same argument
+   `.badge` makes, and without it every group jitters by a digit. */
+.usageAt {
+  flex: none;
+  width: 46px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.rowSelected .usageAt {
+  color: var(--dim);
+}
+
+/* The source line. `pre` so leading indentation survives — a usage's position inside its block is
+   half of what makes the row readable — and clipped rather than wrapped, because a wrapping row
+   would break the virtualizer's fixed height. */
+.usageText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.rowSelected .usageText {
+  color: var(--text);
+}
+
+/* The occurrence itself. `background: transparent` because `<mark>` has a yellow UA default that
+   ignores the palette entirely, which is exactly the kind of thing that looks fine in one theme. */
+.usageMatch {
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* `41 usages in 12 files`, under the list. The count the counter cannot show: the counter says how
+   many the filter left, and this says what the search actually found. */
+.usageSummary {
+  padding: 8px 14px;
+  color: var(--faint);
+  font-size: 11.5px;
+}

@@ -64,7 +64,7 @@ import {
   type ReadoutSlot,
 } from './statusReadout'
 import { claimCaret, type CaretSlot } from './caretTrack'
-import { goToDefinition } from './goToDefinition'
+import { ctrlLink, wordTargetAt } from './ctrlLink'
 import { trailNames, type OutlineNode } from './memberNav'
 import { lintRanges, type LintSource } from './lintMap'
 import { lintGutter, setDiagnostics } from '@codemirror/lint'
@@ -444,66 +444,16 @@ export function EditorSurface({
       crosshairCursor(),
       EditorState.allowMultipleSelections.of(true),
       /*
-       * Alt adds carets; Ctrl navigates. IDEA's arrangement, and the opposite of CodeMirror's.
+       * Ctrl+hover and Ctrl+click. (M14)
        *
-       * CodeMirror's default for this facet is `browser.mac ? metaKey : ctrlKey` — so on Linux
-       * **Ctrl+click was adding a cursor**, which is the chord IDEA uses for Go to Declaration.
-       * Overriding the facet moves that to Alt and frees Ctrl for the handler below.
-       *
-       * Alt+click already reaches `rectangularSelection`'s style (its filter is `altKey && button
-       * == 0`, drag or not), and that style's `get` consults *this* facet for its `multiple`
-       * argument: with it true a zero-drag Alt+click concatenates a new empty range onto the
-       * existing selection, which is exactly "add a caret". So one facet override buys both
-       * halves rather than needing a second handler.
-       *
-       * Two honest divergences, both consequences of routing the caret gesture through the
-       * rectangle style, and neither worth a second facet that disagrees with this one:
-       *
-       * * Alt+**drag** adds its rectangle to the existing selection where IDEA replaces it.
-       * * Alt+click **cannot remove** a caret. CodeMirror's remove-a-range-under-the-pointer
-       *   branch lives in `basicMouseSelection.get`, which `rectangularSelection`'s filter
-       *   pre-empts for any Alt-held click. Recovering it would mean moving column selection off
-       *   Alt (to Alt+Shift+drag, VS Code's chord) — a second change to a gesture nobody asked
-       *   about, so it is written down here rather than made silently.
+       * Both halves of one gesture, and they live together in `ctrlLink.ts` rather than here —
+       * the underline is a promise about what the click will do, and two handlers in two files
+       * would each hold their own idea of which word is under the pointer. The Ctrl+click
+       * `mousedown` that used to sit at this line moved there unchanged, and
+       * `clickAddsSelectionRange` moved with it, because a facet override that frees Ctrl is part
+       * of the gesture rather than part of the surface.
        */
-      EditorView.clickAddsSelectionRange.of((event) => event.altKey),
-      EditorView.domEventHandlers({
-        /*
-         * Ctrl+click → Go to definition.
-         *
-         * On `mousedown` rather than `click`, because CodeMirror starts its own selection
-         * gesture on mousedown: by the time a `click` fired the caret would already have moved
-         * and the selection been replaced, so the jump would be computed from the right position
-         * but leave the old buffer visibly disturbed. Returning `true` marks it handled and
-         * `preventDefault` stops the drag gesture from ever starting.
-         *
-         * `button === 0` so a Ctrl+right-click still opens the context menu — which is where the
-         * same action lives for anyone who prefers a menu. `metaKey` is accepted too: on macOS
-         * ⌘-click is the platform's equivalent, and `platform_layer` rewrites the Ctrl+B binding
-         * the same way.
-         */
-        mousedown: (event, target) => {
-          if (event.button !== 0 || !(event.ctrlKey || event.metaKey) || event.altKey) return false
-          if (project === undefined) return false
-          const at = target.posAtCoords({ x: event.clientX, y: event.clientY })
-          if (at === null) return false
-          const line = target.state.doc.lineAt(at)
-          event.preventDefault()
-          /*
-           * Focus explicitly, because returning `true` skips the code that would have done it.
-           *
-           * CodeMirror focuses the content DOM inside its own `mousedown` handler, and only once
-           * it has produced a selection style (`let mustFocus = !view.hasFocus; …
-           * focusPreventScroll(view.contentDOM)`). Handling the event here bypasses that
-           * entirely, so a Ctrl+click into an *unfocused* pane used to jump correctly and leave
-           * the keyboard pointing at whatever had focus before — the next keystroke went to the
-           * old pane.
-           */
-          if (!target.hasFocus) target.focus()
-          goToDefinition(project, path, line.number, at - line.from + 1)
-          return true
-        },
-      }),
+      ctrlLink(project, path),
       syntaxHighlighting(cideHighlightStyle),
       findExtensions(),
       minimap(),
@@ -660,7 +610,24 @@ export function EditorSurface({
     // Claimed and released with the readout, and for the same reason: the two answer the same
     // question — *which editor is the user in* — and a caret slot outliving its buffer would
     // send Ctrl+F12 to a file that is no longer on screen.
-    caret = claimCaret(path)
+    /*
+     * The word reader is what lets ⌥F7 name the identifier it is searching for.
+     *
+     * `keys/dispatch.ts` has a caret and no `EditorView` — the predicament `caretTrack` exists for
+     * — so without this the popup would be headed *"Usages of the symbol"* and the empty-result
+     * notice would say *"No usages found"* about nothing in particular.
+     *
+     * A **getter**, so nothing is computed until the chord fires: putting the word on the claim
+     * beside the line and column would extract one per selection change, which under a held arrow
+     * key is thirty a second on the one path this file goes out of its way to keep cheap. And it is
+     * `wordTargetAt` — the same normaliser Ctrl+click uses — so the keyboard and the mouse cannot
+     * disagree about where a word starts and ends.
+     */
+    caret = claimCaret(path, () => {
+      const live = viewRef.current
+      if (live === null) return null
+      return wordTargetAt(live, live.state.selection.main.head)?.text ?? null
+    })
     /*
      * Seed the real numbers immediately, because nothing else will until the user types.
      *

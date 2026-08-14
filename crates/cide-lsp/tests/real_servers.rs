@@ -381,3 +381,103 @@ fn a_real_rust_analyzer_resolves_a_definition() {
     assert_eq!(line, 1, "the declaration is on line 1");
     assert!(column >= 1, "columns are 1-based");
 }
+
+#[test]
+#[ignore = "spawns the real rust-analyzer"]
+fn a_real_rust_analyzer_finds_the_usages_of_a_declaration() {
+    // The sibling of the definition test above, and it proves the half a fake cannot: that
+    // `textDocument/references` is answered at all (the capability is negotiated, not assumed),
+    // that `includeDeclaration: false` really does leave the declaration out, and that a list
+    // reply survives the same interleaved `$/progress` traffic the definition reply does.
+    //
+    // The fixture is deliberately the same shape as the definition test's — `target()` declared
+    // on line 1, called on line 4 — so the two read as one story: ask at the *call site* and you
+    // get the declaration; ask at the *declaration* and you get the call site.
+    let dir = std::env::temp_dir().join(format!("cide-lsp-refs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write");
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn target() -> u32 { 7 }\n\npub fn caller() -> u32 {\n    target()\n}\n",
+    )
+    .expect("write");
+
+    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let (up, seen) = wait_for(&handle, Duration::from_secs(180), ready);
+    assert!(
+        up,
+        "rust-analyzer never reached Ready.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    // The handshake has completed by now, so the capability must have been read off it. `None`
+    // here would mean `Session` stopped storing `result.capabilities` and nothing else noticed.
+    assert_eq!(
+        handle.supports_references(),
+        Some(true),
+        "rust-analyzer advertises referencesProvider; a None means the capability was never read"
+    );
+
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), "rust-analyzer");
+    let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
+    if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
+        handle.send(message);
+    }
+
+    let requester = handle.requester();
+    // 0-based on the wire: line 0 is `pub fn target() -> u32 { 7 }`, character 7 is the `t` of
+    // the *declaration*. This is the gesture the whole feature is about.
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 0, "character": 7 },
+        "context": { "includeDeclaration": false },
+    });
+
+    // Retried for the reason the definition test states: "indexed enough to publish diagnostics"
+    // and "indexed enough to resolve a reference" are different readiness questions.
+    let mut answer: Option<Vec<cide_lsp::convert::Loc>> = None;
+    for _ in 0..20 {
+        match requester.request(
+            "textDocument/references",
+            params.clone(),
+            Duration::from_secs(10),
+        ) {
+            Ok(value) => {
+                if let Some(rows) = cide_lsp::convert::locations(&value)
+                    && !rows.is_empty()
+                {
+                    answer = Some(rows);
+                    break;
+                }
+            }
+            Err(error) => panic!("the request failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let rows = answer.expect("rust-analyzer never listed a usage of `target`");
+    // The call site, 1-based. `3` would mean the conversion was skipped.
+    assert!(
+        rows.iter().any(|row| row.line == 4),
+        "the call on line 4 is missing: {rows:?}"
+    );
+    // And the declaration is *not* in the list. That is what `includeDeclaration: false` buys,
+    // and a list whose first row is "where you already are" is the one row that is certainly
+    // useless.
+    assert!(
+        !rows.iter().any(|row| row.line == 1),
+        "the declaration came back despite includeDeclaration: false: {rows:?}"
+    );
+}

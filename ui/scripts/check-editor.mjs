@@ -92,7 +92,7 @@
  * Run: `pnpm --dir ui run check:editor`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join, resolve } from 'node:path'
 
@@ -159,6 +159,10 @@ try {
       // speak; `navHistory.ts` is the whole of what Back and Forward decide.
       'src/editor/position.ts',
       'src/editor/navHistory.ts',
+      // M14, section 14: every decision behind Ctrl+hover and Ctrl+click. Import-free for exactly
+      // this reason — the two bugs this project has paid most for both hid in a rule written
+      // inside an event handler, which is where nothing can compile it.
+      'src/editor/codeIntelGate.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -1960,33 +1964,44 @@ try {
      *
      * CodeMirror's default for `clickAddsSelectionRange` is `ctrlKey` off macOS, so *deleting*
      * this override does not break a build or a type — it quietly hands Ctrl+click back to
-     * multi-cursor and takes Go to Definition's mouse gesture away with it. There is no runtime
-     * check that could notice.
+     * multi-cursor and takes the whole Ctrl gesture away with it. There is no runtime check that
+     * could notice.
+     *
+     * **This moved in M14**, and the assertion moved with it. The facet and the `mousedown` now
+     * live in `ctrlLink.ts` beside the hover, because the underline is a promise about what the
+     * click will do and two handlers in two files would each hold their own idea of which word is
+     * under the pointer. Pinning them here would have kept passing against an `EditorSurface` that
+     * still carried a dead copy.
      */
-    const surfaceCode = strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    const linkCode = strip(readFileSync('src/editor/ctrlLink.ts', 'utf8'))
     ok(
-      /clickAddsSelectionRange\.of\(\(event\) => event\.altKey\)/.test(surfaceCode),
+      /clickAddsSelectionRange\.of\(\(event\) => event\.altKey\)/.test(linkCode),
       'Alt adds carets: without this override CodeMirror puts multi-cursor back on Ctrl+click, ' +
-        'which is the chord Go to Definition needs',
+        'which is the chord the Ctrl gesture needs',
     )
     /*
      * Again scoped, and for the same reason: two independent whole-file greps ANDed together
      * would pass on a file that has a `mousedown` handler doing something else and a
-     * `goToDefinition` call somewhere unrelated — which is precisely the arrangement this is
+     * `ctrlActivate` call somewhere unrelated — which is precisely the arrangement this is
      * supposed to detect.
      */
-    const mousedownAt = surfaceCode.indexOf('mousedown:')
-    ok(mousedownAt !== -1, 'EditorSurface installs a mousedown handler')
-    const mousedownBlock = surfaceCode.slice(mousedownAt, mousedownAt + 900)
+    const mousedownAt = linkCode.indexOf('mousedown:')
+    ok(mousedownAt !== -1, 'ctrlLink installs a mousedown handler')
+    const mousedownBlock = linkCode.slice(mousedownAt, mousedownAt + 900)
     ok(
-      /ctrlKey/.test(mousedownBlock) && /goToDefinition\(/.test(mousedownBlock),
-      'Ctrl+click navigates from inside that handler: on mousedown, because a `click` fires ' +
+      /holdsCtrl\(event\)/.test(mousedownBlock) && /ctrlActivate\(/.test(mousedownBlock),
+      'Ctrl+click acts from inside that handler: on mousedown, because a `click` fires ' +
         'after CodeMirror has already moved the caret',
     )
     ok(
       /\.focus\(\)/.test(mousedownBlock),
       'the handler focuses the editor: returning true skips the CodeMirror path that would ' +
         'otherwise have done it, leaving the keyboard pointed at the previous pane',
+    )
+    ok(
+      /ctrlLink\(project, path\)/.test(strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))),
+      'and EditorSurface installs the extension — a gesture nothing mounts is the defect this ' +
+        'project ships most often',
     )
 
     const surfaceSrc = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
@@ -3378,6 +3393,658 @@ try {
     ok(
       !/state\.update/.test(rustNote.slice(rustAt, rustAt + 400)),
       'which does NOT go through WorkspaceState::update: no rev bump, no `cide://workspace-changed`',
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 14. Ctrl+hover and Ctrl+click
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * Two gestures that have to be one, and a cost budget that is the whole design.
+   *
+   * The underline that appears under Ctrl is a *promise* about what the click will do. If they can
+   * disagree the feature is worse than neither: an affordance that lies gets ignored, and the
+   * gesture it advertises goes unused with it. And a naive `mousemove → invoke` does not merely
+   * spend requests — the outbound queue to a language server is `bounded(256)` and drops
+   * *notifications* when it is full, so a hover flood desyncs rust-analyzer's copy of the buffer,
+   * which is the exact failure `docSync.ts` exists to prevent.
+   *
+   * So the ladder, the cache, the LRU, the backoff and the modifier-release rule are all pure
+   * functions in `codeIntelGate.ts`, driven here — and the wiring is pinned by source assertions,
+   * because every one of the bugs in this class has been a *missing call* rather than a wrong
+   * function, and no test of the surrounding code can see an absence.
+   */
+  {
+    const gate = load('codeIntelGate.js')
+    const strip = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+    /* --- the one rule both gestures read ------------------------------------------------ */
+
+    eq(gate.intent('definition'), 'jump', 'a reference jumps')
+    eq(gate.intent('declaration'), 'usages', 'a declaration lists usages — IDEA’s rule')
+    eq(gate.intent('notFound'), 'none', 'a keyword does nothing')
+    eq(gate.intent('unavailable'), 'none', 'and neither does a server that could not be asked')
+
+    /*
+     * The agreement, asserted as an identity rather than as two lists.
+     *
+     * `underlines` is *derived* from `intent`, so there is no way to make the underline appear for
+     * a kind the click will not act on. A second hand-maintained list of "underlinable" kinds is
+     * exactly the drift this is here to make impossible.
+     */
+    for (const kind of ['definition', 'declaration', 'notFound', 'unavailable']) {
+      eq(
+        gate.underlines(kind),
+        gate.intent(kind) !== 'none',
+        `the underline and the click agree about ${kind}`,
+      )
+    }
+
+    /* --- gate 3: is it even an identifier? ---------------------------------------------- */
+
+    for (const name of ['variableName', 'variableName.function', 'typeName', 'propertyName']) {
+      ok(gate.askableToken(name), `${name} is worth asking about`)
+    }
+    for (const name of ['comment', 'string', 'number', 'keyword', 'punctuation', 'operator']) {
+      ok(!gate.askableToken(name), `${name} can never resolve — asking would be pure cost`)
+    }
+    // Fails **open**, and both cases are real: a buffer past `HIGHLIGHT_LIMIT_BYTES` loads no
+    // language at all, and `StreamLanguage` parses lazily. Neither is evidence that the thing
+    // under the pointer is punctuation.
+    ok(gate.askableToken(null), 'no syntax tree means "we do not know", not "no"')
+    // A sub-tag folds onto its base, so a grammar that starts qualifying a name it used to emit
+    // bare does not silently change the answer.
+    ok(!gate.askableToken('string.special'), 'a qualified reject is still a reject')
+
+    /*
+     * Every tag the grammars can emit is classified, one way or the other.
+     *
+     * This is the assertion that keeps the reject-list honest as the grammars grow: a new token
+     * name that is in neither set is a name whose askability nobody decided, and because the list
+     * fails open it would start costing a round trip per hover with nothing to say why.
+     */
+    {
+      const sources = ['src/editor/streamGrammar.ts']
+      for (const file of readdirSync('src/editor/languages')) {
+        if (file.endsWith('.ts')) sources.push(join('src/editor/languages', file))
+      }
+      const emitted = new Set()
+      for (const file of sources) {
+        for (const [, tag] of strip(readFileSync(file, 'utf8')).matchAll(/return '([a-zA-Z.]+)'/g)) {
+          emitted.add(tag)
+        }
+      }
+      ok(emitted.size >= 15, `read ${emitted.size} token names out of the grammars`)
+      const classified = new Set([...gate.REJECTED_TOKENS, ...gate.ASKED_TOKENS])
+      const unclassified = [...emitted].filter((tag) => !classified.has(tag)).sort()
+      eq(unclassified, [], 'every tag a grammar emits is either asked about or rejected by name')
+      // And the two sets are disjoint, or one of them is a claim nothing enforces.
+      eq(
+        gate.ASKED_TOKENS.filter((tag) => gate.REJECTED_TOKENS.includes(tag)),
+        [],
+        'no tag is in both lists',
+      )
+    }
+
+    /* --- gate 1: the pointer is really on a glyph --------------------------------------- */
+
+    const rect = { left: 100, right: 140, top: 50, bottom: 66 }
+    ok(gate.onGlyph(120, 58, rect, 8), 'dead centre')
+    ok(gate.onGlyph(94, 58, rect, 8), 'one character width of slack to the left')
+    ok(!gate.onGlyph(80, 58, rect, 8), 'and not two')
+    // The case this gate exists for: `posAtCoords` in precise mode answers with the *line-end*
+    // position for a pointer parked in the empty space right of a line, so without the rect check
+    // hovering blank space underlines the last word of the line — and the click keeps that promise.
+    ok(!gate.onGlyph(400, 58, rect, 8), 'the empty space past the end of a line is not a glyph')
+    ok(!gate.onGlyph(120, 20, rect, 8), 'nor is the line above')
+    ok(!gate.onGlyph(120, 90, rect, 8), 'nor the one below — the vertical test has no slack')
+
+    /* --- gate 4: the cache -------------------------------------------------------------- */
+
+    /*
+     * Keyed on the **word range**, which is the single biggest saving in the ladder: crossing a
+     * fourteen-character identifier is one entry rather than fourteen. Keying on `(line, column)`
+     * — the obvious choice — multiplies the cache by the identifier's length and misses on every
+     * re-entry at a different pixel.
+     */
+    eq(
+      gate.keyFor('/w/a.rs', 3, 100, 106),
+      gate.keyFor('/w/a.rs', 3, 100, 106),
+      'the same word is the same key',
+    )
+    ok(
+      gate.keyFor('/w/a.rs', 3, 100, 106) !== gate.keyFor('/w/a.rs', 4, 100, 106),
+      'an edit changes the key, so every answer for that file becomes unreachable at once',
+    )
+    ok(
+      gate.keyFor('/w/a.rs', 3, 100, 106) !== gate.keyFor('/w/b.rs', 3, 100, 106),
+      'and two files never share one',
+    )
+    ok(
+      gate.keyFor('/w/a.rs', 3, 100, 106) !== gate.keyFor('/w/a.rs', 3, 100, 120),
+      'and the whole range is in it — two identifiers starting at the same offset in two ' +
+        'generations of the buffer are different questions',
+    )
+    /*
+     * The prefix and the key agree, which is a real bug this caught while it was being written:
+     * `forgetCodeIntel` drops a file's answers by prefix, and the first version built that prefix
+     * by hand with a **space** while `keyFor` separated with a NUL. It matched nothing, so
+     * unmounting a buffer forgot nothing — invisible on screen, and invisible to any test of
+     * either function on its own.
+     */
+    ok(
+      gate.keyFor('/w/a.rs', 3, 100, 106).startsWith(gate.keyPrefix('/w/a.rs')),
+      'every key for a file starts with that file’s prefix — the eviction path depends on it',
+    )
+    ok(
+      !gate.keyFor('/w/a.rs.bak', 3, 100, 106).startsWith(gate.keyPrefix('/w/a.rs')),
+      'and a longer path is not swept up by a shorter one’s prefix',
+    )
+
+    const answer = (kind, askedMs = gate.HOVER_TIMEOUT_MS, at = 0) => ({
+      kind,
+      askedMs,
+      at,
+    })
+
+    {
+      const cache = new Map()
+      gate.remember(cache, 'a', answer('definition'))
+      gate.remember(cache, 'b', answer('declaration'))
+      eq(gate.recall(cache, 'a')?.kind, 'definition', 'a remembered answer comes back')
+      eq(gate.recall(cache, 'z'), undefined, 'and an unknown key is a miss, not a throw')
+
+      /*
+       * Delete-before-set, so `Map` insertion order is a real LRU rather than first-seen order.
+       * `recall` re-inserts too — an identifier the user keeps returning to must not be the one
+       * evicted, which is exactly what a read-only recall would produce.
+       */
+      gate.remember(cache, 'c', answer('notFound'))
+      // `a` was read most recently of the first two, so `b` is the oldest.
+      eq([...cache.keys()], ['b', 'a', 'c'], 'reading an entry makes it the newest')
+      // And **re-remembering** one moves it too. Without the delete before the set, `Map` keeps
+      // an existing key in its original position, so a hot entry would be evicted before a cold
+      // one that has never been touched since it was written.
+      gate.remember(cache, 'b', answer('definition'))
+      eq([...cache.keys()], ['a', 'c', 'b'], 'and so does writing over one')
+
+      const big = new Map()
+      for (let i = 0; i < gate.CACHE_MAX + 50; i++) gate.remember(big, `k${i}`, answer('notFound'))
+      eq(big.size, gate.CACHE_MAX, 'the cache is bounded')
+      eq(big.has('k0'), false, 'and it is the oldest that goes')
+      eq(big.has(`k${gate.CACHE_MAX + 49}`), true, 'the newest survives')
+    }
+
+    /* --- the invariant that keeps the hover from over-promising -------------------------- */
+
+    /*
+     * **The hover can never underline something the click will not act on; the click may act where
+     * the hover stayed quiet.** A hover asks with a 600 ms deadline and a click with five seconds,
+     * so a hover's "could not be asked" is *not* an answer for a click — which re-asks properly
+     * rather than inheriting a shrug. Wrong in the safe direction, and this is where that is
+     * enforced rather than merely intended.
+     */
+    ok(gate.HOVER_TIMEOUT_MS < gate.CLICK_TIMEOUT_MS, 'the hover is the impatient one')
+    for (const kind of ['definition', 'declaration', 'notFound']) {
+      ok(
+        gate.usable(answer(kind), gate.CLICK_TIMEOUT_MS, 0),
+        `a definite ${kind} answers for anybody while it is fresh`,
+      )
+      // ...but not for ever, and the old comment here said "only an edit can stale it, and that
+      // changes the key" — which was true of an edit to the file the pointer is IN and false of
+      // an edit to the file the answer POINTS AT. The key carries only the hovering file's
+      // generation, so inserting lines above a declaration in another file invalidated nothing
+      // and Ctrl+click went on navigating to a line that had moved, with the underline agreeing.
+      ok(
+        !gate.usable(answer(kind), gate.CLICK_TIMEOUT_MS, gate.DEFINITE_TTL_MS + 1),
+        `a definite ${kind} expires — an edit to the file it POINTS AT cannot change this key`,
+      )
+      ok(
+        gate.usable(answer(kind), gate.CLICK_TIMEOUT_MS, gate.DEFINITE_TTL_MS - 1),
+        `and it is not re-asked on every hover inside the window (${kind})`,
+      )
+    }
+    ok(
+      !gate.usable(answer('unavailable', gate.HOVER_TIMEOUT_MS), gate.CLICK_TIMEOUT_MS, 0),
+      'a hover’s shrug is not an answer for a click',
+    )
+    ok(
+      gate.usable(answer('unavailable', gate.CLICK_TIMEOUT_MS), gate.HOVER_TIMEOUT_MS, 0),
+      'but a click’s is an answer for a hover',
+    )
+    /*
+     * And the backoff expires. `unavailable` is three situations behind one sentence — no server
+     * for this file type, no server running, the server is still indexing — and the third is
+     * *expected* for the first minute of a session. Caching it forever means a buffer that never
+     * underlines anything again after one early hover.
+     */
+    ok(
+      gate.usable(answer('unavailable', gate.HOVER_TIMEOUT_MS, 1000), gate.HOVER_TIMEOUT_MS, 1500),
+      'a fresh shrug suppresses re-asking',
+    )
+    ok(
+      !gate.usable(
+        answer('unavailable', gate.HOVER_TIMEOUT_MS, 1000),
+        gate.HOVER_TIMEOUT_MS,
+        1000 + gate.UNKNOWN_BACKOFF_MS + 1,
+      ),
+      'and stops suppressing once the server has had time to finish indexing',
+    )
+
+    /* --- the ladder, and what a drag actually costs -------------------------------------- */
+
+    /*
+     * **The cost claim, measured rather than asserted.**
+     *
+     * The whole design of this feature is a budget: a naive `mousemove → invoke` is one request
+     * per pointer sample, and the failure that produces is not a slow underline — the outbound
+     * queue to a language server is `bounded(256)` and *drops notifications* when full, so a
+     * dropped `didChange` desyncs rust-analyzer's copy of the buffer permanently.
+     *
+     * So the ladder is replayed here against a synthetic drag, with a clock, counting the requests
+     * it would produce. `hoverPlan` exists as a pure function precisely so this is possible: a
+     * budget whose justification lives inside a `mousemove` handler is a budget nothing can check.
+     *
+     * The drag: 120 pointer samples at 8 ms apart — a second of motion at a compositor's sampling
+     * rate — across a line of eight identifiers separated by punctuation, then the pointer stops
+     * on the last one.
+     */
+    {
+      const words = []
+      // Eight identifiers of six characters, four columns of punctuation between them. `null` is
+      // "not on a word", which is what gate 2 and gate 3 answer for the gaps.
+      for (let i = 0; i < 8; i++) words.push({ from: i * 10, to: i * 10 + 6 })
+      const at = (column) => {
+        const word = words.find((w) => column >= w.from && column < w.to)
+        return word ?? null
+      }
+
+      /*
+       * A pointer that has stopped produces **no further `mousemove` events** — which is the whole
+       * mechanism, so the replay has to model it that way rather than feeding repeated samples at
+       * the same coordinates. `endAt` is when the user stopped looking; the timer matures on its
+       * own between the last move and it.
+       */
+      const replay = (samples, endAt) => {
+        const cache = new Map()
+        let shown = null
+        let timer = null
+        let asks = 0
+        const steps = { clear: 0, keep: 0, draw: 0, hide: 0, wait: 0 }
+        const mature = (t) => {
+          if (timer === null || t - timer.t < gate.SETTLE_MS) return
+          asks += 1
+          gate.remember(cache, gate.keyFor('/w/a.rs', 0, timer.word.from, timer.word.to), {
+            kind: 'definition',
+            askedMs: gate.HOVER_TIMEOUT_MS,
+            at: t,
+          })
+          shown = timer.word
+          timer = null
+        }
+        for (const { t, column } of samples) {
+          mature(t)
+          const word = at(column)
+          const cached =
+            word === null
+              ? undefined
+              : gate.recall(cache, gate.keyFor('/w/a.rs', 0, word.from, word.to))
+          const step = gate.hoverPlan(word, shown, cached)
+          steps[step] += 1
+          if (step === 'clear' || step === 'hide') {
+            shown = null
+            timer = null
+          } else if (step === 'draw') {
+            shown = word
+            timer = null
+          } else if (step === 'wait') {
+            shown = null
+            timer = { t, word }
+          }
+        }
+        mature(endAt)
+        return { asks, steps }
+      }
+
+      // One second of motion at 8 ms per sample, crossing the whole line, and the pointer keeps
+      // going — nothing settles.
+      const dragging = []
+      for (let i = 0; i < 120; i++) dragging.push({ t: i * 8, column: i * 0.62 })
+      const drag = replay(dragging, 960)
+      eq(
+        drag.asks,
+        0,
+        'a drag across a line of identifiers costs ZERO requests — the settle is a trailing ' +
+          'debounce, so continuous motion starves it, which is exactly what is wanted because ' +
+          'there is nothing worth showing while the pointer is moving',
+      )
+      ok(
+        drag.steps.wait > 0,
+        'and it is not zero because the ladder rejected everything — the timer really is being ' +
+          'armed and re-armed',
+      )
+
+      // The same drag, and then the pointer stops. One request, when it stops.
+      const settled = replay(dragging, 960 + gate.SETTLE_MS)
+      eq(settled.asks, 1, 'stopping costs exactly one request')
+
+      /*
+       * And going back to a word it has already resolved.
+       *
+       * The cache is keyed on the **word range**, so re-entering an identifier draws on the frame
+       * it is entered, with no request and no settle delay. Keying on `(line, column)` — the
+       * obvious choice — would have multiplied the cache by each identifier's length and missed on
+       * every re-entry at a different pixel, which is the saving this measures.
+       */
+      const revisit = [...dragging]
+      for (let i = 0; i < 20; i++) revisit.push({ t: 1120 + i * 8, column: 74 - i })
+      for (let i = 0; i < 21; i++) revisit.push({ t: 1280 + i * 8, column: 54 + i })
+      const again = replay(revisit, 1448 + gate.SETTLE_MS)
+      eq(
+        again.asks,
+        1,
+        'a there-and-back drag over six identifiers asks once, where it first stopped — not once ' +
+          'per identifier crossed, and not again for the one it returns to',
+      )
+      ok(
+        again.steps.draw > 0,
+        'because the return re-draws that one straight out of the cache',
+      )
+      ok(
+        again.steps.keep > 0,
+        'and moving WITHIN an identifier that is already underlined does nothing at all — no ' +
+          'dispatch, no timer, no request, which is most of what a pointer does',
+      )
+
+      /*
+       * The pointer resting on a keyword, a comment or punctuation costs nothing at all. Gate 3
+       * rejects those before the timer is ever armed, which is why hovering a page of Rust is
+       * mostly free: comments, strings, keywords and punctuation are most of what a pointer
+       * crosses.
+       */
+      const overGaps = []
+      for (let i = 0; i < 40; i++) overGaps.push({ t: i * 8, column: 6 + (i % 4) })
+      eq(
+        replay(overGaps, 1000).asks,
+        0,
+        'a pointer that settles on something that is not an identifier asks nothing',
+      )
+    }
+
+    /* --- releasing the modifier --------------------------------------------------------- */
+
+    /*
+     * **The key identity is checked before the mask, and that is not a style choice.**
+     * WebKitGTK reports the modifier state from *before* the release, so on the Ctrl keyup itself
+     * `ctrlKey` is still true — a `!ev.ctrlKey` test alone never fires on the platform this ships
+     * on, and the underline would stay on screen until the pointer moved. `keys/switcher.ts` pays
+     * for the same engine behaviour and writes it out at length.
+     */
+    ok(
+      gate.endsCtrlHold({ key: 'Control', ctrlKey: true, metaKey: false }),
+      'the Ctrl keyup ends the hold even though WebKitGTK still reports Ctrl as held',
+    )
+    ok(
+      gate.endsCtrlHold({ key: 'Meta', ctrlKey: false, metaKey: true }),
+      'and so does ⌘, which is the macOS spelling of this gesture',
+    )
+    // The fallback still earns its place: Ctrl+Alt released Alt-first delivers a keyup for `Alt`
+    // whose mask no longer carries Ctrl, and that is a genuine end of the hold.
+    ok(
+      gate.endsCtrlHold({ key: 'Alt', ctrlKey: false, metaKey: false }),
+      'a keyup for another key with the modifier already gone ends it too',
+    )
+    ok(
+      !gate.endsCtrlHold({ key: 'Shift', ctrlKey: true, metaKey: false }),
+      'but releasing Shift mid-hold does not',
+    )
+    ok(gate.holdsCtrl({ ctrlKey: false, metaKey: true }), '⌘ counts as the hold')
+    ok(!gate.holdsCtrl({ ctrlKey: false, metaKey: false }), 'and nothing else does')
+
+    /* --- the wiring, which is where this class of bug actually lives -------------------- */
+
+    const linkSrc = strip(readFileSync('src/editor/ctrlLink.ts', 'utf8'))
+    const intelSrc = strip(readFileSync('src/editor/codeIntel.ts', 'utf8'))
+
+    /*
+     * **One resolver.** This is the structural half of the hover/click agreement: if the click
+     * asked its own question the two could answer differently for the same word, and no assertion
+     * about `intent` would catch it.
+     */
+    eq(
+      (intelSrc.match(/\.probe\(/g) ?? []).length,
+      1,
+      'exactly one call to the probe command in the whole app, and both gestures go through it',
+    )
+    for (const file of ['src/editor/ctrlLink.ts', 'src/editor/EditorSurface.tsx', 'src/keys/dispatch.ts']) {
+      ok(
+        !/\.probe\(/.test(strip(readFileSync(file, 'utf8'))),
+        `and ${file} does not reach past it`,
+      )
+    }
+    ok(
+      /resolveWord\(/.test(linkSrc) && /resolveWord\(/.test(intelSrc),
+      'the hover resolves through the same function the click does',
+    )
+    ok(
+      /underlines\(/.test(linkSrc),
+      'and decides whether to draw from `underlines`, which is derived from `intent` — a second ' +
+        'list of underlinable kinds is the drift this whole arrangement prevents',
+    )
+    ok(
+      /intent\(answer\.kind\)/.test(intelSrc),
+      'while the click switches on `intent` itself',
+    )
+    /*
+     * One ladder, and the click climbs it too.
+     *
+     * Both gestures resolve the pointer through `targetAtPoint`, which is gates 1 to 3 followed by
+     * `wordTargetAt` — so both ask about the **word**, not the pointer's own column, which is what
+     * makes them compute the same cache key for the same identifier. A click that used
+     * `posAtCoords` directly (as it did before M14) would resolve a different position from the one
+     * the underline was drawn for, and the affordance would be wrong at exactly the pixels where
+     * gate 1 disagrees with CodeMirror.
+     */
+    const clickAt = linkSrc.indexOf('mousedown:')
+    ok(
+      /const word = targetAtPoint\(/.test(linkSrc.slice(clickAt, clickAt + 900)),
+      'the click resolves through the same ladder the hover does — so a click on the blank space ' +
+        'past the end of a line is refused exactly where the underline was',
+    )
+    ok(
+      (linkSrc.match(/targetAtPoint\(/g) ?? []).length >= 3,
+      'and there are two call sites, not two implementations',
+    )
+    ok(
+      /wordTargetAt\(/.test(linkSrc.slice(linkSrc.indexOf('function targetAtPoint'))),
+      'with `wordTargetAt` at the bottom of it — the one place a word’s start column is decided',
+    )
+
+    /* The five removals, each a bug if missed. */
+    ok(/endsCtrlHold\(/.test(linkSrc), 'Ctrl released takes the underline down')
+    ok(/mouseleave/.test(linkSrc), 'so does the pointer leaving the text')
+    ok(
+      /addEventListener\('blur'/.test(linkSrc) && /visibilitychange/.test(linkSrc),
+      'so does Alt+Tab — which delivers the keyup to the OTHER application, so nothing else here ' +
+        'would ever hear that the hold ended',
+    )
+    ok(
+      /tr\.docChanged/.test(linkSrc),
+      'so does an edit, in the StateField — including the agent rewriting the file under the user',
+    )
+    ok(
+      /scrollDOM\.addEventListener\('scroll'/.test(linkSrc),
+      'and so does a scroll: the pointer is stationary and the TEXT under it moves, which leaves ' +
+        'the underline on the wrong word. Listened for directly, because CodeMirror only routes ' +
+        'the scroller it recognises to its observers',
+    )
+    ok(
+      /event\.buttons !== 0/.test(linkSrc),
+      'and a drag is suppressed, or selecting text flickers mark spans in and out under the pointer',
+    )
+
+    /*
+     * The hover must never *report*. `goToDefinition`'s `report()` turns every non-`found` answer
+     * into a toast through `unhandledrejection`; on a path that fires whenever the pointer settles
+     * that is a toast every time somebody rests the mouse on a comment. This is the single most
+     * likely integration mistake in the whole feature.
+     */
+    ok(
+      !/Promise\.reject/.test(linkSrc) && !/notify\(/.test(linkSrc),
+      'the hover swallows every outcome silently — no toast, no notice',
+    )
+
+    /* Gate 5 is a *trailing* debounce, not a throttle: starvation under motion is the point. */
+    {
+      const considerAt = linkSrc.indexOf('private consider(')
+      ok(considerAt !== -1, 'the hover has a consider step')
+      const consider = linkSrc.slice(considerAt, considerAt + 1600)
+      ok(
+        /this\.clear\(\)\s+const mine = this\.generation\s+this\.settle = setTimeout\(/.test(
+          consider,
+        ),
+        'the settle timer is CLEARED immediately before it is re-armed, on every move — a ' +
+          'throttle here would fire once per interval for the whole of a drag, which is the ' +
+          'opposite of what is wanted: there is nothing worth showing while the pointer moves',
+      )
+      ok(/SETTLE_MS/.test(consider), 'and it is the shared constant, not a number written here')
+    }
+    ok(gate.SETTLE_MS > 0 && gate.SETTLE_MS <= 300, 'and settles fast enough to be aimed with')
+
+    /*
+     * The mark has to be styled, or the affordance is invisible and nothing else would notice.
+     *
+     * The class name is read **out of the source** rather than written here, so a rename on either
+     * side fails: a hand-copied literal in this script would keep passing against a stylesheet that
+     * no longer matches the decoration.
+     */
+    {
+      const declared = /Decoration\.mark\(\{ class: '([a-z-]+)' \}\)/.exec(linkSrc)
+      ok(declared !== null, 'the hover declares its mark class')
+      const css = readFileSync('src/editor/EditorSurface.module.css', 'utf8')
+      const rule = new RegExp(`\\.body :global\\(\\.${declared?.[1] ?? 'x'}\\)\\s*\\{([^}]*)\\}`)
+      const body = rule.exec(css)
+      ok(
+        body !== null,
+        `\`${declared?.[1]}\` is styled beside the token classes — a decoration whose class ` +
+          'nobody styles draws nothing at all',
+      )
+      ok(
+        /var\(--[a-z-]+\)/.test(body?.[1] ?? ''),
+        'with a token and not a literal, or it survives a theme switch as the wrong colour',
+      )
+      ok(
+        /cursor:\s*pointer/.test(body?.[1] ?? ''),
+        'and the pointer becomes a hand over the word — which is the half that tells the user ' +
+          'where the click will land',
+      )
+    }
+
+    /* --- Find usages: the call sites --------------------------------------------------- */
+
+    ok(
+      /findUsages\(/.test(strip(readFileSync('src/keys/dispatch.ts', 'utf8'))),
+      '⌥F7 reaches the helper — a command id with no dispatch case is listed in the palette and inert',
+    )
+    {
+      const menuCode = strip(readFileSync('src/editor/codeMenu.tsx', 'utf8'))
+      const at = menuCode.indexOf("id: 'findUsages'")
+      ok(at !== -1, 'the context menu has a Find usages item')
+      const next = menuCode.indexOf("id: '", at + 10)
+      const item = menuCode.slice(at, next === -1 ? menuCode.length : next)
+      ok(
+        /run:/.test(item) && /findUsages\(/.test(item),
+        'and it carries a `run` that calls the helper, rather than being drawn and dead',
+      )
+    }
+    ok(
+      /findUsages\(/.test(intelSrc) && /intent\(answer\.kind\)/.test(intelSrc),
+      'and the declaration branch of Ctrl+click goes to the same helper',
+    )
+
+    /* One usage jumps, and it jumps through the seam that records the Back stack. */
+    ok(
+      /rows\.length === 1/.test(intelSrc) && /jumpTo\(/.test(intelSrc),
+      'a single usage jumps rather than opening a popup for one row',
+    )
+    ok(
+      !/requestReveal\(/.test(intelSrc),
+      'through `jumpTo` and never `requestReveal` — this is the gesture people most want to undo, ' +
+        'and the discriminator can send them somewhere they did not ask to go',
+    )
+    /*
+     * Zero usages is a sentence, and it is an `info` — "used nowhere" is a *result*, and
+     * `role="alert"` in red for a result is the accessibility equivalent of a modal dialog
+     * announcing a success. Scoped to the branch, because the neighbouring "no declaration here"
+     * arm also notifies and a whole-file grep would pass on a file where only that one survived.
+     */
+    {
+      const at = intelSrc.indexOf('rows.length === 0')
+      ok(at !== -1, 'the empty-result branch exists')
+      const branch = intelSrc.slice(at, at + 200)
+      ok(
+        /notify\(/.test(branch),
+        'zero usages is a sentence and not a silent no-op',
+      )
+      ok(
+        /kind: 'info'/.test(branch),
+        'and an info notice, not an error',
+      )
+    }
+    /*
+     * The grace timer has to be cleared on **both** exits. Clearing it only on success leaves a
+     * failed search opening an empty popup 150 ms after the toast that explained the failure.
+     */
+    eq(
+      (intelSrc.match(/clearTimeout\(grace\)/g) ?? []).length,
+      2,
+      'the grace timer is cleared on the answer path AND on the rejection path',
+    )
+    ok(/GRACE_MS/.test(intelSrc), 'and the delay is the named constant')
+    /*
+     * Three generation checks, one per way an answer can arrive late: the timer firing, the
+     * answer landing, and the rejection landing. Two of three is a popup that opens over whatever
+     * the user did next.
+     */
+    eq(
+      (intelSrc.match(/isCurrentUsages\(/g) ?? []).length,
+      3,
+      'every path that could act on a stale answer checks the generation first — the timer, the ' +
+        'answer and the rejection',
+    )
+
+    /* Cancellation, which is two things and only one of them is visible. */
+    {
+      const storeSrc = strip(readFileSync('src/overlays/usagesStore.ts', 'utf8'))
+      ok(
+        /usagesCancel\(/.test(storeSrc),
+        'dismissing tells the SERVER to stop, not only the popup — without it "Escape cancelled ' +
+          'it" and "Escape stopped showing it" are indistinguishable and only the second is true',
+      )
+      ok(
+        /generation: generation \+ 1/.test(storeSrc),
+        'and bumps the generation, which is what makes a cancelled search silent rather than a toast',
+      )
+      ok(
+        /useEffect\(\(\) => cancelUsages, \[\]\)/.test(
+          strip(readFileSync('src/overlays/UsagesPopup.tsx', 'utf8')),
+        ),
+        'the popup cancels on unmount — the project closing under a running search has no other ' +
+          'call site to put it in',
+      )
+    }
+
+    /*
+     * And the trap the brief names outright: nothing may gate the *request* on a source being
+     * Ready. rust-analyzer's indexing is a sequence of progress tokens and "nothing in flight" is
+     * true in every gap between them — this repository has already shipped one bug reading such a
+     * gap as "indexed, no results", which is what `READY_SETTLE` exists for.
+     */
+    ok(
+      !/kind === 'ready'/.test(intelSrc) && !/Ready/.test(intelSrc),
+      'the search is never gated on a readiness flag — the timeout is the readiness answer',
     )
   }
 
