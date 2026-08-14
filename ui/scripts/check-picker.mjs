@@ -43,6 +43,7 @@ try {
       'src/overlays/score.ts',
       'src/overlays/format.ts',
       'src/overlays/listKeys.ts',
+      'src/overlays/gotoLine.ts',
       'src/sidebar/rowWindow.ts',
       'src/store/fileIndex.ts',
       '--outDir', out,
@@ -67,6 +68,7 @@ try {
     join(out, 'overlays/format.js'),
   )
   const { listAction, PAGE_ROWS } = require(join(out, 'overlays/listKeys.js'))
+  const { canGo, gotoNote, parseGoto } = require(join(out, 'overlays/gotoLine.js'))
   const { chunkOf, chunkRequest, chunksFor, chunksToEvict } = require(
     join(out, 'sidebar/rowWindow.js'),
   )
@@ -358,6 +360,64 @@ try {
     false,
     'the roots digest cannot collide',
   )
+
+  /* ------------------------------------------------------------------- go to line input */
+
+  /*
+   * What Ctrl+G's box accepts, and — the half that matters — what it refuses.
+   *
+   * The jump itself cannot crash whatever arrives: `editor/revealRequest.ts::revealRange` clamps
+   * the line and the column, and `check-editor.mjs` already drives that clamp with a hit past the
+   * end of a shortened file, line 0 and a negative line. What the clamp *cannot* do is refuse,
+   * and its `whole()` turns a non-finite number into `1` — so a mistyped `l20` would clamp
+   * silently to the top of the file. A caret that lands somewhere the user did not name is worse
+   * than a disabled button, so every refusal below is the point of the module rather than
+   * decoration on it.
+   */
+  {
+    eq(parseGoto('120'), { kind: 'ok', at: { line: 120, column: 1 } }, 'a bare line number')
+    eq(parseGoto('120:8'), { kind: 'ok', at: { line: 120, column: 8 } }, 'line and column')
+    eq(parseGoto('  120  '), { kind: 'ok', at: { line: 120, column: 1 } }, 'surrounding space is trimmed')
+    eq(parseGoto('0'), { kind: 'ok', at: { line: 0, column: 1 } }, 'line 0 is accepted — revealRange clamps it to 1')
+    eq(parseGoto('').kind, 'empty', 'an empty field is not an error, it is how the box opens')
+    eq(parseGoto('   ').kind, 'empty', 'and neither is whitespace')
+
+    // Every one of these used to be a jump to line 1 if it reached `revealRange`.
+    for (const bad of ['abc', 'l20', '12:', ':8', '1.5', '1,200', '12 8', '0x10', '1e3']) {
+      eq(parseGoto(bad).kind, 'invalid', `\`${bad}\` is refused rather than clamped to line 1`)
+    }
+    eq(parseGoto('12:0').kind, 'invalid', 'column 0 is refused — a 0-based paste is an off-by-one worth reporting')
+    eq(parseGoto('0:1'), { kind: 'ok', at: { line: 0, column: 1 } }, 'but line 0 still is not, and the asymmetry is deliberate')
+
+    // Relative and percentage jumps are CodeMirror's `gotoLine` syntax and IDEA's Ctrl+G has
+    // neither. Refused with their own sentence, because the user is not typing nonsense.
+    for (const relative of ['+5', '-5', '50%']) {
+      const parsed = parseGoto(relative)
+      eq(parsed.kind, 'invalid', `\`${relative}\` is refused`)
+      eq(
+        /no \+n, -n or n%/.test(parsed.reason),
+        true,
+        `\`${relative}\` gets the relative-jump sentence, not "type a line number"`,
+      )
+    }
+
+    eq(canGo(parseGoto('7')), true, 'Enter and the button share one predicate')
+    eq(canGo(parseGoto('')), false, 'an empty field submits nothing')
+    eq(canGo(parseGoto('nope')), false, 'and neither does an unparseable one')
+
+    // The note is the only warning an out-of-range jump gets, because the clamp is silent.
+    eq(gotoNote(parseGoto(''), 100), null, 'an empty field says nothing')
+    eq(gotoNote(parseGoto('40'), 100), null, 'and neither does a line that exists')
+    eq(gotoNote(parseGoto('100'), 100), null, 'the last line is in range')
+    eq(
+      gotoNote(parseGoto('101'), 100),
+      'Past the end — this file has 100 lines',
+      'one line past the end is reported, with the number that corrects the user',
+    )
+    eq(gotoNote(parseGoto('2'), 1), 'Past the end — this file has 1 line', 'and the singular is singular')
+    eq(gotoNote(parseGoto('0'), 100), 'Before the first line — goes to line 1', 'line 0 says where it will land')
+    eq(gotoNote(parseGoto('abc'), 100), 'Type a line number, or line:column', 'a refusal carries its own reason')
+  }
 
   eq(isNoIndex({ kind: 'noIndex' }), true, 'the tagged NoIndex rejection is recognised')
   eq(isNoIndex({ kind: 'io', detail: {} }), false, 'a different FsError is not NoIndex')

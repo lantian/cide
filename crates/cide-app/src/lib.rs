@@ -12,6 +12,7 @@ pub mod hooks;
 pub mod ide;
 pub mod lifecycle;
 pub mod lsp;
+pub mod positions_state;
 pub mod state;
 pub mod symbols;
 pub mod windows;
@@ -224,6 +225,14 @@ pub fn run() {
         // real tree on the very first call rather than serving defaults and correcting
         // itself a frame later.
         .manage(WorkspaceState::load())
+        // Per-file view memory. Loaded here rather than in `setup` for the same reason the
+        // workspace is: `file_position` can be asked the instant a restored editor mounts, and
+        // a store that resolved to nothing for the first few hundred milliseconds would put
+        // every restored tab at line 1 — precisely the bug it exists to fix.
+        //
+        // Behind an `Arc` because the flusher thread outlives the call that starts it; Tauri's
+        // `State` hands out a reference, which a `thread::spawn` cannot keep.
+        .manage(std::sync::Arc::new(positions_state::PositionsState::load()))
         .invoke_handler(tauri::generate_handler![
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
@@ -274,6 +283,8 @@ pub fn run() {
             cmd::file::claude_send_lines,
             cmd::file::file_read,
             cmd::file::file_write,
+            cmd::file::file_note_position,
+            cmd::file::file_position,
             cmd::file::tab_open_file,
             cmd::file::terminal_open_path,
             cmd::file::tab_open_diff,
@@ -441,6 +452,13 @@ pub fn run() {
             // Before the first window, so a signal arriving during startup still finds a
             // shutdown path rather than the default disposition.
             lifecycle::install_signal_handlers(app.handle());
+
+            // The view-position store's own flusher. Its own thread and its own timer because
+            // there is no app tick to hang it on — `WorkspaceState::flush_if_due` documents one
+            // and is called by nobody, which is why `workspace.json` is in fact written once
+            // per run. See `positions_state.rs`.
+            app.state::<std::sync::Arc<positions_state::PositionsState>>()
+                .start_flusher();
 
             // Before the listener binds, so a `SIGKILL`ed previous run's socket is gone
             // rather than accumulating one file per hard kill for the life of the account.

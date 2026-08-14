@@ -51,6 +51,7 @@ import type {
   TreeRow,
   TreeRowKind,
   UnsavedTab,
+  ViewPosition,
   WindowMode,
   Workspace,
 } from './generated'
@@ -840,6 +841,57 @@ export const events = {
     ),
 
   /**
+   * A thumb button (mouse back / forward) was pressed in **this** window. (M12)
+   *
+   * From Rust rather than from a DOM listener, and that is not a preference: WebKitGTK maps only
+   * GDK buttons 1–3 and turns everything else into `WebMouseEventButton::None`, which
+   * `MouseEvent`'s constructor then reports as `button === 0`. Both thumb buttons arrive in the
+   * DOM as an ordinary left click, so they cannot be told apart here at all. A GTK handler in
+   * `windows.rs` reads the raw button, swallows the press so it never becomes a phantom click,
+   * and sends this.
+   *
+   * `button` is a **key token**, not a command: `mouseback` / `mouseforward` are bound in
+   * `cide_core::keymap::defaults` and resolved by the key gate's third entry point, so the user
+   * can rebind or unbind them from `keymap.json` like any other chord. `emit_to` one window, not
+   * a broadcast — two windows walking their own history from one press is a Back that sometimes
+   * goes back twice.
+   */
+  onMouseNav: (
+    handler: (
+      button: string,
+      modifiers: { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean },
+    ) => void,
+  ) =>
+    listen<{
+      window: string
+      button: string
+      ctrl: boolean
+      alt: boolean
+      shift: boolean
+      meta: boolean
+    }>('cide://mouse-nav', (e) => {
+      /*
+       * The window filter, and it is load-bearing rather than defensive.
+       *
+       * Rust sends this with `emit_to(label, ..)`, which reads as "only that window" and is
+       * not: Tauri filters by `EventTarget`, `listen()` above registers `EventTarget::Any`,
+       * and the `Any` arm short-circuits past every filter. So the event reaches every
+       * webview. With two shell windows open, one press of the thumb button ran Back in
+       * both — each walking its own history, opening its own file and taking focus — and the
+       * window the user was not pointing at moved for no visible reason.
+       *
+       * `windowLabel()` is what this webview is; the payload says where the press happened.
+       */
+      if (e.payload.window !== windowLabel()) return
+      handler(e.payload.button, {
+        ctrl: e.payload.ctrl,
+        alt: e.payload.alt,
+        shift: e.payload.shift,
+        meta: e.payload.meta,
+      })
+    }),
+
+  /**
    * A tool touched files.
    *
    * The fast path for reloading an open buffer — it arrives sooner than the watcher and
@@ -1119,6 +1171,29 @@ export const file = {
   read: (path: string) => invoke<FileDoc>('file_read', { path }),
 
   write: (path: string, text: string) => invoke<void>('file_write', { path, text }),
+
+  /**
+   * Remember where the user is in a file. (M12)
+   *
+   * **Not a workspace mutation, and that is the whole design.** `setDirty` above goes through
+   * `WorkspaceState::update`, which bumps `rev` and broadcasts the entire tree to every window;
+   * that is right for a dirty dot and ruinous for something the editor reports as the user
+   * scrolls. This one lands in a separate store with its own two-second debounce and no event
+   * at all — `crates/cide-app/src/positions_state.rs` has the four-stage ladder that keeps a
+   * scroll gesture from becoming a disk write.
+   *
+   * `touchedAt` is filled in by Rust whatever is sent: it is the eviction key of a 256-entry
+   * LRU, and a renderer's clock is not what should order it. Zero is the honest thing to send.
+   *
+   * Fire-and-forget, like `setDirty`: the authoritative answer to "where am I in this file" is
+   * the buffer on screen, so nothing waits for the round trip and a failure costs a position
+   * rather than interrupting a scroll.
+   */
+  notePosition: (at: Omit<ViewPosition, 'touchedAt'>) =>
+    invoke<void>('file_note_position', { at: { ...at, touchedAt: 0 } }),
+
+  /** Where the user last was in `path`, or `null`. */
+  position: (path: string) => invoke<ViewPosition | null>('file_position', { path }),
 }
 
 /* --------------------------------------------------------------------------------------

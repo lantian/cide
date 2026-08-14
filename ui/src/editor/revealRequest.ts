@@ -57,6 +57,31 @@ export interface RevealTarget {
   readonly column: number
   /** 1-based and exclusive: the selection is `[column, endColumn)` on `line`. */
   readonly endColumn: number
+  /**
+   * Take the keyboard as well as the caret. Defaults to false, and the default is load-bearing.
+   *
+   * A single click on a search result opens the file, and the results list supports an
+   * ArrowDown/Enter walk — so pulling focus into the buffer on every click would end that walk
+   * after exactly one hit. `EditorSurface`'s receiver has a long comment saying so, and it was
+   * right about clicks and wrong about everything else: a jump the user *asked for by name* —
+   * Go to line, the File Structure popup, Go to symbol — happens with the caret in an overlay
+   * that is about to be unmounted, so leaving focus alone leaves it on `<body>` and the next
+   * arrow key goes nowhere at all.
+   *
+   * So it is a property of the request rather than of the receiver. The one flag distinguishes
+   * "show me this" from "put me here", which is the distinction that was missing.
+   */
+  readonly focus?: boolean
+  /**
+   * `'center'` puts the line in the middle of the viewport; omitted uses CodeMirror's minimal
+   * scroll, which brings the line just inside the nearest edge.
+   *
+   * Minimal is right for a reveal the user did not ask for — it moves the text as little as
+   * possible. It is wrong for an explicit jump: `gotoLine`'s own implementation centres, and a
+   * jump to line 4000 that lands the line flush against the bottom edge shows the destination
+   * with none of the code around it, which is the half the user was going to read.
+   */
+  readonly align?: 'center'
 }
 
 /** Applies a reveal to one live editor. `EditorSurface` registers one per mounted buffer. */
@@ -246,6 +271,43 @@ export function revealRange(doc: Text, target: RevealTarget): SelectionRange {
   // empty selection at the caret rather than a backwards range.
   const head = clamp(line.from + whole(target.endColumn, 1) - 1, anchor, line.to)
   return EditorSelection.range(anchor, head)
+}
+
+/**
+ * Everything a receiver has to decide, decided here.
+ *
+ * `EditorSurface`'s receiver is four lines inside an effect inside a component that needs a
+ * window to exist — which is the one place in this codebase no check script can compile, and
+ * three shipped bugs have now hidden there. So the *decisions* live in this function and the
+ * receiver is left holding only the `dispatch` and the `focus()` call, which are the two things a
+ * headless check could not exercise anyway.
+ *
+ * The two flags default false, and the defaults are the interesting half:
+ *
+ * * **`focus`** — a click on a search result must *not* take the keyboard, because the results
+ *   list supports an ArrowDown/Enter walk that pulling focus would end after one hit. A jump the
+ *   user named — Go to line, Go to symbol, File structure — must, because the overlay that
+ *   accepted it is being unmounted and focus would otherwise fall to `<body>`.
+ * * **`center`** — minimal scrolling moves the text as little as possible, which is right when
+ *   the app moved the view on the user's behalf and wrong for a place they asked for by number.
+ */
+export interface RevealPlan {
+  /** The selection to install, already clamped to this document. */
+  readonly range: SelectionRange
+  /** Put the line in the middle of the viewport rather than just inside the nearest edge. */
+  readonly center: boolean
+  /** Take the keyboard as well as the caret. */
+  readonly focus: boolean
+}
+
+export function planReveal(doc: Text, target: RevealTarget): RevealPlan {
+  return {
+    range: revealRange(doc, target),
+    center: target.align === 'center',
+    // `=== true` rather than truthiness: the field is optional, and `undefined` must mean "leave
+    // focus where it is" and not "whatever the last caller passed".
+    focus: target.focus === true,
+  }
 }
 
 function whole(value: number, fallback: number): number {

@@ -61,6 +61,7 @@ try {
     NO_ACTION_REASON,
     activeItem,
     anchorToRect,
+    focusReturnPlan,
     isEmptyMenu,
     isInertMenu,
     moveFocus,
@@ -523,6 +524,111 @@ try {
     'and an explicit `true` survives it — the escape hatch is not the same switch',
   )
   eq(wantsNativeMenu([], true), false, 'an event with no element target gets nothing')
+
+  // =====================================================================================
+  // 4b. Handing focus back — the reported "the buffer scrolls to the top" jump
+  // =====================================================================================
+  //
+  // *"Right-click in the editor, move the pointer over the menu, close it — the buffer is at
+  // line 1. Without touching the menu it does not happen."* Every step of that is WebKit's
+  // (`FocusController::setFocusedElement` → `clearSelectionIfNeeded`, then
+  // `Element::updateFocusAppearance` inventing and revealing a selection on a root editable
+  // element), and the one line of ours in the chain is the plain `previous.focus()` the menu
+  // performed on the way out. The decision that replaces it is `focusReturnPlan`, here rather
+  // than in the hook precisely so it can be run.
+
+  eq(
+    focusReturnPlan({ hasCustom: false, previousConnected: true }),
+    ['default'],
+    'an ordinary surface just gets its element focused back',
+  )
+  eq(
+    focusReturnPlan({ hasCustom: false, previousConnected: false }),
+    [],
+    'and a menu whose action deleted the row it hung off focuses nothing rather than a '
+      + 'detached node — focus falls to <body>, which the next Tab can start from',
+  )
+  eq(
+    focusReturnPlan({ hasCustom: true, previousConnected: true }),
+    ['custom', 'default'],
+    'the surface\'s own restore is tried FIRST: `preventScroll` suppresses WebKit\'s reveal '
+      + 'and not the `setSelection` before it, so on a CodeMirror buffer the plain DOM step '
+      + 'still collapses the caret to the top — only `EditorView.focus()` restores both',
+  )
+  ok(
+    focusReturnPlan({ hasCustom: true, previousConnected: true }).length === 2,
+    'and `default` stays behind it as a fallback: `restoreFocus` may decline (the view was '
+      + 'destroyed by the action), and a declined custom step with nothing after it is a '
+      + 'window left with no focus at all',
+  )
+  eq(
+    focusReturnPlan({ hasCustom: true, previousConnected: false }),
+    ['custom'],
+    'a surface that rebuilt its DOM under the menu is still asked — it is exactly the surface '
+      + 'that knows where focus should go',
+  )
+
+  // The call sites. Every bug in this section is a *missing call*, which is the one shape a
+  // test of the surrounding code passes straight over.
+  {
+    const hook = readFileSync('src/menus/useContextMenu.tsx', 'utf8')
+    ok(
+      /focusReturnPlan\(/.test(hook),
+      'useContextMenu consults focusReturnPlan — a `close` that decided for itself would pass '
+        + 'every assertion above while shipping the jump',
+    )
+    ok(
+      /previous\?\.focus\(\{ preventScroll: true \}\)/.test(hook),
+      'and its default step passes `preventScroll`, which is what maps to '
+        + 'SelectionRevealMode::DoNotReveal and kills both the editable reveal and '
+        + 'scheduleScrollToFocusedElement for every other surface',
+    )
+
+    const menu = readFileSync('src/menus/ContextMenu.tsx', 'utf8')
+    /*
+     * The focus effect, which was a no-op for the life of the component.
+     *
+     * `useLayoutEffect(..., [])` fired in the same commit as the measure effect, before React
+     * had flushed its `setPlacement` — so the box was still `visibility: hidden` and WebKit
+     * refuses focus on such an element (`hasFocusableStyle`). The whole keyboard model behind
+     * `onKeyDown` was therefore reachable only after the pointer touched an item, and a
+     * Shift+F10 menu could not be driven at all.
+     *
+     * Matched on the dependency array, because that is the whole defect: the body was already
+     * right.
+     */
+    const focusEffect = menu.slice(menu.indexOf('if (placement === null) return'))
+    ok(
+      /box\.current\?\.focus\(\{ preventScroll: true \}\)/.test(focusEffect.slice(0, 400)),
+      'the box focuses itself only once a placement is committed — keyed on `[]` it ran while '
+        + 'the box was still `visibility: hidden`, which WebKit refuses, so the arrows, Escape '
+        + 'and Enter were reachable from nothing until the pointer moved',
+    )
+    ok(
+      /\}, \[placement === null\]\)/.test(focusEffect.slice(0, 500)),
+      'and on `placement === null` rather than on `placement`: re-measuring a moved anchor '
+        + 'must not yank focus off an item the user has already arrowed to',
+    )
+    ok(
+      /item\.focus\(\{ preventScroll: true \}\)/.test(menu)
+        && /item\.scrollIntoView\(\{ block: 'nearest' \}\)/.test(menu),
+      'hover/arrow focus scrolls the box deliberately instead of letting the browser do it — '
+        + 'see the scroll listener below',
+    )
+    ok(
+      /const onScroll = \(ev: Event\) => \{\s*if \(inside\(ev\.target\)\) return/.test(menu),
+      'and a scroll INSIDE the menu does not dismiss it: `.menu` is `overflow-y: auto` under a '
+        + 'computed maxHeight, and the listener is in capture (scroll does not bubble), so '
+        + 'without this arrowing past the fold of a long menu closes it under the user',
+    )
+
+    const code = readFileSync('src/editor/codeMenu.tsx', 'utf8')
+    ok(
+      /restoreFocus:/.test(code) && /live\.focus\(\)/.test(code.slice(code.indexOf('restoreFocus:'))),
+      'and the code pane supplies `restoreFocus` calling EditorView.focus() — the generic '
+        + 'DOM step cannot restore a CodeMirror selection, only its scroll',
+    )
+  }
 
   // =====================================================================================
   // 5. The component is wired to the model, and to the tokens

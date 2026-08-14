@@ -32,6 +32,7 @@ export {
   NO_ACTION_REASON,
   activeItem,
   anchorToRect,
+  focusReturnPlan,
   isEmptyMenu,
   isInertMenu,
   moveFocus,
@@ -41,6 +42,7 @@ export {
 } from './model'
 export type {
   ElementFacts,
+  FocusReturnStep,
   MenuEntry,
   MenuItem,
   MenuMotion,

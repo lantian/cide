@@ -31,12 +31,27 @@ export interface CaretPosition {
   readonly path: string
   readonly line: number
   readonly column: number
+  /**
+   * How many lines the buffer has. At least 1 — an empty document is one empty line.
+   *
+   * Here rather than fetched on demand because there is nowhere to fetch it from: the document
+   * lives in a CodeMirror `EditorState` inside a pane, and the whole reason this module exists is
+   * that the surfaces which need it cannot reach one. Go to line is the caller — it has to tell
+   * the user *before* they press Enter that 1200 is past the end of an 892-line file, and the
+   * clamp inside `revealRange` can only tell them afterwards, by moving the caret somewhere they
+   * did not name.
+   *
+   * It rides along on the position rather than being a second claim because it changes on
+   * exactly the transactions the position does, and two stacks answering "which editor is the
+   * user in" is one more than there should be.
+   */
+  readonly lines: number
 }
 
 /** One mounted editor's hold on the caret slot. */
 export interface CaretSlot {
   /** Report a new position. Reaches [`focusedCaret`] only while this slot is on top. */
-  set(line: number, column: number): void
+  set(line: number, column: number, lines: number): void
   /** Take the slot — the user is in this editor now. A no-op when it is already held. */
   focus(): void
   /** Give it up on unmount. The editor under this one gets it back. */
@@ -47,6 +62,7 @@ interface Claim {
   path: string
   line: number
   column: number
+  lines: number
 }
 
 /**
@@ -61,7 +77,7 @@ const claims: Claim[] = []
 export function focusedCaret(): CaretPosition | null {
   const top = claims.at(-1)
   if (top === undefined) return null
-  return { path: top.path, line: top.line, column: top.column }
+  return { path: top.path, line: top.line, column: top.column, lines: top.lines }
 }
 
 /**
@@ -71,12 +87,15 @@ export function focusedCaret(): CaretPosition | null {
  * `claimStatusReadout` follows, and the two are claimed and released together.
  */
 export function claimCaret(path: string): CaretSlot {
-  const claim: Claim = { path, line: 1, column: 1 }
+  // `lines: 1` rather than 0, because "an empty document is one empty line" is CodeMirror's own
+  // arithmetic and this value is read before the first `set` arrives. A 0 here would let Go to
+  // line report a file with no lines in it for one frame after a split opens.
+  const claim: Claim = { path, line: 1, column: 1, lines: 1 }
   claims.push(claim)
 
   let released = false
   return {
-    set(line, column) {
+    set(line, column, lines) {
       // Written whether or not this claim is on top: an editor the user is not in still knows
       // where its own caret is, and it becomes the answer the moment `focus` is called. Guarding
       // on `released` rather than on position in the stack is what makes that true without a
@@ -84,6 +103,7 @@ export function claimCaret(path: string): CaretSlot {
       if (released) return
       claim.line = line
       claim.column = column
+      claim.lines = lines
     },
     focus() {
       if (released) return

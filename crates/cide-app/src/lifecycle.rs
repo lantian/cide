@@ -72,6 +72,16 @@ pub fn shutdown(app: &AppHandle) {
         None => tracing::error!("no workspace state to flush during shutdown"),
     }
 
+    // Likewise unconditional, and it matters more here than for the workspace: the file the
+    // user was looking at when they quit is the one they are most likely to come back to, and
+    // its position is by construction the newest thing in the store — so a debounce waited out
+    // on the way to exit loses exactly the entry that was worth keeping.
+    if let Some(positions) =
+        app.try_state::<std::sync::Arc<crate::positions_state::PositionsState>>()
+    {
+        positions.write_now();
+    }
+
     // Before the children are signalled. A `claude` blocked on `openDiff` has to receive its
     // rejection over a socket that is still open; killing it first would end the turn with a
     // transport error where a plain "the user did not accept it" was available, and killing

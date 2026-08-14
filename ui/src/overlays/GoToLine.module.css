@@ -1,0 +1,133 @@
+/*
+ * The Go to line popup.
+ *
+ * Deliberately *not* the 620px `.card` in `Overlay.module.css` — see the component's header for
+ * the argument. The box is `chrome/ProjectSwitcher.module.css`'s geometry (centred with a
+ * transform, `--panel` ground, 1px `--border`, 9px radius, `--shadow`) with two differences that
+ * follow from this one taking typing: it is narrower, because the content is a number and not a
+ * list of project paths, and it sits over a scrim.
+ *
+ * Every colour is a token, so both themes come for free. That is the whole reason CodeMirror's
+ * stock `gotoLine` dialog was not reused: its chrome paints from `.cm-panels`, whose colours are
+ * literals in the base theme and do not move when the theme does.
+ */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  /*
+   * The same layer as `Overlay.module.css`'s scrim and for the same reason — above the panes and
+   * the status bar, below the context menus, which portal out at 80. The token is defined per
+   * theme in `styles/tokens.css`; the literal is the fallback and is deliberately the dark value,
+   * so a missing token leaves the theme the mock specifies looking right.
+   */
+  z-index: 60;
+  background: var(--scrim, rgba(0, 0, 0, 0.42));
+}
+
+.popup {
+  position: fixed;
+  /*
+   * Centred with a transform rather than by flexing the scrim, so the box does not move when the
+   * note below appears and disappears: a flex-centred child re-centres on every height change,
+   * which would nudge the field under the caret as the user types.
+   */
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+
+  width: 340px;
+  max-width: calc(100vw - 48px);
+  display: flex;
+  flex-direction: column;
+
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* The same uppercase label the switcher's head uses, so the two small popups read as siblings. */
+.head {
+  flex: none;
+  padding: 9px 14px 7px;
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-ui);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px 0;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  /* Mono, and `tabular-nums`, because the content is a number the user is comparing with the
+     line count in the note underneath. */
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.button {
+  flex: none;
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/*
+ * Disabled is the *normal* state of this button — the field opens prefilled and valid, but every
+ * keystroke that leaves it unparseable greys it — so it has to read as "not yet" rather than as
+ * "broken". Dimmed and non-interactive, keeping the accent hue.
+ */
+.button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/*
+ * The note's slot, always present.
+ *
+ * `min-height` rather than a fixed height so a wrapped sentence still fits, and the height is
+ * reserved either way so the popup does not resize as the user types — a box that grows and
+ * shrinks under the pointer is how a click aimed at `Go` lands on nothing.
+ */
+.note {
+  min-height: 16px;
+  padding: 6px 14px 12px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--faint);
+}

@@ -51,7 +51,8 @@ import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
 import { outsideAsk } from '@/terminal/outsideOpen'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
-import { requestReveal } from '@/editor/revealRequest'
+import { jumpTo } from '@/editor/jump'
+import { UNKNOWN_LINE } from '@/editor/navHistory'
 import { claudeSend } from '@/ipc/client'
 import { useKeyGate } from '@/keys/useKeyGate'
 import { createDispatcher } from '@/keys/dispatch'
@@ -713,16 +714,24 @@ export function App() {
          * precisely how the previous batch nearly shipped a commit-corrupting bug, so it is
          * named as a gap instead of being half-built.
          */
-        const park = (): void => {
+        const park = (record: boolean): void => {
           if (at === null) return
-          requestReveal(path, { line: at.line, column: at.column, endColumn: at.column + 1 })
+          jumpTo(
+            project,
+            { path, line: at.line, column: at.column, endColumn: at.column + 1 },
+            record,
+          )
         }
         // Re-parked on the retry rather than only once, because `REVEAL_TTL_MS` is 10 seconds
         // and reading a confirmation can easily take longer than that. Without this the approved
         // open lands at line 1 — the file opens, and the caret quietly does not go where the
         // user pointed, which is the shape of bug that gets reported months later as "sometimes".
+        // Recorded on the first attempt only. The *reveal* is re-parked on every retry for the
+        // TTL reason above; the *history entry* must not be, or approving the confirmation
+        // leaves two identical origin/destination pairs on the stack and Back appears to do
+        // nothing — it arrives at an entry indistinguishable from the one it left.
         const attempt = (approvedTarget?: string): void => {
-          park()
+          park(approvedTarget === undefined)
           void fileApi
             .openFromTerminal(project, path, approvedTarget)
             .then(() => hydrate())
@@ -872,7 +881,12 @@ export function App() {
             <Explorer
               project={activeProjectId}
               onOpenFile={(path) => {
-                if (activeProjectId) void fileApi.open(activeProjectId, path).then(() => hydrate())
+                if (!activeProjectId) return
+                // `UNKNOWN_LINE`: the Explorer names a file and not a place in it, so the
+                // per-file view memory decides where it opens. The history records the visit
+                // without inventing a line — see `editor/navHistory.ts`.
+                jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
+                void fileApi.open(activeProjectId, path).then(() => hydrate())
               }}
             />
           )}
@@ -883,7 +897,8 @@ export function App() {
               onOpenHit={(path, line, column, endColumn) => {
                 if (!activeProjectId) return
                 // The caret, which is the half the user reported missing — a search result
-                // that opens the file at the top has not gone to the found place.
+                // that opens the file at the top has not gone to the found place. `jumpTo`
+                // also records the visit, so the mouse's Back button returns here.
                 //
                 // Requested BEFORE the open, and that ordering is the design rather than a
                 // preference: the editor for this path usually does not exist yet, so the
@@ -891,7 +906,7 @@ export function App() {
                 // file already open is revealed immediately instead. See
                 // `editor/revealRequest.ts` — the parked request expires, so one for a file
                 // that never opens cannot fire when the user opens it by hand an hour later.
-                requestReveal(path, { line, column, endColumn })
+                jumpTo(activeProjectId, { path, line, column, endColumn })
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
               }}
             />
@@ -906,7 +921,7 @@ export function App() {
                 // Requested BEFORE the open — the editor for this path usually does not exist
                 // yet, so the request is parked and spent by the mount the open causes. The same
                 // ordering the search panel's `onOpenHit` uses; see `editor/revealRequest.ts`.
-                requestReveal(path, { line, column, endColumn: column })
+                jumpTo(activeProjectId, { path, line, column })
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
               }}
             />
@@ -1055,25 +1070,69 @@ export function App() {
             context={keyContext}
             actions={{
               /*
-               * `requestReveal` **before** `fileApi.open`, and the order is the design rather
-               * than a preference: the editor for this path usually does not exist yet, so the
-               * request is parked and spent by the mount the open causes. The same sequence the
-               * search panel's `onOpenHit` uses — see `editor/revealRequest.ts`.
+               * `jumpTo` **before** `fileApi.open`, and the order is the design rather than a
+               * preference: the editor for this path usually does not exist yet, so the reveal
+               * `jumpTo` issues is parked and spent by the mount the open causes. The same
+               * sequence the search panel's `onOpenHit` uses — see `editor/revealRequest.ts`.
+               *
+               * `jumpTo` rather than `requestReveal` directly, here and at every other
+               * navigation in this file: it is the single seam that also records the jump for
+               * Back/Forward. `check-editor.mjs` asserts no `requestReveal(` survives outside
+               * `editor/jump.ts` and `editor/goToDefinition.ts`, because "remember to record"
+               * spread over eight call sites is a rule enforced by memory.
                *
                * For the File Structure popup the file is already open, so the reveal is
                * delivered live and the `open` is a no-op that re-activates the tab.
                */
               goToSymbol: (path, line, column, endColumn) => {
                 closeOverlay()
-                requestReveal(path, { line, column, endColumn })
+                /*
+                 * `focus: true`, and it fixes a defect that predates Go to line.
+                 *
+                 * `closeOverlay()` unmounts the card whose `<input>` held focus, so
+                 * `activeElement` falls to `<body>`. The reveal receiver in `EditorSurface`
+                 * deliberately does not focus — that rule was written for a *click* on a search
+                 * result, where stealing focus would end the results list's ArrowDown/Enter walk
+                 * — so Ctrl+F12 → ⏎ moved the caret and left the keyboard pointing at nothing:
+                 * arrows and typing went nowhere until the user clicked into the buffer.
+                 *
+                 * `align: 'center'` for the same class of reason. A minimal scroll is right when
+                 * the app moved the view on the user's behalf; this is a place they named, and a
+                 * declaration landing flush against the bottom edge shows the signature with none
+                 * of the body under it.
+                 */
+                jumpTo(activeProjectId, { path, line, column, endColumn, focus: true, align: 'center' })
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
+              },
+              /*
+               * Go to line. No `file.open`: the popup will not open without a caret, so the file
+               * is by construction the focused editor's and its tab is already active — and the
+               * reveal is therefore delivered live rather than parked.
+               *
+               * `endColumn: column` is an empty selection at the caret, which is what a line jump
+               * means. `revealRange` clamps the line to the document, so a number past the end of
+               * a file that shrank since the popup opened lands on the last line instead of
+               * throwing out of `dispatch` and taking the React root with it.
+               */
+              goToLine: (path, line, column) => {
+                closeOverlay()
+                jumpTo(activeProjectId, {
+                  path,
+                  line,
+                  column,
+                  focus: true,
+                  align: 'center',
+                })
               },
               openFile: (path) => {
                 closeOverlay()
+                // No position: the picker names a file. See the Explorer above.
+                jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
               },
               openFileInSplit: (path) => {
                 closeOverlay()
+                jumpTo(activeProjectId, { path, line: UNKNOWN_LINE, column: 1 })
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
               },
               mentionFile: (path) => {

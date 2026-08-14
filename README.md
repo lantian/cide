@@ -95,9 +95,21 @@ Rust and Go get a tree-sitter symbol layer (`cide-lang`) and a language-server c
 (`cide-lsp`). The honest state, because half of this is data with no surface on top of it yet:
 
 **Works, and is checked.** `Ctrl+F12` (File Structure popup), `Ctrl+Alt+Shift+N` (Go to Symbol in
-project), `Alt+Up`/`Alt+Down` (previous/next member), the `getDiagnostics` MCP tool answering from
-a real store, and the whole Rust pipeline underneath: extraction for both languages, a parallel
-project walk, the merged diagnostic store, the LSP codec/session/supervisor.
+project), `Alt+Up`/`Alt+Down` (previous/next member), `Ctrl+G` (Go to line), per-file position
+memory, the mouse's back/forward buttons, the `getDiagnostics` MCP tool answering from a real store,
+and the whole Rust pipeline underneath: extraction for both languages, a parallel project walk, the
+merged diagnostic store, the LSP codec/session/supervisor.
+
+**Keys into the editor, and what `Ctrl+G` cost.** Undo/redo (`Ctrl+Z`, `Ctrl+Y`, `Ctrl+Shift+Z`) is
+CodeMirror's `historyKeymap` and is deliberately absent from `cide-core::keymap` — a binding there
+is consumed by the key gate's *window capture* listener before any text surface sees it, and in a
+terminal `Ctrl+Z` is SIGTSTP. Two tests keep it out. The find bar focuses its field on `Ctrl+F` and
+bridges `F3`/`Shift+F3`/`Ctrl+G` into `search-panel` scope, so the keys work with the caret in the
+box as well as in the buffer; the counter reads `3 of 12`, which is the only signal that the search
+wrapped. `Ctrl+G` is Go to line, which **takes find-next away from that chord inside an editor** —
+`F3` is find-next now, `Ctrl+Shift+G` is still find-previous, and one line of `keymap.json` —
+`{"key":"ctrl+g","command":"-navigate.line","when":"editorFocused"}` — gives CodeMirror's `Mod-g`
+back. The `when` is not optional in that line and the test named after it says why.
 
 **Verified against real servers.** `cargo test -p cide-lsp -- --ignored` drives the real binaries;
 **CI does not run it**, so run it by hand after touching that crate. All six pass — `gopls`
@@ -168,6 +180,85 @@ Go has a real grammar now (`func`, `chan`, `defer`, `select`, raw strings, rune 
 non-nesting block comments) instead of borrowing Java's keyword table through `clike`. The outline
 re-parses 300 ms after you stop typing, so the breadcrumb, the popup and the member walk follow the
 buffer rather than the last save.
+
+**Position memory: a file reopens where you left it.** Per file, cide remembers the caret and the
+first visible **line** — lines and not pixels, because wrapping is on for every file under the 1 MB
+limit and the code font size is a runtime setting, so a pixel offset is wrong after a window resize
+or a font change rather than merely imprecise. It survives a tab switch, a project switch, a reload
+from disk when the agent edits the file you are reading, a close-and-reopen, and a relaunch.
+
+It is a separate store from `workspace.json` for the same reason `recent.json` is: the record you
+most need is the one closing the tab has just removed from there. **A scroll gesture is not a
+workspace mutation** and must never become one — `WorkspaceState::update` clones the tree twice,
+re-validates it and broadcasts it to every window, per accepted change. The ladder is four rungs,
+each an order of magnitude cheaper than the next: a `ViewPlugin` coalesces to one animation frame,
+`EditorPane` trailing-debounces to one IPC call per 500 ms, `positions_state.rs` debounces to one
+atomic write per 2 s, and `lifecycle::shutdown` flushes. `$XDG_STATE_HOME/cide/positions.json`, 0600,
+256 files, LRU, **no TTL** — an expiry means the file you come back to on Monday opens at line 1,
+which is the complaint. An explicit navigation always outranks a remembered position: `planRestore`
+refuses while a reveal is parked for that path, so Go to definition into a file you had scrolled
+lands on the definition.
+
+**Mouse back / forward.** The thumb buttons walk a per-project navigation history. **It has to come
+from Rust**, and that is not a preference: WebKitGTK's `buttonForEvent` maps GDK buttons 1–3 and
+leaves the rest at `WebMouseEventButton::None`, which `MouseEvent`'s constructor reports as
+`button === 0` — so both thumb buttons arrive in the DOM as an ordinary left click and cannot be
+told apart there at all. A GTK handler on the `WebKitWebView` widget reads the raw button and emits
+`cide://mouse-nav` to that one window. It also **fixes a phantom click that was already live**: a
+Ctrl+thumb-press over a path in terminal output used to open the file, and over a buffer used to
+fire Go to definition.
+
+The handler names a *button*, never a command. `mouseback`/`mouseforward` are ordinary entries in
+`cide-core::keymap`, resolved by the key gate's **third entry point** over the same `resolveStroke`
+the other two use — so they get `when` clauses, composed modifiers, and rebinding for free:
+`{"key":"mouseback","command":"-navigate.back"}` unbinds. `navigate.back` / `navigate.forward` are
+in the palette and are **unbound to any key** by default; `ctrl+alt+shift+left` / `right` are free
+in every layer if you want them:
+
+```json
+{"key":"ctrl+alt+shift+left","command":"navigate.back"}
+{"key":"ctrl+alt+shift+right","command":"navigate.forward"}
+```
+
+IDEA's own `Ctrl+Alt+Left/Right` is not free here — `ctrl+alt+right` is `pane.split.right`, and on
+KDE both are usually the compositor's virtual-desktop shortcuts — and `alt+left`/`alt+right` are
+readline word-motion the window capture listener would take from every terminal.
+
+**Only an explicit navigation is recorded**, and the list of what deliberately is *not* is in
+`ui/src/editor/navHistory.ts`: typing and arrow keys, scrolling, find-as-you-type, the
+`Alt+Up`/`Alt+Down` member walk (a held key, so ten presses would be ten entries), switching between
+already-open tabs, edits, and a Back/Forward move itself. A history that records caret moves is what
+makes Back useless.
+
+**Unmet, and written here rather than left to be found.** The navigation history is **per JavaScript
+realm and session-scoped**: a detached-pane window keeps its own (always empty, since such a window
+never renders an editor) and refuses Back with a sentence rather than walking the shell window's
+stack; it does not survive a window reload or a relaunch. Making it durable means a Rust-owned
+history and an event per jump to every window, which is not worth it for gesture memory. Also
+unmet: `WorkspaceState::flush_if_due` documents itself as "called from the app's tick and before
+quitting" and **is called from neither** — there is no app tick — so `workspace.json` is in fact
+written exactly once per run, at shutdown, and its 500 ms debounce is inert. The position store does
+not inherit that: it runs its own flusher thread rather than assuming a tick exists.
+
+**A context menu no longer scrolls the buffer to the top.** Right-click in an editor, move the
+pointer over the menu, dismiss it, and the buffer used to jump to line 1 — but only if the pointer
+touched the menu. Every step is WebKit's: a right-click leaves `.cm-content` focused, hovering an
+item moves focus to a `<button>`, `FocusController::setFocusedElement` clears the document selection
+on *every* focus change, and the `previous.focus()` on the way out then runs
+`Element::updateFocusAppearance` on a root editable element whose frame has no selection — which
+invents one at the start of the element and *reveals* it. Without the hover, focus never left, so
+`Element::focus` took its refocus early return and nothing happened. `preventScroll` fixes the
+scroll for every surface; the editor additionally supplies a `restoreFocus` calling
+`EditorView.focus()`, because the `setSelection` runs before the reveal and `preventScroll` does not
+suppress it — the caret would still be collapsed to the top and read back into state.
+
+Two more found in the same twenty lines. The menu's `box.focus()` was a **no-op** — it ran in the
+same commit as the measure effect, before React flushed `setPlacement`, so the box was still
+`visibility: hidden` and WebKit refuses focus on such an element. Escape, the arrows, Home/End, Tab
+and Enter were therefore reachable only after the pointer touched an item, and a keyboard-invoked
+menu (Shift+F10, the Menu key) could not be driven at all. And the `scroll` capture listener that
+dismisses the menu did not exempt the menu's own scroller, so arrowing past the fold of a long menu
+would have closed it.
 
 **Still not built.** "Fix with Claude" on a problem row, and Claude-authored inspections — the
 `claude` source toggle exists and nothing produces findings for it. A row action needs the

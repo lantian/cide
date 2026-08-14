@@ -24,6 +24,8 @@
   "diagnostics_did_save",
   "diagnostics_get",
   "diagnostics_restart",
+  "file_note_position",
+  "file_position",
   "file_read",
   "file_write",
   "fs_close",

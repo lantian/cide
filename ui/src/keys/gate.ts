@@ -1,9 +1,10 @@
 /**
- * The key gate — the ONLY place a chord is resolved, with two entry points that must agree.
+ * The key gate — the ONLY place a chord is resolved, with three entry points that must agree.
  *
  * ```
  * entry 1 (terminals):    term.attachCustomKeyEventHandler(terminalKeyGate)
  * entry 2 (everything):   window.addEventListener('keydown', gate, true)
+ * entry 3 (mouse nav):    events.onMouseNav(...) → mouseNavGate(button, modifiers)
  * ```
  *
  * # Why two
@@ -70,8 +71,28 @@
  * The capture is **not** a second resolution path. It never reads the keymap, never names a
  * command, and answers only "consumed / not consumed"; `check-key-gate.mjs` sweeps it through
  * both entry points alongside everything else for exactly that reason.
+ *
+ * # Entry 3, and why the mouse comes in through a keymap
+ *
+ * The mouse's thumb buttons cannot be read from the DOM under WebKitGTK. `buttonForEvent`
+ * (`Source/WebKit/Shared/gtk/WebEventFactory.cpp`) maps GDK buttons 1/2/3 and leaves everything
+ * else at `WebMouseEventButton::None`, and `MouseEvent`'s constructor turns `None` into
+ * `Left` — so buttons 8 and 9 arrive in JavaScript as `button === 0`, indistinguishable from
+ * each other *and* from a left click. Telling Back from Forward is therefore impossible in the
+ * webview, and a GTK handler in `cide-app` reads the raw button instead and emits
+ * `cide://mouse-nav`.
+ *
+ * That handler names a **button**, never a command — exactly as xterm's handler names a
+ * keystroke — and [`KeyGate::mouseHandler`] resolves it through [`resolveStroke`], the same
+ * function the other two entry points use. So the thumb buttons get the whole keymap for free:
+ * a `when` clause, a user rebind, an unbind, composed modifiers (`ctrl+mouseback`), and the
+ * prefix machine behaving consistently (with `ctrl+k` armed, a thumb press resolves
+ * `ctrl+k mouseback`, finds nothing, is swallowed and disarms). The alternative — a mouse
+ * handler that called `run('navigate.back')` itself — would have been a third place where input
+ * becomes a command, with its own copy of the prefix machine and its own `when` evaluation, and
+ * `check-key-gate.mjs` could not have held it to the same answers.
  */
-import { strokeFromEvent, type KeyStroke } from './chords'
+import { renderStroke, strokeFromEvent, type KeyStroke } from './chords'
 import { buildKeymap, type KeyBinding, type KeyContext, type Keymap } from './keymap'
 
 /**
@@ -133,13 +154,40 @@ export type GateEvent = KeyStroke & {
   stopPropagation?: (() => void) | undefined
 }
 
+/**
+ * A mouse button that is bound like a key. See the module note's "Entry 3".
+ *
+ * The names are the key tokens `cide_core::keymap::defaults` binds and the ones a user writes
+ * in `keymap.json`, so they are API in exactly the way a command id is.
+ */
+export type MouseNavButton = 'mouseback' | 'mouseforward'
+
+/** The modifiers held when a thumb button was pressed, read from GDK's `EventButton::state`. */
+export interface MouseNavModifiers {
+  ctrl?: boolean | undefined
+  alt?: boolean | undefined
+  shift?: boolean | undefined
+  meta?: boolean | undefined
+}
+
 export interface KeyGate {
-  /** The shared resolution. Both entry points are wrappers over this. */
+  /** The shared resolution. All three entry points are wrappers over this. */
   decide: (ev: GateEvent) => Decision
   /** Entry 2 — `window.addEventListener('keydown', …, true)`. */
   windowHandler: (ev: KeyboardEvent) => boolean
   /** Entry 1 — `term.attachCustomKeyEventHandler(…)`. */
   terminalHandler: (ev: KeyboardEvent) => boolean
+  /**
+   * Entry 3 — one `cide://mouse-nav` from Rust.
+   *
+   * Answers the same [`Decision`] the other two do. There is nothing to `preventDefault`: the
+   * GTK handler already returned `Propagation::Stop`, so the web process never saw the press
+   * and there is no DOM event in flight to suppress. The verdict is returned anyway, because a
+   * caller that ignores it and a caller that acts on it must be able to read the same value —
+   * and because `check-key-gate.mjs` compares it against the other two entry points' for every
+   * stroke in the sweep.
+   */
+  mouseHandler: (button: MouseNavButton, modifiers?: MouseNavModifiers) => Decision
   /** The pending prefix, e.g. `ctrl+k`, or `null`. */
   pending: () => string | null
   /** Drop any pending prefix and its timer. */
@@ -320,6 +368,35 @@ export function createKeyGate(host: KeyGateHost): KeyGate {
       return decision.passThrough
     },
 
+    mouseHandler(button, modifiers) {
+      /*
+       * Straight to `resolveStroke`, not through `decide`.
+       *
+       * `decide` exists to memoise against a DOM event object, because entries 1 and 2 can both
+       * be handed the *same* `KeyboardEvent` and a chord that reached both would run its command
+       * twice. There is no event here — the press arrives as one Tauri payload delivered to one
+       * listener — so there is nothing to memoise against and nothing to deduplicate. Building a
+       * fake event to route through `decide` would put an object in a `WeakMap` that nothing
+       * ever looks up again.
+       *
+       * `strokeFromEvent` is skipped for the same reason — it exists to turn a physical
+       * `code`/`key` pair into a token, and this token is already canonical — but `renderStroke`
+       * is **not** skipped, and that is deliberate. `Keymap.resolve` looks a sequence up in a
+       * map keyed by `normalizeSequence(binding.key)`, so the modifier order here has to be the
+       * one `renderStroke` produces, exactly. Writing that order out by hand would be a fourth
+       * copy of it, silently correct until somebody reorders the canonical one.
+       */
+      return resolveStroke(
+        renderStroke({
+          key: button,
+          ctrl: modifiers?.ctrl === true,
+          alt: modifiers?.alt === true,
+          shift: modifiers?.shift === true,
+          meta: modifiers?.meta === true,
+        }),
+      )
+    },
+
     terminalHandler(ev) {
       const decision = decide(ev)
       // No `stopPropagation` here: by the time xterm consults this handler the event has
@@ -351,6 +428,20 @@ export function gate(ev: KeyboardEvent): boolean {
 /** Entry 1. Stable reference; safe to pass to `attachCustomKeyEventHandler`. */
 export function terminalKeyGate(ev: KeyboardEvent): boolean {
   return installed?.terminalHandler(ev) ?? true
+}
+
+/**
+ * Entry 3. Stable reference; safe to hand to the `cide://mouse-nav` listener.
+ *
+ * Answers `PASS` with no gate installed, matching the other two: a window whose gate has been
+ * torn down must not act on input, and a press that resolved to nothing is exactly what
+ * "pass through" means when there is nothing behind it to pass to.
+ */
+export function mouseNavGate(
+  button: MouseNavButton,
+  modifiers?: MouseNavModifiers,
+): Decision {
+  return installed?.mouseHandler(button, modifiers) ?? PASS
 }
 
 /** The installed gate, for a status-bar prefix readout or a diagnostic. */

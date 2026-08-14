@@ -76,6 +76,7 @@ import {
 } from '@/ipc/client'
 import { focusedCaret } from '@/editor/caretTrack'
 import { goToDefinition } from '@/editor/goToDefinition'
+import { navigate } from '@/editor/jump'
 import { memberStep } from '@/editor/memberNav'
 import { symbolsOf } from '@/editor/outlineStore'
 import { requestReveal } from '@/editor/revealRequest'
@@ -728,6 +729,22 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      case 'navigate.line': {
+        /*
+         * Needs a caret, not merely an open editor: the popup opens on the current line, reports
+         * how many lines the file has, and jumps within that one file. A `when` gates the palette
+         * and never the keyboard, so Ctrl+G in a terminal pane arrives here and is refused with a
+         * sentence rather than opening a box with nothing to jump in.
+         */
+        if (focusedCaret() === null) return unmet(command, 'no editor focused')
+        // `toggle`, not `show` — the same argument as `picker.files` below. The gate swallows the
+        // chord either way, so `show` would leave Ctrl+G unable to dismiss what Ctrl+G opened.
+        // `editorFocused` is derived from the focused *pane*, which the overlay does not change,
+        // so the second press still resolves and still lands here.
+        useOverlays.getState().toggle('goto')
+        return
+      }
+
       case 'navigate.definition': {
         /*
          * Unlike its neighbours below this one *does* go to Rust, because resolution is the
@@ -743,6 +760,26 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // Fire-and-forget: every outcome — found, not found, still indexing — reports itself
         // through `Failures`. See `editor/goToDefinition.ts`.
         goToDefinition(project.id, caret.path, caret.line, caret.column)
+        return
+      }
+
+      case 'navigate.back':
+      case 'navigate.forward': {
+        /*
+         * The mouse's thumb buttons, and anything a user binds to these ids.
+         *
+         * Every decision is `editor/navHistory.ts`'s and every refusal is `editor/jump.ts`'s;
+         * this arm turns the second into an `unmet` line. That is the whole of what it does,
+         * and it is deliberately not less: "nothing to go back to" is the state a Back button
+         * spends most of its life in, and a gesture with no visible effect is indistinguishable
+         * from one wired to nothing — which is exactly the report that produced this file.
+         *
+         * The `when` clause is `projectOpen`, so this is reachable with focus anywhere,
+         * including a terminal. That is the point: the thumb button is pressed wherever the
+         * pointer is.
+         */
+        const refusal = navigate(command === 'navigate.back' ? 'back' : 'forward')
+        if (refusal !== null) return unmet(command, refusal)
         return
       }
 
@@ -775,6 +812,13 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * `requestReveal` delivers to *every* editor on this path, so in a split showing one
          * file twice both carets move. Harmless — they show the same file — and the alternative
          * is a second, pane-targeted reveal path, which would be two answers to one question.
+         *
+         * **`requestReveal` and not `jumpTo`, deliberately: the member walk is not recorded in
+         * the navigation history.** This is bound to `alt+up`/`alt+down`, which is a held key,
+         * so ten presses would be ten entries — and `navHistory`'s merge rule cannot collapse
+         * them, because members are far apart by construction. The origin of the walk is still
+         * reachable through Back, because whatever brought the caret into this file recorded an
+         * entry. `editor/navHistory.ts` carries the full list of what is and is not recorded.
          */
         requestReveal(caret.path, {
           line: to.startLine,

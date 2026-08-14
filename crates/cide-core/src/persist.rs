@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use cide_ipc::{RecentProject, Workspace};
+use cide_ipc::{RecentProject, ViewPosition, Workspace};
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -386,6 +386,107 @@ pub fn forget_recent(list: &mut Vec<RecentProject>, path: &Path) -> bool {
     let before = list.len();
     list.retain(|entry| entry.path != path);
     before != list.len()
+}
+
+// --- per-file view positions (M12) --------------------------------------------------------
+
+/// How many files remember where the user was.
+///
+/// **Generous where [`MAX_RECENT`] is small, and the difference is the reason.** Sixteen is a
+/// cap on a list that is *drawn as a menu*: past a screenful the entries stop being useful and
+/// start being a history file nobody reads. Nothing ever draws this one. It is looked up by
+/// path, one entry at a time, so the only cost of a large cap is bytes — 256 records of roughly
+/// a hundred bytes is about 25 KB, which covers a week of files and is smaller than the
+/// workspace it sits beside.
+///
+/// There is deliberately **no TTL**. An expiry means the file you come back to on Monday opens
+/// at line 1, which is the complaint this exists to answer.
+pub const MAX_POSITIONS: usize = 256;
+
+/// Where the view positions live: `$XDG_STATE_HOME/cide/positions.json`.
+///
+/// Beside `recent.json` and `workspace.json`, on the same argument [`state_dir`] makes — the
+/// app writes it, nobody hand-edits it, and nobody wants it in a dotfiles repository.
+pub fn positions_path() -> PathBuf {
+    state_dir().join("positions.json")
+}
+
+/// Read `positions.json`.
+///
+/// Does not fail, and for the same stronger reason [`load_recent`] does not: a broken positions
+/// file is worth *nothing*. It is re-derived by the user simply looking at a file again, so a
+/// missing, truncated or unparseable one answers with an empty list and is not even quarantined
+/// — leaving a stray `positions.corrupt-1.json` behind would cost the user a cleanup in
+/// exchange for data they cannot use.
+///
+/// Deleted files are **not** stat'd away on load. That would be one syscall per entry on the
+/// launch path to reclaim a hundred bytes each, and a stale entry is already harmless: the
+/// restore clamps against the document it actually finds.
+pub fn load_positions(path: &Path) -> Vec<ViewPosition> {
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<Vec<ViewPosition>>(&bytes) {
+        Ok(mut list) => {
+            // Trimmed on read as well as on write. A file written by a build with a larger cap,
+            // or hand-edited, must not make every later save carry entries this build would
+            // never have kept.
+            sort_positions(&mut list);
+            list.truncate(MAX_POSITIONS);
+            list
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "view positions file unusable");
+            Vec::new()
+        }
+    }
+}
+
+/// Write `list` to `path`, atomically and privately, exactly as the workspace is written.
+///
+/// Private (0600) for the reason [`save_recent`] is: the set of files a person has been reading
+/// on a shared machine is inference nobody asked to publish, and one rule here beats two.
+pub fn save_positions(path: &Path, list: &[ViewPosition]) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(list)?)
+}
+
+/// Record where the user is in one file, evicting the least recently touched when full.
+///
+/// Pure, and takes the clock as an argument, so the eviction rule is testable without touching
+/// the filesystem or waiting a millisecond for two entries to differ — the same shape
+/// [`remember_recent`] has.
+///
+/// Matching is on the path alone: one entry per file, overwritten. That is the whole difference
+/// between this and a navigation history, which is an *ordered* list with many entries per file
+/// — see `ui/src/editor/navHistory.ts`, which deliberately does not share this store.
+pub fn remember_position(list: &mut Vec<ViewPosition>, mut at: ViewPosition, touched_at: u64) {
+    at.touched_at = touched_at;
+    list.retain(|entry| entry.path != at.path);
+    list.push(at);
+    if list.len() > MAX_POSITIONS {
+        // Sort then truncate rather than "drop the first": the list is not kept in order on
+        // disk, and a build that wrote it in another order must not evict an entry the user
+        // touched a minute ago.
+        sort_positions(list);
+        list.truncate(MAX_POSITIONS);
+    }
+}
+
+/// The remembered place for `path`, or `None`.
+pub fn position_for<'a>(list: &'a [ViewPosition], path: &Path) -> Option<&'a ViewPosition> {
+    list.iter().find(|entry| entry.path == path)
+}
+
+/// Most recently touched first, ties broken by path so the order is total.
+///
+/// Ties are real: two panes showing two files can be noted within the same millisecond, and an
+/// unstable order there would make the eviction pick a different victim on two identical runs.
+fn sort_positions(list: &mut [ViewPosition]) {
+    list.sort_by(|a, b| {
+        b.touched_at
+            .cmp(&a.touched_at)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 }
 
 /// Newest first, ties broken by path so the order is total.
@@ -1853,6 +1954,176 @@ mod tests {
         assert!(
             !list.iter().any(|e| e.path == Path::new("/p0")),
             "the cap kept the oldest and dropped a recent one",
+        );
+    }
+
+    // --- per-file view positions ----------------------------------------------------------
+
+    fn at(path: &str, line: u32) -> ViewPosition {
+        ViewPosition {
+            path: PathBuf::from(path),
+            top_line: line.saturating_sub(5).max(1),
+            line,
+            column: 1,
+            touched_at: 0,
+        }
+    }
+
+    #[test]
+    fn one_entry_per_file_however_often_it_is_noted() {
+        let mut list = Vec::new();
+        remember_position(&mut list, at("/a.rs", 10), 100);
+        remember_position(&mut list, at("/b.rs", 20), 110);
+        remember_position(&mut list, at("/a.rs", 900), 120);
+
+        assert_eq!(
+            list.len(),
+            2,
+            "a file is remembered once, not once per scroll"
+        );
+        let a = position_for(&list, Path::new("/a.rs")).expect("a is remembered");
+        assert_eq!(a.line, 900, "and the newest note wins");
+        assert_eq!(
+            a.touched_at, 120,
+            "the clock is the store's, whatever the caller sent — it is the eviction key"
+        );
+    }
+
+    #[test]
+    fn the_position_store_evicts_the_least_recently_touched() {
+        /*
+         * **The list is built the way a *load* produces one — newest first — and that is the
+         * whole point of the test.**
+         *
+         * Filling it with `remember_position` alone proves nothing about the eviction rule: that
+         * function retains-then-pushes, so a list it built by itself already has recency and
+         * insertion order agreeing, and "drop element 0" would pass. A mutation test caught
+         * exactly that. `load_positions` sorts newest-first before handing the list over, so the
+         * live list on every launch after the first has element 0 as the *most* recently touched
+         * — and a cap that dropped the front would evict the file the user was reading when they
+         * quit, every time.
+         */
+        let mut list: Vec<ViewPosition> = (0..MAX_POSITIONS)
+            .map(|n| ViewPosition {
+                // Newest first: n = 0 is the most recently touched.
+                touched_at: (MAX_POSITIONS - n) as u64,
+                ..at(&format!("/f{n}.rs"), 1)
+            })
+            .collect();
+
+        remember_position(&mut list, at("/new.rs", 1), 10_001);
+
+        assert_eq!(list.len(), MAX_POSITIONS);
+        assert!(
+            position_for(&list, Path::new("/f0.rs")).is_some(),
+            "the front of a freshly loaded list is the NEWEST entry; evicting it would throw \
+             away the file the user was reading when they quit",
+        );
+        assert!(
+            position_for(&list, Path::new(&format!("/f{}.rs", MAX_POSITIONS - 1))).is_none(),
+            "the genuinely least recently touched entry is the one that goes",
+        );
+
+        // And re-touching an entry rescues it, which is the other half of an LRU.
+        let oldest = format!("/f{}.rs", MAX_POSITIONS - 2);
+        remember_position(&mut list, at(&oldest, 42), 20_000);
+        remember_position(&mut list, at("/newer.rs", 1), 20_001);
+        assert_eq!(list.len(), MAX_POSITIONS);
+        assert!(
+            position_for(&list, Path::new(&oldest)).is_some(),
+            "the file the user just came back to must not be the one evicted",
+        );
+    }
+
+    #[test]
+    fn two_files_noted_in_the_same_millisecond_evict_the_same_way_whatever_order_they_arrived() {
+        /*
+         * Ties are real: two panes showing two files are noted within one millisecond routinely,
+         * and `now_ms` has millisecond resolution. `sort_by` is *stable*, so without the
+         * tie-break the surviving entry is whichever happened to be earlier in the list — which
+         * differs between a fresh session and one restored from disk, for the same set of files.
+         * The user-visible symptom is a position that survives on one machine and is evicted on
+         * another, which is unreportable.
+         */
+        let victim = |mut list: Vec<ViewPosition>| {
+            remember_position(&mut list, at("/new.rs", 1), 9);
+            let mut kept: Vec<String> = list
+                .iter()
+                .map(|e| e.path.to_string_lossy().into_owned())
+                .collect();
+            kept.sort();
+            kept
+        };
+
+        let tied = |names: &[&str]| -> Vec<ViewPosition> {
+            let mut list: Vec<ViewPosition> = (0..MAX_POSITIONS - names.len())
+                .map(|n| ViewPosition {
+                    touched_at: 1_000 + n as u64,
+                    ..at(&format!("/bulk{n}.rs"), 1)
+                })
+                .collect();
+            // All on the same tick, which is what makes the order below the only difference.
+            list.extend(names.iter().map(|name| ViewPosition {
+                touched_at: 7,
+                ..at(name, 1)
+            }));
+            list
+        };
+
+        assert_eq!(
+            victim(tied(&["/a.rs", "/b.rs"])),
+            victim(tied(&["/b.rs", "/a.rs"])),
+            "the same set of files, two arrival orders, one eviction — the tie-break by path is \
+             what makes the order total",
+        );
+    }
+
+    #[test]
+    fn positions_round_trip_and_a_broken_file_costs_nothing() {
+        let dir = TempDir::new("positions");
+        let path = dir.join("positions.json");
+
+        let mut list = Vec::new();
+        remember_position(&mut list, at("/a.rs", 120), 10);
+        save_positions(&path, &list).expect("save");
+
+        let loaded = load_positions(&path);
+        let entry = position_for(&loaded, Path::new("/a.rs")).expect("a is remembered");
+        assert_eq!((entry.line, entry.top_line), (120, 115));
+
+        // A broken positions file is worth *nothing* — it is re-derived by looking at a file
+        // again — so it reads as empty and is deliberately not quarantined. `load` moves a
+        // broken workspace aside; that asymmetry is the point.
+        fs::write(&path, b"{ not a list").expect("write");
+        assert!(load_positions(&path).is_empty());
+        assert_eq!(
+            dir.entries(),
+            ["positions.json"],
+            "nothing was moved aside: a stray file is a cleanup the user did not ask for",
+        );
+
+        // And a file that was never written is the first launch, not a failure.
+        assert!(load_positions(&dir.join("nothing-here.json")).is_empty());
+    }
+
+    #[test]
+    fn a_file_written_with_a_larger_cap_is_trimmed_on_read() {
+        let dir = TempDir::new("positions-oversize");
+        let path = dir.join("positions.json");
+        let over: Vec<ViewPosition> = (0..(MAX_POSITIONS + 20))
+            .map(|n| ViewPosition {
+                touched_at: n as u64,
+                ..at(&format!("/f{n}.rs"), 1)
+            })
+            .collect();
+        save_positions(&path, &over).expect("save");
+
+        let loaded = load_positions(&path);
+        assert_eq!(loaded.len(), MAX_POSITIONS);
+        assert!(
+            position_for(&loaded, Path::new(&format!("/f{}.rs", MAX_POSITIONS + 19))).is_some(),
+            "the trim keeps the newest, so a hand-edited file cannot make every later save \
+             carry entries this build would never have kept",
         );
     }
 

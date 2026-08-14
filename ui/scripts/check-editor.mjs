@@ -9,7 +9,7 @@
  *
  * Same shape as `check-status-format.mjs` and `check-picker.mjs`: no JS test runner in this
  * project, so the TypeScript already in `node_modules` compiles the modules and this file
- * imports the output. Eleven things are pinned, in the order they appear below.
+ * imports the output. Twelve things are pinned, in the order they appear below.
  *
  *  1. **Line endings.** A round trip — capture, hand the text to CodeMirror, restore — is
  *     byte-identical for LF, CRLF, bare CR *and* mixed. This is the regression that already
@@ -50,6 +50,22 @@
  *     — and the two cases where the answer is "none of it, say so instead". Every branch is a
  *     way for the user to be told nothing happened when something did, which is the report
  *     this feature has now been filed under twice.
+ * 12. **Keys into the editor.** Undo/redo, the find bar and the focus handoff — three reports
+ *     with one root, which is a binding that exists and a surface that cannot reach it. The
+ *     match ordinal (`findMatches.ts`) and the reveal plan (`revealRequest.ts::planReveal`) are
+ *     driven directly; the rest is source assertions, because every one of those bugs was a
+ *     *missing call* rather than a wrong function and a module's own tests cannot see one.
+ * 13. **Position memory and navigation history.** Two features that both have to say where
+ *     somebody is in a file, sharing one type (`position.ts`) and deliberately not one store.
+ *     The clamp, the "is this worth an IPC call" rule and the restore veto are driven; so is
+ *     the whole of what Back and Forward decide (`navHistory.ts`) — the merge rule, the
+ *     discarded forward tail, the refresh-from-the-live-caret, the cap, and a four-thousand-op
+ *     fuzz walk that the cursor may never leave the array during. Then the call sites, which
+ *     is where this class of bug actually lives: that `EditorSurface` installs the tracker and
+ *     consults the veto, that `EditorPane` feeds both props and *flushes* rather than cancels
+ *     on unmount, and — the one that matters most — that **no `requestReveal` survives outside
+ *     the `jump.ts` seam**, because "remember to record the jump too" spread over eight call
+ *     sites is a rule enforced by memory.
  *
  * The fifth found two more quadratics on its first run — the markdown link matcher and the
  * shell `${…}` matcher, both the same unbounded-scan-then-backtrack shape as the YAML key
@@ -57,12 +73,21 @@
  *
  * # What this cannot reach, and does not pretend to
  *
- * `EditorSurface.tsx`, `minimap.ts` and `find.ts` are not compiled here. They need a
+ * `EditorSurface.tsx`, `minimap.ts`, `find.ts` and `viewTracker.ts` are not compiled here. They need a
  * `CanvasRenderingContext2D`, a scroller with real geometry, a composition event and a live
  * `data-theme` switch — a window, in other words. The minimap's *painting*, IME preedit
  * under fcitx5, and a theme toggle with terminals running are out of reach of any headless
  * check and are still untested. `minimapGeometry.ts` exists so that the half of the minimap
- * that is arithmetic is not out of reach too.
+ * that is arithmetic is not out of reach too, and `findMatches.ts` was split out of `find.ts`
+ * in M12 for exactly the same reason — as were `position.ts` and `navHistory.ts`, which is why
+ * `viewTracker.ts` and `jump.ts` are left holding a `getBoundingClientRect` and a `Map` and no
+ * decisions at all.
+ *
+ * What section 12 adds for those three files is *source* assertions rather than execution. That
+ * is a weaker gate and it is chosen deliberately: `mount()` not focusing its field, `onKeyDown`
+ * not bridging to `search-panel` scope, and a diff pane with no `history()` are all absences,
+ * and an absence is exactly what a test of the surrounding code passes over. Where a decision
+ * could be lifted out into something runnable it was — that is what `planReveal` is.
  *
  * Run: `pnpm --dir ui run check:editor`
  */
@@ -127,6 +152,13 @@ try {
       'src/editor/lintMap.ts',
       'src/editor/caretTrack.ts',
       'src/editor/highlightLevel.ts',
+      // The find bar's arithmetic, split out of `find.ts` — which needs a window — for exactly
+      // this reason. See section 12.
+      'src/editor/findMatches.ts',
+      // M12, section 13: the two position features. `position.ts` is the type both of them
+      // speak; `navHistory.ts` is the whole of what Back and Forward decide.
+      'src/editor/position.ts',
+      'src/editor/navHistory.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -1712,10 +1744,20 @@ try {
   // and the queue above cover the landing. Both halves are checked, because either one alone
   // is a feature that does nothing: a four-argument callback that discards three arguments
   // reads as correct, and so does a `requestReveal` nobody calls.
+  // Comments stripped, and that is the whole point of this line.
+  //
+  // This assertion used to read raw source for `requestReveal(`. App.tsx stopped calling it
+  // when jumps moved behind `jumpTo`, and the only remaining match was the *prose explaining
+  // that it no longer calls it* — so the check passed on a file that navigated nowhere.
+  // Mutation-tested: deleting the `jumpTo` from the search-hit handler left the gate green.
+  // It is the exact trap this file warns about elsewhere, sprung on itself.
   const appSrc = readFileSync('src/App.tsx', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1')
   ok(
-    /requestReveal\(/.test(appSrc),
-    'App.tsx calls `requestReveal` — without it a search hit opens the file at the top',
+    /jumpTo\(/.test(appSrc),
+    'App.tsx routes navigation through `jumpTo` — without it a search hit opens the file at ' +
+      'the top, and the jump is missing from the Back stack',
   )
   ok(
     /onOpenHit=\{\(path, line, column, endColumn\)/.test(appSrc),
@@ -2401,25 +2443,47 @@ try {
     eq(focusedCaret(), null, 'no editor, no caret')
 
     const first = claimCaret('/a.rs')
-    first.set(3, 7)
-    eq(focusedCaret(), { path: '/a.rs', line: 3, column: 7 }, 'the only claim answers')
+    /*
+     * `lines` is the document's size, added with Go to line, which has to say "this file has 892
+     * lines" *before* the user commits to a number — the clamp in `revealRange` can only answer
+     * afterwards, by moving the caret somewhere they did not name.
+     *
+     * Asserted as a whole object rather than field by field, and that is deliberate: `eq`
+     * compares `JSON.stringify`, which **drops `undefined` values**, so `set(3, 7)` against the
+     * three-argument signature would have produced `{path, line, column}` and compared equal to
+     * the old expectation. A shape assertion that silently tolerates a missing field is the kind
+     * of green this file exists to stop.
+     */
+    first.set(3, 7, 120)
+    eq(
+      focusedCaret(),
+      { path: '/a.rs', line: 3, column: 7, lines: 120 },
+      'the only claim answers, and carries the document size with the position',
+    )
+    ok(
+      Object.hasOwn(focusedCaret(), 'lines'),
+      'the size is a present property, not an implicit undefined that JSON.stringify would hide',
+    )
 
     // A split: the newest claim wins, and focus takes it back — the same stack discipline the
     // status readout uses, and for the same reason.
     const second = claimCaret('/b.rs')
-    second.set(1, 1)
+    eq(focusedCaret().lines, 1, 'a fresh claim reports one line, never zero — an empty doc is one')
+    second.set(1, 1, 4)
     eq(focusedCaret().path, '/b.rs', 'mounting claims the slot')
     first.focus()
     eq(focusedCaret().path, '/a.rs', 'focus takes it back')
+    eq(focusedCaret().lines, 120, 'and the size follows the position it belongs to')
     // An unfocused editor still tracks its own caret, so it is right the moment it is focused.
-    second.set(9, 2)
+    second.set(9, 2, 40)
     eq(focusedCaret().line, 3, 'and a background editor does not overwrite the foreground one')
     second.focus()
     eq(focusedCaret().line, 9, 'but its position was kept')
+    eq(focusedCaret().lines, 40, 'size included')
 
     second.release()
     eq(focusedCaret().path, '/a.rs', 'releasing hands the slot down rather than blanking it')
-    second.set(1, 1)
+    second.set(1, 1, 4)
     eq(focusedCaret().path, '/a.rs', 'and a released handle can no longer write')
     first.release()
     eq(focusedCaret(), null, 'the last release empties the slot')
@@ -2514,6 +2578,731 @@ try {
     ok(
       pane.includes('diagnostics={diagnostics}') && pane.includes('highlight={level}'),
       'and EditorPane actually feeds it — an unfed editor draws nothing and passes every test above',
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 12. Keys into the editor: undo/redo, the find bar, and the focus handoff
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * Three reports, one root: a binding that exists and a surface that cannot reach it.
+   *
+   * The arithmetic half — the match ordinal and the reveal plan — is driven directly, because it
+   * is import-free for exactly that reason. The rest is source assertions, which is the same gate
+   * `useSendToClaude` and the Ctrl+click block get above and for the same reason: `find.ts`,
+   * `EditorSurface.tsx` and `DiffPane.tsx` need a window, and every bug in this section was a
+   * *missing call* rather than a wrong function — the kind of defect a module's own tests cannot
+   * see, because the module was right.
+   */
+  {
+    const { COUNT_CAP, countLabel, tally } = load('findMatches.js')
+
+    /*
+     * Section 9's `strip` is scoped to its own block, and every file read below argues about the
+     * thing it is being checked for — `find.ts` discusses focus and the `main-field` attribute at
+     * length, `codeMenu.tsx` discusses undo's absence from the palette. A pin written against raw
+     * source would match the prose instead of the code, which is how a check certifies the bug it
+     * was written for.
+     */
+    const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+    /*
+     * The find bar's number. `@codemirror/search` wraps silently in both directions, and the bar
+     * used to render a bare total — so passing the last match and landing back on the first was
+     * indistinguishable from the key having done nothing. `3 of 12` is the wrap indicator.
+     */
+    const at = (from, to) => ({ from, to })
+    const three = [at(0, 2), at(10, 12), at(20, 22)]
+
+    eq(tally(three, at(0, 2)), { total: 3, capped: false, ordinal: 1 }, 'the first match is 1')
+    eq(tally(three, at(20, 22)), { total: 3, capped: false, ordinal: 3 }, 'the last match is the total')
+    eq(
+      tally(three, at(10, 12)).ordinal,
+      2,
+      'and the middle one is what it looks like — an off-by-one here is invisible on screen',
+    )
+    eq(
+      tally(three, at(5, 7)).ordinal,
+      null,
+      'a selection that is not a match has no ordinal, so the bar falls back to the total',
+    )
+    eq(
+      tally(three, at(0, 3)).ordinal,
+      null,
+      'both ends must agree: a caret parked at the *start* of a match is not standing on it',
+    )
+    eq(tally([], at(0, 0)), { total: 0, capped: false, ordinal: null }, 'no matches is zero, not null')
+
+    // Wrap-around, which is the whole reason the ordinal exists: `findNext` past the last match
+    // reselects the first, and the number going 3 → 1 is the only signal a sighted user gets.
+    eq(countLabel(tally(three, at(20, 22))), '3 of 3', 'standing on the last match')
+    eq(countLabel(tally(three, at(0, 2))), '1 of 3', 'and one press later, back at the top')
+
+    // The cap. Counting is an unbudgeted `SearchCursor` walk, so past it the bar stops walking —
+    // and the ordinal has to go with it, because the walk may have stopped before the selection.
+    const many = { *[Symbol.iterator]() { for (let i = 0; i < 5000; i++) yield at(i * 4, i * 4 + 2) } }
+    const capped = tally(many, at(0, 2))
+    eq(capped.capped, true, 'past the cap the walk reports that it stopped')
+    eq(capped.total, COUNT_CAP + 1, 'and stops one past it rather than running to the end')
+    eq(capped.ordinal, null, 'the ordinal is suppressed: this walk may never have reached the selection')
+    eq(countLabel(capped), `${COUNT_CAP}+`, 'and the label says so rather than naming a figure')
+
+    // Laziness is a correctness property here, not a nicety: an eager consumer would walk a
+    // five-megabyte document to the end on every keystroke, which is what the cap exists to stop.
+    let produced = 0
+    const counted = { *[Symbol.iterator]() { while (true) { produced++; yield at(produced * 4, produced * 4 + 2) } } }
+    tally(counted, at(0, 0))
+    ok(produced <= COUNT_CAP + 1, `the walk is abandoned at the cap (took ${produced} matches)`)
+
+    eq(countLabel({ total: 1, capped: false, ordinal: null }), '1 match', 'the singular is singular')
+    eq(countLabel({ total: 12, capped: false, ordinal: null }), '12 matches', 'and the plural is not')
+
+    /*
+     * The two lines that were missing from `find.ts`.
+     *
+     * Scoped to the member, never the file: `find.ts` *discusses* focus and the `main-field`
+     * attribute in a comment, and that comment is precisely what made the missing focus call look
+     * deliberate to a reviewer. A whole-file grep would have passed on the broken version.
+     */
+    const findSrc = readFileSync('src/editor/find.ts', 'utf8')
+    const findCode = strip(findSrc)
+    const memberBlock = (src, name) => {
+      const start = src.indexOf(name)
+      if (start === -1) return ''
+      // To the next member of the class: a `private`/`readonly`/`update(`/`destroy(` boundary.
+      const next = src
+        .slice(start + name.length)
+        .search(/\n {2}(private|readonly|update\(|destroy\(|constructor\()/)
+      return next === -1 ? src.slice(start) : src.slice(start, start + name.length + next)
+    }
+
+    const mountBlock = memberBlock(findCode, 'mount(): void {')
+    ok(mountBlock.length > 0, 'FindPanel still has a mount()')
+    ok(
+      /this\.input\.focus\(\)/.test(mountBlock) && /this\.input\.select\(\)/.test(mountBlock),
+      'mount() focuses and selects the field: `openSearchPanel`\'s closed-panel branch only ' +
+        'dispatches `togglePanel`, so without this Ctrl+F opened the bar and the query the user ' +
+        'typed next went into their file',
+    )
+
+    const keyBlock = memberBlock(findCode, 'onKeyDown = (event: KeyboardEvent)')
+    ok(keyBlock.length > 0, 'FindPanel still has a keydown handler')
+    ok(
+      /runScopeHandlers\(this\.view, event, 'search-panel'\)/.test(keyBlock),
+      'the handler bridges into `search-panel` scope, and does it first: the panel is a sibling ' +
+        'of contentDOM, so without this F3, Shift+F3 and Ctrl+G are dead in the one place the ' +
+        'caret actually is after Ctrl+F',
+    )
+    ok(
+      keyBlock.indexOf('runScopeHandlers') < keyBlock.indexOf("'Enter'"),
+      'scope handlers run before the hand-rolled Enter, matching upstream — the other order ' +
+        'would let Enter shadow a binding scoped to this panel',
+    )
+    ok(
+      /import \{[^}]*\brunScopeHandlers\b[^}]*\} from '@codemirror\/view'/s.test(findCode),
+      'runScopeHandlers comes from @codemirror/view — the scope string is matched by value, so a ' +
+        'typo in either half fails silently and for ever',
+    )
+    ok(
+      /searchKeymap\.filter\(\(binding\) => binding\.run !== gotoLine\)/.test(findCode),
+      'searchKeymap is installed whole except CodeMirror\'s own gotoLine, and the one exception ' +
+        'is filtered by command identity rather than by key string — a `key === \'Mod-Alt-g\'` ' +
+        'test would stop matching silently the day upstream re-spells the chord',
+    )
+    ok(
+      /'Next match \(F3, Enter\)'/.test(findCode) && /'Previous match \(Shift\+F3, Shift\+Enter\)'/.test(findCode),
+      'the arrow buttons name F3: these are CodeMirror bindings, so they carry no palette chip ' +
+        'and the bar is the only surface that can document them',
+    )
+    ok(
+      /tr\.isUserEvent\('select\.search'\)/.test(findCode),
+      'the counter recounts on `select.search` — the marker findNext/findPrevious stamp — and ' +
+        'not on bare `selectionSet`, which a held arrow key fires thirty times a second',
+    )
+
+    /*
+     * Undo, which was reachable by key and by nothing else, and absent entirely from the one
+     * editable surface whose Accept writes a file.
+     *
+     * The composed keymap is built from the real packages, so a `defaultKeymap` upgrade that
+     * quietly claimed Mod-z would fail here rather than in a bug report.
+     */
+    const { closeBracketsKeymap } = require('@codemirror/autocomplete')
+    const { defaultKeymap, historyKeymap, indentWithTab } = require('@codemirror/commands')
+    const { searchKeymap } = require('@codemirror/search')
+    const composed = [
+      ...closeBracketsKeymap,
+      ...defaultKeymap,
+      ...historyKeymap,
+      ...searchKeymap,
+      indentWithTab,
+    ]
+    for (const chord of ['Mod-z', 'Mod-y', 'Mod-u']) {
+      const claiming = composed.filter((b) => b.key === chord)
+      eq(claiming.length, 1, `exactly one binding in the composed editor keymap claims ${chord}`)
+      ok(
+        historyKeymap.includes(claiming[0]),
+        `${chord} is history's — anything else claiming it has shadowed undo, which fails as ` +
+          'silently as a feature that was never built',
+      )
+    }
+    ok(
+      historyKeymap.some((b) => b.linux === 'Ctrl-Shift-z'),
+      'redo also answers Ctrl+Shift+Z on Linux, which is the chord half the world reaches for',
+    )
+    ok(
+      historyKeymap.some((b) => b.key === 'Mod-y' && b.mac === 'Mod-Shift-z'),
+      'and Ctrl+Y is redo off macOS — the `mac:` property overrides `key:` only there, so the ' +
+        'chord the report asked for is already bound and needs nothing added',
+    )
+
+    const diffSrc = strip(readFileSync('src/panes/DiffPane.tsx', 'utf8'))
+    const sharedAt = diffSrc.indexOf('const shared =')
+    ok(sharedAt !== -1, 'DiffPane still builds a shared extension list')
+    const sharedLine = diffSrc.slice(sharedAt, diffSrc.indexOf('\n', sharedAt))
+    ok(
+      /history\(\)/.test(sharedLine) && /keymap\.of\(historyKeymap\)/.test(sharedLine),
+      'the diff pane has an undo history: it is the one editable surface whose Accept writes a ' +
+        'file, and it shipped with no `history()` at all, so Ctrl+Z there did nothing',
+    )
+
+    const menuCode12 = strip(readFileSync('src/editor/codeMenu.tsx', 'utf8'))
+    for (const [id, fn] of [['undo', 'undo('], ['redo', 'redo(']]) {
+      const block = menuCode12.slice(
+        menuCode12.indexOf(`id: '${id}'`),
+        menuCode12.indexOf("id: '", menuCode12.indexOf(`id: '${id}'`) + 10),
+      )
+      ok(block.length > 0, `the ${id} menu item exists`)
+      ok(
+        block.includes('run:') && block.includes(fn),
+        `the ${id} item carries a run that calls the command — undo was keyboard-only, which is ` +
+          'a capability nobody who did not already know the chord could find',
+      )
+      ok(
+        block.includes('Depth('),
+        `the ${id} item greys itself from ${id}Depth rather than being always enabled — a menu ` +
+          'entry that runs and does nothing is the same lie as a chord that does nothing',
+      )
+    }
+
+    /*
+     * The focus handoff, which is the same defect as the find bar's in different clothing: a
+     * caret that moved and a keyboard that did not follow it.
+     *
+     * Driven rather than grepped. The decision is `planReveal`'s, in an import-free module,
+     * precisely so it is not four lines inside an effect inside a component that needs a window
+     * — which is where all three of this round's bugs were hiding.
+     */
+    const doc4 = Text.of(['aaaa', 'bbbb', 'cccc', 'dddd'])
+    const base = { line: 2, column: 2, endColumn: 3 }
+    eq(
+      [reveal.planReveal(doc4, base).focus, reveal.planReveal(doc4, base).center],
+      [false, false],
+      'a plain reveal takes neither the keyboard nor the middle of the viewport — a click on a ' +
+        'search result must leave focus in the results list or the ArrowDown walk ends at one hit',
+    )
+    eq(reveal.planReveal(doc4, { ...base, focus: true }).focus, true, 'a named jump asks for focus')
+    eq(reveal.planReveal(doc4, { ...base, align: 'center' }).center, true, 'and for the centre')
+    eq(
+      reveal.planReveal(doc4, { ...base, focus: undefined, align: undefined }).focus,
+      false,
+      'an explicitly undefined flag is "leave it alone", not "whatever the last caller passed"',
+    )
+    eq(
+      [reveal.planReveal(doc4, { line: 99, column: 1, endColumn: 2, focus: true }).range.from],
+      [15],
+      'and the clamp still runs: a line past the end of the file lands on the last one',
+    )
+
+    /*
+     * The call sites. Both symbol pickers and Go to line accept by unmounting the card whose
+     * `<input>` had focus, so `activeElement` falls to `<body>` — the flag is what stops the
+     * caret moving to a place the keyboard cannot then be used in.
+     */
+    const appSrc = strip(readFileSync('src/App.tsx', 'utf8'))
+    const symbolAt = appSrc.indexOf('goToSymbol:')
+    ok(symbolAt !== -1, 'App still wires goToSymbol')
+    ok(
+      /focus: true/.test(appSrc.slice(symbolAt, symbolAt + 400)),
+      'goToSymbol asks for focus: Ctrl+F12 → ⏎ used to move the caret and leave the keyboard on ' +
+        '<body>, so the next arrow key went nowhere',
+    )
+    const lineAt = appSrc.indexOf('goToLine:')
+    ok(lineAt !== -1, 'App wires goToLine')
+    // Bounded at the property's own `},` rather than by a character count: the next action in
+    // the object is `openFile`, which *does* call `fileApi.open`, so a fixed window would make
+    // the "reveals without opening" assertion below read its neighbour and fail for the wrong
+    // reason — or, with the arguments the other way round, pass for one.
+    const lineBlock = appSrc.slice(lineAt, appSrc.indexOf('},', lineAt))
+    ok(lineBlock.length > 40, 'and the goToLine block was bounded rather than collapsing to nothing')
+    ok(
+      /focus: true/.test(lineBlock) && /align: 'center'/.test(lineBlock),
+      'and so does Go to line, centred — a jump to line 4000 that lands flush against the bottom ' +
+        'edge shows the destination with none of the code around it',
+    )
+    ok(
+      /jumpTo\(/.test(lineBlock) && !/fileApi\.open\(/.test(lineBlock),
+      'Go to line reveals without opening: the popup will not open without a caret, so the file ' +
+        'is by construction the focused editor\'s and its tab is already active',
+    )
+    ok(
+      /case 'navigate\.line'/.test(strip(readFileSync('src/keys/dispatch.ts', 'utf8'))),
+      'and Ctrl+G reaches a dispatch arm — a registered command with no case is a palette row ' +
+        'that swallows the keystroke and does nothing',
+    )
+  }
+
+
+  // ---------------------------------------------------------------------------------------
+  // 13. Position memory and navigation history: one type, two stores
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * Two features that both have to say where somebody is in a file. They share `FilePosition`
+   * and nothing else, and the whole of what either of them *decides* is in these two
+   * import-free modules — which is the point: the alternative was a rule inside a `useEffect`
+   * in a component that needs a window, and this project has now paid for that three times.
+   */
+  {
+    const pos = load('position.js')
+    const nav = load('navHistory.js')
+
+    /* ------------------------------------------------ the shared type and its clamp */
+
+    const view = (path, line, column, topLine) => ({ path, line, column, topLine })
+
+    eq(
+      pos.clampView(view('/a.rs', 400, 9, 380), 120),
+      view('/a.rs', 120, 9, 120),
+      'a position recorded against a longer version of the file lands on the last line — ' +
+        '`doc.line(n)` THROWS past the end, and that exception escapes through `dispatch` into ' +
+        'an effect with no error boundary, taking the React root and every terminal with it',
+    )
+    eq(
+      pos.clampView(view('/a.rs', 0, 0, 0), 120),
+      view('/a.rs', 1, 1, 1),
+      'and zero — which is what a 0-based caller would send — clamps up rather than down',
+    )
+    eq(
+      pos.clampView(view('/a.rs', NaN, NaN, NaN), 120),
+      view('/a.rs', 1, 1, 1),
+      'NaN is clamped rather than passed: it fails every comparison a clamp is made of, so it ' +
+        'sails through one written the obvious way and throws at the end of it',
+    )
+    eq(
+      pos.clampView(view('/a.rs', 12, 4, 7), 0),
+      view('/a.rs', 1, 4, 1),
+      'a document of no lines is one empty line — CodeMirror\'s own arithmetic',
+    )
+    eq(
+      pos.clampView(view('/a.rs', 12.7, 4.2, 7.9), 120),
+      view('/a.rs', 12, 4, 7),
+      'and fractions are truncated rather than rounded into a line the user never named',
+    )
+    eq(
+      pos.clampView(view('/a.rs', 12, 4, 400), 120).topLine,
+      120,
+      'the top line is clamped too, not only the caret — restoring a viewport past the end of ' +
+        'a shortened file is the same throw',
+    )
+
+    ok(
+      pos.samePosition({ path: '/a', line: 1, column: 1 }, { path: '/a', line: 1, column: 1 }),
+      'two spellings of one place are one place',
+    )
+    ok(
+      !pos.samePosition({ path: '/a', line: 1, column: 1 }, { path: '/a', line: 1, column: 2 }),
+      'and the column is part of it',
+    )
+    ok(pos.samePosition(null, null), 'nowhere is nowhere')
+    ok(!pos.samePosition(null, { path: '/a', line: 1, column: 1 }), 'and nowhere is not somewhere')
+
+    /* The rung of the write ladder that costs nothing: a report that is not news. */
+    ok(
+      !pos.worthNoting(view('/a', 4, 2, 1), view('/a', 4, 2, 1)),
+      'an unchanged view is not worth an IPC call — a click that lands the caret where it ' +
+        'already was, a scroll that ends where it started, a focus change that moves nothing',
+    )
+    ok(pos.worthNoting(null, view('/a', 4, 2, 1)), 'the first observation always is')
+    ok(
+      pos.worthNoting(view('/a', 4, 2, 1), view('/a', 4, 2, 2)),
+      'and a scroll with the caret still is: `topLine` is half of what "the same lines" means',
+    )
+
+    /*
+     * The top-line correction — a **measured** bug, twice over, in both directions.
+     *
+     * Seeding `positions.json` with `topLine: 200`, launching the real app and reading the value
+     * back gave 199: `scrollIntoView`'s default 5px `yMargin` put the restored line just below
+     * the viewport top, so the hit test landed on the line above, and the launch after that
+     * would have given 198. `yMargin: 0` fixed that and a strict "entirely visible" rule then
+     * over-corrected to 201, because the instrumented geometry says the line's top is at 66 and
+     * the scroller's *border box* starts at 68. Half a line is the threshold that is stable
+     * under both.
+     */
+    const ROW = 19
+    eq(
+      pos.topVisibleLine(200, 66, ROW, 68, 4000),
+      200,
+      'two pixels under a border is still the line you are reading — a stricter rule sent a ' +
+        'seeded 200 back as 201, measured against the real app',
+    )
+    eq(
+      pos.topVisibleLine(199, 100 - ROW + 4, ROW, 100, 4000),
+      200,
+      'but a line cut off by more than half of itself is not: the next one is the top line, ' +
+        'which is what stops a restore creeping a line per relaunch',
+    )
+    eq(
+      pos.topVisibleLine(200, 105, ROW, 105, 4000),
+      200,
+      'a line flush with the viewport top is the answer, unchanged',
+    )
+    eq(
+      pos.topVisibleLine(200, 106, ROW, 105, 4000),
+      200,
+      'and a line starting BELOW the top is never corrected upward',
+    )
+    eq(
+      pos.topVisibleLine(4000, 0, ROW, 1000, 4000),
+      4000,
+      'the correction never walks past the end of the document',
+    )
+    eq(
+      pos.topVisibleLine(7, 0, 0, 1000, 4000),
+      7,
+      'a zero line height is a pane that has not been laid out — the hit line stands rather ' +
+        'than the arithmetic dividing by nothing and walking off the end',
+    )
+    eq(
+      pos.topVisibleLine(12, 100, 76, 130, 4000),
+      12,
+      'and a WRAPPED line is measured against its own height: four rows cut by 30px is still ' +
+        'mostly on screen, so it is still the line you are reading',
+    )
+
+    /*
+     * Idempotence, which is the property that actually matters: restore → read back → restore
+     * must be a fixed point, or the viewport creeps every time the file is reopened.
+     */
+    for (const cut of [0, 0.5, 2, 4, 9]) {
+      eq(
+        pos.topVisibleLine(300, 68 - cut, ROW, 68, 4000),
+        300,
+        `a restore leaving ${cut}px of the line above the fold reads back as the same line`,
+      )
+    }
+
+    /* ------------------------------------------------ an explicit navigation outranks memory */
+
+    eq(
+      pos.planRestore(view('/a.rs', 40, 3, 30), 120, false),
+      view('/a.rs', 40, 3, 30),
+      'with nothing parked, the remembered place is restored',
+    )
+    eq(
+      pos.planRestore(view('/a.rs', 40, 3, 30), 120, true),
+      null,
+      'a parked reveal VETOES the restore: Go to definition into a file you had scrolled must ' +
+        'land on the definition, not where you were last week. Today the ordering also falls ' +
+        'out of the restore running before `registerReveal` — which is correctness that lasts ' +
+        'until somebody swaps two statements, so it is a rule here as well',
+    )
+    eq(pos.planRestore(null, 120, false), null, 'and a file with no memory restores nothing')
+    eq(
+      pos.planRestore(view('/a.rs', 999, 3, 999), 10, false),
+      view('/a.rs', 10, 3, 10),
+      'the restore is clamped on the way out, not trusted from the store',
+    )
+
+    /* ------------------------------------------------ the history: what Back actually walks */
+
+    const at = (path, line) => ({ path, line, column: 1 })
+    const A1 = at('/a.rs', 10)
+    const A2 = at('/a.rs', 500)
+    const B1 = at('/b.rs', 20)
+    const C1 = at('/c.rs', 30)
+
+    eq(nav.EMPTY_HISTORY.index, -1, 'an empty history stands nowhere')
+    ok(!nav.canWalk(nav.EMPTY_HISTORY, 'back'), 'and cannot go back')
+    ok(!nav.canWalk(nav.EMPTY_HISTORY, 'forward'), 'or forward')
+
+    const one = nav.record(nav.EMPTY_HISTORY, A1, B1)
+    eq(
+      one.entries.map((e) => `${e.path}:${e.line}`),
+      ['/a.rs:10', '/b.rs:20'],
+      'the FIRST jump records the origin as well as the destination — without it Back from ' +
+        'the very first jump has nowhere to go, which is the state a user is in when they ' +
+        'first reach for the button',
+    )
+    eq(one.index, 1, 'and the cursor stands on the destination')
+
+    const back = nav.walk(one, 'back', null)
+    eq(back.to.path, '/a.rs', 'Back returns to the origin')
+    eq(back.history.index, 0, 'and the cursor moves rather than the list')
+    eq(
+      back.history.entries.length,
+      2,
+      'walking does NOT push: a Back that recorded itself could never reach the entry before ' +
+        'last',
+    )
+    eq(nav.walk(back.history, 'back', null), null, 'and there is nothing before the origin')
+    eq(nav.walk(back.history, 'forward', null).to.path, '/b.rs', 'Forward comes back')
+
+    /* The live caret refreshes the entry being left — that is what makes a round trip honest. */
+    {
+      const moved = { path: '/b.rs', line: 640, column: 12 }
+      const walked = nav.walk(one, 'back', moved)
+      eq(
+        walked.history.entries[1],
+        moved,
+        'the entry being left is refreshed from the LIVE caret, so Back-then-Forward returns ' +
+          'you to where you actually were and not to where you landed ten minutes ago',
+      )
+      eq(
+        nav.walk(one, 'back', { path: '/z.rs', line: 5, column: 1 }).history.entries[1].line,
+        20,
+        'but only when the caret is still in that file — a caret elsewhere means the user ' +
+          'changed tabs by hand, and writing it in would corrupt the stack several presses later',
+      )
+    }
+
+    /* The merge rule: why Back does not walk five entries to get out of one function. */
+    {
+      const merged = nav.record(nav.record(nav.EMPTY_HISTORY, A1, B1), B1, at('/b.rs', 22))
+      eq(
+        merged.entries.map((e) => `${e.path}:${e.line}`),
+        ['/a.rs:10', '/b.rs:22'],
+        `a jump of ${2} lines inside one file replaces the entry rather than adding one — ` +
+          'MERGE_LINES is 3, about a signature and its first statement',
+      )
+      const kept = nav.record(nav.record(nav.EMPTY_HISTORY, A1, B1), B1, at('/b.rs', 200))
+      eq(kept.entries.length, 3, 'and a real move inside the same file is still an entry')
+      eq(nav.MERGE_LINES, 3, 'the merge distance is what the comment says it is')
+    }
+
+    /* The forward tail, discarded exactly as a browser discards it. */
+    {
+      const two = nav.record(nav.record(nav.EMPTY_HISTORY, A1, B1), B1, C1)
+      eq(two.entries.length, 3, 'three places visited')
+      const stepped = nav.walk(two, 'back', null)
+      eq(stepped.history.index, 1, 'standing on the middle one')
+      const fresh = nav.record(stepped.history, B1, at('/d.rs', 1))
+      eq(
+        fresh.entries.map((e) => e.path),
+        ['/a.rs', '/b.rs', '/d.rs'],
+        'jumping somewhere new from the middle discards what was ahead — keeping it would ' +
+          'make Forward go somewhere you have never been from here',
+      )
+      ok(!nav.canWalk(fresh, 'forward'), 'so there is nothing ahead any more')
+    }
+
+    /* `UNKNOWN_LINE`: the Explorer names a file, not a place in it. */
+    {
+      eq(nav.UNKNOWN_LINE, 0, 'a line of 0 is out of range by construction — lines are 1-based')
+      const opened = nav.record(nav.EMPTY_HISTORY, A1, { path: '/b.rs', line: 0, column: 1 })
+      eq(opened.entries.length, 2, 'an open with no position is still a visit')
+      const later = nav.record(opened, { path: '/b.rs', line: 700, column: 4 }, C1)
+      eq(
+        later.entries.map((e) => `${e.path}:${e.line}`),
+        ['/a.rs:10', '/b.rs:700', '/c.rs:30'],
+        '"somewhere in this file" matches ANY place in that file, so the first live caret ' +
+          'replaces it in place — otherwise the Explorer would leave two entries for one visit',
+      )
+    }
+
+    /* The cap, and the cursor that has to move with it. */
+    {
+      let h = nav.EMPTY_HISTORY
+      for (let i = 0; i < 200; i++) h = nav.record(h, null, at('/f.rs', i * 100))
+      eq(h.entries.length, nav.NAV_CAP, `the list is held at ${nav.NAV_CAP}`)
+      eq(h.index, nav.NAV_CAP - 1, 'and the cursor still stands on the newest entry')
+      eq(
+        h.entries[0].line,
+        (200 - nav.NAV_CAP) * 100,
+        'the OLDEST entries go, not the newest — evicting from the wrong end would make Back ' +
+          'walk into places the user has already come back from',
+      )
+      ok(nav.isCoherent(h), 'and the result is still walkable')
+    }
+
+    /*
+     * A fuzz walk. The one failure mode of an index into an array is an index out of it, and
+     * the symptom would be Back silently doing nothing for ever, with no error anywhere.
+     */
+    {
+      let seed = 12345
+      const rand = (n) => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        return seed % n
+      }
+      let h = nav.EMPTY_HISTORY
+      let broke = null
+      for (let i = 0; i < 4000 && broke === null; i++) {
+        const op = rand(4)
+        const place = at(`/f${rand(6)}.rs`, rand(400))
+        if (op === 0) h = nav.record(h, null, place)
+        else if (op === 1) h = nav.record(h, place, at(`/f${rand(6)}.rs`, rand(400)))
+        else {
+          const stepped = nav.walk(h, op === 2 ? 'back' : 'forward', rand(2) === 0 ? null : place)
+          if (stepped !== null) h = stepped.history
+        }
+        if (!nav.isCoherent(h)) broke = `${i}: ${JSON.stringify(h)}`
+      }
+      eq(broke, null, 'four thousand random record/walk operations never put the cursor out of ' +
+        'bounds or the list over its cap')
+    }
+
+    /* ------------------------------------------------ the call sites, which is where the bugs are */
+
+    const stripJs = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+    /*
+     * **The seam.** Eight gestures used to call `requestReveal` directly, and "remember to
+     * record the jump too" spread over eight call sites is a rule enforced by memory — the
+     * ninth navigation somebody adds next year is the one that forgets. This is the assertion
+     * that stops that, and it is deliberately a whitelist of *files* rather than a count.
+     */
+    {
+      const allowed = new Set([
+        // The seam itself.
+        'src/editor/jump.ts',
+        // The module that defines it.
+        'src/editor/revealRequest.ts',
+        // The member walk, which is deliberately NOT recorded: it is bound to a held key, and
+        // ten presses would be ten entries the merge rule cannot collapse. `navHistory.ts`'s
+        // header carries the whole list of what is and is not recorded.
+        'src/keys/dispatch.ts',
+        // Fixtures and the surface that answers a reveal rather than making one.
+        'src/editor/EditorSurface.tsx',
+      ])
+      /*
+       * Comments are stripped before the search, and that is not tidiness: `App.tsx` *discusses*
+       * `requestReveal` at length in the block explaining why it no longer calls it, and a
+       * whole-file grep would report the explanation as the violation. This is the same lesson
+       * section 12 records — a pin written against raw source certifies the prose rather than
+       * the code.
+       */
+      const offenders = execFileSync('grep', ['-rl', 'requestReveal(', 'src'], {
+        encoding: 'utf8',
+      })
+        .split('\n')
+        .filter((f) => f !== '' && !allowed.has(f))
+        .filter((f) => /requestReveal\(/.test(stripJs(readFileSync(f, 'utf8'))))
+      eq(
+        offenders,
+        [],
+        'every navigation goes through `editor/jump.ts` — a `requestReveal` anywhere else is a ' +
+          'jump that moves the caret and never reaches the Back stack',
+      )
+    }
+
+    const jumpSrc = stripJs(readFileSync('src/editor/jump.ts', 'utf8'))
+    ok(
+      /record\(/.test(jumpSrc) && /walk\(/.test(jumpSrc),
+      'jump.ts drives navHistory rather than reimplementing it',
+    )
+    ok(
+      /role\.kind === 'shell'/.test(jumpSrc),
+      'and it refuses to record in a non-shell realm: a detached pane is a separate JS realm ' +
+        'with its own module instances, and the tab it opens mounts in the shell window',
+    )
+    ok(
+      /if \(to\.line === UNKNOWN_LINE\) return/.test(jumpSrc),
+      'an open with no position reveals NOTHING — a `requestReveal` there would land the caret ' +
+        'on line 1 and overwrite the view memory\'s restore, turning one feature into a bug in ' +
+        'the other',
+    )
+
+    const dispatchSrc = stripJs(readFileSync('src/keys/dispatch.ts', 'utf8'))
+    for (const id of ['navigate.back', 'navigate.forward']) {
+      ok(
+        new RegExp(`case '${id}'`).test(dispatchSrc),
+        `${id} reaches a dispatch arm — a registered command with no case is a palette row and ` +
+          'a mouse button that swallow the gesture and do nothing',
+      )
+    }
+    ok(
+      /navigate\(command === 'navigate\.back'/.test(dispatchSrc),
+      'and the arm calls into jump.ts rather than deciding anything itself',
+    )
+
+    /* The producer, the restore, and the two props that carry them. */
+    const surfaceSrc = stripJs(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    ok(
+      /viewTracker\(path, \(seen\) => \{/.test(surfaceSrc),
+      'EditorSurface installs the view tracker — an editor that never reports its position ' +
+        'leaves the whole feature storing nothing, and every assertion above still passes',
+    )
+    ok(
+      /observedRef\.current = seen/.test(surfaceSrc),
+      'and keeps its own last observation: on a reload from disk that is the ONLY source that ' +
+        'is current, since the `at` prop was fetched when the tab opened and the store holds ' +
+        'whatever the 500 ms debounce last managed to send',
+    )
+    ok(
+      /planRestore\(remembered, view\.state\.doc\.lines, pendingReveals\(\)\.includes\(path\)\)/.test(
+        surfaceSrc,
+      ),
+      'the restore consults planRestore, and hands it the parked-reveal answer — the veto is ' +
+        'the rule that keeps Go to definition outranking a remembered position',
+    )
+    ok(
+      surfaceSrc.indexOf('planRestore(') < surfaceSrc.indexOf('registerReveal('),
+      'and it runs BEFORE registerReveal spends a parked request, so an explicit navigation ' +
+        'always lands last',
+    )
+    ok(
+      /y: 'start',\n\s*yMargin: 0,/.test(surfaceSrc),
+      "the viewport is restored with y: 'start' AND yMargin: 0 — the recorded line goes to the " +
+        'very TOP, which is what "the same lines" means. The default 5px margin puts it one ' +
+        'line down from where the tracker reads it back, and that error is cumulative: measured ' +
+        'against the real app, a seeded 200 came back as 199',
+    )
+    ok(
+      /topVisibleLine\(/.test(stripJs(readFileSync('src/editor/viewTracker.ts', 'utf8'))),
+      'and the tracker applies the correction rather than reporting the raw hit test',
+    )
+
+    const paneSrc = stripJs(readFileSync('src/panes/EditorPane.tsx', 'utf8'))
+    ok(
+      /at=\{load\.at\}/.test(paneSrc) && /onView=\{reportPosition\}/.test(paneSrc),
+      'EditorPane feeds the surface both halves — an unfed prop is this project\'s most-repeated ' +
+        'defect, and it passes every test of the code around it',
+    )
+    ok(
+      /fileApi\.position\(path\)/.test(paneSrc) && /Promise\.all\(/.test(paneSrc),
+      'and fetches the position BESIDE the text rather than after it: sequencing them would put ' +
+        'the editor on screen at line 1 and then jump it, which reads as the app losing your place',
+    )
+    ok(
+      /useEffect\(\(\) => \(\) => sendPosition\(\), \[sendPosition\]\)/.test(paneSrc),
+      'the unmount FLUSHES the pending note rather than cancelling it — tab close, project ' +
+        'switch and detach all arrive as an unmount, and every one of them is a moment the user ' +
+        'expects to come back to. The selection cleanup beside it cancels, and that asymmetry ' +
+        'is the whole point',
+    )
+    ok(
+      /clearTimeout\(selectionTimer\.current\)/.test(paneSrc),
+      'while the selection report still cancels: it describes a caret that is no longer on screen',
+    )
+
+    /* Write amplification: the note must not travel the workspace-mutation path. */
+    const clientSrc = readFileSync('src/ipc/client.ts', 'utf8')
+    const noteAt = clientSrc.indexOf('notePosition:')
+    ok(noteAt !== -1, 'the client exposes notePosition')
+    ok(
+      /invoke<void>\('file_note_position'/.test(clientSrc.slice(noteAt, noteAt + 300)),
+      'and it is its own command, not a workspace mutation — `WorkspaceState::update` clones the ' +
+        'tree twice, re-validates it and broadcasts it to every window, per scroll',
+    )
+    const rustNote = readFileSync('../crates/cide-app/src/cmd/file.rs', 'utf8')
+    const rustAt = rustNote.indexOf('pub fn file_note_position')
+    ok(rustAt !== -1, 'and Rust has the handler')
+    ok(
+      !/state\.update/.test(rustNote.slice(rustAt, rustAt + 400)),
+      'which does NOT go through WorkspaceState::update: no rev bump, no `cide://workspace-changed`',
     )
   }
 

@@ -303,6 +303,82 @@ pub fn close_blocked(
     }
 }
 
+// --- mouse navigation (M12) ---------------------------------------------------------------
+
+/// A thumb button (GDK 8 or 9) was pressed in one window.
+///
+/// # Why this has to come from Rust at all
+///
+/// The webview cannot tell Back from Forward. WebKitGTK's `buttonForEvent`
+/// (`Source/WebKit/Shared/gtk/WebEventFactory.cpp`) maps GDK buttons 1, 2 and 3 and leaves
+/// everything else at `WebMouseEventButton::None`; `MouseEvent`'s constructor then turns `None`
+/// into `Left`. So both thumb buttons arrive in JavaScript as `button === 0`, `buttons === 0`,
+/// indistinguishable from each other and from an ordinary click. A DOM-only implementation is
+/// impossible rather than merely awkward — and, worse, the phantom left click is *live today*:
+/// a Ctrl+thumb-press over a path in terminal output already opens the file, and over a buffer
+/// already fires Go to definition. Swallowing the press in GTK fixes that as a side effect.
+///
+/// # Why `emit_to` and not a broadcast
+///
+/// The press happened in one window. `workspace_changed` goes to every window because the tree
+/// is shared; a mouse gesture is not, and two windows both walking their own history from one
+/// press is the kind of bug that reads as "Back sometimes goes back twice".
+///
+/// # Why the payload names a button and not a command
+///
+/// `ui/src/keys/gate.ts` is the one place input becomes a command, and `mouseback` /
+/// `mouseforward` are ordinary keymap entries there. Naming a command here would be a second
+/// resolver, with its own copy of the prefix machine and the `when` evaluation.
+pub const MOUSE_NAV: &str = "cide://mouse-nav";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MouseNav {
+    /// Which window the press happened in.
+    ///
+    /// **Carried in the payload because `emit_to` cannot narrow this event.** Tauri's
+    /// `emit_to(label, ..)` filters by `EventTarget`, and `@tauri-apps/api`'s `listen()`
+    /// registers `EventTarget::Any` — whose arm in `match_any_or_filter` short-circuits past
+    /// every target filter. So the emit fans out to every webview regardless of the label,
+    /// and with two shell windows open one thumb press ran Back in both, each walking its own
+    /// history and stealing focus from the other.
+    ///
+    /// The alternative was `emit_to` with an explicit `EventTarget::Webview`, which would
+    /// mean changing how *every* listener in `client.ts` registers — a wide change to fix one
+    /// event. Filtering on a field the receiver already knows how to check (`windowLabel()`)
+    /// keeps the blast radius at this event.
+    window: String,
+    /// `mouseback` or `mouseforward` — the key token, not a command.
+    button: &'static str,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
+pub fn mouse_nav(
+    app: &AppHandle,
+    window: &str,
+    button: &'static str,
+    modifiers: (bool, bool, bool, bool),
+) {
+    let (ctrl, alt, shift, meta) = modifiers;
+    let payload = MouseNav {
+        window: window.to_string(),
+        button,
+        ctrl,
+        alt,
+        shift,
+        meta,
+    };
+    // Still `emit_to` rather than `emit`: it is the honest statement of intent, it narrows
+    // delivery for any listener that ever registers a real target, and the payload's `window`
+    // is what actually enforces it today.
+    if let Err(error) = app.emit_to(window, MOUSE_NAV, payload) {
+        tracing::debug!(%error, window, "mouse-nav reached no window");
+    }
+}
+
 // --- diagnostics ------------------------------------------------------------------------
 
 /// The IPC transport is on the slow path.

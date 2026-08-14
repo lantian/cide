@@ -18,9 +18,10 @@
  * M8 frontend report.
  */
 import { useEffect, useRef } from 'react'
-import { installKeyGate } from './gate'
+import { installKeyGate, mouseNavGate } from './gate'
 import { mergeContext } from './context'
 import { switcherCapture } from './switcherStore'
+import { events } from '@/ipc/client'
 import type { KeyBinding, KeyContext } from './keymap'
 
 export interface KeyGateWiring {
@@ -67,4 +68,40 @@ export function useKeyGate(wiring: KeyGateWiring): void {
       }),
     [],
   )
+
+  /*
+   * Entry point 3: the mouse's thumb buttons, which arrive as an event from Rust because the
+   * DOM cannot tell them apart. See `gate.ts`'s module note.
+   *
+   * A separate effect from the install above rather than a line inside it, because the two have
+   * different shapes: `installKeyGate` is synchronous and returns its own teardown, while
+   * `listen` is a promise that resolves a tick or more later. `dropped` and not merely a null
+   * check on the teardown — a window closed inside that tick would otherwise leave a
+   * subscription nobody can cancel, holding this closure for the life of the window. The same
+   * guard, for the same reason, as `panes/EditorPane.tsx`'s `onSessionTool` wiring.
+   *
+   * The decision is thrown away deliberately: there is nothing to `preventDefault`. The GTK
+   * handler already returned `Propagation::Stop`, so the web process never saw the press.
+   */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let dropped = false
+    void events
+      .onMouseNav((button, modifiers) => {
+        // Guarded rather than cast: the payload crosses a process boundary, and a Rust change
+        // that started sending a third button must not resolve as a stroke nobody bound —
+        // which would swallow it and leave no trace of why.
+        if (button !== 'mouseback' && button !== 'mouseforward') return
+        mouseNavGate(button, modifiers)
+      })
+      .then((fn) => {
+        if (dropped) fn()
+        else unlisten = fn
+      })
+      .catch(() => {})
+    return () => {
+      dropped = true
+      unlisten?.()
+    }
+  }, [])
 }

@@ -11,6 +11,7 @@ import { useEffect } from 'react'
 import { BranchPopup } from '@/chrome/BranchSelector'
 import { CommandPalette } from './CommandPalette'
 import { FilePicker } from './FilePicker'
+import { GoToLine } from './GoToLine'
 import { StructurePicker } from './StructurePicker'
 import { SymbolPicker } from './SymbolPicker'
 import { focusedCaret } from '@/editor/caretTrack'
@@ -36,6 +37,17 @@ export interface OverlayActions {
    * in that order, so the request is parked and spent by the mount the open causes.
    */
   goToSymbol: (path: string, line: number, column: number, endColumn: number) => void
+  /**
+   * ⏎ in the Go to line popup: put the caret on a line of the file that is already open.
+   *
+   * Separate from [`goToSymbol`] rather than folded into it, because the two differ in both
+   * halves. A symbol jump *selects* the declaration's identifier, so it carries an `endColumn`
+   * and has to open a file that is very likely not open yet; this one places an empty caret in
+   * the buffer the user is already looking at — the popup will not open without a caret in one.
+   * One callback covering both would need a comment at every argument saying which case it was
+   * for.
+   */
+  goToLine: (path: string, line: number, column: number) => void
 }
 
 export interface OverlayHostProps {
@@ -67,6 +79,13 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
     // the caret is in and jumps from there. Closed rather than rendered empty, for the reason
     // above — a store left open with nothing on screen makes `overlayOpen()` lie.
     if (open === 'structure' && focusedCaret() === null) close()
+    // Go to line needs a caret for the same reason and one more: it prefills with the line the
+    // caret is on and reports how many lines the file has, and neither question has an answer
+    // without one. The caret is the *only* thing it needs — it asks Rust nothing — so unlike its
+    // three neighbours there is no `project === null` arm below. `App` still only mounts this
+    // host with a project, which is why that costs nothing today; it is written this way so the
+    // popup does not acquire a dependency it does not have.
+    if (open === 'goto' && focusedCaret() === null) close()
   }, [open, project, close])
 
   if (open === null) return null
@@ -104,6 +123,13 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
   if (open === 'symbols') {
     if (project === null) return null
     return <SymbolPicker project={project} onDismiss={close} onGoTo={actions.goToSymbol} />
+  }
+
+  if (open === 'goto') {
+    // Until the effect above runs. One frame, and it draws nothing. No `project` guard: see the
+    // note in the effect.
+    if (focusedCaret() === null) return null
+    return <GoToLine onDismiss={close} onGoTo={actions.goToLine} />
   }
 
   return (

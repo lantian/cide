@@ -38,6 +38,7 @@ import {
   symbolsOf,
 } from '@/editor/outlineStore'
 import { closeDoc, openDoc, resetDoc, savedDoc, scheduleDoc } from '@/editor/docSync'
+import type { FileView } from '@/editor/position'
 import { levelFor, subscribeHighlightLevels } from '@/editor/highlightLevel'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { useWorkspace } from '@/store/workspace'
@@ -83,8 +84,19 @@ function levelOf(
 /** What the pane is currently showing instead of, or as well as, a buffer. */
 type Load =
   | { kind: 'loading' }
-  | { kind: 'ready'; text: string; writable: boolean }
+  | { kind: 'ready'; text: string; writable: boolean; at: FileView | null }
   | { kind: 'failed'; why: string }
+
+/**
+ * How long a burst of scrolling accumulates before one IPC call.
+ *
+ * The second rung of the ladder in `crates/cide-app/src/positions_state.rs`. Longer than the
+ * 80 ms `reportSelection` uses below, and the difference is what each notification is *for*:
+ * that one drives a status line a human is watching in another process, so staleness is
+ * visible; this one is a durable record nobody reads until the file is reopened, so the only
+ * thing that matters is that the last gesture of a burst lands.
+ */
+const POSITION_DEBOUNCE_MS = 500
 
 export function EditorPane({ path, root, project, tab }: EditorPaneProps): ReactNode {
   /*
@@ -203,6 +215,58 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
   )
 
   /**
+   * Remember where the user is in this file.
+   *
+   * Debounced here rather than in the surface, for the reason `reportSelection` above is: the
+   * surface is documented as pure — "no IPC, no store, no knowledge of tabs" — and the moment it
+   * knows what a debounce is for, it knows about the wire.
+   *
+   * The trailing edge matters and the leading edge does not. Nobody needs the *first* frame of a
+   * scroll recorded; what has to survive is where the gesture ended, which is why this resets
+   * the timer on every report rather than rate-limiting.
+   */
+  const positionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const pendingPosition = useRef<FileView | null>(null)
+  const sendPosition = useCallback(() => {
+    const at = pendingPosition.current
+    pendingPosition.current = null
+    if (positionTimer.current !== undefined) {
+      clearTimeout(positionTimer.current)
+      positionTimer.current = undefined
+    }
+    if (at === null) return
+    // Fire-and-forget: a lost position costs a scroll offset, and a rejected promise on the
+    // scroll path would reach `Failures` and put a notice on screen for something the user did
+    // not ask for and cannot act on.
+    void fileApi.notePosition(at).catch(() => {})
+  }, [])
+  const reportPosition = useCallback(
+    (at: FileView) => {
+      pendingPosition.current = at
+      if (positionTimer.current !== undefined) clearTimeout(positionTimer.current)
+      positionTimer.current = setTimeout(sendPosition, POSITION_DEBOUNCE_MS)
+    },
+    [sendPosition],
+  )
+
+  /*
+   * On the way out this **flushes**, where the selection cleanup above **cancels** — and the
+   * asymmetry is the whole point rather than an oversight.
+   *
+   * A pending `selection_changed` for a pane that has gone is noise: it describes a caret that
+   * is no longer on screen, in a notification whose only consumer is a status line. A pending
+   * *position* for a pane that has gone is the single most valuable one there is — closing the
+   * tab, switching project and detaching a pane all arrive here as an unmount, and every one of
+   * them is a moment the user expects to come back to. Cancelling would mean the last half
+   * second of every reading session was the half that got lost.
+   *
+   * A window closed by the compositor does not run React cleanup at all. The 500 ms debounce
+   * will normally have fired long before; what covers the rest is the store's own flush in
+   * `lifecycle::shutdown`, which writes unconditionally.
+   */
+  useEffect(() => () => sendPosition(), [sendPosition])
+
+  /**
    * Publish this buffer's save function so `CloseConfirm` can offer *Save and close*.
    *
    * Keyed on the tab, not the pane: the dirty flag the confirmation reads is per tab, and a
@@ -221,11 +285,31 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
   const read = useCallback(
     (bump: boolean) => {
       let cancelled = false
-      void fileApi
-        .read(path)
-        .then((doc) => {
+      /*
+       * The remembered position is fetched **beside** the text, in one `Promise.all`, and the
+       * surface is not rendered until both have landed.
+       *
+       * Sequencing it after the read would put the editor on screen at line 1 and then jump it,
+       * which is worse than the bug: a visible jump reads as the app losing your place and
+       * finding it again. `catch(() => null)` because there is no position for most files and a
+       * store that could not answer must not stop the file from opening.
+       *
+       * `bump` — a reload from disk — deliberately re-fetches it and deliberately does *not*
+       * use it: `EditorSurface` prefers its own live observation over this prop, which is the
+       * only value that is current after the user has been scrolling. See `observedRef` there.
+       */
+      void Promise.all([fileApi.read(path), fileApi.position(path).catch(() => null)])
+        .then(([doc, at]) => {
           if (cancelled) return
-          setLoad({ kind: 'ready', text: doc.text, writable: doc.writable })
+          setLoad({
+            kind: 'ready',
+            text: doc.text,
+            writable: doc.writable,
+            at:
+              at === null
+                ? null
+                : { path: at.path, line: at.line, column: at.column, topLine: at.topLine },
+          })
           setConflict(false)
           reportDirty(false)
           if (bump) setReloadKey((n) => n + 1)
@@ -350,6 +434,8 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           onDirtyChange={reportDirty}
           onSave={onSave}
           onSelection={reportSelection}
+          at={load.at}
+          onView={reportPosition}
           onSaveHandle={registerSaveHandle}
           symbols={outline}
           onDocChanged={(read) => {

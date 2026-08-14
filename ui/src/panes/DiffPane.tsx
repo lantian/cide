@@ -14,8 +14,9 @@
  */
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { MergeView, unifiedMergeView } from '@codemirror/merge'
+import { history, historyKeymap } from '@codemirror/commands'
 import { EditorState } from '@codemirror/state'
-import { EditorView, lineNumbers } from '@codemirror/view'
+import { EditorView, keymap, lineNumbers } from '@codemirror/view'
 import {
   getDiffView,
   getServerDiffView,
@@ -238,7 +239,38 @@ export function DiffPane({
     const host = hostRef.current
     if (host === null) return
 
-    const shared = [lineNumbers(), EditorView.lineWrapping]
+    /*
+     * Line numbers, wrapping — and an undo history, which this pane shipped without.
+     *
+     * # Why the omission mattered here more than anywhere else
+     *
+     * This is the one editable surface in the app whose Accept **writes a file**, and it does it
+     * while `openDiff` is blocking the agent's turn. A user tidying the proposal before accepting
+     * it could delete a block, reach for Ctrl+Z, and get nothing back: `history()` is a
+     * `StateField`, and without it in the state `undo` has no transactions to walk and returns
+     * `false`. Nothing in the app was swallowing the chord — `cide-core::keymap` binds no `z`, so
+     * the window capture gate passes it straight through (see
+     * `the_editor_undo_chords_are_not_bound_here` over there) — the editor simply had nowhere to
+     * put it. `EditorSurface` has had `history()` since M9; this pane never got it.
+     *
+     * `historyKeymap` alone, not `defaultKeymap`. The rest of `defaultKeymap` would be a much
+     * larger behaviour change to a pane that has been getting its Enter, Backspace and arrow
+     * handling from CodeMirror's own `beforeinput`/DOM-observation path since it shipped, and
+     * changing that while fixing undo would put two unrelated risks on one line. It carries
+     * Mod-z, Mod-y, Ctrl-Shift-z (Linux), Mod-u and Alt-u, which is the whole of the gesture.
+     *
+     * Shared with the read-only `a` side deliberately: that side adds `EditorState.readOnly`, and
+     * `undo`/`redo` check exactly that facet and refuse, so one array is safe for both.
+     *
+     * What this still cannot do is survive `carryRef` (see below). A layout toggle rebuilds the
+     * editor — `MergeView` and `unifiedMergeView` are different editors, not a reconfigure — and
+     * the carry hands the replacement the *text*, not the history. Undo after switching Split ↔
+     * Unified therefore starts from the carried document. That is a real limit and is written
+     * down rather than left for a reader to assume otherwise; carrying the history would mean
+     * serialising a `StateField` across two different extension sets, which CodeMirror offers no
+     * way to do.
+     */
+    const shared = [lineNumbers(), EditorView.lineWrapping, history(), keymap.of(historyKeymap)]
     // Long unchanged stretches collapse to a clickable band. Without this a one-line change in
     // a thousand-line file opens on a screen of identical context.
     const collapseUnchanged = { margin: 3, minSize: 4 }

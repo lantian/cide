@@ -17,7 +17,7 @@
  * is a sentence saying so, never a guess.
  */
 import { diagnostics as diagnosticsApi, file as fileApi, type ProjectId } from '@/ipc/client'
-import { requestReveal } from './revealRequest'
+import { jumpTo } from './jump'
 
 /**
  * Put a sentence on screen.
@@ -49,7 +49,7 @@ export function goToDefinition(
       switch (answer.kind) {
         case 'found':
           /*
-           * `requestReveal` **before** `file.open`, which is the design and not a preference.
+           * `jumpTo` **before** `file.open`, which is the design and not a preference.
            *
            * A definition usually lives in a file no pane has open — that is most of what the
            * gesture is for — so the reveal is parked and spent by the mount the open causes.
@@ -58,15 +58,23 @@ export function goToDefinition(
            * search panel's `onOpenHit` use.
            *
            * Awaiting the lookup first is safe: the 10 s reveal TTL starts here, not at the click.
+           *
+           * Through `jumpTo` rather than `requestReveal` directly, so the place the user jumped
+           * *from* is on the Back stack — this is the gesture people most want to undo. No
+           * `endColumn`: `jumpTo` defaults it to `column`, which is a bare caret rather than a
+           * selection, and `revealRange` documents that an empty range collapses to the anchor.
+           * That is what IDEA does on Go to Declaration — it puts you *at* the name. Selecting
+           * would also mean guessing an end from a `Location.range` whose meaning varies by
+           * server.
+           *
+           * The reveal flags are deliberately left alone (no `focus`, no `align`): this gesture
+           * shipped without them, and changing where an existing jump lands is a separate
+           * decision from recording that it happened.
            */
-          requestReveal(answer.path, {
+          jumpTo(project, {
+            path: answer.path,
             line: answer.line,
             column: answer.column,
-            // `endColumn === column` is a bare caret, not a selection — `revealRange` documents
-            // that an empty range collapses to the anchor. That is what IDEA does on Go to
-            // Declaration: it puts you *at* the name, it does not select it. Selecting would also
-            // mean guessing an end from a `Location.range` whose meaning varies by server.
-            endColumn: answer.column,
           })
           /*
            * Deliberately **uncaught**.

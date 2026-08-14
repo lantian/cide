@@ -338,6 +338,65 @@ export function activeItem(
 }
 
 // ---------------------------------------------------------------------------------------
+// Handing focus back
+// ---------------------------------------------------------------------------------------
+
+/**
+ * One step of the focus handoff a closing menu performs.
+ *
+ * * `custom` — the surface's own `restoreFocus`. It may decline (return `false`), which is
+ *   why this is a *chain* and not a single verdict.
+ * * `default` — `previous.focus({ preventScroll: true })` on the element that had focus when
+ *   the menu opened.
+ */
+export type FocusReturnStep = 'custom' | 'default'
+
+/**
+ * What a closing menu should try, in order, to give the keyboard back.
+ *
+ * # Why this is a list and not a verdict
+ *
+ * A surface's `restoreFocus` is allowed to say "not now" — `useCodeMenu`'s returns `false`
+ * when the `EditorView` has already been destroyed, which happens whenever the menu's action
+ * closed the tab it hung off. Collapsing this to a single answer would mean either dropping
+ * the fallback (a window left with focus on `<body>`) or running both unconditionally (the
+ * editor focused, then a stale `.cm-content` focused on top of it). So the caller walks the
+ * chain and stops at the first step that reports success.
+ *
+ * # Why `custom` outranks `default`, and why `default` exists at all
+ *
+ * `default` is a raw DOM `focus()`, and on a CodeMirror surface that is not merely coarse —
+ * it is *wrong*, and the reason is the bug this function was written for. WebKit clears the
+ * document selection on every focus change (`FocusController::setFocusedElement` →
+ * `clearSelectionIfNeeded`), so by the time the menu closes the editor's DOM selection is
+ * gone; `Element::updateFocusAppearance` then sees a root editable element whose frame has no
+ * selection, sets one at `firstPositionInOrBeforeNode(this)` and reveals it. The buffer jumps
+ * to line 1. `preventScroll` suppresses the reveal and *not* the `setSelection` that precedes
+ * it, so the caret is still collapsed to the top and CodeMirror's `DOMObserver` reads it back
+ * into state. Only `EditorView.focus()` — which is `focusPreventScroll` **plus**
+ * `docView.updateSelection()` — restores both, and only the surface can call it.
+ *
+ * # Why a disconnected `previous` is skipped rather than focused
+ *
+ * A menu whose action deleted the row it hung off would otherwise focus a detached node and
+ * leave the window with no focus at all. Doing nothing is better: focus falls to `<body>` and
+ * the next Tab starts from the top rather than from nowhere. `custom` is still offered in that
+ * case, because a surface that rebuilt its DOM under the menu is exactly the surface that knows
+ * where focus should go.
+ */
+export function focusReturnPlan(options: {
+  /** The surface supplied a `restoreFocus`. */
+  readonly hasCustom: boolean
+  /** The element that had focus at open time is still in the document. */
+  readonly previousConnected: boolean
+}): readonly FocusReturnStep[] {
+  const steps: FocusReturnStep[] = []
+  if (options.hasCustom) steps.push('custom')
+  if (options.previousConnected) steps.push('default')
+  return steps
+}
+
+// ---------------------------------------------------------------------------------------
 // Whose menu is this — ours or the webview's
 // ---------------------------------------------------------------------------------------
 

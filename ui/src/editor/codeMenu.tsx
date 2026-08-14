@@ -9,7 +9,16 @@
  *
  * # What is here and what is deliberately not
  *
- * Cut / Copy / Paste, Select all, Find, Go to definition, and *@-mention the selection*.
+ * Undo / Redo, Cut / Copy / Paste, Select all, Find, Go to definition, and *@-mention the
+ * selection*.
+ *
+ * **Undo and Redo were reachable from the keyboard and from nothing else.** `history()` and
+ * `historyKeymap` have been in `EditorSurface` since M9, so Ctrl+Z, Ctrl+Y and Ctrl+Shift+Z all
+ * worked — but there was no command id, no palette row and no menu item, so a user who did not
+ * already know the chord had no way to find out that the buffer even had a history. That is the
+ * milder half of this project's recurring defect (built, and reachable from almost nothing), and
+ * a menu item is the cheapest honest fix: it names the capability, and `undoDepth`/`redoDepth`
+ * let it say *why* it is greyed when there is nothing to undo, which a chord cannot.
  *
  * **Go to definition is live** as of M12's second half, and the promise this header used to make
  * — "the moment an LSP exists this line gets a `run` and nothing else changes" — is what came due.
@@ -24,12 +33,22 @@
  *
  * # Why the commands are CodeMirror's rather than the app's keymap
  *
- * `selectAll` and `openSearchPanel` are dispatched into the view directly. Routing them
- * through the app's command layer would need two new command ids, two default bindings and a
- * `when` clause for "an editor is focused" — and the editor already has all three from
- * `defaultKeymap` and `searchKeymap`. The menu items therefore carry no `command`, so they
- * show no shortcut chip: a chip must come from the live keymap or not at all, and CodeMirror's
- * internal bindings are not in it.
+ * `undo`, `redo`, `selectAll` and `openSearchPanel` are dispatched into the view directly.
+ * Routing them through the app's command layer would need a new command id, a default binding
+ * and a `when` clause for "an editor is focused" apiece — and the editor already has all three
+ * from `defaultKeymap`, `historyKeymap` and `searchKeymap`. The menu items therefore carry no
+ * `command`, so they show no shortcut chip: a chip must come from the live keymap or not at all,
+ * and CodeMirror's internal bindings are not in it.
+ *
+ * For undo specifically the app-command route is not merely redundant, it is a **regression**,
+ * and the reason is written out at length in `cide-core::keymap`'s
+ * `the_editor_undo_chords_are_not_bound_here`: the key gate's second entry point is a *window
+ * capture* listener, so a `ctrl+z` in the Rust table would be consumed before the event reached
+ * CodeMirror, the find field, the commit box or any rename input — and Ctrl+Z in a terminal is
+ * SIGTSTP. A palette row for undo would additionally have to act on a view it cannot reach:
+ * opening the palette moves focus off the buffer, and there is no live-`EditorView` registry to
+ * look one up in. The menu has the view in hand, through the `view()` getter below, which is
+ * exactly why the menu can do this and the palette cannot.
  *
  * *Send lines to Claude* used to be the exception — it carried `command: 'claude.mention.file'`
  * and drew that command's chip. It no longer does, and the reason is worth reading before
@@ -40,7 +59,7 @@
  * a shortcut for a dead command is a worse lie than no chip. See `useSendToClaude.ts`, which
  * binds `Alt-Enter` inside the editor so the keyboard route works without either fix.
  */
-import { selectAll } from '@codemirror/commands'
+import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/commands'
 import { openSearchPanel } from '@codemirror/search'
 import type { EditorView } from '@codemirror/view'
 import { useContextMenu, type ContextMenuHandle, type MenuEntry } from '@/menus'
@@ -116,6 +135,38 @@ export function useCodeMenu({
 
   return useContextMenu({
     label: 'Code',
+    /*
+     * Hand the keyboard back through CodeMirror rather than through the DOM.
+     *
+     * This is the fix for *"right-click, hover the menu, dismiss it — and the buffer is at the
+     * top"*. The hook's default is `previous.focus({ preventScroll: true })`, which is right for
+     * every other surface in the app and is not enough for this one: `preventScroll` maps to
+     * `SelectionRevealMode::DoNotReveal`, so it suppresses WebKit's *reveal* — but the
+     * `setSelection(firstPositionInOrBeforeNode(this))` that `Element::updateFocusAppearance`
+     * performs on a root editable element with no frame selection runs **before** the reveal and
+     * is not suppressed by anything. The caret would still be collapsed to the top of the buffer,
+     * and CodeMirror's `DOMObserver` would read that back into state — a silent caret move
+     * instead of a visible scroll, which is worse.
+     *
+     * `EditorView.focus()` is `focusPreventScroll(contentDOM)` **plus**
+     * `docView.updateSelection()`: it takes the keyboard without scrolling and then writes the
+     * selection back out of CodeMirror's own state, so both halves are restored.
+     *
+     * Returning `false` when the view is gone matters. The menu's action may have closed the tab
+     * it hung off, and `focusReturnPlan` then falls back to the plain DOM step rather than
+     * leaving the window with focus on `<body>`.
+     *
+     * Why the editor and not the read-only diff panes: `EditorView.editable.of(false)` means
+     * `.cm-content` is not a *root editable element*, so `updateFocusAppearance` never takes the
+     * branch that invents a selection. A read-only buffer is the discriminating case — it does
+     * not reproduce the bug, and it does not need this.
+     */
+    restoreFocus: () => {
+      const live = view()
+      if (live === null) return false
+      live.focus()
+      return true
+    },
     items: (): readonly MenuEntry[] => {
       const live = view()
       if (live === null) return []
@@ -129,6 +180,48 @@ export function useCodeMenu({
       const needsSelection = hasSelection ? undefined : 'Select some text first'
 
       return [
+        {
+          id: 'undo',
+          label: 'Undo',
+          /*
+           * `undoDepth` reads the `history()` `StateField`, so it answers *this* buffer and is 0
+           * both when there is nothing to undo and when the field is absent entirely — the honest
+           * answer in both cases, since `undo` refuses in both. Read from `live` at menu-open
+           * time, like every other reason here: `items` runs when the menu opens, and a depth
+           * captured at render time would grey the item against a history two edits old.
+           *
+           * Read-only first, and it is not redundant with the depth. A read-only buffer has a
+           * depth of 0 today, but `EditorState.readOnly` is what `undo` actually checks —
+           * `@codemirror/commands` refuses on that facet before looking at the field — so naming
+           * it keeps the sentence true if such a buffer ever acquires history from a
+           * programmatic dispatch.
+           */
+          disabledReason: readOnly
+            ? 'This buffer is read-only'
+            : undoDepth(live.state) === 0
+              ? 'Nothing to undo yet'
+              : undefined,
+          run: () => {
+            undo(live)
+            // Focus, for the reason Cut and Copy do: the menu took it, and the next Ctrl+Z has
+            // to reach the buffer rather than whatever the menu left behind.
+            live.focus()
+          },
+        },
+        {
+          id: 'redo',
+          label: 'Redo',
+          disabledReason: readOnly
+            ? 'This buffer is read-only'
+            : redoDepth(live.state) === 0
+              ? 'Nothing to redo'
+              : undefined,
+          run: () => {
+            redo(live)
+            live.focus()
+          },
+        },
+        { kind: 'separator' },
         {
           id: 'cut',
           label: 'Cut',

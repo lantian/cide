@@ -577,9 +577,34 @@ fn build() -> Vec<Command> {
         Command::new("structure.file", "File structure…", NAVIGATE)
             .when("editorFocused")
             .keywords(&["outline", "members", "symbols", "popup"]),
+        // Go to line. The `…` says it opens a box, matching "File structure…" above.
+        //
+        // `navigate.line` rather than `goto.line`: the group already spells this family
+        // `navigate.*`, and ids are API — a second prefix for the same idea is one more thing a
+        // user's `keymap.json` has to guess at.
+        Command::new("navigate.line", "Go to line…", NAVIGATE)
+            .when("editorFocused")
+            // "goto" is what a user types, and none of the five scoring tiers reaches "Go to
+            // line…" from it — the space is in the title and not in the needle.
+            .keywords(&["goto", "jump", "line", "number", "column"]),
         Command::new("navigate.definition", "Go to definition", NAVIGATE)
             .when("editorFocused")
             .keywords(&["declaration", "jump", "resolve", "symbol", "source"]),
+        // Back / Forward — the mouse's thumb buttons, and the only two commands in this group
+        // that are *not* `editorFocused`.
+        //
+        // `projectOpen` and nothing narrower, deliberately. The thumb button is pressed wherever
+        // the pointer happens to be, which in a terminal-centric app is most often over a
+        // terminal pane — and a Back that only worked while a buffer had focus would be a Back
+        // that did nothing most of the times it was pressed. The precondition that *is* real —
+        // "there is somewhere to go back to" — is re-checked in the handler, per the rule stated
+        // at the head of this file: a `when` gates the palette and never the keyboard.
+        Command::new("navigate.back", "Back", NAVIGATE)
+            .when("projectOpen")
+            .keywords(&["previous", "jump", "history", "return", "backwards"]),
+        Command::new("navigate.forward", "Forward", NAVIGATE)
+            .when("projectOpen")
+            .keywords(&["next", "jump", "history", "forwards"]),
         Command::new("navigate.nextMember", "Next member declaration", NAVIGATE)
             .when("editorFocused")
             .keywords(&["method", "function", "down"]),
@@ -1116,5 +1141,26 @@ mod tests {
     #[test]
     fn validate_accepts_an_empty_table() {
         assert_eq!(validate_table(&[]), Ok(()));
+    }
+
+    #[test]
+    fn back_and_forward_are_not_scoped_to_an_editor() {
+        for id in ["navigate.back", "navigate.forward"] {
+            let entry = by_id(id).unwrap_or_else(|| panic!("{id} is registered"));
+            assert_eq!(
+                entry.when.as_deref(),
+                Some("projectOpen"),
+                "{id} must not require a focused editor: the thumb button is pressed wherever \
+                 the pointer is, which in this app is most often over a terminal, so \
+                 `editorFocused` would make Back do nothing most of the times it is pressed"
+            );
+            assert!(
+                entry.unavailable.is_none(),
+                "{id} is dispatched, so it must not carry an `unavailable` reason"
+            );
+        }
+        // Both are reachable from the palette by the word a user would type for them.
+        assert!(search("back").iter().any(|c| c.id == "navigate.back"));
+        assert!(search("forward").iter().any(|c| c.id == "navigate.forward"));
     }
 }

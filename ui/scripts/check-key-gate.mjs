@@ -1,5 +1,5 @@
 /**
- * The key gate's unit test: **both entry points resolve every chord identically**.
+ * The key gate's unit test: **every entry point resolves every chord identically**.
  *
  * Without this, someone adds a binding to one path and Ctrl+P works everywhere except
  * terminals — a failure with no error and no symptom until a user types `^P` into a shell
@@ -117,7 +117,7 @@ try {
   )
 
   const require = createRequire(import.meta.url)
-  const { createKeyGate, currentStroke } = require(join(out, 'keys/gate.js'))
+  const { createKeyGate, currentStroke, mouseNavGate } = require(join(out, 'keys/gate.js'))
   const { buildKeymap } = require(join(out, 'keys/keymap.js'))
   const { chipLabel, normalizeSequence, strokeFromEvent } = require(join(out, 'keys/chords.js'))
   const { evaluateWhen } = require(join(out, 'keys/when.js'))
@@ -180,15 +180,84 @@ try {
     // It was missing from this fixture for a whole milestone because `rustDefaults()` above
     // could not see a 3-tuple — see the note there.
     { key: 'ctrl+b', command: 'navigate.definition', when: 'editorFocused' },
+    // Go to line. Scoped for the same reason ⌃B is, and one sharper: `^G` is readline's abort,
+    // so an unconditional binding would take the cancel key of every shell in every pane.
+    // `KeyG` is in the sweep below, so both entry points are held to agreeing about it — and to
+    // *passing it through* in a terminal-focused context, which is the half that matters.
+    { key: 'ctrl+g', command: 'navigate.line', when: 'editorFocused' },
+    // The mouse's thumb buttons, as pseudo-keys. Unscoped, unlike every other M12 binding: a
+    // thumb button is pressed wherever the pointer is, which in this app is most often over a
+    // terminal — and unlike ⌃B or ⌃G there is nothing to take away, since no shell reads GDK
+    // button 8. `mouseback` is also in the sweep below, so the *keyboard* entry points are held
+    // to leaving it alone in every modifier combination: a key named `mouseback` does not exist,
+    // and the day one did it must not resolve here.
+    { key: 'mouseback', command: 'navigate.back', when: null },
+    { key: 'mouseforward', command: 'navigate.forward', when: null },
   ]
 
   /* The fixture is a mirror, so check it against the thing it mirrors before trusting it. */
   {
     const rust = rustDefaults()
     ok(rust.length >= 16, `read ${rust.length} defaults out of keymap.rs — the regex still matches`)
-    for (const { key, command } of rust) {
-      const mirrored = BINDINGS.some((b) => b.key === key && b.command === command)
-      ok(mirrored, `the fixture mirrors cide_core::keymap::defaults(): ${key} → ${command}`)
+    for (const { key, command, when } of rust) {
+      /*
+       * **The `when` is compared, and it was not until a mutation test caught that.**
+       *
+       * Matching on `(key, command)` alone left the scope unmirrored, so deleting `editorFocused`
+       * from a binding in `keymap.rs` — which is what turns ⌃G from Go to line into a chord that
+       * swallows readline's abort in every terminal pane in every window — changed nothing here.
+       * The fixture kept its own copy of the clause and every assertion below kept testing that
+       * copy. Same class as the 3-tuple hole described in `rustDefaults`: not a wrong answer, a
+       * question nobody asked.
+       *
+       * `?? null` on both sides because the two spell "unconditional" differently: the regex
+       * leaves the field absent, the fixture writes `null`.
+       */
+      const mirrored = BINDINGS.some(
+        (b) => b.key === key && b.command === command && (b.when ?? null) === (when ?? null),
+      )
+      ok(
+        mirrored,
+        `the fixture mirrors cide_core::keymap::defaults(): ${key} → ${command}` +
+          `${when === undefined ? '' : ` when ${when}`}`,
+      )
+    }
+
+    /*
+     * **And the other direction, which was missing — a third instance of the same hole.**
+     *
+     * The loop above walks Rust and demands the fixture contain each entry, so a *rename* over
+     * there fails here. A **deletion** did not: the Rust row simply stopped being iterated, the
+     * fixture kept its own copy, and every assertion below carried on testing a binding that no
+     * longer shipped. Found by mutation — removing `mouseback`/`mouseforward` from
+     * `defaults()` left this script green.
+     *
+     * Same shape as the two holes already recorded in `rustDefaults` and beside the `when`
+     * comparison: not a wrong answer, a question nobody asked.
+     *
+     * `EXTRAS` is the deliberate difference. The fixture carries a multi-stroke sequence and two
+     * `when`-gated bindings that the shipped table does not have, because the *gate* must handle
+     * them whether or not anything is bound that way today. Anything else in the fixture with no
+     * Rust counterpart is drift.
+     */
+    const EXTRAS = new Set([
+      'ctrl+k ctrl+s',
+      'ctrl+k ctrl+w',
+      'ctrl+shift+c',
+      'ctrl+e',
+    ])
+    for (const binding of BINDINGS) {
+      if (EXTRAS.has(binding.key)) continue
+      const shipped = rust.some(
+        (b) =>
+          b.key === binding.key &&
+          b.command === binding.command &&
+          (b.when ?? null) === (binding.when ?? null),
+      )
+      ok(
+        shipped,
+        `and mirrors nothing that has been deleted from it: ${binding.key} → ${binding.command}`,
+      )
     }
   }
 
@@ -214,6 +283,16 @@ try {
     // measured claim rather than an assumption about a table.
     { code: 'KeyB', key: 'b' },
     { code: 'KeyV', key: 'v' },
+    // ⌃G is Go to line inside an editor and `^G` — readline's abort — everywhere else, so it is
+    // swept for the same reason ⌃B is.
+    { code: 'KeyG', key: 'g' },
+    // The undo family. Bound by nothing here and asserted so below; sweeping them is what makes
+    // "the gate does not touch them" a measured claim rather than an assumption about a table.
+    { code: 'KeyZ', key: 'z' },
+    { code: 'KeyY', key: 'y' },
+    { code: 'KeyU', key: 'u' },
+    // F3 is find-next inside CodeMirror, in the buffer and in the find field both. Unbound here.
+    { code: 'F3', key: 'F3' },
     { code: 'Digit1', key: '1' },
     { code: 'ArrowUp', key: 'ArrowUp' },
     { code: 'ArrowDown', key: 'ArrowDown' },
@@ -359,6 +438,151 @@ try {
     }
   }
   ok(compared === CONTEXTS.length * KEYS.length * 16, 'swept the whole modifier × key space')
+
+  let mouseSwept = 0
+
+  /* ------------------------------------ entry point 3: the mouse's thumb buttons (M12) */
+
+  /*
+   * The gate grew a third entry point, and the whole premise of this script is that entry
+   * points do not get to have their own opinions.
+   *
+   * The mouse buttons cannot arrive as `KeyboardEvent`s — WebKitGTK flattens GDK buttons 8 and 9
+   * to `button === 0` before the DOM sees them, which is why they come from Rust as an event and
+   * enter the gate as a *token* rather than as a stroke to be parsed. So the comparison cannot
+   * be "the same event through three functions"; it is "the same stroke string through the
+   * resolver, reached three ways". What is pinned here is that the token the mouse handler
+   * builds is the token the keymap is indexed by — an off-by-one in modifier *order* would make
+   * `ctrl+mouseback` resolve to nothing, silently, for ever.
+   */
+  {
+    // `eq` compares with `Object.is`, which is right for the strings and booleans everything
+    // above asserts on and useless for a dispatch log. One local helper rather than widening
+    // the shared one, so nothing already green changes meaning.
+    const same = (actual, expected, what) => {
+      const a = JSON.stringify(actual)
+      const b = JSON.stringify(expected)
+      if (a !== b) fail(what, `actual:   ${a}\n  expected: ${b}`)
+    }
+    let mouseCompared = 0
+    // Published so the summary line can say how much of the sweep was the mouse's.
+
+    for (const ctx of CONTEXTS) {
+      for (const button of ['mouseback', 'mouseforward']) {
+        for (let bits = 0; bits < 16; bits++) {
+          const mods = {
+            ctrl: (bits & 1) !== 0,
+            alt: (bits & 2) !== 0,
+            shift: (bits & 4) !== 0,
+            meta: (bits & 8) !== 0,
+          }
+          const label = `${JSON.stringify(mods)} ${button} in ${JSON.stringify(ctx)}`
+          const bare = bits === 0
+
+          const viaMouse = makeGate(ctx)
+          const decision = viaMouse.gate.mouseHandler(button, mods)
+
+          // The stroke the gate says it resolved is the one the keymap would be indexed by.
+          // `normalizeSequence` is the function `buildKeymap` runs over every binding's key, so
+          // comparing against it is comparing against the index itself.
+          const spelled = [
+            mods.ctrl ? 'ctrl+' : '',
+            mods.alt ? 'alt+' : '',
+            mods.shift ? 'shift+' : '',
+            mods.meta ? 'meta+' : '',
+            button,
+          ].join('')
+          eq(
+            decision.sequence,
+            normalizeSequence(spelled),
+            `the mouse handler spells the stroke the way the keymap is indexed: ${label}`,
+          )
+
+          if (bare) {
+            eq(decision.command, button === 'mouseback' ? 'navigate.back' : 'navigate.forward',
+              `a bare thumb press dispatches, in every context: ${label}`)
+            eq(decision.passThrough, false, `and is consumed: ${label}`)
+            eq(viaMouse.dispatched.length, 1, `exactly once: ${label}`)
+          } else {
+            // Nothing is bound with modifiers, so a modified press must fall through rather
+            // than being quietly eaten — the same rule an unbound chord gets.
+            eq(decision.command, null, `a modified thumb press is not the bare binding: ${label}`)
+            eq(decision.passThrough, true, `and is not swallowed: ${label}`)
+          }
+
+          mouseCompared += 1
+        }
+      }
+    }
+    ok(
+      mouseCompared === CONTEXTS.length * 2 * 16,
+      `swept both thumb buttons across every modifier and context (${mouseCompared})`,
+    )
+    mouseSwept = mouseCompared
+
+    /*
+     * **No real keystroke can spell a thumb button.**
+     *
+     * The token spaces are deliberately *shared* — that is the whole trick, and it is what lets
+     * a user write `{"key":"mouseback",...}` in `keymap.json` and get modifiers, `when` clauses
+     * and unbinding for free. The safety property is therefore not "the vocabularies are
+     * disjoint" (a `KeyboardEvent` carrying `key: 'mouseback'` would resolve, and asserting
+     * otherwise would be asserting something false); it is that **nothing a keyboard can
+     * produce lands on one**. `strokeFromEvent` is the only thing that turns a physical key into
+     * a token, so that is what is checked, over the whole swept key space.
+     */
+    for (const spec of KEYS) {
+      for (let bits = 0; bits < 16; bits++) {
+        const mods = {
+          ctrl: (bits & 1) !== 0,
+          alt: (bits & 2) !== 0,
+          shift: (bits & 4) !== 0,
+          meta: (bits & 8) !== 0,
+        }
+        const stroke = strokeFromEvent({
+          code: spec.code,
+          key: spec.key,
+          ctrlKey: mods.ctrl,
+          altKey: mods.alt,
+          shiftKey: mods.shift,
+          metaKey: mods.meta,
+        })
+        ok(
+          stroke === null || (!stroke.endsWith('mouseback') && !stroke.endsWith('mouseforward')),
+          `no keystroke spells a thumb button: ${spec.code} → ${stroke}`,
+        )
+      }
+    }
+
+    /*
+     * The prefix machine sees the mouse the same way it sees a key.
+     *
+     * With `ctrl+k` armed, a thumb press extends the sequence, completes nothing, is swallowed
+     * and disarms — which is the rule `resolveStroke` applies to any unbound second stroke. The
+     * alternative (a mouse handler that bypassed the prefix state) would leave `ctrl+k` armed
+     * and eat the user's *next* keystroke, in a terminal, with no trace of why.
+     */
+    const armed = makeGate({})
+    armed.gate.windowHandler(event({ code: 'KeyK', key: 'k', ctrl: true }))
+    eq(armed.gate.pending(), 'ctrl+k', 'the prefix is armed')
+    const after = armed.gate.mouseHandler('mouseback')
+    eq(after.sequence, 'ctrl+k mouseback', 'a thumb press extends the armed prefix')
+    eq(after.command, null, 'completes nothing')
+    eq(after.passThrough, false, 'is swallowed anyway')
+    eq(armed.gate.pending(), null, 'and disarms')
+    same(armed.dispatched, [], 'nothing was dispatched by the pair')
+
+    /*
+     * A press with no gate installed. `mouseNavGate` is a module-level stable reference handed
+     * to a Tauri listener that resolves a tick late, so it can genuinely be called after the
+     * window's gate has been torn down.
+     */
+    same(
+      mouseNavGate('mouseback'),
+      { passThrough: true, command: null, sequence: null },
+      'with no gate installed a thumb press passes through rather than throwing',
+    )
+  }
 
   /* Multi-stroke sequences, both entry points, stroke by stroke. */
   for (const sequence of [
@@ -599,17 +823,43 @@ try {
    * `the_terminal_clipboard_chords_are_not_bound_here` says the same thing on the Rust side;
    * this is the half that also proves the *gate* does nothing with them.
    */
+  /*
+   * …and so do **Ctrl+Z, Ctrl+Y, Ctrl+Shift+Z, Ctrl+U, Alt+U and F3**, for the same reason
+   * spelled a different way.
+   *
+   * Those five are `@codemirror/commands`' `historyKeymap` and `@codemirror/search`'s find-next,
+   * and they work in a buffer today *because* `cide_core::keymap` is silent about them. Binding
+   * one here would not add a capability, it would remove several: the window listener runs in the
+   * capture phase, so Ctrl+Z would stop reaching CodeMirror, the find field beside it, the commit
+   * message box, every rename field in the file tree and every plain `<input>` in the app — all
+   * of which have working native undo precisely because nothing intercepts the chord. And in a
+   * terminal pane Ctrl+Z is **SIGTSTP**, the only keyboard way to suspend a foreground job.
+   *
+   * `cide_core::keymap`'s `the_editor_undo_chords_are_not_bound_here` and
+   * `nothing_binds_the_find_bars_f_keys` say the same thing on the Rust side; this is the half
+   * that also proves the *gate* does nothing with them, at both entry points, in every context.
+   *
+   * Ctrl+G is deliberately **not** in this list: it *is* bound, to `navigate.line`, and the
+   * comment on that binding names what it costs (find-next moves to F3, which is why F3 is here).
+   */
   {
-    for (const key of ['ctrl+c', 'ctrl+v']) {
+    for (const key of ['ctrl+c', 'ctrl+v', 'ctrl+z', 'ctrl+y', 'ctrl+shift+z', 'ctrl+u', 'alt+u', 'f3', 'shift+f3']) {
       ok(
         !rustDefaults().some((b) => b.key === key),
-        `${key} is bound by no default — the terminal owns it, focus-scoped`,
+        `${key} is bound by no default — the terminal or CodeMirror owns it, focus-scoped`,
       )
     }
     for (const ctx of CONTEXTS) {
       for (const spec of [
         { code: 'KeyC', key: 'c', ctrl: true },
         { code: 'KeyV', key: 'v', ctrl: true },
+        { code: 'KeyZ', key: 'z', ctrl: true },
+        { code: 'KeyY', key: 'y', ctrl: true },
+        { code: 'KeyZ', key: 'z', ctrl: true, shift: true },
+        { code: 'KeyU', key: 'u', ctrl: true },
+        { code: 'KeyU', key: 'u', alt: true },
+        { code: 'F3', key: 'F3' },
+        { code: 'F3', key: 'F3', shift: true },
       ]) {
         const w = makeGate(ctx)
         const t = makeGate(ctx)
@@ -625,6 +875,29 @@ try {
         eq(w.dispatched.length + t.dispatched.length, 0, 'and runs no command on either path')
       }
     }
+  }
+
+  /*
+   * **Ctrl+G opens Go to line in an editor and reaches the shell everywhere else.**
+   *
+   * The `when` is the whole of this binding's safety. `^G` is readline's `abort` and emacs'
+   * universal cancel, so an unscoped `ctrl+g` would be swallowed by the window capture listener
+   * in every terminal pane in every window — the same failure the `ctrl+b`/tmux comment in
+   * `keymap.rs` describes, on a chord people press far more often. The sweep above already proves
+   * the two entry points agree about it; this pins *which way* they agree in each context, which
+   * a sweep for agreement alone cannot.
+   */
+  {
+    const spec = { code: 'KeyG', key: 'g', ctrl: true }
+    const editor = makeGate({ editorFocused: true })
+    eq(editor.gate.windowHandler(event(spec)), false, 'ctrl+g is claimed with an editor focused')
+    eq(editor.dispatched[0]?.command, 'navigate.line', 'and it opens Go to line')
+
+    const term = makeGate({ terminalFocused: true })
+    const ev = event(spec)
+    eq(term.gate.terminalHandler(ev), true, 'ctrl+g reaches the pty with a terminal focused')
+    eq(ev.prevented, 0, 'and keeps its default action — ^G is readline abort')
+    eq(term.dispatched.length, 0, 'nothing ran')
   }
 
   // One event object seen by both entry points dispatches once, not twice.
@@ -869,8 +1142,9 @@ try {
     process.exit(1)
   }
   console.log(
-    `check-key-gate: ok (${compared + capturedCompared} chords through both entry points, ` +
-      `${capturedCompared} of them with a switcher walk open)`,
+    `check-key-gate: ok (${compared + capturedCompared} chords through the keyboard entry ` +
+      `points, ${capturedCompared} of them with a switcher walk open; ${mouseSwept} thumb-button ` +
+      'presses through the third)',
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

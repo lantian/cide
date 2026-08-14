@@ -348,6 +348,11 @@ const KEY_GLYPHS: Readonly<Record<string, string>> = {
   backquote: '`',
   plus: '+',
   multiply: '*',
+  // The mouse's thumb buttons, which the keymap carries as pseudo-keys — see
+  // `cide_core::keymap::defaults`. Without these the palette's chip would print the raw token
+  // `mouseback`, which is a spelling only this codebase uses. `Mouse ←` says what to press.
+  mouseback: 'Mouse ←',
+  mouseforward: 'Mouse →',
 }
 
 /** Render a binding key as the palette's chip text, e.g. `ctrl+shift+p` → `⌃⇧P`. */

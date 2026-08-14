@@ -78,15 +78,48 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
     )
   }, [at, entries])
 
-  // The menu takes focus so the arrows are its own. Item 0 is *not* pre-selected: a menu that
-  // opens with a destructive line highlighted is one stray Enter from doing it.
+  /*
+   * The menu takes focus so the arrows are its own. Item 0 is *not* pre-selected: a menu that
+   * opens with a destructive line highlighted is one stray Enter from doing it.
+   *
+   * # Why this is keyed on the placement and was dead before
+   *
+   * It used to be `useLayoutEffect(() => { box.current?.focus() }, [])`, which is a **no-op**,
+   * and the whole keyboard model went with it. Both layout effects run in the same commit, so
+   * this one fired before React had flushed the `setPlacement` above — the box still carried
+   * `styles.measuring`, which is `visibility: hidden`, and WebKit refuses focus on it
+   * (`Element::focus` → `isProgramaticallyFocusable` → `hasFocusableStyle`, which requires
+   * `Visibility::Visible`). Measured against this app's own React and CSS, not reasoned about:
+   * `activeElement` stayed `BODY`, and the only thing that ever moved focus into the menu was
+   * hovering an item. So `onKeyDown` below — Escape, the arrows, Home/End, Tab, Enter — was
+   * reachable from nothing until the pointer touched a line, and a menu opened from the
+   * keyboard (Shift+F10, the Menu key) could not be driven at all.
+   *
+   * `placement === null` as the dependency, not `placement`: re-measuring on a moved anchor
+   * must not yank focus back off an item the user has already arrowed to.
+   *
+   * `preventScroll` for the same reason `useContextMenu`'s `close` passes it — this focus
+   * change is what *causes* WebKit to clear the document selection, and a portalled box at the
+   * far corner of the window is exactly the element the browser would otherwise scroll an
+   * ancestor to bring into view.
+   */
   useLayoutEffect(() => {
-    box.current?.focus()
-  }, [])
+    if (placement === null) return
+    box.current?.focus({ preventScroll: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [placement === null])
 
   useEffect(() => {
     if (active === null) return
-    items.current.get(active)?.focus()
+    // `preventScroll`, and the menu is the one surface where that is not merely hygiene: the
+    // box is `overflow-y: auto` under a computed `maxHeight`, so arrowing to an item below the
+    // fold scrolls it — and the `scroll` capture listener below would then dismiss the menu
+    // under the user's own ArrowDown. The scroller is moved deliberately instead, by
+    // `scrollIntoView` with the block alignment a menu wants.
+    const item = items.current.get(active)
+    if (item === undefined) return
+    item.focus({ preventScroll: true })
+    item.scrollIntoView({ block: 'nearest' })
   }, [active])
 
   const run = useCallback(
@@ -113,20 +146,36 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
    * detached windows.
    */
   useEffect(() => {
-    const onPointerDown = (ev: PointerEvent) => {
+    const inside = (target: EventTarget | null): boolean => {
       const el = box.current
-      if (el !== null && ev.target instanceof Node && el.contains(ev.target)) return
+      return el !== null && target instanceof Node && el.contains(target)
+    }
+    const onPointerDown = (ev: PointerEvent) => {
+      if (inside(ev.target)) return
+      onClose()
+    }
+    /*
+     * The menu's *own* scrolling is not "the thing this menu was about has moved".
+     *
+     * `.menu` is `overflow-y: auto` under a computed `maxHeight`, so a long menu — the git
+     * changes one is the long one — scrolls internally, and a `scroll` listener in capture on
+     * `window` sees that too (scroll does not bubble, which is why the listener is in capture
+     * in the first place). Without this, arrowing or wheeling inside a clipped menu dismisses
+     * it: the box scrolls, the listener fires, and the menu vanishes under the pointer.
+     */
+    const onScroll = (ev: Event) => {
+      if (inside(ev.target)) return
       onClose()
     }
     // `true`: a pane that stops propagation on its own pointerdown must not be able to trap
     // a menu open, and scroll does not bubble from an inner container at all.
     window.addEventListener('pointerdown', onPointerDown, true)
-    window.addEventListener('scroll', onClose, true)
+    window.addEventListener('scroll', onScroll, true)
     window.addEventListener('resize', onClose)
     window.addEventListener('blur', onClose)
     return () => {
       window.removeEventListener('pointerdown', onPointerDown, true)
-      window.removeEventListener('scroll', onClose, true)
+      window.removeEventListener('scroll', onScroll, true)
       window.removeEventListener('resize', onClose)
       window.removeEventListener('blur', onClose)
     }

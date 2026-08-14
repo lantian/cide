@@ -11,6 +11,9 @@ pub mod git;
 pub mod headless;
 pub mod ids;
 pub mod keymap;
+/// Per-file view memory. Its own module, and deliberately not part of [`workspace`] — the
+/// header of `positions.rs` says why at length.
+pub mod positions;
 pub mod settings;
 pub mod settings_ops;
 pub mod workspace;
@@ -18,6 +21,7 @@ pub mod workspace;
 pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
+pub use positions::ViewPosition;
 pub use settings::{
     ClaudeSettings, DEFAULT_CODE_FONT_SIZE, EditorSettings, GraphicsSettings, HighlightLevel,
     InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MIN_CODE_FONT_SIZE,

@@ -171,6 +171,44 @@ pub fn defaults() -> Vec<Binding> {
         // `claude.split.newSession`, and the two normalise to different keys).
         ("ctrl+f12", "structure.file"),
         ("ctrl+alt+shift+n", "picker.symbols"),
+        // The mouse's thumb buttons, as keys. (M12)
+        //
+        // # Why they are in the keymap at all
+        //
+        // They are not keys and they are bound here anyway, because the alternative is a second
+        // place where input is turned into a command. `ui/src/keys/gate.ts` has *one* resolver
+        // with two entry points that `check-key-gate.mjs` holds to the same answer for every
+        // chord; a mouse handler that named a command directly would be a third path with its
+        // own copy of the prefix machine, the `when` evaluation and the dispatch. Instead the
+        // Rust side names a *button* — exactly as xterm's handler names a keystroke — and the
+        // gate resolves it through the same table.
+        //
+        // Both parsers already accept any key token (`parse_stroke` here validates modifiers
+        // only, and `ui/src/keys/chords.ts::parseStroke` does the same), so this needs no parser
+        // change and the user gets the whole keymap vocabulary for free: modifiers compose
+        // (`ctrl+mouseback`), a rebind is one line of `keymap.json`
+        // (`{"key":"mouseback","command":"navigate.definition"}`), and so is an unbind
+        // (`{"key":"mouseback","command":"-navigate.back"}`).
+        //
+        // # Why they carry no `when`
+        //
+        // Unlike every other M12 binding these are *not* `editorFocused`. A thumb button is
+        // pressed wherever the pointer is, which in this app is most often over a terminal, and
+        // there is nothing to take away: buttons 8 and 9 reach no pty and no shell reads them.
+        // The one precondition that matters — somewhere to go back to — cannot be a context flag
+        // and is re-checked in `keys/dispatch.ts`.
+        //
+        // # Why no keyboard chord is bound to these
+        //
+        // IDEA's Ctrl+Alt+Left/Right is not free here: `ctrl+alt+right` is already
+        // `pane.split.right` above, and on KDE both are commonly the compositor's
+        // virtual-desktop shortcuts and never reach the app. `alt+left`/`alt+right` are
+        // word-motion in readline and would be taken from every terminal in every window by the
+        // window capture listener. `ctrl+alt+shift+left`/`right` are free in every layer and are
+        // what a user should add if they want them — `README.md` prints the two lines. Shipping
+        // an unbound pair rather than guessing is the same trade `file.saveAll` already makes.
+        ("mouseback", "navigate.back"),
+        ("mouseforward", "navigate.forward"),
     ]
     .into_iter()
     .map(|(key, command)| Binding::new(key, command))
@@ -210,6 +248,36 @@ pub fn defaults() -> Vec<Binding> {
             // On macOS `platform_layer` rewrites this to ⌘B, which is IDEA's mac binding for the
             // same action — correct by luck rather than by exception, but correct.
             ("ctrl+b", "navigate.definition", "editorFocused"),
+            // Go to line, on IDEA's and VS Code's chord for it.
+            //
+            // # What it costs, named rather than discovered later
+            //
+            // Ctrl+G is not free *inside CodeMirror*: `@codemirror/search`'s `searchKeymap` binds
+            // `Mod-g` to find-next. It is free everywhere else — nothing in this table uses `g`,
+            // and xterm claims nothing — so the collision is entirely with the editor, and the
+            // gate resolves before CodeMirror is offered the event, so find-next on this chord
+            // goes.
+            //
+            // What survives is the point: `F3` and `Shift-F3` are find-next and find-previous in
+            // `searchKeymap` too, both unbound here (`nothing_binds_the_find_bars_f_keys` keeps
+            // them that way), and `ctrl+shift+g` normalises to a different stroke so
+            // find-previous keeps that one as well. So the asymmetry this introduces, stated
+            // plainly, is: **find-previous still answers Ctrl+Shift+G, find-next only F3.** That
+            // trade is worth making because Ctrl+G is Go to line in both editors this keymap
+            // follows, and because the same change made F3 work in the find field, where it had
+            // never worked at all.
+            //
+            // Scoped to `editorFocused` for the reason spelled out for `ctrl+b` above, and it is
+            // sharper here: `^G` is readline's `abort` and emacs' universal cancel, so an
+            // unscoped binding would take the escape key of every shell running in every terminal
+            // pane in every window, for a command that needs a caret to mean anything.
+            //
+            // On macOS `platform_layer` rewrites this to ⌘G mechanically. That is a *divergence*
+            // rather than a lucky landing, and it is worth knowing which: IDEA-on-mac puts Go to
+            // line on ⌘L and find-next on ⌘G. Left as the blanket rewrite produces it — a
+            // platform exception here would need a matching one in `keeps_ctrl_on_macos` and
+            // would be the only entry in that list not justified by the OS eating the chord.
+            ("ctrl+g", "navigate.line", "editorFocused"),
         ]
         .into_iter()
         .map(|(key, command, when)| Binding::new(key, command).when(when)),
@@ -637,6 +705,70 @@ mod tests {
         }
     }
 
+    /// **Undo and redo are CodeMirror's, and must never become the keymap's.**
+    ///
+    /// The same argument as [`the_terminal_clipboard_chords_are_not_bound_here`] above, arriving
+    /// through a different door. `@codemirror/commands`' `historyKeymap` already binds `Mod-z`,
+    /// `Mod-y`, `Ctrl-Shift-z` (its Linux spelling for redo), `Mod-u` and `Alt-u`, and
+    /// `EditorSurface` installs it — so all of these work in a buffer today *because* this table
+    /// is silent about them.
+    ///
+    /// Adding one here would not add a capability, it would remove five. The key gate's second
+    /// entry point is a window **capture** listener (`ui/src/keys/gate.ts`), so a binding is
+    /// consumed before the event reaches its target: Ctrl+Z would stop reaching CodeMirror, the
+    /// find field beside it, the commit message box, every rename field in the file tree and
+    /// every plain `<input>` in the app, all of which have working native undo precisely because
+    /// nothing intercepts it. And in a terminal pane Ctrl+Z is **SIGTSTP** — a binding here
+    /// silently removes the only keyboard way to suspend a foreground job.
+    ///
+    /// A `when: "editorFocused"` clause does not rescue it. That flag is derived from the focused
+    /// *pane kind* (`ui/src/keys/context.ts`), so it stays true while the caret sits in the find
+    /// bar inside that pane — which is one of the inputs the binding would break.
+    ///
+    /// `ui/scripts/check-key-gate.mjs` proves the other half, that the gate passes these strokes
+    /// through at both entry points in every context.
+    #[test]
+    fn the_editor_undo_chords_are_not_bound_here() {
+        for binding in defaults().into_iter().chain(platform_defaults()) {
+            let key = normalize_key(&binding.key);
+            assert!(
+                !matches!(
+                    key.as_str(),
+                    "ctrl+z" | "ctrl+y" | "ctrl+shift+z" | "ctrl+u" | "alt+u"
+                ),
+                "{key} is bound to {} — undo/redo belong to CodeMirror's historyKeymap, and a \
+                 binding here is swallowed by the window capture gate before any text surface \
+                 sees it (ctrl+z in a terminal is SIGTSTP)",
+                binding.command
+            );
+        }
+    }
+
+    /// **F3 and Shift+F3 stay unbound, because they are the find bar's only surviving chord.**
+    ///
+    /// `@codemirror/search`'s `searchKeymap` binds `F3`/`Shift-F3` to find-next/find-previous
+    /// with `scope: "editor search-panel"`, and `ui/src/editor/find.ts` installs it whole and
+    /// bridges the panel's own keydown into that scope. A binding here would be consumed by the
+    /// window capture gate in *both* contexts at once — the buffer and the find field — and the
+    /// bar would be left with Enter and the two arrow buttons.
+    ///
+    /// This matters more since `ctrl+g` became `navigate.line` below. `searchKeymap` also binds
+    /// `Mod-g` to find-next, and that spelling is now swallowed inside an editor, so F3 is not a
+    /// convenience — it is what find-next has left. The comment on the `ctrl+g` binding states
+    /// the same trade from the other end; this is the half a compiler can check.
+    #[test]
+    fn nothing_binds_the_find_bars_f_keys() {
+        for binding in defaults().into_iter().chain(platform_defaults()) {
+            let key = normalize_key(&binding.key);
+            assert!(
+                key != "f3" && key != "shift+f3",
+                "{key} is bound to {} — F3 is find-next inside the editor, and the window \
+                 capture gate would take it from the buffer and the find field together",
+                binding.command
+            );
+        }
+    }
+
     #[test]
     fn spellings_of_one_keystroke_all_normalise_alike() {
         let canonical = normalize_key("ctrl+shift+p");
@@ -1030,6 +1162,104 @@ mod tests {
             ["theme.toggle"],
             "and it must not take the neighbouring chord with it"
         );
+    }
+
+    /// Ctrl+G goes to a line, and the escape hatch the README offers for it actually works —
+    /// **including the `when`, which is the half a user will leave out.**
+    ///
+    /// The binding costs something real: `@codemirror/search` binds `Mod-g` to find-next, and the
+    /// gate resolves before CodeMirror is offered the event, so inside an editor that stops
+    /// working. The justification for making the trade anyway is that one line of
+    /// `~/.config/cide/keymap.json` takes it back, and an escape hatch nobody exercises is a
+    /// claim rather than a feature — the same reasoning as
+    /// [`ctrl_t_pulls_and_can_be_given_back_to_the_terminal`] above.
+    ///
+    /// The sharp edge is `when`. Removal matches on (key, command, `when`), so the unscoped
+    /// removal a user would write first matches *nothing* and the chord stays bound — with a
+    /// `RemovalMatchedNothing` diagnostic and no visible change. Both halves are asserted here so
+    /// the README cannot document the wrong line.
+    #[test]
+    fn ctrl_g_goes_to_a_line_and_can_be_given_back_to_codemirror() {
+        let shipped = resolve(&[]);
+        assert_eq!(command_for(&shipped, "ctrl+g"), ["navigate.line"]);
+        // The neighbouring chord is a *different* stroke, so find-previous survives untouched —
+        // which is the asymmetry the binding's own comment names.
+        assert!(command_for(&shipped, "ctrl+shift+g").is_empty());
+
+        let scoped = resolve(&[Binding::new("ctrl+g", "-navigate.line").when("editorFocused")]);
+        assert!(
+            command_for(&scoped, "ctrl+g").is_empty(),
+            "the documented one-liner has to actually give Mod-g back to the editor"
+        );
+
+        let unscoped = resolve(&[Binding::new("ctrl+g", "-navigate.line")]);
+        assert_eq!(
+            command_for(&unscoped, "ctrl+g"),
+            ["navigate.line"],
+            "a removal that forgets the `when` matches nothing — the README must not print it"
+        );
+        let (_, diags) = resolve_with_diagnostics(&[Binding::new("ctrl+g", "-navigate.line")]);
+        assert!(
+            diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::RemovalMatchedNothing { command, .. } if command == "navigate.line"
+            )),
+            "and the user is told, rather than left with a line that looks right: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn the_thumb_buttons_are_bound_here_like_any_other_key() {
+        let shipped = resolve(&[]);
+        assert_eq!(command_for(&shipped, "mouseback"), ["navigate.back"]);
+        assert_eq!(command_for(&shipped, "mouseforward"), ["navigate.forward"]);
+
+        // Unconditional, unlike every other M12 binding. A thumb button is pressed wherever the
+        // pointer is — in this app, most often over a terminal — and unlike ⌃B or ⌃G there is
+        // nothing to take away: no shell reads GDK button 8.
+        for binding in defaults() {
+            if binding.key.contains("mouse") {
+                assert_eq!(
+                    binding.when, None,
+                    "{} must stay unscoped, or Back does nothing wherever the pointer usually is",
+                    binding.key
+                );
+            }
+        }
+
+        // The whole point of routing the mouse through the keymap: a user can rebind or unbind
+        // it with one line, exactly as for a chord. No `when`, so no `when` on the removal
+        // either — the trap `ctrl_g_goes_to_a_line_and_can_be_given_back_to_codemirror` pins.
+        let unbound = resolve(&[Binding::new("mouseback", "-navigate.back")]);
+        assert!(command_for(&unbound, "mouseback").is_empty());
+        let rebound = resolve(&[Binding::new("mouseback", "navigate.definition")]);
+        assert_eq!(
+            command_for(&rebound, "mouseback"),
+            ["navigate.definition"],
+            "a rebind shadows the default rather than failing to parse"
+        );
+
+        // `parse_stroke` validates modifiers only, so a token that is not a key name needs no
+        // parser change — and `ctrl+mouseback` is a legal thing for a user to write.
+        let chord = parse_chord("ctrl+mouseback").expect("a modified thumb press parses");
+        assert_eq!(chord.len(), 1);
+        assert_eq!(chord[0].key, "mouseback");
+        assert!(chord[0].ctrl);
+        assert_eq!(normalize_key("Ctrl+MouseBack"), "ctrl+mouseback");
+    }
+
+    #[test]
+    fn the_macos_layer_leaves_the_thumb_buttons_alone() {
+        // They carry no `ctrl`, so `ctrl_to_meta` has nothing to rewrite — asserted rather than
+        // assumed, because a blanket rewrite that produced `meta+mouseback` would leave macOS
+        // with two bindings for one button and no way to tell which fired.
+        let mac = platform_layer(true);
+        assert!(
+            !mac.iter().any(|b| b.key.contains("mouse")),
+            "the macOS layer must not touch a button that has no ctrl to rewrite: {mac:?}"
+        );
+        let resolved = resolve_layers(&mac, &[]);
+        assert_eq!(command_for(&resolved, "mouseback"), ["navigate.back"]);
     }
 
     #[test]

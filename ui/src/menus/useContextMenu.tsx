@@ -26,6 +26,7 @@ import { ContextMenu } from './ContextMenu'
 import { menuLifetime } from './menuState'
 import {
   anchorToRect,
+  focusReturnPlan,
   isEmptyMenu,
   resolveMenu,
   type MenuEntry,
@@ -54,6 +55,41 @@ export interface UseContextMenuOptions {
    * from a fixture, or from a surface that deliberately shows a different map.
    */
   readonly keymap?: Pick<Keymap, 'chipFor'> | null | undefined
+  /**
+   * Hand the keyboard back this surface's own way. Return `true` when it was taken.
+   *
+   * # The bug this exists for
+   *
+   * *"Right-click in the editor, move the pointer over the menu, close it — the buffer jumps
+   * to the top."* The whole chain is WebKit's and none of it is ours:
+   *
+   * 1. A right-click leaves `.cm-content` as `document.activeElement` — WebKit focuses the
+   *    first mouse-focusable ancestor on **any** mousedown, button 2 included
+   *    (`EventHandler::dispatchMouseEvent`). So `returnTo` below is the editor's content DOM.
+   * 2. Hovering an item focuses that `<button>`, and WebKit *clears the document selection* on
+   *    every focus change: `FocusController::setFocusedElement` calls `clearSelectionIfNeeded`,
+   *    whose contentEditable escape hatch needs `!mousePressNode->canStartSelection()` — and
+   *    the node the right-click landed on is editable, so `canStartSelection()` is true and the
+   *    clear happens.
+   * 3. `previous.focus()` on the way out therefore runs `Element::updateFocusAppearance` on a
+   *    root editable element whose frame has *no* selection, which sets one at the start of the
+   *    element and calls `revealSelection`. `.cm-scroller` goes to 0.
+   *
+   * Without the hover, focus never left `.cm-content`, `Element::focus` hits its refocus early
+   * return and nothing happens at all — which is exactly the asymmetry that was reported.
+   *
+   * `preventScroll` (which [`close`] now always passes) kills step 3's *reveal* and not the
+   * `setSelection` before it, so the caret is still collapsed to the top of the buffer and
+   * CodeMirror's `DOMObserver` will read that back into state. Fixing both halves needs
+   * `EditorView.focus()`, which no generic hook can call — hence this escape hatch. See
+   * `focusReturnPlan`, which owns the ordering.
+   *
+   * *The option that lost:* cloning the DOM `Range` at open time and re-adding it in `close`.
+   * Generic, with no per-surface hook — but CodeMirror's viewport may have re-rendered the
+   * nodes the range points at, and it feeds the `DOMObserver` a `selectionchange` CodeMirror
+   * did not cause.
+   */
+  readonly restoreFocus?: ((previous: HTMLElement | null) => boolean) | undefined
 }
 
 export interface ContextMenuHandle {
@@ -92,21 +128,33 @@ interface OpenMenu {
 }
 
 export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandle {
-  const { label, items, keymap } = options
+  const { label, items, keymap, restoreFocus } = options
   const windowKeymap = useWindowKeymap()
   const chipFor = (keymap ?? windowKeymap).chipFor
 
   const [open, setOpen] = useState<OpenMenu | null>(null)
   /** Where focus was when the menu opened, so it can be handed back. */
   const returnTo = useRef<HTMLElement | null>(null)
+  // In a ref so `close`'s identity does not change when a caller rebuilds the callback every
+  // render — `close` is a dependency of the dismissal effect in `ContextMenu`, and a new
+  // identity per render would tear that effect's four listeners down and put them back on
+  // every keystroke the surface handles.
+  const restoreCb = useRef(restoreFocus)
+  restoreCb.current = restoreFocus
 
   const close = useCallback(() => {
     /*
-     * Focus goes back where it came from, and only if that element is still in the document
-     * — a menu whose action deleted the row it hung off would otherwise focus a detached
-     * node and leave the window with no focus at all. When it is gone, doing nothing is
-     * right: focus falls to `<body>` and the next Tab starts from the top rather than from
-     * nowhere.
+     * Give the keyboard back, by whatever route the surface has.
+     *
+     * The order and the fallback are `focusReturnPlan`'s, in `model.ts`, where a check script
+     * can run them — that is not ceremony, it is the lesson this project has now paid for
+     * three times: a rule that lives in a hook is in the one place no check can compile.
+     *
+     * `preventScroll` on the default step is the fix for the reported jump, and the whole
+     * explanation is on `UseContextMenuOptions.restoreFocus`. Short version: WebKit's
+     * `Element::updateFocusAppearance` *reveals* the selection it just invented for a root
+     * editable element, and `preventScroll` maps to `SelectionRevealMode::DoNotReveal`, which
+     * suppresses both that reveal and `scheduleScrollToFocusedElement` for every other surface.
      *
      * Outside the `setOpen` updater on purpose. An updater is called twice under StrictMode
      * and may be replayed by React at will, so it is the wrong place for a DOM side effect;
@@ -116,7 +164,19 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
     const previous = returnTo.current
     returnTo.current = null
     setOpen(null)
-    if (previous !== null && previous.isConnected) previous.focus()
+    const custom = restoreCb.current
+    const plan = focusReturnPlan({
+      hasCustom: custom !== undefined,
+      previousConnected: previous !== null && previous.isConnected,
+    })
+    for (const step of plan) {
+      if (step === 'custom') {
+        if (custom?.(previous) === true) return
+        continue
+      }
+      previous?.focus({ preventScroll: true })
+      return
+    }
   }, [])
 
   const openAt = useCallback(

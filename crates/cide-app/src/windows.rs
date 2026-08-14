@@ -14,6 +14,7 @@ use cide_ipc::{SessionId, Theme, WindowLabel};
 use tauri::window::Color;
 use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
+use crate::emit;
 use crate::workspace_state::WorkspaceState;
 
 /// `--bg` for each theme, as `tokens.css` defines it.
@@ -258,8 +259,209 @@ pub fn create(
         let _ = window.set_size(LogicalSize::new(width, height));
     }
 
+    // Every window, shell and detached alike: the thumb buttons have to be swallowed even in a
+    // window that has nothing to navigate, or the phantom left click described below survives
+    // in exactly the windows nobody thought to test.
+    install_mouse_nav(app, &window);
+
     Ok(window)
 }
+
+/// GDK's number for the mouse's "back" thumb button.
+///
+/// X11 delivers the thumb buttons as 8 and 9, and GTK3's Wayland backend produces the same
+/// numbers — `pointer_handle_button` in `gdk/wayland/gdkdevice-wayland.c` computes
+/// `button - BTN_LEFT + 1 + 3`, so `BTN_SIDE` is 8 and `BTN_EXTRA` is 9. The same values on
+/// both backends is what keeps this independent of ADR 0006's graphics ladder.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const GDK_BUTTON_BACK: u32 = 8;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const GDK_BUTTON_FORWARD: u32 = 9;
+
+/// Route the mouse's thumb buttons into the key gate, and stop them reaching the web process.
+///
+/// # Why this is in GTK and not in JavaScript
+///
+/// It cannot be in JavaScript. WebKitGTK's `buttonForEvent` maps GDK buttons 1, 2 and 3 and
+/// leaves everything else at `WebMouseEventButton::None`, and `MouseEvent`'s constructor turns
+/// `None` into `Left` — so both thumb buttons arrive in the DOM as an ordinary `button === 0`
+/// press, indistinguishable from each other and from a real click. Back and Forward cannot be
+/// told apart there at all.
+///
+/// That also means there is a **phantom left click today, before any of this**: a thumb press
+/// over terminal output already reaches `pathLinks.ts` (Ctrl+thumb-press opens the file under
+/// the pointer), over a buffer it already fires Go to definition, and a plain press starts a
+/// selection. Returning `Propagation::Stop` below is what removes it.
+///
+/// # Why the handler goes on the webview widget rather than the toplevel
+///
+/// `webkitWebViewBaseButtonPressEvent` has no button filter and returns `GDK_EVENT_STOP` for
+/// every press, so the event never propagates up to the GTK window — a handler on
+/// `gtk_window()` would never see one. Connecting to the WebKitWebView widget itself works
+/// because GTK3 declares `button-press-event` `G_SIGNAL_RUN_LAST`: a normally-connected handler
+/// runs *before* the class closure, so stopping here means the web process is never told.
+///
+/// # Not `with_webview`
+///
+/// That route needs the `webkit2gtk` crate. `Cargo.toml` pins `gtk` to exactly what tauri pins
+/// precisely so this stays a `gtk::Widget` problem — a second version of either crate forks the
+/// webview stack — so the widget is found by walking the container tree and matching the type
+/// name.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn install_mouse_nav(app: &AppHandle, window: &WebviewWindow) {
+    let handle = app.clone();
+    let label = window.label().to_owned();
+    let window = window.clone();
+    // On the GTK thread, because that is where widgets may be touched at all. The same shape
+    // `cmd::project::show_folder_picker` uses, and for the same reason.
+    let queued = app.run_on_main_thread(move || {
+        use gtk::prelude::*;
+
+        let Some(webview) = gtk_window_webview(&window) else {
+            // Survivable and worth a line: the thumb buttons simply do nothing, which is what
+            // they did before this existed. Silently degrading is what would make a WebKitGTK
+            // rename look like a mouse problem.
+            tracing::warn!(window = %label, "no WebKitWebView widget; mouse back/forward is off");
+            return;
+        };
+
+        // A positive line, not only the failure above. Whether the widget walk found its target
+        // is the one thing about this feature no check script can reach, and "the warning did not
+        // appear" is a weaker thing to read in a log than "it installed".
+        tracing::debug!(window = %label, "mouse back/forward handler installed");
+
+        let probe = std::env::var_os("CIDE_INPUT_PROBE").is_some();
+        let press_app = handle.clone();
+        let press_label = label.clone();
+        webview.connect_button_press_event(move |_, event| {
+            let button = event.button();
+            if probe {
+                tracing::info!(
+                    button,
+                    event_type = ?event.event_type(),
+                    "CIDE_INPUT_PROBE: gdk button press"
+                );
+            }
+            let Some(name) = nav_button(button) else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            /*
+             * Double and triple presses are swallowed and *not* acted on.
+             *
+             * GDK emits `ButtonPress`, `2ButtonPress`, `ButtonPress`, `3ButtonPress` for a
+             * triple press, so treating every press event as a step would walk three entries for
+             * two physical clicks. WebKit peeks ahead for the same reason
+             * (`WebKitWebViewBase.cpp`). Swallowing them is still required: an unhandled
+             * `2ButtonPress` would reach the web process as yet another phantom left click.
+             */
+            if event.event_type() == gtk::gdk::EventType::ButtonPress {
+                let state = event.state();
+                emit::mouse_nav(
+                    &press_app,
+                    &press_label,
+                    name,
+                    (
+                        state.contains(gtk::gdk::ModifierType::CONTROL_MASK),
+                        state.contains(gtk::gdk::ModifierType::MOD1_MASK),
+                        state.contains(gtk::gdk::ModifierType::SHIFT_MASK),
+                        state.contains(gtk::gdk::ModifierType::SUPER_MASK),
+                    ),
+                );
+            }
+            gtk::glib::Propagation::Stop
+        });
+
+        // The release too. A mouseup with no matching mousedown leaves WebKit's event handler
+        // believing a drag is in progress — which is how a swallowed press turns into a
+        // selection that will not let go.
+        webview.connect_button_release_event(move |_, event| {
+            if nav_button(event.button()).is_none() {
+                return gtk::glib::Propagation::Proceed;
+            }
+            gtk::glib::Propagation::Stop
+        });
+    });
+    if let Err(error) = queued {
+        tracing::warn!(%error, "could not install the mouse back/forward handler");
+    }
+}
+
+/// The key token for a GDK button number, or `None` for a button we do not claim.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn nav_button(button: u32) -> Option<&'static str> {
+    match button {
+        GDK_BUTTON_BACK => Some("mouseback"),
+        GDK_BUTTON_FORWARD => Some("mouseforward"),
+        _ => None,
+    }
+}
+
+/// Find the `WebKitWebView` inside a window's widget tree.
+///
+/// By type name rather than by downcast, because the concrete type lives in the `webkit2gtk`
+/// crate this crate deliberately does not depend on. A depth-first walk: tauri nests the
+/// webview inside a `GtkBox` inside the `GtkApplicationWindow`, and that nesting is an
+/// implementation detail of a dependency, so nothing here assumes a depth.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn gtk_window_webview(window: &WebviewWindow) -> Option<gtk::Widget> {
+    use gtk::glib::object::ObjectExt;
+    use gtk::prelude::*;
+
+    fn find(widget: &gtk::Widget) -> Option<gtk::Widget> {
+        if widget.type_().name() == "WebKitWebView" {
+            return Some(widget.clone());
+        }
+        let container = widget.downcast_ref::<gtk::Container>()?;
+        container.children().iter().find_map(find)
+    }
+
+    find(window.gtk_window().ok()?.upcast_ref::<gtk::Widget>())
+}
+
+/// Nothing to install off the GTK platforms.
+///
+/// A stub rather than a `cfg` at the call site, so [`create`] reads the same on every target and
+/// a Windows or macOS build cannot silently lose the call. Both platforms deliver the thumb
+/// buttons to the DOM as `button` 3 and 4 with no mangling, so when either becomes a target the
+/// answer there is a listener in `ui/src/keys/`, not this.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn install_mouse_nav(_app: &AppHandle, _window: &WebviewWindow) {}
 
 /// Destroy the OS window called `label`, if it exists.
 ///

@@ -637,6 +637,41 @@ pub async fn file_write(path: String, text: String) -> Result<()> {
     blocking(move || document::write(&PathBuf::from(path), &text)).await
 }
 
+/// Remember where the user is in a file. (M12)
+///
+/// **Deliberately infallible and deliberately not a workspace mutation.** Nothing here can fail
+/// in a way the caller could act on — the state is a `Mutex<Vec<_>>` and the disk write happens
+/// later, on the store's own debounce — and a scroll gesture that could reject would be a
+/// scroll gesture that can raise a dialog. Compare `tab_set_dirty` above, which goes through
+/// `WorkspaceState::update` and therefore bumps `rev` and broadcasts the whole tree to every
+/// window: correct for a dirty dot, ruinous for something the editor reports as the user
+/// scrolls. `positions_state.rs` has the whole ladder.
+///
+/// `touched_at` is filled in on this side, whatever the caller sent: it is the eviction key,
+/// and a renderer's clock is not something the store should trust to order its own LRU.
+#[tauri::command(rename_all = "camelCase")]
+pub fn file_note_position(
+    positions: State<'_, std::sync::Arc<crate::positions_state::PositionsState>>,
+    at: cide_ipc::ViewPosition,
+) {
+    positions.note(at);
+}
+
+/// Where the user last was in `path`, or `null`.
+///
+/// Answered from Rust rather than from a per-webview cache, and that is the point: a detached
+/// pane window is a separate JS realm with its own module instances, and two windows showing
+/// one file must not race two private copies of its position. Rust owning it is also what makes
+/// the memory survive a relaunch, which is the half of the report that a module-level map
+/// cannot reach at all.
+#[tauri::command(rename_all = "camelCase")]
+pub fn file_position(
+    positions: State<'_, std::sync::Arc<crate::positions_state::PositionsState>>,
+    path: String,
+) -> Option<cide_ipc::ViewPosition> {
+    positions.get(Path::new(&path))
+}
+
 /// Run a fallible blocking job on the pool, reporting a lost worker as an IO error.
 ///
 /// The join can only fail if the task panicked or the runtime is shutting down. Neither is

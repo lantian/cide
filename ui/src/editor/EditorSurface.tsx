@@ -53,7 +53,9 @@ import { minimap } from './minimap'
 import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import { exceedsBytes } from './byteSize'
-import { registerReveal, revealRange } from './revealRequest'
+import { pendingReveals, planReveal, registerReveal } from './revealRequest'
+import { planRestore, type FileView } from './position'
+import { viewTracker } from './viewTracker'
 import {
   claimStatusReadout,
   formatReadout,
@@ -196,6 +198,28 @@ export interface EditorSurfaceProps {
    * one.
    */
   highlight?: 'none' | 'syntax' | 'all' | undefined
+  /**
+   * Where the user was last time this file was on screen. (M12)
+   *
+   * Applied once, in the dispatch that follows construction, and only when no explicit
+   * navigation is parked for this path — `planRestore` owns that rule and says why.
+   *
+   * Read through a ref and **deliberately not a dependency of the build effect**: this value's
+   * whole life cycle is that the pane fetches it, hands it down, and then the editor starts
+   * *producing* newer ones through [`onView`]. A prop that both feeds the effect and is
+   * refreshed by it would rebuild the `EditorView` — losing scrollback, undo history and any
+   * unsaved edits — every time the user scrolled.
+   */
+  at?: FileView | null | undefined
+  /**
+   * The buffer's view moved: the caret, the first visible line, or both. (M12)
+   *
+   * Fires at most once an animation frame, and only when the answer actually changed — see
+   * `viewTracker.ts`. **The caller must debounce before it does anything expensive**, the same
+   * contract [`onSelection`] carries and for the same reason; `EditorPane` trailing-debounces
+   * this at 500 ms and flushes it on unmount.
+   */
+  onView?: ((at: FileView) => void) | undefined
 }
 
 /** `Ln 128, Col 24`, one-based in both, which is what every editor and every stack trace uses. */
@@ -221,6 +245,8 @@ export function EditorSurface({
   symbols,
   diagnostics,
   highlight = 'all',
+  at,
+  onView,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -243,6 +269,24 @@ export function EditorSurface({
   saveHandleCb.current = onSaveHandle
   const docChangedCb = useRef(onDocChanged)
   docChangedCb.current = onDocChanged
+  const viewCb = useRef(onView)
+  viewCb.current = onView
+  const atRef = useRef(at)
+  atRef.current = at
+  /**
+   * The most recent view this component itself observed, whatever the props say.
+   *
+   * This is what makes *reload from disk* keep the user's place, and it is the one part of this
+   * feature where the obvious implementation is quietly wrong. `EditorPane` bumps `reloadKey`
+   * when the agent edits the open file, the build effect re-runs, and the new `EditorView` has
+   * to be restored from *where the user was a moment ago* — not from the `at` prop, which was
+   * fetched when the tab opened, and not from the Rust store, which holds whatever the 500 ms
+   * debounce last managed to send. Both of those are stale by exactly the amount the user has
+   * scrolled since, which on a file they are actively reading is all of it.
+   *
+   * Guarded on the path so a *different* file does not inherit this one's line number.
+   */
+  const observedRef = useRef<FileView | null>(null)
 
   /*
    * The right-click menu. Reads the view through a getter rather than being handed it, because
@@ -463,6 +507,19 @@ export function EditorSurface({
       syntaxHighlighting(cideHighlightStyle),
       findExtensions(),
       minimap(),
+      /*
+       * Per-file view memory's producer. Beside `minimap()` because it watches the same thing
+       * for the same reason — a scroll is not reliably a `ViewUpdate` — and the two carry the
+       * same note.
+       *
+       * Both destinations in one place: the ref that survives a reload of *this* buffer, and
+       * the callback the pane debounces into Rust. Two subscribers on the update listener would
+       * be two things to keep in step, and the ref is the one that must never be skipped.
+       */
+      viewTracker(path, (seen) => {
+        observedRef.current = seen
+        viewCb.current?.(seen)
+      }),
       indentUnit.of('    '),
       EditorState.tabSize.of(4),
       languageSlot.of([]),
@@ -516,7 +573,10 @@ export function EditorSurface({
             const head = update.state.selection.main.head
             const at = update.state.doc.lineAt(head)
             const column = head - at.from + 1
-            caret?.set(at.number, column)
+            // `doc.lines` is a field on the rope, not a walk — the same integer the readout's
+            // `Ln x, Col y` is already computed beside, so Go to line's "past the end of this
+            // file" note costs nothing on the per-keystroke path.
+            caret?.set(at.number, column, update.state.doc.lines)
             /*
              * `src/main.rs › impl Parser › parse`.
              *
@@ -601,6 +661,90 @@ export function EditorSurface({
     // question — *which editor is the user in* — and a caret slot outliving its buffer would
     // send Ctrl+F12 to a file that is no longer on screen.
     caret = claimCaret(path)
+    /*
+     * Seed the real numbers immediately, because nothing else will until the user types.
+     *
+     * `claimCaret` opens at `{line: 1, column: 1, lines: 1}` and the only writer is the update
+     * listener's `selectionSet || docChanged` branch — and constructing a view produces no
+     * update at all. So a file opened and never touched reported *one line*, and Go to line,
+     * whose only feedback is that count, told the user "Past the end — this file has 1 line"
+     * about a nine-hundred-line file. The jump itself was right, which is what made it read as
+     * the popup lying rather than as a bug.
+     *
+     * After the restore below would be wrong: this runs before it, so the line count is correct
+     * from the first frame and the restore's own selection dispatch updates the position.
+     */
+    caret.set(
+      view.state.doc.lineAt(view.state.selection.main.head).number,
+      view.state.selection.main.head - view.state.doc.lineAt(view.state.selection.main.head).from + 1,
+      view.state.doc.lines,
+    )
+
+    /*
+     * Put the user back where they were.
+     *
+     * # Where the position comes from, in order
+     *
+     * `observedRef` first — this component's own last observation, which is the only source
+     * that is current on a reload from disk (see the ref's comment). The `at` prop second,
+     * which is what Rust remembered from a previous session or a previously closed tab.
+     *
+     * # Why this is a dispatch and not `EditorState.create({ selection })`
+     *
+     * The selection could go into the initial state, and the scroll could not: `scrollIntoView`
+     * is an *effect*, and effects need a view to be dispatched into. Doing half of it one way
+     * and half the other would be two mechanisms for one restore. One dispatch also means one
+     * undo-history entry boundary and one `update`, which is what the tracker above sees.
+     *
+     * `scrollIntoView: true` is deliberately **not** set on this transaction. That flag scrolls
+     * the *selection* into view, minimally, and would fight the explicit `y: 'start'` effect —
+     * the same collision `planReveal`'s `center` branch documents below.
+     *
+     * # Why it is before `registerReveal`, and why that is not left to line order
+     *
+     * An explicit navigation outranks a remembered position: Go to definition into a file the
+     * user had scrolled must land on the definition, not where they were last week. Running the
+     * restore first and the reveal second gets that for free — but "for free" here means "until
+     * someone swaps two statements", so the rule is also *stated* and enforced, in
+     * `planRestore`, which refuses outright while a request is parked for this path.
+     */
+    {
+      const remembered =
+        observedRef.current?.path === path ? observedRef.current : (atRef.current ?? null)
+      const plan = planRestore(remembered, view.state.doc.lines, pendingReveals().includes(path))
+      if (plan !== null) {
+        try {
+          const target = view.state.doc.line(plan.line)
+          // `Math.min` against `line.to`: `clampView` bounds the *line*, and a column past the
+          // end of a line that has since been shortened would still be past the end of the
+          // document's idea of that line. Same rule as `revealRange`.
+          const anchor = Math.min(target.from + plan.column - 1, target.to)
+          view.dispatch({
+            selection: EditorSelection.cursor(anchor),
+            /*
+             * `yMargin: 0`, and it is not cosmetic — it is the fix for a **cumulative** drift.
+             *
+             * `scrollIntoView`'s default margin is 5px, so `y: 'start'` puts the recorded line
+             * five pixels *below* the top of the viewport and the tracker's hit test at the top
+             * pixel lands on the line above. Measured, not reasoned about: seeding
+             * `positions.json` with `topLine: 200`, launching and reading the file back gave
+             * 199 — and it would have given 198 the launch after that, creeping a line per
+             * relaunch. `firstFullyVisible` covers the same class of error from the other side.
+             */
+            effects: EditorView.scrollIntoView(view.state.doc.line(plan.topLine).from, {
+              y: 'start',
+              yMargin: 0,
+            }),
+          })
+        } catch (error) {
+          // Wrapped for the reason `registerReveal`'s handler is: this runs inside an effect
+          // with no error boundary above it, and an exception escaping here unmounts the React
+          // root and takes every terminal in the window with it. `planRestore` clamps, so this
+          // is for what the clamp cannot foresee.
+          console.error('[cide] could not restore the last view of this file', error)
+        }
+      }
+    }
 
     /*
      * "Open this file at this line", from a click in the search results.
@@ -610,11 +754,20 @@ export function EditorSurface({
      * made while nothing was mounted is parked and spent by this call — see
      * `revealRequest.ts`, which is where the whole of that reasoning lives.
      *
-     * The editor is deliberately **not** focused. A single click on a result opens the file
-     * (`clickSemantics.ts`), and pulling focus out of the results list on every click would
-     * end the ArrowDown/Enter walk the panel supports after exactly one hit. The selection
-     * and the active-line tint are both painted while unfocused — see the `.cm-activeLine`
-     * note in `EditorSurface.module.css` — so the place is shown without taking the keyboard.
+     * The editor is focused **only when the request asks for it**, and the default is not to.
+     * A single click on a result opens the file (`clickSemantics.ts`), and pulling focus out of
+     * the results list on every click would end the ArrowDown/Enter walk the panel supports
+     * after exactly one hit. The selection and the active-line tint are both painted while
+     * unfocused — see the `.cm-activeLine` note in `EditorSurface.module.css` — so the place is
+     * shown without taking the keyboard.
+     *
+     * That reasoning is right for a click and was silently wrong for everything else. Go to
+     * line, the File Structure popup and Go to symbol all accept with `closeOverlay()`, which
+     * unmounts the card whose `<input>` held focus — so `activeElement` falls to `<body>`, this
+     * handler moved the caret without claiming it, and the `updateListener` above only re-takes
+     * the readout on `update.view.hasFocus`, which is false. The caret moved and the keyboard
+     * did not follow it. `RevealTarget.focus` is where that decision now lives, on the request
+     * rather than here, because only the caller knows which of the two gestures it is.
      *
      * The clamp inside `revealRange` is what keeps this from throwing; the guard is for what
      * it cannot foresee. This runs inside the sidebar's click handler, which has no error
@@ -623,10 +776,23 @@ export function EditorSurface({
      */
     const stopReveal = registerReveal(path, (target) => {
       try {
+        // Every decision is `planReveal`'s, so this handler holds only the two things a headless
+        // check could not run anyway: the dispatch and the focus call.
+        const plan = planReveal(view.state.doc, target)
         view.dispatch({
-          selection: EditorSelection.create([revealRange(view.state.doc, target)]),
-          scrollIntoView: true,
+          selection: EditorSelection.create([plan.range]),
+          /*
+           * `scrollIntoView: true` is CodeMirror's minimal scroll; `'center'` is an explicit
+           * effect. They are alternatives rather than additions — passing both would queue two
+           * scrolls for one dispatch, and the minimal one runs second and undoes the centring.
+           */
+          ...(plan.center
+            ? { effects: EditorView.scrollIntoView(plan.range.from, { y: 'center' }) }
+            : { scrollIntoView: true }),
         })
+        // After the dispatch, not before: `focus()` scrolls the caret into view on its own in
+        // some browsers, and doing it first would fight the alignment chosen above.
+        if (plan.focus && !view.hasFocus) view.focus()
       } catch (error) {
         console.error('[cide] the editor could not reveal that position', error)
       }
