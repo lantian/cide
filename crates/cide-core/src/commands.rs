@@ -445,13 +445,36 @@ fn build() -> Vec<Command> {
         Command::new("claude.fork", "Fork session into new pane", CLAUDE).when("claudePaneFocused"),
         Command::new("claude.mirror", "Mirror session into new pane", CLAUDE)
             .when("claudePaneFocused"),
-        Command::new("claude.restart", "Restart Claude session", CLAUDE)
-            .when("claudePaneFocused")
-            // A restart is kill-then-respawn, and only the pane can respawn: `TerminalPane`
-            // spawns once on mount and `paneHosts` caches the session id for the life of the
-            // host, so killing from here leaves an exit marker and no way back. Killing alone
-            // would be a *stop* command wearing the word restart.
-            .unavailable("needs a respawn path in the pane host; kill alone is not a restart"),
+        /*
+         * Restart and resume, and why there are two of them.
+         *
+         * `claude.restart` carried `.unavailable("needs a respawn path in the pane host; kill
+         * alone is not a restart")` — accurate at the time: only `TerminalPane` knows a pane's
+         * geometry and holds the terminal a new child must attach to, so a command layer that
+         * could only kill would have been a *stop* command wearing the word restart. The pane
+         * publishes the respawn now (`ui/src/panes/paneRestart.ts`), so both of these run.
+         *
+         * They are separate ids rather than one command with an argument because **ids are
+         * API**: a user's `keymap.json` names them and they are never renamed, so splitting one
+         * later would leave an existing binding meaning whichever half we happened to pick.
+         * Fresh and resume are also genuinely different acts — one starts an empty conversation,
+         * the other hands the old `SessionId` back to `claude --resume`, which keeps it, so the
+         * pane's binding and the project's primary session do not move.
+         *
+         * Neither is bound by default; a restart is not a per-minute gesture, and the pane's own
+         * bar is where a user with a dead terminal is actually looking.
+         */
+        Command::new("claude.restart", "Restart Claude session", CLAUDE).when("claudePaneFocused"),
+        // Whether a transcript still exists is a fact about the disk — a file under
+        // `~/.claude/projects` — so no clause can claim it. The handler asks `session_resumable`
+        // and says so when the answer is no, which is the rule this table's header states about
+        // preconditions the webview cannot evaluate.
+        Command::new(
+            "claude.resume",
+            "Resume Claude session in this pane",
+            CLAUDE,
+        )
+        .when("claudePaneFocused"),
         // The exception to the rule above, and the reason the rule is not a blanket one: you
         // mention the file you are *looking at*, which means an editor has focus and a Claude
         // pane by definition does not. `claudeTarget` is "this project has a Claude pane to

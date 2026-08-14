@@ -47,7 +47,30 @@ function rustDefaults() {
   if (start < 0) throw new Error(`could not find defaults() in ${path}`)
   const end = source.indexOf('\n}', start)
   const body = source.slice(start, end)
-  return [...body.matchAll(/\("([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({ key: m[1], command: m[2] }))
+  /*
+   * **Three-tuples as well as two, and this was a real hole rather than tidiness.**
+   *
+   * `defaults()` grew a `.chain(...)` block of `(key, command, when)` entries in M12, and the
+   * two-tuple regex below cannot see them at all — so `ctrl+b → navigate.definition` was in the
+   * shipped table, absent from the fixture below, and invisible to the "every bound key reaches
+   * a dispatcher" loop at the foot of this file. A binding whose command nothing dispatches
+   * swallows the keystroke and does nothing, which is precisely what that loop exists to catch,
+   * and "the regex did not match it" is the quietest way for a gate to fail. `check-commands.mjs`
+   * had already been taught the same lesson and carries the same pair of patterns.
+   */
+  const two = [...body.matchAll(/\("([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({
+    key: m[1],
+    command: m[2],
+  }))
+  const three = [...body.matchAll(/\("([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({
+    key: m[1],
+    command: m[2],
+    when: m[3],
+  }))
+  if (three.length === 0) {
+    throw new Error('no `when`-carrying default binding matched — the 3-tuple regex has broken')
+  }
+  return [...two, ...three]
 }
 
 const out = mkdtempSync(join(tmpdir(), 'cide-keys-'))
@@ -149,6 +172,14 @@ try {
     { key: 'ctrl+alt+shift+n', command: 'picker.symbols', when: null },
     { key: 'alt+down', command: 'navigate.nextMember', when: 'editorFocused' },
     { key: 'alt+up', command: 'navigate.prevMember', when: 'editorFocused' },
+    // Go to Declaration. Scoped, and the scope is load-bearing: unconditional, the window
+    // capture listener would swallow ⌃B in every terminal pane, which is `tmux`'s prefix key.
+    // `KeyB` is in the sweep below, so both entry points are held to agreeing about it in a
+    // terminal-focused context as well as an editor-focused one.
+    //
+    // It was missing from this fixture for a whole milestone because `rustDefaults()` above
+    // could not see a 3-tuple — see the note there.
+    { key: 'ctrl+b', command: 'navigate.definition', when: 'editorFocused' },
   ]
 
   /* The fixture is a mirror, so check it against the thing it mirrors before trusting it. */
@@ -177,6 +208,12 @@ try {
     { code: 'KeyJ', key: 'j' },
     { code: 'KeyL', key: 'l' },
     { code: 'KeyA', key: 'a' },
+    // ⌃B is `tmux`'s prefix and is bound here only inside an editor, and ⌃C/⌃V are bound
+    // nowhere at all — the terminal resolves those two itself, focus-scoped, in
+    // `src/terminal/keys.ts`. All three are swept so that "the gate does not touch them" is a
+    // measured claim rather than an assumption about a table.
+    { code: 'KeyB', key: 'b' },
+    { code: 'KeyV', key: 'v' },
     { code: 'Digit1', key: '1' },
     { code: 'ArrowUp', key: 'ArrowUp' },
     { code: 'ArrowDown', key: 'ArrowDown' },
@@ -548,6 +585,46 @@ try {
     eq(through, false, 'ctrl+p is swallowed before the PTY')
     eq(t.dispatched.length, 1, 'ctrl+p dispatched exactly one command')
     eq(t.dispatched[0]?.command, 'picker.files', 'ctrl+p ran picker.files')
+  }
+
+  /*
+   * **Ctrl+C and Ctrl+V pass through the gate, on both paths, in every context.**
+   *
+   * They are the terminal's own — resolved in `src/terminal/keys.ts` from xterm's custom key
+   * handler, which is the app's only focus-scoped keyboard entry point — and binding them here
+   * instead is the obvious-looking way to implement copy and paste and is silently catastrophic:
+   * the window listener runs in the capture phase, so the chord would be taken from the file
+   * tree's own clipboard, from the commit box, from every rename field and from every text input
+   * in the app, and Ctrl+C would stop being the interrupt in every pane. `cide_core::keymap`'s
+   * `the_terminal_clipboard_chords_are_not_bound_here` says the same thing on the Rust side;
+   * this is the half that also proves the *gate* does nothing with them.
+   */
+  {
+    for (const key of ['ctrl+c', 'ctrl+v']) {
+      ok(
+        !rustDefaults().some((b) => b.key === key),
+        `${key} is bound by no default — the terminal owns it, focus-scoped`,
+      )
+    }
+    for (const ctx of CONTEXTS) {
+      for (const spec of [
+        { code: 'KeyC', key: 'c', ctrl: true },
+        { code: 'KeyV', key: 'v', ctrl: true },
+      ]) {
+        const w = makeGate(ctx)
+        const t = makeGate(ctx)
+        const evW = event(spec)
+        eq(w.gate.windowHandler(evW), true, `${spec.key} passes the window entry in ${JSON.stringify(ctx)}`)
+        eq(evW.stopped, 0, 'and is not stopped before its target — a text input still gets it')
+        eq(evW.prevented, 0, 'and keeps its default action, which is what a text input pastes from')
+        eq(
+          t.gate.terminalHandler(event(spec)),
+          true,
+          `${spec.key} reaches xterm in ${JSON.stringify(ctx)} — where ETX and the clipboard rule live`,
+        )
+        eq(w.dispatched.length + t.dispatched.length, 0, 'and runs no command on either path')
+      }
+    }
   }
 
   // One event object seen by both entry points dispatches once, not twice.

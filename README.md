@@ -303,6 +303,45 @@ On relaunch, `app_restore_plan` marks each pane `Resumable` or `Fresh`, and exac
 per project `eager` — its primary session. Every other Claude pane shows a resume splash and
 spawns when asked, so reopening a six-pane project does not silently start six agents.
 
+## Opening a file a pane printed, including one outside the project
+
+Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the
+producer named. The bytes a pane prints are attacker-influenced by definition — a build log, a
+tool result, an agent's transcript — so `terminal_open_path` is the one command in the app whose
+path argument is untrusted, and it is the only route from a pane to the tab list.
+
+Four guards sit on that path and they answer four different questions. Only one of them is about
+the project boundary:
+
+| guard | concern | can the user overrule it? |
+| --- | --- | --- |
+| absolute, no `..` | integrity — a path that resolves differently depending on who resolves it | no |
+| inside a root (textually, then again after `canonicalize`) | confidentiality — any readable file on the machine | **yes, per click, by name** |
+| a regular file | liveness — a FIFO parks a blocking-pool worker in `read_to_end` for ever; `/dev/zero` reports length 0 and is read until the process is OOM-killed | no |
+| under the editor's size limit | junk — a 2 GB log becomes a tab and then an error | no |
+
+The second one is a **question**, not a verdict: the refusal comes back carrying the canonical
+path, a confirmation names it in full — and names the symlink target too, when the link resolves
+somewhere else — and the answer that goes back to Rust is *that path*, not a boolean, so an
+approval is an approval of a file rather than of a string. There is no "don't ask again": one
+approval becoming a standing capability for every later line naming a sibling file is the thing
+the gate exists to prevent, and the second line is written by whoever wrote the first.
+
+A path is only offered as a link if it is really there. In-project candidates are answered from
+the file index at no syscall cost; out-of-project ones get a real `stat` through `fs_stat_paths`,
+because a linker error names `/usr/bin/ld`, `/dev/null` and half a dozen `.so`s, and underlining
+all of them is how an underline stops meaning "cide can open this". **A relative path never
+becomes an out-of-project candidate** — resolving `../../.ssh/id_rsa` against the pane's cwd
+would produce a real private key from six characters on screen — so the property the
+confirmation rests on holds: the full path was printed, and the user could read it before
+clicking.
+
+What such a tab then does: the status bar shows the whole absolute path (`pathTrail` falls back
+to it), Ctrl+F12 and the member walk work, save works, and *Reveal in Files* says there is no row
+rather than doing nothing. Diagnostics are the ragged edge — an out-of-project `.rs` is still
+routed to the project's rust-analyzer by extension, which answers "file not included in module
+tree" or nothing at all.
+
 ## The pane audit
 
 The host registry is the one piece of this application that cannot be verified by reading

@@ -6,12 +6,17 @@
  * same pane, shown somewhere else. A second rendering of it is how the two drift, and the
  * drift shows up as a pane that behaves differently depending on which window it is in.
  *
- * Nothing here spawns. The pane arrives carrying `pane.session`, `TerminalPane` adopts that
- * binding instead of spawning, and the bytes come from the Rust screen mirror, which is fed
- * whether or not anything is attached. A detached window that spawned its own child would
- * leave the original running with nobody watching it — for a Claude pane, a duplicated
- * conversation and a doubled bill. The guard below is that rule made load-bearing rather
- * than assumed.
+ * Nothing here spawns *while the app is running*. The pane arrives carrying `pane.session`,
+ * `TerminalPane` adopts that binding instead of spawning, and the bytes come from the Rust
+ * screen mirror, which is fed whether or not anything is attached. A detached window that
+ * spawned its own child would leave the original running with nobody watching it — for a Claude
+ * pane, a duplicated conversation and a doubled bill. The guard below is that rule made
+ * load-bearing rather than assumed.
+ *
+ * After a **restart** it is the other way round and always was: this window is rebuilt from
+ * `workspace.json` before any process exists, so the id it arrives with names a child that died
+ * with the previous run and there is nothing to adopt. That is what `restore` is for, and its
+ * absence here is what made every torn-out pane come back saying `— no such session —`.
  *
  * The terminal itself does not travel: each Tauri window is a separate webview and a
  * separate JavaScript realm, so this window builds its own xterm against the same
@@ -21,11 +26,24 @@ import type { ReactNode } from 'react'
 import { WindowFrame } from '@/chrome/WindowFrame'
 import { PaneFrame } from '@/layout/PaneTitleBar'
 import { TerminalPane } from '@/panes/TerminalPane'
-import type { Pane } from '@/ipc/client'
+import type { Pane, PaneRestore } from '@/ipc/client'
+import { detachedContent } from './detachedPane'
 import styles from './DetachedPaneWindow.module.css'
 
 export interface DetachedPaneWindowProps {
   pane: Pane
+  /**
+   * Record the session this pane bound, exactly as the shell window does.
+   *
+   * Omitting it is not a smaller version of the shell's behaviour, it is a leak. A pane that
+   * respawns here — which is what the restart affordance does after a double Ctrl+C — mints a
+   * new `SessionId`, and with nothing to report it the workspace goes on naming the child that
+   * died. Re-docking then restores the dead id, so the pane comes back showing a session that
+   * does not exist while the live `claude` belongs to no pane at all and survives until quit.
+   *
+   * Optional because the audit driver mounts this window without a workspace to write back to.
+   */
+  onSessionBound?: ((session: string) => void) | undefined
   /** The project's primary root, passed through to the pane unchanged. */
   cwd: string
   /**
@@ -44,27 +62,20 @@ export interface DetachedPaneWindowProps {
    */
   roots?: readonly string[] | undefined
   onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
+  /**
+   * This pane's entry in the launch plan, when the workspace was restored.
+   *
+   * The paragraph above says nothing here spawns, and that is true of a pane torn out during
+   * *this* run. It is not true after a restart: the window is re-created from `workspace.json`
+   * before any process exists, so the pane arrives carrying a `SessionId` whose owner died with
+   * the last run and there is nothing to attach to. `lifecycle::plan_restore` has always walked
+   * `project.detached` and produced an entry for exactly this case — and this window never
+   * passed one, so the pane adopted the dead id and printed `— no such session —` into a blank
+   * pane on every launch, deterministically, for as long as detach has existed.
+   */
+  restore?: PaneRestore | undefined
   /** Put the pane back in its home tab and close this window. */
   onRedock?: (() => void) | undefined
-}
-
-/**
- * Whether this kind runs a child, and must therefore reach this window with one already
- * running.
- *
- * Written as the list of kinds that run *nothing*, so a `PaneKind` added later falls into
- * the default and is treated as spawning. The guard below then refuses to render rather
- * than letting `TerminalPane` start a second child — the wrong answer in that direction is
- * a pane that says it has no session, and in the other it is a duplicated conversation.
- */
-function needsSession(pane: Pane): boolean {
-  switch (pane.kind) {
-    case 'diff':
-    case 'editor':
-      return false
-    default:
-      return true
-  }
 }
 
 export function DetachedPaneWindow({
@@ -72,14 +83,27 @@ export function DetachedPaneWindow({
   cwd,
   project,
   roots,
+  restore,
   onOpenPath,
+  onSessionBound,
   onRedock,
 }: DetachedPaneWindowProps): ReactNode {
-  // A pane can only be detached after it has spawned, so this is the state that should not
-  // occur rather than one a user reaches. It is still rendered rather than ignored: letting
-  // `TerminalPane` fall through to a spawn would start a child whose id no window records,
-  // and an unrecorded child is one nothing can resume or reap.
-  const orphaned = needsSession(pane) && pane.session === null
+  /*
+   * What goes inside the frame — a decision, so it lives in `detachedPane.ts` where a check
+   * script can run it.
+   *
+   * It was two lines here and one of them was missing. `needsSession` answered `false` for an
+   * `editor` pane, which is true and was then used as *"so it is not orphaned"* — leaving
+   * `TerminalPane` as the only remaining branch. A detached editor pane would have spawned a
+   * shell in a window titled `main.rs`, and only `layout::take_pane`'s refusal to detach the
+   * last pane of a tab kept it out of reach.
+   *
+   * A pane that runs a child can only be detached after it has spawned, so `orphaned` is a
+   * state that should not occur rather than one a user reaches. It is still rendered rather
+   * than ignored: letting `TerminalPane` fall through to a spawn would start a child whose id
+   * no window records, and an unrecorded child is one nothing can resume or reap.
+   */
+  const content = detachedContent(pane)
 
   return (
     <WindowFrame>
@@ -118,16 +142,20 @@ export function DetachedPaneWindow({
               so the depth-first position the tree would compute is 1, and there is no second
               pane for focus to be on. */}
           <PaneFrame pane={pane} index={1} focused maximized={false}>
-            {orphaned ? (
-              <p className={styles.orphan}>This pane has no session. Redock it to start one.</p>
-            ) : (
+            {content.kind === 'terminal' ? (
               <TerminalPane
                 pane={pane}
                 cwd={cwd}
                 project={project}
                 roots={roots}
+                restore={restore}
                 onOpenPath={onOpenPath}
+                onSessionBound={onSessionBound}
               />
+            ) : (
+              // One element for both refusals: they differ only in their sentence, and a second
+              // paragraph style is how the two drift apart.
+              <p className={styles.orphan}>{content.message}</p>
             )}
           </PaneFrame>
         </div>

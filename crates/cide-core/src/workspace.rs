@@ -822,6 +822,70 @@ pub fn console_tab(ws: &Workspace, project: ProjectId) -> Result<TabId> {
         .ok_or(CoreError::LastTab)
 }
 
+/// Record which session a pane is showing — and move the project's primary session with it.
+///
+/// # Why the second half is not optional
+///
+/// `Project::primary_session` is minted once, in [`open_project`], and until this function
+/// existed **nothing ever wrote it again**. It is not decoration: `lifecycle::entry_for`
+/// computes a pane's `eager` flag as `pane.session == Some(project.primary_session)`, which is
+/// what brings the project console up *live* on the next launch instead of at a Resume splash.
+///
+/// So the moment the console's pane bound a different session — which any respawn does, and
+/// which already happened on every restore whose transcript had gone — the console stopped
+/// being eager and came back at a splash. The field went on naming a conversation no pane held,
+/// which is the state `cmd::file`'s tests and `App.tsx`'s mention target both had to write
+/// comments about. Moving it with the pane is what makes a restart survive the next launch.
+///
+/// Only for [`PaneRole::Primary`]. Every other pane binds its own session and has no claim on
+/// the project's: a second Claude pane, a mirror or a fork must not silently become the console.
+///
+/// # A detached pane is not in its tab, and looking only there orphaned live children
+///
+/// `detach_pane` *removes* the pane from `tab.tree.panes` and parks it in `project.detached`,
+/// because the tree invariant is that every leaf is present. So the tab lookup alone answered
+/// `NoSuchPane` for exactly the panes a restart is most likely to happen in — a torn-out window
+/// is where a user watches a long turn — and the workspace went on naming the child that had
+/// died while the one that replaced it belonged to nobody. Re-docking then restored the *old*
+/// id, so the pane came back showing a session that no longer existed and the live `claude`
+/// survived with no pane at all until the app quit.
+///
+/// `set_diff_spec` above documents the same fact about the same map. Two functions needing the
+/// same correction is the argument for making the fallback explicit here rather than leaving
+/// each caller to remember it.
+pub fn bind_session(
+    ws: &mut Workspace,
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    session: SessionId,
+) -> Result<()> {
+    // The detached map first only when the tab does not hold it: an id is in one place or the
+    // other, never both, and preferring the tab keeps the ordinary path a single lookup.
+    if let Ok(t) = tab_mut(ws, project, tab)
+        && let Some(p) = t.tree.panes.get_mut(&pane)
+    {
+        p.session = Some(session);
+        let primary = p.role == PaneRole::Primary;
+        if primary {
+            project_mut(ws, project)?.primary_session = session;
+        }
+        return Ok(());
+    }
+
+    let proj = project_mut(ws, project)?;
+    let Some(p) = proj.detached.get_mut(&pane) else {
+        return Err(CoreError::NoSuchPane(pane));
+    };
+    p.session = Some(session);
+    // The console keeps its claim while detached — it is still the project's primary pane, it
+    // is merely being shown somewhere else, and re-docking must not find the field stale.
+    if p.role == PaneRole::Primary {
+        proj.primary_session = session;
+    }
+    Ok(())
+}
+
 /// Locate the tab that owns a pane.
 ///
 /// Pane ids are unique across the whole workspace (asserted by [`validate`]), so a pane
@@ -1464,6 +1528,94 @@ mod tests {
         assert_eq!(pane.session, Some(p.primary_session));
         assert_eq!(tree.focused, pane.id);
         validate(&ws).expect("a fresh project is valid");
+    }
+
+    /// A restarted console keeps being the console — which is what `eager` is read from.
+    ///
+    /// `lifecycle::entry_for` computes `eager: pane.session == Some(project.primary_session)`,
+    /// and that is the flag that brings the console up **live** on the next launch instead of at
+    /// a Resume splash. Nothing ever wrote `primary_session` after project creation, so the
+    /// first time the console's pane bound a different session — a restore whose transcript had
+    /// gone, and now every restart — the two stopped matching for the rest of the project's
+    /// life. The user reports that as a second bug a launch later.
+    #[test]
+    fn binding_the_console_pane_moves_the_project_primary_session() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("a console exists");
+        let pane = project(&ws, id).expect("exists").tabs[0].tree.focused;
+        let before = project(&ws, id).expect("exists").primary_session;
+
+        let restarted = SessionId::new();
+        bind_session(&mut ws, id, console, pane, restarted).expect("the pane binds");
+
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(p.tabs[0].tree.panes[&pane].session, Some(restarted));
+        assert_eq!(
+            p.primary_session, restarted,
+            "the console's session is the project's primary session, or `eager` is false for ever"
+        );
+        assert_ne!(
+            before, restarted,
+            "the fixture only means anything if it moved"
+        );
+        validate(&ws).expect("still valid");
+    }
+
+    /// And every other pane binds only itself.
+    ///
+    /// A mirror, a fork or a second Claude pane must not silently become the console: they are
+    /// bound by the same command on the same path, and the difference is `PaneRole::Primary`.
+    #[test]
+    fn binding_a_secondary_pane_leaves_the_primary_session_alone() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("a console exists");
+        let second = split_console(&mut ws, id);
+        let primary = project(&ws, id).expect("exists").primary_session;
+
+        bind_session(&mut ws, id, console, second, SessionId::new()).expect("the pane binds");
+
+        assert_eq!(project(&ws, id).expect("exists").primary_session, primary);
+    }
+
+    #[test]
+    fn a_detached_pane_can_still_bind_a_session_it_respawned() {
+        // The blocker this fallback exists for. A torn-out window is where a user watches a
+        // long turn, so it is where a double Ctrl+C and a restart happen — and `detach_pane`
+        // has already moved the pane out of `tab.tree.panes`, so a tab-only lookup answered
+        // `NoSuchPane` and the workspace kept naming the child that died. Re-docking then
+        // restored the dead id while the live `claude` belonged to no pane at all.
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("a console exists");
+        let extra = split_console(&mut ws, id);
+
+        detach_pane(&mut ws, id, console, extra).expect("the pane detaches");
+        assert!(
+            !ws.projects[&id].tabs[0].tree.panes.contains_key(&extra),
+            "the pane really has left its tab — otherwise this test proves nothing",
+        );
+
+        let respawned = SessionId::new();
+        bind_session(&mut ws, id, console, extra, respawned).expect("a detached pane binds");
+        assert_eq!(
+            ws.projects[&id].detached[&extra].session,
+            Some(respawned),
+            "the detached pane records the session that replaced the one that died",
+        );
+    }
+
+    #[test]
+    fn binding_a_pane_that_is_not_there_is_refused() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = console_tab(&ws, id).expect("a console exists");
+        let ghost = PaneId::new();
+        assert_eq!(
+            bind_session(&mut ws, id, console, ghost, SessionId::new()),
+            Err(CoreError::NoSuchPane(ghost)),
+        );
     }
 
     #[test]

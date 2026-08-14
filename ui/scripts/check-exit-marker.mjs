@@ -53,9 +53,8 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { exitMarkerText, exitMarkerBytes, showsCode, markFor } = await import(
-    `file://${join(out, 'exitMarker.js')}`
-  )
+  const { exitMarkerText, exitMarkerBytes, showsCode, markFor, isRecoverableSessionError } =
+    await import(`file://${join(out, 'exitMarker.js')}`)
 
   // --- the distinction the Rust side exists to preserve --------------------------------
   //
@@ -145,6 +144,38 @@ try {
     '— exited —',
     'and the case with no code still does not invent one',
   )
+
+  // --- which failures a pane may recover from, and which it must report -------------------
+  //
+  // `— no such session —` is what a user actually saw, printed into an otherwise blank pane. It
+  // is the registry correctly refusing to answer for an id it has never held — a `SessionId`
+  // read out of `workspace.json` whose owning process died with the previous run — and it is
+  // the app reporting an internal bookkeeping fact to somebody who can do nothing with it. That
+  // one is recoverable: forget the id, start a session. The other two are not, and retrying
+  // either would spin on a failure the user has to read.
+  eq(
+    isRecoverableSessionError({ kind: 'noSuchSession', message: 'no such session' }),
+    true,
+    'a session the registry never held is recoverable — start one rather than reporting a refusal',
+  )
+  eq(
+    isRecoverableSessionError({ kind: 'alreadyOpen', message: 'session … is already open' }),
+    false,
+    'a conversation already open in another pane is a refusal the user must read, not a retry',
+  )
+  eq(
+    isRecoverableSessionError({ kind: 'pty', message: 'No such file or directory' }),
+    false,
+    'a child that cannot be spawned at all is not fixed by spawning it again',
+  )
+  for (const other of [null, undefined, 'no such session', new Error('no such session'), 7]) {
+    eq(
+      isRecoverableSessionError(other),
+      false,
+      `an untagged rejection (${String(other)}) is not assumed recoverable — the tag is the ` +
+        'contract, and prose is what `spawnFailureText` is for',
+    )
+  }
 
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)

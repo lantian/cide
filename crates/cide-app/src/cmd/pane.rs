@@ -257,9 +257,16 @@ pub fn pane_swap(
 
 /// Record which session a pane is showing.
 ///
-/// Called once the frontend has measured the pane and spawned a child at the right size.
-/// The binding is what survives a restart: `SessionId` is the value passed to
-/// `claude --session-id`, so a persisted pane knows which conversation to resume.
+/// Called once the frontend has measured the pane and spawned a child at the right size, and
+/// again whenever that pane restarts into a new one. The binding is what survives a restart:
+/// `SessionId` is the value passed to `claude --session-id`, so a persisted pane knows which
+/// conversation to resume.
+///
+/// The mutation itself is [`workspace::bind_session`], in `cide-core`, and it does one thing
+/// more than this used to: for the console's primary pane it moves `Project::primary_session`
+/// too. That field decides whether the console comes back *live* on the next launch or at a
+/// Resume splash, and nothing had ever written it after project creation — see the function's
+/// own note.
 #[tauri::command(rename_all = "camelCase")]
 pub fn pane_bind_session(
     app: tauri::AppHandle,
@@ -271,14 +278,7 @@ pub fn pane_bind_session(
     session: SessionId,
 ) -> Result<Mutated, CoreError> {
     let out = state
-        .update(|ws| {
-            let t = workspace::tab_mut(ws, project, tab)?;
-            let Some(p) = t.tree.panes.get_mut(&pane) else {
-                return Err(CoreError::NoSuchPane(pane));
-            };
-            p.session = Some(session);
-            Ok(())
-        })
+        .update(|ws| workspace::bind_session(ws, project, tab, pane, session))
         .map(|()| Mutated { rev: state.rev() })?;
 
     // This is the only point at which a pid and a pane are both known, which is what the IDE

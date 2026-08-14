@@ -55,16 +55,16 @@ import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
 import { explain, pullReport, type RepoFetch } from '@/chrome/branchModel'
-import { notify } from '@/chrome/notices'
+import { notify, notifyFailure } from '@/chrome/notices'
+import { pasteIntoTerminal } from '@/terminal/clipboard'
+import { paneRestarter } from '@/panes/paneRestart'
 import { useGitCount } from '@/chrome/gitCountStore'
 import { requestFocus } from '@/chrome/focusRequests'
 import {
   branch as branchApi,
   claudeSend,
-  clipboard,
   diag,
   git as gitApi,
-  session as sessionApi,
   settings as settingsApi,
   type Axis,
   type Direction,
@@ -378,6 +378,55 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return split(on, 'row', { kind: 'mirror', session })
       }
 
+      /*
+       * Restart, and resume — the two ways back into a pane whose `claude` has gone.
+       *
+       * `claude.restart` was registered from the first draft of the command table and carried
+       * `.unavailable("needs a respawn path in the pane host; kill alone is not a restart")`,
+       * which was an accurate description of the gap: only `TerminalPane` knows a pane's
+       * geometry and holds the terminal a new child must attach to, so a command layer that
+       * could only kill would have been a *stop* command wearing the word restart. The pane
+       * publishes the respawn now (`panes/paneRestart.ts`) and these two run it.
+       *
+       * Two ids rather than one with an argument, because ids are API and are never renamed:
+       * splitting them later would leave a `claude.restart` in somebody's `keymap.json` meaning
+       * whichever of the two we happened to pick today. Neither is bound by default — a restart
+       * is not a per-minute gesture — and both are reachable from the pane's own bar and its
+       * context menu, which is where a user looking at a dead terminal actually is.
+       */
+      case 'claude.restart':
+      case 'claude.resume': {
+        if (target === null || on === null) return unmet(command, 'no focused pane')
+        // The clause is `claudePaneFocused` and a clause does not gate the keyboard, so the
+        // same fact is checked here — the rule this file's header states.
+        if (target.pane.kind !== 'claude') return unmet(command, 'the focused pane is not Claude')
+        const restarter = paneRestarter(on.pane)
+        if (restarter === null) {
+          // A pane this window is not showing — the detached-pane case, where `focusTarget`
+          // answers `null` anyway — or one whose mount has been torn down. Reported rather
+          // than silently ignored: the palette offered the row.
+          return unmet(command, 'this window is not showing that pane')
+        }
+        if (command === 'claude.restart') {
+          void restarter.restart('fresh').catch(notifyFailure)
+          return
+        }
+        void restarter
+          .canResume()
+          .then((yes) => {
+            if (!yes) {
+              // A sentence, not a diag line. Whether Claude Code still holds the transcript is
+              // a fact about the user's disk that they just asked a question about, and the
+              // alternative to saying so is a menu row that appears to do nothing.
+              notify('There is no saved conversation for this pane to resume.', { kind: 'info' })
+              return
+            }
+            return restarter.restart('resume')
+          })
+          .catch(notifyFailure)
+        return
+      }
+
       case 'claude.mention.file': {
         // Deliberately uncaught: `claude_send_lines` rejects with `noServer` /
         // `notConnected` when nothing is listening, and `chrome/Failures.tsx` turns that
@@ -414,16 +463,21 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       }
 
       case 'terminal.paste': {
-        // "Paste" here means *write bytes to a pty*, which is what every keystroke in the
-        // pane already does — this is the one surface where WebKit's refusal to run
-        // `execCommand('paste')` from page script does not bite.
+        // Through the terminal, not the pty. `term.paste` is the one path that wraps the text
+        // in `ESC[200~ … ESC[201~` when — and only when — the child has asked for bracketed
+        // paste, which is what stops a multi-line paste executing line by line in `bash` and
+        // submitting at the first newline in `claude`. It leaves through the same `onData` the
+        // pane already writes to the pty, so this is not a second way of reaching the child.
+        // One implementation, shared with the pane menu and with Ctrl+V: `terminal/clipboard.ts`.
         if (on === null) return unmet(command, 'no focused pane')
-        const session = paneSessionId(on.pane)
-        if (session === undefined) return unmet(command, 'the focused pane has no session yet')
-        void (async () => {
-          const text = await clipboard.readText()
-          if (text !== '') await sessionApi.write(session, text)
-        })().catch((error: unknown) => void diag.log(`terminal.paste failed: ${String(error)}`))
+        const term = peekHost(on.pane)?.terminal?.term
+        if (term === undefined) return unmet(command, 'the focused pane has no terminal')
+        if (paneSessionId(on.pane) === undefined) {
+          return unmet(command, 'the focused pane has no session yet')
+        }
+        void pasteIntoTerminal(term).catch(
+          (error: unknown) => void diag.log(`terminal.paste failed: ${String(error)}`),
+        )
         return
       }
 
@@ -486,7 +540,30 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // Shown before revealed. Revealing into a sidebar that is on Git — or closed —
         // scrolls a tree nobody can see, which is a command that "did nothing" again.
         deps.showSidebar?.('files')
-        void useFileTree.getState().reveal(path)
+        /*
+         * And the answer is read, which it was not.
+         *
+         * `fs_reveal` is index-only, so it says "no row" for a gitignored file, for one deleted
+         * between the pick and the reveal, and — since M13, ordinarily — for a tab holding a
+         * file that is not in the project at all. The store swallowed all three, so this arm was
+         * a listed, enabled, bindable command that opened the Files panel and then did nothing
+         * whatsoever: the exact defect this project has now found more than a dozen times, in
+         * the exact place the out-of-project open makes common.
+         *
+         * A notice rather than `unmet`: the user made a gesture that could not be honoured, and
+         * `unmet` is a diagnostic line nobody sees. It says *why* rather than "failed", because
+         * "not in this project's file tree" is the whole answer for the case that now dominates.
+         */
+        void useFileTree
+          .getState()
+          .reveal(path)
+          .then((shown) => {
+            if (shown) return
+            notify(`${path} is not in this project's file tree, so there is no row to show.`, {
+              kind: 'info',
+              hint: 'Files outside the project, and files git ignores, have no row in the tree.',
+            })
+          })
         return
       }
 

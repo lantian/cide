@@ -214,6 +214,30 @@ export function missing(commands, handled) {
   }
 }
 
+{
+  /*
+   * ...and a `case` whose call answers "nothing to do" and is not read is not a dispatcher
+   * either. Same defect, one layer down.
+   *
+   * `file.reveal` was the live example. It opened the Files panel and called
+   * `treeStore.reveal(path)`, which asks the index-only `fs_reveal`; that answers `null` for
+   * a gitignored file, for one deleted between the pick and the reveal, and — now that a file
+   * outside the project can be opened at all — for the ordinary case of an out-of-project tab.
+   * The store swallowed all three and the promise was `void`ed, so the command was listed,
+   * enabled, bindable, and silently did nothing.
+   */
+  const reveal = HANDLERS.find((h) => h.id === 'file.reveal')
+  ok(reveal !== undefined, 'file.reveal still has a case in dispatch.ts')
+  if (reveal) {
+    ok(
+      /\.then\(/.test(reveal.body) && /notify\(/.test(reveal.body),
+      'file.reveal reads whether the reveal landed and says so when it did not — a command ' +
+        'that opens a panel and then does nothing is indistinguishable from one wired to ' +
+        'nothing, which is the defect this project has now found more than a dozen times',
+    )
+  }
+}
+
 /* --------------------------------------------------------------- the `when` vocabulary */
 
 /**

@@ -393,15 +393,20 @@ export interface Bases {
 }
 
 /**
- * Every absolute path this candidate could name, most likely first, deduplicated.
+ * Every absolute path **inside the project** this candidate could name, most likely first,
+ * deduplicated.
  *
- * **Nothing outside the project's roots survives this function.** That is the frontend's half
- * of containment: an absolute `/etc/shadow` printed by a build script produces an empty list
- * and is never even asked about, and a relative path that climbs out with `../..` is dropped
- * after normalisation rather than before, so the climb cannot be hidden by a middle segment.
- * It is *not* the security boundary — Rust re-checks on the click, because a frontend answer
- * is not evidence — it is the first of the two locks, and the one that keeps the hover probe
- * from ever naming a file outside the project.
+ * **Nothing outside the project's roots survives this function**, and that has not changed: an
+ * absolute `/etc/shadow` produces an empty list here, and a relative path that climbs out with
+ * `../..` is dropped after normalisation rather than before, so the climb cannot be hidden by a
+ * middle segment. What changed in M13 is that this is no longer the *only* source of candidates
+ * — [`outsidePaths`] is the deliberately much narrower second one, and the split is the point:
+ * a path that reaches the user through a cwd or a root can never be an out-of-project open, so
+ * the two can never be confused for one another at the call site.
+ *
+ * It is *not* the security boundary — Rust re-checks on the click, because a frontend answer is
+ * not evidence — it is the first of the two locks, and the one that keeps the hover probe from
+ * asking the *index* about a file outside the project.
  *
  * A bare basename yields nothing: [`matchPaths`] cannot produce one, and if a caller invents
  * one anyway, resolving it against every root is the ambiguity this whole design refuses.
@@ -427,6 +432,39 @@ export function candidatePaths(text: string, bases: Bases): string[] {
     add(`${base}/${text}`)
   }
   return out
+}
+
+/**
+ * Every absolute path this candidate could name that lies **outside** every root.
+ *
+ * The complement of [`candidatePaths`], and the two are disjoint by construction: for an
+ * absolute path exactly one of them is non-empty, and for a relative one this is always empty.
+ * That last clause is the whole rule, so it is worth stating on its own:
+ *
+ * > **A relative path never produces an out-of-project candidate.**
+ *
+ * Resolving `../../.ssh/id_rsa` against the pane's cwd would produce a perfectly good absolute
+ * path to a private key, and the user would have approved it having read six characters of it
+ * on screen. That is precisely the escape `cmd::session.rs`'s `contained_cwd` refuses, and it is
+ * what keeps the property this feature rests on true: *the full path was spelled out in the
+ * output, and the user could read it before clicking.*
+ *
+ * The second clause is `normalize(text) === text` — the spelling is already canonical. It drops
+ * `/home/you/proj/../../.ssh/id_rsa`, which normalises to something outside but was never
+ * *written* on screen, and it exactly matches what Rust will accept: `openable` refuses any path
+ * with a `..` component outright, approval or no approval, so a candidate that failed this test
+ * would be an underline leading to a refusal nothing can answer.
+ *
+ * `~/…` stays refused upstream in [`matchPaths`] for the same reason: the tilde is a shell's
+ * word, not a path, and expanding it here would be this module inventing a path nobody printed.
+ */
+export function outsidePaths(text: string, bases: Bases): string[] {
+  if (!text.startsWith('/')) return []
+  const normalized = normalize(text)
+  if (normalized === '' || normalized !== text) return []
+  const roots = bases.roots.map(normalize).filter((r) => r !== '')
+  if (roots.some((root) => within(root, normalized))) return []
+  return [normalized]
 }
 
 /**
@@ -472,12 +510,17 @@ const NONE: Resolution = { kind: 'none' }
 
 export interface ResolveContext extends Bases {
   /**
-   * Whether an absolute path is a regular file the project holds.
+   * Whether an absolute path is a regular file.
    *
-   * Supplied by the caller from the project index — see `fs_paths_exist` — so this module
-   * needs no disk and the check script can drive it from a `Set`. Directories must answer
-   * `false`: `Compiling cide-app v0.1.0 (/home/…/cide)` is a frequent, real line, and a link
-   * that opens a directory in a text editor is a link that does nothing.
+   * Supplied by the caller — from the project index for a path inside a root (`fs_paths_exist`,
+   * zero syscalls) and from `fs_stat_paths` for one outside every root, which the index will
+   * never hold — so this module needs no disk and the check script can drive it from a `Set`.
+   * Which oracle answered is deliberately invisible here: a link is offered for a file that
+   * exists, and *whether cide may open it* is a question for the click, in Rust, where it can be
+   * asked of the user.
+   *
+   * Directories must answer `false`: `Compiling cide-app v0.1.0 (/home/…/cide)` is a frequent,
+   * real line, and a link that opens a directory in a text editor is a link that does nothing.
    */
   readonly isFile: (path: string) => boolean
 }
@@ -498,7 +541,10 @@ export interface ResolveContext extends Bases {
  * prevent.
  */
 export function resolveCandidate(text: string, ctx: ResolveContext): Resolution {
-  const hits = candidatePaths(text, ctx).filter(ctx.isFile)
+  // Concatenated rather than merged: the two sets are disjoint (see [`outsidePaths`]), so this
+  // can never turn one inside answer and one outside answer into a `many` the user has to
+  // disambiguate. `many` stays what it always was — two roots, or a cwd that agrees with a root.
+  const hits = [...candidatePaths(text, ctx), ...outsidePaths(text, ctx)].filter(ctx.isFile)
   if (hits.length === 0) return NONE
   const only = hits[0]
   if (hits.length === 1 && only !== undefined) return { kind: 'one', path: only }

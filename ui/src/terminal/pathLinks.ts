@@ -63,11 +63,32 @@
  * which gesture opens it. Fired from `click` rather than `mousedown` and gated on an empty
  * selection specifically so that *dragging* across a path to copy it — the other thing users do
  * to paths — stays silent.
+ *
+ * # Decision 3: a path outside the project is underlined only if it is really there
+ *
+ * M13 lets a ctrl+click open a file the project does not contain, once, after a confirmation
+ * that names it. That could have been done with no hover-time work at all — offer the link for
+ * any well-formed absolute path and let the click answer — and it was not, because a linker
+ * error line names `/usr/bin/ld`, `/lib64/libc.so.6`, `/dev/null` and half a dozen `.so`s, and
+ * underlining all of them is how an underline stops meaning "cide can open this".
+ *
+ * So out-of-project candidates get a real `stat`, through `fs_stat_paths` — a *second* command,
+ * so that in-project hovering keeps costing zero syscalls, which is a stated property of
+ * `fs_paths_exist` and not an accident. Their answers live in their own map with a TTL, because
+ * the exact invalidation the other map enjoys (`cide://fs-changed`) is the project watcher's and
+ * does not reach outside the project.
  */
 import type { IBufferLine, ILink, IDisposable } from '@xterm/xterm'
 import { notify } from '@/chrome/notices'
 import { events, fs as fsApi, session as sessionApi } from '@/ipc/client'
-import { candidatePaths, matchPaths, resolveCandidate, type Candidate, type Resolution } from './pathMatch'
+import {
+  candidatePaths,
+  matchPaths,
+  outsidePaths,
+  resolveCandidate,
+  type Candidate,
+  type Resolution,
+} from './pathMatch'
 import type { TerminalHandle } from './xterm'
 
 /**
@@ -116,6 +137,28 @@ type Existence = 'file' | 'dir' | 'absent'
  */
 const existence = new Map<string, Existence>()
 
+/**
+ * Answers from `fs_stat_paths`, for paths no root contains.
+ *
+ * A **separate map with a TTL**, and not entries in `existence`, because the invalidation that
+ * makes that one exact does not reach here: `cide://fs-changed` is emitted by the project's
+ * watcher, which watches the project. An out-of-project entry parked in `existence` would go
+ * stale for the life of the window — a file created in a sibling repo would never light up, and
+ * one deleted there would keep its underline for ever. A TTL is a number invented to stand in
+ * for a fact the app is being told, which is why `existence` does not have one; here there is no
+ * fact to be told, so a short one is the honest answer rather than the lazy one.
+ */
+const outsideExistence = new Map<string, { at: number; kind: Existence }>()
+
+/**
+ * How long a `stat` answer for an out-of-project path is believed.
+ *
+ * Long enough that dragging the pointer down a linker error costs one round trip rather than one
+ * per line; short enough that `go build` writing a file into the module cache lights it up while
+ * the user is still looking at the line that named it.
+ */
+const OUTSIDE_TTL_MS = 3_000
+
 /** Entries kept. A build log hovered end to end is a few thousand distinct paths at most. */
 const CACHE_MAX = 4096
 
@@ -135,6 +178,28 @@ function remember(path: string, kind: Existence): void {
     if (oldest === undefined) break
     existence.delete(oldest)
   }
+}
+
+/** The same, for the TTL'd half. Same eviction, one extra field. */
+function rememberOutside(path: string, kind: Existence): void {
+  outsideExistence.delete(path)
+  outsideExistence.set(path, { at: Date.now(), kind })
+  while (outsideExistence.size > CACHE_MAX) {
+    const oldest = outsideExistence.keys().next().value
+    if (oldest === undefined) break
+    outsideExistence.delete(oldest)
+  }
+}
+
+/** A live answer for an out-of-project path, or `undefined` if there is none or it has aged out. */
+function outsideKnown(path: string): Existence | undefined {
+  const entry = outsideExistence.get(path)
+  if (entry === undefined) return undefined
+  if (Date.now() - entry.at >= OUTSIDE_TTL_MS) {
+    outsideExistence.delete(path)
+    return undefined
+  }
+  return entry.kind
 }
 
 let watching = false
@@ -211,6 +276,33 @@ async function sessionCwd(project: string, session: string | null): Promise<stri
     })
   cwdPending.set(session, request)
   return request
+}
+
+/**
+ * Ask the **disk** about every out-of-project path not already answered for.
+ *
+ * The costly sibling of [`probe`], and it is called with a list that is almost always empty:
+ * `outsidePaths` yields at most one candidate, only for text that was spelled as a full absolute
+ * path, and only when that path is in no root. A line of ordinary relative diagnostics costs
+ * nothing here.
+ *
+ * A failure is not cached, exactly as in [`probe`] and for the same reason: caching it would
+ * make the pane stay dark after the command becomes available.
+ */
+async function probeOutside(paths: string[]): Promise<void> {
+  for (let i = 0; i < paths.length; i += PROBE_MAX) {
+    const batch = paths.slice(i, i + PROBE_MAX)
+    let answers: Array<'dir' | 'file' | null>
+    try {
+      answers = await fsApi.statPaths(batch)
+    } catch {
+      return
+    }
+    for (const [j, path] of batch.entries()) {
+      const answer = answers[j]
+      rememberOutside(path, answer === null || answer === undefined ? 'absent' : answer)
+    }
+  }
 }
 
 /** Ask about every path not already answered for, in bounded batches. */
@@ -295,15 +387,27 @@ export function attachPathLinks(
     const cwds = proc === null ? [env.cwd] : [proc, env.cwd]
     const bases = { cwds, roots: env.roots }
 
+    // Two oracles, because the index cannot answer for a path it will never hold. Which one a
+    // candidate goes to is decided by `pathMatch.ts` and nowhere else: `candidatePaths` is
+    // in-project by construction, `outsidePaths` is out-of-project by construction, and the two
+    // are disjoint. Nothing here re-derives that, so there is no second place for it to drift.
     const unknown: string[] = []
+    const unknownOutside: string[] = []
     for (const candidate of candidates) {
       for (const path of candidatePaths(candidate.text, bases)) {
         if (!existence.has(path) && !unknown.includes(path)) unknown.push(path)
       }
+      for (const path of outsidePaths(candidate.text, bases)) {
+        if (outsideKnown(path) === undefined && !unknownOutside.includes(path)) {
+          unknownOutside.push(path)
+        }
+      }
     }
     if (unknown.length > 0) await probe(env.project, unknown)
+    if (unknownOutside.length > 0) await probeOutside(unknownOutside)
 
-    const isFile = (path: string): boolean => existence.get(path) === 'file'
+    const isFile = (path: string): boolean =>
+      existence.get(path) === 'file' || outsideKnown(path) === 'file'
     const links: ILink[] = []
     let cursor: Cursor = { y: topIdx, x: 0, idx: 0 }
     for (const candidate of candidates) {

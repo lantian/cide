@@ -461,6 +461,21 @@ export const fs = {
   pathsExist: (projectId: ProjectId, paths: string[]) =>
     invoke<Array<TreeRowKind | null>>('fs_paths_exist', { project: projectId, paths }),
 
+  /**
+   * The same question, answered from **disk** instead of from the index.
+   *
+   * The oracle for the one case `pathsExist` structurally cannot answer: an absolute path
+   * outside every root, which the index will never hold however long it walks. One `stat` per
+   * path, clamped to the same 128, so it is asked *only* for the candidates
+   * `terminal/pathMatch.ts`'s `outsidePaths` produced — in-project hovering keeps its
+   * zero-syscall property, which is a design property of `pathsExist` and not an accident.
+   *
+   * Not project-scoped, because the answer is not: it stats what it is given. A FIFO, a socket
+   * and a device node all answer `null` rather than `'file'`, so the shape that would park a
+   * blocking-pool worker in `read_to_end` for ever never gets an underline in the first place.
+   */
+  statPaths: (paths: string[]) => invoke<Array<TreeRowKind | null>>('fs_stat_paths', { paths }),
+
   readFile: (projectId: ProjectId, path: string) =>
     invoke<string>('fs_read_file', { project: projectId, path }),
 
@@ -1075,17 +1090,27 @@ export const file = {
    * all. This one's argument was parsed out of a pane's bytes, which are a repository's build
    * output, a file some tool printed, a tool result — attacker-influenced by definition.
    *
-   * So Rust checks, on every call: inside a project root, no `..`, canonicalised and contained
-   * again so a symlink cannot point out, a regular file (not a directory, not a device, and
-   * above all not a FIFO), and under the editor's size limit *before* a tab exists. It rejects
-   * with a typed `{kind, message}` the notice stack shows verbatim — a refusal the user cannot
+   * So Rust checks, on every call: absolute and free of `..`, canonicalised, a regular file (not
+   * a directory, not a device, and above all not a FIFO), under the editor's size limit *before*
+   * a tab exists, and inside a project root. It rejects with a typed
+   * `{kind, message, path, real}` the notice stack shows verbatim — a refusal the user cannot
    * see is indistinguishable from a link wired to nothing.
+   *
+   * `approvedTarget` is the answer to the one refusal a user may overrule. Absent — every first
+   * click, and every click on a path the project contains — nothing has changed. Present, it is
+   * the **canonical path the confirmation named**, and Rust re-canonicalises and compares, so an
+   * approval is an approval of a file rather than of a string. The rules for when that dialog
+   * may be offered at all are in `terminal/outsideOpen.ts`; `OutsideOpenGate` draws it.
    *
    * There is no line argument: the caret is `editor/revealRequest.ts`'s job and is requested
    * on this side, before this call, for the reason written there.
    */
-  openFromTerminal: (projectId: ProjectId, path: string) =>
-    invoke<TabId>('terminal_open_path', { project: projectId, path }),
+  openFromTerminal: (projectId: ProjectId, path: string, approvedTarget?: string | undefined) =>
+    invoke<TabId>('terminal_open_path', {
+      project: projectId,
+      path,
+      approvedTarget: approvedTarget ?? null,
+    }),
 
   /** Record whether a file tab has unsaved edits. This is what draws the tab's dirty dot. */
   setDirty: (projectId: ProjectId, id: TabId, dirty: boolean) =>
@@ -1953,4 +1978,23 @@ export const sendFocus = {
   // `string` for the same reason, and `WindowLabel` *is* `string` in `generated.ts`.
   revealPane: (projectId: ProjectId, paneId: PaneId) =>
     invoke<string | null>('window_reveal_pane', { project: projectId, pane: paneId }),
+}
+
+/**
+ * Whether a pane could resume the conversation it was showing.
+ *
+ * Appended as its own namespace rather than added to `session` above, per this file's
+ * append-only rule — that block has conflicted in five consecutive rounds.
+ *
+ * The question is asked by a pane whose child has just died, once, so the bar it puts over the
+ * dead terminal can offer *Resume this conversation* beside *Start a new session*. It is not a
+ * registry lookup: a transcript is a file under `~/.claude/projects` and outlives the process
+ * that wrote it, which is exactly why the answer cannot be derived on this side of the wire.
+ *
+ * `cwd` is the directory the session was spawned in — the project's primary root, the same one
+ * `session.spawn` was given. Never rejects for an unknown session; the answer is simply `false`.
+ */
+export const claudeSession = {
+  resumable: (cwd: string, id: SessionId) =>
+    invoke<boolean>('session_resumable', { cwd, session: id }),
 }

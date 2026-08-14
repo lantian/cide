@@ -69,7 +69,7 @@ try {
     { cwd: UI, stdio: 'inherit' },
   )
 
-  const { matchPaths, candidatePaths, resolveCandidate, MAX_LINE } = await import(
+  const { matchPaths, candidatePaths, outsidePaths, resolveCandidate, MAX_LINE } = await import(
     `file://${join(out, 'pathMatch.js')}`
   )
 
@@ -245,13 +245,61 @@ try {
   eq(
     candidatePaths('/etc/shadow', bases([`${ROOT}/ui`])),
     [],
-    'an absolute path outside every root is never even asked about',
+    'an absolute path outside every root is never asked of the INDEX — `candidatePaths` is ' +
+      'the in-project set and stays that way; the out-of-project set is its own function',
   )
   eq(
     candidatePaths('../../.ssh/id_rsa', bases([`${ROOT}/ui`])),
     [],
     'and a relative one that climbs out is dropped AFTER normalisation, so the climb cannot ' +
       'be hidden behind a middle segment',
+  )
+
+  // --- stage 2b: which paths may be offered as an OUT-OF-PROJECT open? ---------------------
+  //
+  // The narrow half. Everything here is one ctrl+click plus one confirmation away from a file
+  // the project does not contain, so every negative is a security assertion and not a taste.
+
+  eq(
+    outsidePaths('/usr/lib/go/src/fmt/print.go', bases([`${ROOT}/ui`])),
+    ['/usr/lib/go/src/fmt/print.go'],
+    'a fully spelled absolute path outside every root is the case the feature exists for',
+  )
+  eq(
+    outsidePaths(`${ROOT}/run.sh`, bases([`${ROOT}/ui`])),
+    [],
+    'a path INSIDE a root is never an out-of-project candidate — the two sets are disjoint, ' +
+      'which is what stops `resolveCandidate` inventing a `many` out of one file',
+  )
+  eq(
+    outsidePaths('../../.ssh/id_rsa', bases([`${ROOT}/ui`])),
+    [],
+    'A RELATIVE PATH NEVER LEAVES THE PROJECT. Resolved against the pane cwd this is a real ' +
+      'private key, and the user would have approved it having read six characters of it',
+  )
+  eq(
+    outsidePaths('.ssh/id_rsa', bases(['/home/lantian'])),
+    [],
+    'and neither does a plain relative one that happens to resolve outside: the whole ' +
+      'property is that the full path was on screen before the click',
+  )
+  eq(
+    outsidePaths('/home/lantian/work/cide/../../.ssh/id_rsa', bases([`${ROOT}/ui`])),
+    [],
+    'a climbing ABSOLUTE path is refused too — it normalises to something outside, but that ' +
+      'string was never written on screen, and Rust refuses `..` however anyone approves it',
+  )
+  eq(
+    outsidePaths('/etc//passwd', bases([ROOT])),
+    [],
+    'and so is any spelling that is not already canonical, for the same reason: `openable` ' +
+      'takes the path as given, so an offered link must be one it will accept',
+  )
+  eq(
+    outsidePaths('~/.claude/.credentials.json', bases([ROOT])),
+    [],
+    'a tilde is a shell word, not a path; expanding it here would be this module inventing a ' +
+      'path nobody printed',
   )
   eq(
     candidatePaths('./run.sh', bases([ROOT])),
@@ -319,6 +367,24 @@ try {
     resolveCandidate('src/App.tsx', ctx([`${ROOT}/ui/src/App.tsx`], [])),
     { kind: 'none' },
     'with no cwd and no root there is nothing to resolve against, and nothing is invented',
+  )
+  eq(
+    resolveCandidate('/usr/lib/go/src/fmt/print.go', ctx(['/usr/lib/go/src/fmt/print.go'], [])),
+    { kind: 'one', path: '/usr/lib/go/src/fmt/print.go' },
+    'an out-of-project file that really is there resolves — the click, not the hover, is ' +
+      'where "may cide open this" gets asked, and it gets asked of the user',
+  )
+  eq(
+    resolveCandidate('/etc/shadow', ctx([], [])),
+    { kind: 'none' },
+    'and one that is not a regular file resolves to nothing, so `/dev/null`, `/proc/…` and ' +
+      'every `.so` in a linker error stay un-underlined',
+  )
+  eq(
+    resolveCandidate('../../.ssh/id_rsa', ctx(['/home/lantian/.ssh/id_rsa'], ['/home/lantian/w/x'], ['/home/lantian/w/x'])),
+    { kind: 'none' },
+    'THE ONE THAT MATTERS: a climbing relative path resolves to a real private key on disk ' +
+      'and is still offered nothing, because neither candidate set will produce it',
   )
 
   // --- the source pins: each is a fix a later edit would silently undo ---------------------

@@ -8,16 +8,26 @@
  * the pane is. A child born before its slot has been laid out gets the fallback geometry
  * below and, for a fullscreen TUI, draws a ruined first frame.
  */
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
-import { getHost, openTerminal } from '@/layout/paneHosts'
+import { forgetSession, getHost, openTerminal, peekHost, setHostBusy } from '@/layout/paneHosts'
 import { setPathLinkEnv } from '@/terminal/pathLinks'
+import { copyTerminalSelection, pasteIntoTerminal } from '@/terminal/clipboard'
+import type { TerminalPaneKind } from '@/terminal/keys'
 import { takeSpawnPlan } from '@/layout/spawnPlans'
 import { useContextMenu, type MenuEntry } from '@/menus'
-import { exitMarkerBytes, markFor, spawnFailureBytes, spawnFailureText } from './exitMarker'
+import {
+  exitMarkerBytes,
+  isRecoverableSessionError,
+  markFor,
+  spawnFailureBytes,
+  spawnFailureText,
+} from './exitMarker'
+import { restartOffer, type RestartMode, type RestartOffer } from './restartRule'
+import { registerRestarter } from './paneRestart'
 import { acknowledge } from './awaiting'
 import {
-  clipboard,
+  claudeSession,
   diag,
   events,
   paneSession,
@@ -89,7 +99,20 @@ export interface TerminalPaneProps {
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
   onSessionBound?: ((session: string) => void) | undefined
   className?: string | undefined
-  onExit?: (() => void) | undefined
+  /*
+   * `onExit` was here, and it is deliberately gone rather than merely unused.
+   *
+   * It was declared, held in a ref, and fired from both of the paths that learn a child has
+   * died — and **no caller ever passed one**. `PaneBody` and `DetachedPaneWindow` are the only
+   * two mount sites and neither supplied it, so the exit signal reached the transcript and
+   * nothing else: no title bar state, no store, no chrome, and no way back. That is this
+   * project's recurring defect wearing a prop.
+   *
+   * What replaced it is the pane acting on its own exit — see `restartRule.ts` and the bar this
+   * component now renders — which is the thing the prop was presumably reserved for and never
+   * connected to. A caller that needs to hear about exits should subscribe to
+   * `cide://session-state`, which is where the fact actually comes from.
+   */
 }
 
 /**
@@ -261,9 +284,15 @@ function reportWriteFailure(paneId: string, error: unknown): void {
  *
  * Returns whether this call is the one that wrote it. Exit reaches a pane from two
  * directions — the `cide://session-state` event, and the one-shot check for a session that
- * was already dead before this pane attached — and `onExit` must fire once however many
- * arrive. The first one to arrive is the one whose code is shown; that is the event whenever
- * the pane was mounted at the time, which is every case but rehydration.
+ * was already dead before this pane attached — and the *marker* must be written once however
+ * many arrive. The first one to arrive is the one whose code is shown; that is the event
+ * whenever the pane was mounted at the time, which is every case but rehydration.
+ *
+ * The **offer** over the pane is deliberately not one-shot; see `noteExit`. A pane remounted by
+ * a split learns of the exit again through the one-shot check, and it must come back showing
+ * the way out even though the marker was written for the previous mount. Tying the control to
+ * this return value is how it would have gone missing on exactly the panes that had been
+ * around longest.
  */
 function markExited(paneId: string, code?: number): boolean {
   const host = getHost(paneId)
@@ -319,41 +348,26 @@ async function sessionIsLive(session: string): Promise<boolean> {
 }
 
 /**
- * Send text to the child as if it had been typed.
+ * Paste into this pane, and copy out of it.
  *
- * This is the whole of Paste, and it is why the item can exist at all: WebKit refuses
- * `document.execCommand('paste')` from page script, so the native menu's Paste is the only
- * one that works on a plain input — see `menus/model.ts`. A terminal is the one surface where
- * that limitation does not bite, because "paste" here means *write bytes to a pty*, and this
- * app already writes bytes to a pty on every keystroke.
- *
- * Bracketed paste is deliberately not added around it. Whether the child wants
- * `ESC[200~ … ESC[201~` is the child's own DECSET 2004 state, which lives in the vt100 mirror
- * on the Rust side and is not on the wire; wrapping unconditionally would make a plain `bash`
- * print the literal escape codes. The cost of not wrapping is that a multi-line paste into
- * `claude` submits at the first newline, which is the same thing typing it would do.
+ * Both bodies used to live here and both are now `terminal/clipboard.ts`, because the same two
+ * gestures are reachable from three places — this menu, the `terminal.paste` command, and
+ * Ctrl+C / Ctrl+V inside the terminal — and three implementations is how a menu item and a
+ * keystroke with the same name come to do different things. In particular the old paste wrote
+ * the clipboard straight at the pty, so a multi-line paste executed line by line in `bash` and
+ * submitted at the first newline in `claude`; `term.paste` wraps in bracketed paste when, and
+ * only when, the child has asked for it.
  */
 async function pasteInto(paneId: string): Promise<void> {
-  const id = getHost(paneId).sessionId
-  if (!id) return
-  const text = await clipboard.readText()
-  if (text === '') return
-  await sessionApi.write(id, text)
+  const term = getHost(paneId).terminal?.term
+  if (!term) return
+  await pasteIntoTerminal(term)
 }
 
-/**
- * Put the terminal's selection on the system clipboard.
- *
- * Through the Tauri plugin rather than `navigator.clipboard.writeText`. The async Clipboard
- * API needs a secure context and a user-gesture-adjacent permission decision, and a menu item
- * activated by keyboard is on the wrong side of that in WebKitGTK — the write silently
- * resolves against nothing. The plugin writes through the compositor's own selection, which
- * is what every other application on the desktop reads.
- */
 async function copySelection(paneId: string): Promise<void> {
-  const text = getHost(paneId).terminal?.term.getSelection() ?? ''
-  if (text === '') return
-  await clipboard.writeText(text)
+  const term = getHost(paneId).terminal?.term
+  if (!term) return
+  await copyTerminalSelection(term)
 }
 
 async function sessionFor(paneId: string, spec: TerminalSpec, geometry: Geometry): Promise<string> {
@@ -387,15 +401,12 @@ export function TerminalPane({
   onOpenPath,
   onSessionBound,
   className,
-  onExit,
 }: TerminalPaneProps) {
   const paneId = pane.id
   const boundRef = useRef<string | null>(null)
   // Held in refs so a changed callback identity cannot tear the session down and respawn it.
   const boundCb = useRef(onSessionBound)
   boundCb.current = onSessionBound
-  const exitCb = useRef(onExit)
-  exitCb.current = onExit
   const cwdRef = useRef(cwd)
   cwdRef.current = cwd
   const projectRef = useRef(project)
@@ -417,6 +428,46 @@ export function TerminalPane({
   const restoreRef = useRef(restore)
   restoreRef.current = restore
   const domainSession = pane.session
+
+  /** What this pane runs, in the two-valued form the clipboard rule and the offer both use. */
+  const runKind: TerminalPaneKind = pane.kind === 'claude' ? 'claude' : 'shell'
+
+  /*
+   * This pane's child has gone, and with what status.
+   *
+   * React state as well as `host.exitMarked`, because the two answer different questions: the
+   * host flag is "has the marker been written into this terminal" and must survive every mount,
+   * and this is "does the pane currently offer a way back", which is a render. Seeded *from*
+   * the host so that a pane remounted by a split — React swaps a leaf node for a split node in
+   * the same position — comes back still offering it, rather than showing a dead terminal with
+   * the control gone because the one-shot that set it had already fired.
+   */
+  const [exit, setExit] = useState<{ code?: number } | null>(() =>
+    peekHost(paneId)?.exitMarked === true ? {} : null,
+  )
+  /**
+   * Whether Claude Code still holds a transcript for the session that just died.
+   *
+   * Asked of Rust once, when the pane learns it has exited, because it is a fact about the
+   * filesystem. `false` until the answer arrives, which is the safe direction: the offer gains
+   * the Resume button a round trip later rather than showing one that cannot work.
+   */
+  const [resumable, setResumable] = useState(false)
+  /**
+   * The restart itself, installed by the effect.
+   *
+   * A ref rather than state: it closes over the terminal handle and the pane's spec, both of
+   * which belong to the effect, and re-rendering because a function identity changed would be
+   * churn on a component whose whole design is to re-render as little as possible.
+   */
+  const restartRef = useRef<((mode: RestartMode) => Promise<void>) | null>(null)
+  const runRestart = (mode: RestartMode): void => {
+    void restartRef.current?.(mode).catch((error: unknown) => {
+      console.error('[cide] restart failed', error)
+      void diag.log(`pane ${paneId}: restart failed — ${spawnFailureText(error)}`).catch(() => {})
+      getHost(paneId).terminal?.term.write(spawnFailureBytes(spawnFailureText(error)))
+    })
+  }
 
   /*
    * The terminal body's own menu: copy, paste, clear, select all.
@@ -491,11 +542,10 @@ export function TerminalPane({
         /*
          * Interrupt, as a real thing rather than a menu entry for a command nobody wired.
          *
-         * `claude.restart`, `claude.fork` and `claude.mirror` are the other three the brief
-         * names, and none of them is reachable from here: each needs the project and tab a
-         * pane sits in, which only `App.tsx` holds. They are reported rather than drawn —
-         * an item that logs "command not handled by this window" is the dead control this
-         * project keeps finding.
+         * `claude.fork` and `claude.mirror` are two the brief names and neither is reachable
+         * from here: each needs the project and tab a pane sits in, which only `App.tsx` holds.
+         * They are reported rather than drawn — an item that logs "command not handled by this
+         * window" is the dead control this project keeps finding.
          *
          * This one needs none of that. Interrupting is `ETX` on the pty, which is the same
          * write every keystroke in this pane already performs.
@@ -515,6 +565,30 @@ export function TerminalPane({
               },
         disabledReason: host.sessionId === undefined ? 'This pane has no session yet' : undefined,
       },
+      {
+        /*
+         * Restart, which the comment above used to explain the absence of.
+         *
+         * `claude.restart` was `Command::unavailable("needs a respawn path in the pane host;
+         * kill alone is not a restart")`, and that reason was accurate: only this component
+         * knows the pane's geometry and holds the terminal a new child must attach to. The
+         * respawn path exists now, so the item is drawn — and it is drawn *here* as well as in
+         * the palette because the palette is not where a user with a dead pane looks.
+         *
+         * No `command:` chip. The registry entry is `claude.restart` and this item restarts a
+         * shell pane too, so naming the command would put a Claude-only shortcut beside an
+         * action that is not only Claude's.
+         *
+         * Withheld when the pane has no respawn to run — `specFor` answers `null` for a kind
+         * that runs no process, so the effect returns before installing one. Drawing it there
+         * would be the dead control this whole item exists to remove.
+         */
+        id: 'restart',
+        label: runKind === 'claude' ? 'Restart session' : 'Restart',
+        run: restartRef.current === null ? undefined : () => runRestart('fresh'),
+        disabledReason:
+          restartRef.current === null ? 'This pane does not run a process' : undefined,
+      },
     ]
   }
 
@@ -527,7 +601,10 @@ export function TerminalPane({
 
   useEffect(() => {
     let disposed = false
-    const handle = openTerminal(paneId)
+    // The kind reaches the terminal at construction, because it decides a keystroke: a Claude
+    // pane must not claim Ctrl+V, or the CLI's own image paste stops working. See
+    // `terminal/keys.ts`.
+    const handle = openTerminal(paneId, runKind)
     const { term, fit } = handle
 
     /*
@@ -563,20 +640,6 @@ export function TerminalPane({
 
     const restoreEntry = restoreRef.current
 
-    // The domain may already hold a session for this pane — a pane that was detached and
-    // re-docked, or one re-mounting after a split. Adopt it before considering a spawn.
-    //
-    // Not when this pane is in the launch plan. There, `pane.session` names a child from the
-    // process that wrote `workspace.json`, and adopting it attaches to a session the registry
-    // has never heard of: the pane comes up blank and stays that way. Such a pane spawns
-    // instead, resuming the old conversation when the plan says it can — but only
-    // after `sessionIsLive` has said the old id really is dead, because the plan is read once
-    // and a pane that has already spawned in this run still carries its entry. Re-docking one
-    // into a second window must not fork a rival child.
-    if (domainSession && !getHost(paneId).sessionId && restoreEntry === undefined) {
-      getHost(paneId).sessionId = domainSession
-    }
-
     const spec = specFor(
       { ...pane, kind: kindRef.current },
       cwdRef.current,
@@ -599,31 +662,71 @@ export function TerminalPane({
       spec.fork = true
     }
 
-    try {
-      fit.fit()
-    } catch {
-      /* the slot may not be laid out yet on the very first frame */
+    /**
+     * The pane's size right now, as a cell geometry.
+     *
+     * A function rather than a value computed once at mount, because a restart happens
+     * whenever the user asks — minutes later, in a pane that has been dragged to a different
+     * size since. Spawning the replacement at the geometry the *first* child was born with
+     * would draw its first frame at the wrong width, which for a fullscreen TUI is a ruined
+     * screen until something forces a repaint.
+     */
+    const measure = (): Geometry => {
+      try {
+        fit.fit()
+      } catch {
+        /* the slot may not be laid out yet on the very first frame */
+      }
+      const measured = plausible(term.cols, term.rows)
+      const cell = measured
+        ? handle.cellSize()
+        : { width: FALLBACK.cellWidth, height: FALLBACK.cellHeight }
+      return measured
+        ? { cols: term.cols, rows: term.rows, cellWidth: cell.width, cellHeight: cell.height }
+        : FALLBACK
     }
 
-    const measured = plausible(term.cols, term.rows)
-    const cell = measured
-      ? handle.cellSize()
-      : { width: FALLBACK.cellWidth, height: FALLBACK.cellHeight }
-    const geo: Geometry = measured
-      ? { cols: term.cols, rows: term.rows, cellWidth: cell.width, cellHeight: cell.height }
-      : FALLBACK
+    /**
+     * This pane's child has gone: write the marker, and offer a way back.
+     *
+     * Reached from both directions — the `cide://session-state` event, and the one-shot check
+     * for a child that was already dead when this pane attached — because a pane must offer the
+     * control however it learns. `markExited` stays one-shot (the marker is written once per
+     * host); the offer is not, so a pane remounted by a split still shows it.
+     */
+    const noteExit = (code?: number): void => {
+      markExited(paneId, code)
+      setHostBusy(paneId, false)
+      if (disposed) return
+      setExit(code === undefined ? {} : { code })
 
-    ;(async () => {
-      // A planned pane's `pane.session` was not adopted above, because at launch it names a
-      // dead child. It is adopted here if the registry proves otherwise — which is the case
-      // for a pane that already spawned in this run and is now being re-docked or re-mounted
-      // in a window that still holds the plan.
-      if (restoreEntry !== undefined && domainSession && !getHost(paneId).sessionId) {
-        if (await sessionIsLive(domainSession)) getHost(paneId).sessionId = domainSession
-        if (disposed) return
-      }
+      // Only Claude has a conversation to resume, and only Rust can say whether the transcript
+      // is still there — it is a file under `~/.claude/projects`, and a Resume button that
+      // spawns `--resume` for a transcript that is gone is a control that fails after it is
+      // pressed. A rejection leaves the answer at `false`, which offers one button instead of
+      // two rather than offering a broken one.
+      const id = getHost(paneId).sessionId
+      if (runKind !== 'claude' || id === undefined) return
+      void claudeSession
+        .resumable(cwdRef.current, id)
+        .then((yes) => {
+          if (!disposed) setResumable(yes)
+        })
+        .catch(() => {})
+    }
 
-      const id = await sessionFor(paneId, spec, geo)
+    /**
+     * Attach this pane to a session, spawning one if it does not already hold one.
+     *
+     * Everything from "which session" to "the screen is painted" lives here, as a function
+     * rather than as the body of the mount effect, because a restart is exactly this sequence
+     * run again against the same terminal. Doing it by unmounting and remounting the pane was
+     * the alternative and it is forbidden: `layout/paneHosts.ts` rule 2, and it would throw
+     * away the transcript the user is reading the exit code off.
+     */
+    const start = async (spawnSpec: TerminalSpec): Promise<void> => {
+      const geo = measure()
+      const id = await sessionFor(paneId, spawnSpec, geo)
       if (disposed) return
 
       // Tell the domain which session this pane holds, once. The binding is what survives a
@@ -693,6 +796,16 @@ export function TerminalPane({
       for (const bytes of queued) deliver(bytes)
       queued.length = 0
 
+      // The pane is attached and painting, so any offer over it is spent.
+      //
+      // Cleared *here* rather than when the button was pressed, and that is the difference
+      // between a control and a trapdoor: a restart whose spawn fails would otherwise take the
+      // only way out of the pane away with it, leaving the same dead end the button exists to
+      // fix — this time with a `— could not start —` line instead of `— exited —`. React bails
+      // out of a re-render when the state is already `null`, so this costs a live pane nothing.
+      setExit(null)
+      setResumable(false)
+
       if (alt) {
         // A fullscreen TUI's own model is authoritative for everything the screen mirror
         // does not track — OSC 8 hyperlinks, OSC 52 clipboard traffic, DEC 2026 sync
@@ -714,16 +827,138 @@ export function TerminalPane({
       // `— exited —` over a status the registry was still holding — the same pane, the same
       // dead child, a different sentence depending only on whether it happened to be mounted.
       const mark = await exitMark(id)
-      if (mark && markExited(paneId, mark.code)) exitCb.current?.()
-    })().catch((e) => {
-      // Into the pane, not only the console. A pane whose spawn failed is blank, and blank is
-      // also what "still connecting" and "the renderer died" look like — so the reason has to
-      // land where the user is already looking. `SessionError::AlreadyOpen` was invisible for
-      // exactly this reason: refused for a good cause, said so precisely, unreadable.
-      console.error('[cide] terminal pane failed to start', e)
-      void diag.log(`pane ${paneId} failed to start: ${spawnFailureText(e)}`).catch(() => {})
-      getHost(paneId).terminal?.term.write(spawnFailureBytes(spawnFailureText(e)))
+      if (mark) noteExit(mark.code)
+    }
+
+    /**
+     * Start, and recover once from the one failure that is recoverable.
+     *
+     * `— no such session —` was what a user saw, printed into an otherwise blank pane, and it
+     * is the registry correctly refusing to answer for an id it has never held — which is not
+     * something the person reading it can do anything about. It happens when this pane adopted
+     * a `SessionId` out of `workspace.json` whose owning process died with the previous run.
+     * The adoption itself is now guarded (see below), so this is the second line of defence
+     * rather than the first: forget the id and start a session instead of reporting a refusal.
+     *
+     * Once, and only for `noSuchSession`. A retry loop on a spawn that genuinely cannot work —
+     * no such program, a conversation already open in another pane — would spin, and those two
+     * failures are ones the user *must* read.
+     */
+    const startOrRecover = async (spawnSpec: TerminalSpec, retried: boolean): Promise<void> => {
+      try {
+        await start(spawnSpec)
+      } catch (error: unknown) {
+        if (disposed) return
+        if (!retried && isRecoverableSessionError(error)) {
+          void diag
+            .log(`pane ${paneId}: the session it was holding is gone; starting one instead`)
+            .catch(() => {})
+          forgetSession(paneId)
+          writeFailures.delete(paneId)
+          await startOrRecover(spawnSpec, true)
+          return
+        }
+        // Into the pane, not only the console. A pane whose spawn failed is blank, and blank is
+        // also what "still connecting" and "the renderer died" look like — so the reason has to
+        // land where the user is already looking. `SessionError::AlreadyOpen` was invisible for
+        // exactly this reason: refused for a good cause, said so precisely, unreadable.
+        console.error('[cide] terminal pane failed to start', error)
+        void diag.log(`pane ${paneId} failed to start: ${spawnFailureText(error)}`).catch(() => {})
+        term.write(spawnFailureBytes(spawnFailureText(error)))
+      }
+    }
+
+    /**
+     * Wait until the registry agrees this child is gone.
+     *
+     * Only for a resume, and it is not optional there: `session_spawn` refuses to adopt an id
+     * whose entry is still `running` (`SessionError::AlreadyOpen`, which exists so two panes
+     * cannot resume one conversation), and `has_exited()` flips on EOF from a *different thread*
+     * than the one this kill returned on. Restarting a live pane would otherwise race and fail
+     * with a refusal that reads like a bug. A fresh restart mints a new id and needs none of
+     * this.
+     *
+     * Bounded, because a child that ignores the whole signal ladder is a real possibility and
+     * hanging the button for ever is worse than a spawn that reports why it was refused.
+     */
+    const settled = async (id: string): Promise<void> => {
+      const deadline = Date.now() + 3000
+      while (Date.now() < deadline) {
+        if (await sessionIsLive(id).then((live) => !live)) return
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+    }
+
+    /**
+     * Kill what this pane is running and start again — the respawn path `claude.restart` was
+     * marked `unavailable` for the want of.
+     *
+     * `fresh` mints a new session; `resume` hands the old id back to `claude --resume`, which
+     * keeps it, so the pane's binding and the project's primary session do not move. The
+     * terminal is never torn down: the transcript stays on screen and the new child prints
+     * below it, exactly as re-running a command in a shell does.
+     */
+    const restart = async (mode: RestartMode): Promise<void> => {
+      const old = getHost(paneId).sessionId
+      if (old !== undefined) {
+        await sessionApi.kill(old).catch((error: unknown) => {
+          // Not fatal. A child that is already dead is the ordinary case here, and the spawn
+          // below is what the user asked for either way.
+          void diag.log(`pane ${paneId}: kill before restart failed — ${String(error)}`).catch(() => {})
+        })
+        if (mode === 'resume') await settled(old)
+        // The sink goes with the session it was registered against. Without this the pane's
+        // attachment record would name a session it no longer shows, and the detach in this
+        // effect's cleanup — which reads the host's *current* id — would never take it off.
+        void paneSession.detach(paneId, old)
+      }
+      if (disposed) return
+
+      forgetSession(paneId)
+      writeFailures.delete(paneId)
+
+      await startOrRecover(
+        { ...spec, resume: mode === 'resume' ? old : undefined, fork: false },
+        false,
+      )
+    }
+    restartRef.current = restart
+    const unregisterRestarter = registerRestarter(paneId, {
+      restart,
+      canResume: async () => {
+        const id = getHost(paneId).sessionId
+        if (runKind !== 'claude' || id === undefined) return false
+        return claudeSession.resumable(cwdRef.current, id).catch(() => false)
+      },
     })
+
+    void (async () => {
+      /*
+       * The domain may already hold a session for this pane — one detached and re-docked, one
+       * re-mounting after a split, or one restored from `workspace.json`. Adopt it **only if
+       * the registry still holds a running child for it**.
+       *
+       * The liveness check used to be skipped whenever the pane had no entry in the launch
+       * plan, on the reasoning that a plan entry is the only thing that says `pane.session`
+       * comes from a previous process. That reasoning has two holes, and both of them printed
+       * `— no such session —` into a blank pane:
+       *
+       * * a detached-pane window never received a plan at all — `App.tsx` computed one, fetched
+       *   it, and rendered `DetachedPaneWindow` on a branch that did not pass it — so every
+       *   torn-out pane came back at launch, adopted its dead id and failed, every time; and
+       * * the plan is fetched in one effect and the workspace hydrated in another, so a pane
+       *   painted before the plan resolved read `restore === undefined` and did the same thing.
+       *
+       * Asking the registry costs one round trip on a re-dock and closes both, whatever the
+       * plan says and whenever it arrives. `restore` keeps the one thing only it knows: whether
+       * to pass `--resume`.
+       */
+      if (domainSession && !getHost(paneId).sessionId) {
+        if (await sessionIsLive(domainSession)) getHost(paneId).sessionId = domainSession
+        if (disposed) return
+      }
+      await startOrRecover(spec, false)
+    })()
 
     const onData = term.onData((data) => {
       const id = getHost(paneId).sessionId
@@ -809,13 +1044,22 @@ export function TerminalPane({
     let unlistenExit: (() => void) | null = null
     void events
       .onSessionState((session, state) => {
-        if (state.state !== 'exited') return
         // Not `id` from the async block above: this handler outlives it, and a pane that
         // respawned holds a different session by now.
         if (session !== getHost(paneId).sessionId) return
+        /*
+         * Mid-turn, which is the one state that must keep this host out of the eviction sweep.
+         *
+         * `setHostBusy` had no caller anywhere: `PaneHost.busy` was documented as being set from
+         * this very event and nobody was setting it, so it was permanently `false` and the pane
+         * with a turn in flight was as evictable as an idle one. Rehydrating from the screen
+         * mirror is lossless for a settled pane and is not for one whose bytes are arriving now.
+         */
+        setHostBusy(paneId, state.state === 'busy')
+        if (state.state !== 'exited') return
         // `state.code` is the whole reason the Rust side threads the status out of `wait()`.
         // Dropping it here was the last link in the chain, and it made the change invisible.
-        if (markExited(paneId, state.code)) exitCb.current?.()
+        noteExit(state.code)
       })
       .then((fn) => {
         if (disposed) fn()
@@ -827,6 +1071,8 @@ export function TerminalPane({
       disposed = true
       onData.dispose()
       unlistenExit?.()
+      unregisterRestarter()
+      restartRef.current = null
       // The provider stays on the host — it belongs to the terminal, not to this mount — so
       // what has to go is the environment it reads. Without this, a pane unmounted from a
       // closing project would keep resolving paths against that project's roots and opening
@@ -849,11 +1095,122 @@ export function TerminalPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paneId, domainSession])
 
+  /*
+   * What this pane offers now that its child has gone. `null` while it is alive, which is
+   * every pane in ordinary use.
+   *
+   * The decision is `restartRule.ts`'s and not this component's, deliberately: it is the rule
+   * — what is offered, when, and in which words — and a rule inside a render is a rule no check
+   * script can compile. `check:restart` runs every branch of it.
+   */
+  const offer = restartOffer({
+    kind: runKind,
+    exited: exit !== null,
+    code: exit?.code,
+    resumable,
+  })
+
   return (
     <>
       <PaneSlot paneId={paneId} className={className} onResize={() => syncSize(paneId)} />
+      {/*
+        * The bar is a *sibling* of the slot and is absolutely positioned, and both halves of
+        * that matter. Rendering it above the terminal in flow is what the restored-shell banner
+        * did: `PaneSlot` still claims `height: 100%`, so the terminal was pushed its own height
+        * past the bottom of the pane frame and painted over the row below. And the slot itself
+        * is never conditionally rendered — rule 2 of `layout/paneHosts.ts` — so the terminal,
+        * its scrollback and the `— exited —` line the user is reading all stay exactly where
+        * they were while the control sits over the last two lines.
+        */}
+      {offer !== null && <ExitedBar offer={offer} onRun={runRestart} />}
       {/* Portals out of here entirely; it is in the tree so React owns its lifetime. */}
       {menu}
     </>
+  )
+}
+
+/*
+ * Styles inline rather than in a CSS module, on `ResumeSplash`'s own argument: hover is the only
+ * state and a stylesheet for one bar and two buttons buys nothing. If this grows, it wants a
+ * module.
+ */
+const barStyle: CSSProperties = {
+  position: 'absolute',
+  left: 0,
+  right: 0,
+  bottom: 0,
+  display: 'flex',
+  alignItems: 'center',
+  gap: 10,
+  padding: '6px 10px',
+  background: 'var(--panel-2)',
+  borderTop: '1px solid var(--border)',
+  fontFamily: 'var(--font-mono)',
+  fontSize: 12,
+  lineHeight: '19px',
+  color: 'var(--dim)',
+  // Under the pane frame's floating control cluster, which is `z-index: 2` inside a stacking
+  // context of its own — so this cannot cover the close button, and the cluster cannot cover
+  // these two, because they sit at the other end of the pane.
+  zIndex: 1,
+}
+
+const statusStyle: CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+}
+
+function actionStyle(accent: boolean): CSSProperties {
+  return {
+    padding: '3px 10px',
+    borderRadius: 6,
+    borderWidth: 1,
+    borderStyle: 'solid',
+    borderColor: accent ? 'var(--accent)' : 'var(--border)',
+    background: 'transparent',
+    color: accent ? 'var(--text-hi)' : 'var(--text)',
+    font: 'inherit',
+    cursor: 'pointer',
+    flex: 'none',
+  }
+}
+
+/**
+ * The way out of a pane whose child has died.
+ *
+ * Drawn in the pane rather than only in the command palette, and that is the whole point: the
+ * user is looking at a dead terminal, and an affordance they have to already know the name of
+ * is the unreachable feature wearing a different hat. The palette rows exist too
+ * (`claude.restart`, `claude.resume`), for the user who prefers the keyboard.
+ *
+ * It repeats the exit status rather than relying on the `— exited (n) —` line it may be sitting
+ * over, so the one thing a user needs off that transcript is never the thing this covers.
+ */
+function ExitedBar({
+  offer,
+  onRun,
+}: {
+  offer: RestartOffer
+  onRun: (mode: RestartMode) => void
+}) {
+  // Read out before the JSX: TypeScript drops a narrowing of `offer.secondary` inside the
+  // click handler's closure, and a non-null assertion there would be the kind of thing that
+  // survives a refactor that makes it false.
+  const secondary = offer.secondary
+  return (
+    <div style={barStyle} data-audit="exitedPane">
+      <span style={statusStyle}>{offer.status}</span>
+      {secondary !== null && (
+        <button type="button" style={actionStyle(false)} onClick={() => onRun(secondary.mode)}>
+          {secondary.label}
+        </button>
+      )}
+      <button type="button" style={actionStyle(true)} onClick={() => onRun(offer.primary.mode)}>
+        {offer.primary.label}
+      </button>
+    </div>
   )
 }

@@ -288,6 +288,70 @@ pub async fn fs_paths_exist(
     .await
 }
 
+/// What is on **disk** at each of these paths — the oracle for terminal links that leave the
+/// project.
+///
+/// [`fs_paths_exist`]'s disk-touching sibling, and a separate command rather than a flag on it
+/// because the two have different costs and the difference has to stay visible at the call site.
+/// That one is a hash lookup against a tree that has already been walked and answers `None` for
+/// everything the index cannot see, which since M13 includes the case this command exists for:
+/// a path outside every root, which the index will never hold however long it walks.
+///
+/// # Why the project-scoped one could not simply be relaxed
+///
+/// Two properties would have gone with it. `fs_paths_exist` is asked from `provideLinks` while
+/// the pointer crosses a line of output, so *in-project hovering costs zero syscalls* — that is
+/// a design property, written down where it is relied on, and putting a `stat` behind the same
+/// name would have made every hover in every pane pay filesystem latency to buy a case that
+/// only arises for absolute paths naming somewhere else. Splitting them also puts the new cost
+/// in one greppable place: if terminal hovering ever gets slow on a stalled mount, this is the
+/// command to look at, and it has exactly one caller.
+///
+/// # What it does and does not reveal
+///
+/// It answers *file / directory / nothing* for absolute paths anywhere on the machine, so it
+/// tells the webview whether an arbitrary path exists. That is not a new capability — `file_read`
+/// in `cmd::file` has no containment at all, so a *compromised webview* already reads any file —
+/// and it is not what this feature's threat model is about, which is attacker-chosen bytes on
+/// screen plus one unsuspecting ctrl+click. Against that, the defence is the confirmation
+/// `cmd::file::terminal_open_path` refuses into, not the answer to a `stat`.
+///
+/// A relative path answers `None` rather than being resolved against cide's own cwd, which is
+/// not the project and is not anything the user could have meant. Clamped to [`MAX_PROBE`] like
+/// its sibling, and on the blocking pool because `stat` on a stalled network mount blocks.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_stat_paths(
+    paths: Vec<PathBuf>,
+) -> Result<Vec<Option<cide_ipc::TreeRowKind>>, FsError> {
+    blocking("fs_stat_paths", move || {
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                if i >= MAX_PROBE || !path.is_absolute() {
+                    return None;
+                }
+                // `metadata`, not `symlink_metadata`: a symlink to a real file is a file as far
+                // as opening it goes, and `openable` canonicalises on the click anyway. A
+                // dangling symlink therefore answers `None`, which is the honest answer — the
+                // click would refuse it as `Missing`.
+                let meta = std::fs::metadata(path).ok()?;
+                if meta.is_dir() {
+                    Some(cide_ipc::TreeRowKind::Dir)
+                } else if meta.is_file() {
+                    Some(cide_ipc::TreeRowKind::File)
+                } else {
+                    // A FIFO, a socket or a device node. `None` rather than `File`, so the link
+                    // is never offered for the one shape that would park a blocking-pool worker
+                    // in `read_to_end` for ever if the click's own guard ever slipped.
+                    None
+                }
+            })
+            .collect()
+    })
+    .await
+}
+
 /// Show a path in the desktop file manager. Returns the directory that was opened.
 ///
 /// The file tree's context menu offers *Reveal*, and without this that item could only ever

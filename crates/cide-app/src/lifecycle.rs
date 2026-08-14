@@ -645,6 +645,21 @@ fn claude_projects_dir() -> Option<PathBuf> {
     Some(base.join("projects"))
 }
 
+/// Whether a pane could resume `session` right now, asked one pane at a time.
+///
+/// [`plan_restore`] answers the same question for the whole workspace, once, at launch — which
+/// is the only moment it used to be asked. A pane whose child dies *during* the run needs it
+/// again and cannot wait for the next launch: it is what decides whether the bar over a dead
+/// terminal offers **Resume this conversation** beside **Start a new session**, and an offer
+/// made without asking would be a button that fails after it is pressed.
+///
+/// `cwd` is the directory the session was spawned in — the project's primary root, which is
+/// what the pane passes to `session_spawn`. Nothing is read or written under the transcript
+/// directory; see [`transcript_exists`], which is the whole of the filesystem contact.
+pub fn resumable(cwd: &Path, session: SessionId) -> bool {
+    claude_projects_dir().is_some_and(|dir| transcript_exists(&dir, cwd, session))
+}
+
 /// Whether Claude Code holds a transcript for `session`, started in `cwd`.
 ///
 /// `<projects>/<encoded cwd>/<session>.jsonl` is an **internal Claude Code implementation

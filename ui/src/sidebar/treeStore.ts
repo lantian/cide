@@ -234,8 +234,16 @@ interface FileTreeStore {
   selectAll: () => Promise<string | null>
   /** Expand or collapse a directory row. */
   toggle: (row: TreeRow) => Promise<void>
-  /** Expand ancestors until `path` is visible, then scroll to it. */
-  reveal: (path: string) => Promise<void>
+  /**
+   * Expand ancestors until `path` is visible, then scroll to it. `false` when there is no row.
+   *
+   * The answer is not decoration. `fs_reveal` is index-only, so it says `null` for a
+   * gitignored file, a file deleted between the pick and the reveal, and — since M13 — for the
+   * ordinary case of a tab holding a file that is not in the project at all. This store used to
+   * swallow all three, which made *Reveal in Files* a listed, enabled, keyboard-reachable
+   * command that silently did nothing; the caller now has something to say a sentence about.
+   */
+  reveal: (path: string) => Promise<boolean>
   clearReveal: () => void
   /**
    * Re-read the count and the visible rows, and update only if they moved. The
@@ -502,16 +510,17 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
 
   async reveal(path) {
     const { project } = get()
-    if (project === null) return
+    if (project === null) return false
 
-    // `fs_reveal` answers `null` for a path outside the index — a stale picker row, or a
-    // file deleted between the pick and the reveal. Treated as "nothing to scroll to"
-    // rather than coerced to a row number.
+    // `fs_reveal` answers `null` for a path outside the index — a gitignored file, a stale
+    // picker row, a file deleted between the pick and the reveal, or a tab holding a file the
+    // project does not contain at all. Treated as "nothing to scroll to" rather than coerced to
+    // a row number, and *reported*: the caller is the one that knows whether silence is honest.
     const index = await tree('fs_reveal', () => fsApi.reveal(project, path), null)
     // The project can be swapped out from under a reveal — `attach` is what a project switch
     // runs — and writing this count and this index into the new project's tree would scroll it
     // to a row belonging to the old one.
-    if (index === null || index < 0 || get().project !== project) return
+    if (index === null || index < 0 || get().project !== project) return false
 
     // Revealing expands ancestors, so the flattening moved; everything cached is stale.
     resetCache()
@@ -520,7 +529,10 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     // The same guard `attach` and `refresh` carry, for the same reason: an expand or a watcher
     // refresh that landed while this count was in flight has already re-flattened the tree, so
     // both the count and the row index below describe a shape that is gone.
-    if (generation !== mine) return
+    // `true`, not `false`: the row exists and the ancestors are expanded — the tree simply
+    // re-flattened under the count, and the next `refresh` puts it on screen. Answering `false`
+    // here would make the caller say "that file is not in this project" about a file that is.
+    if (generation !== mine) return true
     // A reveal scrolls to a row the user was not looking at, so it also selects it: landing
     // on a screenful of rows with nothing marked leaves them to find the file again by eye,
     // which is the whole thing `file.reveal` was supposed to do for them.
@@ -535,6 +547,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       // Delete act on rows from wherever the user was before.
       selection: collapseTo(path),
     })
+    return true
   },
 
   clearReveal() {

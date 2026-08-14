@@ -133,6 +133,27 @@
   /* The pane host inside is `position: absolute; inset: 0` and resolves against this. */
   position: relative;
   /*
+   * A stacking context, which this box was already assumed to be and was not.
+   *
+   * `position: relative` with `z-index: auto` does not make one, so everything inside a pane
+   * competed directly with the frame's own layers — `.frameFocused::after` at `z-index: 1` and
+   * `.cluster` at `z-index: 2`. CodeMirror puts `.cm-panels` at **300** and `.cm-tooltip` at
+   * **500** (`@codemirror/view/dist/index.js` L6986, L10559), and neither `.cm-editor` nor this
+   * box contained them: opening the find bar in an editor pane (Ctrl+F, `editor/find.ts`, a
+   * top-anchored panel) painted it over the top focus edge *and* over the ⊞⛶⧉× cluster, so
+   * those four buttons were drawn under it and could not be clicked while the bar was open.
+   * An autocomplete or hover tooltip near the top of the pane did the same thing.
+   *
+   * `z-index: 0` and not `isolation: isolate` only because this box is already positioned, so
+   * the number is the smaller change and says the same thing. The gutters do *not* need it —
+   * `.cm-scroller` is `position: relative; z-index: 0` and contains their `z-index: 200`.
+   *
+   * Nothing inside a pane relies on escaping: the context menus portal to a sibling of `#root`
+   * (`PaneTitleBar.tsx`'s `useContextMenu`), and the overlays are rendered by `App.tsx`, not by
+   * a pane. `.reveal` already isolates its own scrim for the mirror-image reason.
+   */
+  z-index: 0;
+  /*
    * Nothing in a pane may paint outside it, and this is the one line that can guarantee it.
    *
    * The host resolves `inset: 0` against this box, so in the ordinary case there is nothing

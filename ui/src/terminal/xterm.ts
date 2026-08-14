@@ -20,7 +20,8 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { notify } from '@/chrome/notices'
 import { terminalKeyGate } from '@/keys/gate'
-import { terminalKeyBytes } from './keys'
+import { terminalClipboardAction, terminalKeyBytes, type TerminalPaneKind } from './keys'
+import { copyTerminalSelection, pasteIntoTerminal } from './clipboard'
 import { imeFiltered, InputGuard } from './inputRouting'
 import {
   paletteSignature,
@@ -98,7 +99,16 @@ function oneLine(text: string): string {
   return flat.length > 120 ? `${flat.slice(0, 119)}…` : flat
 }
 
-export function createTerminal(): TerminalHandle {
+/**
+ * Build a terminal for a pane of `kind`.
+ *
+ * The kind is a constructor argument rather than something set afterwards because it decides a
+ * keystroke, and a terminal that existed for one frame without knowing what it was hosting is a
+ * terminal that could have swallowed a `^V` the Claude CLI was waiting for. A pane's kind never
+ * changes — `PaneKind` is domain state and a Claude pane does not become a shell — so there is
+ * nothing to update later.
+ */
+export function createTerminal(kind: TerminalPaneKind): TerminalHandle {
   const style = getComputedStyle(document.documentElement)
   const theme = readTheme(style)
 
@@ -292,6 +302,34 @@ export function createTerminal(): TerminalHandle {
     if (ev.type === 'keypress') return false
 
     if (!terminalKeyGate(ev)) return false
+
+    /*
+     * Ctrl+C / Ctrl+V, decided by `terminalClipboardAction` and by nothing else.
+     *
+     * Here rather than in the keymap because this handler is the app's only *focus-scoped*
+     * keyboard entry point: xterm consults it for a keydown delivered to this terminal's own
+     * textarea, so a rule written here cannot reach the file tree, a rename field or the commit
+     * box. The window-capture gate can and would — see `keys.ts`, which carries the whole
+     * argument, and `sidebar/FileTree.tsx`, where it was first written down.
+     *
+     * Below the gate, like `terminalKeyBytes`: a user who binds `ctrl+c` in `keymap.json` still
+     * wins, and both entry points of the gate still agree about every chord, so `check:keys` is
+     * unaffected by any of this.
+     *
+     * The action is run without being awaited and the handler returns `false` synchronously.
+     * That ordering is the whole of the interception: the bytes are stopped by the return
+     * value, not by the promise, so nothing is racing the pty.
+     */
+    const action = terminalClipboardAction(ev, { selection: term.getSelection(), kind })
+    if (action !== null) {
+      ev.preventDefault()
+      const done =
+        action.kind === 'copy' ? copyTerminalSelection(term) : pasteIntoTerminal(term)
+      void done.catch((error: unknown) => {
+        notify(`The clipboard could not be reached: ${String(error)}`, { kind: 'error' })
+      })
+      return false
+    }
 
     const bytes = terminalKeyBytes(ev)
     if (bytes === null) return true

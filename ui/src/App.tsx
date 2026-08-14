@@ -46,6 +46,9 @@ import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
 import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
+import { OutsideOpenGate } from '@/chrome/OutsideOpenGate'
+import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
+import { outsideAsk } from '@/terminal/outsideOpen'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
 import { requestReveal } from '@/editor/revealRequest'
@@ -219,8 +222,21 @@ export function App() {
    * Read once and never refreshed: it describes what the workspace looked like when this
    * process started, so a pane created later has no entry and spawns immediately — which is
    * correct, because the user just asked for it.
+   *
+   * **`null` means "not fetched yet", and no pane is rendered until it is not `null`.** It used
+   * to start as an empty map, which is indistinguishable from "the plan says nothing about any
+   * of these panes" — and that is a different claim with two consequences, both silent.
+   * `PaneBody` latches its Resume splash on the *first* render (the splash and the terminal are
+   * different element types in one position, so it cannot be recomputed), so a tree painted
+   * before the plan arrived spawned every restored Claude pane at once — the "reopening a
+   * six-pane project starts six agents" case the splash exists to prevent. And a pane with no
+   * entry never passes `--resume`, so the conversation comes back empty. Both depended on two
+   * unrelated mount effects resolving in the order they were declared.
+   *
+   * A failed fetch sets an empty map rather than leaving this `null`: a plan that cannot be
+   * read costs a pane its resume, and a workspace that never renders costs the user everything.
    */
-  const [restorePlan, setRestorePlan] = useState<Map<string, PaneRestore>>(new Map())
+  const [restorePlan, setRestorePlan] = useState<Map<string, PaneRestore> | null>(null)
   const [bench, setBench] = useState<string | null>(null)
   const [benchRunning, setBenchRunning] = useState(false)
 
@@ -283,7 +299,13 @@ export function App() {
     void appApi
       .restorePlan()
       .then((plan) => setRestorePlan(new Map(plan.map((e) => [e.pane, e]))))
-      .catch((e) => diag.log(`restore plan unavailable: ${String(e)}`))
+      .catch((e) => {
+        // An empty plan, not a permanent `null`: every pane then spawns fresh, which is the
+        // same thing this window did before the plan existed. Leaving it `null` would hold the
+        // whole workspace off the screen because one optimisation could not be read.
+        setRestorePlan(new Map())
+        return diag.log(`restore plan unavailable: ${String(e)}`)
+      })
   }, [])
 
   useEffect(() => {
@@ -665,33 +687,52 @@ export function App() {
    * `openFromTerminal` and not `open`, and that is the whole security story in one word — see
    * `cmd::file::terminal_open_path`. A refusal is a sentence in the notice stack, because a
    * ctrl+click that silently does nothing is indistinguishable from a link wired to nothing.
+   *
+   * One refusal is a *question* instead of a sentence: a path outside every root. Whether it may
+   * be asked is `terminal/outsideOpen.ts`'s rule and emphatically not this callback's — a rule in
+   * a `.catch` is in the one place no check script can compile, which is where two shipped bugs
+   * have already hidden. All this does is route: ask the module, park the question if there is
+   * one, report the message if there is not.
    */
   const openTerminalPath = useCallback(
     (project: ProjectId) =>
       (path: string, at: { line: number; column: number } | null): void => {
-        if (at !== null) {
-          /*
-           * KNOWN GAP, and it is written here rather than left to be rediscovered: this lands
-           * the caret only when the tab opens in *this* window.
-           *
-           * `revealRequest` is a module-level map, and a detached pane (`pane:<uuid>`) is a
-           * separate webview with its own module instances. `terminal_open_path` is a workspace
-           * mutation, so the tab and its editor mount in the shell window — which never sees
-           * the request parked here, and the caret sits at line 1 while the file itself opens
-           * correctly.
-           *
-           * Not fixed in passing, deliberately. Carrying a caret across windows needs the
-           * target to be durable state Rust owns, and no such field exists — there is no cursor
-           * in `EditorViewState` for this to ride on. Inventing one at the end of a batch is
-           * precisely how the previous batch nearly shipped a commit-corrupting bug, so it is
-           * named as a gap instead of being half-built.
-           */
+        /*
+         * KNOWN GAP, and it is written here rather than left to be rediscovered: this lands
+         * the caret only when the tab opens in *this* window.
+         *
+         * `revealRequest` is a module-level map, and a detached pane (`pane:<uuid>`) is a
+         * separate webview with its own module instances. `terminal_open_path` is a workspace
+         * mutation, so the tab and its editor mount in the shell window — which never sees
+         * the request parked here, and the caret sits at line 1 while the file itself opens
+         * correctly.
+         *
+         * Not fixed in passing, deliberately. Carrying a caret across windows needs the
+         * target to be durable state Rust owns, and no such field exists — there is no cursor
+         * in `EditorViewState` for this to ride on. Inventing one at the end of a batch is
+         * precisely how the previous batch nearly shipped a commit-corrupting bug, so it is
+         * named as a gap instead of being half-built.
+         */
+        const park = (): void => {
+          if (at === null) return
           requestReveal(path, { line: at.line, column: at.column, endColumn: at.column + 1 })
         }
-        void fileApi
-          .openFromTerminal(project, path)
-          .then(() => hydrate())
-          .catch(notifyFailure)
+        // Re-parked on the retry rather than only once, because `REVEAL_TTL_MS` is 10 seconds
+        // and reading a confirmation can easily take longer than that. Without this the approved
+        // open lands at line 1 — the file opens, and the caret quietly does not go where the
+        // user pointed, which is the shape of bug that gets reported months later as "sometimes".
+        const attempt = (approvedTarget?: string): void => {
+          park()
+          void fileApi
+            .openFromTerminal(project, path, approvedTarget)
+            .then(() => hydrate())
+            .catch((reason: unknown) => {
+              const ask = outsideAsk(reason)
+              if (ask === null) return notifyFailure(reason)
+              requestOutsideOpen({ ask, proceed: () => attempt(ask.target) })
+            })
+        }
+        attempt()
       },
     [hydrate],
   )
@@ -699,9 +740,14 @@ export function App() {
   // A `pane:<uuid>` window shows exactly one pane. It shares the workspace mirror with the
   // shell window but none of its chrome: no project tabs, no rail, no status bar.
   if (boot?.role.kind === 'detachedPane') {
-    const { project, pane } = boot.role
+    const { project, tab: homeTab, pane } = boot.role
     const owner = boot.workspace.projects[project]
     const detachedPane = owner?.detached[pane]
+    // Nothing until the plan is in, for the reason on `restorePlan` above. This window is the
+    // one that suffered most from doing otherwise: it never received a plan at all, so a
+    // torn-out pane came back at launch, adopted a `SessionId` from the process that had
+    // written `workspace.json`, and printed `— no such session —` into a blank pane every time.
+    if (restorePlan === null) return <WindowFrame>{null}</WindowFrame>
     if (!owner || !detachedPane) {
       // The domain no longer holds this pane — its project closed while the window was up.
       // Rendering nothing is honest; the window closes on the next snapshot.
@@ -714,10 +760,20 @@ export function App() {
           cwd={owner.roots[0]?.path ?? PROJECT_ROOT}
           project={project}
           roots={owner.roots.map((r) => r.path)}
+          // The plan entry for this pane. `lifecycle::plan_restore` has always walked
+          // `project.detached` and produced one; this branch simply never read it, so the one
+          // thing it knows — that `pane.session` names a conversation from a previous process,
+          // and whether it can be resumed — reached nobody.
+          restore={restorePlan.get(pane)}
           // A torn-out pane opens tabs in the shell window, which is correct and needs no
           // special case: `terminal_open_path` is a workspace mutation, so it broadcasts
           // `cide://workspace-changed` and the shell picks the tab up like any other.
           onOpenPath={openTerminalPath(project)}
+          // The same write the shell branch makes, and it has to be made from here too: this
+          // window is where a long turn is watched and therefore where a restart happens, and
+          // `bind_session` reaches `project.detached` precisely so this call has somewhere to
+          // land. Without it the workspace keeps naming the dead child.
+          onSessionBound={(session) => void bindSession(project, homeTab, pane, session)}
           onRedock={() => void redockPane(boot.window)}
         />
         {/*
@@ -726,6 +782,14 @@ export function App() {
           * a rejected command had nowhere to be seen. Same reasoning as the shell's copy.
           */}
         <Failures />
+        {/*
+          * And the same reasoning again, one refusal further on. A torn-out pane's output names
+          * out-of-project paths exactly as a docked one does, and this branch returns before the
+          * shell's copy below — so a gate wired only into the shell tree would leave a ctrl+click
+          * here asking nobody and opening nothing. That is the shape of defect this batch's other
+          * half was fixing in `restorePlan`; it does not get to reappear in the same file.
+          */}
+        <OutsideOpenGate />
       </>
     )
   }
@@ -887,7 +951,10 @@ export function App() {
                 IPC channel would be measuring the wrong thing. The chrome audit skips them
                 for a different reason — it measures chrome, and four `claude` processes are
                 a slow way to take a ruler to a status bar. */}
-            {!benchMode() && !auditMode() && activeProject && (
+            {/* `restorePlan !== null` gates the whole tree, not just the prop: a pane that
+                renders before the plan lands latches `PaneBody`'s splash decision without it.
+                See the note on the state itself. */}
+            {!benchMode() && !auditMode() && activeProject && restorePlan !== null && (
               <TabContent
                 tabs={activeProject.tabs}
                 activeTab={activeProject.activeTab}
@@ -1059,6 +1126,10 @@ export function App() {
           * `void` call sites above it discard.
           */}
         <Failures />
+
+        {/* The out-of-project confirmation. Also in the detached branch above — one gesture,
+            two window kinds, and neither of them may be the one that asks nobody. */}
+        <OutsideOpenGate />
 
         {/*
           * The Ctrl+Tab popup. No props and no keyboard handling: the walk, its claim on Tab

@@ -21,12 +21,39 @@
 /*
  * The tree itself. One stretched cell, so the root node fills whatever is left over the
  * strip whether it is a leaf or a chain.
+ *
+ * # The 3px is the outer half of the gutter system, and it is what makes a focus ring legible
+ *
+ * A splitter track is 6px, which is really two 3px half-gutters back to back: each pane gives
+ * up 3px to the space between it and its neighbour. At the *edges* of the tree there was no
+ * neighbour and therefore no half-gutter, so the outermost pane's frame sat flush against the
+ * app's own chrome — the tab strip's `border-bottom`, the sidebar's `border-right`, the status
+ * bar's `border-top`, each a 1px `--border` line.
+ *
+ * That is fine in the Claude tab, where the pane you are looking at usually has a neighbour and
+ * the accent edge is read against the gutter between them. It is not fine in a **file tab**,
+ * which always opens as one pane in a tab of its own (`cmd/file.rs::open_file_tab` builds a
+ * tree with a single `Editor` pane), so every edge of that pane is an outer edge: the 2px accent
+ * ring was drawn immediately against a 1px border line on three sides, with no ground between
+ * them and no unfocused sibling to be brighter than. The ring was there — `PaneTitleBar.tsx`
+ * sets `focused` from `tree.focused`, which is correct for editor panes and always has been —
+ * and it read as part of the window frame rather than as a mark on the pane.
+ *
+ * Padding on the canvas rather than a margin on the leaf, because the leaf's box is a grid
+ * *track* and a margin there would come out of the `fr` fractions the splitters commit — the
+ * ratio would silently stop meaning what it says, which is the thing `min-*: 0` below is also
+ * there to prevent. The canvas's own background resolves to `.tree`'s `--panel-2`, so the new
+ * 3px is the same ground the gutters already show.
+ *
+ * It costs one terminal refit at load — the panes are 6px narrower and shorter — and none
+ * afterwards: nothing about this changes when a pane is focused, split or maximized.
  */
 .canvas {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   display: grid;
+  padding: 3px;
 }
 
 /*

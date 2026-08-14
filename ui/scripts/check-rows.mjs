@@ -400,6 +400,59 @@ try {
     'the frame publishes the pane kind, without which that inset selects nothing',
   )
 
+  // --- nothing inside a pane paints over its focus ring or its controls -----------------
+  //
+  // `.frame` isolates, so the ring (`z-index: 1`) and the cluster (`z-index: 2`) are scoped
+  // to the pane — but `.body` was `position: relative; z-index: auto`, which is *not* a
+  // stacking context, so a pane's contents competed with those two numbers directly.
+  // CodeMirror's own layers are two orders of magnitude higher: opening the find bar in an
+  // editor pane (Ctrl+F, a top-anchored `.cm-panels`) painted it over the top focus edge and
+  // over the ⊞⛶⧉× cluster, and those four buttons could not be clicked while it was up.
+  //
+  // The comparison against the real numbers in `node_modules` is the point: it is what makes
+  // this an assertion about a collision that exists rather than a restatement of the
+  // stylesheet, and it is what will explain itself if a CodeMirror upgrade ever moves them.
+  const ringZ = px(/\.frameFocused::after \{[^}]*z-index:\s*(-?\d+)/)
+  const clusterZ = px(/\.cluster \{[^}]*z-index:\s*(-?\d+)/)
+  const cmZ = [...readFileSync('node_modules/@codemirror/view/dist/index.js', 'utf8')
+    .matchAll(/zIndex:\s*(\d+)/g)].map((m) => Number(m[1]))
+  const cmMax = Math.max(0, ...cmZ)
+  ok(
+    cmMax > ringZ && cmMax > clusterZ,
+    `CodeMirror still paints something (z-index ${cmMax}) above the pane's ring (${ringZ}) ` +
+      `and cluster (${clusterZ}), so the containment below is load-bearing`,
+  )
+  ok(
+    /\.body \{[^}]*position:\s*relative[^}]*\}/.test(paneCss) &&
+      /\.body \{[^}]*z-index:\s*0[^}]*\}/.test(paneCss),
+    'and the pane body is a stacking context — positioned AND with a numeric z-index — so ' +
+      'those layers are scoped to the pane body instead of escaping over the frame',
+  )
+
+  // --- every pane edge gets the same gutter, including the ones with no neighbour -------
+  //
+  // A splitter track is 6px, which is two 3px half-gutters back to back. At the edges of the
+  // tree there is no neighbour and so there was no half-gutter: the outermost pane's frame
+  // sat flush against the tab strip, the sidebar and the status bar. Invisible in the Claude
+  // tab, where the pane you are looking at usually has a neighbour — and the whole story in a
+  // **file tab**, which always opens as one pane in a tab of its own, so every edge is an
+  // outer edge and the accent focus ring was drawn immediately against the app's own 1px
+  // border on three sides with no ground between them.
+  //
+  // Tied to `--w-splitter` rather than asserted as a literal, because the two numbers are one
+  // decision: a splitter that stops being 6px leaves the edges out of step with the middle.
+  const splitCss = css('src/layout/SplitTree.module.css')
+  const canvasPad = Number(/\.canvas \{[^}]*padding:\s*(\d+)px/.exec(splitCss)?.[1] ?? NaN)
+  const splitter = Number(
+    /--w-splitter:\s*(\d+)px/.exec(readFileSync('src/styles/tokens.css', 'utf8'))?.[1] ?? NaN,
+  )
+  eq(
+    canvasPad,
+    splitter / 2,
+    'the tree canvas pads by half a splitter, so a pane against the window chrome shows the ' +
+      'same gutter as a pane against its neighbour and its focus ring reads as a ring',
+  )
+
   if (failed === 0) console.log('rows layout: ok')
   else console.error(`\n${failed} failure(s)`)
 } finally {

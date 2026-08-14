@@ -82,6 +82,8 @@ Which check covers what you touched:
 | menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
 | terminal input, session state | `check:input`, `check:exit`, `check:awaiting`, `check:format` |
 | overlays, pickers, search | `check:picker`, `check:search`, `check:problems` |
+| terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
+| `windows/`, detach and re-dock | `check:detached`, `check:window-controls` |
 | `cide-lang`, `cide-lsp`, symbol navigation, diagnostics | `check:outline`, `check:problems`, `check:commands`, `check:keys` |
 
 ## Architecture

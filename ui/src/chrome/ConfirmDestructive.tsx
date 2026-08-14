@@ -35,9 +35,18 @@
  *   likely", and the recovery went from nothing to a desktop trash the user has to go and
  *   find. The dialog is there because the act became **easy to trigger by accident**.
  *
- * Both reasons produce the same dialog; only the body text differs, which is what the body
- * text is for. What they must not do is diverge in their *shape* — one that named the paths
- * and one that counted them would teach the user to read one and skim the other.
+ * * **A terminal pane**, for opening a file that is not in the project. Nothing is destroyed
+ *   and nothing is hard to trigger; the dialog is there because the path was **chosen by
+ *   attacker-influenced bytes** and the whole safeguard *is* the user reading it. That makes
+ *   rule 1 — name every path, in full, never a basename — load-bearing rather than considerate:
+ *   `credentials.json` looks like a project file and `/home/you/.claude/.credentials.json` does
+ *   not. The rules live in `terminal/outsideOpen.ts` so a check script can run them; this
+ *   component only draws what that module decided.
+ *
+ * All three reasons produce the same dialog; the body text differs, which is what the body text
+ * is for, and the third overrides the list glyph because it is not a removal. What they must not
+ * do is diverge in their *shape* — one that named the paths and one that counted them would
+ * teach the user to read one and skim the other.
  */
 import { useEffect, useRef } from 'react'
 import { OverlayCard } from '@/overlays/ModalShell'
@@ -57,6 +66,15 @@ export interface ConfirmState {
   files: readonly string[]
   /** The word on the destructive button, e.g. `Revert 4 files`. */
   confirmLabel: string
+  /**
+   * The glyph before each path. `−` (removal) unless the caller says otherwise.
+   *
+   * Optional because the third caller is not a removal — see the header — and the mark is the
+   * one part of this dialog that states *what kind of thing* is about to happen. Reusing `−`
+   * for an open would say "these files are about to go", which is a sentence the dialog would
+   * then be contradicting.
+   */
+  mark?: string
   run: () => void
 }
 
@@ -102,9 +120,11 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
             return (
               <li key={path} className={styles.row} title={path}>
                 {/* `−` rather than the tab strip's `●`: what is about to happen to these rows
-                    is removal, and reusing the dirty dot would say "unsaved" instead. */}
+                    is removal, and reusing the dirty dot would say "unsaved" instead. The
+                    out-of-project open overrides it with `↗`, because nothing is being
+                    removed there — see `ConfirmState.mark`. */}
                 <span className={styles.mark} aria-hidden="true">
-                  −
+                  {state.mark ?? '−'}
                 </span>
                 <span className={styles.name}>{name}</span>
                 <span className={styles.where}>{dir}</span>

@@ -78,22 +78,27 @@ fn open_file_tab(state: &WorkspaceState, project: ProjectId, path: PathBuf) -> R
 
 /// Why a path named by terminal output was not opened.
 ///
-/// Tagged `{kind, message}` on the wire like [`ClaudeSendError`], and typed rather than a bare
-/// string for the same reason: the frontend must be able to tell a refusal from a failure
-/// without matching on prose. Every variant is a sentence a user reads in the notice stack.
+/// Tagged `{kind, message, path, real}` on the wire like [`ClaudeSendError`], and typed rather
+/// than a bare string for the same reason: the frontend must be able to tell a refusal from a
+/// failure without matching on prose. Every variant is a sentence a user reads in the notice
+/// stack — except [`Self::Outside`], which is a *question*, and the only one the frontend turns
+/// into a dialog instead.
 ///
 /// A silent `Ok` for a refused path was the obvious alternative and is the worst of them: a
 /// ctrl+click that resolves to nothing is indistinguishable from a link wired to nothing, which
 /// is the defect this project has now found twelve times.
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalOpenError {
-    /// The path is not inside any of this project's roots — or is not absolute, or climbs with
-    /// `..`, both of which [`cide_fs::ops::check_within`] refuses outright.
-    #[error(
-        "{0} is outside this project. cide only opens files from terminal output that are \
-         inside the project's roots."
-    )]
-    Outside(String),
+    /// The path is not inside any of this project's roots.
+    ///
+    /// **This is the one refusal the user may overrule**, and `real` is what makes that safe:
+    /// it is the canonical path the click would actually open, which is what the confirmation
+    /// names and what comes back as `approvedTarget`. It is `None` when there is nothing to
+    /// approve because the path was *malformed* rather than merely outside — not absolute, or
+    /// carrying a `..` component — and a `None` here is the frontend's signal that no dialog
+    /// may be offered. See [`outside_ask`'s mirror in `ui/src/terminal/outsideOpen.ts`].
+    #[error("{path} is outside this project's roots.")]
+    Outside { path: String, real: Option<String> },
 
     /// Nothing is there. Ordinary: output outlives the files it names.
     #[error("{0} no longer exists")]
@@ -112,21 +117,53 @@ pub enum TerminalOpenError {
     Failed(String),
 }
 
+impl TerminalOpenError {
+    /// The path this refusal is about, as it was asked for.
+    ///
+    /// Serialised alongside the message so the frontend's rules can be written over data rather
+    /// than over prose. The caller already knows the string it sent; carrying it back anyway is
+    /// what lets `outsideOpen.ts` be a pure function of the refusal alone, which is what makes
+    /// it testable under node.
+    fn path(&self) -> &str {
+        match self {
+            Self::Outside { path, .. } => path,
+            Self::Missing(p) | Self::NotAFile(p) | Self::Failed(p) => p,
+            Self::TooLarge { path, .. } => path,
+        }
+    }
+}
+
 impl serde::Serialize for TerminalOpenError {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let kind = match self {
-            Self::Outside(_) => "outside",
+            Self::Outside { .. } => "outside",
             Self::Missing(_) => "missing",
             Self::NotAFile(_) => "notAFile",
             Self::TooLarge { .. } => "tooLarge",
             Self::Failed(_) => "failed",
         };
+        let real = match self {
+            Self::Outside { real, .. } => real.as_deref(),
+            _ => None,
+        };
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("TerminalOpenError", 2)?;
+        let mut st = s.serialize_struct("TerminalOpenError", 4)?;
         st.serialize_field("kind", kind)?;
         st.serialize_field("message", &self.to_string())?;
+        st.serialize_field("path", self.path())?;
+        st.serialize_field("real", &real)?;
         st.end()
     }
+}
+
+/// What [`openable`] decided about a path it is willing to open.
+#[derive(Debug, PartialEq, Eq)]
+struct Openable {
+    /// The canonical path. **Not** what the tab opens on — see [`terminal_open_path`] — but it
+    /// is what an out-of-project approval is bound to, so it has to travel out of here.
+    real: PathBuf,
+    /// This path is outside every root and the user approved it by name.
+    outside: bool,
 }
 
 /// Every check a path parsed out of a pane's bytes has to pass before it may open a tab.
@@ -148,44 +185,91 @@ impl serde::Serialize for TerminalOpenError {
 ///
 /// Unguarded, `⏺ Read(/home/you/.claude/.credentials.json)` printed by any program in any pane
 /// would be a ~1 KiB valid-UTF-8 text file: it would open, and its contents would be in the
-/// webview. That is the constraint this function exists to make unreachable.
+/// webview. That is the constraint this function exists around.
 ///
-/// # The checks, in order, and what each one is for
+/// # Four guards on one error path, and only one of them is about the project boundary
 ///
-/// 1. **[`cide_fs::ops::check_within`]** — absolute, no `..` component, inside a root. This
-///    alone answers `/etc/shadow`, `~/.claude/.credentials.json` and everything outside the
-///    project. It is deliberately *textual*, which is why it cannot be the last word.
-/// 2. **`canonicalize`, then contain again** — because (1) cannot see a symlink inside the
-///    project pointing out of it. The roots are canonicalised too: a machine whose `$HOME` is a
-///    symlink would otherwise fail every one of its own files.
-/// 3. **A regular file** — not a directory (`Compiling … (/abs/dir)` is a frequent, real line),
-///    and not a device or a socket, and above all **not a FIFO**: `document::read`'s only
-///    metadata check is `is_dir`, so a named pipe would park a blocking-pool worker inside
-///    `read_to_end` for ever, and `/dev/zero` would allocate 32 MiB before being refused.
-/// 4. **The size limit, before a tab exists** — so a 2 GB log is a sentence rather than a junk
-///    tab the user has to close and an editor that then refuses to fill it.
+/// They were written together and they answer completely different questions. Writing them
+/// down separately is the point of this section, because M13 relaxed exactly one of them and a
+/// reader who thinks of them as one rule will relax the wrong one next time.
 ///
-/// What it does **not** do is grant any new capability. The only thing that happens on success
-/// is the workspace mutation `tab_open_file` already performs; a terminal-derived path never
+/// | guard | concern | what removing it costs |
+/// | --- | --- | --- |
+/// | shape: absolute, no `..` | **integrity** — a path that means something different depending on who resolves it | a relative path canonicalised against cide's *own* cwd, which is not the project |
+/// | containment (textual, then canonical) | **confidentiality** — any readable text file on the machine | `~/.claude/.credentials.json` in a buffer, and from there in `claude_selection_changed` |
+/// | `is_file` | **liveness** — FIFOs, device nodes, sockets, directories | a blocking-pool worker parked in `read_to_end` for ever, or `/dev/zero` read until the process is OOM-killed |
+/// | size limit | **junk** — a 2 GB log becomes a tab and then an error | annoying, not dangerous |
+///
+/// Only the second is a *project* boundary, and it is the only one `approved` can overrule.
+/// The other three stay hard refusals for an approved out-of-project path exactly as they are
+/// for an in-project one — which is what the "…even when approved" tests below pin, because
+/// until M13 containment fired first for everything under `/dev`, `/proc` and `/tmp` and those
+/// three guards were very nearly decorative.
+///
+/// # Why containment is now checked *last* rather than first
+///
+/// It used to be first, so nothing outside the project was ever `stat`ed. The order is now
+/// shape → `canonicalize` → `metadata` → containment, and the trade is deliberate:
+///
+/// * **A refusal that cannot be overruled must never open a dialog.** A ctrl+click on
+///   `/dev/zero`, on a directory, or on a path that no longer exists is answered with one
+///   sentence and no question — because asking "may cide open this?" about a thing it could
+///   not open either way trains the user to approve without reading, which is the only way
+///   this dialog can fail.
+/// * **The dialog must name what would actually be opened**, which means the canonical path,
+///   which means canonicalising before refusing.
+///
+/// What it costs is two `stat`-class syscalls on an out-of-project path before the user has
+/// approved it, which tells the webview whether that path exists. That is not a new capability:
+/// `file_read` beside this function has no containment at all, so a *compromised webview*
+/// already reads any file, and the threat this function actually defends against is a different
+/// one — attacker-chosen bytes on screen plus one unsuspecting ctrl+click. Against that threat
+/// the defence has to be visible to the user at the moment of the click, and that is the
+/// confirmation, not the ordering of two syscalls.
+///
+/// # What `approved` is, and why it is a path and not a bool
+///
+/// It is the canonical path the confirmation named — the one the user read before clicking
+/// *Open*. Rust re-canonicalises and compares, so the approval is an approval of **a file**
+/// rather than of a string. A bool would approve whatever that string resolves to *now*: swap
+/// the symlink between the dialog and the click and the user's answer applies to a file they
+/// were never shown. Mismatch is refused as `Outside` again, carrying the new target, so the
+/// user is asked about what is actually there.
+///
+/// What none of this grants is any new *capability*. On success the only thing that happens is
+/// the workspace mutation `tab_open_file` already performs; a terminal-derived path never
 /// reaches `fs_show_in_manager`, `tauri_plugin_opener` or anything else that hands a path to
 /// the desktop.
-fn openable(roots: &[PathBuf], path: &Path) -> std::result::Result<(), TerminalOpenError> {
+fn openable(
+    roots: &[PathBuf],
+    path: &Path,
+    approved: Option<&Path>,
+) -> std::result::Result<Openable, TerminalOpenError> {
     let shown = path.display().to_string();
 
-    cide_fs::ops::check_within(roots, path)
-        .map_err(|_| TerminalOpenError::Outside(shown.clone()))?;
+    // Shape, against no roots at all — so it holds whether or not anything was approved. This
+    // is `check_within`'s first two clauses, lifted out of it precisely because the third
+    // (containment) is now overrulable and these two never are. `real: None` is what tells the
+    // frontend there is nothing here to offer a dialog about.
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(TerminalOpenError::Outside {
+            path: shown,
+            real: None,
+        });
+    }
 
     let real = std::fs::canonicalize(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TerminalOpenError::Missing(shown.clone()),
         _ => TerminalOpenError::Failed(format!("{shown}: {e}")),
     })?;
-    let canonical_roots: Vec<PathBuf> = roots
-        .iter()
-        .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
-        .collect();
-    cide_fs::ops::check_within(&canonical_roots, &real)
-        .map_err(|_| TerminalOpenError::Outside(shown.clone()))?;
 
+    // Liveness and junk, on the canonical path, before containment and before any approval is
+    // consulted. `canonicalize` already proved it exists, so a failure here is a race or a
+    // permission problem rather than the ordinary "output outlives its files".
     let meta = std::fs::metadata(&real).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TerminalOpenError::Missing(shown.clone()),
         _ => TerminalOpenError::Failed(format!("{shown}: {e}")),
@@ -200,7 +284,37 @@ fn openable(roots: &[PathBuf], path: &Path) -> std::result::Result<(), TerminalO
             limit: document::MAX_FILE_BYTES / (1024 * 1024),
         });
     }
-    Ok(())
+
+    // Containment, both locks. Textual on the path as given, because that is the string the
+    // user read; canonical on what it resolves to, because the textual check cannot see a
+    // symlink inside the project pointing out of it. The roots are canonicalised too: a machine
+    // whose `$HOME` is a symlink would otherwise fail every one of its own files.
+    let canonical_roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
+        .collect();
+    let contained = cide_fs::ops::check_within(roots, path).is_ok()
+        && cide_fs::ops::check_within(&canonical_roots, &real).is_ok();
+    if contained {
+        return Ok(Openable {
+            real,
+            outside: false,
+        });
+    }
+
+    match approved {
+        // The user was shown this exact target and said yes.
+        Some(target) if target == real.as_path() => Ok(Openable {
+            real,
+            outside: true,
+        }),
+        // Either nobody has been asked yet, or the answer was about a different file than the
+        // one this path resolves to now. Both end in the same place: ask about what is there.
+        _ => Err(TerminalOpenError::Outside {
+            path: shown,
+            real: Some(real.display().to_string()),
+        }),
+    }
 }
 
 /// Open a file a terminal pane named — the one command whose path argument is untrusted.
@@ -210,14 +324,22 @@ fn openable(roots: &[PathBuf], path: &Path) -> std::result::Result<(), TerminalO
 /// at rather than whatever a symlink resolved to — and so the `requestReveal` the frontend
 /// parked under that same string is spent by the editor this opens.
 ///
-/// `spawn_blocking` because steps 2-4 of [`openable`] are `stat`s, and a project on a stalled
-/// network mount would otherwise take the event loop and with it every terminal in the window.
-/// The same reasoning as `file_read` beside it.
+/// `approved_target` is the out-of-project answer, and it is a *parameter rather than a second
+/// command* on purpose. Two entry points into one tab list is how the trust story forks: the
+/// day someone adds `terminal_open_path_approved` is the day one of the two stops canonicalising
+/// and nobody notices, because the tests are attached to the other one. Absent — which is every
+/// first click, and every click on an in-project path for ever — nothing about this command's
+/// behaviour has changed.
+///
+/// `spawn_blocking` because [`openable`] is a `canonicalize` and two `stat`s, and a project on a
+/// stalled network mount would otherwise take the event loop and with it every terminal in the
+/// window. The same reasoning as `file_read` beside it.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn terminal_open_path(
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     path: PathBuf,
+    approved_target: Option<PathBuf>,
 ) -> std::result::Result<TabId, TerminalOpenError> {
     let roots: Vec<PathBuf> = state
         .with(|ws| {
@@ -227,14 +349,28 @@ pub async fn terminal_open_path(
         .map_err(|e| TerminalOpenError::Failed(e.to_string()))?;
 
     let checked = path.clone();
-    let job = tauri::async_runtime::spawn_blocking(move || openable(&roots, &checked));
-    match job.await {
+    let job = tauri::async_runtime::spawn_blocking(move || {
+        openable(&roots, &checked, approved_target.as_deref())
+    });
+    let opened = match job.await {
         Ok(result) => result?,
         Err(e) => {
             return Err(TerminalOpenError::Failed(format!(
                 "file worker failed: {e}"
             )));
         }
+    };
+
+    if opened.outside {
+        // Worth a line in the log and only a line: the user answered a dialog naming this exact
+        // path, so it is not a surprise to them — but it is the one gesture in the app that
+        // reads a file the project does not contain, and a log with no record of it would make
+        // an after-the-fact "how did that get open?" unanswerable.
+        tracing::info!(
+            path = %path.display(),
+            real = %opened.real.display(),
+            "opening a file outside the project, approved by the user"
+        );
     }
 
     open_file_tab(&state, project, path).map_err(|e| TerminalOpenError::Failed(e.to_string()))
@@ -1602,20 +1738,29 @@ mod tests {
         dir
     }
 
+    /// Nobody has approved anything — the state every first click is in.
+    const UNASKED: Option<&Path> = None;
+
     #[test]
     fn a_file_inside_the_project_opens() {
         let root = scratch("inside");
         let roots = vec![root.clone()];
-        assert!(openable(&roots, &root.join("src/main.rs")).is_ok());
+        let opened = openable(&roots, &root.join("src/main.rs"), UNASKED).expect("openable");
+        assert!(
+            !opened.outside,
+            "a file the project contains is not an out-of-project open, and must not be logged \
+             or treated as one"
+        );
     }
 
-    /// The line at the top of this feature's brief, made unreachable.
+    /// The line at the top of this feature's brief. Not opened without an answer.
     ///
     /// `⏺ Read(/home/you/.claude/.credentials.json)` printed by any program in any pane is a
     /// small, valid-UTF-8 text file: without containment it would open and its contents would
-    /// be in the webview.
+    /// be in the webview. Since M13 the user may overrule this — but only by name, and only
+    /// after reading the path, which is what the second half of this test pins.
     #[test]
-    fn a_path_outside_every_root_is_refused_however_ordinary_the_file_is() {
+    fn a_path_outside_every_root_is_refused_until_the_user_approves_that_exact_file() {
         let root = scratch("outside");
         let elsewhere = std::env::temp_dir().join(format!(
             "cide-openable-outside-secret-{}.json",
@@ -1623,25 +1768,72 @@ mod tests {
         ));
         std::fs::write(&elsewhere, "{\"token\":\"nope\"}\n").expect("a perfectly readable file");
         let roots = vec![root.clone()];
+
+        let refusal = openable(&roots, &elsewhere, UNASKED).expect_err("unapproved");
+        let TerminalOpenError::Outside { real, .. } = &refusal else {
+            panic!("a readable text file outside the project must be refused: {refusal:?}");
+        };
+        let real = real
+            .clone()
+            .expect("the refusal has to name what would be opened");
+        assert_eq!(
+            real,
+            std::fs::canonicalize(&elsewhere)
+                .expect("canonical")
+                .display()
+                .to_string(),
+            "the confirmation names the canonical path, so the refusal has to carry it"
+        );
+
+        let approved = openable(&roots, &elsewhere, Some(Path::new(&real))).expect("approved");
         assert!(
-            matches!(
-                openable(&roots, &elsewhere),
-                Err(TerminalOpenError::Outside(_))
-            ),
-            "a readable text file outside the project is exactly the case that must be refused"
+            approved.outside,
+            "an approved open is still an out-of-project open and has to say so"
         );
         let _ = std::fs::remove_file(&elsewhere);
     }
 
-    /// `..` is refused as a component rather than normalised, which is `check_within`'s rule.
+    /// The approval is an approval of a *file*, not of a string.
+    ///
+    /// Swap what the path resolves to between the dialog and the click and the user's answer no
+    /// longer describes anything they were shown. Refused, and refused with the *new* target, so
+    /// the second question is about what is actually there.
+    #[test]
+    fn an_approval_for_a_different_target_is_not_an_approval() {
+        let root = scratch("approval-mismatch");
+        let elsewhere =
+            std::env::temp_dir().join(format!("cide-openable-mismatch-{}.txt", std::process::id()));
+        std::fs::write(&elsewhere, "hello\n").expect("a file");
+        let roots = vec![root.clone()];
+        let stale = std::env::temp_dir().join("cide-openable-mismatch-something-else.txt");
+
+        let refusal = openable(&roots, &elsewhere, Some(&stale)).expect_err("mismatch");
+        assert!(
+            matches!(&refusal, TerminalOpenError::Outside { real: Some(r), .. }
+                if *r == std::fs::canonicalize(&elsewhere).expect("canonical").display().to_string()),
+            "a stale approval is answered by asking again about the real target: {refusal:?}"
+        );
+        let _ = std::fs::remove_file(&elsewhere);
+    }
+
+    /// `..` is refused as a component rather than normalised.
+    ///
+    /// And it is refused **with no `real`**, which is load-bearing: a malformed path is the one
+    /// out-of-project refusal that no approval can ever satisfy, so the frontend must not be
+    /// able to raise a dialog for it. `real: None` is that signal.
     #[test]
     fn a_path_that_climbs_out_is_refused_even_though_it_starts_inside_a_root() {
         let root = scratch("climb");
         let roots = vec![root.clone()];
         let climbing = root.join("src/../../etc/passwd");
         assert!(matches!(
-            openable(&roots, &climbing),
-            Err(TerminalOpenError::Outside(_))
+            openable(&roots, &climbing, UNASKED),
+            Err(TerminalOpenError::Outside { real: None, .. })
+        ));
+        // And approving it changes nothing — there is no target to approve.
+        assert!(matches!(
+            openable(&roots, &climbing, Some(Path::new("/etc/passwd"))),
+            Err(TerminalOpenError::Outside { real: None, .. })
         ));
     }
 
@@ -1658,9 +1850,12 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         let roots = vec![root.clone()];
+        let refusal = openable(&roots, &link, UNASKED).expect_err("refused");
         assert!(
-            matches!(openable(&roots, &link), Err(TerminalOpenError::Outside(_))),
-            "check_within is textual by design, so the canonical path has to be contained too"
+            matches!(&refusal, TerminalOpenError::Outside { real: Some(r), .. }
+                if r.contains("cide-openable-symlink-target")),
+            "check_within is textual by design, so the canonical path has to be contained too — \
+             and the dialog has to name where the link actually goes: {refusal:?}"
         );
         let _ = std::fs::remove_file(&target);
     }
@@ -1679,7 +1874,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &alias).expect("symlink the root itself");
         let roots = vec![alias.clone()];
         assert!(
-            openable(&roots, &alias.join("src/main.rs")).is_ok(),
+            openable(&roots, &alias.join("src/main.rs"), UNASKED).is_ok(),
             "the file is inside the root the user opened; that the root is a symlink is not \
              the user's problem"
         );
@@ -1692,7 +1887,7 @@ mod tests {
         let root = scratch("dir");
         let roots = vec![root.clone()];
         assert!(matches!(
-            openable(&roots, &root.join("src")),
+            openable(&roots, &root.join("src"), UNASKED),
             Err(TerminalOpenError::NotAFile(_))
         ));
     }
@@ -1717,7 +1912,7 @@ mod tests {
         }
         let roots = vec![root.clone()];
         assert!(matches!(
-            openable(&roots, &fifo),
+            openable(&roots, &fifo, UNASKED),
             Err(TerminalOpenError::NotAFile(_))
         ));
     }
@@ -1728,7 +1923,7 @@ mod tests {
         let root = scratch("missing");
         let roots = vec![root.clone()];
         assert!(matches!(
-            openable(&roots, &root.join("src/gone.rs")),
+            openable(&roots, &root.join("src/gone.rs"), UNASKED),
             Err(TerminalOpenError::Missing(_))
         ));
     }
@@ -1740,16 +1935,165 @@ mod tests {
         let root = scratch("relative");
         let roots = vec![root];
         assert!(matches!(
-            openable(&roots, Path::new("src/main.rs")),
-            Err(TerminalOpenError::Outside(_))
+            openable(&roots, Path::new("src/main.rs"), UNASKED),
+            Err(TerminalOpenError::Outside { real: None, .. })
         ));
+    }
+
+    // --- the guards that are NOT about the project boundary ---------------------------------
+    //
+    // Until the out-of-project open existed, containment fired first for everything under
+    // `/dev`, `/proc` and `/tmp`, so `is_file` and the size limit were very nearly decorative:
+    // nothing they refuse was reachable except through a path inside the project. An approved
+    // out-of-project path reaches them for the first time, which is why each one is pinned here
+    // *with* an approval — the approval answers one question and must not answer the others.
+
+    /// A FIFO outside the project would still park a blocking-pool worker for ever.
+    #[cfg(unix)]
+    #[test]
+    fn an_approved_fifo_outside_the_project_is_still_refused() {
+        let root = scratch("approved-fifo");
+        // Named apart from `scratch`'s own directory: `scratch("approved-fifo")` builds
+        // `cide-openable-approved-fifo-<pid>`, and giving the FIFO that same path made
+        // `mkfifo` fail with EEXIST — which this test treats as "this filesystem cannot hold a
+        // FIFO" and passes. A silent pass is the one outcome an escape hatch must not produce
+        // for the wrong reason, and it did, until a mutation run noticed the test never failed.
+        let fifo = std::env::temp_dir().join(format!(
+            "cide-openable-approved-fifo-{}.pipe",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&fifo);
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("c string");
+        // SAFETY: a valid NUL-terminated path and a constant mode; `mkfifo` touches nothing else.
+        if unsafe { libc::mkfifo(c.as_ptr(), 0o644) } != 0 {
+            return;
+        }
+        let roots = vec![root];
+        assert!(
+            matches!(
+                openable(&roots, &fifo, Some(&fifo)),
+                Err(TerminalOpenError::NotAFile(_))
+            ),
+            "the user approved crossing the project boundary, not hanging the blocking pool"
+        );
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    /// `/dev/zero` reports `len == 0`, so only `is_file` stands between it and `read_to_end`.
+    #[cfg(unix)]
+    #[test]
+    fn an_approved_device_node_is_still_refused() {
+        let root = scratch("approved-dev");
+        let roots = vec![root];
+        let zero = Path::new("/dev/zero");
+        if !zero.exists() {
+            return;
+        }
+        assert!(
+            matches!(
+                openable(&roots, zero, Some(zero)),
+                Err(TerminalOpenError::NotAFile(_))
+            ),
+            "`/dev/zero` has a length of 0, so the size guard is inert there and `is_file` is \
+             the only thing between it and a read that allocates until the process is killed"
+        );
+    }
+
+    /// A directory outside the project is as un-openable as one inside it.
+    #[test]
+    fn an_approved_directory_outside_the_project_is_still_refused() {
+        let root = scratch("approved-dir");
+        let elsewhere = scratch("approved-dir-elsewhere");
+        let roots = vec![root];
+        assert!(matches!(
+            openable(&roots, &elsewhere, Some(&elsewhere)),
+            Err(TerminalOpenError::NotAFile(_))
+        ));
+    }
+
+    /// The size limit is the editor's, not the project's.
+    #[test]
+    fn an_approved_enormous_file_outside_the_project_is_still_refused() {
+        let root = scratch("approved-huge");
+        let huge = std::env::temp_dir().join(format!(
+            "cide-openable-approved-huge-{}.log",
+            std::process::id()
+        ));
+        // Sparse: `set_len` past the limit costs no blocks and no time.
+        let f = std::fs::File::create(&huge).expect("create");
+        f.set_len(document::MAX_FILE_BYTES + 1).expect("set_len");
+        drop(f);
+        let roots = vec![root];
+        let real = std::fs::canonicalize(&huge).expect("canonical");
+        assert!(matches!(
+            openable(&roots, &huge, Some(&real)),
+            Err(TerminalOpenError::TooLarge { .. })
+        ));
+        let _ = std::fs::remove_file(&huge);
+    }
+
+    /// An approval cannot conjure a file. Refused as `Missing`, and with no dialog behind it.
+    #[test]
+    fn an_approved_path_that_does_not_exist_is_still_missing() {
+        let root = scratch("approved-gone");
+        let gone = std::env::temp_dir().join(format!(
+            "cide-openable-approved-gone-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&gone);
+        let roots = vec![root];
+        assert!(matches!(
+            openable(&roots, &gone, Some(&gone)),
+            Err(TerminalOpenError::Missing(_))
+        ));
+    }
+
+    /// A refusal that cannot be overruled must never reach the confirmation.
+    ///
+    /// The frontend's rule is "`kind == outside` and `real != null` asks; everything else is a
+    /// sentence" (`ui/src/terminal/outsideOpen.ts`). This is the Rust half of that agreement:
+    /// no other variant may ever serialise a `real`, or a device node would grow an *Open
+    /// anyway* button that opens nothing.
+    #[test]
+    fn only_the_outside_refusal_carries_a_target_to_approve() {
+        let cases = [
+            TerminalOpenError::Missing("/p/gone.rs".into()),
+            TerminalOpenError::NotAFile("/p/src".into()),
+            TerminalOpenError::TooLarge {
+                path: "/p/huge.log".into(),
+                size: 2048,
+                limit: 32,
+            },
+            TerminalOpenError::Failed("the project closed".into()),
+            TerminalOpenError::Outside {
+                path: "../../.ssh/id_rsa".into(),
+                real: None,
+            },
+        ];
+        for case in cases {
+            let json = serde_json::to_value(&case).expect("serialisable");
+            assert!(
+                json["real"].is_null(),
+                "this refusal is final; a target on it would offer an approval that cannot \
+                 work: {json}"
+            );
+        }
+        let asked = serde_json::to_value(TerminalOpenError::Outside {
+            path: "/home/you/.ssh/id_rsa".into(),
+            real: Some("/home/you/.ssh/id_rsa".into()),
+        })
+        .expect("serialisable");
+        assert_eq!(asked["real"], "/home/you/.ssh/id_rsa");
     }
 
     /// Every refusal is a sentence, because every one of them is shown to a person.
     #[test]
     fn every_refusal_carries_a_message_and_a_kind() {
         let cases = [
-            TerminalOpenError::Outside("/etc/shadow".into()),
+            TerminalOpenError::Outside {
+                path: "/etc/shadow".into(),
+                real: Some("/etc/shadow".into()),
+            },
             TerminalOpenError::Missing("/p/gone.rs".into()),
             TerminalOpenError::NotAFile("/p/src".into()),
             TerminalOpenError::TooLarge {
@@ -1763,7 +2107,9 @@ mod tests {
             let json = serde_json::to_value(&case).expect("serialisable");
             let kind = json["kind"].as_str().expect("a kind to branch on");
             let message = json["message"].as_str().expect("a sentence to read");
+            let path = json["path"].as_str().expect("the path it is about");
             assert!(!kind.is_empty(), "{json}");
+            assert!(!path.is_empty(), "{json}");
             assert!(
                 message.len() > 10 && message.contains(' '),
                 "a refusal the user cannot read is a link wired to nothing: {json}"

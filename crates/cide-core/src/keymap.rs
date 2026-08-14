@@ -609,6 +609,34 @@ mod tests {
             .collect()
     }
 
+    /// **Ctrl+C and Ctrl+V are not the keymap's, and must never become the keymap's.**
+    ///
+    /// They are resolved inside the terminal instead — `ui/src/terminal/keys.ts`, from xterm's
+    /// own custom key handler — and the difference is not stylistic. The key gate's second entry
+    /// point is a window **capture** listener, so a binding here is consumed before the event
+    /// reaches its target: it would take Ctrl+C and Ctrl+V away from the file tree (which has
+    /// its own copy/cut/paste over the selected rows), from the commit message box, from every
+    /// rename field and from every text input in the app. A `when: "terminalFocused"` clause
+    /// does not save it — that flag is derived from `tab.tree.focused`, which stays true while
+    /// the caret is in any of those.
+    ///
+    /// And Ctrl+C is the interrupt. A binding here swallows the keystroke, so the pty never
+    /// receives `ETX` and a runaway command or a mid-turn `claude` cannot be stopped from the
+    /// keyboard at all. That is the regression this test exists to make loud, because "just add
+    /// a binding" is the obvious-looking way to implement copy and it is silently catastrophic.
+    #[test]
+    fn the_terminal_clipboard_chords_are_not_bound_here() {
+        for binding in defaults().into_iter().chain(platform_defaults()) {
+            let key = normalize_key(&binding.key);
+            assert!(
+                key != "ctrl+c" && key != "ctrl+v",
+                "{key} is bound to {} — the terminal owns these two, focus-scoped; see \
+                 ui/src/terminal/keys.ts",
+                binding.command
+            );
+        }
+    }
+
     #[test]
     fn spellings_of_one_keystroke_all_normalise_alike() {
         let canonical = normalize_key("ctrl+shift+p");

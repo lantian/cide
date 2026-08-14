@@ -57,27 +57,54 @@ pub async fn symbols_outline(
         .map(|fs| fs.root_paths())
         .unwrap_or_default();
 
-    blocking(move || {
-        // Containment first, whatever the source of the text: a path outside the project is one
-        // this command has no business reading, and answering for it would let any window read
-        // any file by asking for its outline.
-        if !roots.is_empty() && cide_fs::ops::check_within(&roots, &path).is_err() {
-            return Err(SymbolError::Outside(path.display().to_string()));
-        }
-        let text = match text {
-            Some(text) => text,
-            None => std::fs::read_to_string(&path).map_err(|error| SymbolError::Io {
+    blocking(move || outline_of(&roots, &path, text)).await
+}
+
+/// The body of [`symbols_outline`], as a free function over the roots.
+///
+/// Split out for the same reason `cmd::file::openable` is: the containment rule below is the
+/// half that must not rot, and a `#[tauri::command]` taking a `State` cannot be called from a
+/// test.
+///
+/// # Containment guards the read, and only the read
+///
+/// It used to be the first statement in this function, before the `match` — and that was quietly
+/// wrong. The check exists so that *a window cannot read any file by asking for its outline*;
+/// when the caller supplies `text` no file is read, so there is nothing to guard, and refusing
+/// anyway answered every out-of-project buffer with a rejection.
+///
+/// That rejection is *swallowed on purpose* by `ui/src/editor/outlineStore.ts` — a toast per
+/// keystroke of the breadcrumb would be unusable — so the whole visible symptom was: Ctrl+F12
+/// opens an empty popup, the status bar's member trail stops after the filename, and Alt+Down
+/// does nothing. No error, anywhere. It was unreachable while nothing outside the roots could be
+/// opened; Ctrl+B into `~/.cargo/registry/…` has reached it for as long as go-to-definition has
+/// existed, and the approved out-of-project open in `cmd::file::terminal_open_path` makes it
+/// ordinary.
+///
+/// Moving it into the `None` arm keeps the security property exactly as it was — the only thing
+/// that touches the disk is inside the guard — and costs the outline nothing.
+fn outline_of(
+    roots: &[PathBuf],
+    path: &std::path::Path,
+    text: Option<String>,
+) -> Result<FileOutline> {
+    let text = match text {
+        Some(text) => text,
+        None => {
+            if !roots.is_empty() && cide_fs::ops::check_within(roots, path).is_err() {
+                return Err(SymbolError::Outside(path.display().to_string()));
+            }
+            std::fs::read_to_string(path).map_err(|error| SymbolError::Io {
                 path: path.display().to_string(),
                 message: error.to_string(),
-            })?,
-        };
-        Ok(cide_lang::outline(
-            &path,
-            &text,
-            cide_lang::Limits::default(),
-        ))
-    })
-    .await
+            })?
+        }
+    };
+    Ok(cide_lang::outline(
+        path,
+        &text,
+        cide_lang::Limits::default(),
+    ))
 }
 
 /// Build this project's symbol index, or report the one already built.
@@ -161,4 +188,72 @@ async fn blocking<T: Send + 'static>(
             path: String::new(),
             message: format!("the symbol worker did not finish: {error}"),
         })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch project root, removed and recreated so a rerun is not a failure.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cide-outline-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch root");
+        dir
+    }
+
+    const RUST: &str = "pub fn alpha() {}\npub fn beta() {}\n";
+
+    /// The defect this arrangement exists to prevent, stated as a test.
+    ///
+    /// Every editor surface that shows structure — Ctrl+F12, the status bar's member trail,
+    /// Alt+Up/Down — asks with the live buffer. While the containment check sat above the
+    /// `match`, all three answered nothing for a file the project does not contain, and
+    /// answered it *silently*, because `outlineStore.ts` swallows the rejection on purpose.
+    #[test]
+    fn a_buffer_outside_the_project_still_has_an_outline_when_its_text_is_supplied() {
+        let root = scratch("outside-with-text");
+        let elsewhere =
+            std::env::temp_dir().join(format!("cide-outline-elsewhere-{}.rs", std::process::id()));
+        let outline = outline_of(&[root], &elsewhere, Some(RUST.to_owned()))
+            .expect("supplied text needs no disk and therefore no containment check");
+        let FileOutline::Ready { symbols, .. } = outline else {
+            panic!("a .rs buffer parses whether or not the project contains it: {outline:?}");
+        };
+        assert_eq!(
+            symbols.len(),
+            2,
+            "the popup, the breadcrumb and the member walk all read this list"
+        );
+    }
+
+    /// And the property the check was there for is unchanged.
+    #[test]
+    fn a_file_outside_the_project_is_still_never_read_from_disk() {
+        let root = scratch("outside-no-text");
+        let elsewhere = root
+            .parent()
+            .expect("temp dir")
+            .join(format!("cide-outline-secret-{}.rs", std::process::id()));
+        std::fs::write(&elsewhere, RUST).expect("a perfectly readable file");
+        assert!(
+            matches!(
+                outline_of(&[root], &elsewhere, None),
+                Err(SymbolError::Outside(_))
+            ),
+            "with no text supplied this would `read_to_string` a path the project does not \
+             contain, which is the one thing the guard is for"
+        );
+        let _ = std::fs::remove_file(&elsewhere);
+    }
+
+    /// A project with no index yet answers rather than refusing — the pre-existing rule.
+    #[test]
+    fn no_roots_means_no_containment_to_check() {
+        let dir = scratch("no-roots");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, RUST).expect("write");
+        let outline = outline_of(&[], &file, None).expect("no roots, nothing to be outside of");
+        assert!(matches!(outline, FileOutline::Ready { ref symbols, .. } if symbols.len() == 2));
+    }
 }

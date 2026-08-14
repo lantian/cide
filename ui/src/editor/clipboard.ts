@@ -1,6 +1,13 @@
 /**
  * Cut, copy and paste for the code pane, and the one honest answer about paste.
  *
+ * It serves the *terminal* as well now — `terminal/clipboard.ts` reaches the system clipboard
+ * through these two wrappers rather than through `clipboard.readText`/`writeText` directly,
+ * because the part worth sharing is not the invoke, it is the classification below: "the
+ * clipboard is empty" and "this window's capability file lost a line" arrive as the same
+ * rejection and mean entirely different things. The module keeps its name and its home; moving
+ * it to a neutral directory would be churn over a paragraph.
+ *
  * # Why paste needs a plugin at all
  *
  * WebKit refuses `document.execCommand('paste')` from page script — there is no gesture that

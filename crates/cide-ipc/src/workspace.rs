@@ -154,9 +154,18 @@ pub struct Project {
     /// pane was out. Re-docking checks before it trusts one.
     #[serde(default)]
     pub dock_anchors: IndexMap<PaneId, DockAnchor>,
-    /// Immortal while the project is open. For a Claude pane this id *is* the value passed
-    /// to `claude --session-id`, so restoring a workspace needs no extra bookkeeping to map
-    /// a pane back to its conversation.
+    /// The console's conversation. For a Claude pane this id *is* the value passed to
+    /// `claude --session-id`, so restoring a workspace needs no extra bookkeeping to map a pane
+    /// back to its conversation.
+    ///
+    /// It **follows the console's primary pane** — minted with the project and rewritten by
+    /// `cide_core::workspace::bind_session` whenever that pane binds a different session, which
+    /// is what a restart does. This used to say "immortal while the project is open", and it
+    /// was: nothing wrote it after `open_project`, so the first time the console respawned (a
+    /// restore whose transcript had gone, and now any restart) this field went on naming a
+    /// conversation no pane held. `lifecycle::entry_for` reads it to decide whether the console
+    /// comes back live on the next launch, so a stale value costs the user a Resume splash on
+    /// the one pane that should never need one.
     pub primary_session: SessionId,
 }
 
@@ -269,6 +278,27 @@ pub enum TabKind {
     ClaudeFull {
         title: String,
     },
+    /// A file, by absolute path. **Nothing here says the file is in the project.**
+    ///
+    /// It never did — `tab_open_file` enforces nothing, and a Ctrl+B into
+    /// `~/.cargo/registry/…` has opened an editable tab for as long as go-to-definition has
+    /// existed. `cmd::file::terminal_open_path`'s approved out-of-project open makes that
+    /// ordinary rather than incidental, so the consequence is written down here rather than
+    /// discovered later:
+    ///
+    /// **A tab approved once comes back on restart without being asked again.** That is a
+    /// decision and not an oversight. The approval was for a *file*, the user gave it by name,
+    /// and re-opening the same file they approved grants nothing new; asking again every launch
+    /// would train exactly the reflexive approval the confirmation exists to prevent. The tab is
+    /// also cide's own record, in a file cide writes — a `workspace.json` an attacker can edit
+    /// is a machine on which `keymap.json` already runs arbitrary commands.
+    ///
+    /// There is deliberately **no `external: bool`** beside `dirty`. It would have to earn its
+    /// place by changing behaviour, and the two candidates both lost: read-only does not
+    /// un-read a file that has already been read into the buffer, and it would leave cide's two
+    /// ctrl+clicks disagreeing about the same file; and a marker in the tab strip is already
+    /// there in a better form, because `editor/statusReadout.ts`'s `pathTrail` falls back to
+    /// the *whole absolute path* for a file no root contains.
     File {
         #[ts(type = "string")]
         path: PathBuf,

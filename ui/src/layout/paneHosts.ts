@@ -29,6 +29,7 @@
 import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from '@/terminal/xterm'
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
 import { attachPathLinks } from '@/terminal/pathLinks'
+import type { TerminalPaneKind } from '@/terminal/keys'
 import { diag } from '@/ipc/client'
 
 export interface PaneHost {
@@ -57,7 +58,14 @@ export interface PaneHost {
    * a pane duplicates the neighbouring pane's history on screen.
    */
   hydrated: boolean
-  sessionId?: string
+  /**
+   * The session this pane is attached to *in this process*.
+   *
+   * `| undefined` explicitly rather than by omission, because under
+   * `exactOptionalPropertyTypes` those are different types and this one has to be *assignable*
+   * to `undefined`: `forgetSession` clears it when a pane restarts.
+   */
+  sessionId?: string | undefined
   cleanup: Array<() => void>
   /** True while the element sits in a live slot. A mounted host is never evicted. */
   mounted: boolean
@@ -205,19 +213,19 @@ export function paneSessionId(paneId: string): string | undefined {
  * only needs repeating when the element moves to a different *browser window* — moving
  * within one document, which is all we ever do, keeps the renderer intact.
  */
-export function ensureTerminal(paneId: string): TerminalHandle {
+export function ensureTerminal(paneId: string, kind: TerminalPaneKind): TerminalHandle {
   const host = getHost(paneId)
   if (host.terminal) return host.terminal
 
-  const handle = createTerminal()
+  const handle = createTerminal(kind)
   host.terminal = handle
   return handle
 }
 
 /** Open the terminal into the host element. Safe to call repeatedly; acts once. */
-export function openTerminal(paneId: string): TerminalHandle {
+export function openTerminal(paneId: string, kind: TerminalPaneKind): TerminalHandle {
   const host = getHost(paneId)
-  const handle = ensureTerminal(paneId)
+  const handle = ensureTerminal(paneId, kind)
   if (host.opened) return handle
 
   if (!host.el.isConnected) {
@@ -462,10 +470,53 @@ function evictionCandidate(): PaneHost | undefined {
   return best
 }
 
-/** Mark a pane's session as mid-turn, which makes its host ineligible for eviction. */
+/**
+ * Mark a pane's session as mid-turn, which makes its host ineligible for eviction.
+ *
+ * Called from `TerminalPane`'s `cide://session-state` subscription. It had **no caller at all**
+ * until then: the flag was documented as "set by whoever tracks session state (M7's
+ * `cide://session-state`)" and nobody did, so `busy` was permanently `false` and
+ * `evictionCandidate` was free to take the one pane with a turn in flight — the exact case the
+ * field exists to protect, and the one where rehydrating from the screen mirror is not lossless
+ * because the bytes are arriving now.
+ */
 export function setHostBusy(paneId: string, busy: boolean): void {
   const host = hosts.get(paneId)
   if (host) host.busy = busy
+}
+
+/**
+ * Forget the session this pane was holding, and ready the host for the next one.
+ *
+ * For a restart and for the recovery path in `TerminalPane`: the child is gone (or is being
+ * killed on purpose) and this pane is about to spawn or resume another one, in the *same*
+ * terminal. Both copies of the id have to go — the host's and the ledger's — or `getHost` would
+ * hand the id straight back after an eviction and `paneSessionId` would keep naming a corpse to
+ * `PaneBody` and the command dispatcher.
+ *
+ * `exitMarked` is cleared so the next exit prints its own marker with its own code; leaving it
+ * set is how a pane restarted twice ends up showing one `— exited —` for two dead children.
+ *
+ * **`needsReset` is deliberately *not* set**, which is the difference between this and
+ * [`releaseHost`]. A released pane is coming back to a session that ran on without it, so its
+ * terminal holds a stale screen that the mirror must replace. A restarted pane's terminal holds
+ * the transcript of the child that just died — including the `— exited —` line and its status,
+ * which is the thing the user is looking at when they press the button — and the new child's
+ * screen belongs *below* it, exactly as re-running a command in a shell leaves the previous run
+ * on screen. `hydrated` still clears, so a session whose mirror is non-empty (a restarted shell
+ * replaying its predecessor's screen) still paints.
+ */
+export function forgetSession(paneId: string): void {
+  const host = hosts.get(paneId)
+  if (host) {
+    host.sessionId = undefined
+    host.exitMarked = false
+    host.hydrated = false
+    host.busy = false
+    host.lastGeometry = undefined
+  }
+  const entry = ledger.get(paneId)
+  if (entry) entry.sessionId = undefined
 }
 
 export function liveHosts(): Iterable<PaneHost> {

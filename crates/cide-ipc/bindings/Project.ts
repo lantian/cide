@@ -56,8 +56,17 @@ detached: { [key in PaneId]: Pane },
  */
 dockAnchors: { [key in PaneId]: DockAnchor }, 
 /**
- * Immortal while the project is open. For a Claude pane this id *is* the value passed
- * to `claude --session-id`, so restoring a workspace needs no extra bookkeeping to map
- * a pane back to its conversation.
+ * The console's conversation. For a Claude pane this id *is* the value passed to
+ * `claude --session-id`, so restoring a workspace needs no extra bookkeeping to map a pane
+ * back to its conversation.
+ *
+ * It **follows the console's primary pane** — minted with the project and rewritten by
+ * `cide_core::workspace::bind_session` whenever that pane binds a different session, which
+ * is what a restart does. This used to say "immortal while the project is open", and it
+ * was: nothing wrote it after `open_project`, so the first time the console respawned (a
+ * restore whose transcript had gone, and now any restart) this field went on naming a
+ * conversation no pane held. `lifecycle::entry_for` reads it to decide whether the console
+ * comes back live on the next launch, so a stale value costs the user a Resume splash on
+ * the one pane that should never need one.
  */
 primarySession: SessionId, };

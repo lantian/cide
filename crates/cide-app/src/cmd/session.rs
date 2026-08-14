@@ -835,6 +835,26 @@ pub fn session_list(registry: State<'_, SessionRegistry>) -> Vec<SessionId> {
     registry.ids()
 }
 
+/// Whether this pane could resume `session` — i.e. whether Claude Code still holds its
+/// transcript.
+///
+/// Asked by a pane whose child has just died, to decide whether the bar it puts over the dead
+/// terminal offers *Resume this conversation* as well as *Start a new session*. The same
+/// question [`crate::lifecycle::plan_restore`] answers for every pane at launch, asked for one
+/// pane at a moment when the launch plan is long stale.
+///
+/// **Not a registry question**, which is why it takes a `cwd` rather than reading one: a
+/// transcript outlives the process that wrote it, and after a restart the registry has never
+/// heard of the id at all. `cwd` is the directory the session was spawned in, which is the
+/// project root the pane already passes to [`session_spawn`].
+///
+/// `false` for every way of being unable to tell. A wrong `false` costs a button; a wrong
+/// `true` costs a `claude --resume` that fails in front of the user.
+#[tauri::command(rename_all = "camelCase")]
+pub fn session_resumable(cwd: String, session: SessionId) -> bool {
+    crate::lifecycle::resumable(std::path::Path::new(&cwd), session)
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn session_kill(registry: State<'_, SessionRegistry>, session: SessionId) {
     if let Some(s) = registry.get(session) {

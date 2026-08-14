@@ -165,6 +165,25 @@ export function spawnFailureBytes(message: string): string {
  * — arrives as a bare string or an `Error`, and rendering `[object Object]` into the pane
  * would replace one unreadable state with another.
  */
+/**
+ * Whether a rejected session command means *the id this pane was holding is gone*.
+ *
+ * `SessionError` crosses the wire tagged — `{ kind, message }` — precisely so the frontend can
+ * branch on the variant instead of matching on prose, and this is the branch that matters.
+ * `noSuchSession` is the registry's correct refusal to answer for an id it has never held, and
+ * printing it into the pane was reporting an internal bookkeeping fact to a user who can do
+ * nothing with it: `— no such session —` on a blank pane, on every launch, for every pane the
+ * user had torn into its own window. It is *recoverable* — forget the id and start a session —
+ * and every other kind is not, which is what this predicate is for.
+ *
+ * Deliberately narrow. `alreadyOpen` is a refusal the user must see (a conversation cannot be
+ * resumed twice), and `pty` is a real failure to start a process; retrying either would loop.
+ */
+export function isRecoverableSessionError(reason: unknown): boolean {
+  if (reason === null || typeof reason !== 'object') return false
+  return (reason as { kind?: unknown }).kind === 'noSuchSession'
+}
+
 export function spawnFailureText(reason: unknown): string {
   if (typeof reason === 'string' && reason.length > 0) return reason
   if (reason instanceof Error && reason.message.length > 0) return reason.message
