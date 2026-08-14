@@ -224,6 +224,13 @@ mod tests {
     /// It is `Permissions::readonly()` inverted — the mode bits and nothing else. It does
     /// not know about ownership or about a read-only mount, so the field must not be
     /// described (or relied on) as "this process can write this file".
+    ///
+    /// **Nor does it know about dependency caches**, and that is now deliberate rather than an
+    /// oversight. `cargo` unpacks a crate mode 644, so the mode bits say a registry source is
+    /// writable and it is not a file cide may write — the rule that says so is
+    /// `crate::toolchain::read_only_reason`, and it is applied in `cide_app::cmd::file`, where
+    /// the project's roots are known. Keeping it out of here is what lets a user who opened a
+    /// vendored crate *as a project root* still save in it.
     #[cfg(unix)]
     #[test]
     fn writable_follows_the_mode_bits() {

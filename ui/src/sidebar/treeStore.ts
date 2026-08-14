@@ -47,6 +47,7 @@ import {
   type TreeRow,
 } from '@/ipc/client'
 import { isNoIndex } from '@/store/fileIndex'
+import { groupPath, rowVerbs } from './groupRows'
 import { CHUNK_CAP, CHUNK_ROWS, chunkOf, chunkRequest, chunksFor, chunksToEvict } from './rowWindow'
 import {
   applyRange,
@@ -55,10 +56,17 @@ import {
   NO_PATHS,
   pressSelect,
   rangeRefusal,
+  releaseSelect,
   type SelectMods,
   type SelectPlan,
   type TreeSelection,
 } from './treeSelection'
+
+/**
+ * The writable set before Rust has answered, shared so `attach` and the initial state are the
+ * same object — a fresh `[]` per reset would re-render every subscriber for no change.
+ */
+const NO_WRITABLE: readonly string[] = []
 
 /**
  * A tree command, with "the index is not built yet" separated from "there is no such
@@ -87,6 +95,18 @@ async function tree<T>(name: string, call: () => Promise<T>, fallback: T): Promi
   )
 }
 
+/**
+ * What a press answered: the half the caller needs now, and the half it can wait for.
+ *
+ * See `FileTreeStore.pressRow` for why the deferral cannot travel inside the promise.
+ */
+export interface TreePress {
+  /** The collapse is waiting for the release — this press may be the start of a drag. */
+  readonly deferred: boolean
+  /** The refusal sentence for a band that was too wide, or `null`. */
+  readonly settled: Promise<string | null>
+}
+
 interface FileTreeStore {
   project: ProjectId | null
   /** Total rows in the flattened tree. The virtualizer's `count`. */
@@ -98,6 +118,22 @@ interface FileTreeStore {
    * commands are not in this build. A project waiting for its first walk is not degraded.
    */
   degraded: boolean
+  /**
+   * Every directory this project's disk-changing verbs may act inside: its roots, **plus** the
+   * scratch drawer.
+   *
+   * Not derivable here. The drawer is `$XDG_STATE_HOME/cide/scratches/<blake3 of the
+   * canonicalised primary root>` — a fact only Rust can compute — and it is outside every root
+   * by construction, which is the whole point of a scratch. So it is asked once per attach,
+   * from `fs_writable_roots`, which answers with the *same list* `cide_fs::ops::check_within`
+   * is given. Two derivations of "may cide write here" is how a menu comes to offer a verb the
+   * handler then refuses, which is the dead control this panel has already shipped twice.
+   *
+   * `[]` until the answer lands, and `FileTree` unions it with the workspace mirror's roots
+   * rather than using it alone — so for that one frame a project file is still mutable and a
+   * scratch is not, which is the safe direction of being briefly wrong.
+   */
+  writable: readonly string[]
   /**
    * A row index the tree should scroll to, set by `reveal` and cleared by the component
    * once it has scrolled. A number rather than a boolean flag so two reveals in a row are
@@ -211,13 +247,26 @@ interface FileTreeStore {
   /**
    * A left press on a row, with modifiers — the mouse half of the multi-selection.
    *
-   * Resolves to a sentence for the problem strip when the gesture was refused (a Shift-range
-   * wider than `RANGE_ROWS`), and to `null` when it was carried out. Asynchronous because a
-   * band whose rows are not all resident has to be asked for; the *cursor* moves before the
-   * await either way, so nothing about it waits on IPC.
+   * Answers **synchronously** with whether the collapse was deferred, and asynchronously (in
+   * `settled`) with a sentence for the problem strip when the gesture was refused — a Shift-range
+   * wider than `RANGE_ROWS` — or `null` when it was carried out. A band whose rows are not all
+   * resident has to be asked for; the *cursor* moves before the await either way, so nothing
+   * about it waits on IPC.
+   *
+   * The two halves are split rather than folded into one promise because the caller has to know
+   * about the deferral *at press time*, to remember the row whose release will finish the job.
+   * Reading it out of a promise would put a rule about mousedown behind a microtask that a fast
+   * click can, in principle, outrun — and a selection that collapses only sometimes is worse than
+   * one that never does. See `TreePressPlan`.
    */
-  pressRow: (path: string, index: number, mods: SelectMods) => Promise<string | null>
-  /** The same, for an arrow that has already decided which row it is moving to. */
+  pressRow: (path: string, index: number, mods: SelectMods) => TreePress
+  /**
+   * The release of a press [`pressRow`] deferred: collapse to that row after all.
+   *
+   * The caller runs it only when the gesture did **not** become a drag; see `useTreeDrag`.
+   */
+  releaseRow: (path: string, index: number) => void
+  /** The same as [`pressRow`], for an arrow that has already decided which row it is moving to. */
   keyToRow: (path: string, index: number, mods: SelectMods) => Promise<string | null>
   /** Write a selection worked out elsewhere — the right-click rule; see `pressMenu`. */
   setSelection: (next: TreeSelection, lead: string | null, index: number) => void
@@ -244,6 +293,21 @@ interface FileTreeStore {
    * command that silently did nothing; the caller now has something to say a sentence about.
    */
   reveal: (path: string) => Promise<boolean>
+  /**
+   * Scroll to a synthetic group's header, expand it, and select it. `false` when this project
+   * has no such group.
+   *
+   * A separate action from [`reveal`] because the two differ in the step that matters: this one
+   * **expands the row it lands on**, which is also what starts the dependency resolution. A
+   * reveal deliberately does not — unfolding a directory somebody only asked to be shown moves
+   * every row below it — so folding the expand into `reveal` would have changed that for every
+   * caller to give one command what it needs.
+   *
+   * `false` rather than a silent no-op is the whole point: a project with no `Cargo.toml` and no
+   * `go.mod` has no group row at all, and a palette entry that scrolls nowhere and says nothing
+   * is the defect this codebase keeps finding.
+   */
+  revealGroup: (id: string) => Promise<boolean>
   clearReveal: () => void
   /**
    * Re-read the count and the visible rows, and update only if they moved. The
@@ -349,6 +413,12 @@ const ROW_FIELDS: Readonly<Record<keyof TreeRow, true>> = {
   hasChildren: true,
   symlink: true,
   root: true,
+  // M13. The group header's count and a dependency's version live here, and both change
+  // *without any row moving*: `External Libraries` goes from no detail to `593` when a
+  // resolution lands, on the same row, at the same index. Without this entry `sameRows` would
+  // call the two identical and the count would never appear — the exact silent staleness the
+  // compiler-checked census exists to prevent, arriving in the same batch that added the field.
+  detail: true,
 }
 const ROW_KEYS = Object.keys(ROW_FIELDS) as Array<keyof TreeRow>
 
@@ -373,6 +443,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   count: 0,
   chunks: new Map(),
   degraded: false,
+  writable: NO_WRITABLE,
   revealTo: null,
   selected: null,
   selectedIndex: 0,
@@ -397,6 +468,9 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       selectedIndex: 0,
       selection: NO_PATHS,
       draft: null,
+      // The old project's drawer names nothing in the new one, and leaving it would make a
+      // stale path look mutable for as long as the fetch below takes.
+      writable: NO_WRITABLE,
     })
     if (project === null) return
 
@@ -404,6 +478,19 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     const count = await tree('fs_tree_count', () => fsApi.treeCount(project), 0)
     if (generation !== mine) return
     set({ count, degraded: isDegraded('fs_tree_count') })
+
+    /*
+     * The writable set, after the count and not awaited alongside it.
+     *
+     * The rows are what the user is waiting for; this only decides whether five context-menu
+     * items are greyed, and a tree that painted a frame later so a menu could be right would be
+     * the wrong trade. Its own `tree()` fallback, so a build whose backend predates
+     * `fs_writable_roots` keeps a working file tree and merely refuses to rename a scratch —
+     * which it also has no way to create.
+     */
+    const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project), [])
+    if (generation !== mine || get().project !== project) return
+    set({ writable })
   },
 
   ensure(from, to) {
@@ -457,8 +544,13 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     set({ selected: path, selectedIndex: index, selection: collapseTo(path) })
   },
 
-  async pressRow(path, index, mods) {
-    return runPlan(pressSelect(get().selection, path, mods), path, index, set, get)
+  pressRow(path, index, mods) {
+    const { plan, deferred } = pressSelect(get().selection, path, mods)
+    return { deferred, settled: runPlan(plan, path, index, set, get) }
+  },
+
+  releaseRow(path, index) {
+    set({ selection: releaseSelect(path), selected: path, selectedIndex: index })
   },
 
   async keyToRow(path, index, mods) {
@@ -492,7 +584,9 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
 
   async toggle(row) {
     const { project } = get()
-    if (project === null || row.kind !== 'dir') return
+    // `rowVerbs`, not `kind === 'dir'`: a group header folds too, and a note must not. This is
+    // one of the six sites that used to ask about `'dir'` and meant six different things.
+    if (project === null || !rowVerbs(row.kind, true).expandable) return
 
     const call = row.expanded
       ? () => fsApi.collapse(project, row.path)
@@ -550,6 +644,39 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     return true
   },
 
+  async revealGroup(id) {
+    const { project } = get()
+    if (project === null) return false
+    const path = groupPath(id)
+
+    // Reveal first, expand second — the same order `beginDraft` uses and for the same reason:
+    // expanding changes the row numbers *below* the header and leaves the header's own alone,
+    // so the index from the reveal survives the expand and is not re-read.
+    //
+    // `fs_reveal` answers `null` when this project has no such group, which is every project
+    // with no Cargo or Go manifest under a root. That is the honest "nothing to show" and the
+    // caller says so.
+    const at = await tree('fs_reveal', () => fsApi.reveal(project, path), null)
+    if (at === null || at < 0 || get().project !== project) return false
+
+    // The expand is what starts the resolution, and its answer is the new count — the group is
+    // about to grow a `Resolving…` row, so the scroller has to be sized for it before the
+    // virtualizer is told where to scroll.
+    const count = await tree('fs_expand', () => fsApi.expand(project, path), get().count)
+    if (get().project !== project) return false
+
+    resetCache()
+    set({
+      count,
+      chunks: new Map(),
+      revealTo: at,
+      selected: path,
+      selectedIndex: at,
+      selection: collapseTo(path),
+    })
+    return true
+  },
+
   clearReveal() {
     set({ revealTo: null })
   },
@@ -568,6 +695,22 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
 
     const count = await tree('fs_tree_count', () => fsApi.treeCount(project), get().count)
     if (generation !== mine || get().project !== project) return
+
+    /*
+     * Self-heal the writable set, and *only* when it is empty.
+     *
+     * `attach` asks once, and once is right — the answer moves when a project's roots move and
+     * at no other time, and this runs on every watcher burst. But `attach` can lose: a project
+     * whose index does not exist yet answers `NoIndex`, `tree()` falls back to `[]`, and nothing
+     * would ever ask again. The tree would then work perfectly and grey *Rename…* on every
+     * scratch for the life of the window, which is a dead control with no error anywhere — the
+     * shape this whole milestone is about. The guard keeps the ordinary burst at zero calls.
+     */
+    if (get().writable.length === 0) {
+      const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project), [])
+      if (generation !== mine || get().project !== project) return
+      if (writable.length > 0) set({ writable })
+    }
 
     const wanted = [...visible].filter((chunk) => chunk * CHUNK_ROWS < count)
     const fetched = await Promise.all(wanted.map((chunk) => readChunk(project, chunk, count)))
@@ -706,6 +849,20 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
  *
  * Resolves to the sentence the panel should show, or `null`.
  */
+/**
+ * Do these two selections name the same rows from the same anchor?
+ *
+ * Identity first, which is the case that matters: a deferred press hands back the very object it
+ * was given. The walk after it is bounded by `RANGE_ROWS` and only ever runs when the two are the
+ * same size, so the ordinary "collapse 10 000 rows to one" answers `false` on the size check.
+ */
+function same(a: TreeSelection, b: TreeSelection): boolean {
+  if (a === b) return true
+  if (a.anchor !== b.anchor || a.paths.size !== b.paths.size) return false
+  for (const path of a.paths) if (!b.paths.has(path)) return false
+  return true
+}
+
 async function runPlan(
   plan: SelectPlan,
   to: string,
@@ -714,6 +871,16 @@ async function runPlan(
   get: () => FileTreeStore,
 ): Promise<string | null> {
   if (plan.kind === 'set') {
+    // The same guard `select` carries, and it moved here when every mouse press started coming
+    // through `pressRow`: a click on the row the cursor is already on is the common case — it is
+    // the first half of every double-click — and an unconditional write would hand every
+    // subscriber a new `Set` holding the same one path, re-rendering every visible row to draw
+    // exactly what it is drawing. The deferred press relies on it too: its plan is the *current*
+    // selection by identity, so this is the line that makes "nothing yet" cost nothing.
+    const state = get()
+    if (state.selected === to && state.selectedIndex === index && same(state.selection, plan.next)) {
+      return null
+    }
     set({ selection: plan.next, selected: to, selectedIndex: index })
     return null
   }

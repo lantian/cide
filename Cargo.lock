@@ -585,6 +585,7 @@ version = "0.1.0"
 dependencies = [
  "cide-claude",
  "cide-core",
+ "cide-deps",
  "cide-fs",
  "cide-git",
  "cide-ide-mcp",
@@ -648,6 +649,17 @@ dependencies = [
  "tracing",
  "ts-rs",
  "uuid",
+]
+
+[[package]]
+name = "cide-deps"
+version = "0.1.0"
+dependencies = [
+ "cide-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

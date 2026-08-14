@@ -99,6 +99,12 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     "multipleTabs",
     "closableTab",
     "editorOpen",
+    // "the tab this window is showing is *about* a file" — a file tab, or a diff tab, which
+    // names the file it is diffing. Distinct from `editorFocused`, which is about the focused
+    // *pane*: a file tab split with a shell pane is still a file tab, and `file.reveal` works
+    // there. Derivable from the mirror as Rust actually fills it — `TabKind::File` is written
+    // by `tab_open_file` on every file open — which is the rule the `repoOpen` disaster left.
+    "fileTabActive",
     "claudeTarget",
     // There is deliberately no `repoOpen`. See the note above the Git group in [`build`]: the
     // webview cannot answer "does this project contain a git repository" without asking the
@@ -489,7 +495,52 @@ fn build() -> Vec<Command> {
         // File.
         Command::new("file.save", "Save file", FILE).when("editorFocused"),
         Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
-        Command::new("file.reveal", "Reveal file in sidebar", FILE).when("editorFocused"),
+        /*
+         * *Select Opened File* — IDEA's name for it, and the name a user types into the palette.
+         *
+         * The id is unchanged and must stay unchanged: ids are API, a `keymap.json` names them,
+         * and a second id for the same act would list two palette rows that do the same thing.
+         * The *title* is not API.
+         *
+         * # The clause, which was wrong in the direction that hides a working command
+         *
+         * It was `editorFocused`, which is strictly stronger than what the handler needs:
+         * `editorFocused` is about the focused **pane**, and a file tab split with a shell pane
+         * (`SplitIntent::Shell`) leaves the tab a file tab with a non-editor pane focused — so
+         * the palette hid a row that would have worked. `fileTabActive` is the honest
+         * precondition, and `shellWindow` is the other half: a detached-pane window renders no
+         * Explorer at all, so revealing into it is revealing into nothing.
+         *
+         * The keyboard is a different matter — the gate never reads this field, see the module
+         * header — and `ctrl+shift+e` is deliberately unconditional there, because "where is the
+         * file I am editing" is asked most often from a terminal.
+         */
+        Command::new("file.reveal", "Select opened file", FILE)
+            .when("shellWindow && fileTabActive")
+            .keywords(&["reveal", "locate", "show", "sidebar", "explorer", "tree"]),
+        /*
+         * A scratch file: a buffer that is not part of the project, in a drawer cide owns.
+         *
+         * `shellWindow && projectOpen`. The project is what keys the drawer, and the shell
+         * window is where the tab and the tree that the gesture ends in actually live — a
+         * detached-pane window would create a file and open its tab in the window next door,
+         * which is a gesture landing somewhere the user was not looking.
+         *
+         * The ellipsis is the house spelling for a command that opens something to answer
+         * first, matching *File structure…* and *Go to line…*: this one raises the type picker,
+         * because the extension is what decides the language and choosing it afterwards would
+         * mean renaming a file to change its highlighting.
+         */
+        Command::new("scratch.new", "New scratch file…", FILE)
+            .when("shellWindow && projectOpen")
+            .keywords(&[
+                "scratch",
+                "buffer",
+                "temporary",
+                "notes",
+                "playground",
+                "snippet",
+            ]),
         /*
          * Git — and the clause here is `projectOpen`, not "a repository is open".
          *
@@ -632,6 +683,49 @@ fn build() -> Vec<Command> {
                 "definition",
                 "declaration",
             ]),
+        /*
+         * The External Libraries group, reached without a mouse.
+         *
+         * The group is a row in the file tree and the tree is virtualized, so on a repository
+         * with any depth to it the header can be thousands of rows below the viewport — the one
+         * place in this app where a feature is *drawn* and still effectively unreachable. This
+         * scrolls to it and opens it, which is also what starts the resolution.
+         *
+         * `shellWindow && projectOpen`: the sidebar exists only in the shell window, and a
+         * project is what has dependencies. The handler still checks — the clause gates the
+         * palette, never the keyboard — and reports when the project has no manifest and so no
+         * group, which is the honest answer rather than a scroll to nowhere.
+         *
+         * No default binding. Every free chord in this app is free because somebody wanted it,
+         * and a browser for a group most users open once a session does not outrank them; the
+         * palette and `keymap.json` are both one step away.
+         */
+        Command::new("view.externalLibraries", "Show External Libraries", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&[
+                "dependencies",
+                "crates",
+                "modules",
+                "cargo",
+                "go",
+                "packages",
+                "vendor",
+            ]),
+        /*
+         * And the same route to the other group, for the same reason.
+         *
+         * *Scratches* sits below *External Libraries* at the very bottom of a virtualized tree,
+         * so on any repository with depth to it the header is thousands of rows past the
+         * viewport. `scratch.new` reveals the group as a side effect of creating a file; this is
+         * how somebody who wants to *find* the scratches they already have gets there without
+         * scrolling, and it is the only route that does not first create something.
+         *
+         * `projectOpen` because the drawer is keyed by the project's primary root; the handler
+         * re-checks, because the clause gates the palette and never the keyboard.
+         */
+        Command::new("view.scratches", "Show Scratches", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["scratch", "buffer", "temporary", "notes", "playground"]),
         Command::new("palette.commands", "Show all commands", VIEW),
         Command::new("theme.toggle", "Toggle light/dark theme", VIEW),
         // Settings opens as a *tab inside a project*, so with no project open there is

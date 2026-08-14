@@ -42,8 +42,15 @@ export interface AnchorRow {
   readonly isDir: boolean
 }
 
-/** The directory part of an absolute POSIX path, without its trailing slash. */
-function dirnameOf(path: string): string {
+/**
+ * The directory part of an absolute POSIX path, without its trailing slash.
+ *
+ * Exported since M13 for `treeDrag.ts`, which needs "is this file already in the folder it was
+ * dropped on" and must answer it with the *same* arithmetic [`targetFor`] uses to place a new
+ * file — a second `lastIndexOf('/')` somewhere else is how a drop reports "already here" for a
+ * path that is not.
+ */
+export function dirnameOf(path: string): string {
   const cut = path.lastIndexOf('/')
   // `/a` → `/`, not `''`. An empty parent would be sent to Rust and refused as a relative
   // path, which is a correct refusal to a question nobody meant to ask.

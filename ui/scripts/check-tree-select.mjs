@@ -75,6 +75,12 @@ try {
     plan.kind === 'range'
       ? ['range', plan.from, plan.to]
       : ['set', [...plan.next.paths], plan.next.anchor]
+  /**
+   * A press answers `{plan, deferred}` since the drag landed; the arrows still answer a bare plan.
+   * Spelled out here so every assertion below reads as the rule it is pinning rather than as a
+   * field access.
+   */
+  const pressOf = (press) => planOf(press.plan)
 
   const A = '/w/a.rs'
   const B = '/w/b.rs'
@@ -95,48 +101,93 @@ try {
   // ---------------------------------------------------------------- a plain press
 
   eq(
-    planOf(s.pressSelect(s.NO_PATHS, A, PLAIN)),
+    pressOf(s.pressSelect(s.NO_PATHS, A, PLAIN)),
     ['set', [A], A],
     'a plain press selects one row and puts the anchor on it',
   )
   eq(
-    planOf(s.pressSelect(sel([A, B, C], A), B, PLAIN)),
+    pressOf(s.pressSelect(sel([A, B, C], A), D, PLAIN)),
+    ['set', [D], D],
+    'a plain press on a row OUTSIDE the selection collapses to it at once',
+  )
+  eq(
+    pressOf(s.pressSelect(sel([A], A), A, PLAIN)),
+    ['set', [A], A],
+    'a plain press on the ONLY selected row is the same thing again, not a deferral',
+  )
+
+  // ------------------------------------------------- the deferred press, and its release
+  /*
+   * This is the rule that makes dragging a multi-row selection possible at all, and it replaced
+   * an assertion that said the opposite ("a plain press collapses a multi-row selection, even
+   * onto a row already in it"). That was not a weaker claim, it was the *wrong* one: the press
+   * that collapses is also the press that begins a drag of the whole set, so collapsing on
+   * mousedown destroyed the selection before the pointer had moved a pixel and "drag the four
+   * files I selected" could only ever have dragged one. The collapse now waits for the release.
+   */
+  const many3 = sel([A, B, C], A)
+  ok(
+    s.pressSelect(many3, B, PLAIN).deferred,
+    'a plain press on a row already in a MULTI-row selection defers its collapse to the release',
+  )
+  ok(
+    s.pressSelect(many3, B, PLAIN).plan.kind === 'set'
+      && s.pressSelect(many3, B, PLAIN).plan.next === many3,
+    'and it leaves the selection exactly as it was, by identity — nothing to re-render, nothing '
+      + 'for the drag to lose',
+  )
+  ok(
+    !s.pressSelect(sel([A], A), A, PLAIN).deferred,
+    'the only selected row is not deferred: there is no set to preserve and the anchor would go '
+      + 'stale',
+  )
+  ok(
+    !s.pressSelect(many3, D, PLAIN).deferred,
+    'a press outside the selection is not deferred either — it has already collapsed',
+  )
+  eq(
+    planOf({ kind: 'set', next: s.releaseSelect(B) }),
     ['set', [B], B],
-    'a plain press collapses a multi-row selection, even onto a row already in it',
+    'the release finishes what the deferred press did not: one row, anchored on it',
   )
 
   // ---------------------------------------------------------------- ctrl
 
   eq(
-    planOf(s.pressSelect(sel([A], A), B, CTRL)),
+    pressOf(s.pressSelect(sel([A], A), B, CTRL)),
     ['set', [A, B], B],
     'ctrl adds a row and moves the anchor to it',
   )
   eq(
-    planOf(s.pressSelect(sel([A, B], A), A, CTRL)),
+    pressOf(s.pressSelect(sel([A, B], A), A, CTRL)),
     ['set', [B], A],
     'ctrl on a selected row removes it — and still moves the anchor there',
   )
   eq(
-    planOf(s.pressSelect(sel([A], A), A, CTRL)),
+    pressOf(s.pressSelect(sel([A], A), A, CTRL)),
     ['set', [], A],
     'ctrl can empty the selection while leaving the cursor where it was',
+  )
+  ok(
+    !s.pressSelect(sel([A, B, C], A), B, CTRL).deferred
+      && !s.pressSelect(sel([A, B, C], A), B, SHIFT).deferred,
+    'a MODIFIED press is never deferred: it is a selection gesture and it never starts a drag',
   )
 
   // ---------------------------------------------------------------- shift
 
   eq(
-    planOf(s.pressSelect(sel([A], A), C, SHIFT)),
+    pressOf(s.pressSelect(sel([A], A), C, SHIFT)),
     ['range', A, C],
     'shift asks for the band from the anchor; only the store can resolve it',
   )
   eq(
-    planOf(s.pressSelect(s.NO_PATHS, C, SHIFT)),
+    pressOf(s.pressSelect(s.NO_PATHS, C, SHIFT)),
     ['set', [C], C],
     'shift with no anchor yet is a plain press',
   )
   eq(
-    planOf(s.pressSelect(sel([A], A), C, BOTH)),
+    pressOf(s.pressSelect(sel([A], A), C, BOTH)),
     ['range', A, C],
     'ctrl+shift is shift — the same order rowSelection.ts uses',
   )
@@ -145,7 +196,7 @@ try {
 
   eq(
     planOf(s.keySelect(sel([A], A), C, SHIFT)),
-    planOf(s.pressSelect(sel([A], A), C, SHIFT)),
+    pressOf(s.pressSelect(sel([A], A), C, SHIFT)),
     'shift+arrow and shift+click ask for the same band',
   )
   const held = sel([A, B], A)
@@ -246,20 +297,63 @@ try {
     /aria-multiselectable/.test(tree),
     'a tree whose rows can all be aria-selected has to say it is multi-selectable',
   )
-  // The gestures that act on files must read the selection, not the row under the pointer.
+  /*
+   * The gestures that act on files must read the selection, not the row under the pointer.
+   *
+   * Two halves now, because M13 put a refusal between them: the scope is computed, checked
+   * against `mutationRefusal`, and only then handed to `takeClip`. Both halves are pinned, and
+   * both are pinned **inside the clipboard branch** rather than anywhere in the file — the
+   * Delete branch a few lines below computes an identically-spelled `scope`, so a whole-file
+   * regex passes while the clipboard's own scope is narrowed to the cursor row. That is not
+   * hypothetical: it is exactly what the first version of this assertion missed.
+   */
+  const clipBranch = /&& clipboardKey\) \{[\s\S]*?\n      \}/.exec(tree)?.[0] ?? ''
+  ok(clipBranch !== '', 'the Ctrl+X / Ctrl+C branch is still there to check')
   ok(
-    /takeClip\(key === 'x' \? 'cut' : 'copy', actionScope\(store\.selection\)\)/.test(tree),
-    'Ctrl+X / Ctrl+C must act on the whole selection',
+    /const scope = actionScope\(store\.selection\)/.test(clipBranch),
+    'Ctrl+X / Ctrl+C must take their scope from the whole selection',
+  )
+  ok(
+    /takeClip\(key === 'x' \? 'cut' : 'copy', scope\)/.test(clipBranch),
+    'Ctrl+X / Ctrl+C must act on that scope, not on the row under the pointer',
   )
   ok(
     /const marked = pressMenu\(store\.selection, row\.path\)/.test(tree),
     'the context menu must go through pressMenu, or right-clicking destroys what it acts on',
   )
-  // `select` is the plain rule and has to collapse: without this a click on the row the cursor
-  // is already on leaves a five-row selection standing.
+  // `select` is the plain rule and has to collapse: it is what a reveal, a paste landing and a
+  // freshly created file use, and none of those has a release to wait for.
   ok(
     /selection: collapseTo\(path\)/.test(store),
     'treeStore.select must collapse the selection to the row it selects',
+  )
+  /*
+   * The deferral is a rule in a pure module and a *wire* through two files, and the wire is the
+   * half that has been missing four times in this project. Every mouse press has to reach
+   * `pressRow` — the plain one too, which is the press that can be deferred — and the release has
+   * to be able to finish it.
+   */
+  ok(
+    /const press = store\.pressRow\(row\.path, index, mods\)/.test(tree)
+      && /deferredPress\.current = press\.deferred \? row\.path : null/.test(tree),
+    'every selecting press goes through `pressRow` and remembers a deferral; the plain press '
+      + 'calling `select` directly is what made a multi-row drag impossible',
+  )
+  ok(
+    /releaseRow\(path, index\)/.test(store) && /getState\(\)\.releaseRow\(path, index\)/.test(tree),
+    '`treeStore.releaseRow` exists and the panel calls it — a deferral nothing resolves leaves '
+      + 'five rows selected after a click that meant one',
+  )
+  ok(
+    /if \(drag\.dragged\(\)\) \{[\s\S]{0,200}?deferredPress\.current = null[\s\S]{0,40}?return/.test(
+      tree,
+    ),
+    'the release is SKIPPED when the gesture became a drag: the whole selection has just been '
+      + 'moved and collapsing to one row would undo the widening',
+  )
+  ok(
+    /onMouseUp=\{\(e\) => \{[\s\S]{0,240}?onRelease\(row\.path, index\)/.test(tree),
+    'and the row actually carries the mouseup that runs it',
   )
   ok(
     /selection: NO_PATHS/.test(store),

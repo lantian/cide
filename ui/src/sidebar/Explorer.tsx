@@ -31,9 +31,38 @@ export interface ExplorerProps {
    * the note in `FileTree.tsx`.
    */
   onOpenFileToSide?: ((path: string) => void) | undefined
+  /**
+   * The path the active tab is *about*, or `null` when it is about no file.
+   *
+   * Not used to reveal anything — that is [`onSelectOpened`]'s business, and it re-derives the
+   * path from the same `focusedTabPath` the `fileTabActive` context flag does. This is here
+   * only so the button can be **disabled with a reason** rather than being enabled and failing:
+   * the header knows nothing about tabs, and the alternative is a control that looks live on a
+   * Claude console and answers a click with a notice.
+   */
+  openedFile?: string | null
+  /**
+   * *Select opened file* — the ⌖ button.
+   *
+   * Routed through the command, never through `treeStore.reveal` directly. One code path for
+   * the button, the ⌃⇧E chord and the palette row, because a second call site with its own copy
+   * of the preconditions is how three gestures come to behave in three ways — the same argument
+   * `keymap.rs` makes for routing the mouse's thumb buttons through the key gate.
+   *
+   * Optional, and the button is not drawn without it: a host with no dispatcher cannot honour
+   * the click, and the honest shape there is absence rather than a permanently greyed control.
+   * `App.tsx` always supplies it in the shell window, which is the only window with a sidebar.
+   */
+  onSelectOpened?: (() => void) | undefined
 }
 
-export function Explorer({ project, onOpenFile, onOpenFileToSide }: ExplorerProps) {
+export function Explorer({
+  project,
+  onOpenFile,
+  onOpenFileToSide,
+  openedFile = null,
+  onSelectOpened,
+}: ExplorerProps) {
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
 
@@ -188,6 +217,37 @@ export function Explorer({ project, onOpenFile, onOpenFileToSide }: ExplorerProp
           >
             †
           </span>
+        )}
+        {/*
+          * *Select opened file*. IDEA's own crosshair, as a literal Unicode glyph — this
+          * application bundles no UI icon set, and `ActivityRail.tsx` and `GitPanel/Toolbar.tsx`
+          * both state that as policy rather than as a gap. U+2316 POSITION INDICATOR; `◎`
+          * (U+25CE) is the fallback if a font somewhere renders it as tofu, and nothing in this
+          * repository checks glyph coverage — `check-fonts.mjs` is size arithmetic.
+          *
+          * `title` and `aria-label` carry the same sentence, and it changes with the state:
+          * a disabled control that says only "Select opened file" leaves the user to guess why
+          * it is grey. This is the house treatment — see `GitPanel/Toolbar.tsx`, which calls
+          * disabled-with-a-tooltip "the honest placeholder", and `menuModel.ts`'s `NO_HOST`.
+          */}
+        {onSelectOpened !== undefined && (
+          <button
+            type="button"
+            className={styles.headerAction}
+            data-audit="explorerSelectOpened"
+            disabled={openedFile === null}
+            title={
+              openedFile === null
+                ? 'No file is open in this tab'
+                : 'Select opened file — scroll to it in the tree'
+            }
+            aria-label={
+              openedFile === null ? 'No file is open in this tab' : 'Select opened file'
+            }
+            onClick={onSelectOpened}
+          >
+            ⌖
+          </button>
         )}
       </div>
       <FileTree project={project} onOpen={onOpenFile} onOpenToSide={onOpenFileToSide} />

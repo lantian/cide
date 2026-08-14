@@ -145,6 +145,50 @@ export function focusedFilePath(boot: Bootstrap | null): string | null {
   return tab.kind.path
 }
 
+/**
+ * The absolute path the focused tab is *about*, or `null` when it is about no file.
+ *
+ * Wider than [`focusedFilePath`] by exactly one case: a **diff** tab, which names the file it is
+ * diffing. That is what *Select opened file* means when the thing on screen is a diff of
+ * `src/main.rs` — IDEA reveals `src/main.rs` — and the alternative is a command that goes dead
+ * on a tab where the answer is obvious.
+ *
+ * And only when that name is **absolute**, which is the half a reader will assume is missing.
+ * `DiffSpec.newPath` is absolute for a `ClaudeMcp` diff, which names files on disk, and
+ * *repo-relative* for a `Git` one — its own doc comment says so — because that is how git
+ * spells a path. Handing a relative string to `fs_reveal` would find nothing and the command
+ * would report that a file *is not in this project's file tree* while naming a path that is not
+ * a path. Answering `null` instead makes `fileTabActive` false there, so the palette hides the
+ * row and the chord says there is no file tab, which are both true.
+ *
+ * `focusedFilePath` is deliberately left as it was rather than widened, because its other caller
+ * is `claude.mention.file` and "mention the file I am looking at" over a diff is a different
+ * question with a different answer (which side?), which nothing has asked yet.
+ *
+ * The two arms mirror `chrome/menuModel.ts::pathOf`, which cannot be imported here: that module
+ * is compiled standalone by `check-menu-model.mjs` and its header forbids a value import, so a
+ * dependency in this direction would eventually be reversed by somebody. `check:select-opened`
+ * asserts the two agree.
+ *
+ * # What this is the *only* honest source for
+ *
+ * There is no most-recently-used file here and there must not be one. `Project` carries
+ * `active_tab` and nothing else — no focus history — so a "last file tab" fallback would be a
+ * webview-side cache with no invalidation, which is verbatim the `repoOpen` mistake recorded at
+ * the foot of this file. A tab that is not about a file answers `null`, and the handler says so.
+ */
+export function focusedTabPath(boot: Bootstrap | null): string | null {
+  const tab = activeTabOf(boot)
+  if (tab === null) return null
+  if (tab.kind.kind === 'file') return tab.kind.path
+  // Absolute only — see above. A leading `/` is the whole test: cide is Linux-first and every
+  // path on the wire is POSIX, which is the same shape `groupRows.isSyntheticPath` keys on.
+  if (tab.kind.kind === 'diff' && tab.kind.spec.newPath.startsWith('/')) {
+    return tab.kind.spec.newPath
+  }
+  return null
+}
+
 /*
  * There is deliberately no `reposOf` here any more, and no repository fact of any kind.
  *

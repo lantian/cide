@@ -32,7 +32,7 @@
  * The selection lives in `treeStore`, not here, because it has to outlive both a refresh of
  * the rows underneath it and an unmount of this panel; see the field's comment there.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
@@ -53,10 +53,14 @@ import {
   pressMenu,
   type SelectMods,
 } from './treeSelection'
+import { inDrag, inDropBand, type DragRow } from './treeDrag'
+import { useTreeDrag, type TreeDragState } from './useTreeDrag'
+import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import { copyText } from './copyText'
-import { isRootPath, relativeTo } from './rowPaths'
+import { creationRefusal, isRootPath, mutationRefusal, relativeTo, rootOf } from './rowPaths'
+import { groupIcon, groupIdOf, isSyntheticPath, rowVerbs } from './groupRows'
 import { basenameOf, checkName, nameToSend, targetFor, type NewEntryTarget } from './newEntry'
-import { useFileClipboard } from './fileClipboard'
+import { pasteEntries, planEntries, useFileClipboard } from './fileClipboard'
 import {
   clipboardText,
   copyLabel,
@@ -76,6 +80,7 @@ import {
   askDecisions,
   askIsDone,
   cancelledNote,
+  moveCancelledNote,
   startAsk,
   type PasteAnswer,
   type PasteAsk,
@@ -153,6 +158,36 @@ const NO_ROOTS: readonly string[] = []
  */
 const ROOT_NOT_RENAMED = 'A project root is renamed where the project was opened'
 const ROOT_NOT_DELETED = 'A project root is closed, not deleted'
+
+/**
+ * `data-row-kind`, as read back out of the DOM.
+ *
+ * A cast rather than a validated parse, and narrowed to the generated union so a variant added
+ * in Rust reaches `rowVerbs`'s exhaustive switch. That switch has a `default` arm precisely
+ * because this cast is a claim about a string attribute rather than a proof.
+ */
+type RowKindAttr = TreeRow['kind']
+
+/**
+ * Some paths, where they are going, and how they were picked.
+ *
+ * The one shape behind both gestures that put files in a folder — Ctrl+V and a drop — so that the
+ * collision question, the dialog, the cancellation note and the reveal-what-landed are written
+ * once. They were not, at first: the drag arrived with the paste's four handlers already in
+ * place, and copying them would have produced a second confirmation flow that agrees with the
+ * first only for as long as nobody edits either.
+ *
+ * `fromClip` is the whole of the difference, and it is a fact about *provenance*, not about the
+ * operation: a clipboard cut is consumed by the paste it was made for, a dropped set never
+ * touched the clipboard at all.
+ */
+interface Transfer {
+  readonly sources: readonly string[]
+  readonly destDir: string
+  readonly mode: ClipMode
+  /** The sources came off the clipboard, so a successful cut consumes it. */
+  readonly fromClip: boolean
+}
 
 /**
  * Which colour class a status paints the name and the letter with.
@@ -258,6 +293,26 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         : (s.boot?.workspace.projects[project]?.roots.map((r) => r.path) ?? NO_ROOTS),
     ),
   )
+  /**
+   * Where the disk-changing verbs may act: the roots, **plus** whatever `fs_writable_roots`
+   * added — today, the *Scratches* drawer.
+   *
+   * A second list rather than a wider `roots`, because the two answer different questions and
+   * three call sites below depend on the difference. `relativeTo` and `isRootPath` mean
+   * *project roots* — a scratch shown with a relative path would read as a file in the project,
+   * and the drawer counted as a root would be refused by `check_not_root` for the wrong reason —
+   * while `pasteTargetFor` picks the root a paste with no anchor lands in, which must never be
+   * the drawer. So `roots` keeps its meaning and this is the containment set, matching
+   * `ProjectFs::writable_paths` exactly.
+   *
+   * The union is taken here rather than in Rust's answer so that the roots are right from the
+   * first frame: `writable` is `[]` until an IPC round trip lands, and a menu that greyed
+   * *Rename…* on every project file for that frame would be a flicker in the one control this
+   * change is about.
+   */
+  const extraWritable = useFileTree((s) => s.writable)
+  const writable = useMemo(() => [...roots, ...extraWritable], [roots, extraWritable])
+
   /** The path whose name is currently an `<input>`. At most one row at a time. */
   const [renaming, setRenaming] = useState<string | null>(null)
   /**
@@ -310,14 +365,14 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
    */
   const pasting = useRef(false)
   /**
-   * The collisions the user is being asked about, and where they would land.
+   * The collisions the user is being asked about, and the transfer they belong to.
    *
-   * `null` for every paste with nothing in its way, which is nearly all of them. The dialog
-   * lives here rather than in the shell because this panel owns the gesture that opens it —
+   * `null` for every transfer with nothing in its way, which is nearly all of them. The dialog
+   * lives here rather than in the shell because this panel owns both gestures that open it —
    * `App.tsx` never needs to know it exists.
    */
   const [pendingPaste, setPendingPaste] = useState<{
-    readonly destDir: string
+    readonly transfer: Transfer
     readonly ask: PasteAsk
   } | null>(null)
 
@@ -432,17 +487,24 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   )
 
   /**
-   * Send the paste, with whatever the user answered about the names that were taken.
+   * Send the transfer, with whatever the user answered about the names that were taken.
    *
-   * Split from `runPaste` because it is the second half of a gesture that may have paused for
-   * a dialog in between: everything that has to happen once, before the question, is up there,
-   * and everything that happens once the answer is in is here.
+   * Split from `startTransfer` because it is the second half of a gesture that may have paused
+   * for a dialog in between: everything that has to happen once, before the question, is up
+   * there, and everything that happens once the answer is in is here.
+   *
+   * The two sources of a transfer part company on exactly one line. A **clipboard** paste goes
+   * through the store, because a successful cut consumes the clip and only the store owns that;
+   * a **drop** goes straight to `pasteEntries` with the paths it is carrying. Sending a drop
+   * through the store would mean calling `take()` first — which overwrites the user's clipboard,
+   * and the system clipboard with it, for a gesture that has nothing to do with either.
    */
-  const commitPaste = useCallback(
-    (project_: ProjectId, destDir: string, decisions: ReturnType<typeof askDecisions>) => {
-      void useFileClipboard
-        .getState()
-        .paste(project_, destDir, decisions)
+  const commitTransfer = useCallback(
+    (project_: ProjectId, transfer: Transfer, decisions: ReturnType<typeof askDecisions>) => {
+      const sent = transfer.fromClip
+        ? useFileClipboard.getState().paste(project_, transfer.destDir, decisions)
+        : pasteEntries(project_, transfer.sources, transfer.destDir, transfer.mode, decisions)
+      void sent
         .finally(() => {
           pasting.current = false
         })
@@ -450,25 +512,63 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           setNote(result.note)
           const first = result.paths[0]
           // `reveal` rather than `refresh`: the row may be inside a folder that is collapsed,
-          // and a paste whose result is not on screen is one the user cannot check. It
-          // selects too, which is what makes Enter open the thing that was just pasted.
+          // and a transfer whose result is not on screen is one the user cannot check. It
+          // selects too, which is what makes Enter open the thing that was just moved — and for
+          // a drop it is the whole receipt, since the row left the place the user was looking at.
           if (first !== undefined) void useFileTree.getState().reveal(first)
           else void useFileTree.getState().refresh()
         })
-        .catch(fail('Paste'))
+        .catch(fail(transfer.fromClip ? 'Paste' : 'Move'))
     },
     [fail],
   )
 
   /**
-   * Paste the clipboard into `target`, asking first about anything it would land on top of.
+   * Plan the transfer, ask about anything it would land on top of, then send it.
    *
    * > *"Paste collisions - yes, should be a confirmation"*
    *
-   * `plan` reads and writes nothing, so the ordinary paste — nothing in the way — costs one
-   * extra round trip and no dialog, and a paste that *would* overwrite is stopped before a
-   * single byte is written. That ordering is why `PasteConfirm` can promise that cancelling
-   * leaves everything as it was: there is no partial paste to report, because none started.
+   * `plan` reads and writes nothing, so the ordinary transfer — nothing in the way — costs one
+   * extra round trip and no dialog, and one that *would* overwrite is stopped before a single
+   * byte is written. That ordering is why `PasteConfirm` can promise that cancelling leaves
+   * everything as it was: there is no partial paste to report, because none started.
+   *
+   * **A drag lands here too, deliberately.** The hazard is identical — a name already taken in
+   * the destination — and the user asked for a confirmation on exactly this hazard once already.
+   * Two dialogs for one question is how one of them ends up defaulting to *Replace*; there is one
+   * dialog, and its default is *Keep both*, which is what makes a dropped folder recoverable in a
+   * feature with no undo.
+   */
+  const startTransfer = useCallback(
+    (transfer: Transfer) => {
+      if (project === null) return
+      // One transfer per gesture, however long Ctrl+V is held. A directory paste is seconds of
+      // work, and a second one launched into it would race the first for the same names —
+      // both would succeed, and the user would get `src` and `src copy` from one keystroke.
+      // The flag also covers the time the dialog is open, so a held key cannot stack questions,
+      // and it is what stops a second drop landing while the first is still being answered.
+      if (pasting.current) return
+      pasting.current = true
+      setProblem(null)
+      setNote(null)
+      void planEntries(project, transfer.sources, transfer.destDir, transfer.mode)
+        .then((collisions) => {
+          if (collisions.length === 0) {
+            commitTransfer(project, transfer, [])
+            return
+          }
+          setPendingPaste({ transfer, ask: startAsk(collisions) })
+        })
+        .catch((error: unknown) => {
+          pasting.current = false
+          fail(transfer.fromClip ? 'Paste' : 'Move')(error)
+        })
+    },
+    [commitTransfer, fail, project],
+  )
+
+  /**
+   * Paste the clipboard into `target`.
    *
    * The refusals are checked here rather than left to Rust so that they arrive as a sentence
    * about folders — "“src” cannot be pasted into itself" — instead of as a rejected command.
@@ -478,55 +578,59 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   const runPaste = useCallback(
     (target: NewEntryTarget | null) => {
       if (project === null) return
-      const refusal = pasteRefusal(useFileClipboard.getState().clip, project, target)
-      if (refusal !== null || target === null) {
+      const clip = useFileClipboard.getState().clip
+      const refusal = pasteRefusal(clip, project, target)
+      if (refusal !== null || target === null || clip === null) {
         setProblem(refusal ?? 'There is nowhere to paste into.')
         return
       }
-      // One paste per gesture, however long Ctrl+V is held. A directory paste is seconds of
-      // work, and a second one launched into it would race the first for the same names —
-      // both would succeed, and the user would get `src` and `src copy` from one keystroke.
-      // The flag also covers the time the dialog is open, so a held key cannot stack questions.
-      if (pasting.current) return
-      pasting.current = true
-      setProblem(null)
-      setNote(null)
-      const destDir = target.parent
-      void useFileClipboard
-        .getState()
-        .plan(project, destDir)
-        .then((collisions) => {
-          if (collisions.length === 0) {
-            commitPaste(project, destDir, [])
-            return
-          }
-          setPendingPaste({ destDir, ask: startAsk(collisions) })
-        })
-        .catch((error: unknown) => {
-          pasting.current = false
-          fail('Paste')(error)
-        })
+      startTransfer({
+        sources: clip.paths,
+        destDir: target.parent,
+        mode: clip.mode,
+        fromClip: true,
+      })
     },
-    [commitPaste, fail, project],
+    [project, startTransfer],
+  )
+
+  /**
+   * Drop `sources` into `destDir` — the drag's landing.
+   *
+   * Called by `useTreeDrag` only for a `move` verdict, so every refusal in `treeDrag.ts` has
+   * already been applied and drawn on the ghost. It is still a *cut*, and it is still planned
+   * first: the tree can change between the last pointer move and the release (a watcher burst, an
+   * agent writing a file), and Rust re-checks every containment rule regardless. What this must
+   * never do is call `take()` — see `commitTransfer`.
+   */
+  const runMove = useCallback(
+    (sources: readonly string[], destDir: string) => {
+      if (sources.length === 0) return
+      startTransfer({ sources, destDir, mode: 'cut', fromClip: false })
+    },
+    [startTransfer],
   )
 
   /**
    * Back out. The clipboard is left alone so the gesture can simply be repeated.
    *
    * The note is not decoration: a dialog that vanishes with nothing said is indistinguishable
-   * from a paste that silently failed, and the one thing worth saying here is the property the
-   * whole plan-then-paste ordering was built for — nothing was written.
+   * from a transfer that silently failed, and the one thing worth saying here is the property the
+   * whole plan-then-send ordering was built for — nothing was written. It names the gesture the
+   * user actually made, because "Paste cancelled" after a drag describes something that never
+   * happened.
    *
    * Above `answerPaste` because that one depends on it, and a `const` named in a dependency
    * array is read *during* the render that declares it.
    */
   const cancelPaste = useCallback(() => {
+    const fromClip = pendingPaste?.transfer.fromClip ?? true
     setPendingPaste(null)
     pasting.current = false
-    setNote(cancelledNote())
-  }, [])
+    setNote(fromClip ? cancelledNote() : moveCancelledNote())
+  }, [pendingPaste])
 
-  /** One answer from the dialog. The last one sends the paste. */
+  /** One answer from the dialog. The last one sends the transfer. */
   const answerPaste = useCallback(
     (answer: PasteAnswer, applyToRest: boolean) => {
       if (pendingPaste === null) return
@@ -540,13 +644,13 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       }
       const next = answerAsk(pendingPaste.ask, answer, applyToRest)
       if (!askIsDone(next)) {
-        setPendingPaste({ destDir: pendingPaste.destDir, ask: next })
+        setPendingPaste({ transfer: pendingPaste.transfer, ask: next })
         return
       }
       setPendingPaste(null)
-      commitPaste(project, pendingPaste.destDir, askDecisions(next))
+      commitTransfer(project, pendingPaste.transfer, askDecisions(next))
     },
-    [cancelPaste, commitPaste, pendingPaste, project],
+    [cancelPaste, commitTransfer, pendingPaste, project],
   )
 
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -600,6 +704,27 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     useFileTree.getState().clearReveal()
   }, [revealTo, virtualizer])
 
+  /*
+   * *Select opened file* asked for the keyboard. Give it to the scroller and spend the request.
+   *
+   * The scroller is the tree's single tab stop (`role="tree"`, `tabIndex={0}` below), so
+   * focusing it is the whole of "the arrows now move in the tree" — which is what was missing:
+   * ⌃⇧E from a terminal lit up a row and left every subsequent arrow key going to the pty.
+   *
+   * A parked request rather than a `focus()` in the dispatcher, for the two reasons
+   * `chrome/focusRequests.ts` gives: this panel is usually not mounted when the command runs
+   * (the sidebar was on Git, or shut), and when it *is* mounted nothing new mounts, so an
+   * `autoFocus` would silently do nothing on the second press. Consumed — not merely observed —
+   * so a request cannot fire later on an unrelated mount, which for this panel would mean
+   * clicking the Files icon in the rail snatching the caret out of a terminal.
+   */
+  const wantsFocus = useFocusRequested('fileTree')
+  useEffect(() => {
+    if (!wantsFocus) return
+    scrollRef.current?.focus()
+    clearFocusRequest('fileTree')
+  }, [wantsFocus])
+
   /**
    * Show a refused selection gesture, or say nothing.
    *
@@ -611,11 +736,36 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
     if (refusal !== null) setProblem(refusal)
   }, [])
 
+  /**
+   * The row whose press deferred its collapse, waiting for the release.
+   *
+   * A ref and not state: nothing renders from it, and a `setState` on mousedown is a re-render
+   * that the drag's own 4px threshold logic then has to survive — the same reasoning
+   * `ChangesTree` gives for the identical ref one panel over.
+   */
+  const deferredPress = useRef<string | null>(null)
+
   /** Perform whatever `clickSemantics` decided, on a row we already have in hand. */
   const apply = useCallback(
     (action: RowAction, row: TreeRow, index: number, mods: SelectMods = NO_MODS) => {
       const store = useFileTree.getState()
-      if (action.select && (mods.ctrl || mods.shift)) {
+      if (action.select) {
+        /*
+         * Every selecting press goes through `pressRow`, plain or modified, and that is a change
+         * this feature needed. The plain press used to call `store.select`, which collapses
+         * unconditionally — so pressing on one of five selected files destroyed the set before
+         * the pointer had moved a pixel, and "drag the elements I selected" could only ever have
+         * dragged one. `pressSelect` now answers *deferred* for that case and the collapse waits
+         * for the mouseup, where it is skipped if the gesture became a drag.
+         *
+         * `select` is still the store's method for a reveal, a paste landing and a fresh file —
+         * gestures with no release to wait for.
+         */
+        const press = store.pressRow(row.path, index, mods)
+        deferredPress.current = press.deferred ? row.path : null
+        void press.settled.then(reported)
+      }
+      if (mods.ctrl || mods.shift) {
         /*
          * A modified press assembles a selection and does **nothing else** — no fold, no open —
          * which is the same gate `ChangesTree` puts on its own diff-opening press.
@@ -626,14 +776,96 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
          * measures against, so the band would cover files nobody pointed at. The opening half is
          * merely obvious — Ctrl+double-click on four files should not leave four tabs open.
          */
-        void store.pressRow(row.path, index, mods).then(reported)
         return
       }
-      if (action.select) store.select(row.path, index)
-      if (action.toggle && row.kind === 'dir') void store.toggle(row)
-      if (action.open && row.kind === 'file') onOpen?.(row.path)
+      // `rowVerbs`, not `kind === 'dir'` / `kind === 'file'`. A group header folds; a note does
+      // nothing at all; a dependency source opens exactly as a project file does — and the tab
+      // it opens is read-only, because `file_read` clears `writable` for anything under a
+      // toolchain's dependency cache. See `groupRows.ts` for why there is no confirmation here.
+      const verbs = rowVerbs(row.kind, true)
+      if (action.toggle && verbs.expandable) void store.toggle(row)
+      if (action.open && verbs.openable) onOpen?.(row.path)
     },
     [onOpen, reported],
+  )
+
+  /**
+   * The live row for a path — what the drag hit-tests against.
+   *
+   * Through the store rather than out of a captured array, because this tree is windowed: the
+   * only thing the DOM can give a drag is `data-row-path`, and everything else the drop rules
+   * need (is it a folder, is it open, does it have children, what is it called) lives on the
+   * `TreeRow`. `indexOf` searches resident chunks only, which is exactly the right scope — a row
+   * under the pointer is on screen, and a row on screen was rendered from a resident chunk.
+   */
+  const rowFor = useCallback((path: string): DragRow | null => {
+    const store = useFileTree.getState()
+    const at = store.indexOf(path)
+    return at === null ? null : (store.rowAt(at) ?? null)
+  }, [])
+
+  /**
+   * Unfold a folder the pointer has rested on for 600 ms — spring loading.
+   *
+   * You cannot drop into a folder you cannot see, and the alternative is to abandon the drag,
+   * expand the folder and start again, which is the gesture people give up on. Which rows qualify
+   * is `treeDrag.springTarget`; the timer is the hook's.
+   */
+  const springOpen = useCallback((path: string) => {
+    const store = useFileTree.getState()
+    const at = store.indexOf(path)
+    const row = at === null ? undefined : store.rowAt(at)
+    if (row !== undefined) void store.toggle(row)
+  }, [])
+
+  /**
+   * Dragging rows into a folder.
+   *
+   * The rules are `treeDrag.ts` and the pointer state machine is `useTreeDrag.ts`; what is here
+   * is the wiring, and the wiring is the half this project has shipped broken four times. Two
+   * things make it reachable rather than merely present: `onMove` is passed (without it the hook
+   * refuses to start a gesture at all rather than running a drag that lands nowhere), and the
+   * rows below carry `onPointerDown` plus the three `data-` attributes the stylesheet draws from.
+   */
+  const drag = useTreeDrag({
+    carried: selection.paths,
+    roots,
+    writable,
+    container: scrollRef,
+    rowFor,
+    onSpring: springOpen,
+    onMove: runMove,
+  })
+
+  /**
+   * The release of a press whose collapse was deferred.
+   *
+   * Skipped when the gesture became a drag: the whole selection has just been moved and it is
+   * still the right selection, so collapsing to the one row the pointer happened to be on would
+   * undo the widening the drag existed to carry.
+   */
+  /**
+   * The load in flight as a set, built once per drag rather than once per row per frame.
+   *
+   * `inDrag` asks it about a row's ancestors, so this is what keeps the dim independent of how
+   * many rows were picked up — Ctrl+A can select 10 000 of them.
+   */
+  const inFlight = useMemo(
+    () => (drag.state === null ? null : new Set(drag.state.drag.paths)),
+    [drag.state],
+  )
+
+  const releasePress = useCallback(
+    (path: string, index: number) => {
+      if (drag.dragged()) {
+        deferredPress.current = null
+        return
+      }
+      if (deferredPress.current !== path) return
+      deferredPress.current = null
+      useFileTree.getState().releaseRow(path, index)
+    },
+    [drag],
   )
 
   /**
@@ -709,11 +941,19 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         setProblem(`${ROOT_NOT_RENAMED}.`)
         return
       }
+      // A group header, a note, or a dependency source: `fs_rename` refuses all three via
+      // `check_within`, and the box would open over a row nothing could rename. Said out loud
+      // and in the same words the menu greys the item with — see `mutationRefusal`.
+      const refusal = mutationRefusal([row.path], writable)
+      if (refusal !== null) {
+        setProblem(`${refusal}.`)
+        return
+      }
       setProblem(null)
       if (at >= 0) moveTo(at)
       setRenaming(row.path)
     },
-    [moveTo],
+    [moveTo, roots],
   )
 
   const onKeyDown = useCallback(
@@ -775,6 +1015,18 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
             // user was not looking is the one outcome worth a round trip to avoid, and this
             // costs a scroll instead.
             setProblem('Scroll back to the selected row before pasting — it is no longer loaded.')
+          } else if (
+            row !== undefined &&
+            (mutationRefusal([row.path], writable) ?? creationRefusal(row.path, roots)) !== null
+          ) {
+            // Pasting *into* a dependency source, onto a group header, or into the scratch
+            // drawer. The first two `fs_paste` refuses outright; the third it would accept,
+            // and refusing it here is a policy — see `creationRefusal`. The honest place to
+            // say so is before the copy dialog rather than after it. The same two rules the
+            // context menu's Paste item greys itself with, in the same order.
+            setProblem(
+              `${mutationRefusal([row.path], writable) ?? creationRefusal(row.path, roots) ?? ''}.`,
+            )
           } else {
             const anchor = row === undefined ? null : { path: row.path, isDir: row.kind === 'dir' }
             runPaste(pasteTargetFor(anchor, roots))
@@ -787,7 +1039,15 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         // Ctrl- or Shift-click is the set. The row under the cursor is deliberately not a
         // fallback — see `actionScope`: the cursor can sit on a row that is *not* selected, and
         // cutting one of those would move a file with nothing on screen marking it.
-        takeClip(key === 'x' ? 'cut' : 'copy', actionScope(store.selection))
+        //
+        // A **cut** is a mutation and a **copy** is not, which is why only one of them is gated:
+        // copying a dependency's source into the project is a real thing to want, and `fs_paste`
+        // reads the source and writes only into the destination. Moving one out of the registry
+        // would break every other project on the machine that depends on it.
+        const scope = actionScope(store.selection)
+        const refusal = key === 'x' ? mutationRefusal(scope, writable) : null
+        if (refusal !== null) setProblem(`${refusal}.`)
+        else takeClip(key === 'x' ? 'cut' : 'copy', scope)
         e.preventDefault()
         return
       }
@@ -849,7 +1109,12 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           // it goes back to the browser rather than being swallowed with a shrug.
           const scope = actionScope(store.selection)
           if (scope.length === 0) return
-          askDelete(scope)
+          // A group header or a dependency source in the set. `fs_delete` refuses both, and a
+          // confirmation dialog listing a file cide will then decline to trash is worse than
+          // the refusal it is standing in for.
+          const refusal = mutationRefusal(scope, writable)
+          if (refusal !== null) setProblem(`${refusal}.`)
+          else askDelete(scope)
           e.preventDefault()
           return
         }
@@ -933,12 +1198,15 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
 
       const row = store.rowAt(at)
       if (row === undefined) return
+      const verbs = rowVerbs(row.kind, true)
       switch (e.key) {
         case 'Enter':
-          apply(enterOn({ expandable: row.kind === 'dir' }), row, at)
+          // A group header is `expandable`, so Enter opens it — which is what starts the
+          // dependency resolution, and is the keyboard's only route to it besides the palette.
+          apply(enterOn({ expandable: verbs.expandable }), row, at)
           break
         case 'ArrowRight':
-          if (row.kind === 'dir' && !row.expanded) void store.toggle(row)
+          if (verbs.expandable && !row.expanded) void store.toggle(row)
           else moveTo(Math.min(at + 1, count - 1), mods)
           break
         case 'ArrowLeft':
@@ -951,7 +1219,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
            * trip per keystroke, in a handler that has to feel instant. One row up reaches the
            * parent for the common case (the first child) and never stalls.
            */
-          if (row.kind === 'dir' && row.expanded) void store.toggle(row)
+          if (verbs.expandable && row.expanded) void store.toggle(row)
           else moveTo(Math.max(at - 1, 0), mods)
           break
         default:
@@ -1104,15 +1372,28 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       const el = target?.closest<HTMLElement>('[data-row-path]')
       const path = el?.dataset['rowPath']
       if (el === null || el === undefined || path === undefined) return null
+      const kind = (el.dataset['rowKind'] ?? 'file') as RowKindAttr
       return {
         path,
-        isDir: el.dataset['rowKind'] === 'dir',
+        kind,
+        isDir: kind === 'dir',
         expanded: el.dataset['rowExpanded'] === 'true',
         /** A project root: `fs_rename` and `fs_delete` both refuse one, so the menu does too. */
         isRoot: isRootPath(path, roots),
+        /**
+         * What this row lets the user do. Read here, once, rather than by each item asking
+         * about `kind` again — six call sites asking `kind === 'dir'` and meaning six different
+         * things is the state `groupRows.ts` exists to end.
+         *
+         * `writable`, not `roots`: a scratch is outside every root and is still renamed, cut
+         * and trashed, because cide owns the directory it is in. That is the *only* thing
+         * `inProject` was ever asking, and answering it from the list Rust checks against is
+         * what stops the menu and the handler drifting into two rules.
+         */
+        verbs: rowVerbs(kind, rootOf(path, writable) !== null),
       }
     },
-    [roots],
+    [roots, writable],
   )
 
   /**
@@ -1132,6 +1413,16 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       if (project === null) return []
 
       /*
+       * A **note** row offers nothing, and offers it by not opening a menu at all.
+       *
+       * It is a sentence — *`cargo` is not on PATH…* — and every item below is about a file.
+       * Falling through to the empty-space branch would have offered *New File in cide…* from a
+       * right-click on an error message, which is a menu acting on something the user was not
+       * pointing at. `useContextMenu` declines on `[]`.
+       */
+      if (row !== null && row.kind === 'note') return []
+
+      /*
        * *New File…* and *New Folder…*, which are the two items this menu was missing.
        *
        * Built before the early return below, because the empty space under the last row is
@@ -1143,7 +1434,33 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
        * clicked — the empty-space case, and the multi-root case where "the project root" is
        * several different directories. `targetFor` decides which root; this only says so.
        */
-      const target_ = targetFor(row === null ? null : { path: row.path, isDir: row.isDir }, roots)
+      /*
+       * Why the disk-changing verbs are off for *this row*, or null.
+       *
+       * One call, read by five items below, so the menu cannot end up offering *Cut* on a row
+       * it refuses to *Rename*. A group header and a dependency source are the two populations
+       * it catches; `mutationRefusal` is the same rule `check_within` applies in Rust, said
+       * early enough to grey a row instead of erroring after the click.
+       */
+      const rowRefusal = row === null ? null : mutationRefusal([row.path], writable)
+      /*
+       * And the narrower one: a row cide may *rename* but whose directory nobody fills.
+       *
+       * A scratch is the only such row. `mutationRefusal` passes it — Rename, Cut and *Move to
+       * Trash* all work — while `New File in 4f2a9c7b…` beside it would name a blake3 and drop
+       * an ordinary file into the drawer. See `creationRefusal`.
+       */
+      const fillRefusal =
+        rowRefusal ?? (row === null ? null : creationRefusal(row.path, roots))
+      // `null` when nothing here may be created in: a header, a directory under
+      // `~/.cargo/registry`, or the scratch drawer. Deliberately not "fall back to the project
+      // root" — a *New File in cide…* item on a right-click over `serde` would create a file
+      // somewhere the user was not pointing at, which is the failure the labelled destination
+      // exists to prevent.
+      const target_ =
+        fillRefusal !== null
+          ? null
+          : targetFor(row === null ? null : { path: row.path, isDir: row.isDir }, roots)
       // Name the destination whenever it is not the thing that was clicked. A **file** row is
       // the case that matters: *New File* on `src/main.rs` creates a sibling in `src`, not
       // something "inside" a file, and the label is where the user finds that out — before the
@@ -1171,8 +1488,12 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
        * reason on it** rather than hidden — an item that appears only sometimes teaches the
        * user nothing about why, and "nothing has been copied yet" is the answer to the
        * question they are actually asking.
+       *
+       * `fillRefusal` first: with a dependency source or a scratch under the pointer, `target_`
+       * is null and `pasteRefusal` would say "this project has no folder to paste into", which
+       * is a true sentence about the wrong thing.
        */
-      const refusal = pasteRefusal(clipNow(), project, target_)
+      const refusal = fillRefusal ?? pasteRefusal(clipNow(), project, target_)
       const paste: MenuEntry = {
         id: 'paste',
         label: pasteLabel(clipNow(), target_),
@@ -1198,9 +1519,38 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
        */
       const marked = pressMenu(store.selection, row.path)
       store.setSelection(marked, row.path, at ?? store.selectedIndex)
-      /** The rows this menu's verbs act on: exactly what the tree is now showing as selected. */
-      const scope = actionScope(marked)
+      /**
+       * The rows this menu's verbs act on: exactly what the tree is now showing as selected,
+       * minus anything that is not a file.
+       *
+       * The filter is not cosmetic. `actionScope` answers with paths, and a Ctrl-click that
+       * added the *External Libraries* header to the selection would otherwise put
+       * `cide://group/externalLibraries` into *Copy 3 Paths* and into the trash confirmation's
+       * list — a dialog naming a row that is not a file, about to call a command that refuses it.
+       */
+      const scope = actionScope(marked).filter((path) => !isSyntheticPath(path))
       const many = scope.length > 1
+
+      /*
+       * A **group header** offers one thing: the twisty it already has.
+       *
+       * Every item below is about a file, and this row is not one — it has no path on disk, no
+       * git status, no name to copy and nothing to open in a pane. Returning a one-item menu
+       * rather than a disabled version of the full one is the honest shape: fourteen greyed rows
+       * with fourteen identical reasons teaches nothing and looks broken.
+       */
+      if (row.kind === 'group') {
+        const live = at === null ? undefined : store.rowAt(at)
+        return [
+          {
+            id: 'open',
+            label: row.expanded ? 'Collapse' : 'Expand',
+            ...(live === undefined
+              ? { disabledReason: 'Scroll back to the row before folding it' }
+              : { run: () => void store.toggle(live) }),
+          },
+        ]
+      }
 
       const openLabel = row.isDir ? (row.expanded ? 'Collapse' : 'Expand') : 'Open'
       const entries: MenuEntry[] = [
@@ -1244,7 +1594,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         {
           id: 'cut',
           label: copyLabel('cut', scope.length),
-          ...cutAction(scope, roots, takeClip),
+          ...cutAction(scope, roots, writable, takeClip),
         },
         {
           id: 'copy',
@@ -1257,9 +1607,19 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           // The one verb here that is about a *place* rather than a set of files. A file
           // manager is asked to show one directory, so it gets the row that was clicked even
           // when several are selected — opening five windows is not what anyone means.
+          //
+          // Disabled for a dependency source rather than enabled by relaxing Rust's check.
+          // `fs_show_in_manager` calls `check_within`, and widening a containment check so a
+          // menu item looks better is the kind of change that should be argued on its own
+          // rather than slipped into a feature — see the note in `cmd::fs`.
           id: 'reveal',
           label: 'Reveal in File Manager',
-          run: () => void fsReveal.showInManager(project, row.path).catch(fail('Reveal')),
+          ...(rowRefusal === null
+            ? { run: () => void fsReveal.showInManager(project, row.path).catch(fail('Reveal')) }
+            : {
+                disabledReason:
+                  'cide opens a file manager only on paths inside the project',
+              }),
         },
         /*
          * The two that copy *names* rather than files, and they follow the selection: with
@@ -1302,9 +1662,14 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           // one new name. See the Ctrl+R branch in `onKeyDown`, which makes the same choice.
           id: 'rename',
           label: 'Rename…',
+          // Two refusals, most specific first. A project root is refused for a reason about
+          // *roots*; a dependency source is refused for a reason about *containment*, and
+          // saying the wrong one of the two would send the user looking in the wrong place.
           ...(row.isRoot
             ? { disabledReason: ROOT_NOT_RENAMED }
-            : { run: () => startRename(at ?? -1, row) }),
+            : rowRefusal !== null
+              ? { disabledReason: rowRefusal }
+              : { run: () => startRename(at ?? -1, row) }),
         },
         {
           id: 'delete',
@@ -1312,10 +1677,13 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           danger: true,
           // A root anywhere in the selection greys the item, not just a root under the pointer
           // — `askDelete` refuses the same set for the same reason, and the two must agree or
-          // the menu enables something the handler then declines.
+          // the menu enables something the handler then declines. Same for a path outside the
+          // project: the Delete key checks the whole scope with the same function.
           ...(scope.some((path) => isRootPath(path, roots))
             ? { disabledReason: ROOT_NOT_DELETED }
-            : { run: () => askDelete(scope) }),
+            : (mutationRefusal(scope, writable) ?? null) !== null
+              ? { disabledReason: mutationRefusal(scope, writable) ?? '' }
+              : { run: () => askDelete(scope) }),
         },
       ]
       return entries
@@ -1362,6 +1730,10 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
            reads `aria-selected` on several rows as a bug in a tree that claims single select. */
         aria-multiselectable={true}
         tabIndex={0}
+        /* One flag for the whole box while a drag is in flight: it turns off the hover wash,
+           which would otherwise follow the pointer *and* the drop outline — two bands making two
+           different claims about where the files are going. */
+        {...(drag.state === null ? {} : { 'data-dragging': '' })}
         onKeyDown={onKeyDown}
         onContextMenu={onContextMenu}
       >
@@ -1393,6 +1765,18 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
                 />
               )
             }
+            const flight = drag.state
+            /*
+             * The drop's three answers for *this* row, computed here rather than in `Row` so the
+             * row stays a renderer. All three are `null`/`undefined` unless a drag is in flight,
+             * which is the ordinary case and costs one comparison.
+             *
+             * `mark` is the destination folder for an accepted drop and the row under the pointer
+             * for a refused one — see `TreeDropOutcome`. It is a *path*, so a destination with no
+             * visible row (the hidden root of a single-root project, a folder scrolled off the
+             * top) simply matches nothing, and its children still take the band.
+             */
+            const mark = flight?.outcome.mark ?? null
             return (
               <Row
                 key={item.key}
@@ -1405,9 +1789,19 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
                 selected={selection.paths.has(row.path)}
                 current={row.path === selected}
                 cut={isCutPending(clip, row.path)}
+                dragging={inFlight !== null && inDrag(inFlight, row.path)}
+                drop={mark === row.path && flight !== null ? flight.outcome.kind : undefined}
+                dropBand={
+                  mark !== null && flight !== null && flight.outcome.kind !== 'refuse'
+                  && inDropBand(row.path, mark)
+                    ? flight.outcome.kind
+                    : undefined
+                }
                 renaming={row.path === renaming}
                 project={project}
                 onAct={apply}
+                onPick={drag.onPointerDown}
+                onRelease={releasePress}
                 onEndRename={() => setRenaming(null)}
                 onFail={fail('Rename')}
               />
@@ -1551,7 +1945,44 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
           onConfirm={() => closeDelete(pendingDelete.run)}
         />
       )}
+      {/*
+        * What is being dragged and what will happen to it, under the pointer.
+        *
+        * Outside the scroller, like every other overlay here: it is `position: fixed`, the
+        * scroller is `role="tree"` and its children have to be tree items, and its viewport is as
+        * tall as the whole flattened repository.
+        */}
+      {drag.state !== null && <TreeDragGhost state={drag.state} />}
     </>
+  )
+}
+
+/**
+ * The drag ghost: the load, and the verdict.
+ *
+ * A drag with no indicator is a gesture people abandon halfway — or worse, finish over the wrong
+ * folder — so this says both facts *in words* rather than relying on a cursor: what is being
+ * carried (`4 items`, `src/`) and what the thing under the pointer will do with it (`Move 4 items
+ * to “sidebar”`, `Already in “src”`, or the reason it is refused). The refusal is the one that
+ * earns the component: dropping a folder into its own descendant is a gesture with no undo, and
+ * the sentence is what stops it being attempted twice.
+ *
+ * `position: fixed` at the pointer, offset down-right so it never sits under the cursor's own
+ * hotspot, and `pointer-events: none` so it is never what `elementFromPoint` finds — which would
+ * make the drop target flicker between the row and the ghost as the pointer moved.
+ */
+function TreeDragGhost({ state }: { state: TreeDragState }) {
+  return (
+    <div
+      className={styles.ghost}
+      data-outcome={state.outcome.kind}
+      data-audit="fileTreeDragGhost"
+      style={{ left: `${state.x + 12}px`, top: `${state.y + 14}px` }}
+      aria-hidden="true"
+    >
+      <span className={styles.ghostLoad}>{state.drag.label}</span>
+      <span className={styles.ghostHint}>{state.outcome.hint}</span>
+    </div>
   )
 }
 
@@ -1712,11 +2143,20 @@ function sideAction(
 function cutAction(
   scope: readonly string[],
   roots: readonly string[],
+  /** Where cide may write: the roots plus the scratch drawer. See the panel's `writable`. */
+  writable: readonly string[],
   take: (mode: ClipMode, paths: readonly string[]) => void,
 ): { disabledReason: string } | { run: () => void } {
   if (scope.some((path) => isRootPath(path, roots))) {
     return { disabledReason: 'A project root is closed, not moved' }
   }
+  // A dependency source, or a group header. **Cut** is refused and *Copy* is not, deliberately:
+  // copying a crate's source into the project is a real thing to want, while moving one out of
+  // `~/.cargo/registry` would break every other project on the machine that depends on it —
+  // which is also why `check_within` refuses it in Rust. A **scratch** is cut like any other
+  // file: it is in `writable`, so this passes and `fs_paste` moves it.
+  const outside = mutationRefusal(scope, writable)
+  if (outside !== null) return { disabledReason: outside }
   return { run: () => take('cut', scope) }
 }
 
@@ -1740,9 +2180,24 @@ interface RowProps {
   current: boolean
   /** On the clipboard for a **cut**: drawn faded, because it is about to move. */
   cut: boolean
+  /**
+   * In flight: this row, or a folder above it, is being dragged. Drawn dimmed.
+   *
+   * The single most important signal in the gesture — without it a drag of four files looks
+   * exactly like a drag of one, which is the whole subject of the request.
+   */
+  dragging: boolean
+  /** `move` / `noop` / `refuse` when this row is the drop's marked row, else `undefined`. */
+  drop: string | undefined
+  /** The same, for a row *inside* the destination folder. See `treeDrag.inDropBand`. */
+  dropBand: string | undefined
   renaming: boolean
   project: ProjectId | null
   onAct: (action: RowAction, row: TreeRow, index: number, mods: SelectMods) => void
+  /** The press that may become a drag. See `useTreeDrag`. */
+  onPick: (e: React.PointerEvent, row: TreeRow) => void
+  /** The release, which finishes a press whose collapse was deferred. */
+  onRelease: (path: string, index: number) => void
   onEndRename: () => void
   /** Where a rejected `fs_rename` goes. See `problem` in the panel. */
   onFail: (error: unknown) => void
@@ -1758,14 +2213,32 @@ function Row({
   selected,
   current,
   cut,
+  dragging,
+  drop,
+  dropBand,
   renaming,
   project,
   onAct,
+  onPick,
+  onRelease,
   onEndRename,
   onFail,
 }: RowProps) {
   const isDir = row.kind === 'dir'
-  const tone = statusAt(statuses, row.path)
+  /**
+   * What this row answers. `true` for `inProject` because nothing the *renderer* draws depends
+   * on containment — the twisty, the icon and the double-click are the same for a dependency
+   * source as for a project file, and the verbs that do care are the context menu's, which asks
+   * `rowVerbs` again with the real answer.
+   */
+  const verbs = rowVerbs(row.kind, true)
+  const synthetic = row.kind === 'group' || row.kind === 'note'
+  /** A synthetic row's glyph, or `null` for one that draws none. See `groupRows.groupIcon`. */
+  const stem = groupIcon(row.kind, row.expanded, groupIdOf(row.path))
+  // A synthetic row has no path on disk, so it has no git status either. Asking anyway would
+  // resolve `cide://group/externalLibraries` against the status map's ancestor walk, which
+  // terminates but is work per row per frame for an answer that is always `clean`.
+  const tone = synthetic ? 'clean' : statusAt(statuses, row.path)
   const letter = letterFor(tone, isDir)
   /*
    * `?? CLEAN` even though `TreeStatus` says the lookup is total. The compiler is checking a
@@ -1775,13 +2248,20 @@ function Row({
    * render*, which unmounts the whole tree rather than mis-drawing one row.
    */
   const status = STATUS[tone] ?? CLEAN
-  const hasTwisty = isDir && row.hasChildren
+  // `verbs.expandable`, not `isDir`: a group header folds, and it is drawn before it has any
+  // children at all — `has_children` is hard-coded true on it in Rust, because a header with no
+  // twisty cannot be opened and opening it is what starts the resolution.
+  const hasTwisty = verbs.expandable && row.hasChildren
   const twisty = hasTwisty ? (row.expanded ? '▾' : '▸') : ''
 
   // Composed rather than a ternary chain: a row can be selected, be the cursor *and* be pending
   // a cut all at once, which is the ordinary case — Ctrl+X acts on the selection.
   const rowClass = [
     styles.row,
+    // A group header is a heading and reads like one; a note is a sentence and reads dim and
+    // italic, so neither can be mistaken for a file whose name happens to be a sentence.
+    row.kind === 'group' ? styles.rowGroup : null,
+    row.kind === 'note' ? styles.rowNote : null,
     selected ? styles.rowSelected : null,
     current ? styles.rowCurrent : null,
     cut ? styles.rowCut : null,
@@ -1804,13 +2284,54 @@ function Row({
        */
       data-row-path={row.path}
       data-row-kind={row.kind}
-      data-row-expanded={isDir ? String(row.expanded) : undefined}
+      data-row-expanded={verbs.expandable ? String(row.expanded) : undefined}
+      /*
+       * The three channels of the drag's feedback, and none of them is polish: a drop moves the
+       * user's files and there is no undo anywhere in `cide_fs::ops`.
+       *
+       * `data-drag` dims what is in flight. `data-drop` says what the marked row will do —
+       * accent ring for a move, a neutral ring for a drop that changes nothing, `--red` for a
+       * refusal. `data-drop-band` tints the rows *inside* the destination, because the
+       * destination is very often above the fold: drop onto a file thirty rows into an expanded
+       * folder and the folder's own row is off the top of a 252px panel, so a ring on it alone
+       * would highlight nothing at all.
+       */
+      {...(dragging ? { 'data-drag': '' } : {})}
+      {...(drop === undefined ? {} : { 'data-drop': drop })}
+      {...(dropBand === undefined ? {} : { 'data-drop-band': dropBand })}
       role="treeitem"
       aria-level={row.depth + 1}
       aria-selected={selected}
-      {...(isDir ? { 'aria-expanded': row.expanded } : {})}
+      {...(verbs.expandable ? { 'aria-expanded': row.expanded } : {})}
       style={{ height: `${height}px`, transform: `translateY(${top}px)` }}
-      title={row.path}
+      /* The full path, because the panel is 252px wide and long names are truncated. A
+         synthetic row's `path` is a `cide://…` sentinel that names nothing, so it gets its own
+         text instead — a tooltip reading `cide://group/externalLibraries` would look like a
+         leaked internal, which is what it is. */
+      title={synthetic ? row.name : row.path}
+      /*
+       * First, and deliberately separate from the click handling below: a press only becomes a
+       * drag after 4px of movement, so every click rule keeps running exactly as it did and a
+       * press that never moves costs nothing at all.
+       *
+       * Nothing calls `preventDefault` here, unlike `ChangesTree`. Rows in this tree are not
+       * focusable — the scroller is the panel's single tab stop — so a press whose default is
+       * prevented never focuses it, and every arrow key afterwards goes nowhere. See the header
+       * of `useTreeDrag.ts`.
+       */
+      onPointerDown={(e) => {
+        if (renaming) return
+        onPick(e, row)
+      }}
+      /*
+       * The release: it finishes a press whose collapse was deferred, and it is skipped when the
+       * gesture became a drag. Without it, pressing on one of five selected rows and *not*
+       * dragging would leave all five selected — the deferral would never resolve.
+       */
+      onMouseUp={(e) => {
+        if (e.button !== 0 || renaming) return
+        onRelease(row.path, index)
+      }}
       onMouseDown={(e) => {
         // Middle and right buttons are not this gesture. Right-click still selects, from the
         // menu's own `items` callback, so the row the menu acts on is the row that lights up.
@@ -1818,7 +2339,9 @@ function Row({
         onAct(
           fileTreeClick({
             gesture: gestureOf(e.detail),
-            isDir,
+            // "does a double-click fold this rather than open it", which is what `expandable`
+            // means here — a group header answers yes and is not a directory.
+            isDir: verbs.expandable,
             /*
              * The twisty is a control of its own: one click on the arrow folds the folder,
              * because requiring a double-click on an 11px glyph to do the only thing it does
@@ -1848,6 +2371,14 @@ function Row({
       <span
         className={styles.twisty}
         style={{ marginLeft: `${row.depth * INDENT}px` }}
+        /*
+         * The twisty is a control, not a handle: one click on it folds the folder, so a hand that
+         * shifts three pixels while clicking it must not pick the row up instead. The *click*
+         * still reaches the row — only the pointer press is stopped — so `fileTreeClick`'s
+         * `onTwisty` rule is untouched. `ChangesTree` stops the same event on its checkbox for
+         * the same reason.
+         */
+        onPointerDown={(e) => e.stopPropagation()}
         aria-hidden="true"
       >
         {twisty}
@@ -1861,7 +2392,23 @@ function Row({
        * This replaced the literal `▤`/`▫`. The activity rail still draws `▤` for Files, which
        * is a different claim — that rail names a *panel*, not a directory.
        */}
-      <FileIcon row={row} theme={iconTheme} />
+      {/*
+       * A synthetic row's glyph is decided by `groupRows.groupIcon` rather than by the icon
+       * theme, and a note gets none at all: the Material table associates *filenames* with
+       * icons, so `iconFor` would hand a sentence to the extension lookup and draw the default
+       * document — a row that reads as a file called "cargo is not on PATH".
+       */}
+      {synthetic ? (
+        stem === null ? (
+          // A note. The empty span keeps the sentence aligned with the names above it, so a
+          // failure row reads as part of the list rather than as something that slipped left.
+          <span className={styles.noteGap} aria-hidden="true" />
+        ) : (
+          <FileIcon row={row} theme={iconTheme} stem={stem} />
+        )
+      ) : (
+        <FileIcon row={row} theme={iconTheme} />
+      )}
       {renaming && project !== null ? (
         <RenameInput project={project} row={row} onDone={onEndRename} onFail={onFail} />
       ) : (
@@ -1872,6 +2419,17 @@ function Row({
         >
           {row.name}
         </span>
+      )}
+      {/*
+       * The dim second column: a dependency's version, the group's count, `not downloaded`.
+       *
+       * A sibling of the name rather than part of it, so the icon lookup, the rename box and
+       * the "already exists" sibling check keep reading a *name*. It shrinks before the name
+       * does — see `.detail` in the stylesheet — because in a 252px panel `serde` matters more
+       * than `1.0.229`.
+       */}
+      {row.detail !== null && row.detail !== '' && (
+        <span className={styles.detail}>{row.detail}</span>
       )}
       <span
         className={

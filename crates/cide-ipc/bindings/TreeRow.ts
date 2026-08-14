@@ -31,5 +31,16 @@ symlink: boolean,
 /**
  * Index into `Project::roots`. The tree colours and groups by root in a multi-root
  * project, and needs this without re-deriving it from path prefixes on every row.
+ *
+ * [`NO_ROOT`] for a row that belongs to no root at all — every row of a synthetic group.
  */
-root: number, };
+root: number, 
+/**
+ * Drawn dim after the name: a dependency's version, a group's count, `not downloaded`.
+ *
+ * `None` for every row that came out of the walk, which is every row the file tree drew
+ * before M13. A second *field* rather than a suffix on `name` because `name` is what the
+ * icon lookup, the rename box and the sibling-name check all read — folding `serde 1.0.229`
+ * into it would mean an icon chosen from a version number.
+ */
+detail: string | null, };

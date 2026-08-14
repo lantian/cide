@@ -107,6 +107,52 @@ pub fn defaults() -> Vec<Binding> {
         // ⇧⌘F, which is the same gesture every editor on that platform uses for the same thing,
         // so it needs no exception in `keeps_ctrl_on_macos`.
         ("ctrl+shift+f", "sidebar.search"),
+        // *Select opened file*, and the same story as `ctrl+shift+f` above: the command existed,
+        // was dispatched, read its answer and reported a failure — and could be reached only by
+        // typing its name into the palette **while an editor pane had focus**. The button in the
+        // Explorer header and this chord are the two gestures that make it a feature.
+        //
+        // # What it costs: nothing, in any of the three layers
+        //
+        // Nothing in this table uses `e` at all. CodeMirror's installed keymaps
+        // (`closeBracketsKeymap`, `defaultKeymap`, `historyKeymap`, `indentWithTab`, and a
+        // filtered `searchKeymap`) bind `Mod-Shift-` only for `l`, `u` and `z`. And xterm sends
+        // **no bytes**: `Keyboard.ts` encodes a control character only for
+        // `ctrlKey && !shiftKey && !altKey && !metaKey`, which is exactly what leaves
+        // Ctrl+Shift+C and Ctrl+Shift+V inert in a terminal today.
+        //
+        // # Unconditional, deliberately
+        //
+        // `Command::when` gates the *palette*; a `Binding::when` here would gate the keyboard,
+        // and an `editorFocused` clause would make the chord dead in a terminal and in the file
+        // tree — which is where somebody asking "where is the file I am editing?" most often
+        // has their hands. Nothing is taken from anyone, so there is nothing to scope.
+        //
+        // # The IDEA divergence, named rather than discovered
+        //
+        // ⌃⇧E is *Recent Locations* in IDEA; *Select Opened File* has no default chord there at
+        // all (it is a gear-menu action). cide has no Recent Locations, so nothing is lost — but
+        // a user coming from IDEA will press this expecting one, and `README.md` says so. On
+        // macOS `platform_layer` rewrites it to ⇧⌘E, which is free there too and needs no
+        // exception in `keeps_ctrl_on_macos`.
+        ("ctrl+shift+e", "file.reveal"),
+        // A new scratch file, on IDEA's own chord for it.
+        //
+        // # What it costs a terminal, precisely
+        //
+        // xterm claims nothing here; it *encodes*. Shift+Alt+S becomes `ESC` `S`
+        // (`@xterm/xterm`'s `Keyboard.ts`), and the gate is a window **capture** listener, so
+        // those two bytes are what this binding takes from every pane in every window. `ESC S`
+        // is unbound in stock readline. In vim it is *leave insert mode, then* `S`, which
+        // substitutes the current line — so for a vim user this binding arguably prevents a
+        // keystroke rather than costing one. Rebindable either way:
+        // `{"key":"alt+shift+s","command":"-scratch.new"}` in `keymap.json`.
+        //
+        // Free everywhere else. This table has no `alt+shift+*` binding at all, and a sweep of
+        // `@codemirror/{commands,search,autocomplete,language}` finds no `Alt-s` in any
+        // spelling. `platform_layer` only rewrites keys containing `ctrl`, so this passes
+        // through untouched on macOS — where ⌥⇧S is also free.
+        ("alt+shift+s", "scratch.new"),
         ("ctrl+w", "tab.close"),
         ("ctrl+s", "file.save"),
         ("ctrl+shift+t", "theme.toggle"),

@@ -43,15 +43,65 @@ pub struct TreeRow {
     pub symlink: bool,
     /// Index into `Project::roots`. The tree colours and groups by root in a multi-root
     /// project, and needs this without re-deriving it from path prefixes on every row.
+    ///
+    /// [`NO_ROOT`] for a row that belongs to no root at all — every row of a synthetic group.
     pub root: u16,
+    /// Drawn dim after the name: a dependency's version, a group's count, `not downloaded`.
+    ///
+    /// `None` for every row that came out of the walk, which is every row the file tree drew
+    /// before M13. A second *field* rather than a suffix on `name` because `name` is what the
+    /// icon lookup, the rename box and the sibling-name check all read — folding `serde 1.0.229`
+    /// into it would mean an icon chosen from a version number.
+    pub detail: Option<String>,
 }
 
+/// [`TreeRow::root`] for a row no project root contains.
+///
+/// A reserved value rather than an `Option<u16>`: the field is on every row of a 100k-row tree,
+/// `Option` would widen the wire form of all of them for a handful of synthetic rows, and every
+/// consumer already treats it as an index it must bounds-check. `u16::MAX` cannot collide — a
+/// project with 65,535 roots is not a thing, and `cide_fs::Index` indexes `roots` by this value.
+pub const NO_ROOT: u16 = u16::MAX;
+
+/// What a tree row *is*, which decides every gesture it answers.
+///
+/// The two synthetic variants are the M13 addition, and they are on this enum rather than being
+/// a flag beside it because "is this a directory" was already the question every call site
+/// asked. A boolean `synthetic: bool` would have left `kind == 'dir'` true for a group header
+/// and every one of those call sites silently wrong; widening the enum makes the compiler and
+/// `check-groups.mjs` name each one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum TreeRowKind {
     Dir,
     File,
+    /// A synthetic group header — *External Libraries*. Expands and collapses like a directory
+    /// and is nothing else: it has no path on disk, cannot be renamed, copied, deleted or
+    /// revealed in a file manager, and never opens a tab.
+    ///
+    /// Its `path` is a `cide://group/<id>` sentinel, which is not absolute and is therefore
+    /// refused by `cide_fs::ops::check_within` — so a frontend bug that sent it to a file
+    /// operation gets an error rather than an action.
+    Group,
+    /// A sentence, drawn where rows would be. *Resolving dependencies…*, *`cargo` is not on
+    /// PATH…*, *No external dependencies.*
+    ///
+    /// It exists so that a group can never be **silently** empty: an empty group and a broken
+    /// one look identical, and the one thing a user cannot debug is a twisty that opens onto
+    /// nothing. Not selectable, not openable, carries no menu.
+    Note,
+}
+
+impl TreeRowKind {
+    /// Whether this row stands for something on disk that file operations may touch.
+    ///
+    /// The single place the "which kinds are real" question is answered in Rust; the frontend's
+    /// mirror is `ui/src/sidebar/groupRows.ts`. Every command in `cmd::fs` that takes a path
+    /// still re-checks containment — this is about *rows*, not about trust.
+    pub fn is_path(self) -> bool {
+        matches!(self, Self::Dir | Self::File)
+    }
 }
 
 /// What a project's index is doing, and how it is watching.

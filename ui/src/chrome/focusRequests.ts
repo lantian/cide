@@ -58,6 +58,15 @@ export type FocusSurface =
   | 'search'
   /** The Git panel's commit message textarea, for `git.commit`. */
   | 'commitMessage'
+  /**
+   * The file tree's scroller, for `file.reveal` — *Select opened file*.
+   *
+   * The tree is one tab stop with the arrows moving inside it (`role="tree"`, `tabIndex={0}`
+   * on the scroller), so this is the whole of "give the tree the keyboard". Without it ⌃⇧E
+   * highlights a row and leaves the arrows pointing at the terminal the chord was pressed in,
+   * which is the same half-finished shape `sidebar.search` had before this module existed.
+   */
+  | 'fileTree'
 
 interface FocusRequestStore {
   /** The surfaces with an unanswered request. Empty almost always. */

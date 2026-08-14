@@ -49,6 +49,7 @@
  */
 import { useOverlays } from '@/overlays/store'
 import { useFileTree } from '@/sidebar/treeStore'
+import { EXTERNAL_LIBRARIES, SCRATCHES } from '@/sidebar/groupRows'
 import { useGitStatus } from '@/sidebar/gitStatusStore'
 import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
@@ -88,6 +89,7 @@ import {
   claudeTargetOf,
   focusTarget,
   focusedFilePath,
+  focusedTabPath,
   isClosableTab,
   windowProjectsOf,
 } from './target'
@@ -533,14 +535,46 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      /*
+       * *Select opened file* — ⌃⇧E, the ⌖ button in the Explorer header, and the palette row.
+       *
+       * All three arrive here and none of them has its own copy of the rules, which is the
+       * point: `Explorer`'s button calls `runCommand('file.reveal', null)` rather than
+       * `treeStore.reveal` directly, because a second call site with its own preconditions is
+       * how three gestures come to behave in three ways.
+       */
       case 'file.reveal': {
-        // The path comes from the focused file tab when the caller named none, so the
-        // palette row works. `args.path` still wins: a `keymap.json` entry may carry one.
-        const path = pathArg(args) ?? focusedFilePath(boot())
-        if (path === null) return unmet(command, 'no file tab focused and no path argument')
+        /*
+         * Every refusal below is a *sentence*, and that is the whole of what this arm learned.
+         *
+         * It used to answer `unmet`, which writes a line to the diagnostic log and nothing to
+         * the screen. With no binding on the command that was survivable — the palette hid the
+         * row. With a hotkey on it, it is a key that does nothing, in an application that has
+         * now found that defect fifteen times.
+         */
+        if (deps.showSidebar === undefined || boot()?.role.kind !== 'shell') {
+          notify('This window has no file tree, so there is nothing to select a file in.', {
+            kind: 'info',
+            hint: 'Detached panes are their own window and show no sidebar.',
+          })
+          return
+        }
+        // The path comes from the focused tab when the caller named none, so the palette row
+        // and the button work. `args.path` still wins: a `keymap.json` entry may carry one.
+        //
+        // `focusedTabPath`, not `focusedFilePath`: a diff tab names the file it is diffing, and
+        // revealing it is what IDEA does. See that function for the git-diff case it excludes.
+        const path = pathArg(args) ?? focusedTabPath(boot())
+        if (path === null) {
+          notify('No file tab is active, so there is nothing to select.', {
+            kind: 'info',
+            hint: 'Open a file — the Claude console and the settings tab are not files.',
+          })
+          return
+        }
         // Shown before revealed. Revealing into a sidebar that is on Git — or closed —
         // scrolls a tree nobody can see, which is a command that "did nothing" again.
-        deps.showSidebar?.('files')
+        deps.showSidebar('files')
         /*
          * And the answer is read, which it was not.
          *
@@ -559,10 +593,86 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           .getState()
           .reveal(path)
           .then((shown) => {
+            if (!shown) {
+              notify(`${path} is not in this project's file tree, so there is no row to show.`, {
+                kind: 'info',
+                hint: 'Files git ignores have no row in the tree, and neither does a file that has been deleted since it was opened.',
+              })
+              return
+            }
+            /*
+             * …and give the tree the keyboard, which is the half that made this feel unfinished.
+             *
+             * The row lights up and the arrows still go to whatever had focus — a terminal,
+             * after ⌃⇧E from a pane. The tree's single tab stop is its scroller (`role="tree"`,
+             * `tabIndex={0}`), and the request is *parked* rather than focused here for the two
+             * reasons `chrome/focusRequests.ts` gives: the panel is usually not mounted yet when
+             * this runs, and when it is, nothing mounts, so an `autoFocus` would do nothing on
+             * the second press.
+             *
+             * After the reveal resolves, deliberately: focusing a scroller that is about to
+             * scroll to a different index is a focus ring in the wrong place for a frame.
+             */
+            requestFocus('fileTree')
+          })
+        return
+      }
+
+      /*
+       * The External Libraries group, without a mouse and without hunting for it.
+       *
+       * The group is the last row of a virtualized tree, so in any repository with depth to it
+       * the header sits thousands of rows below the viewport — drawn, and in practice
+       * unreachable. This is the route that does not depend on scrolling to find it.
+       *
+       * Shown before revealed, the same order as `file.reveal` above: revealing into a sidebar
+       * that is on Git — or shut — scrolls a tree nobody can see.
+       *
+       * And the answer is read. `revealGroup` is `false` for a project with no `Cargo.toml` and
+       * no `go.mod` under any root, which is the ordinary case for a repository in another
+       * language: there is genuinely no group row, and saying so is the difference between this
+       * command and the fourteen dead controls this project has already found.
+       */
+      case 'view.externalLibraries': {
+        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
+        deps.showSidebar('files')
+        void useFileTree
+          .getState()
+          .revealGroup(EXTERNAL_LIBRARIES)
+          .then((shown) => {
             if (shown) return
-            notify(`${path} is not in this project's file tree, so there is no row to show.`, {
+            notify('This project has no External Libraries group.', {
               kind: 'info',
-              hint: 'Files outside the project, and files git ignores, have no row in the tree.',
+              hint: 'The group is shown for a project with a Cargo.toml or a go.mod under one of its roots.',
+            })
+          })
+        return
+      }
+
+      /*
+       * The Scratches group, by the same route and for the same reason as the one above.
+       *
+       * It is the *last* row of the tree — the second group, under External Libraries — so on
+       * any repository with depth to it the header is thousands of rows past the viewport.
+       * `scratch.new` reveals it as a side effect of creating something; this is the route for
+       * somebody who wants to find the scratches they already have.
+       *
+       * `revealGroup` answers `false` only for a project with no roots at all, which
+       * `cide_core::workspace` refuses to create — so the notice below is the defensive arm
+       * rather than the ordinary one, and it still exists because a palette row that scrolls
+       * nowhere and says nothing is this codebase's signature defect.
+       */
+      case 'view.scratches': {
+        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
+        deps.showSidebar('files')
+        void useFileTree
+          .getState()
+          .revealGroup(SCRATCHES)
+          .then((shown) => {
+            if (shown) return
+            notify('This project has no Scratches group.', {
+              kind: 'info',
+              hint: 'The group is keyed by the project\u2019s first root directory.',
             })
           })
         return
@@ -726,6 +836,28 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // in, and with no caret there is nothing to preselect and nothing to jump *from*.
         if (focusedCaret() === null) return unmet(command, 'no editor focused')
         useOverlays.getState().toggle('structure')
+        return
+      }
+
+      /*
+       * A new scratch file: ⇧⌥S, and the palette row.
+       *
+       * The chord is unconditional in `keymap.rs` — the gate never reads a `Command::when` —
+       * so this arm is what stops it opening a picker in a window that cannot honour it. Both
+       * refusals are `unmet` rather than a notice, and that is the deliberate difference from
+       * `file.reveal` above: those two are *facts about the user's situation that they just
+       * asked a question about*, while these are "this window is not the one that has a project
+       * and a file tree", which is a precondition the palette already hides the row for and
+       * which a detached-pane window is in permanently. A notice there would fire on every
+       * stray ⇧⌥S in a torn-out terminal.
+       */
+      case 'scratch.new': {
+        if (boot()?.role.kind !== 'shell') return unmet(command, 'this window has no file tree')
+        if (activeProjectOf(boot()) === null) return unmet(command, 'no open project')
+        // `toggle`, not `show` — the same argument `navigate.line` makes below: the gate
+        // swallows the chord either way, so `show` would leave ⇧⌥S unable to dismiss what ⇧⌥S
+        // opened.
+        useOverlays.getState().toggle('scratch')
         return
       }
 

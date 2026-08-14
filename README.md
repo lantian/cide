@@ -89,6 +89,123 @@ CIDE_AUDIT_PANES=1 ./target/debug/cide # re-check the pane host registry under c
 CIDE_AUDIT_WINDOWS=1 ./target/debug/cide # re-check detach/re-dock and window modes
 ```
 
+## Dragging rows into a folder (M13), and what is not done
+
+Press a row, move four pixels, and the file tree picks it up — the whole selection when the row is
+part of it, that row alone when it is not. A drop is a **cut and paste**, and deliberately not a new
+operation: `fs_paste` in `PasteMode::Cut` is what runs, so every refusal, the collision plan and the
+cross-device fallback are the ones Ctrl+X/Ctrl+V already had. There is **no `fs_move`** and no Rust
+change at all in this feature.
+
+**A collision asks the same question the paste asks.** `fs_paste_plan` runs first and writes
+nothing, so a drop onto a name that is taken raises `PasteConfirm` — the same dialog, the same
+*Keep both* default, the same promise that nothing has been written yet. One hazard, one dialog:
+two would eventually disagree, and the one that would go wrong is the drag, which has no undo
+anywhere and no keystroke to repeat.
+
+**Every refusal is a sentence on the ghost, before the release**, because a drag that simply does
+not land is indistinguishable from a broken feature. The rules are `ui/src/sidebar/treeDrag.ts`,
+pure and executed by `check:tree-drag`; the pointer state machine is `useTreeDrag.ts`, which nothing
+in this repo can run. A project root is not moved; a dependency source under *External Libraries* is
+neither dragged nor dropped into; the *Scratches* drawer is refused as a destination although Rust
+would accept it, because *New File…* and *Paste* are already refused there; a group header is a
+heading, not a folder; and a folder cannot be dropped into itself or into anything under it — the
+one that destroys a directory tree if it is merely unlikely rather than refused. A **scratch** is
+draggable, which is how one leaves the drawer for the project.
+
+Feedback is four channels and none of it is polish: the rows in flight dim, the destination folder
+takes an accent ring, the rows *inside* it take a tint (it is usually scrolled off the top by the
+time the pointer is over its files), and a ghost under the pointer names the load and the verdict.
+Folders spring open after 600 ms — except under a refused drop, which is what stops resting the
+pointer over *External Libraries* from launching `cargo metadata`.
+
+**Divergences and what is not done.** Pointer events, not HTML5 drag and drop, for the three
+reasons in `useTreeDrag.ts`'s header — so there is **no drag into cide from Dolphin or Nautilus and
+none out**, the same missing desktop-clipboard flavours the tree's Copy already documents. Dropping
+on empty space is refused rather than meaning "the project root", because a pointer released over
+the editor resolves to no row either. Nothing retargets an **open editor tab** when its file moves —
+`fs_rename` and Cut+Paste have always had that gap and this does not widen it. And none of it has
+been confirmed on screen: the gesture needs a pointer, KDE will not raise a shell-launched window,
+and the Wayland compositor exposes no capture protocol.
+
+## Scratch files and Select opened file (M13), and what is not done
+
+**Scratch files** (⇧⌥S, *New scratch file…*) are buffers that are not part of the project. They
+live in `$XDG_STATE_HOME/cide/scratches/<blake3 of the project's canonical first root>/`, flat, one
+drawer per project — the same keying `cide-git` uses for changelists and the shelf, and for the
+same reasons. Not inside the project, because the walk is gitignore-aware and a scratch in the
+working tree would either show up in `git status` or be hidden from cide's own file tree by the
+user's own ignore file. A sibling `<key>.json` records which project a drawer belongs to, so an
+orphan left by a moved project is findable by hand; **there is no garbage collection**, exactly as
+for `repos/`.
+
+Choosing the type first is what makes the file `scratch.rs` rather than an untitled buffer, and the
+extension is the whole of how the editor decides the language. The offered list is
+`SCRATCH_TYPES` in `ui/src/editor/languages.ts`, beside the table it must agree with; `check:editor`
+asserts every offered extension resolves through that same table to that same label, so a type
+cannot be offered that opens with no highlighting.
+
+Scratches are a second synthetic group in the file tree, under *External Libraries*, and the only
+one cide writes into: `ProjectFs::writable_paths()` is the roots **plus** the drawer, and it is
+what the mutating `fs_*` handlers check against instead of the roots alone. So a scratch is saved,
+renamed (which changes its language), cut, pasted and trashed like any other file. Nothing watches
+the drawer — the group is re-listed by whatever changed it, which is also what emits the
+`cide://fs-status` a second window redraws on.
+
+**Select opened file** (⌃⇧E, and the ⌖ button in the Explorer header) scrolls the tree to the file
+the active tab is about and selects it, for a project file, for a scratch, and for a dependency
+source opened by Go to definition. That last case is the one that would otherwise be missing: the
+*External Libraries* group holds no packages until somebody expands it, so `fs_reveal` resolves it
+inline — once per project per process, gated on an I/O-free "is this path in a dependency cache"
+test — rather than telling the user that a file they are looking at is not in the tree.
+
+**Divergences and what is not done.** ⌃⇧E is *Recent Locations* in IDEA, where Select Opened File
+has no default chord at all; cide has no Recent Locations, so nothing is lost, but the chord will
+surprise somebody. ⇧⌥S costs every terminal pane the `ESC S` byte pair, unconditionally and in
+every window (rebindable in one line of `keymap.json`). Scratches are **not** in Ctrl+P: the picker's
+candidates come from the walk, and groups are not walked. *New File…* and *Paste* are refused
+**inside** the drawer, deliberately — it is not a folder anybody organises, and the menu label would
+be a blake3. A scratch renamed or deleted from one window reaches a second window's tree at once;
+one *pasted* out of the drawer reaches it on that window's next refresh, because `fs_paste` has no
+`AppHandle` to emit from. And none of this has been confirmed on screen — see the note under
+*External Libraries* about the audits; the coverage is `cide_app::cmd::fs::scratch_tests`, which
+drives the real command layer.
+
+## External Libraries (M13), and what is not done
+
+The file tree grows a second row source. `cide_fs::groups` is a **mechanism**, not a feature: a
+group is a header row plus a lazily materialised subtree, drawn after the walked index's rows and
+composed at the command layer (`cmd::fs::compose`). *External Libraries* is the first group;
+Scratches is meant to be the second, and needs nothing new from that crate.
+
+**Nothing happens when a project opens.** The first tree read runs a `has_marker` probe — a handful
+of `stat`s to depth two — which decides only whether the header row exists. Resolution happens when
+the user expands it: `cargo metadata --format-version 1 --frozen --manifest-path <m>` or
+`go list -m -e -json all`, on a `cide-deps` thread of its own, with the group already showing
+*Resolving dependencies…*. `--frozen` is the only cargo flag combination that resolves the full
+graph **without writing `Cargo.lock`** — `--offline` was measured creating one — and go gets
+`GOFLAGS=-mod=readonly` plus `GOPROXY=off`. Nothing under `~/.cargo/registry` or `$GOMODCACHE` is
+ever walked, watched, indexed or offered to Ctrl+P.
+
+**A group is never silently empty.** Every path ends in package rows or in a `Note` row the user
+can read: `cargo` is not on PATH (with the install command), the lockfile is out of date (cargo's
+own sentence, verbatim), a module go could not load (`-e` gives that per row), or *No external
+dependencies*.
+
+**Dependency sources are read-only, and that fixed a live bug.** Cargo unpacks a crate mode 644, so
+before M13 a Go-to-definition into `serde` gave an editable buffer whose Ctrl+S wrote into the copy
+every project on the machine builds against. `cide_core::toolchain::read_only_reason` now clears
+`FileDoc::writable` for anything under a toolchain's dependency cache and `file_write` refuses it a
+second time — unless the user opened that directory as a project root, which overrides.
+
+**Not done.** *Reveal in File Manager* is disabled for a row outside the project rather than
+relaxing `fs_show_in_manager`'s containment check; the resolver has no timeout (`--frozen` and
+`GOPROXY=off` make the network impossible, so the only unbounded wait left is cargo's own
+package-cache lock); a project that gains its first `Cargo.toml` while open does not grow the group
+until the next launch; and there is no default key binding — the palette's *Show External
+Libraries* (`view.externalLibraries`) is the keyboard route — as is *Show Scratches*
+(`view.scratches`) for the group below it, which is otherwise the last row of a virtualized tree.
+
 ## Language support (M12), and what is not done
 
 Rust and Go get a tree-sitter symbol layer (`cide-lang`) and a language-server client
@@ -488,6 +605,7 @@ crates/
   cide-search/     Fuzzy pickers behind a Matcher trait.                         (M8)
   cide-lang/       tree-sitter: what a Rust or Go file declares.                 (M12)
   cide-lsp/        An LSP *client*: rust-analyzer and gopls.                     (M12)
+  cide-deps/       What a project depends on, and where its source is unpacked.   (M13)
   cide-hook/       Second binary: bridges a Claude hook to the running IDE.      (M7)
   cide-headless/   Third binary: proves the core links without tauri.
 ui/                React 19 + Vite 8 frontend. One document per window.

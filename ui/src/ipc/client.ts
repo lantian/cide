@@ -493,6 +493,35 @@ export const fs = {
   /** Moves to the desktop trash — never `unlink`. Returns where each path landed. */
   delete: (projectId: ProjectId, paths: string[]) =>
     invoke<string[]>('fs_delete', { project: projectId, paths }),
+
+  /**
+   * Create a scratch file of this type and answer where it landed.
+   *
+   * `ext` is a bare extension without the dot — `'rs'`, `'json'` — taken from `SCRATCH_TYPES`
+   * in `editor/languages.ts`, which is the same table that decides which grammar the resulting
+   * buffer loads. Rust validates the *shape* and not the membership, deliberately: shipping the
+   * offered list across the wire would make it a DTO that has to stay in step with a TypeScript
+   * record, and `check:editor` pins the agreement on this side instead.
+   *
+   * The file is created empty and immediately, and the tree's *Scratches* group is re-listed
+   * before this resolves — so the caller may open the tab and reveal the row with no wait and
+   * no watcher.
+   */
+  scratchNew: (projectId: ProjectId, ext: string) =>
+    invoke<string>('fs_scratch_new', { project: projectId, ext }),
+
+  /**
+   * Every directory the file tree's disk-changing verbs may act inside.
+   *
+   * The project's roots **plus** the scratch drawer, which is outside all of them. Asked once
+   * per attach, because the answer only moves when a project's roots do. It is what
+   * `sidebar/rowPaths.ts::mutationRefusal` greys *Rename…*, *Cut* and *Move to Trash* from, and
+   * the reason it comes from Rust rather than being derived here is that the drawer's path is a
+   * blake3 of a canonicalised root under `$XDG_STATE_HOME` — a fact only Rust can compute, and
+   * the same list `cide_fs::ops::check_within` is given.
+   */
+  writableRoots: (projectId: ProjectId) =>
+    invoke<string[]>('fs_writable_roots', { project: projectId }),
 }
 
 /**

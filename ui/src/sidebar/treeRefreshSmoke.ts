@@ -38,6 +38,9 @@ function row(path: string, depth = 0): TreeRow {
     hasChildren: false,
     symlink: false,
     root: 0,
+    // `null` for every walked row; only a synthetic group row carries one. Present because
+    // `TreeRow` requires it — which is exactly the compile error `ROW_FIELDS` is there to force.
+    detail: null,
   }
 }
 
@@ -54,6 +57,13 @@ function install(): void {
         const len = args['len'] as number
         return Promise.resolve(backend.rows.slice(offset, offset + len))
       }
+      case 'fs_writable_roots':
+        // M13. `attach` asks once, after the count, so a project's scratch drawer is known
+        // before the context menu needs it. The drawer itself is deliberately absent from this
+        // fixture: nothing here draws a menu, and the property under test is that a *refresh*
+        // never asks this again — a `fs_writable_roots` per watcher burst would be an IPC round
+        // trip per burst for an answer that only moves when a project's roots do.
+        return Promise.resolve(['/p'])
       case 'git_tree_status':
         // Deliberately a *fresh object with equal contents* on every call, which is what
         // `gitStatusStore` installs after every refresh. It is the case `FileTree`'s
@@ -85,6 +95,10 @@ const SELECTORS: Array<{ name: string; read: () => unknown; equal: (a: unknown, 
   { name: 'chunks', read: () => useFileTree.getState().chunks, equal: Object.is },
   { name: 'degraded', read: () => useFileTree.getState().degraded, equal: Object.is },
   { name: 'revealTo', read: () => useFileTree.getState().revealTo, equal: Object.is },
+  // Written by `attach` and by nothing else. Listed anyway, and that is the point of listing
+  // it: the day a refresh starts writing it, this row turns true and the digest reports a
+  // re-render per watcher burst rather than letting one arrive silently.
+  { name: 'writable', read: () => useFileTree.getState().writable, equal: Object.is },
   {
     name: 'statuses',
     read: () => useGitStatus.getState().status.statuses,

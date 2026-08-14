@@ -34,7 +34,15 @@ import { create } from 'zustand'
  * all. A popup owned by the widget would be unreachable in any window whose bar does not
  * mount it, which is the "control wired to nothing" shape this app keeps producing.
  */
-export type OverlayKind = 'files' | 'commands' | 'branches' | 'structure' | 'symbols' | 'goto'
+export type OverlayKind =
+  | 'files'
+  | 'commands'
+  | 'branches'
+  | 'structure'
+  | 'symbols'
+  | 'goto'
+  /** The *New scratch file…* type picker (`overlays/ScratchType.tsx`). */
+  | 'scratch'
 
 interface OverlayStore {
   open: OverlayKind | null

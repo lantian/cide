@@ -27,6 +27,8 @@ pub mod keymap;
 pub mod layout;
 pub mod persist;
 pub mod proxy;
+pub mod scratch;
+pub mod toolchain;
 pub mod workspace;
 
 pub use error::{CoreError, Result};

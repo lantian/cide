@@ -5,8 +5,21 @@
 //! `not_connected` makes, and for the same reason: a frontend that has to turn
 //! `Unavailable(NotFound)` into English is a frontend that will word it differently from the next
 //! surface that needs the same sentence.
+//!
+//! # Where `which` went
+//!
+//! [`which`], `search_paths` and the marker walk are now `cide_core::toolchain` and re-exported
+//! from here, so no call site moved. They left because a second caller appeared that must not
+//! depend on this crate: the dependency resolver behind *External Libraries* asks "is `cargo` on
+//! PATH" and "is there a `Cargo.toml` under this root", and routing that through the
+//! **language-server client** would have been the same inversion `docs/adr/0008` records for
+//! `child_env::arm`. This module keeps what is genuinely about servers: which binary, which
+//! marker files, and the sentence to print when either is missing.
 
 use std::path::{Path, PathBuf};
+
+/// Re-exported so `cide_lsp::discover::which` keeps working. See the module note.
+pub use cide_core::toolchain::which;
 
 /// A language server cide knows how to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,13 +84,6 @@ pub enum Found {
     Missing(String),
 }
 
-/// How deep under a root a project marker is looked for.
-///
-/// 2, not unbounded: a `Cargo.toml` seven directories down is a vendored dependency or a test
-/// fixture, not this project — and walking a whole repository to decide whether to *start* an
-/// indexer would cost more than the indexer.
-const MARKER_DEPTH: usize = 2;
-
 /// Both probes, in the order that gives the more useful sentence first.
 pub fn find(server: Server, roots: &[PathBuf]) -> Found {
     let Some(binary) = which(server.binary()) else {
@@ -96,37 +102,6 @@ pub fn find(server: Server, roots: &[PathBuf]) -> Found {
         ));
     }
     Found::Ready(binary)
-}
-
-/// `PATH`, plus the two directories the toolchains install into.
-///
-/// Hand-rolled rather than a `which` crate for a dozen lines. The extra directories are not
-/// belt-and-braces: `~/.cargo/bin` and `~/go/bin` are added by a shell rc file, so a cide started
-/// from a terminal sees them and the same cide started from a desktop launcher or an AppImage
-/// does **not** — and the failure is a Problems panel that says the server is missing on a machine
-/// where the user can run it by hand.
-pub fn which(binary: &str) -> Option<PathBuf> {
-    for dir in search_paths() {
-        let candidate = dir.join(binary);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn search_paths() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for extra in [home.join(".cargo/bin"), home.join("go/bin")] {
-            if !dirs.contains(&extra) {
-                dirs.push(extra);
-            }
-        }
-    }
-    dirs
 }
 
 /// Only mentioned when the toolchain's own directory exists but is not on `PATH`, because that is
@@ -149,46 +124,8 @@ fn extra_paths_hint(server: Server) -> String {
     }
 }
 
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
 fn has_marker(server: Server, root: &Path) -> bool {
-    fn search(server: Server, dir: &Path, depth: usize) -> bool {
-        if server
-            .project_markers()
-            .iter()
-            .any(|marker| dir.join(marker).is_file())
-        {
-            return true;
-        }
-        if depth == 0 {
-            return false;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        entries.flatten().any(|entry| {
-            // Hidden directories and the two build outputs that would otherwise dominate the
-            // scan. `target/` in particular contains thousands of vendored `Cargo.toml`s.
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                return false;
-            }
-            entry.file_type().is_ok_and(|t| t.is_dir()) && search(server, &entry.path(), depth - 1)
-        })
-    }
-    search(server, root, MARKER_DEPTH)
+    cide_core::toolchain::has_marker(server.project_markers(), root)
 }
 
 #[cfg(test)]
@@ -274,16 +211,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_toolchain_directories_are_searched_even_when_path_omits_them() {
-        // The AppImage case: a desktop launcher does not run the user's shell rc, so `~/go/bin`
-        // is absent from PATH while `gopls` sits in it.
-        let dirs = search_paths();
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            assert!(dirs.contains(&home.join(".cargo/bin")), "{dirs:?}");
-            assert!(dirs.contains(&home.join("go/bin")), "{dirs:?}");
-        }
-    }
+    // `the_toolchain_directories_are_searched_even_when_path_omits_them` moved with
+    // `search_paths` into `cide_core::toolchain`, where the function now lives. It is asserted
+    // there rather than restated here, because two copies of one claim is how one of them stops
+    // being true.
 
     #[test]
     fn each_server_knows_its_own_language_id_and_source() {

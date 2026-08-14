@@ -57,6 +57,7 @@ import {
   activeProjectOf,
   claudeTargetOf,
   focusTarget,
+  focusedTabPath,
   isClosableTab,
   windowProjectsOf,
 } from './target'
@@ -85,6 +86,7 @@ export const DERIVED_FLAGS = [
   'multipleTabs',
   'closableTab',
   'editorOpen',
+  'fileTabActive',
   'claudeTarget',
   'shellWindow',
 ] as const
@@ -126,6 +128,14 @@ export function deriveContext(boot: Bootstrap | null): KeyContext {
     // `EditorPane` registers on mount, so "a file tab exists somewhere" is not the same
     // claim as "something here can save one".
     editorOpen: registeredBuffers().length > 0,
+    // "the tab this window shows is about a file", which is **not** `editorFocused`: that one
+    // is about the focused *pane*, and a file tab split with a shell pane is still a file tab.
+    // `file.reveal` was gated on the pane flag and so was hidden from the palette in exactly
+    // that arrangement — a command that works, filtered out of the only list that offers it.
+    //
+    // Derived from `focusedTabPath`, the same function the handler and the Explorer's button
+    // call, so the row the palette offers is offered exactly when the button is enabled.
+    fileTabActive: focusedTabPath(boot) !== null,
     claudeTarget: claudeTargetOf(boot) !== null,
     // There is no `repoOpen`, and its absence is deliberate — see the note at the foot of
     // `target.ts`. It was derived from `ProjectRoot.repo`, which Rust never filled, so it was

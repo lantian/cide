@@ -27,6 +27,9 @@ cide-git = { workspace = true }
 # M12: the tree-sitter symbol layer, and the language-server client.
 cide-lang = { workspace = true }
 cide-lsp = { workspace = true }
+# M13: what a project depends on, for the External Libraries group. Spawns `cargo` and `go`
+# and parses their answers; see `crate::libraries` for the thread it must run on.
+cide-deps = { workspace = true }
 
 tauri = { workspace = true }
 tauri-plugin-clipboard-manager = { workspace = true }

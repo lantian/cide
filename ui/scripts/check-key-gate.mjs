@@ -142,6 +142,16 @@ try {
     // for a chord the terminal would otherwise receive: both entry points must swallow it
     // identically, or ⌃⇧F opens the panel *and* sends `^F` to whatever pty had focus.
     { key: 'ctrl+shift+f', command: 'sidebar.search', when: null },
+    // M13. *Select opened file*, unconditional — and `KeyE` is in the sweep below, which is
+    // what pins the property that matters for a chord a terminal would otherwise get: both
+    // entry points must swallow it identically. xterm encodes a control byte only for
+    // `ctrl && !shift && !alt && !meta`, so ⌃⇧E costs a pty nothing; ⌃E, one row down in this
+    // fixture, is the shape that *would* cost something and is deliberately not shipped.
+    { key: 'ctrl+shift+e', command: 'file.reveal', when: null },
+    // M13. A new scratch file. Alt is in the sweep's modifier product, so this also covers the
+    // one case an Alt binding has that a Ctrl one does not: `alt+shift+s` must resolve while
+    // `alt+s` and `ctrl+alt+shift+s` pass through.
+    { key: 'alt+shift+s', command: 'scratch.new', when: null },
     { key: 'ctrl+w', command: 'tab.close', when: null },
     { key: 'ctrl+s', command: 'file.save', when: null },
     { key: 'ctrl+shift+t', command: 'theme.toggle', when: null },
@@ -165,7 +175,18 @@ try {
     { key: 'ctrl+k ctrl+s', command: 'settings.keymap', when: null },
     { key: 'ctrl+k ctrl+w', command: 'tab.closeOthers', when: null },
     { key: 'ctrl+shift+c', command: 'terminal.clear', when: 'terminalFocused' },
-    { key: 'ctrl+e', command: 'file.reveal', when: 'editorFocused && !overlayOpen' },
+    /*
+     * A **compound** `when`, which nothing in the shipped table has: the gate must evaluate
+     * `a && !b` on both entry points, and that is a property of the gate rather than of any
+     * binding. Held in `EXTRAS` below as fixture-only for exactly that reason.
+     *
+     * It used to name `file.reveal`, and that was the smoking gun of this milestone's defect:
+     * the gate had been tested against a `file.reveal` hotkey for a whole milestone while the
+     * command shipped with **no binding at all**. `file.reveal` now ships on ⌃⇧E above, so this
+     * row points at a different command — otherwise a reader would take it for a second, real
+     * binding and the two would eventually be reconciled in the wrong direction.
+     */
+    { key: 'ctrl+e', command: 'sidebar.search', when: 'editorFocused && !overlayOpen' },
     // M12. `alt+up`/`alt+down` carry a `when` because the gate is a window capture listener:
     // unconditionally bound they would fire in a terminal pane and move a caret nobody can see.
     { key: 'ctrl+f12', command: 'structure.file', when: null },

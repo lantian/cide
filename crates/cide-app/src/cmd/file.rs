@@ -627,14 +627,101 @@ pub fn tab_set_dirty(
     })
 }
 
-#[tauri::command(rename_all = "camelCase")]
-pub async fn file_read(path: String) -> Result<FileDoc> {
-    blocking(move || document::read(&PathBuf::from(path))).await
+/// Every root of every open project, for the read-only rule below.
+///
+/// Every project, not the active one, and not a `project` argument on the commands: `file_read`
+/// has never taken one, and the question these roots answer is not "which project is this file
+/// in" but "has the user opened this directory at all". A file that is a project root in the
+/// window behind this one is still the user's own code.
+fn open_roots(state: &WorkspaceState) -> Vec<PathBuf> {
+    state.with(|ws| {
+        ws.projects
+            .iter()
+            .flat_map(|(_, project)| project.roots.iter().map(|root| root.path.clone()))
+            .collect()
+    })
 }
 
+/// Read a file for an editor pane.
+///
+/// # The read-only rule, and the bug it closes
+///
+/// `FileDoc::writable` was the file's mode bits and nothing else, which was correct for every
+/// path this command could reach until M12 gave the editor Go to definition. That command opens
+/// `~/.cargo/registry/src/index.crates.io-…/serde-1.0.229/src/lib.rs`, and cargo unpacks a crate
+/// **mode 644** — so the buffer was editable, Ctrl+S went through `document::write`, and the edit
+/// landed in the registry copy *every project on the machine* builds against. Cargo's checksum
+/// verification then fails builds in repositories the user never touched, and `cargo clean` does
+/// not undo it. Go's module cache is mode 444, so the same gesture there failed at `File::create`
+/// and the user saw an error; Rust's being writable was the whole difference, and it was luck.
+///
+/// M13 makes that population one click away — every row under *External Libraries* is one of
+/// these files — so the rule is fixed here rather than left to the group. It is deliberately about
+/// the **dependency cache**, not about the group: a path dependency on a sibling crate is a row in
+/// the group and is the user's own code, and Go to definition reaches a registry source whether or
+/// not the group has ever been opened.
+///
+/// `cide_core::toolchain::read_only_reason` is the rule and a project root overrides it — see
+/// there. This clears `writable`, which is what `EditorPane` turns into `readOnly` and what
+/// `EditorSurface` turns into `EditorState.readOnly` plus `EditorView.editable.of(false)`: the
+/// buffer cannot be typed into at all, so there is no silently-dropped Ctrl+S to explain.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn file_write(path: String, text: String) -> Result<()> {
-    blocking(move || document::write(&PathBuf::from(path), &text)).await
+pub async fn file_read(state: State<'_, WorkspaceState>, path: String) -> Result<FileDoc> {
+    let roots = open_roots(&state);
+    let caches = cide_core::toolchain::dependency_roots();
+    blocking(move || read_document(&PathBuf::from(path), &roots, &caches)).await
+}
+
+/// [`file_read`]'s body, over values.
+///
+/// Split out for the same reason `cmd::fs::index_project` is, and here the reason is sharper: the
+/// only other way to exercise this composition — `document::read` over a *real* mode-644 file,
+/// plus the rule — would be to write a file into the user's own `~/.cargo/registry`, which is
+/// precisely what the rule exists to prevent. Taking the cache list as an argument lets the test
+/// at the foot of this file build a cache of its own in a temporary directory.
+pub(crate) fn read_document(path: &Path, roots: &[PathBuf], caches: &[PathBuf]) -> Result<FileDoc> {
+    let mut doc = document::read(path)?;
+    if let Some(reason) = cide_core::toolchain::read_only_reason_in(path, roots, caches) {
+        tracing::debug!(%reason, "opening a dependency source read-only");
+        doc.writable = false;
+    }
+    Ok(doc)
+}
+
+/// Write a buffer back.
+///
+/// The second lock on the rule [`file_read`] describes, and it is not redundant. `writable` is a
+/// flag that travelled through the webview: it decides what the *editor* allows, which is the
+/// right place for it, and it is not evidence about what the disk should accept. The house rule
+/// throughout this file is that a claim coming back from the webview is re-checked in Rust — see
+/// `openable` above, which makes the same argument about an approved out-of-project path — and a
+/// pane that somehow held a stale writable buffer over a registry source would otherwise overwrite
+/// it.
+///
+/// The refusal carries the sentence rather than a code, because the only useful thing to do with
+/// it is show it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn file_write(
+    state: State<'_, WorkspaceState>,
+    path: String,
+    text: String,
+) -> Result<()> {
+    let roots = open_roots(&state);
+    let caches = cide_core::toolchain::dependency_roots();
+    blocking(move || write_document(&PathBuf::from(path), &text, &roots, &caches)).await
+}
+
+/// [`file_write`]'s body, over values. See [`read_document`].
+pub(crate) fn write_document(
+    path: &Path,
+    text: &str,
+    roots: &[PathBuf],
+    caches: &[PathBuf],
+) -> Result<()> {
+    if let Some(reason) = cide_core::toolchain::read_only_reason_in(path, roots, caches) {
+        return Err(CoreError::Io(reason));
+    }
+    document::write(path, text)
 }
 
 /// Remember where the user is in a file. (M12)
@@ -2150,5 +2237,144 @@ mod tests {
                 "a refusal the user cannot read is a link wired to nothing: {json}"
             );
         }
+    }
+}
+
+/// The read-only rule, driven end to end over a real file.
+///
+/// A module of its own so it does not have to share the `openable` suite's scratch-directory
+/// helpers, and because the claim is different in kind: that one is about a path the *user*
+/// clicked in a terminal, this one is about every file the editor opens.
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cide-readonly-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// A crate as cargo actually unpacks one: mode **644**.
+    ///
+    /// That mode is the whole bug. Go's module cache is 444, so an edit there failed at
+    /// `File::create` and the user saw an error; Rust's registry is writable, so before this rule
+    /// existed Ctrl+S in a `serde` buffer opened by Go to definition wrote through
+    /// `document::write` into the copy every project on the machine builds against.
+    #[test]
+    #[cfg(unix)]
+    fn a_registry_source_is_read_only_even_though_its_mode_bits_say_otherwise() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("registry");
+        let cache = dir.join("registry/src");
+        let crate_dir = cache.join("index.crates.io-1949/serde-1.0.229/src");
+        std::fs::create_dir_all(&crate_dir).expect("mkdir");
+        let path = crate_dir.join("lib.rs");
+        std::fs::write(&path, "pub fn de() {}\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let roots = vec![dir.join("work/cide")];
+        let caches = vec![cache.clone()];
+
+        assert!(
+            document::read(&path).expect("read").writable,
+            "the mode bits really do say this file is writable — that is the trap"
+        );
+        let doc = read_document(&path, &roots, &caches).expect("read");
+        assert!(
+            !doc.writable,
+            "a dependency source must open read-only whatever its mode bits say"
+        );
+
+        // The second lock. `writable` is a flag that travelled through the webview and is not
+        // evidence about what the disk should accept.
+        let error = write_document(&path, "wiped", &roots, &caches)
+            .expect_err("a dependency source must not be written");
+        let message = error.to_string();
+        assert!(message.contains("read-only"), "{message}");
+        assert!(
+            message.contains("serde-1.0.229"),
+            "the refusal has to name the file, or nobody can tell which save failed: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("still there"),
+            "pub fn de() {}\n",
+            "the refusal has to happen BEFORE the write, not after it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The override, and it has to exist: a user who opened a vendored crate *as a project root*
+    /// has said with the strongest gesture the app has that this is their code.
+    #[test]
+    fn a_project_root_over_the_cache_stays_writable() {
+        let dir = scratch("patched");
+        let cache = dir.join("registry/src");
+        let crate_dir = cache.join("index.crates.io-1949/serde-1.0.229");
+        std::fs::create_dir_all(&crate_dir).expect("mkdir");
+        let path = crate_dir.join("lib.rs");
+        std::fs::write(&path, "pub fn de() {}\n").expect("seed");
+
+        let caches = vec![cache];
+        assert!(
+            read_document(&path, std::slice::from_ref(&crate_dir), &caches)
+                .expect("read")
+                .writable,
+            "opening the crate as a project root is an explicit instruction to edit it"
+        );
+        assert!(
+            write_document(
+                &path,
+                "patched\n",
+                std::slice::from_ref(&crate_dir),
+                &caches
+            )
+            .is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the rule must not fire for the 99.9% case, or every save in the project fails.
+    #[test]
+    fn an_ordinary_project_file_is_untouched() {
+        let dir = scratch("ordinary");
+        let root = dir.join("work/cide/src");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("main.rs");
+        std::fs::write(&path, "fn main() {}\n").expect("seed");
+
+        let roots = vec![dir.join("work/cide")];
+        let caches = vec![dir.join("registry/src")];
+        assert!(
+            read_document(&path, &roots, &caches)
+                .expect("read")
+                .writable
+        );
+        assert!(write_document(&path, "fn main() { }\n", &roots, &caches).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("written"),
+            "fn main() { }\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The commands have to pass the *real* cache list, not an empty one — an empty `caches`
+    /// makes the rule a no-op and every assertion above vacuous at runtime.
+    #[test]
+    fn the_machine_has_dependency_roots_to_check_against() {
+        let roots = cide_core::toolchain::dependency_roots();
+        assert!(
+            !roots.is_empty(),
+            "no cargo or go cache could be derived, so `file_read` would pass an empty list"
+        );
+        assert!(
+            roots.iter().any(|r| r.ends_with("registry/src")),
+            "the cargo registry is the one that is writable and so the one that matters: {roots:?}"
+        );
     }
 }

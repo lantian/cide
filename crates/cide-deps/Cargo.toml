@@ -1,0 +1,22 @@
+[package]
+name = "cide-deps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# What a project depends on, and where that dependency's source is unpacked on this machine.
+#
+# It asks `cargo` and `go` and parses their answers; it never resolves anything itself, never
+# touches the network, and never writes to the user's repository — see `src/lib.rs` for the
+# flags that make each of those a property rather than an intention.
+#
+# No tauri, no `cide-fs`, no `cide-lsp`. It depends on `cide-core` for two things and only two:
+# `child_env` (the bundle scrub and the death signal every child in this workspace is owed) and
+# `toolchain` (where `cargo` and `go` are, and which markers name a project).
+[dependencies]
+cide-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

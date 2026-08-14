@@ -156,20 +156,102 @@ pub(crate) async fn status_of(
     blocking("fs_status", move || fs.status()).await
 }
 
+// --- one tree out of two ------------------------------------------------------------------
+//
+// The file tree the user sees is the concatenation of two independent row sources: the walked,
+// watched, gitignore-filtered `cide_fs::Index`, and the lazy, unwatched, unindexed
+// `cide_fs::groups::Groups` that draws *External Libraries* and *Scratches*. The composition
+// lives here, at the command layer, and not inside either of them — that is the whole point of
+// the split, and `cide_fs::groups`'s header says what grafting one into the other would have
+// cost.
+//
+// The arithmetic is four lines and every one of them is an off-by-one waiting to happen, so it
+// is written once, in named functions, with a test at the foot of this file that sweeps every
+// window of every size across the seam.
+
+/// Everything a tree read needs to do before it answers, on every one of them.
+///
+/// [`crate::groups::ProjectGroups::prepare`] decides which group rows exist (one atomic after
+/// the first call), and the stamp check notices a `Cargo.lock` that moved. Both are here rather
+/// than in `fs_index` because a second window attaching to an already-indexed project never
+/// calls `fs_index` at all — its first contact with this project is `fs_tree_count`.
+///
+/// `events` is `None` for the reads that cannot start work — the two that only look. A stale
+/// group noticed by a read that cannot resolve is left marked stale; the next `fs_tree_count`
+/// picks it up, and that is a fraction of a second later.
+fn prepare(fs: &Arc<crate::files::ProjectFs>, resolve: Option<(&Arc<dyn FsEvents>, ProjectId)>) {
+    // Guarded, so the ordinary call — every tree read after the first for this project — costs
+    // one atomic load and does not even build the root list.
+    if fs.groups().needs_prepare() {
+        fs.groups().prepare(&fs.root_paths());
+    }
+    let Some((events, project)) = resolve else {
+        return;
+    };
+    if fs.groups().stale() == Some(cide_fs::groups::Expanded::Resolve) {
+        crate::libraries::spawn_resolve(Arc::clone(fs), Arc::clone(events), project);
+    }
+}
+
+/// The composed row count: the index's rows, then the groups'.
+fn tree_count(fs: &crate::files::ProjectFs) -> usize {
+    fs.with_index(|index| index.count()) + fs.groups().count()
+}
+
+/// Serve one row window from two sources laid end to end.
+///
+/// A named function with `compose_serves_every_window_across_the_seam` behind it, rather than
+/// four lines inline in the handler, because the failure it prevents is invisible: a window
+/// straddling the seam that asks the second source for the wrong offset draws a *correct-looking*
+/// list of rows with a few missing in the middle, and no test that only checks the two ends can
+/// see it. The tree is virtualized, so the straddling window is not an edge case — it is what
+/// every scroll past the last project file produces.
+///
+/// Both sources clamp out-of-range requests to `[]` (`Index::rows` and `Groups::rows` both say so
+/// in their own docs), so this never has to bounds-check either of them.
+fn compose(
+    first_len: usize,
+    offset: usize,
+    len: usize,
+    first: impl FnOnce(usize, usize) -> Vec<TreeRow>,
+    second: impl FnOnce(usize, usize) -> Vec<TreeRow>,
+) -> Vec<TreeRow> {
+    let mut rows = if offset < first_len {
+        first(offset, len)
+    } else {
+        Vec::new()
+    };
+    if rows.len() < len {
+        // Where the second source starts: `0` for a window that straddles the seam — the first
+        // source has already served everything up to it — and `offset - first_len` for one that
+        // begins past the seam entirely. `saturating_sub` is both cases in one expression.
+        rows.extend(second(offset.saturating_sub(first_len), len - rows.len()));
+    }
+    rows
+}
+
 /// How many rows the tree currently has. The virtual scroller's range.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_tree_count(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_tree_count", move || {
-        fs.with_index(|index| index.count() as u32)
+        prepare(&fs, Some((&events, project)));
+        tree_count(&fs) as u32
     })
     .await
 }
 
 /// The rows in `[offset, offset + len)`.
+///
+/// The window is served from the index while it lasts and from the groups afterwards, which is
+/// what makes a window *straddling* the seam the interesting case: it asks the index for its
+/// tail and the groups for their head, and returns the two concatenated. Both sources clamp an
+/// out-of-range request to `[]` rather than erroring, so the arithmetic never has to.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_tree_rows(
     registry: State<'_, FsRegistry>,
@@ -180,28 +262,55 @@ pub async fn fs_tree_rows(
     let fs = project_fs(&registry, project)?;
     let len = (len as usize).min(MAX_ROWS);
     blocking("fs_tree_rows", move || {
-        fs.with_index(|index| index.rows(offset as usize, len))
+        prepare(&fs, None);
+        let walked = fs.with_index(|index| index.count());
+        compose(
+            walked,
+            offset as usize,
+            len,
+            |offset, len| fs.with_index(|index| index.rows(offset, len)),
+            |offset, len| fs.groups().rows(offset, len),
+        )
     })
     .await
 }
 
-/// Expand a directory. Returns the new row count.
+/// Expand a directory, or a synthetic group. Returns the new row count.
+///
+/// The index is asked first and the groups only if it declines, which is the right order for
+/// two reasons: every expand in an ordinary project is an index row, and the index physically
+/// cannot hold a path outside its roots, so "the index said no" is a complete answer.
+///
+/// Expanding an unresolved group **starts a resolution and returns immediately**, with the
+/// *Resolving…* row already in the count it answers. A handler that waited for `cargo metadata`
+/// would be a click that blocks a blocking-pool worker for a quarter of a second at best.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_expand(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     path: PathBuf,
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_expand", move || {
-        fs.with_index_mut(|index| index.expand(&path))
-            .map(|n| n as u32)
-            .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
+        prepare(&fs, Some((&events, project)));
+        if fs.with_index_mut(|index| index.expand(&path)).is_some() {
+            return Ok(tree_count(&fs) as u32);
+        }
+        match fs.groups().expand(&path) {
+            Some(cide_fs::groups::Expanded::Resolve) => {
+                crate::libraries::spawn_resolve(Arc::clone(&fs), events, project);
+                Ok(tree_count(&fs) as u32)
+            }
+            Some(cide_fs::groups::Expanded::Ready) => Ok(tree_count(&fs) as u32),
+            None => Err(FsError::InvalidPath(path.display().to_string())),
+        }
     })
     .await?
 }
 
-/// Collapse a directory. Returns the new row count.
+/// Collapse a directory, or a synthetic group. Returns the new row count.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_collapse(
     registry: State<'_, FsRegistry>,
@@ -210,8 +319,13 @@ pub async fn fs_collapse(
 ) -> Result<u32, FsError> {
     let fs = project_fs(&registry, project)?;
     blocking("fs_collapse", move || {
-        fs.with_index_mut(|index| index.collapse(&path))
-            .map(|n| n as u32)
+        prepare(&fs, None);
+        if fs.with_index_mut(|index| index.collapse(&path)).is_some() {
+            return Ok(tree_count(&fs) as u32);
+        }
+        fs.groups()
+            .collapse(&path)
+            .map(|()| tree_count(&fs) as u32)
             .ok_or_else(|| FsError::InvalidPath(path.display().to_string()))
     })
     .await?
@@ -222,6 +336,24 @@ pub async fn fs_collapse(
 /// `None` rather than an error when the path is not in the tree: revealing a file that is
 /// gitignored, or that has just been deleted, is an ordinary thing for the editor to ask and
 /// the honest answer is "there is no row for that".
+///
+/// A path the index does not hold is offered to the groups, which is what makes *Select Opened
+/// File* work for a tab opened by Go to definition into `~/.cargo/registry`, and for a scratch.
+/// That walk materialises a chain that has never been expanded — one `read_dir` per level.
+///
+/// # The one place a reveal is allowed to block
+///
+/// A group that has never been expanded holds no rows, so `Groups::reveal` cannot find a file
+/// inside it and this would answer `None` — and the caller would tell the user that a file they
+/// are looking at *is not in this project's file tree*. That is not a degradation, it is a
+/// false statement, and it is the exact class of answer this milestone exists to stop giving.
+///
+/// So when both sources decline **and** the path is one an unresolved *External Libraries*
+/// would hold, the resolution is run here, on this blocking worker, before the second attempt.
+/// [`crate::groups::ProjectGroups::resolve_now`] states the trade in full; the short version is
+/// that the gate is I/O-free, the ordinary reveal never reaches it, and it can happen at most
+/// once per project per process. *Scratches* needs none of this — its listing is eager — which
+/// is why the retry is gated on the library predicate rather than run unconditionally.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_reveal(
     registry: State<'_, FsRegistry>,
@@ -229,10 +361,43 @@ pub async fn fs_reveal(
     path: PathBuf,
 ) -> Result<Option<u32>, FsError> {
     let fs = project_fs(&registry, project)?;
-    blocking("fs_reveal", move || {
-        fs.with_index_mut(|index| index.reveal(&path).map(|n| n as u32))
-    })
-    .await
+    blocking("fs_reveal", move || reveal_path(&fs, &path)).await
+}
+
+/// [`fs_reveal`]'s body, over values.
+///
+/// A named function for the same reason [`index_project`] and [`create_entry`] are: the
+/// property worth testing — that a tab opened by Go to definition into `~/.cargo/registry` can
+/// be found in the tree even though nobody has ever opened the group — is a property of *this*
+/// sequence, and a body inline in the `#[tauri::command]` item cannot be called from a test.
+pub(crate) fn reveal_path(
+    fs: &Arc<crate::files::ProjectFs>,
+    path: &std::path::Path,
+) -> Option<u32> {
+    prepare(fs, None);
+    if let Some(row) = fs.with_index_mut(|index| index.reveal(path)) {
+        return Some(row as u32);
+    }
+    if let Some(row) = reveal_in_groups(fs, path) {
+        return Some(row);
+    }
+    if !fs.groups().is_unlisted_library_path(path, &fs.root_paths()) {
+        return None;
+    }
+    // `resolve_now` answers false when another thread already holds the resolution — a click on
+    // the header a moment earlier. Nothing is retried in that case and the caller reports:
+    // waiting on somebody else's `cargo` inside a keystroke would turn a gesture that usually
+    // costs nothing into one that occasionally costs a cold build.
+    if !fs.groups().resolve_now(&fs.root_paths()) {
+        return None;
+    }
+    reveal_in_groups(fs, path)
+}
+
+/// A group row's index in the **composed** tree: the index's rows come first.
+fn reveal_in_groups(fs: &crate::files::ProjectFs, path: &std::path::Path) -> Option<u32> {
+    let walked = fs.with_index(|index| index.count());
+    fs.groups().reveal(path).map(|row| (walked + row) as u32)
 }
 
 /// The most paths one existence probe will answer.
@@ -381,7 +546,13 @@ pub async fn fs_show_in_manager(
     blocking("fs_show_in_manager", move || {
         use tauri_plugin_opener::OpenerExt;
 
-        ops::check_within(&fs.root_paths(), &path)?;
+        // `writable_paths`, so a scratch can be shown in a file manager. That is a *widening*
+        // of a containment check and it is argued rather than assumed: the drawer is a
+        // directory cide itself writes into and draws rows for, so opening it is exactly as
+        // legitimate as renaming a file in it. A dependency source is still refused — that
+        // group contributes no writable directory — which is the case the note in the tree's
+        // context menu is about.
+        ops::check_within(&fs.writable_paths(), &path)?;
         // `is_dir` follows symlinks, which is what the user means here: revealing a symlinked
         // directory should open what it points at, not the directory the link sits in.
         let target = if path.is_dir() {
@@ -410,7 +581,7 @@ pub async fn fs_read_file(
 ) -> Result<String, FsError> {
     let fs = project_fs(&registry, project)?;
     blocking("fs_read_file", move || {
-        ops::check_within(&fs.root_paths(), &path)?;
+        ops::check_within(&fs.writable_paths(), &path)?;
         ops::read_to_string(&path)
     })
     .await?
@@ -425,8 +596,13 @@ pub async fn fs_write_file(
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
     blocking("fs_write_file", move || {
-        ops::check_within(&fs.root_paths(), &path)?;
-        ops::write(&path, &contents)
+        ops::check_within(&fs.writable_paths(), &path)?;
+        ops::write(&path, &contents)?;
+        // Nothing watches the drawer, so a write that created a file there has to say so or
+        // the row appears the next time somebody folds the group. Guarded, so the ordinary
+        // write — a project file — costs one lock and a prefix test.
+        let _ = relist_if_scratch(&fs, std::slice::from_ref(&path));
+        Ok(())
     })
     .await?
 }
@@ -440,8 +616,10 @@ pub async fn fs_create(
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
     blocking("fs_create", move || {
-        ops::check_within(&fs.root_paths(), &path)?;
-        ops::create(&path, directory)
+        ops::check_within(&fs.writable_paths(), &path)?;
+        ops::create(&path, directory)?;
+        let _ = relist_if_scratch(&fs, std::slice::from_ref(&path));
+        Ok(())
     })
     .await?
 }
@@ -493,7 +671,16 @@ pub(crate) fn create_entry(
     name: &str,
     directory: bool,
 ) -> Result<PathBuf, FsError> {
-    let created = ops::create_in(&fs.root_paths(), parent, name, directory)?;
+    let created = ops::create_in(&fs.writable_paths(), parent, name, directory)?;
+
+    // A scratch is not in the index and never will be, so the fold below cannot show it: the
+    // drawer is re-listed instead, which is the same "the row exists before this returns"
+    // promise by the other mechanism. Returned early because the two are exclusive — a path
+    // cannot be both inside a project root and inside the drawer.
+    if fs.groups().is_scratch_path(&created) {
+        fs.groups().relist_scratches();
+        return Ok(created);
+    }
 
     // The same fold the watcher does, run here so the tree does not have to wait for it.
     // `admits` is consulted by `Index::apply` itself, so a name the project's ignore rules
@@ -515,22 +702,135 @@ pub(crate) fn create_entry(
     Ok(created)
 }
 
+/// Create a scratch file of `ext` in this project's drawer, and answer where it landed.
+///
+/// # Why the extension and not a language name
+///
+/// The list of *offered* types lives in `ui/src/editor/languages.ts`, beside the table that
+/// decides which grammar a path loads and what the status bar calls it. Shipping that list to
+/// Rust would make it a DTO that has to stay in step with a TypeScript record, and the failure
+/// when it drifts is silent and specific: a scratch offered as *YAML* whose extension the
+/// editor does not recognise opens with no highlighting and a status bar reading `Plain Text`.
+/// So the frontend names an extension, one assertion in `check:editor` pins that every offered
+/// extension resolves through that same table, and this side validates the *shape* — see
+/// `cide_core::scratch::check_ext`.
+///
+/// The file is created **empty and immediately** rather than opened as an unsaved buffer; the
+/// three reasons are in `cide_core::scratch::create`. The drawer is re-listed before this
+/// returns, so the row is in the tree the instant the command answers — the same promise
+/// [`create_entry`] makes for a project file, by the other mechanism.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_scratch_new(
+    app: tauri::AppHandle,
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    ext: String,
+) -> Result<PathBuf, FsError> {
+    let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
+    blocking("fs_scratch_new", move || {
+        // `roots[0]`, which is the project's identity everywhere else in this codebase —
+        // `RecentProject` is keyed by it and so is the scratch drawer. A multi-root project
+        // gets one drawer, which is what "per project" means to the person using it.
+        let root = fs
+            .roots
+            .first()
+            .map(|root| root.path.clone())
+            .ok_or(FsError::NoIndex)?;
+        let created = fs
+            .groups()
+            .new_scratch(&root, &ext)
+            .map_err(|error| FsError::Io {
+                path: root.display().to_string(),
+                message: error.to_string(),
+            })?;
+        // So the *other* window's Explorer redraws. The drawer is unwatched by design, so this
+        // is the only thing that would ever tell it — and `FsStatus::rows` carries the composed
+        // count, so its scroller resizes in the same frame the row appears.
+        events.status(project, &fs.status());
+        Ok(created)
+    })
+    .await?
+}
+
+/// Every directory the file tree's disk-changing verbs may act inside.
+///
+/// The project's roots, plus the scratch drawer. The frontend needs the same list Rust checks
+/// against, because `ui/src/sidebar/rowPaths.ts::mutationRefusal` is what greys *Rename…*,
+/// *Cut* and *Move to Trash* on a row before the click — and a menu that offers a verb the
+/// handler then refuses is the dead control this panel has already shipped twice.
+///
+/// A command rather than a field on `FsStatus`, which is emitted on every watcher burst: this
+/// answer changes when a project's roots change and at no other time, so it is asked once per
+/// attach. It is deliberately **not** `Project::roots` widened — see
+/// [`crate::files::ProjectFs::writable_paths`] for what that would break.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_writable_roots(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<Vec<PathBuf>, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_writable_roots", move || {
+        // Through `prepare`, because the drawer is only known once the groups have been shown
+        // and this is routinely the *first* thing a freshly attached tree asks for. Without it
+        // the answer would be the roots alone until some later read, and every scratch row
+        // would be greyed for that window.
+        if fs.groups().needs_prepare() {
+            fs.groups().prepare(&fs.root_paths());
+        }
+        fs.writable_paths()
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_rename(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     from: PathBuf,
     to: PathBuf,
 ) -> Result<(), FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_rename", move || {
-        let roots = fs.root_paths();
-        ops::check_within(&roots, &from)?;
-        ops::check_within(&roots, &to)?;
-        ops::check_not_root(&roots, &from)?;
-        ops::rename(&from, &to)
+        if rename_entry(&fs, &from, &to)? {
+            events.status(project, &fs.status());
+        }
+        Ok(())
     })
     .await?
+}
+
+/// [`fs_rename`] with its Tauri-injected arguments already resolved. Answers whether the scratch
+/// drawer changed, which is what the caller turns into a `cide://fs-status`.
+///
+/// A named function for the same reason [`create_entry`] and [`reveal_path`] are: the property
+/// worth pinning is **which list the containment check is given**, and that is a property of
+/// this wiring rather than of `ops::rename`. A test that called `ops::check_within` itself would
+/// agree with whatever list it chose, which is exactly the shape that let this handler keep
+/// using the project roots while a scratch was supposed to be renamable.
+pub(crate) fn rename_entry(
+    fs: &crate::files::ProjectFs,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<bool, FsError> {
+    // `writable_paths`, so a scratch can be renamed — which also changes its *language*, because
+    // `ui/src/editor/languages.ts` resolves by extension and `EditorSurface` reloads the grammar
+    // when the path changes. That is the right behaviour and it is the reason a scratch is a
+    // real file with a real name rather than a titled buffer.
+    //
+    // `check_not_root` gets the same list, so the drawer itself cannot be renamed away from
+    // underneath the group — exactly as a project root cannot.
+    let writable = fs.writable_paths();
+    ops::check_within(&writable, from)?;
+    ops::check_within(&writable, to)?;
+    ops::check_not_root(&writable, from)?;
+    ops::rename(from, to)?;
+    Ok(relist_if_scratch(
+        fs,
+        &[from.to_path_buf(), to.to_path_buf()],
+    ))
 }
 
 /// Move paths to the desktop trash. Returns where each one landed.
@@ -545,37 +845,75 @@ pub async fn fs_rename(
 /// caller knows what actually moved rather than assuming nothing did.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_delete(
+    app: tauri::AppHandle,
     registry: State<'_, FsRegistry>,
     project: ProjectId,
     paths: Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, FsError> {
     let fs = project_fs(&registry, project)?;
+    let events: Arc<dyn FsEvents> = Arc::new(app);
     blocking("fs_delete", move || {
-        let roots = fs.root_paths();
-        for path in &paths {
-            ops::check_within(&roots, path)?;
-            ops::check_not_root(&roots, path)?;
-        }
-        let mut trashed = Vec::with_capacity(paths.len());
-        for path in &paths {
-            match ops::delete(path) {
-                Ok(dest) => trashed.push(dest),
-                Err(err) => {
-                    tracing::warn!(
-                        failed = %path.display(),
-                        already_trashed = trashed.len(),
-                        "a multi-path delete stopped part way through"
-                    );
-                    return Err(FsError::PartialDelete {
-                        trashed: trashed.iter().map(|p| p.display().to_string()).collect(),
-                        error: err.to_string(),
-                    });
-                }
-            }
+        let (trashed, moved) = delete_entries(&fs, &paths)?;
+        if moved {
+            events.status(project, &fs.status());
         }
         Ok(trashed)
     })
     .await?
+}
+
+/// [`fs_delete`] with its Tauri-injected arguments already resolved. See [`rename_entry`] for
+/// why this is a named function; the second half of the answer is whether the drawer changed.
+pub(crate) fn delete_entries(
+    fs: &crate::files::ProjectFs,
+    paths: &[PathBuf],
+) -> Result<(Vec<PathBuf>, bool), FsError> {
+    let writable = fs.writable_paths();
+    for path in paths {
+        ops::check_within(&writable, path)?;
+        ops::check_not_root(&writable, path)?;
+    }
+    let mut trashed = Vec::with_capacity(paths.len());
+    for path in paths {
+        match ops::delete(path) {
+            Ok(dest) => trashed.push(dest),
+            Err(err) => {
+                tracing::warn!(
+                    failed = %path.display(),
+                    already_trashed = trashed.len(),
+                    "a multi-path delete stopped part way through"
+                );
+                return Err(FsError::PartialDelete {
+                    trashed: trashed.iter().map(|p| p.display().to_string()).collect(),
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+    // After the moves, not before: a delete that failed part way through has still removed the
+    // rows it managed, and re-listing here is what stops the group showing files that are
+    // already in the trash.
+    let moved = relist_if_scratch(fs, paths);
+    Ok((trashed, moved))
+}
+
+/// Re-list the scratch drawer if any of these paths was in it, and say whether it happened.
+///
+/// Every mutating handler above calls this rather than reasoning about which of them could
+/// have changed the drawer, because the reasoning is what rots: a `read_dir` of a flat
+/// directory is microseconds, and a group showing a file the user deleted a moment ago is the
+/// bug this saves. There is no watcher to fall back on — see `crate::scratches`.
+///
+/// The answer is what the two handlers with an `AppHandle` turn into a `cide://fs-status`, so
+/// a **second window** hears about it. That event is the one the Explorer already refreshes on,
+/// and it is needed here for the same reason the drawer is re-listed at all: with no watcher on
+/// it, nothing else would ever tell the other window.
+fn relist_if_scratch(fs: &crate::files::ProjectFs, paths: &[PathBuf]) -> bool {
+    if !paths.iter().any(|path| fs.groups().is_scratch_path(path)) {
+        return false;
+    }
+    fs.groups().relist_scratches();
+    true
 }
 
 /// Which names a paste would land on that are already taken — and nothing is written.
@@ -599,8 +937,7 @@ pub async fn fs_paste_plan(
 ) -> Result<Vec<cide_ipc::PasteCollision>, FsError> {
     let fs = project_fs(&registry, project)?;
     blocking("fs_paste_plan", move || {
-        let roots = fs.root_paths();
-        cide_fs::copy::plan(&roots, &sources, &dest_dir, mode)
+        cide_fs::copy::plan(&fs.writable_paths(), &sources, &dest_dir, mode)
     })
     .await?
 }
@@ -656,8 +993,11 @@ pub(crate) fn paste_into(
     mode: cide_ipc::PasteMode,
     decisions: &[cide_ipc::PasteDecision],
 ) -> Result<Vec<cide_ipc::PastedEntry>, FsError> {
-    let roots = fs.root_paths();
-    let pasted = cide_fs::copy::paste_with(&roots, sources, dest_dir, mode, decisions)?;
+    // `writable_paths`, so the drawer is a place things can be pasted into and out of. The
+    // out-of direction is the one that matters: a scratch that turned out to be worth keeping
+    // is copied into the project with the gesture the user already knows.
+    let writable = fs.writable_paths();
+    let pasted = cide_fs::copy::paste_with(&writable, sources, dest_dir, mode, decisions)?;
 
     // Sources first so a rename that lands on the *same* directory reads as one rescan, and
     // because a cut's old row has to go in the same write that adds the new one.
@@ -676,6 +1016,14 @@ pub(crate) fn paste_into(
             item.path.to_string_lossy().into_owned(),
         ));
     }
+    // The fold above cannot reach the drawer, so anything that landed there — or left it —
+    // needs the other mechanism. `change.paths` is sources *and* destinations, which is
+    // exactly the set that matters for a cut out of the drawer as well as a paste into it.
+    // No `fs-status` here, and that is a gap rather than a decision: `fs_paste` has no
+    // `AppHandle` and `paste_into` is also called from tests with none, so a second window sees
+    // a scratch cut into the project on its next refresh rather than at once. The window that
+    // made the gesture is correct immediately, which is the case that matters.
+    let _ = relist_if_scratch(fs, &change.paths);
     Ok(pasted)
 }
 
@@ -1645,5 +1993,597 @@ mod tests {
             .expect_err("a rootless project cannot be indexed");
         assert_eq!(error, FsError::NoIndex);
         assert!(status_of(&registry, project).await.is_err());
+    }
+}
+
+/// The seam between the two row sources, and the group whose rows sit past it.
+///
+/// A module of its own rather than more tests in the one above, which is about the picker
+/// answering during a walk and drags a 30 000-file corpus in with it. Nothing here writes a
+/// corpus; the point is arithmetic.
+#[cfg(test)]
+mod compose_tests {
+    use super::*;
+    use cide_fs::groups::{Entry, Groups, group_path};
+    use cide_ipc::{NO_ROOT, TreeRowKind};
+
+    /// A row source that answers with names, so a window can be compared to a list of strings.
+    fn source(names: &'static [&'static str]) -> impl Fn(usize, usize) -> Vec<TreeRow> {
+        move |offset: usize, len: usize| {
+            names
+                .iter()
+                .skip(offset)
+                .take(len)
+                .map(|name| TreeRow {
+                    path: PathBuf::from(*name),
+                    name: (*name).to_string(),
+                    depth: 0,
+                    kind: TreeRowKind::File,
+                    expanded: false,
+                    has_children: false,
+                    symlink: false,
+                    root: NO_ROOT,
+                    detail: None,
+                })
+                .collect()
+        }
+    }
+
+    /// Every window of every size across the join, against the flat list.
+    ///
+    /// The straddling window is the one that matters and the one an end-to-end test would miss:
+    /// it draws a plausible list with rows missing from the middle, which no assertion about the
+    /// first or last row can see. A virtualized tree produces one on every scroll past the last
+    /// project file.
+    #[test]
+    fn compose_serves_every_window_across_the_seam() {
+        const FIRST: &[&str] = &["a", "b", "c"];
+        const SECOND: &[&str] = &["External Libraries", "serde", "anyhow"];
+        let all: Vec<&str> = FIRST.iter().chain(SECOND).copied().collect();
+
+        for offset in 0..=all.len() + 2 {
+            for len in 0..=all.len() + 2 {
+                let window: Vec<String> =
+                    compose(FIRST.len(), offset, len, source(FIRST), source(SECOND))
+                        .into_iter()
+                        .map(|row| row.name)
+                        .collect();
+                let start = offset.min(all.len());
+                let end = (offset + len).min(all.len());
+                assert_eq!(window, all[start..end], "offset {offset} len {len}");
+            }
+        }
+    }
+
+    /// With nothing past the seam — every project that has no Cargo or Go manifest — the
+    /// composed answer has to be byte-identical to the index's own.
+    ///
+    /// The group source *is* still asked, and it has to be: `compose` cannot know it is empty
+    /// without asking, and short-circuiting on a count read a moment earlier would be a second
+    /// opinion about the same lock. The cost is one read-lock over an empty `Vec` per window
+    /// request, and what the assertion pins is the offset it is asked with — `0`, because the
+    /// window never reached the seam.
+    #[test]
+    fn a_project_with_no_groups_is_served_entirely_by_the_index() {
+        const FIRST: &[&str] = &["a", "b", "c"];
+        let asked = std::cell::Cell::new(None);
+        let rows = compose(FIRST.len(), 0, 10, source(FIRST), |offset, len| {
+            asked.set(Some((offset, len)));
+            Vec::new()
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            FIRST
+        );
+        assert_eq!(asked.get(), Some((0, 7)));
+    }
+
+    /// The composition is over `Groups` in the app, so the same sweep is run against the real
+    /// one — the fake above proves the arithmetic, this proves the two agree about `count`.
+    #[test]
+    fn the_real_group_tree_agrees_with_its_own_count() {
+        let mut groups = Groups::new();
+        groups.show("externalLibraries", "External Libraries");
+        groups.expand(&group_path("externalLibraries"));
+        groups.fulfil(
+            "externalLibraries",
+            vec![
+                Entry::note("Resolving dependencies…"),
+                Entry::note("and another"),
+            ],
+            Some("2".into()),
+        );
+
+        let walked = 4usize;
+        let total = walked + groups.count();
+        for offset in 0..=total + 1 {
+            for len in 0..=total + 1 {
+                let rows = compose(
+                    walked,
+                    offset,
+                    len,
+                    source(&["a", "b", "c", "d"]),
+                    |o, l| groups.rows(o, l),
+                );
+                let expected = len.min(total.saturating_sub(offset));
+                assert_eq!(rows.len(), expected, "offset {offset} len {len}");
+            }
+        }
+    }
+}
+
+/// The *Scratches* group, through the real command layer.
+///
+/// Not `#[ignore]`d, unlike its neighbour below: a scratch drawer needs no toolchain, no
+/// network and no registry — it is a `read_dir` of a directory this test makes itself. So the
+/// half of M13 that a user touches most often is covered by `cargo test` rather than by a
+/// deliberate run, which matters because every mutation path here (create, rename, delete,
+/// paste) has to re-list a group **nothing watches**, and a path that forgets shows the user a
+/// file that is no longer there.
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use crate::scratches::GROUP_ID;
+    use cide_fs::groups::group_path;
+    use cide_ipc::TreeRowKind;
+    use std::path::Path;
+
+    struct Silent;
+    impl FsEvents for Silent {
+        fn status(&self, _: ProjectId, _: &cide_ipc::FsStatus) {}
+        fn changed(&self, _: ProjectId, _: &cide_ipc::FsChange) {}
+    }
+
+    /// A project of one root under a temporary directory, walked through the real command
+    /// layer, plus the drawer its primary root keys.
+    async fn project(tag: &str) -> (FsRegistry, ProjectId, Arc<crate::files::ProjectFs>, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("cide-scratchcmd-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("seed");
+
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Silent);
+        let id = ProjectId::new();
+        index_project(events, &registry, id, vec![root.clone()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(id).expect("an indexed project");
+        (registry, id, fs, root)
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = std::fs::remove_dir_all(cide_core::scratch::dir_for(root));
+        let _ = std::fs::remove_file(cide_core::scratch::origin_path(root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The rows the groups contribute, which start where the walked index ends.
+    fn group_rows(fs: &crate::files::ProjectFs) -> Vec<cide_ipc::TreeRow> {
+        fs.groups().rows(0, 4096)
+    }
+
+    /// The sequence a user performs: open a project, make a scratch, find it in the tree,
+    /// edit it, rename it, throw it away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scratch_is_created_listed_saved_renamed_and_deleted() {
+        let (_registry, _id, fs, root) = project("lifecycle").await;
+        let walked = fs.with_index(|index| index.count());
+
+        // 1. The group is there before any scratch is, and says what makes one. A project with
+        //    no Cargo.toml has no *External Libraries* header, so this is the only group.
+        prepare(&fs, None);
+        assert_eq!(
+            tree_count(&fs),
+            walked + 1,
+            "one header, collapsed, for a project that has never had a scratch"
+        );
+        let header = group_rows(&fs).remove(0);
+        assert_eq!(header.kind, TreeRowKind::Group);
+        assert_eq!(header.name, "Scratches");
+        assert_eq!(header.path, group_path(GROUP_ID));
+        assert_eq!(header.detail, None);
+        assert!(
+            !cide_core::scratch::dir_for(&root).exists(),
+            "and opening the project wrote nothing to disk"
+        );
+
+        fs.groups().expand(&header.path);
+        let rows = group_rows(&fs);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].kind, TreeRowKind::Note);
+        assert!(
+            rows[1].name.contains("No scratch files yet"),
+            "{:?}",
+            rows[1].name
+        );
+
+        // 2. Create one. The row is there when the command answers — nothing watches the
+        //    drawer, so "the watcher will catch up" is not available as an excuse.
+        let created = fs.groups().new_scratch(&root, "rs").expect("scratch");
+        assert_eq!(
+            created.file_name().and_then(|n| n.to_str()),
+            Some("scratch.rs")
+        );
+        let rows = group_rows(&fs);
+        assert_eq!(rows.len(), 2, "the note is replaced, not appended to");
+        assert_eq!(rows[1].kind, TreeRowKind::File);
+        assert_eq!(rows[1].path, created);
+        assert_eq!(rows[0].detail.as_deref(), Some("1"));
+
+        // 3. It is outside every root — that is what makes it a scratch — and the containment
+        //    check that guards the disk knows it anyway.
+        assert!(
+            ops::check_within(&fs.root_paths(), &created).is_err(),
+            "a scratch is deliberately outside the project, or it would show in git status"
+        );
+        assert!(ops::check_within(&fs.writable_paths(), &created).is_ok());
+
+        // 4. Saving. This is the one that makes it a scratch rather than a decoration: the
+        //    editor's own path (`file_write`) has never had a containment check, and the file
+        //    tree's (`fs_write_file`) now admits the drawer.
+        cide_core::document::write(&created, "fn main() {}\n").expect("the editor's save");
+        assert_eq!(
+            std::fs::read_to_string(&created).expect("read"),
+            "fn main() {}\n"
+        );
+        assert!(
+            cide_core::toolchain::read_only_reason(&created, &fs.root_paths()).is_none(),
+            "a scratch must not be caught by the dependency-cache read-only rule"
+        );
+
+        // 5. Renaming, **through the handler's own body** and not through `ops::rename`.
+        //    That distinction is the point: what is being pinned is which list the containment
+        //    check is given, and a test that called `ops::check_within` itself would agree with
+        //    whatever list it chose. Renaming also changes the language, because the extension
+        //    is the whole of how `ui/src/editor/languages.ts` decides.
+        let renamed = created.with_file_name("notes.md");
+        assert!(
+            rename_entry(&fs, &created, &renamed).expect("a scratch is renamed"),
+            "…and the drawer says it changed, which is what becomes a cide://fs-status so the \
+             second window redraws — nothing watches this directory"
+        );
+        assert_eq!(group_rows(&fs)[1].name, "notes.md");
+        // A rename *out of* the drawer into the project is deliberately **allowed** — both
+        // sides are in the writable set, and "this scratch turned out to be worth keeping" is a
+        // real thing to want. Not asserted here as a success, because `ops::rename` is one
+        // `rename(2)` and the drawer is under `$XDG_STATE_HOME` while this test's project is
+        // under `/tmp`, which on a normal machine is a different filesystem: the assertion
+        // would pass or fail on the device layout rather than on the rule.
+
+        // 6. And the drawer itself is refused, exactly as a project root is: selecting the
+        //    header and pressing Delete must not put a directory in the trash.
+        let drawer = cide_core::scratch::dir_for(&root);
+        assert!(delete_entries(&fs, std::slice::from_ref(&drawer)).is_err());
+        assert!(drawer.is_dir(), "and nothing moved");
+
+        // 7. Deleting the last one puts the note back — again through the handler's body, so
+        //    the containment list and the re-listing are both the shipped ones.
+        let (trashed, moved) =
+            delete_entries(&fs, std::slice::from_ref(&renamed)).expect("a scratch is trashed");
+        assert_eq!(trashed.len(), 1);
+        assert!(moved, "and the drawer changed");
+        assert!(!renamed.exists());
+        let rows = group_rows(&fs);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].kind, TreeRowKind::Note);
+        assert_eq!(rows[0].detail, None);
+
+        // 8. The negative half, which is the one that must not rot. Widening containment for
+        //    the drawer must not have widened it for anything else.
+        assert!(
+            delete_entries(&fs, &[PathBuf::from("/etc/passwd")]).is_err(),
+            "/etc/passwd is not in this project, its drawer, or anywhere else cide may write"
+        );
+        assert!(rename_entry(&fs, Path::new("/etc/passwd"), Path::new("/etc/passwd.bak")).is_err());
+
+        cleanup(&root);
+    }
+
+    /// *Select Opened File* over a scratch: the reveal has to find a row for a path that is in
+    /// no index and under no root, and it has to answer the **composed** index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scratch_is_revealed_at_its_row_in_the_composed_tree() {
+        let (_registry, _id, fs, root) = project("reveal").await;
+        prepare(&fs, None);
+        let walked = fs.with_index(|index| index.count());
+
+        let a = fs.groups().new_scratch(&root, "rs").expect("first");
+        let b = fs.groups().new_scratch(&root, "rs").expect("second");
+
+        let at = reveal_path(&fs, &b).expect("a scratch has a row");
+        assert_eq!(
+            at as usize,
+            walked + 2,
+            "the walked rows, then the header, then scratch.rs, then scratch_1.rs"
+        );
+        let rows = fs.groups().rows(at as usize - walked, 1);
+        assert_eq!(rows[0].path, b);
+        assert!(
+            fs.groups().rows(0, 1)[0].expanded,
+            "revealing into a collapsed group has to open it, or the row is not on screen"
+        );
+
+        assert_eq!(
+            reveal_path(&fs, &a).expect("and the other one"),
+            (walked + 1) as u32
+        );
+        let main = reveal_path(&fs, &root.join("src/main.rs"))
+            .expect("and an ordinary project file still has a row");
+        // Compared against the count *after* the reveal: `Index::reveal` expands `src` on the
+        // way, which is the whole reason it is `with_index_mut`, so the pre-reveal count would
+        // be the wrong side of the seam by exactly the row it just unfolded.
+        assert!(
+            (main as usize) < fs.with_index(|index| index.count()),
+            "which is the *index's* answer and not the group's: {main} is past the walked rows"
+        );
+        assert_eq!(
+            fs.with_index(|index| index.rows(main as usize, 1))[0].name,
+            "main.rs"
+        );
+        assert_eq!(
+            reveal_path(&fs, &root.join("src/never-existed.rs")),
+            None,
+            "a path in neither is honestly nothing, which is what the caller reports"
+        );
+
+        cleanup(&root);
+    }
+
+    /// The paths a mutating handler is allowed inside, which is also what the frontend greys
+    /// its menu items from — `fs_writable_roots` answers this exact list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_writable_set_is_the_roots_plus_the_drawer_and_nothing_else() {
+        let (_registry, _id, fs, root) = project("writable").await;
+        prepare(&fs, None);
+
+        assert_eq!(
+            fs.writable_paths(),
+            vec![root.clone(), cide_core::scratch::dir_for(&root)],
+            "the roots first, so a project path is still matched by the cheapest test"
+        );
+        // The negative half, and it is the one that must not rot: widening containment for
+        // scratches must not widen it for anything else.
+        for outside in ["/etc/passwd", "/tmp", "/"] {
+            assert!(
+                ops::check_within(&fs.writable_paths(), Path::new(outside)).is_err(),
+                "{outside} must still be refused"
+            );
+        }
+        let caches = cide_core::toolchain::dependency_roots();
+        if let Some(cache) = caches.first() {
+            assert!(
+                ops::check_within(&fs.writable_paths(), &cache.join("serde-1.0/src/lib.rs"))
+                    .is_err(),
+                "a dependency source is readable, never writable — that group contributes no \
+                 writable directory at all"
+            );
+        }
+
+        cleanup(&root);
+    }
+}
+
+/// The whole *External Libraries* feature, over this repository, through the real command layer.
+///
+/// `#[ignore]`d like every other test in this workspace that spawns a real binary: it needs
+/// `cargo` on PATH, an authenticated toolchain and a populated registry, and it spends a quarter
+/// of a second of somebody's CPU. Run it deliberately —
+/// `cargo test -p cide-app external_libraries -- --ignored` — after touching either the resolver
+/// or the composition, because everything else in this file exercises the two halves separately.
+///
+/// What it pins is the sequence a user actually performs, in the order they perform it: open a
+/// project, look at the tree, expand the header, watch the rows arrive — and then the one that
+/// does not start from the tree at all, *Select Opened File* over a tab Go to definition opened.
+#[cfg(test)]
+mod external_libraries_tests {
+    use super::*;
+    use crate::libraries::GROUP_ID;
+    use cide_fs::groups::group_path;
+    use cide_ipc::TreeRowKind;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Default)]
+    struct Counting(AtomicU32);
+    impl FsEvents for Counting {
+        fn status(&self, _: ProjectId, _: &cide_ipc::FsStatus) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn changed(&self, _: ProjectId, _: &cide_ipc::FsChange) {}
+    }
+
+    fn workspace_root() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the workspace root")
+            .to_path_buf()
+    }
+
+    async fn indexed(root: PathBuf) -> (FsRegistry, ProjectId, Arc<crate::files::ProjectFs>) {
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+        let project = ProjectId::new();
+        index_project(events, &registry, project, vec![root])
+            .await
+            .expect("the walk");
+        let fs = registry.get(project).expect("an indexed project");
+        (registry, project, fs)
+    }
+
+    /// The rows of the *External Libraries* group alone. It is drawn first, so its rows run
+    /// until the next depth-0 row — which is the *Scratches* header.
+    fn library_rows(fs: &crate::files::ProjectFs) -> Vec<cide_ipc::TreeRow> {
+        let all = fs.groups().rows(0, 8192);
+        let mut out = Vec::new();
+        for row in all {
+            if out.is_empty() {
+                assert_eq!(row.name, "External Libraries", "the group is drawn first");
+                out.push(row);
+                continue;
+            }
+            if row.depth == 0 {
+                break;
+            }
+            out.push(row);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "spawns the real cargo against this repository"]
+    async fn this_repository_grows_a_group_and_fills_it_in() {
+        let root = workspace_root();
+        let (_registry, project, fs) = indexed(root.clone()).await;
+        let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
+
+        // 1. Opening a project resolves nothing. The header exists after the first tree read —
+        //    which is `prepare` — and is collapsed, unresolved and one row. *Scratches* is the
+        //    second header and is why this is `+ 2` rather than `+ 1`.
+        prepare(&fs, Some((&events, project)));
+        let walked = fs.with_index(|index| index.count());
+        assert_eq!(
+            tree_count(&fs),
+            walked + 2,
+            "each group contributes exactly one row before anybody opens it"
+        );
+        let header = library_rows(&fs).remove(0);
+        assert_eq!(header.kind, TreeRowKind::Group);
+        assert_eq!(header.name, "External Libraries");
+        assert!(!header.expanded);
+        assert_eq!(
+            header.detail, None,
+            "no count until there is something to count"
+        );
+
+        // 2. The header is the first row past the walked ones, and the seam serves it.
+        let last = compose(
+            walked,
+            walked,
+            1,
+            |o, l| fs.with_index(|index| index.rows(o, l)),
+            |o, l| fs.groups().rows(o, l),
+        );
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].path, group_path(GROUP_ID));
+
+        // 3. Expanding starts the resolver and returns at once, with a row already up saying so.
+        let path = group_path(GROUP_ID);
+        assert_eq!(
+            fs.groups().expand(&path),
+            Some(cide_fs::groups::Expanded::Resolve)
+        );
+        crate::libraries::spawn_resolve(Arc::clone(&fs), Arc::clone(&events), project);
+        assert_eq!(
+            tree_count(&fs),
+            walked + 3,
+            "the two headers plus the row that says one of them is working"
+        );
+
+        // 4. And the rows arrive. Polled rather than joined: `spawn_resolve` is deliberately
+        //    fire-and-forget, which is the whole reason the click does not block.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while tree_count(&fs) <= walked + 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let rows = library_rows(&fs);
+        assert!(
+            rows.len() > 100,
+            "cide has hundreds of dependencies, not {}: {:?}",
+            rows.len(),
+            rows.iter().take(4).collect::<Vec<_>>()
+        );
+        assert!(
+            rows[0].detail.is_some(),
+            "the header carries the count once there is one"
+        );
+        assert!(
+            rows.iter().skip(1).all(|r| r.kind == TreeRowKind::Dir),
+            "every row cargo reported has a directory to open"
+        );
+        let serde = rows
+            .iter()
+            .find(|r| r.name == "serde")
+            .expect("cide depends on serde");
+        assert!(
+            serde
+                .detail
+                .as_deref()
+                .is_some_and(|d: &str| d.starts_with('1')),
+            "{:?}",
+            serde.detail
+        );
+
+        // 5. Reveal into a package that has never been expanded — the *Select Opened File* path.
+        let target = serde.path.join("src/lib.rs");
+        let row = fs
+            .groups()
+            .reveal(&target)
+            .expect("a chain nobody opened is materialised on demand");
+        assert_eq!(fs.groups().rows(row, 1)[0].path, target);
+        assert_eq!(
+            fs.with_index_mut(|index| index.reveal(&target)),
+            None,
+            "the walked index cannot hold a path outside its roots — that is the whole reason \
+             the group is a second tree"
+        );
+
+        // 6. And it is read-only, whatever its mode bits say.
+        assert!(
+            cide_core::toolchain::read_only_reason(&target, &[root]).is_some(),
+            "a registry source opened from this group must not be writable: {}",
+            target.display()
+        );
+    }
+
+    /// *Select Opened File* on a tab Go to definition opened, with the group **never expanded**.
+    ///
+    /// This is the case the feature is most likely to be shipped without. Ctrl+B into `serde`
+    /// gives a tab on a path that is in no index and under no root; the group that would hold it
+    /// has never been opened, so it holds no packages, so a reveal finds nothing — and the
+    /// command tells the user the file is *not in this project's file tree*, about a file they
+    /// are looking at. `reveal_path` resolves the group rather than saying that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "spawns the real cargo against this repository"]
+    async fn revealing_a_dependency_source_resolves_the_group_it_needs() {
+        let root = workspace_root();
+        let (_registry, _project, fs) = indexed(root.clone()).await;
+        prepare(&fs, None);
+        assert_eq!(
+            fs.groups().expand(&group_path(GROUP_ID)),
+            Some(cide_fs::groups::Expanded::Resolve),
+            "nothing has resolved this group, which is the state this test is about"
+        );
+        fs.groups().collapse(&group_path(GROUP_ID));
+
+        // A real registry source, found the way Go to definition finds one: from the resolver.
+        let cache = cide_core::toolchain::dependency_roots()
+            .into_iter()
+            .find(|root| root.ends_with("registry/src"))
+            .expect("a cargo registry");
+        let serde = std::fs::read_dir(&cache)
+            .expect("registry index directories")
+            .flatten()
+            .flat_map(|index| {
+                std::fs::read_dir(index.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("serde-1."))
+            .expect("an unpacked serde")
+            .path();
+        let target = serde.join("src/lib.rs");
+        assert!(target.is_file(), "{} is not unpacked", target.display());
+
+        let walked = fs.with_index(|index| index.count());
+        let at = reveal_path(&fs, &target).expect(
+            "a dependency source has a row, and finding it must not depend on the user having \
+             opened the group first",
+        );
+        assert!(at as usize >= walked, "the row is past the walked index");
+        assert_eq!(fs.groups().rows(at as usize - walked, 1)[0].path, target);
     }
 }

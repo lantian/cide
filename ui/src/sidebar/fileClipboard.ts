@@ -102,20 +102,58 @@ export const useFileClipboard = create<FileClipboardStore>((set, get) => ({
   async plan(project, destDir) {
     const clip = get().clip
     if (clip === null) return []
-    return fsClipboard.plan(project, clip.paths, destDir, clip.mode)
+    return planEntries(project, clip.paths, destDir, clip.mode)
   },
 
   async paste(project, destDir, decisions) {
     const clip = get().clip
     if (clip === null) return { paths: [], note: null }
 
-    const entries = await fsClipboard.paste(project, clip.paths, destDir, clip.mode, decisions)
+    const result = await pasteEntries(project, clip.paths, destDir, clip.mode, decisions)
     // A cut is consumed by the paste it was made for. A copy is not: pressing Ctrl+V twice is
     // how anyone makes two copies, and clearing here would make the second press do nothing.
     if (clip.mode === 'cut') set({ clip: null })
-    return { paths: entries.map((entry) => entry.dest), note: summarize(entries, clip.mode) }
+    return result
   },
 }))
+
+/*
+ * The two calls below are free functions rather than methods, and that is the seam a **drag** uses.
+ *
+ * A drop is a move of paths the user is pointing at — it has nothing to do with what is on the
+ * clipboard, and routing it through the store's methods would have been actively destructive:
+ * they read their sources from `clip`, so a drop would first have to `take()` the dragged rows,
+ * which overwrites both the in-app clipboard *and* the system clipboard, and then `paste()` would
+ * clear the clip on a cut. Dragging one file would silently throw away the four the user had
+ * copied ten seconds earlier, with nothing on screen to say so.
+ *
+ * Split out here rather than called straight from the panel so that the *summary* stays in one
+ * place: `pastedSummary` is the only thing that knows a rename must be reported and an ordinary
+ * paste must say nothing, and a drag with its own copy of that would be the second version that
+ * drifts.
+ */
+
+/** Which names this transfer would land on that are already taken. Writes nothing. */
+export function planEntries(
+  project: ProjectId,
+  sources: readonly string[],
+  destDir: string,
+  mode: ClipMode,
+): Promise<PasteCollision[]> {
+  return fsClipboard.plan(project, sources, destDir, mode)
+}
+
+/** Send it, with whatever the user answered about the names that were taken. */
+export async function pasteEntries(
+  project: ProjectId,
+  sources: readonly string[],
+  destDir: string,
+  mode: ClipMode,
+  decisions: readonly PasteDecision[],
+): Promise<PasteResult> {
+  const entries = await fsClipboard.paste(project, sources, destDir, mode, decisions)
+  return { paths: entries.map((entry) => entry.dest), note: summarize(entries, mode) }
+}
 
 /**
  * `PastedEntry` (generated from Rust) read through the model's structural `PasteOutcome`.

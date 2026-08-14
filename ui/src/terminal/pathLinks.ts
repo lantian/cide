@@ -80,7 +80,7 @@
  */
 import type { IBufferLine, ILink, IDisposable } from '@xterm/xterm'
 import { notify } from '@/chrome/notices'
-import { events, fs as fsApi, session as sessionApi } from '@/ipc/client'
+import { events, fs as fsApi, session as sessionApi, type TreeRowKind } from '@/ipc/client'
 import {
   candidatePaths,
   matchPaths,
@@ -292,24 +292,36 @@ async function sessionCwd(project: string, session: string | null): Promise<stri
 async function probeOutside(paths: string[]): Promise<void> {
   for (let i = 0; i < paths.length; i += PROBE_MAX) {
     const batch = paths.slice(i, i + PROBE_MAX)
-    let answers: Array<'dir' | 'file' | null>
+    let answers: Array<TreeRowKind | null>
     try {
       answers = await fsApi.statPaths(batch)
     } catch {
       return
     }
     for (const [j, path] of batch.entries()) {
-      const answer = answers[j]
-      rememberOutside(path, answer === null || answer === undefined ? 'absent' : answer)
+      rememberOutside(path, linkable(answers[j]))
     }
   }
+}
+
+/**
+ * A probe answer, as this module's two-state cache stores it.
+ *
+ * `TreeRowKind` gained `group` and `note` in M13 — synthetic rows the *file tree* draws — and
+ * neither can ever come back from a path probe, which answers about the disk. Narrowing here
+ * rather than widening the cache is the point: a terminal link is offered for a file and for
+ * nothing else, so an answer this module has never heard of has to land on `absent` rather than
+ * on whatever the compiler was willing to infer.
+ */
+function linkable(answer: TreeRowKind | null | undefined): 'dir' | 'file' | 'absent' {
+  return answer === 'dir' || answer === 'file' ? answer : 'absent'
 }
 
 /** Ask about every path not already answered for, in bounded batches. */
 async function probe(project: string, paths: string[]): Promise<void> {
   for (let i = 0; i < paths.length; i += PROBE_MAX) {
     const batch = paths.slice(i, i + PROBE_MAX)
-    let answers: Array<'dir' | 'file' | null>
+    let answers: Array<TreeRowKind | null>
     try {
       answers = await fsApi.pathsExist(project, batch)
     } catch {
@@ -322,8 +334,7 @@ async function probe(project: string, paths: string[]): Promise<void> {
       return
     }
     for (const [j, path] of batch.entries()) {
-      const answer = answers[j]
-      remember(path, answer === null || answer === undefined ? 'absent' : answer)
+      remember(path, linkable(answers[j]))
     }
   }
 }

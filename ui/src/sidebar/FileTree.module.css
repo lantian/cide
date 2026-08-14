@@ -61,6 +61,59 @@
   cursor: help;
 }
 
+/*
+ * *Select opened file*, in the header.
+ *
+ * The first action button any sidebar panel header carries. `GitPanel` puts its actions in a
+ * 28px strip of their own, and a second strip here for one button would cost 28px of tree on a
+ * panel whose whole job is showing rows — so this is `GitPanel/Toolbar.module.css`'s `.button`
+ * shrunk from 22px to 20px to sit inside a 30px header, with the same radius, the same hover
+ * and the same focus ring so the two surfaces read as one application.
+ *
+ * `flex: none` and last in a `display: flex` header whose `.headerTitle` is `flex: 1`, so it
+ * lands at the right edge with no change to the layout the chrome audit measures.
+ */
+.headerAction {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  /* Not the header's own: that is 10.5px uppercase with 0.09em tracking, which would draw the
+     glyph as a tiny smudge and letter-space it away from the centre of its box. */
+  font-family: var(--font-ui);
+  font-size: 13px;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+.headerAction:hover:not(:disabled) {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+/*
+ * Disabled is an ordinary state here, not a failure: it is what "no file tab is open" looks
+ * like, which is true every time the Claude console is the active tab. So it dims and stops
+ * responding rather than disappearing — a control that renders nothing does not read as "not
+ * applicable", it reads as broken, which is a user report this project has already had.
+ */
+.headerAction:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.headerAction:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .scroll {
   flex: 1;
   min-height: 0;
@@ -484,4 +537,213 @@
  */
 .rowCut {
   opacity: 0.5;
+}
+
+/*
+ * ---------------------------------------------------------------------------------------
+ * Synthetic rows: the *External Libraries* header, its dim second column, and the sentences
+ * a group shows when it has nothing else to show.
+ * ---------------------------------------------------------------------------------------
+ */
+
+/*
+ * A group header is drawn as a **node**, not as a heading — which is what IDEA does, and IDEA is
+ * this panel's reference (see `ROW_HEIGHT`'s comment in `FileTree.tsx`: the mock stopped being
+ * the reference for this panel and `idea.png` took over).
+ *
+ * The first version of this rule made it uppercase, tracked out and 11px, on the argument that a
+ * user who reads it as a directory will go looking for it on disk. Checked against IDEA's own
+ * project tree — where *External Libraries* and *Scratches and Consoles* sit at the foot of the
+ * tree in the same face, the same size and the same weight as every other row — that argument is
+ * an invention. What distinguishes the row there is its **icon** and its position, which is
+ * exactly what `groupRows.groupIcon` and the composition order already give it.
+ *
+ * So this rule carries one thing: a slightly quieter colour, because the header is a container
+ * and never a file the user is looking for by name. Weight, size and face are the row's.
+ */
+.rowGroup {
+  color: var(--dim);
+}
+
+/*
+ * A note: `Resolving dependencies…`, `cargo is not on PATH…`, `No external dependencies.`
+ *
+ * Italic and dim so it cannot be mistaken for a file whose name happens to be a sentence, and
+ * `cursor: default` like every row — it is not clickable and must not pretend to be.
+ */
+.rowNote {
+  font-style: italic;
+  color: var(--dim);
+}
+
+/* Where a note's icon would be, so its sentence lines up with the names above it. */
+.noteGap {
+  flex: none;
+  width: 15px;
+}
+
+/*
+ * The dim second column: a dependency's version, a group's count, `not downloaded`.
+ *
+ * `flex: none` with `min-width: 0` and an ellipsis, beside a `.name` that already has `flex: 1`:
+ * in a 252px panel the *name* is what the user is looking for, so the name takes the slack and
+ * this shrinks only when the name has already been truncated. `margin-left: auto` on the group
+ * header's own detail would right-align the count, and it is deliberately *not* used — the count
+ * sits against the label, where it reads as part of it rather than as a column of its own.
+ */
+.detail {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+
+/*
+ * --- dragging rows into a folder -----------------------------------------------------------
+ *
+ * > *"drag selected elements to some folder"*
+ *
+ * Four channels, and none of them is decoration: a drop moves the user's files and there is no
+ * undo anywhere in `cide_fs::ops`, so "which rows are in flight" and "what will the thing under
+ * the pointer do with them" both have to be legible without letting go to find out. The rules are
+ * `treeDrag.ts`, the gesture is `useTreeDrag.ts`, and these are ported from
+ * `GitPanel/ChangesTree.module.css` so the two sidebar trees say the same thing the same way.
+ *
+ * Every colour is a token: this panel is white in one theme and near-black in the other, and a
+ * drop outline that reads on only one of them is worse than none.
+ */
+
+/*
+ * While a drag is in flight the hover wash would follow the pointer alongside the drop outline —
+ * two bands making two different claims about where the files are going. The row under the
+ * pointer is already drawing the true one.
+ *
+ * `:not(.rowSelected)` is load-bearing rather than tidy: without it this rule out-specifies
+ * `.rowSelected:hover` and blanks the selection band on whichever selected row the pointer
+ * happens to cross — i.e. it erases the very set the drag is carrying.
+ */
+.scroll[data-dragging] .row:not(.rowSelected):hover {
+  background: none;
+}
+
+.scroll[data-dragging] {
+  cursor: grabbing;
+}
+
+/*
+ * What is in flight. Dimmed rather than hidden: a row that vanished under the pointer would
+ * reflow the tree mid-gesture and move the folder the user is aiming at.
+ */
+.row[data-drag] {
+  opacity: 0.45;
+}
+
+/*
+ * The marked row, and what it will do.
+ *
+ * An inset ring rather than a border, so nothing shifts by a pixel when the outline appears — the
+ * same reason `.rowCurrent` uses an inset shadow. `move` is the accent (this app's one "yes"),
+ * `noop` is a neutral `--border` ring on the selection ground (the drop is allowed and changes
+ * nothing, which is not an error), and `refuse` is `--red` with the reason on the ghost.
+ *
+ * For an accepted drop the marked row is the **destination folder**, which is not always the row
+ * under the pointer: dropping on `src/main.rs` lands in `src`. Ringing the file would claim the
+ * file was the target, which is the misreading that puts a folder somewhere nobody meant.
+ */
+.row[data-drop='move'] {
+  background: var(--sel);
+  box-shadow:
+    inset 0 0 0 1px var(--accent),
+    inset 2px 0 0 var(--accent);
+}
+
+.row[data-drop='noop'] {
+  background: var(--sel);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.row[data-drop='refuse'] {
+  box-shadow: inset 0 0 0 1px var(--red);
+  cursor: not-allowed;
+}
+
+/*
+ * The rest of the destination folder, tinted.
+ *
+ * The folder's own row carries the ring, but in a 252px panel it is very often above the fold by
+ * the time the pointer is over the files inside it — so the band says "this folder" where the ring
+ * cannot be seen. A wash rather than a ground, for the same reason `.row:hover` is one: a selected
+ * or cut row has a colour of its own and an opaque tint would take it away. Nothing for a refused
+ * drop: there is no folder to join.
+ *
+ * The `--chrome-hi` line is the fallback, not a leftover — an engine without `color-mix()` drops
+ * the second declaration and keeps the first.
+ */
+.row[data-drop-band='move'],
+.row[data-drop-band='noop'] {
+  background-image: linear-gradient(var(--chrome-hi), var(--chrome-hi));
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--sel) 40%, transparent),
+    color-mix(in srgb, var(--sel) 40%, transparent)
+  );
+}
+
+/*
+ * The ghost: what is being carried, and the verdict, under the pointer.
+ *
+ * `position: fixed` because the tree scrolls under it — an absolutely positioned ghost would ride
+ * the scroll and drift off the pointer during an edge auto-scroll. `pointer-events: none` so it is
+ * never what `elementFromPoint` returns, which would make the drop target flicker between the row
+ * and the ghost as the pointer moved.
+ */
+.ghost {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  max-width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--chrome);
+  box-shadow: var(--shadow);
+}
+
+.ghostLoad {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ghostHint {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.ghost[data-outcome='move'] {
+  border-color: var(--accent);
+}
+
+.ghost[data-outcome='move'] .ghostHint {
+  color: var(--accent);
+}
+
+/* Refused, in words. The colour alone would say "no" to everyone who can see it and nothing at
+   all to everyone who cannot; the sentence is the part that says *why*, and it is allowed to
+   wrap because "“src” cannot be moved into itself" does not fit on one 260px line. */
+.ghost[data-outcome='refuse'] {
+  border-color: var(--red);
+}
+
+.ghost[data-outcome='refuse'] .ghostHint {
+  color: var(--red);
+  white-space: normal;
 }

@@ -39,7 +39,7 @@ import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
-import { notifyFailure } from '@/chrome/notices'
+import { notify, notifyFailure } from '@/chrome/notices'
 import { ProjectSwitcher } from '@/chrome/ProjectSwitcher'
 import { SidebarSplitter } from '@/chrome/SidebarSplitter'
 import { installNativeMenuSuppression, useContextMenuOpen } from '@/menus'
@@ -68,6 +68,7 @@ import {
   app as appApi,
   benchMode,
   file as fileApi,
+  fs as fsApi,
   project as projectApi,
   windows as windowApi,
   diag,
@@ -81,6 +82,8 @@ import {
 import { runBench, formatReport, probeIpcOnce } from '@/bench/ipcBench'
 import { retheme } from '@/terminal/xterm'
 import { useWorkspace } from '@/store/workspace'
+import { useFileTree } from '@/sidebar/treeStore'
+import { focusedTabPath } from '@/keys/target'
 import styles from './App.module.css'
 
 /**
@@ -880,6 +883,18 @@ export function App() {
           {view === 'files' && (
             <Explorer
               project={activeProjectId}
+              /*
+               * *Select opened file*, and the two halves are deliberately different in kind.
+               *
+               * `openedFile` is a *fact* — the path the active tab is about — and it only
+               * decides whether the button is enabled or greyed with a reason. `onSelectOpened`
+               * runs the **command**, which re-derives that same path from the same function.
+               * That looks redundant and is not: the button, ⌃⇧E and the palette row all end in
+               * one handler with one copy of the rules, and a button that called
+               * `treeStore.reveal` itself would be a second call site to keep in step.
+               */
+              openedFile={focusedTabPath(boot)}
+              onSelectOpened={() => runCommand('file.reveal', null)}
               onOpenFile={(path) => {
                 if (!activeProjectId) return
                 // `UNKNOWN_LINE`: the Explorer names a file and not a place in it, so the
@@ -1164,6 +1179,35 @@ export function App() {
                 void claudeSend
                   .lines(activeProjectId, mentionTarget, path, '')
                   .then((sent) => revealPane(activeProjectId, sent.pane))
+              },
+              /*
+               * A new scratch file, in the order that makes it feel like one gesture: create,
+               * open, select.
+               *
+               * The reveal is **last and its answer is read**, which is the rule `file.reveal`
+               * exists to enforce: `fs_scratch_new` re-lists the group before it resolves, so a
+               * `false` here means something genuinely went wrong rather than "not yet", and
+               * saying nothing about it would be the silent no-op this whole round is about.
+               *
+               * No `jumpTo`: a scratch is empty and has no place in it to go to, and recording a
+               * navigation entry for a file with one line would put a Back stop on nothing.
+               * `Failures` turns a rejected `scratchNew` into the sentence that says why —
+               * deliberately uncaught, like every other command call in this file.
+               */
+              createScratch: (ext) => {
+                closeOverlay()
+                void fsApi.scratchNew(activeProjectId, ext).then(async (path) => {
+                  await fileApi.open(activeProjectId, path)
+                  hydrate()
+                  setView('files')
+                  const shown = await useFileTree.getState().reveal(path)
+                  if (!shown) {
+                    notify('The scratch file was created but has no row in the tree yet.', {
+                      kind: 'info',
+                      hint: 'Fold and unfold Scratches to re-read the drawer.',
+                    })
+                  }
+                })
               },
               runCommand: (id) => {
                 closeOverlay()

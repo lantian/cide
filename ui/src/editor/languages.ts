@@ -117,6 +117,103 @@ const BY_EXTENSION: Record<string, { id: LanguageId; label?: string }> = {
 }
 
 /**
+ * A type the *New scratch file…* picker offers.
+ *
+ * The `ext` is what crosses the wire — `fs.scratchNew(project, 'rs')` — and what names the file
+ * on disk, so it is also what decides the language of the buffer that opens.
+ */
+export interface ScratchType {
+  /** The row's label, and what the status bar will say once the file is open. */
+  readonly label: string
+  /** The extension, without the dot. Lowercase letters and digits; Rust refuses anything else. */
+  readonly ext: string
+}
+
+/**
+ * The types a scratch file may be, in the order the picker lists them.
+ *
+ * # Why this lives here and not in the overlay
+ *
+ * Because this file is the thing it must not disagree with. [`lookup`] resolves an extension to
+ * a grammar and a label; if the picker carried its own array of `{label, ext}` pairs, the first
+ * entry whose extension is not in [`BY_EXTENSION`] would produce a scratch offered as *YAML*
+ * that opens with no highlighting and a status bar reading `Plain Text` — a failure that is
+ * silent, specific, and invisible to `tsc`. Keeping the two in one file does not prevent that
+ * on its own, so `ui/scripts/check-editor.mjs` asserts that **every entry's extension resolves
+ * through `lookup` to that entry's own label**, which makes the disagreement unrepresentable.
+ *
+ * # What is offered, and what is not
+ *
+ * One row per language in [`REGISTRY`] that a person would name, ordered by what this
+ * application is for, plus plain text. `.txt` is the deliberate exception to the rule above:
+ * it is **not** in `BY_EXTENSION` and must not be added — that would be a language with no
+ * grammar — so it resolves to `Plain Text` by the same fallback every unknown extension takes,
+ * and the check special-cases exactly that.
+ *
+ * `C-like` is not offered under that name: the module is reached under six different labels
+ * (`c`, `cpp`, `java`, …) and "C-like" is an implementation detail, not something a person
+ * picks. C and C++ are listed separately and point at the same loader, which is precisely what
+ * the per-extension `label` override in `BY_EXTENSION` exists for.
+ */
+export const SCRATCH_TYPES: readonly ScratchType[] = [
+  { label: 'Rust', ext: 'rs' },
+  { label: 'Go', ext: 'go' },
+  { label: 'TypeScript', ext: 'ts' },
+  { label: 'JavaScript', ext: 'js' },
+  { label: 'Python', ext: 'py' },
+  { label: 'JSON', ext: 'json' },
+  { label: 'YAML', ext: 'yaml' },
+  { label: 'TOML', ext: 'toml' },
+  { label: 'Markdown', ext: 'md' },
+  { label: 'Shell', ext: 'sh' },
+  { label: 'C', ext: 'c' },
+  { label: 'C++', ext: 'cpp' },
+  { label: 'Plain Text', ext: 'txt' },
+]
+
+/**
+ * Which row the type picker opens on, given the file the user is looking at.
+ *
+ * The language of the focused editor's file when it is one of the offered types, else the first
+ * row. IDEA preselects nothing and makes every scratch a two-decision gesture; preselecting
+ * makes the common case — *another one of these* — two keystrokes, and costs nothing when the
+ * guess is wrong because the list is right there.
+ *
+ * Matched through [`lookup`] rather than on the extension string, in two passes, because the
+ * extension the user is looking at is usually **not** one of the offered ones:
+ *
+ *   1. the *label* — so `.mjs` preselects `JavaScript` rather than `TypeScript`, even though
+ *      both load the same module;
+ *   2. failing that, the *grammar* — so `.tsx` preselects `TypeScript` and `.java` preselects
+ *      `C`, which is the offered row that loads the same table. A one-row-off guess on a
+ *      language nobody offers beats falling back to Rust because the list happens to start
+ *      there.
+ *
+ * A file whose extension resolves to nothing preselects the row that also resolves to nothing,
+ * which is `Plain Text` — the same fallback, arrived at the same way, rather than a second rule
+ * naming `'txt'`.
+ *
+ * Pure and index-returning rather than a `ScratchType`, because the overlay's selection state is
+ * an index: handing it a value it would then have to `indexOf` is two representations of one
+ * fact. Never out of range — [`SCRATCH_TYPES`] is non-empty and `0` is the fallback.
+ */
+export function defaultScratchType(path: string | null): number {
+  if (path === null) return 0
+  const found = lookup(path)
+  const at = SCRATCH_TYPES.findIndex((type) => {
+    const offered = lookup(`scratch.${type.ext}`)
+    if (found === null) return offered === null
+    return offered !== null && offered.label === found.label
+  })
+  if (at >= 0) return at
+  if (found === null) return 0
+  const sameGrammar = SCRATCH_TYPES.findIndex(
+    (type) => lookup(`scratch.${type.ext}`)?.id === found.id,
+  )
+  return sameGrammar < 0 ? 0 : sameGrammar
+}
+
+/**
  * Files with no extension that are still a known language.
  *
  * Keyed on the whole file name, and lowercased before lookup — `Dockerfile` and

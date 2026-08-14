@@ -12,6 +12,7 @@ import { BranchPopup } from '@/chrome/BranchSelector'
 import { CommandPalette } from './CommandPalette'
 import { FilePicker } from './FilePicker'
 import { GoToLine } from './GoToLine'
+import { ScratchType } from './ScratchType'
 import { StructurePicker } from './StructurePicker'
 import { SymbolPicker } from './SymbolPicker'
 import { focusedCaret } from '@/editor/caretTrack'
@@ -48,6 +49,15 @@ export interface OverlayActions {
    * for.
    */
   goToLine: (path: string, line: number, column: number) => void
+  /**
+   * ⏎ in the scratch type picker: create a scratch of this extension, open it, and select its
+   * row in the tree.
+   *
+   * The extension rather than a language name, because the extension *is* the language here —
+   * see `editor/languages.ts::SCRATCH_TYPES`. All three steps belong to the host: this overlay
+   * knows which type was chosen and nothing about projects, tabs or the file tree.
+   */
+  createScratch: (ext: string) => void
 }
 
 export interface OverlayHostProps {
@@ -86,6 +96,10 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
     // host with a project, which is why that costs nothing today; it is written this way so the
     // popup does not acquire a dependency it does not have.
     if (open === 'goto' && focusedCaret() === null) close()
+    // The drawer is keyed by the project's primary root, so there is nothing to create in
+    // without one. Closed rather than rendered `null`, for the reason above: a store left open
+    // with nothing on screen makes `overlayOpen()` lie, and the next ⇧⌥S toggles a phantom shut.
+    if (open === 'scratch' && project === null) close()
   }, [open, project, close])
 
   if (open === null) return null
@@ -123,6 +137,12 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
   if (open === 'symbols') {
     if (project === null) return null
     return <SymbolPicker project={project} onDismiss={close} onGoTo={actions.goToSymbol} />
+  }
+
+  if (open === 'scratch') {
+    // Until the effect above runs. One frame, and it draws nothing.
+    if (project === null) return null
+    return <ScratchType onDismiss={close} onCreate={actions.createScratch} />
   }
 
   if (open === 'goto') {

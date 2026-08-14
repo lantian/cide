@@ -32,7 +32,19 @@ export type IconTheme = 'dark' | 'light'
 export interface IconRow {
   /** The last path component. Matching is case-insensitive; the raw value is fine. */
   readonly name: string
-  readonly kind: 'dir' | 'file'
+  /**
+   * Only `'dir'` takes the folder table; **everything else takes the filename table**, which is
+   * what `'file'` has always meant here.
+   *
+   * The two synthetic kinds are listed so a whole `TreeRow` still assigns to this structurally —
+   * that is the property this interface exists for, and narrowing it would have forced the tree
+   * to destructure a row and lose the compile error a renamed field is supposed to cause. They
+   * never actually reach [`iconFor`]: `sidebar/groupRows.ts` decides their glyph and the tree
+   * passes it to `FileIcon` as an explicit `stem`. If one ever did arrive here it would draw the
+   * generic document rather than throw, which is the right degradation for a row that is only
+   * ever a sentence.
+   */
+  readonly kind: 'dir' | 'file' | 'group' | 'note'
   /** Directories only. Absent or false draws the closed folder. */
   readonly expanded?: boolean | undefined
 }
@@ -77,9 +89,23 @@ function lookup(table: Readonly<Record<string, string>>, key: string): string | 
  */
 export function iconFor(row: IconRow, theme: IconTheme): string {
   const stem = row.kind === 'dir' ? folderStem(row) : fileStem(row.name)
-  // `_light` is a second *file*, not a CSS filter: an `<img>` is opaque to the page's
-  // stylesheet, and these icons are multi-colour by design, so there is no single hue to
-  // override. Asking for one that does not exist is a 404 and a blank row, hence the set.
+  return themed(stem, theme)
+}
+
+/**
+ * The light-theme spelling of a stem the caller already chose.
+ *
+ * Split out of [`iconFor`] for the one caller that does not resolve from a *name*: the file
+ * tree's synthetic group headers, whose icon is a tree decision (`sidebar/groupRows.ts`) rather
+ * than a filename association. Putting `folder-lib` into the transcribed Material tables would
+ * be inventing an association, which this module's header forbids; letting that caller build
+ * `${stem}_light` itself would be a second copy of the rule below.
+ *
+ * `_light` is a second *file*, not a CSS filter: an `<img>` is opaque to the page's stylesheet,
+ * and these icons are multi-colour by design, so there is no single hue to override. Asking for
+ * one that does not exist is a 404 and a blank row, hence the set.
+ */
+export function themed(stem: string, theme: IconTheme): string {
   return theme === 'light' && LIGHT.has(stem) ? `${stem}_light` : stem
 }
 

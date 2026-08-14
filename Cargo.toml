@@ -11,6 +11,7 @@ members = [
     "crates/cide-search",
     "crates/cide-lang",
     "crates/cide-lsp",
+    "crates/cide-deps",
     "crates/cide-hook",
     "crates/cide-headless",
     "crates/cide-app",
@@ -42,6 +43,7 @@ cide-fs = { path = "crates/cide-fs" }
 cide-search = { path = "crates/cide-search" }
 cide-lang = { path = "crates/cide-lang" }
 cide-lsp = { path = "crates/cide-lsp" }
+cide-deps = { path = "crates/cide-deps" }
 
 # --- shell (only cide-app may depend on tauri) ---
 # `devtools` so a release build can still open an inspector. Debug builds enable it anyway;

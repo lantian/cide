@@ -26,7 +26,7 @@
  * The CSP is satisfied without a special case: `img-src 'self'` covers `public/icons/`, and no
  * external host is named anywhere in this module.
  */
-import { iconFor, type IconRow, type IconTheme } from './iconFor'
+import { iconFor, themed, type IconRow, type IconTheme } from './iconFor'
 import styles from './FileIcon.module.css'
 
 /**
@@ -55,13 +55,25 @@ export interface FileIconProps {
   theme: IconTheme
   /** Extra class for layout — the caller owns where the icon sits in its row. */
   className?: string | undefined
+  /**
+   * An icon stem chosen by the caller, bypassing the name lookup.
+   *
+   * For the one row that has no filename to look up: the file tree's synthetic group headers
+   * (`sidebar/groupRows.ts`'s `groupIcon`). The theme suffix is still applied here, so the
+   * override cannot forget it and 404 into a blank row.
+   *
+   * Deliberately not "put `folder-lib` in the Material tables": `iconFor`'s header says the
+   * associations are transcribed upstream's and an association invented here would be a bug
+   * even if it looked reasonable. A group header is not a filename association at all.
+   */
+  stem?: string | undefined
 }
 
-export function FileIcon({ row, theme, className }: FileIconProps) {
+export function FileIcon({ row, theme, className, stem }: FileIconProps) {
   return (
     <img
       className={className === undefined ? styles.icon : `${styles.icon} ${className}`}
-      src={iconUrl(iconFor(row, theme))}
+      src={iconUrl(stem === undefined ? iconFor(row, theme) : themed(stem, theme))}
       /*
        * Decorative. The row already carries the filename as text and the git status as an
        * aria-label; an alt string here would make a screen reader read every row twice, once

@@ -8,11 +8,14 @@ pub mod emit;
 // M8: one file index, picker and watcher per project.
 pub mod files;
 pub mod graphics;
+pub mod groups;
 pub mod hooks;
 pub mod ide;
+pub mod libraries;
 pub mod lifecycle;
 pub mod lsp;
 pub mod positions_state;
+pub mod scratches;
 pub mod state;
 pub mod symbols;
 pub mod windows;
@@ -361,6 +364,8 @@ pub fn run() {
             cmd::fs::fs_write_file,
             cmd::fs::fs_create,
             cmd::fs::fs_create_in,
+            cmd::fs::fs_scratch_new,
+            cmd::fs::fs_writable_roots,
             cmd::fs::fs_rename,
             cmd::fs::fs_delete,
             cmd::fs::fs_paste,

@@ -100,9 +100,36 @@ export function rangeRefusal(rows: number): string | null {
 }
 
 /**
+ * What a press does to the selection, and whether it has to wait for the release.
+ *
+ * `deferred` is the detail that makes **dragging a multi-row selection** possible at all, and it
+ * is the one concept this module took from `GitPanel/rowSelection.ts` after the fact. A plain
+ * press on a row that is *already* part of a multi-row selection must not collapse the selection
+ * to that row on mousedown, because that press is also how a drag of the whole selection begins:
+ * collapsing first would destroy the set before the pointer had moved a pixel, and "drag the four
+ * files I selected" would be unreachable however correct the drag itself was. So the collapse
+ * waits for the mouseup ([`releaseSelect`]) and is skipped when the gesture turned out to be a
+ * drag — `useTreeDrag`'s `dragged()` is the signal, exactly as `ChangesTree` reads it.
+ *
+ * The **shape** is copied from `rowSelection.ts`; the module is not, and the header above says
+ * why at length (ids over an array there, paths over a windowed store here). Copying the shape is
+ * what makes the two trees mean the same thing by a press; sharing the code would mean one of
+ * them resolving a Shift-band it cannot see.
+ */
+export interface TreePressPlan {
+  readonly plan: SelectPlan
+  readonly deferred: boolean
+}
+
+/**
  * A left press on `path`, with modifiers.
  *
- * * **plain** — that row alone, and the anchor moves to it.
+ * * **plain, on an unselected row** — that row alone, and the anchor moves to it. This is what
+ *   makes "a drag starting on an unselected row picks up that row" true without the drag knowing
+ *   anything about selection: the press has already run by the time the 4px threshold is crossed.
+ * * **plain, on a row already in a multi-row selection** — nothing yet; see [`TreePressPlan`].
+ * * **plain, on the only selected row** — the same thing again, so it is *not* deferred: there is
+ *   no set to preserve and deferring would leave the anchor stale.
  * * **ctrl** — toggle that row, and the anchor moves to it. The caller must not also open or
  *   fold anything: Ctrl-click means "add this row", and a folder that folded while a selection
  *   was being assembled would renumber every row below it mid-gesture.
@@ -117,14 +144,33 @@ export function rangeRefusal(rows: number): string | null {
  * Unlike the git tree there is no unselectable row: every row in this tree is a file or a
  * folder, both of which are things the menu can act on.
  */
-export function pressSelect(sel: TreeSelection, path: string, mods: SelectMods): SelectPlan {
-  if (mods.shift && sel.anchor !== null) return { kind: 'range', from: sel.anchor, to: path }
+export function pressSelect(sel: TreeSelection, path: string, mods: SelectMods): TreePressPlan {
+  if (mods.shift && sel.anchor !== null) {
+    return { plan: { kind: 'range', from: sel.anchor, to: path }, deferred: false }
+  }
   if (mods.ctrl) {
     const paths = new Set(sel.paths)
     if (!paths.delete(path)) paths.add(path)
-    return { kind: 'set', next: { paths, anchor: path } }
+    return { plan: { kind: 'set', next: { paths, anchor: path } }, deferred: false }
   }
-  return { kind: 'set', next: only(path) }
+  // The whole selection is kept, by identity, so the store can tell "nothing to write" from "the
+  // same rows in a new Set" and skip a render of every visible row.
+  if (sel.paths.has(path) && sel.paths.size > 1) {
+    return { plan: { kind: 'set', next: sel }, deferred: true }
+  }
+  return { plan: { kind: 'set', next: only(path) }, deferred: false }
+}
+
+/**
+ * The release of a deferred press: collapse to the row the press landed on.
+ *
+ * Called only when [`pressSelect`] said `deferred` **and** the gesture did not become a drag. A
+ * release that skipped the check would undo the drag's own widening the instant the button came
+ * up — the four files would move and then one of them would be selected, with the tree scrolled
+ * to a folder holding all four.
+ */
+export function releaseSelect(path: string): TreeSelection {
+  return only(path)
 }
 
 /**

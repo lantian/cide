@@ -240,6 +240,16 @@ impl Drop for IndexingGuard {
 pub struct ProjectFs {
     pub roots: Vec<Root>,
     index: RwLock<Index>,
+    /// The synthetic groups drawn *after* the index's rows — *External Libraries*, and whatever
+    /// comes next.
+    ///
+    /// A second tree beside the first rather than a synthetic root inside it. `cide_fs::groups`
+    /// has the four couplings that decide it; the short version is that `Index::dir_paths()` is
+    /// the watcher's watch list and the walk's sink is the picker's injector, so a dependency
+    /// source grafted in would be watched and searched — 2,223 crate directories and 2.9 GB of
+    /// `~/.cargo/registry` on this machine. Beside it, "never watched, never indexed" is true
+    /// because there is no code that could do either.
+    groups: crate::groups::ProjectGroups,
     filter: RwLock<Arc<Filter>>,
     matcher: Arc<NucleoMatcher>,
     /// `Option` because it only exists once the walk has produced a directory list, and
@@ -280,6 +290,9 @@ impl ProjectFs {
     fn new(roots: Vec<Root>) -> Self {
         Self {
             index: RwLock::new(Index::empty(roots.clone())),
+            // Empty, and it stays empty until the first tree read probes for a manifest. Opening
+            // a project must cost nothing here — see `crate::libraries`.
+            groups: crate::groups::ProjectGroups::new(),
             filter: RwLock::new(Arc::new(Filter::build(
                 &roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
                 Vec::new(),
@@ -503,13 +516,40 @@ impl ProjectFs {
         f(&mut self.index.write())
     }
 
+    /// This project's synthetic groups. See the field.
+    pub fn groups(&self) -> &crate::groups::ProjectGroups {
+        &self.groups
+    }
+
+    /// Every directory the disk-changing `fs_*` handlers may act inside.
+    ///
+    /// The roots, **plus** the scratch drawer. Deliberately a second list rather than a wider
+    /// [`Self::root_paths`]: that one means *project roots* to `relativeTo`, to `isRootPath`,
+    /// to `Filter::build` and to `pasteTargetFor`, and widening it would make a scratch file
+    /// appear to live in the project — with a relative path in the status trail and a row the
+    /// paste target could land in.
+    ///
+    /// *External Libraries* contributes nothing here, and that is the point of asking the
+    /// groups rather than hard-coding the drawer: a rename inside `~/.cargo/registry` would
+    /// break every project on the machine that depends on the crate, so that group answers
+    /// with no writable directory at all.
+    pub fn writable_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.root_paths();
+        paths.extend(self.groups.writable_dirs());
+        paths
+    }
+
     pub fn status(&self) -> FsStatus {
         let index = self.index.read();
         FsStatus {
             indexing: self.indexing.load(Ordering::Acquire),
             files: index.files(),
             dirs: index.dirs(),
-            rows: index.count() as u32,
+            // The **composed** count, matching `fs_tree_count`. `files` and `dirs` deliberately
+            // do not move: they describe the walk, and a dependency source was never walked.
+            // `rows` is the scroller's range, so it has to include the group rows or a resolution
+            // that finished would leave rows the virtualizer refuses to ask for.
+            rows: (index.count() + self.groups.count()) as u32,
             watch: self.watch_status.lock().clone(),
         }
     }

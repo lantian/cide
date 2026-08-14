@@ -195,7 +195,8 @@ try {
   const { exceedsBytes, utf8ByteLength } = load('byteSize.js')
   const buffers = load('openBuffers.js')
   const reveal = load('revealRequest.js')
-  const { basename, languageName, loadLanguage } = load('languages.js')
+  const { basename, languageName, loadLanguage, SCRATCH_TYPES, defaultScratchType } =
+    load('languages.js')
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
   const send = load('sendToClaude.js')
@@ -422,6 +423,80 @@ try {
   for (const [path, expected] of Object.entries(names)) {
     eq(languageName(path), expected, `languageName(${JSON.stringify(path)})`)
   }
+
+  /*
+   * The scratch type list, against the table it must not disagree with.
+   *
+   * This is the assertion the whole `SCRATCH_TYPES`-lives-in-`languages.ts` decision exists to
+   * make possible, and the failure it prevents is silent and specific: an extension the picker
+   * offers that `lookup` does not know produces a scratch labelled *YAML* that opens with no
+   * highlighting and a status bar reading `Plain Text`. Nothing about that is visible to `tsc`,
+   * to a screenshot, or to a reviewer reading two files.
+   *
+   * Both directions are pinned: the label the picker prints is the label the status bar will
+   * print, **and** a grammar actually loads. `.txt` is the one deliberate exception — it is not
+   * in `BY_EXTENSION` and must not be added, because that would be a language with no grammar —
+   * so it is required to resolve to `Plain Text` and to load nothing, which is exactly what
+   * every unknown extension does.
+   */
+  ok(SCRATCH_TYPES.length >= 8, `the picker offers ${SCRATCH_TYPES.length} types`)
+  for (const type of SCRATCH_TYPES) {
+    ok(
+      /^[a-z0-9]{1,12}$/.test(type.ext),
+      `SCRATCH_TYPES ${JSON.stringify(type.ext)} is a shape cide_core::scratch::check_ext accepts`,
+    )
+    eq(
+      languageName(`scratch.${type.ext}`),
+      type.label,
+      `a scratch offered as ${JSON.stringify(type.label)} opens as that language`,
+    )
+    const grammar = await loadLanguage(`scratch.${type.ext}`)
+    if (type.label === 'Plain Text') {
+      eq(grammar, null, 'Plain Text is the absence of a grammar, not a grammar')
+    } else {
+      ok(grammar !== null, `and ${type.label} actually loads a grammar`)
+    }
+  }
+  eq(
+    new Set(SCRATCH_TYPES.map((t) => t.ext)).size,
+    SCRATCH_TYPES.length,
+    'no extension is offered twice — the second row would create a file the first one names',
+  )
+
+  /*
+   * Which row the picker opens on. Matched on the resolved **label**, so a `.tsx` buffer
+   * preselects TypeScript rather than falling through to the first row because `tsx` is not
+   * itself an offered extension.
+   */
+  eq(defaultScratchType(null), 0, 'with no file open the picker opens on the first row')
+  eq(defaultScratchType('/p/src/main.rs'), 0, 'a Rust buffer opens on Rust, which is first')
+  eq(
+    SCRATCH_TYPES[defaultScratchType('/p/ui/src/App.tsx')]?.label,
+    'TypeScript',
+    'a TSX buffer opens on TypeScript — the offered row that loads the same grammar',
+  )
+  eq(
+    SCRATCH_TYPES[defaultScratchType('/p/ui/src/app.mjs')]?.label,
+    'JavaScript',
+    'and a .mjs one opens on JavaScript, not on TypeScript — the label wins over the module',
+  )
+  eq(
+    SCRATCH_TYPES[defaultScratchType('/p/Main.java')]?.label,
+    'C',
+    'a language nobody offers falls back to the offered row that loads the same grammar, ' +
+      'not to whatever happens to be first in the list',
+  )
+  eq(
+    SCRATCH_TYPES[defaultScratchType('/p/archive.tar.gz')]?.label,
+    'Plain Text',
+    'a file whose extension resolves to nothing opens on the row that also resolves to ' +
+      'nothing — the same fallback, not a second rule naming "txt"',
+  )
+  eq(
+    SCRATCH_TYPES[defaultScratchType('/p/notes.txt')]?.label,
+    'Plain Text',
+    'and Plain Text is reachable as a preselection, not only as a row',
+  )
 
   eq(await loadLanguage('nope.qqq'), null, 'an unknown extension loads no grammar')
   eq(await loadLanguage(''), null, 'an empty path loads no grammar')

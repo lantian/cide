@@ -240,9 +240,26 @@ export function nothingWrittenYet(): string {
   return 'Nothing has been written yet — cancelling leaves everything exactly as it is.'
 }
 
-/** What the panel says after the user backs out. */
+/** What the panel says after the user backs out of a paste. */
 export function cancelledNote(): string {
   return 'Paste cancelled. Nothing was written.'
+}
+
+/**
+ * The same, for a drop.
+ *
+ * A sibling here rather than a second dialog, and that is the whole point: a drag onto a folder
+ * and a Ctrl+V into it hit the same collisions, so they ask the same question with the same
+ * buttons, the same default (*Keep both*, never *Replace*) and the same promise that nothing has
+ * been written yet. Everything in this module is verb-neutral except these two sentences, and two
+ * dialogs for one hazard is how one of them quietly stops naming the paths.
+ *
+ * It says *Move* because the user dragged: reporting "Paste cancelled" after a drag names a
+ * gesture that never happened, and a message that does not match what was just done is how people
+ * learn to stop reading them.
+ */
+export function moveCancelledNote(): string {
+  return 'Move cancelled. Nothing was written.'
 }
 
 /** `1 file` / `3 files`, with the thousands separator a four-digit count needs. */

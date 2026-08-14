@@ -18,6 +18,7 @@
 pub mod copy;
 pub mod error;
 pub mod filter;
+pub mod groups;
 pub mod index;
 pub mod ops;
 #[doc(hidden)]
@@ -27,5 +28,6 @@ pub mod watch;
 
 pub use error::{FsError, Result};
 pub use filter::Filter;
+pub use groups::{Entry, Expanded, GroupState, Groups};
 pub use index::{BuildOptions, Index, Root, WalkItem};
 pub use watch::{Coalescer, WatchConfig, WatchEvent, Watcher};
