@@ -104,3 +104,19 @@
      changed files. Monospace plus zero tracking keeps one- and two-digit pills stable. */
   letter-spacing: 0;
 }
+
+/*
+ * The ⚑ badge, when the project has errors. (M12)
+ *
+ * A colour override and nothing else: it inherits every dimension from `.badge` above, so the
+ * geometry `CIDE_AUDIT=1` measures is the same pill whichever view is carrying it. `--red` is the
+ * token the Problems panel already paints an error glyph with and the token the editor's error
+ * squiggle uses, so the three surfaces name one severity with one colour.
+ *
+ * `--on-accent` is kept for the ink. It is documented for contrast against an accent fill in both
+ * palettes, and `--red` is close enough in luminance in both that a second token would be one more
+ * thing for `check:theme` to hold true for no visible gain.
+ */
+.badgeError {
+  background: var(--red);
+}

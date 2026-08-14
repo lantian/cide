@@ -61,6 +61,11 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     description: 'The environment every claude pane is spawned with.',
   },
   { id: 'editor', title: 'Editor', description: 'The code buffer.' },
+  {
+    id: 'inspections',
+    title: 'Inspections',
+    description: 'Which analysers run, and which of their findings you see.',
+  },
   { id: 'git', title: 'Git', description: 'Changelists, staging and the commit tool window.' },
   { id: 'terminal', title: 'Terminal', description: 'Every pane running a shell or a TUI.' },
 ]
@@ -420,9 +425,130 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       )
     case 'editor':
       return <Editor {...props} />
+    case 'inspections':
+      return <Inspections {...props} />
     case 'git':
       return <Git />
     case 'terminal':
       return <Terminal {...props} />
   }
+}
+
+/**
+ * Which analysers run, and which of their findings are shown. (M12)
+ *
+ * IDEA's three axes, and they are not one axis said three times:
+ *
+ *  * **Sources** decide which *processes run*. Turning rust-analyzer off turns off a 1–4 GB
+ *    indexer, so nothing is computed and nothing can be revealed by turning a severity back on.
+ *    It is also the only axis Claude sees — a severity a user hid is a statement about their own
+ *    screen, not about what an agent should be told.
+ *  * **Severities** decide what is *shown*, of what was computed. Applied once in Rust, so the
+ *    panel, the status bar and the rail badge cannot disagree.
+ *  * The **highlighting level** here is only the *default* a newly opened editor starts at. The
+ *    per-editor override lives in the code pane's context menu and is deliberately not persisted:
+ *    a `none` set three weeks ago, restored silently, is a user concluding their language server
+ *    is broken while the app shows a confidently clean gutter.
+ */
+function Inspections({ settings, patch }: SectionProps) {
+  const inspections = settings.inspections
+  const set = (next: Partial<typeof inspections>) =>
+    patch({ inspections: { ...inspections, ...next } })
+  const severity = (next: Partial<typeof inspections.severities>) =>
+    set({ severities: { ...inspections.severities, ...next } })
+  /** Absent means shown — see `InspectionSettings::sources`. */
+  const shows = (source: string) => inspections.sources[source] !== false
+  const setSource = (source: string, on: boolean) =>
+    set({ sources: { ...inspections.sources, [source]: on } })
+
+  return (
+    <>
+      <Group title="Severities">
+        <ToggleRow
+          label="Errors"
+          checked={inspections.severities.error}
+          onChange={(error) => severity({ error })}
+        />
+        <ToggleRow
+          label="Warnings"
+          checked={inspections.severities.warning}
+          onChange={(warning) => severity({ warning })}
+        />
+        <ToggleRow
+          label="Weak warnings"
+          // Named for what the user sees in IDEA, explained for what the wire calls it. One
+          // thing, three names — IDEA's *weak warning*, LSP's `Information`, our `info` — and a
+          // row labelled only "Info" would leave nobody able to map it to either.
+          hint="IDEA’s weak warning. Language servers report these as “information”."
+          checked={inspections.severities.weakWarning}
+          onChange={(weakWarning) => severity({ weakWarning })}
+        />
+        <ToggleRow
+          label="Hints"
+          hint="Suggestions rather than defects. Never counted in the status bar."
+          checked={inspections.severities.hint}
+          onChange={(hint) => severity({ hint })}
+        />
+      </Group>
+
+      <Group title="Sources">
+        <ToggleRow
+          label="rust-analyzer"
+          hint="Semantic diagnostics for Rust. Needs `rustup component add rust-analyzer`."
+          checked={shows('rust-analyzer')}
+          onChange={(on) => setSource('rust-analyzer', on)}
+        />
+        <ToggleRow
+          label="gopls"
+          hint="Semantic diagnostics for Go. Needs `go install golang.org/x/tools/gopls@latest`."
+          checked={shows('gopls')}
+          onChange={(on) => setSource('gopls', on)}
+        />
+        <ToggleRow
+          label="tree-sitter"
+          hint="Syntax errors, in-process and instant. Only sees files you have open."
+          checked={shows('tree-sitter')}
+          onChange={(on) => setSource('tree-sitter', on)}
+        />
+        <ToggleRow
+          label="Claude inspections"
+          hint="A headless one-shot review, run only when you ask for it. Costs tokens."
+          checked={shows('claude')}
+          onChange={(on) => setSource('claude', on)}
+        />
+        <Note title="A source not listed here is shown">
+          The list is exceptions, not a registry. A language server may attribute a finding to a
+          tool of its own — rust-analyzer reports clippy’s lints as <code>clippy</code> — and
+          anything cide has not heard of is shown rather than silently hidden. Turn one of those
+          off and it gains a row here.
+        </Note>
+      </Group>
+
+      <Group title="Highlighting">
+        <Row
+          label="Default level"
+          hint="What a newly opened editor starts at. Change it per file from the editor’s context menu."
+          control={
+            <Segmented
+              label="Default highlighting level"
+              value={inspections.defaultHighlightLevel}
+              onChange={(defaultHighlightLevel) => set({ defaultHighlightLevel })}
+              options={[
+                { value: 'none', label: 'None' },
+                { value: 'syntaxOnly', label: 'Syntax' },
+                { value: 'allProblems', label: 'All problems' },
+              ]}
+            />
+          }
+        />
+        <Note title="The level is per editor, and the panel is per project">
+          Turning highlighting down hides squiggles in <em>that buffer</em>. It does not change
+          the Problems panel or the status bar, which count the whole project — a per-file switch
+          cannot coherently redefine a project-wide total. IDEA behaves the same way. The severity
+          and source toggles above <em>do</em> affect all three, because they are applied once,
+          before any of them sees the list.
+        </Note>
+      </Group>
+    </>
+  )
 }

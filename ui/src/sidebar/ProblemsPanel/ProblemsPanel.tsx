@@ -101,6 +101,14 @@ export interface ProblemsPanelProps {
    * rendered as static text rather than as buttons that do nothing when clicked.
    */
   onOpenLocation?: ((path: string, line: number, column: number) => void) | undefined
+  /**
+   * How many items the filters removed. (M12)
+   *
+   * Threaded to [`headline`], and only there — it is what stops an empty list produced by the
+   * user's own settings from headlining as *No problems found*. Defaulted so every existing call
+   * site, and every fixture, keeps its behaviour exactly.
+   */
+  hidden?: number | undefined
 }
 
 export function ProblemsPanel({
@@ -108,12 +116,13 @@ export function ProblemsPanel({
   // Omitting the prop *is* the v1 answer, not a missing one. See `NO_SOURCE`.
   snapshot = NO_SOURCE,
   onOpenLocation,
+  hidden = 0,
 }: ProblemsPanelProps) {
   const groups = useMemo(
     () => (snapshot.kind === 'ready' ? groupByFile(snapshot.items) : []),
     [snapshot],
   )
-  const head = headline(snapshot)
+  const head = headline(snapshot, hidden)
   const scanned = checked(snapshot)
 
   return (
@@ -218,7 +227,13 @@ export function ProblemsPanel({
                         data-audit="problemsRow"
                         data-severity={item.severity}
                         title={label}
-                        onClick={() => onOpenLocation(group.path, item.line, item.column)}
+                        onClick={() =>
+                          // The *absolute* path when the producer sent one: `group.path` is
+                          // workspace-relative for display, and in a multi-root project it is
+                          // label-prefixed as well, so it names no file on disk. Falling back to
+                          // it keeps every pre-M12 fixture working.
+                          onOpenLocation(item.absPath ?? group.path, item.line, item.column)
+                        }
                       >
                         {body}
                       </button>

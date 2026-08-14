@@ -54,7 +54,18 @@ import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import { exceedsBytes } from './byteSize'
 import { registerReveal, revealRange } from './revealRequest'
-import { claimStatusReadout, formatReadout, pathTrail, type ReadoutSlot } from './statusReadout'
+import {
+  claimStatusReadout,
+  formatReadout,
+  pathTrail,
+  sameTrail,
+  type ReadoutSlot,
+} from './statusReadout'
+import { claimCaret, type CaretSlot } from './caretTrack'
+import { goToDefinition } from './goToDefinition'
+import { trailNames, type OutlineNode } from './memberNav'
+import { lintRanges, type LintSource } from './lintMap'
+import { lintGutter, setDiagnostics } from '@codemirror/lint'
 import { useSendToClaude } from './useSendToClaude'
 import styles from './EditorSurface.module.css'
 
@@ -89,6 +100,14 @@ export interface EditorSurfaceProps {
    * `home › lantian › work › cide › crates › …`. See `pathTrail`.
    */
   root?: string | undefined
+  /**
+   * The project this buffer belongs to, for Go to definition.
+   *
+   * Distinct from `root`, which is only ever used to shorten a path for display: this one is an
+   * identity the backend resolves against. Passed down rather than derived here — see
+   * `CodeMenuOptions.project` for why deriving it from the window's role is wrong.
+   */
+  project?: string | undefined
   /** The file exactly as it came off disk, line endings included. */
   doc: string
   /**
@@ -134,6 +153,49 @@ export interface EditorSurfaceProps {
    * read it.
    */
   onSaveHandle?: ((save: (() => Promise<void>) | null) => void) | undefined
+  /**
+   * The buffer changed, and here is how to read it. (M12)
+   *
+   * **No text is passed.** This fires on every keystroke, and `doc.toString()` on a five-megabyte
+   * rope per character is exactly the cost the rest of this file goes out of its way to avoid —
+   * the cursor readout is written straight into a DOM node for the same reason. The caller
+   * debounces and then calls `read()`, which returns the buffer *as it is then*, not as it was
+   * when the change fired.
+   *
+   * The same shape as [`onSaveHandle`], and for the same reason: a live view outlives any value
+   * a callback could have closed over.
+   */
+  onDocChanged?: ((read: () => string) => void) | undefined
+  /**
+   * This file's structure, for the status bar's `mod › impl › fn` trail. (M12)
+   *
+   * Passed **in** rather than read from a store, so this module stays what its header says it is:
+   * text in, text out, no IPC. `outlineStore` reaches `client.ts`, and importing it here would
+   * make every editor transitively depend on the wire.
+   *
+   * The arithmetic over it is `memberNav.ts`, which is pure and import-free — so the trail is
+   * computed in the update listener below without a round trip, which is the whole reason the
+   * outline is cached in the first place.
+   */
+  symbols?: readonly OutlineNode[] | undefined
+  /**
+   * This file's problems, already filtered by the host. (M12)
+   *
+   * Filtered *before* it gets here, deliberately: the panel, the status bar and the rail badge
+   * all read one snapshot that `App.tsx` filters once, and an editor applying the severity rules
+   * itself would be a fourth place for them to disagree. What this component decides is only
+   * *where* to draw them.
+   */
+  diagnostics?: readonly LintSource[] | undefined
+  /**
+   * How much to draw. IDEA's highlighting-level widget, per editor.
+   *
+   * `none` draws nothing; `syntax` is applied by the host's filter, not here — by the time a list
+   * arrives it is already the right list. This prop only decides whether the lint extension is in
+   * the compartment at all, so `none` also removes the gutter column rather than leaving an empty
+   * one.
+   */
+  highlight?: 'none' | 'syntax' | 'all' | undefined
 }
 
 /** `Ln 128, Col 24`, one-based in both, which is what every editor and every stack trace uses. */
@@ -146,6 +208,7 @@ export function cursorLabel(state: EditorState): string {
 export function EditorSurface({
   path,
   root,
+  project,
   doc,
   reloadKey = 0,
   readOnly = false,
@@ -154,9 +217,15 @@ export function EditorSurface({
   onFocus,
   onSelection,
   onSaveHandle,
+  onDocChanged,
+  symbols,
+  diagnostics,
+  highlight = 'all',
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
+  /** The live view's lint compartment, so the push effect can reconfigure it. */
+  const lintSlotRef = useRef<Compartment | null>(null)
   /** This buffer's hold on the status bar, for the trail effect below. See `statusReadout.ts`. */
   const slotRef = useRef<ReadoutSlot | null>(null)
 
@@ -172,6 +241,8 @@ export function EditorSurface({
   selectionCb.current = onSelection
   const saveHandleCb = useRef(onSaveHandle)
   saveHandleCb.current = onSaveHandle
+  const docChangedCb = useRef(onDocChanged)
+  docChangedCb.current = onDocChanged
 
   /*
    * The right-click menu. Reads the view through a getter rather than being handed it, because
@@ -182,6 +253,15 @@ export function EditorSurface({
     view: () => viewRef.current,
     path,
     readOnly,
+    project,
+    /*
+     * The buffer's *effective* level, which is the right fallback in both cases: with a per-file
+     * override it already equals that override, and without one it equals the workspace default.
+     * The option was previously supplied by nobody, so `checked: levelFor(path, defaultLevel)`
+     * fell back to the literal `all` and a user whose default was `Syntax only` saw the tick on
+     * `All problems` while the buffer showed neither.
+     */
+    defaultLevel: highlight,
   })
 
   /*
@@ -200,6 +280,16 @@ export function EditorSurface({
   sendCb.current = toClaude
 
   const segments = useMemo(() => pathTrail(path, root), [path, root])
+  /*
+   * The outline, in a ref rather than a dependency.
+   *
+   * The effect below is keyed on `[path, reloadKey]` and rebuilds the whole `EditorView` when it
+   * re-runs — scrollback, selection, undo history and any in-flight composition included. A
+   * re-parse arriving three hundred milliseconds after a keystroke must not do that, so the
+   * listener reads the latest value through a ref instead.
+   */
+  const symbolsRef = useRef<readonly OutlineNode[]>(symbols ?? [])
+  symbolsRef.current = symbols ?? []
   const language = useMemo(() => languageName(path), [path])
   const endings = useMemo(() => captureLineEndings(doc), [doc])
 
@@ -221,6 +311,15 @@ export function EditorSurface({
     dirtyRef.current = false
 
     const languageSlot = new Compartment()
+    /*
+     * The lint gutter, reconfigurable without rebuilding the view.
+     *
+     * A `Compartment` for the same reason `languageSlot` is one: the effect that builds this view
+     * is keyed on `[path, reloadKey]`, and rebuilding it would take scrollback, selection, undo
+     * history and any in-flight composition with it. Turning highlighting off for one file must
+     * not cost the user their undo stack.
+     */
+    const lintSlot = new Compartment()
     let baseline: EditorState['doc'] | null = null
     /*
      * The status bar's line, claimed once the view exists further down — the update
@@ -230,6 +329,10 @@ export function EditorSurface({
      * in a buffer the user cannot see yet.
      */
     let readout: ReadoutSlot | null = null
+    let caret: CaretSlot | null = null
+    // The whole trail as last published, so the listener can compare before touching the DOM.
+    // `sameTrail` does the same job one layer down; this avoids even building the array.
+    let publishedTrail: readonly string[] = segments
     const readoutFor = (state: EditorState): string =>
       formatReadout({ language, ending: endings.ending, cursor: cursorLabel(state) })
 
@@ -296,12 +399,74 @@ export function EditorSurface({
       rectangularSelection(),
       crosshairCursor(),
       EditorState.allowMultipleSelections.of(true),
+      /*
+       * Alt adds carets; Ctrl navigates. IDEA's arrangement, and the opposite of CodeMirror's.
+       *
+       * CodeMirror's default for this facet is `browser.mac ? metaKey : ctrlKey` — so on Linux
+       * **Ctrl+click was adding a cursor**, which is the chord IDEA uses for Go to Declaration.
+       * Overriding the facet moves that to Alt and frees Ctrl for the handler below.
+       *
+       * Alt+click already reaches `rectangularSelection`'s style (its filter is `altKey && button
+       * == 0`, drag or not), and that style's `get` consults *this* facet for its `multiple`
+       * argument: with it true a zero-drag Alt+click concatenates a new empty range onto the
+       * existing selection, which is exactly "add a caret". So one facet override buys both
+       * halves rather than needing a second handler.
+       *
+       * Two honest divergences, both consequences of routing the caret gesture through the
+       * rectangle style, and neither worth a second facet that disagrees with this one:
+       *
+       * * Alt+**drag** adds its rectangle to the existing selection where IDEA replaces it.
+       * * Alt+click **cannot remove** a caret. CodeMirror's remove-a-range-under-the-pointer
+       *   branch lives in `basicMouseSelection.get`, which `rectangularSelection`'s filter
+       *   pre-empts for any Alt-held click. Recovering it would mean moving column selection off
+       *   Alt (to Alt+Shift+drag, VS Code's chord) — a second change to a gesture nobody asked
+       *   about, so it is written down here rather than made silently.
+       */
+      EditorView.clickAddsSelectionRange.of((event) => event.altKey),
+      EditorView.domEventHandlers({
+        /*
+         * Ctrl+click → Go to definition.
+         *
+         * On `mousedown` rather than `click`, because CodeMirror starts its own selection
+         * gesture on mousedown: by the time a `click` fired the caret would already have moved
+         * and the selection been replaced, so the jump would be computed from the right position
+         * but leave the old buffer visibly disturbed. Returning `true` marks it handled and
+         * `preventDefault` stops the drag gesture from ever starting.
+         *
+         * `button === 0` so a Ctrl+right-click still opens the context menu — which is where the
+         * same action lives for anyone who prefers a menu. `metaKey` is accepted too: on macOS
+         * ⌘-click is the platform's equivalent, and `platform_layer` rewrites the Ctrl+B binding
+         * the same way.
+         */
+        mousedown: (event, target) => {
+          if (event.button !== 0 || !(event.ctrlKey || event.metaKey) || event.altKey) return false
+          if (project === undefined) return false
+          const at = target.posAtCoords({ x: event.clientX, y: event.clientY })
+          if (at === null) return false
+          const line = target.state.doc.lineAt(at)
+          event.preventDefault()
+          /*
+           * Focus explicitly, because returning `true` skips the code that would have done it.
+           *
+           * CodeMirror focuses the content DOM inside its own `mousedown` handler, and only once
+           * it has produced a selection style (`let mustFocus = !view.hasFocus; …
+           * focusPreventScroll(view.contentDOM)`). Handling the event here bypasses that
+           * entirely, so a Ctrl+click into an *unfocused* pane used to jump correctly and leave
+           * the keyboard pointing at whatever had focus before — the next keystroke went to the
+           * old pane.
+           */
+          if (!target.hasFocus) target.focus()
+          goToDefinition(project, path, line.number, at - line.from + 1)
+          return true
+        },
+      }),
       syntaxHighlighting(cideHighlightStyle),
       findExtensions(),
       minimap(),
       indentUnit.of('    '),
       EditorState.tabSize.of(4),
       languageSlot.of([]),
+      lintSlot.of([]),
       // `Prec` is not needed here: this keymap is added before `defaultKeymap`, and
       // CodeMirror runs same-precedence keymaps in order, so Mod-s is claimed before
       // anything else can look at it.
@@ -336,8 +501,37 @@ export function EditorSurface({
           // mounts in a fresh split takes the readout when it appears, and without this the
           // bar would keep reporting that new pane's `Ln 1, Col 1` while the user carries on
           // typing over here. `focus` costs one array read when the slot is already held.
-          if (update.view.hasFocus) readout?.focus()
+          if (update.view.hasFocus) {
+            readout?.focus()
+            caret?.focus()
+          }
           readout?.set(readoutFor(update.state))
+          /*
+           * A plain assignment into a module-level object — no React, no store, no listener.
+           * This runs on every selection change, which under a held arrow key is thirty times a
+           * second, and it sits directly beside the readout write that already goes to that
+           * length to avoid a re-render. `caretTrack` is a *read* surface: nothing subscribes.
+           */
+          {
+            const head = update.state.selection.main.head
+            const at = update.state.doc.lineAt(head)
+            const column = head - at.from + 1
+            caret?.set(at.number, column)
+            /*
+             * `src/main.rs › impl Parser › parse`.
+             *
+             * The path half changes when the user switches file — rare; the symbol half changes
+             * when the caret crosses a member boundary, which is far rarer than a caret move.
+             * So this runs on every selection change and publishes on almost none of them, which
+             * is what keeps it off the same budget as the `Ln 7, Col 48` readout beside it (that
+             * one is written straight into a DOM node for exactly this reason).
+             */
+            const next = [...segments, ...trailNames(symbolsRef.current, at.number, column)]
+            if (!sameTrail(publishedTrail, next)) {
+              publishedTrail = next
+              readout?.setTrail(next)
+            }
+          }
           // Read from `update.state`, not from a captured view: this listener outlives
           // several states and the one that changed is the one to report.
           const { from, to } = update.state.selection.main
@@ -347,6 +541,11 @@ export function EditorSurface({
             endLine: update.state.doc.lineAt(to).number,
           })
         }
+        if (update.docChanged) {
+          // The read is deferred, not the notification: `viewRef` is what makes "as it is then"
+          // rather than "as it was when this fired" possible.
+          docChangedCb.current?.(() => viewRef.current?.state.doc.toString() ?? '')
+        }
         if (update.docChanged && baseline !== null) {
           // `Text.eq` compares lengths and line counts first, so the common case — a typed
           // character, which changes the length — costs two integer comparisons rather than
@@ -354,6 +553,7 @@ export function EditorSurface({
           setDirty(!update.state.doc.eq(baseline))
         }
         if (update.focusChanged && update.view.hasFocus) {
+          caret?.focus()
           // Before the callback, so the bar follows a click into a pane even when the click
           // lands on the caret's own position and no selection change follows it.
           readout?.focus()
@@ -386,6 +586,7 @@ export function EditorSurface({
     }
     baseline = view.state.doc
     viewRef.current = view
+    lintSlotRef.current = lintSlot
     // Hand the awaitable save outward, so a close confirmation can offer *Save and close*.
     // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
     // that is no longer on screen.
@@ -396,6 +597,10 @@ export function EditorSurface({
     // construct returned above and never claims one.
     readout = claimStatusReadout(segments, readoutFor(view.state))
     slotRef.current = readout
+    // Claimed and released with the readout, and for the same reason: the two answer the same
+    // question — *which editor is the user in* — and a caret slot outliving its buffer would
+    // send Ctrl+F12 to a file that is no longer on screen.
+    caret = claimCaret(path)
 
     /*
      * "Open this file at this line", from a click in the search results.
@@ -438,10 +643,12 @@ export function EditorSurface({
 
     return () => {
       viewRef.current = null
+      lintSlotRef.current = null
       saveHandleCb.current?.(null)
       // Hands the bar back to whichever editor is under this one, and blanks it when there
       // is none. A slot left behind would keep a closed file's position on screen.
       readout?.release()
+      caret?.release()
       if (slotRef.current === readout) slotRef.current = null
       // Before `destroy`, so a request racing the unmount cannot dispatch into a dead view.
       stopReveal()
@@ -464,6 +671,41 @@ export function EditorSurface({
   useEffect(() => {
     slotRef.current?.setTrail(segments)
   }, [segments])
+
+  /*
+   * Push the diagnostics, and configure the gutter.
+   *
+   * Two dispatches rather than one, because they answer different questions and change at wildly
+   * different rates: the gutter's presence follows a setting the user changes by hand, the
+   * squiggles follow an analyser that republishes on every save.
+   *
+   * `setDiagnostics` — not `linter()`. `linter()` is a *pull* source CodeMirror polls on a timer;
+   * ours are pushed from Rust the moment a server publishes, and a poll on top of a push is a
+   * second clock to keep in step for no gain.
+   *
+   * The clear-on-`none` is load-bearing: reconfiguring the compartment removes the *gutter* but
+   * leaves whatever `setDiagnostics` last installed underlining the text, so turning highlighting
+   * off would drop the marks in the margin and keep the squiggles.
+   */
+  useEffect(() => {
+    const view = viewRef.current
+    const slot = lintSlotRef.current
+    if (view === null || slot === null) return
+    const on = highlight !== 'none'
+    view.dispatch({ effects: slot.reconfigure(on ? [lintGutter()] : []) })
+    const ranges = on ? lintRanges(diagnostics ?? [], view.state.doc) : []
+    /*
+     * Wrapped, for the reason `registerReveal`'s handler is: this runs inside an effect with no
+     * error boundary above it, and a `dispatch` that throws unmounts the React root and takes
+     * every terminal in the window with it. `lintMap` clamps every position it produces, so this
+     * is for what it cannot foresee — a CodeMirror invariant we have not read.
+     */
+    try {
+      view.dispatch(setDiagnostics(view.state, ranges))
+    } catch (error) {
+      console.error('[cide] could not paint diagnostics', error)
+    }
+  }, [diagnostics, highlight])
 
   /*
    * No breadcrumb bar. `crates › cide-core › src › lib.rs · Rust · UTF-8 · LF · Ln 7, Col 48`

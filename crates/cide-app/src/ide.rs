@@ -143,6 +143,44 @@ impl PendingIdeServers {
     }
 }
 
+/// Point one IDE server's `getDiagnostics` at a project's store, if that project has one.
+///
+/// `McpDiagnostics` holds the *store*, not an `AppHandle`: `cide-ide-mcp` must not depend on
+/// tauri, and this is what keeps that true while still answering from live data.
+fn link_into(server: &cide_ide_mcp::IdeServer, app: &AppHandle, project: ProjectId) {
+    if let Some(registry) = app.try_state::<crate::lsp::DiagnosticsRegistry>()
+        && let Some(diagnostics) = registry.get(project)
+    {
+        server.set_diagnostics(std::sync::Arc::new(crate::lsp::McpDiagnostics::new(
+            diagnostics.store(),
+        )));
+    }
+}
+
+/// Wire this project's diagnostics into its IDE server, from the diagnostics side.
+///
+/// # Why both ends and not an ordering
+///
+/// The two halves start independently — `IdeServers::ensure` and `DiagnosticsRegistry::ensure` —
+/// and whichever runs second is the one that can complete the link. This used to be done only
+/// from the IDE side, guarded by "the registry may not have this project yet", on the reasoning
+/// that the order was a race that degraded to honesty.
+///
+/// It was not a race. `project_open` calls the IDE `ensure` **first**, every time, so the guard
+/// was always false and `set_diagnostics` was never called from any real path: `getDiagnostics`
+/// answered `[]` for every project, for ever, while looking exactly like a workspace with no
+/// problems — and that is the one failure this whole surface exists to prevent. Calling from both
+/// ends makes the order genuinely not matter, which is what the original comment claimed.
+///
+/// `set_diagnostics` overwrites, so calling this twice for one project is harmless.
+pub fn link_diagnostics(app: &AppHandle, project: ProjectId) {
+    if let Some(servers) = app.try_state::<IdeServers>()
+        && let Some(entry) = servers.servers.get(&project)
+    {
+        link_into(&entry.server, app, project);
+    }
+}
+
 impl IdeServers {
     /// Start a server for a project, or return the port of the one already running.
     ///
@@ -171,6 +209,11 @@ impl IdeServers {
         // silently take the stream from this pump and diffs would stop reaching the UI.
         self.rt
             .spawn(pump(app.clone(), project, events, broker.clone()));
+
+        // Give `getDiagnostics` something to read, if the other half is up. If it is not, the
+        // other half calls [`link_diagnostics`] when it arrives — see there for why this is done
+        // from both ends rather than by ordering the two `ensure`s.
+        link_into(&server, app, project);
 
         self.servers.insert(
             project,
@@ -298,7 +341,10 @@ impl IdeServers {
 /// Every root, not just `roots[0]`: the CLI matches its cwd against the lockfile's
 /// `workspaceFolders`, so a `claude` started in a project's second root would otherwise not
 /// see this server as its own.
-fn servable_projects(ws: &Workspace) -> Vec<(ProjectId, Vec<PathBuf>)> {
+/// Public because the language servers restore from the same list, in `lib.rs`'s `setup`: both
+/// features need "every project the restored workspace holds", and two walks of one tree would be
+/// two chances for a project to get one half and not the other.
+pub fn servable_projects(ws: &Workspace) -> Vec<(ProjectId, Vec<PathBuf>)> {
     // What each restored window is *showing* comes first, and header order fills in behind
     // it. This ordering exists only for the cap below, and it is what makes the cap safe: in
     // header order a workspace whose active project sits past index 32 would launch with 32
@@ -388,7 +434,9 @@ async fn pump(
                 close_diff_tab_by_name(&app, project, &tab_name);
             }
             ServerEvent::Connected {
-                pid, client_version, ..
+                pid,
+                client_version,
+                ..
             } => {
                 tracing::debug!(
                     %project,

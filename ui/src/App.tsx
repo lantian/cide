@@ -9,7 +9,7 @@
  * The pane grid is still M0's hard-coded 2x2. M4 replaces it with the real split tree
  * rendered from `tab.tree`.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AppHeader } from '@/chrome/AppHeader'
 import { ActivityRail, type ActivityView } from '@/chrome/ActivityRail'
 import { StatusBar } from '@/chrome/StatusBar'
@@ -34,6 +34,8 @@ import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
 import { SearchPanel } from '@/sidebar/SearchPanel'
 import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
+import { ALL_VISIBLE, applyFilters, statusBarCounts } from '@/sidebar/ProblemsPanel/model'
+import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
 import { Failures } from '@/chrome/Failures'
@@ -442,6 +444,69 @@ export function App() {
     boot?.role.kind === 'detachedPane' ? null : activeProjectId,
   )
 
+  /*
+   * Diagnostics: one snapshot, filtered once, read by three surfaces. (M12)
+   *
+   * The filter is applied *here* and not in the store, and not in any of the three consumers.
+   * `ProblemsPanel/model.ts` states the rule it follows: the panel and the status bar are two
+   * renderings of one snapshot precisely so they cannot drift into disagreeing about whether the
+   * workspace is clean. A second surface applying the filter itself is a second chance to
+   * disagree; the rail badge makes it a third.
+   */
+  const rawDiagnostics = useDiagnostics((s) => s.snapshot)
+  const attachDiagnostics = useDiagnostics((s) => s.attach)
+  const scheduleDiagnostics = useDiagnostics((s) => s.schedule)
+  const inspections = boot?.workspace.settings.inspections
+  const diagnosticFilters = useMemo(
+    () =>
+      inspections === undefined
+        ? ALL_VISIBLE
+        : {
+            severities: {
+              error: inspections.severities.error,
+              warning: inspections.severities.warning,
+              // IDEA's "weak warning" is LSP's Information is our `info`. One thing, three names.
+              info: inspections.severities.weakWarning,
+              hint: inspections.severities.hint,
+            },
+            sources: inspections.sources,
+            /*
+             * **`all`, always** — the highlighting level is deliberately not applied here.
+             *
+             * It is a *per-editor* reading mode, and this filter feeds the Problems panel, the
+             * status bar counts and the rail badge, which are workspace-wide. Putting it here
+             * meant a user who set the default level to `None` got `✗ 0 ⚠ 0` in the status bar
+             * and an empty panel over a workspace full of errors — a confident zero, which is the
+             * one failure this whole surface is built to prevent. The level is applied once, in
+             * `EditorPane`, to the buffer it belongs to.
+             *
+             * The mapping from the settings enum to the editor's vocabulary now lives in
+             * `EditorPane`, which is the only layer that applies it.
+             */
+            level: 'all' as const,
+          },
+    [inspections],
+  )
+  const diagnostics = useMemo(
+    () => applyFilters(rawDiagnostics, diagnosticFilters),
+    [rawDiagnostics, diagnosticFilters],
+  )
+
+  useEffect(() => {
+    void attachDiagnostics(boot?.role.kind === 'detachedPane' ? null : (activeProjectId ?? null))
+  }, [attachDiagnostics, activeProjectId, boot?.role.kind])
+
+  useEffect(() => {
+    // Only `cide://diagnostics`. Not `fs-changed`: a diagnostics push is authoritative, and
+    // re-asking on every filesystem burst would double the work for no new information.
+    const off = events.onDiagnostics((project) => {
+      if (project === activeProjectId) scheduleDiagnostics()
+    })
+    return () => {
+      void off.then((stop) => stop())
+    }
+  }, [activeProjectId, scheduleDiagnostics])
+
   /**
    * The tab and pane the user is looking at.
    *
@@ -709,6 +774,7 @@ export function App() {
           <ActivityRail
             active={view}
             changed={auditMode() ? AUDIT_GIT_CHANGES : gitChanged}
+            errors={statusBarCounts(diagnostics.snapshot)?.errors ?? null}
             onSelect={(next) => {
               // The rail's ⚙ is the only gesture that reaches Settings until the command
               // palette lands, and Settings is a workspace tab rather than a sidebar view —
@@ -766,7 +832,21 @@ export function App() {
               }}
             />
           )}
-          {view === 'problems' && <ProblemsPanel project={activeProjectId} />}
+          {view === 'problems' && (
+            <ProblemsPanel
+              project={activeProjectId}
+              snapshot={diagnostics.snapshot}
+              hidden={diagnostics.hidden}
+              onOpenLocation={(path, line, column) => {
+                if (!activeProjectId) return
+                // Requested BEFORE the open — the editor for this path usually does not exist
+                // yet, so the request is parked and spent by the mount the open causes. The same
+                // ordering the search panel's `onOpenHit` uses; see `editor/revealRequest.ts`.
+                requestReveal(path, { line, column, endColumn: column })
+                void fileApi.open(activeProjectId, path).then(() => hydrate())
+              }}
+            />
+          )}
           {/* The sidebar's drag edge — one handle for all four panels, because there are only
               two widths: `--w-sidebar-files` sizes the explorer, search and problems, and
               `--w-sidebar-git` sizes git. Absent under `settings`, which has no panel, and
@@ -907,6 +987,20 @@ export function App() {
             keymap={buildKeymap(boot.keymap)}
             context={keyContext}
             actions={{
+              /*
+               * `requestReveal` **before** `fileApi.open`, and the order is the design rather
+               * than a preference: the editor for this path usually does not exist yet, so the
+               * request is parked and spent by the mount the open causes. The same sequence the
+               * search panel's `onOpenHit` uses — see `editor/revealRequest.ts`.
+               *
+               * For the File Structure popup the file is already open, so the reveal is
+               * delivered live and the `open` is a no-op that re-activates the tab.
+               */
+              goToSymbol: (path, line, column, endColumn) => {
+                closeOverlay()
+                requestReveal(path, { line, column, endColumn })
+                void fileApi.open(activeProjectId, path).then(() => hydrate())
+              },
               openFile: (path) => {
                 closeOverlay()
                 void fileApi.open(activeProjectId, path).then(() => hydrate())
@@ -1017,7 +1111,12 @@ export function App() {
           * fills that end of the bar with the file readout it owns, and the bar subscribes
           * to it directly (see `chrome/StatusBar.tsx`), so nothing is passed for it here.
           */}
-        <StatusBar claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined} />
+        <StatusBar
+          claude={claudeReadout ?? boot?.capabilities.claudeVersion ?? undefined}
+          /* The *filtered* snapshot, so the bar and the panel cannot disagree — and `null`
+             whenever nothing has looked, which is what makes it print `✗ — ⚠ —`. */
+          diagnostics={statusBarCounts(diagnostics.snapshot)}
+        />
 
         {/*
           * Says so when the IPC transport has silently degraded. WebKitGTK's custom-protocol

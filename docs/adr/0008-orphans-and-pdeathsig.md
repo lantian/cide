@@ -52,7 +52,7 @@ death notification has already happened and the signal is never delivered.
 **Children are armed with `PR_SET_PDEATHSIG = SIGTERM` from inside a `pre_exec` hook**, and
 every spawn that is armed runs on a single process-lifetime thread.
 
-`cide-claude::orphans` holds all of it:
+`cide-core::child_env` holds all of it:
 
 * `arm(&mut Command)` installs the hook, capturing the parent pid *before* the fork so the
   child can detect the race in fact 4 and `raise()` on itself when it has already been
@@ -61,6 +61,27 @@ every spawn that is armed runs on a single process-lifetime thread.
   spawner in another crate can use the same implementation rather than a second copy.
 * `on_spawn_thread(f)` runs a spawn on one named thread (`cide-spawn`) that is created once
   and never joined, which is the whole answer to fact 3.
+
+### Amendment (M12): the arming rule moved out of `cide-claude`
+
+It originally lived in `cide_claude::orphans`, which was right while every armed child was a
+`claude`. A language server is the second — and it is the shape `PDEATHSIG` exists for, more so
+than `claude`: `rust-analyzer` on a large workspace is 1–4 GB of resident memory with nothing
+left to talk to once cide is gone.
+
+With the rule in the Claude supervisor, `cide-lsp` would have had to depend on `cide-claude` to
+hand the kernel a pid to kill. That inverts the layering — and it would have dragged the Claude
+session machinery into `cide-headless`, whose whole job is to prove the core links without the
+shell. So `arm`, `set_parent_death_signal`, `DEATH_SIGNAL` and `on_spawn_thread` moved to
+`cide-core::child_env`, which `CLAUDE.md` already names as **the** module every `Command::new`
+and `SpawnSpec` in the workspace passes through. One dependency now answers "what does a spawn
+site owe a child?" instead of two, and the two answers sit in one file.
+
+`cide_claude::orphans` re-exports all four, so no call site changed and `orphans::arm` still
+reads correctly beside `orphans::sweep_hook_sockets`. The sweep itself **stayed**: it needs
+`cide_ide_mcp::lockfile::pid_is_alive`, and `cide-core` must not depend on the MCP server.
+`libc` moved with the code, and is now a `cfg(unix)` **dev**-dependency of `cide-claude` —
+nothing that crate compiles calls it any more.
 
 `SIGTERM` rather than `SIGKILL`: it gives `claude` its normal exit path and gives a shell the
 chance to finish a `write(2)` into one of the user's files. Neither program ignores `SIGTERM`,

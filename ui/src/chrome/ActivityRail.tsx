@@ -52,10 +52,19 @@ export interface ActivityRailProps {
    * state. See `chrome/gitCountStore.ts` for where the number now comes from.
    */
   changed?: number | null | undefined
+  /**
+   * Errors in the project, for the ⚑ badge. (M12)
+   *
+   * `null` means **nobody has looked** — no analyser is running, or none has answered yet — and
+   * it draws no badge at all. That is the same distinction the panel and the status bar make, and
+   * making it here too is what stops the rail from being the one surface that implies a clean
+   * workspace: a `0` and a `null` must not look alike, so only a positive count draws anything.
+   */
+  errors?: number | null | undefined
   onSelect?: ((view: ActivityView) => void) | undefined
 }
 
-export function ActivityRail({ active, changed, onSelect }: ActivityRailProps) {
+export function ActivityRail({ active, changed, errors, onSelect }: ActivityRailProps) {
   /*
    * Keyed by view id so the loop stays layout-only; more entries land here, not in JSX.
    *
@@ -67,12 +76,25 @@ export function ActivityRail({ active, changed, onSelect }: ActivityRailProps) {
    * `groupDigits` and stay standalone-compilable for `check-git-tree.mjs`.
    */
   const count = changed ?? null
-  const badges: Record<string, { pill: string; name: string } | undefined> = {
+  const badges: Record<
+    string,
+    { pill: string; name: string; pillClass?: string | undefined } | undefined
+  > = {
     git: (() => {
       const pill = badgeText(count)
       const name = count === null ? undefined : badgeLabel(count, groupDigits(count))
       return pill === null || name === undefined ? undefined : { pill, name }
     })(),
+    // Only a positive, *known* count. `null` (nothing looked) and `0` (looked, clean) both draw
+    // nothing — a badge is a call to action, and there is nothing to act on in either case.
+    problems:
+      typeof errors === 'number' && errors > 0
+        ? {
+            pill: badgeText(errors) ?? String(errors),
+            pillClass: styles.badgeError,
+            name: `${groupDigits(errors)} ${errors === 1 ? 'error' : 'errors'}`,
+          }
+        : undefined,
   }
 
   return (
@@ -115,7 +137,11 @@ export function ActivityRail({ active, changed, onSelect }: ActivityRailProps) {
                  * at the cap as "Git — 1,203 changed files, 99+", which is the one rendering
                  * of that number that means nothing at all. The name above is the wording.
                  */
-                <span className={styles.badge} data-audit="gitBadge" aria-hidden="true">
+                <span
+                  className={`${styles.badge} ${badge.pillClass ?? ''}`}
+                  data-audit="gitBadge"
+                  aria-hidden="true"
+                >
                   {badge.pill}
                 </span>
               )}

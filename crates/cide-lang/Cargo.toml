@@ -1,0 +1,30 @@
+[package]
+name = "cide-lang"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Language identity and structure: which language a file is, and what it declares.
+#
+# A crate of its own rather than a module in `cide-search`, whose own header justifies its two
+# halves with "they share this crate because they share nothing else and both are 'search' to the
+# rest of the app". Half of that is false for symbols — the structure popup, the breadcrumb and
+# the member walk search nothing. It also keeps the two C parser tables out of `cide-fs`'s
+# dev-dependency on `cide-search`, which would otherwise make `cargo test -p cide-fs` build them.
+#
+# No `tauri`, and deliberately no `cide-fs`: the gitignore decision arrives as an injected
+# closure, exactly as `cide_search::content::Admits` does.
+[dependencies]
+cide-ipc = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-go = { workspace = true }
+# The same parallel gitignore-aware walker `cide-fs` indexes with and `cide-search` greps with. A
+# third traversal would drift from the file tree the first time somebody changed one.
+ignore = { workspace = true }
+tracing = { workspace = true }
+# `SymbolError` is `Serialize`-only and derives no `TS`, exactly like `cide_fs::FsError` — see
+# `src/error.rs` for why a `#[derive(TS)]` outside `cide-ipc` is dead output.
+serde = { workspace = true }
+thiserror = { workspace = true }

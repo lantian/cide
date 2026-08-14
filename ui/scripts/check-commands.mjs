@@ -299,12 +299,29 @@ const HOST_FLAGS = flagList('HOST_FLAGS')
   // and a key bound to an unavailable command is a *swallowed* keystroke: the gate consumes
   // it, so the editor and the pty never see it either.
   const keymapRs = read('../../crates/cide-core/src/keymap.rs')
+  const defaultsBody = rustBody(keymapRs, 'pub fn defaults() -> Vec<Binding> {', 'defaults()')
   const bound = [
-    ...rustBody(keymapRs, 'pub fn defaults() -> Vec<Binding> {', 'defaults()').matchAll(
-      /\("([^"]+)",\s*"([^"]+)"\)/g,
-    ),
+    ...defaultsBody.matchAll(/\("([^"]+)",\s*"([^"]+)"\)/g),
   ].map((m) => ({ key: m[1], command: m[2] }))
-  ok(bound.length >= 16, `read ${bound.length} default bindings — the regex still matches`)
+  /*
+   * The `when`-carrying entries, which are 3-tuples and which the 2-tuple regex above cannot
+   * see at all. M12 added the first of them (`alt+up` / `alt+down`, scoped to `editorFocused`),
+   * and without this they would escape *both* gates below in silence — a key bound to an
+   * unavailable command, or to no command at all, is exactly what this block exists to catch,
+   * and "the regex did not match it" is the quietest possible way to fail.
+   */
+  bound.push(
+    ...[...defaultsBody.matchAll(/\("([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({
+      key: m[1],
+      command: m[2],
+      when: m[3],
+    })),
+  )
+  ok(bound.length >= 20, `read ${bound.length} default bindings — the regex still matches`)
+  ok(
+    bound.some((b) => b.when !== undefined),
+    'no `when`-carrying default binding was found — the 3-tuple regex has stopped matching',
+  )
   const unavailable = new Set(COMMANDS.filter((c) => c.unavailable !== null).map((c) => c.id))
   for (const { key, command } of bound) {
     ok(!unavailable.has(command), `${key} is not bound to the unavailable command ${command}`)

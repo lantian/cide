@@ -453,6 +453,14 @@ pub enum SettingsSection {
     Keymap,
     ClaudeSessions,
     Editor,
+    /// Which analysers run, and which of their findings are shown. (M12)
+    ///
+    /// Its own section rather than a group inside `Editor`, which is described as "the code
+    /// buffer" and already carries six rows: four severity toggles, one row per analyser, and a
+    /// default highlighting level is a screenful, and burying a 1–4 GB indexer's on/off switch
+    /// under a font size makes it undiscoverable. Named for IDEA's own tree node — the sidebar
+    /// panel keeps "Problems", so the two surfaces are not both called the same thing.
+    Inspections,
     Git,
     Terminal,
 }

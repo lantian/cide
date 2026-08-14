@@ -131,10 +131,20 @@ fn capabilities() -> Capabilities {
     Capabilities {
         version: env!("CARGO_PKG_VERSION").to_string(),
         claude_version: claude_version(),
-        // No language server ships in v1, so `getDiagnostics` answers empty and the status
-        // bar's error and warning counts are a placeholder. Saying so here is what stops the
-        // frontend from rendering a confident `✗ 0` that means "we did not look".
-        diagnostics: false,
+        // **This flag's meaning changed in M12, and the change matters.**
+        //
+        // It used to mean "a language server ships", which was a *runtime* claim wearing a
+        // build-time flag: the frontend read `false` and knew not to paint counts. Now this build
+        // can genuinely run diagnostics sources, so it is unconditionally `true` — and the
+        // runtime truth moved to `SourceReport`, which says per analyser whether it is running,
+        // scanning, or absent and why.
+        //
+        // Leaving this `false` would have been the safe-looking choice and the wrong one: the
+        // panel would never ask. Flipping it without the `SourceReport`s would have been worse —
+        // the frontend would read `true` as "there are counts to show" and paint a confident
+        // `✗ 0` on a machine with no rust-analyzer, which is exactly what the old comment here
+        // existed to prevent.
+        diagnostics: true,
         // Wired in M6.
         ide_protocol: false,
     }

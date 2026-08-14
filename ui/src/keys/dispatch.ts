@@ -74,6 +74,11 @@ import {
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
+import { focusedCaret } from '@/editor/caretTrack'
+import { goToDefinition } from '@/editor/goToDefinition'
+import { memberStep } from '@/editor/memberNav'
+import { symbolsOf } from '@/editor/outlineStore'
+import { requestReveal } from '@/editor/revealRequest'
 import { focusedTabOf, registeredBuffers, saveAll, saveTab } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
 import { startProjectSwitch } from './switcherStore'
@@ -102,7 +107,7 @@ export interface DispatchDeps {
    * Optional because a detached-pane window has no rail and no sidebar to switch. Every arm
    * that uses it checks for `undefined` and reports rather than assuming.
    */
-  showSidebar?: ((view: 'files' | 'git' | 'search') => void) | undefined
+  showSidebar?: ((view: 'files' | 'git' | 'search' | 'problems') => void) | undefined
   /**
    * Override for which tab `file.save` writes.
    *
@@ -636,7 +641,82 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      /* ---------------------------------------------------------------------- Navigate */
+
+      case 'structure.file': {
+        // Needs a caret, not merely an open editor: the popup preselects the member the caret is
+        // in, and with no caret there is nothing to preselect and nothing to jump *from*.
+        if (focusedCaret() === null) return unmet(command, 'no editor focused')
+        useOverlays.getState().toggle('structure')
+        return
+      }
+
+      case 'navigate.definition': {
+        /*
+         * Unlike its neighbours below this one *does* go to Rust, because resolution is the
+         * language server's and nothing cached can answer it. That is also why the `when` clause
+         * is not enough on its own: a `when` gates the palette, never the keyboard, so Ctrl+B in
+         * a terminal pane arrives here and has to be refused with a sentence rather than run
+         * against a caret that does not exist.
+         */
+        const caret = focusedCaret()
+        if (caret === null) return unmet(command, 'no editor focused')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        // Fire-and-forget: every outcome — found, not found, still indexing — reports itself
+        // through `Failures`. See `editor/goToDefinition.ts`.
+        goToDefinition(project.id, caret.path, caret.line, caret.column)
+        return
+      }
+
+      case 'navigate.nextMember':
+      case 'navigate.prevMember': {
+        /*
+         * Answered entirely from the cached outline — no IPC. That is the reason the cache
+         * exists: this fires on a held key, and a round trip per press would be the freeze
+         * `cmd/picker.rs` was written to avoid.
+         */
+        const caret = focusedCaret()
+        if (caret === null) return unmet(command, 'no editor focused')
+        const symbols = symbolsOf(caret.path)
+        if (symbols.length === 0) return unmet(command, 'this file has no outline yet')
+
+        const direction = command === 'navigate.nextMember' ? 'next' : 'prev'
+        const to = memberStep(symbols, caret.line, caret.column, direction)
+        // Clamped, never wrapped — see `memberNav.ts`. Reported rather than silently ignored,
+        // per `unmet`'s doctrine: a chord that does nothing with no trace is the complaint this
+        // whole file exists to answer.
+        if (to === null) {
+          return unmet(
+            command,
+            direction === 'next'
+              ? 'the caret is already at the last member'
+              : 'the caret is already at the first member',
+          )
+        }
+        /*
+         * `requestReveal` delivers to *every* editor on this path, so in a split showing one
+         * file twice both carets move. Harmless — they show the same file — and the alternative
+         * is a second, pane-targeted reveal path, which would be two answers to one question.
+         */
+        requestReveal(caret.path, {
+          line: to.startLine,
+          column: to.startColumn,
+          endColumn: to.endColumn,
+        })
+        return
+      }
+
       /* -------------------------------------------------------------------------- View */
+
+      case 'picker.symbols':
+        // Toggling, like `picker.files`: Escape is the only other way out of an overlay.
+        //
+        // The index is built lazily and idempotently, so asking here — rather than at project
+        // open — means a user who never presses this never pays for a symbol walk.
+        if (activeProjectOf(boot()) === null) return unmet(command, 'no open project')
+        useOverlays.getState().toggle('symbols')
+        return
 
       case 'picker.files':
         // `toggle`, not `show`: Ctrl+P with the picker already up closes it. The gate
@@ -674,6 +754,15 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       case 'sidebar.git':
         if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
         deps.showSidebar('git')
+        return
+
+      case 'sidebar.problems':
+        // Reveal, never toggle — the same call `sidebar.files` and `sidebar.git` make, and for
+        // the reason spelled out under `sidebar.search`: a panel is not an overlay, the ⚑ button
+        // is right there, and a second press that closed it would take away the thing the
+        // binding is for.
+        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
+        deps.showSidebar('problems')
         return
 
       case 'sidebar.search':

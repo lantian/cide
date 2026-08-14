@@ -15,8 +15,12 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   Axis,
   Bootstrap,
+  DefinitionAnswer,
+  DiagnosticSourceId,
+  DiagnosticsSnapshot,
   DiffAnswer,
   Direction,
+  FileOutline,
   FsChange,
   FsStatus,
   GraphicsStatus,
@@ -28,6 +32,8 @@ import type {
   PaneRestore,
   PickerFrame,
   PickerItem,
+  SymbolFrame,
+  SymbolIndexStatus,
   ProjectId,
   QuitDecision,
   SearchFrame,
@@ -496,6 +502,88 @@ export const picker = {
 }
 
 /**
+ * Code structure: one file's outline, and the project-wide symbol picker. (M12)
+ *
+ * A namespace of its own rather than more of `picker`, because its rows are not `PickerRow`s. A
+ * `PickerRow` carries one `text` that is both matched and drawn; a symbol row draws four things —
+ * kind glyph, name, dimmed container, dimmed file — of which exactly one is matched. Sharing the
+ * type would put the file path into the fuzzy score and make the highlight offsets meaningless.
+ */
+export const symbols = {
+  /**
+   * One file's structure.
+   *
+   * `text` is the **live buffer**, and passing it is not optional in spirit: the breadcrumb and
+   * the member walk are positional, so an outline of on-disk content names the wrong function
+   * for as long as the buffer is dirty.
+   */
+  outline: (projectId: ProjectId, path: string, text?: string) =>
+    invoke<FileOutline>('symbols_outline', { project: projectId, path, text: text ?? null }),
+
+  /** Build the project's symbol index. Idempotent — safe to call whenever the overlay opens. */
+  index: (projectId: ProjectId) =>
+    invoke<SymbolIndexStatus>('symbols_index', { project: projectId }),
+
+  /** Rank the project's symbols. Rejects with `{kind:'notIndexed'}` until `index` has run. */
+  query: (projectId: ProjectId, query: string, limit?: number) =>
+    invoke<SymbolFrame>('symbol_query', { project: projectId, query, limit: limit ?? null }),
+}
+
+/**
+ * Problems: the merged view over the language servers, tree-sitter and Claude. (M12)
+ *
+ * There is no `onChanged` here — see `events.onDiagnostics`. The event carries only a project id
+ * and the frontend answers with `get`, because the snapshot depends on settings the emitter would
+ * have to read and the receiver already has.
+ */
+export const diagnostics = {
+  /**
+   * The snapshot as it stands, projected through the current inspection settings.
+   *
+   * Never rejects. A project with no language server is `{kind:'unavailable'}` carrying a
+   * sentence, because "nothing is analysing this" is an answer and a rejected promise is not.
+   */
+  get: (projectId: ProjectId) =>
+    invoke<DiagnosticsSnapshot>('diagnostics_get', { project: projectId }),
+
+  didOpen: (projectId: ProjectId, path: string, version: number, text: string) =>
+    invoke<void>('diagnostics_did_open', { project: projectId, path, version, text }),
+
+  /**
+   * The buffer changed.
+   *
+   * **Debounce this.** A command per keystroke is an IPC round trip per keystroke, and the whole
+   * text goes with it — the same rule `claude.selectionChanged` states for a selection drag.
+   */
+  didChange: (projectId: ProjectId, path: string, version: number, text: string) =>
+    invoke<void>('diagnostics_did_change', { project: projectId, path, version, text }),
+
+  didSave: (projectId: ProjectId, path: string) =>
+    invoke<void>('diagnostics_did_save', { project: projectId, path }),
+
+  didClose: (projectId: ProjectId, path: string) =>
+    invoke<void>('diagnostics_did_close', { project: projectId, path }),
+
+  /**
+   * Where the thing at `line`/`column` is declared.
+   *
+   * Never rejects: "still indexing", "no server for this language" and "no declaration here" are
+   * all *answers*, and each is a different `DefinitionAnswer` variant carrying its own sentence.
+   * Collapsing them into a rejection — or into `null` — is what would make a busy analyser look
+   * like an empty one.
+   *
+   * `line` and `column` are 1-based and `column` is UTF-16, the same units as `RevealTarget`.
+   * It may block for up to five seconds server-side; the command runs on the blocking pool.
+   */
+  definition: (projectId: ProjectId, path: string, line: number, column: number) =>
+    invoke<DefinitionAnswer>('diagnostics_definition', { project: projectId, path, line, column }),
+
+  /** Restart one analyser after it gave up. The panel's only recovery gesture. */
+  restart: (projectId: ProjectId, source: DiagnosticSourceId) =>
+    invoke<void>('diagnostics_restart', { project: projectId, source }),
+}
+
+/**
  * The Settings tab's surface.
  *
  * `set` takes a patch rather than the whole struct: two windows can have Settings open, and
@@ -782,6 +870,20 @@ export const events = {
     listen<{ project: ProjectId; tree: ChangesTree }>('cide://git-status', (e) =>
       handler(e.payload.project, e.payload.tree),
     ),
+
+  /**
+   * A project's merged diagnostics changed. (M12)
+   *
+   * Carries **only** the project id: the snapshot depends on the user's inspection settings, and
+   * the receiver already has those where the emitter would have to read them. So this is a
+   * "something moved" ping and the handler answers with `diagnostics.get`.
+   *
+   * Already coalesced in Rust — rust-analyzer publishes per file, and a workspace check is
+   * hundreds of publishes in a burst. Do not add a second debounce here; a throttle on the
+   * *refresh* is a different thing and is what `diagnosticsStore` does.
+   */
+  onDiagnostics: (handler: (project: ProjectId) => void) =>
+    listen<{ project: ProjectId }>('cide://diagnostics', (e) => handler(e.payload.project)),
 }
 
 /**

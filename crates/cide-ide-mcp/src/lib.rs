@@ -64,8 +64,12 @@ pub mod tools;
 
 pub use diff_broker::{CancelReason, DiffBroker, DiffRequest};
 pub use lockfile::{Lockfile, sweep_stale};
-pub use protocol::{AtMentioned, DiffOutcome, OpenDiffParams, SelectionChanged};
+pub use protocol::{
+    AtMentioned, DiffOutcome, LspDiagnostic, LspPosition, LspRange, OpenDiffParams,
+    SelectionChanged, UriDiagnostics,
+};
 pub use server::{Delivery, IdeServer, ServerEvent};
+pub use tools::DiagnosticSource;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdeError {

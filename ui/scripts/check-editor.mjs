@@ -123,6 +123,10 @@ try {
       'src/editor/sendToClaude.ts',
       'src/editor/revealTarget.ts',
       'src/editor/statusReadout.ts',
+      // M12. All three are import-free for exactly this reason.
+      'src/editor/lintMap.ts',
+      'src/editor/caretTrack.ts',
+      'src/editor/highlightLevel.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -642,6 +646,7 @@ try {
 
   const grammars = {
     rust: require(join(out, 'editor/languages/rust.js')).spec,
+    go: require(join(out, 'editor/languages/go.js')).spec,
     typescript: require(join(out, 'editor/languages/typescript.js')).spec,
     python: require(join(out, 'editor/languages/python.js')).spec,
     clike: require(join(out, 'editor/languages/clike.js')).spec,
@@ -692,6 +697,38 @@ try {
   }
 
   const sources = {
+    /*
+     * Go, added in M12 when `.go` stopped pointing at the `clike` table. Every line is a shape
+     * that table got wrong or a shape the hook exists for.
+     */
+    go: [
+      'package main',
+      'import "fmt"',
+      '// A raw string spanning lines, with a backslash that is not an escape:',
+      'var path = `C:\\new\\table`',
+      'var query = `SELECT *',
+      'FROM t`',
+      "var r = 'x'",
+      "var esc = '\\n'",
+      "var quote = '\\''",
+      'type Server struct{ addr string `json:"addr"` }',
+      'var ch chan int = make(chan int, 1)',
+      'func (s *Server) Serve(ctx context.Context) error {',
+      '\tdefer close(ch)',
+      '\tgo func() { ch <- 1 }()',
+      '\tselect {',
+      '\tcase v := <-ch:',
+      '\t\tfmt.Println(v, len(path), cap(ch))',
+      '\tdefault:',
+      '\t}',
+      '\tfor i := range xs {',
+      '\t\tif i > 0 { continue }',
+      '\t}',
+      '\treturn nil',
+      '}',
+      '/* a block comment /* that does not nest in Go */',
+      'var after = 1',
+    ].join('\n'),
     rust: [
       '#[derive(Debug, Clone)] // a note after the attribute',
       'pub fn main(argv: &[String]) -> Result<(), Error> {',
@@ -879,6 +916,60 @@ try {
     eq(byText.get("'static"), 'typeName', 'rust: a lifetime is not a character literal')
     eq(byText.get('Result'), 'typeName', 'rust: a capitalised name is a type')
     eq(byText.get('1_000u64'), 'number', 'rust: a separated literal with a suffix')
+  }
+
+  /*
+   * Go, and specifically the things `clike` got wrong before this grammar existed. Every
+   * assertion below failed against the Java table `.go` used to be pointed at.
+   */
+  {
+    const byText = new Map()
+    const all = tokenize(grammars.go, sources.go, 'go roles')
+    for (const { tag, text } of all) {
+      if (!byText.has(text)) byText.set(text, tag)
+    }
+    for (const word of ['func', 'defer', 'go', 'chan', 'select', 'range', 'package', 'type']) {
+      eq(byText.get(word), 'keyword', `go: \`${word}\` is a keyword`)
+    }
+    eq(byText.get('nil'), 'atom', 'go: `nil` is an atom, not an identifier')
+    eq(byText.get('error'), 'typeName', 'go: `error` is a predeclared type')
+    eq(byText.get('string'), 'typeName', 'go: and so is `string`')
+    eq(byText.get('len'), 'variableName.function', 'go: a builtin reads as a call')
+    eq(byText.get('Server'), 'typeName', 'go: a capitalised name is a type')
+
+    /*
+     * The raw string, which is the whole reason this grammar has a hook. A backtick-quoted
+     * literal contains backslashes that are **not** escapes; a grammar that treated them as such
+     * would end the literal early and paint the rest of the line as code.
+     */
+    const strings = all.filter((t) => t.tag === 'string').map((t) => t.text)
+    ok(
+      strings.some((text) => text.includes('C:') && text.includes('\\')),
+      'go: a raw string keeps its backslashes rather than reading them as escapes',
+    )
+    ok(
+      strings.some((text) => text.includes('SELECT')),
+      'go: a raw string may span lines',
+    )
+    ok(strings.some((text) => text === "'x'"), 'go: a rune literal is one token')
+    ok(
+      strings.some((text) => text === "'\\''"),
+      'go: and an escaped quote inside one does not cut it short',
+    )
+
+    // Go's block comments do **not** nest: the first close marker ends one, whatever is inside.
+    // Rust's do, and copying that setting here would swallow everything after a commented-out
+    // region containing a comment, to the end of the file.
+    const afterComment = tokenize(
+      grammars.go,
+      '/* a /* b */\nvar after = 1\n',
+      'go non-nesting comments',
+    )
+    eq(
+      afterComment.find((t) => t.text === 'var')?.tag,
+      'keyword',
+      'go: code after a comment containing `/*` is still code',
+    )
   }
   {
     const tagOf = (spec, source, text) => {
@@ -1701,6 +1792,86 @@ try {
         'advertise a shortcut that does nothing',
     )
 
+
+    /*
+     * Go to definition, pinned at the source.
+     *
+     * Nothing gated this item before: the identifier appeared only in codeMenu.tsx, so a version
+     * that was drawn, enabled and wired to nothing would have shipped through a fully green gate.
+     * That is the defect this project has shipped more times than any other, so the assertions
+     * below are about *being called*, not about being defined.
+     *
+     * Comments stripped first — codeMenu.tsx argues at length about the disabled reason it used to
+     * carry, and a pin written against raw source would match the argument instead of the code.
+     */
+    const strip = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+    const menuCode = strip(menuSrc)
+    /*
+     * Scoped to the item, not to the file.
+     *
+     * A whole-file grep for `goToDefinition(` passes on a file that imports it and calls it from
+     * somewhere else entirely, and an earlier version of this check did exactly that. The block
+     * from the item's `id` to the start of the next entry is what has to contain the call.
+     */
+    const itemBlock = (src, id) => {
+      const at = src.indexOf(`id: '${id}'`)
+      if (at === -1) return ''
+      const next = src.indexOf("id: '", at + 10)
+      return src.slice(at, next === -1 ? src.length : next)
+    }
+    const gotoItem = itemBlock(menuCode, 'goToDefinition')
+    ok(gotoItem.length > 0, 'the Go to definition item still exists')
+    ok(
+      /run:/.test(gotoItem) && /goToDefinition\(/.test(gotoItem),
+      'the Go to definition item carries a `run` that calls the helper — it was drawn and ' +
+        'disabled for two milestones, and being drawn is not the same as being wired',
+    )
+    ok(
+      !/does not (yet )?resolve|Needs a language server|No language server yet/.test(gotoItem),
+      'no leftover "there is no language server" excuse on the item: a client that sends ' +
+        '`textDocument/definition` makes every wording of that sentence false',
+    )
+    ok(
+      /goToDefinition\(/.test(strip(readFileSync('src/keys/dispatch.ts', 'utf8'))),
+      'the keyboard route reaches the same helper — a command id with no dispatch case is listed ' +
+        'in the palette and inert',
+    )
+
+    /*
+     * The click modifiers, which are pure convention and therefore silently reversible.
+     *
+     * CodeMirror's default for `clickAddsSelectionRange` is `ctrlKey` off macOS, so *deleting*
+     * this override does not break a build or a type — it quietly hands Ctrl+click back to
+     * multi-cursor and takes Go to Definition's mouse gesture away with it. There is no runtime
+     * check that could notice.
+     */
+    const surfaceCode = strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    ok(
+      /clickAddsSelectionRange\.of\(\(event\) => event\.altKey\)/.test(surfaceCode),
+      'Alt adds carets: without this override CodeMirror puts multi-cursor back on Ctrl+click, ' +
+        'which is the chord Go to Definition needs',
+    )
+    /*
+     * Again scoped, and for the same reason: two independent whole-file greps ANDed together
+     * would pass on a file that has a `mousedown` handler doing something else and a
+     * `goToDefinition` call somewhere unrelated — which is precisely the arrangement this is
+     * supposed to detect.
+     */
+    const mousedownAt = surfaceCode.indexOf('mousedown:')
+    ok(mousedownAt !== -1, 'EditorSurface installs a mousedown handler')
+    const mousedownBlock = surfaceCode.slice(mousedownAt, mousedownAt + 900)
+    ok(
+      /ctrlKey/.test(mousedownBlock) && /goToDefinition\(/.test(mousedownBlock),
+      'Ctrl+click navigates from inside that handler: on mousedown, because a `click` fires ' +
+        'after CodeMirror has already moved the caret',
+    )
+    ok(
+      /\.focus\(\)/.test(mousedownBlock),
+      'the handler focuses the editor: returning true skips the CodeMirror path that would ' +
+        'otherwise have done it, leaving the keyboard pointed at the previous pane',
+    )
+
     const surfaceSrc = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
     ok(
       /key: 'Alt-Enter'/.test(surfaceSrc),
@@ -2141,6 +2312,208 @@ try {
       /scrollToBottom\(\)/.test(revealSrc),
       'and the transcript is scrolled to the prompt — a pane the user had scrolled up in shows ' +
         'the mention off screen below the fold',
+    )
+  }
+
+  /* ------------------------------------------------------ M12: diagnostics in the buffer */
+
+  {
+    const { lintRanges, offsetOf } = await import(`file://${join(out, 'editor/lintMap.js')}`)
+
+    /** A three-line document: offsets 0-4, 6-14, 16-20. */
+    const doc = {
+      lines: 3,
+      length: 21,
+      line(n) {
+        return [
+          { from: 0, to: 5 },
+          { from: 6, to: 15 },
+          { from: 16, to: 21 },
+        ][n - 1]
+      },
+    }
+    const at = (line, column, endLine, endColumn, extra = {}) => ({
+      line,
+      column,
+      endLine,
+      endColumn,
+      severity: 'error',
+      message: 'boom',
+      ...extra,
+    })
+
+    eq(offsetOf(doc, 1, 1), 0, '1-based line and column become a 0-based offset')
+    eq(offsetOf(doc, 2, 3), 8, 'and the offset is relative to that line’s start')
+
+    /*
+     * The clamp, and it is not defensive programming. The buffer is edited while the analyser is
+     * still thinking, so a diagnostic for a line that no longer exists is routine — and
+     * `EditorView.dispatch` *throws* on an out-of-range range, with no error boundary above it.
+     * An unclamped offset takes the React root down and every terminal in the window with it.
+     */
+    eq(offsetOf(doc, 999, 1), 16, 'a line past the end clamps to the last line')
+    eq(offsetOf(doc, 2, 999), 15, 'a column past the end clamps to that line’s end')
+    eq(offsetOf(doc, 0, 0), 0, 'and a position before the start clamps forward')
+    eq(offsetOf({ lines: 0, length: 0, line: () => ({ from: 0, to: 0 }) }, 5, 5), 0, 'empty doc')
+
+    // A zero-width range draws *nothing* — a real error with no squiggle, which reads as a
+    // missed diagnostic rather than as a zero-width one.
+    const point = lintRanges([at(1, 2, 1, 2)], doc)
+    ok(point[0].to > point[0].from, 'an empty span is widened so it is actually drawn')
+
+    // A producer that reports only a point, and the panel fixtures that predate end positions.
+    const noEnd = lintRanges([{ line: 1, column: 2, severity: 'error', message: 'm' }], doc)
+    ok(noEnd[0].to > noEnd[0].from, 'a diagnostic with no end position still gets a span')
+
+    // An inverted range is one CodeMirror rejects outright.
+    const inverted = lintRanges([at(2, 5, 1, 1)], doc)
+    ok(inverted[0].to >= inverted[0].from, 'an end before its start is never sent as one')
+
+    eq(
+      lintRanges([at(3, 1, 3, 2), at(1, 1, 1, 2), at(2, 1, 2, 2)], doc).map((r) => r.from),
+      [0, 6, 16],
+      'ranges are sorted, because `setDiagnostics` throws on an unsorted list',
+    )
+
+    eq(
+      lintRanges([at(1, 1, 1, 2, { source: 'rust-analyzer', code: 'E0308' })], doc)[0].source,
+      'rust-analyzer E0308',
+      'the producer and its code are joined for the dimmed half of the tooltip',
+    )
+    ok(
+      !('source' in lintRanges([at(1, 1, 1, 2)], doc)[0]),
+      'and the property is absent rather than undefined — CodeMirror’s type refuses the latter',
+    )
+    eq(
+      lintRanges([at(1, 1, 1, 2, { severity: 'catastrophe' })], doc)[0].severity,
+      'error',
+      'an unrecognised severity is drawn rather than dropped — the `other`-bucket rule, as a squiggle',
+    )
+  }
+
+  /* -------------------------------------------------- M12: the caret slot and the level */
+
+  {
+    const { claimCaret, focusedCaret, resetCaretsForTest } = await import(
+      `file://${join(out, 'editor/caretTrack.js')}`
+    )
+    resetCaretsForTest()
+    eq(focusedCaret(), null, 'no editor, no caret')
+
+    const first = claimCaret('/a.rs')
+    first.set(3, 7)
+    eq(focusedCaret(), { path: '/a.rs', line: 3, column: 7 }, 'the only claim answers')
+
+    // A split: the newest claim wins, and focus takes it back — the same stack discipline the
+    // status readout uses, and for the same reason.
+    const second = claimCaret('/b.rs')
+    second.set(1, 1)
+    eq(focusedCaret().path, '/b.rs', 'mounting claims the slot')
+    first.focus()
+    eq(focusedCaret().path, '/a.rs', 'focus takes it back')
+    // An unfocused editor still tracks its own caret, so it is right the moment it is focused.
+    second.set(9, 2)
+    eq(focusedCaret().line, 3, 'and a background editor does not overwrite the foreground one')
+    second.focus()
+    eq(focusedCaret().line, 9, 'but its position was kept')
+
+    second.release()
+    eq(focusedCaret().path, '/a.rs', 'releasing hands the slot down rather than blanking it')
+    second.set(1, 1)
+    eq(focusedCaret().path, '/a.rs', 'and a released handle can no longer write')
+    first.release()
+    eq(focusedCaret(), null, 'the last release empties the slot')
+  }
+
+  {
+    const { levelFor, overrideFor, setLevel, clearLevel, reducedCount, resetLevelsForTest } =
+      await import(`file://${join(out, 'editor/highlightLevel.js')}`)
+    resetLevelsForTest()
+
+    eq(levelFor('/a.rs', 'all'), 'all', 'with no override, a path follows the workspace default')
+    eq(overrideFor('/a.rs'), null, 'and reports that it has none')
+    setLevel('/a.rs', 'none')
+    eq(levelFor('/a.rs', 'all'), 'none', 'an override wins')
+    eq(levelFor('/b.rs', 'all'), 'all', 'and is per path')
+
+    // "I chose the default for this file" and "this file follows the default" are different
+    // intentions, and a later change to the default should move only the second.
+    setLevel('/b.rs', 'all')
+    eq(overrideFor('/b.rs'), 'all', 'choosing the default still records a choice')
+    eq(levelFor('/b.rs', 'none'), 'all', 'so a changed default does not move it')
+
+    eq(reducedCount('all'), 1, 'the panel can report how many editors are quieter than the default')
+    clearLevel('/a.rs')
+    eq(overrideFor('/a.rs'), null, 'clearing returns the path to the default')
+    eq(reducedCount('all'), 0, 'and the count follows')
+  }
+
+  /* ------------------------------------------ M12: the lint CSS a later edit would undo */
+
+  {
+    const css = readFileSync('src/editor/EditorSurface.module.css', 'utf8')
+
+    /*
+     * `@codemirror/lint` bakes `#d11` and `orange` into inline-SVG `background-image` data URIs,
+     * and a data URI cannot read a custom property — so a stock install survives a theme switch
+     * with the wrong colours. Overriding it is mandatory, and these pins are what stop the
+     * override being tidied away.
+     */
+    for (const [rule, token] of [
+      ['cm-lintRange-error', '--red'],
+      ['cm-lintRange-warning', '--yellow'],
+      ['cm-lintRange-info', '--blue'],
+      ['cm-lintRange-hint', '--faint'],
+    ]) {
+      const block = css.slice(css.indexOf(rule), css.indexOf(rule) + 220)
+      ok(block.includes(`var(${token})`), `${rule} is drawn with ${token}, not a literal colour`)
+    }
+    ok(
+      /\.cm-lintRange\)[^}]*background-image:\s*none/.test(css),
+      'the stock SVG underline is turned off, or the literal colours come back with it',
+    )
+    /*
+     * Declarations only. The first version of this matched the *comments* — including this
+     * file's own header, which names `#f5f5f5` as the base theme's hardcoded background, and the
+     * note above the lint block naming `#d11` as what CodeMirror ships. An assertion that a file
+     * may not *mention* a colour is not the assertion anybody wanted.
+     */
+    const declarations = css.replace(/\/\*[\s\S]*?\*\//g, '')
+    ok(
+      !/#d11|\borange\b/.test(declarations),
+      'no literal diagnostic colour is actually declared — only tokens reach the rules',
+    )
+
+    /*
+     * The geometry. `.cm-lineNumbers` takes `flex: 1` of the gutter reservation, so the lint
+     * column takes its width out of the numbers' share unless the reservation grows by exactly
+     * that much — and every line number shifts left the moment a file gains its first diagnostic.
+     */
+    ok(/\.cm-gutters\)[^}]*min-width:\s*70px/.test(css), 'the gutter reserves room for the marker')
+    ok(/\.cm-lint-marker\)[^}]*width:\s*14px/.test(css), 'and the marker is a fixed 14px')
+    ok(
+      css.split('.cm-gutters)').length === 2,
+      'one `.cm-gutters` rule, so the width is not decided by cascade order',
+    )
+  }
+
+  /* ------------------------------------------------ M12: the editor is actually wired up */
+
+  {
+    const surface = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
+    ok(
+      surface.includes('setDiagnostics('),
+      'diagnostics are pushed with `setDiagnostics`, not pulled by `linter()` — ours come from Rust',
+    )
+    ok(!surface.includes('lintKeymap'), 'and `lintKeymap` is not installed: there is no lint panel')
+    ok(
+      surface.includes('lintSlot.of(') && surface.includes('lintSlotRef.current'),
+      'the gutter lives in a Compartment, so turning it off does not rebuild the view',
+    )
+    const pane = readFileSync('src/panes/EditorPane.tsx', 'utf8')
+    ok(
+      pane.includes('diagnostics={diagnostics}') && pane.includes('highlight={level}'),
+      'and EditorPane actually feeds it — an unfed editor draws nothing and passes every test above',
     )
   }
 

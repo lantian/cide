@@ -159,7 +159,14 @@
 /* --- gutter, 56px and right-aligned ---------------------------------------------------- */
 
 .body :global(.cm-gutters) {
-  min-width: 56px;
+  /*
+   * 56px until M12, 70px since: `.cm-lineNumbers` takes `flex: 1` of this reservation, so the
+   * lint gutter added beside it would otherwise take its 14px *out* of the numbers' share and
+   * shift every line number left the moment a file gained its first diagnostic. Widening the
+   * reservation by exactly the marker's fixed width keeps the numbers where they were, whether
+   * or not anything is marked.
+   */
+  min-width: 70px;
   background: var(--panel);
   color: var(--faint);
   border-right: none;
@@ -429,4 +436,131 @@
   border-color: var(--accent-dim);
   background: var(--accent-dim);
   color: var(--text-hi);
+}
+
+/* --- Diagnostics (M12) ------------------------------------------------------------------ */
+
+/*
+ * Overriding `@codemirror/lint`'s defaults is **mandatory, not cosmetic**.
+ *
+ * Its stock styles bake literal colours — `#d11`, `orange` — into inline-SVG `background-image`
+ * data URIs, and a data URI cannot read a CSS custom property. That is exactly the hazard this
+ * stylesheet's header already names for CodeMirror's base theme: a colour that survives a theme
+ * switch. So the wavy underline is drawn with `text-decoration`, which does read tokens, and the
+ * SVG is turned off.
+ *
+ * The four tokens are the four `ProblemsPanel.module.css` paints its severity glyphs with. That
+ * is the point: the gutter, the squiggle and the panel row for one diagnostic are the same colour
+ * because they name the same token, not because three files were kept in step by hand.
+ */
+.body :global(.cm-lintRange) {
+  background-image: none;
+  /* `skip-ink: none` so a descender does not punch holes in the wave and make a three-character
+     span look like two. */
+  text-decoration-skip-ink: none;
+  text-decoration-line: underline;
+  text-decoration-style: wavy;
+  /* Thin, because at the default thickness a wavy underline on 12.5px mono reads as a strike. */
+  text-decoration-thickness: 1px;
+}
+
+.body :global(.cm-lintRange-error) {
+  text-decoration-color: var(--red);
+}
+
+.body :global(.cm-lintRange-warning) {
+  text-decoration-color: var(--yellow);
+}
+
+.body :global(.cm-lintRange-info) {
+  text-decoration-color: var(--blue);
+}
+
+.body :global(.cm-lintRange-hint) {
+  text-decoration-color: var(--faint);
+}
+
+/*
+ * The gutter marks, as the panel's own glyphs rather than as CodeMirror's SVGs.
+ *
+ * `✗ ⚠ ℹ ·` is `SEVERITY_GLYPH` in `ProblemsPanel.tsx`, so a user reading the margin and a user
+ * reading the panel see one alphabet.
+ *
+ * **The width is load-bearing**, and it is set on `.cm-gutters` above rather than here — see the
+ * note on that rule.
+ */
+.body :global(.cm-lint-marker) {
+  width: 14px;
+  background-image: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  /* Matches `.cm-lineNumbers`' own line box, so a marked line's glyph sits on the number's
+     baseline rather than half a pixel above it. */
+  line-height: inherit;
+  text-align: center;
+}
+
+.body :global(.cm-lint-marker-error)::before {
+  content: '✗';
+  color: var(--red);
+}
+
+.body :global(.cm-lint-marker-warning)::before {
+  content: '⚠';
+  color: var(--yellow);
+}
+
+.body :global(.cm-lint-marker-info)::before {
+  content: 'ℹ';
+  color: var(--blue);
+}
+
+.body :global(.cm-lint-marker-hint)::before {
+  content: '·';
+  color: var(--faint);
+}
+
+/*
+ * The hover tooltip. Styled from the same tokens as `Overlay.module.css`'s card, so a diagnostic
+ * popover and a picker read as one surface.
+ */
+.body :global(.cm-tooltip.cm-tooltip-lint) {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  max-width: 420px;
+  padding: 2px;
+}
+
+.body :global(.cm-diagnostic) {
+  border-left: 2px solid transparent;
+  padding: 4px 8px;
+}
+
+.body :global(.cm-diagnostic-error) {
+  border-left-color: var(--red);
+}
+
+.body :global(.cm-diagnostic-warning) {
+  border-left-color: var(--yellow);
+}
+
+.body :global(.cm-diagnostic-info) {
+  border-left-color: var(--blue);
+}
+
+.body :global(.cm-diagnostic-hint) {
+  border-left-color: var(--faint);
+}
+
+/* `rust-analyzer E0308` after the message — the producer, dimmed, never competing with it. */
+.body :global(.cm-diagnosticSource) {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding-left: 6px;
 }

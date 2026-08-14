@@ -18,7 +18,7 @@
 //! the thread.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
 use cide_fs::{BuildOptions, Filter, Index, Root, WalkItem, WatchConfig, WatchEvent, Watcher};
@@ -252,6 +252,28 @@ pub struct ProjectFs {
     /// Distinct from `!indexing`, which is also true *before* the first walk. This is what
     /// makes a repeat `fs.index` a no-op; see [`FsRegistry::claim`].
     walked: AtomicBool,
+
+    // --- M12: symbols -------------------------------------------------------------------
+    //
+    // A **second** matcher rather than a second column on the first: `Ctrl+P` and
+    // `Ctrl+Alt+Shift+N` answer different queries at the same time, and `Matcher::query` holds
+    // one query per matcher. Sharing would make each keystroke in one overlay reset the other.
+    /// The symbol picker's candidates. May lag [`Self::symbol_store`] — see `crate::symbols`.
+    symbol_matcher: Arc<NucleoMatcher>,
+    /// The authoritative index the matcher is derived from.
+    symbol_store: RwLock<crate::symbols::SymbolStore>,
+    /// Candidates the matcher still holds that the store no longer backs.
+    ///
+    /// Drives the rebuild threshold. The matcher is append-only, so this only ever grows until a
+    /// rebuild clears it.
+    symbols_stale: AtomicU32,
+    symbols_indexing: AtomicBool,
+    /// A symbol walk has been started for this project at least once.
+    ///
+    /// What makes `symbol_query` answer `NotIndexed` — "nobody looked" — rather than an empty
+    /// frame, and what stops a watcher burst from parsing files for a project whose symbol index
+    /// nobody has ever asked for.
+    symbols_started: AtomicBool,
 }
 
 impl ProjectFs {
@@ -272,6 +294,174 @@ impl ProjectFs {
             }),
             indexing: AtomicBool::new(false),
             walked: AtomicBool::new(false),
+            symbol_matcher: Arc::new(NucleoMatcher::new()),
+            symbol_store: RwLock::new(crate::symbols::SymbolStore::new()),
+            symbols_stale: AtomicU32::new(0),
+            symbols_indexing: AtomicBool::new(false),
+            symbols_started: AtomicBool::new(false),
+        }
+    }
+
+    // --- M12: symbols ---------------------------------------------------------------------
+
+    pub fn symbol_matcher(&self) -> &NucleoMatcher {
+        &self.symbol_matcher
+    }
+
+    pub fn symbol_store(&self) -> &RwLock<crate::symbols::SymbolStore> {
+        &self.symbol_store
+    }
+
+    pub fn is_symbol_indexing(&self) -> bool {
+        self.symbols_indexing.load(Ordering::Acquire)
+    }
+
+    /// Has a symbol walk ever been started for this project?
+    ///
+    /// What separates "nobody looked" from "looked and found nothing" — `symbol_query` answers
+    /// [`cide_lang::SymbolError::NotIndexed`] while this is false, so the overlay shows
+    /// *Indexing…* rather than an empty list over a repository full of functions.
+    pub fn symbols_started(&self) -> bool {
+        self.symbols_started.load(Ordering::Acquire)
+    }
+
+    /// Walk this project and build its symbol index. Blocking; idempotent.
+    ///
+    /// A second call while a walk is running, or after one finished, reports the index that
+    /// exists rather than starting a second walk over the same tree — the same rule
+    /// [`FsRegistry::claim`] applies to the file index, and for the same reason: re-walking would
+    /// clear the matcher the first caller's overlay is reading from.
+    pub fn index_symbols(&self) -> cide_ipc::SymbolIndexStatus {
+        if self.symbols_indexing.swap(true, Ordering::AcqRel) || self.symbols_started() {
+            return self.symbol_status();
+        }
+        // Cleared by a guard, so a panic in the walk cannot leave the flag set for ever — which
+        // would make every later call take the branch above and report an empty index as final.
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&self.symbols_indexing);
+
+        let roots: Vec<cide_lang::WalkRoot> = self
+            .roots
+            .iter()
+            .map(|root| cide_lang::WalkRoot {
+                path: root.path.clone(),
+                label: root
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned()),
+            })
+            .collect();
+        // The same ignore decision the file tree and the content search use, injected rather than
+        // recomputed — three implementations of "is this file ignored" is how a picker starts
+        // offering rows the explorer does not show.
+        let filter = self.filter();
+        let admits = |path: &std::path::Path, is_dir: bool| filter.admits(path, is_dir);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        cide_lang::walk_symbols(
+            &roots,
+            cide_lang::Limits::default(),
+            Some(&admits),
+            &cancel,
+            &mut |file| {
+                let (candidates, stale) = self.symbol_store.write().insert(file);
+                for candidate in candidates {
+                    self.symbol_matcher.push(candidate);
+                }
+                if stale > 0 {
+                    self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
+                }
+            },
+        );
+
+        self.symbols_started.store(true, Ordering::Release);
+        self.symbol_status()
+    }
+
+    /// Re-parse a handful of files a watcher burst touched.
+    ///
+    /// Only ever called when [`Self::symbols_started`] — a project nobody has asked for symbols in
+    /// must not start parsing because somebody ran `cargo build`.
+    pub fn refresh_symbols(&self, paths: &[PathBuf]) {
+        let filter = self.filter();
+        for path in paths {
+            if cide_lang::Lang::of_path(path).is_none() {
+                continue;
+            }
+            if !path.is_file() {
+                // Deleted, or moved out. Forgetting it is what stops the picker offering rows for
+                // a file that is gone.
+                let stale = self.symbol_store.write().remove(&path.to_string_lossy());
+                self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
+                continue;
+            }
+            if !filter.admits(path, false) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Some(lang) = cide_lang::Lang::of_path(path) else {
+                continue;
+            };
+            let Some((symbols, _)) =
+                cide_lang::outline_symbols(lang, &text, cide_lang::Limits::default())
+            else {
+                continue;
+            };
+            let rel = self
+                .roots
+                .iter()
+                .find_map(|root| path.strip_prefix(&root.path).ok())
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            let (candidates, stale) = self.symbol_store.write().insert(cide_lang::WalkedFile {
+                path: path.to_string_lossy().into_owned(),
+                rel,
+                lang,
+                symbols,
+            });
+            for candidate in candidates {
+                self.symbol_matcher.push(candidate);
+            }
+            self.symbols_stale.fetch_add(stale, Ordering::Relaxed);
+        }
+        self.rebuild_symbols_if_stale();
+    }
+
+    /// Rebuild the matcher from the store once enough of it is dead weight.
+    ///
+    /// The only thing that ever actually removes a stale candidate — the matcher is append-only,
+    /// so `resolve` hides them and this is what reclaims them. A tenth of the index, floored at
+    /// 2,000, so a small project does not rebuild on every save and a large one does not carry an
+    /// unbounded tail through a long editing session.
+    fn rebuild_symbols_if_stale(&self) {
+        let total = self.symbol_store.read().symbols();
+        let threshold = (total / 10).max(2_000);
+        if self.symbols_stale.load(Ordering::Acquire) < threshold {
+            return;
+        }
+        // `clear` then one `extend`: `NucleoMatcher::clear` replaces the injector under the same
+        // lock precisely so a concurrent pusher cannot fill a queue nobody reads. Same sequence
+        // `Indexing::run` uses for the file matcher.
+        self.symbol_matcher.clear();
+        let candidates = self.symbol_store.read().candidates();
+        self.symbol_matcher.extend(&mut candidates.into_iter());
+        self.symbols_stale.store(0, Ordering::Release);
+    }
+
+    fn symbol_status(&self) -> cide_ipc::SymbolIndexStatus {
+        let store = self.symbol_store.read();
+        cide_ipc::SymbolIndexStatus {
+            indexing: self.is_symbol_indexing(),
+            files: store.files(),
+            symbols: store.symbols(),
+            truncated: store.truncated,
         }
     }
 
@@ -345,6 +535,24 @@ fn on_watch_event(
                     item.rel.clone(),
                     item.path.to_string_lossy().into_owned(),
                 ));
+            }
+            // Keep the symbol index in step — but only for a project that has one. A project
+            // nobody has pressed Ctrl+Alt+Shift+N in must not start parsing because somebody ran
+            // `cargo build`.
+            if fs.symbols_started() {
+                let touched: Vec<PathBuf> = change
+                    .paths
+                    .iter()
+                    .map(PathBuf::from)
+                    .filter(|p| cide_lang::Lang::of_path(p).is_some())
+                    .collect();
+                if !touched.is_empty() {
+                    // On a blocking worker, never here. This callback runs on the watcher thread
+                    // and also carries the file-tree updates; a `cargo fmt` over 400 files is 400
+                    // parses, and doing them inline would stall every later burst behind them.
+                    let fs = Arc::clone(&fs);
+                    tauri::async_runtime::spawn_blocking(move || fs.refresh_symbols(&touched));
+                }
             }
             events.changed(project, &change);
         }

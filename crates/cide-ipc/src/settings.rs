@@ -62,6 +62,7 @@ pub struct Settings {
     pub claude: ClaudeSettings,
     pub proxy: ProxySettings,
     pub sidebar: SidebarSettings,
+    pub inspections: InspectionSettings,
 }
 
 impl Default for Settings {
@@ -79,6 +80,7 @@ impl Default for Settings {
             claude: ClaudeSettings::default(),
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
+            inspections: InspectionSettings::default(),
         }
     }
 }
@@ -607,6 +609,156 @@ pub fn redact_proxy_url(url: &str) -> String {
     }
 }
 
+/// How much of a buffer's diagnostics are drawn in the gutter and under the text.
+///
+/// IDEA's highlighting-level widget, and the reason it exists is a 40,000-line generated file
+/// where every line is a warning. Per *editor* rather than global — see
+/// `ui/src/editor/highlightLevel.ts` for where the override is held and why it is not persisted.
+///
+/// All three levels keep the grammar. Turning highlighting down is about problems, not colour,
+/// and IDEA's lexer keeps colouring at every level too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum HighlightLevel {
+    /// No squiggles, no gutter marks. The panel and the status bar are unaffected.
+    None,
+    /// Only [`crate::DiagnosticKind::Syntax`] — the things that are wrong about the *text*,
+    /// which is what stays useful in a file whose semantics are hopeless.
+    SyntaxOnly,
+    #[default]
+    AllProblems,
+}
+
+/// Which problems are analysed, and which of them are shown.
+///
+/// Three axes, and they are not one axis said three times:
+///
+/// * [`Self::sources`] decides which **processes run**. Turning rust-analyzer off turns off a
+///   1–4 GB indexer; nothing is computed, so nothing can be revealed by turning a severity back
+///   on afterwards. It is also the only axis Claude sees — see
+///   `cide_ide_mcp::tools::get_diagnostics`.
+/// * [`Self::severities`] decides what is **shown**, of what was computed. A display filter,
+///   applied once in Rust so the panel and the status bar cannot disagree.
+/// * The per-editor highlighting level is **not stored here**. [`Self::default_highlight_level`]
+///   is only what a newly opened editor starts at; the override lives in the webview for the
+///   session and is deliberately not persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct InspectionSettings {
+    pub severities: SeverityFilter,
+    /// Analyser name → shown. **A source absent from this map is shown.**
+    ///
+    /// A map rather than a struct of four bools, for two reasons. A new language server should
+    /// not need a DTO change and a migration to be toggleable; and `clippy` arrives inside
+    /// rust-analyzer's stream under its own name, so the set is not knowable in advance.
+    ///
+    /// "Absent means shown" is `countBySeverity`'s `other`-bucket rule applied to sources: a
+    /// producer we have never seen must not be silently hidden. [`Default`] seeds the one
+    /// exception — see below.
+    pub sources: std::collections::BTreeMap<String, bool>,
+    /// What an editor's highlighting level starts at when nothing has overridden it.
+    pub default_highlight_level: HighlightLevel,
+    /// Type a note into the pinned Claude pane when new problems appear.
+    ///
+    /// Off by default, and read the note in `cide_app::cmd::diagnostics` before "improving" this
+    /// into a real protocol notification: the CLI has no `diagnostics_changed` method, and one
+    /// sent to it would be dropped with no error in either direction. What makes Claude aware
+    /// of problems is that it *pulls* — it calls `getDiagnostics` at the start of a turn. This
+    /// setting is the small extra of putting a line in front of the user, unsent.
+    pub push_to_claude: bool,
+    /// Debounce for that note, clamped to [`MIN_PUSH_DEBOUNCE_MS`]..=[`MAX_PUSH_DEBOUNCE_MS`]
+    /// where the patch lands rather than on read.
+    pub push_debounce_ms: u32,
+}
+
+/// The four severities, as toggles.
+///
+/// `weak_warning` is IDEA's name for what LSP calls **Information** and what
+/// [`crate::Severity`] calls `Info`. Mapped rather than added — see that enum's comment for
+/// what a fifth severity would cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct SeverityFilter {
+    pub error: bool,
+    pub warning: bool,
+    pub weak_warning: bool,
+    pub hint: bool,
+}
+
+/// The floor on [`InspectionSettings::push_debounce_ms`].
+///
+/// A hand-edited `0` would write into the user's live Claude prompt on every publish of a
+/// `cargo check` — hundreds of them, into a text field they are typing in.
+pub const MIN_PUSH_DEBOUNCE_MS: u32 = 500;
+
+/// The ceiling. Past half a minute the note is about a state the user has already moved on from.
+pub const MAX_PUSH_DEBOUNCE_MS: u32 = 30_000;
+
+impl Default for SeverityFilter {
+    /// Hand-written, and this is the `resume_all_on_launch` lesson applied before it bites
+    /// again: `#[derive(Default)]` gives every `bool` here `false`, which would ship a panel
+    /// that shows nothing at all and a status bar reading `✗ 0` over a broken workspace.
+    fn default() -> Self {
+        Self {
+            error: true,
+            warning: true,
+            weak_warning: true,
+            hint: true,
+        }
+    }
+}
+
+impl Default for InspectionSettings {
+    fn default() -> Self {
+        Self {
+            severities: SeverityFilter::default(),
+            // Seeded with the one source that is opt-in, which is also what keeps
+            // "absent means shown" intact for everything else. A `claude: bool` field beside
+            // the map would be a second control writing the same fact.
+            //
+            // Off because it is the only source that spends the user's quota. rust-analyzer and
+            // gopls cost CPU and memory on a machine the user already owns; a Claude inspection
+            // costs tokens, and defaulting that on would be a bill nobody agreed to.
+            sources: [("claude".to_string(), false)].into_iter().collect(),
+            default_highlight_level: HighlightLevel::default(),
+            push_to_claude: false,
+            push_debounce_ms: 2_000,
+        }
+    }
+}
+
+impl InspectionSettings {
+    /// Is this producer's output shown? Absent means yes — see [`Self::sources`].
+    pub fn shows_source(&self, source: &str) -> bool {
+        self.sources.get(source).copied().unwrap_or(true)
+    }
+
+    /// Is this severity shown?
+    pub fn shows_severity(&self, severity: crate::Severity) -> bool {
+        match severity {
+            crate::Severity::Error => self.severities.error,
+            crate::Severity::Warning => self.severities.warning,
+            crate::Severity::Info => self.severities.weak_warning,
+            crate::Severity::Hint => self.severities.hint,
+        }
+    }
+
+    /// Clamp anything a hand-edited `workspace.json` could have put out of range.
+    ///
+    /// Called where the patch lands, like [`SidebarSettings::clamped`] and
+    /// [`clamp_font_size`] — never on read, so the stored value is the one the user set.
+    #[must_use]
+    pub fn clamped(mut self) -> Self {
+        self.push_debounce_ms = self
+            .push_debounce_ms
+            .clamp(MIN_PUSH_DEBOUNCE_MS, MAX_PUSH_DEBOUNCE_MS);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +982,120 @@ mod tests {
         assert_eq!(settings.sidebar.git_width, 420);
         // And the rest of the file still parsed: the new field did not become required.
         assert!(!settings.reopen_last_project);
+    }
+
+    /// The same guarantee for M12's field. Every `workspace.json` on disk predates it.
+    #[test]
+    fn settings_saved_before_the_inspections_field_existed_still_load() {
+        let legacy = r#"{"theme":"dark","sidebar":{"filesWidth":300}}"#;
+        let settings: Settings = serde_json::from_str(legacy).expect("legacy settings");
+        assert_eq!(settings.inspections, InspectionSettings::default());
+        assert!(settings.inspections.severities.error);
+        assert_eq!(
+            settings.inspections.default_highlight_level,
+            HighlightLevel::AllProblems
+        );
+        // And the rest of the file still parsed.
+        assert_eq!(settings.sidebar.files_width, 300);
+    }
+
+    #[test]
+    fn an_inspection_setting_survives_the_json_round_trip_under_its_wire_name() {
+        // Equality alone would pass with snake_case on both sides, and the frontend would then
+        // read `undefined` for every one of these — the bug
+        // `a_sidebar_width_survives_the_json_round_trip_under_its_wire_name` documents.
+        let mut settings = Settings::default();
+        settings.inspections.severities.weak_warning = false;
+        settings.inspections.push_to_claude = true;
+        settings
+            .inspections
+            .sources
+            .insert("rust-analyzer".into(), false);
+
+        let json = serde_json::to_string(&settings).expect("serialize");
+        for wire in [
+            r#""weakWarning":false"#,
+            r#""pushToClaude":true"#,
+            r#""pushDebounceMs":2000"#,
+            r#""defaultHighlightLevel":"allProblems""#,
+            r#""rust-analyzer":false"#,
+        ] {
+            assert!(json.contains(wire), "{wire} missing from {json}");
+        }
+        assert_eq!(
+            serde_json::from_str::<Settings>(&json).expect("round trip"),
+            settings
+        );
+    }
+
+    #[test]
+    fn every_analyser_is_on_by_default_except_the_one_that_spends_money() {
+        // A derived `Default` would have made all four `false` and shipped an IDE whose panel
+        // says nothing runs. This is the assertion that would have caught it.
+        let inspections = InspectionSettings::default();
+        for source in ["rust-analyzer", "gopls", "tree-sitter", "clippy"] {
+            assert!(
+                inspections.shows_source(source),
+                "{source} was off by default"
+            );
+        }
+        assert!(
+            !inspections.shows_source("claude"),
+            "Claude inspections cost tokens and must be opt-in"
+        );
+    }
+
+    #[test]
+    fn a_source_nobody_has_heard_of_is_shown_rather_than_hidden() {
+        // The `other`-bucket rule applied to producers: an analyser we have never seen must
+        // not be silently filtered out, because the map is a list of *exceptions*, not a
+        // registry. `clippy` arrives inside rust-analyzer's stream under its own name and was
+        // never written to this map by anyone.
+        let mut inspections = InspectionSettings::default();
+        inspections.sources.insert("gopls".into(), false);
+        assert!(inspections.shows_source("some-future-linter"));
+        assert!(!inspections.shows_source("gopls"));
+    }
+
+    #[test]
+    fn a_partial_inspections_object_leaves_the_rest_at_their_defaults() {
+        // What a hand-edited file tends to look like.
+        let partial = r#"{"inspections":{"severities":{"hint":false}}}"#;
+        let settings: Settings = serde_json::from_str(partial).expect("partial inspections");
+        assert!(!settings.inspections.severities.hint);
+        assert!(
+            settings.inspections.severities.error,
+            "naming one severity turned the others off"
+        );
+        assert_eq!(settings.inspections.push_debounce_ms, 2_000);
+    }
+
+    #[test]
+    fn a_hand_edited_debounce_of_zero_is_clamped_rather_than_honoured() {
+        // Zero would write into the user's live Claude prompt on every publish of a
+        // `cargo check` — hundreds of writes into a text field they are typing in.
+        let wild = InspectionSettings {
+            push_debounce_ms: 0,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(wild.clamped().push_debounce_ms, MIN_PUSH_DEBOUNCE_MS);
+
+        let huge = InspectionSettings {
+            push_debounce_ms: u32::MAX,
+            ..InspectionSettings::default()
+        };
+        assert_eq!(huge.clamped().push_debounce_ms, MAX_PUSH_DEBOUNCE_MS);
+    }
+
+    #[test]
+    fn a_severity_toggle_maps_ideas_name_onto_lsps() {
+        // IDEA's "weak warning" is LSP's Information is our `Info`. One thing, three names —
+        // and the settings row is the only place the user sees IDEA's.
+        let mut inspections = InspectionSettings::default();
+        inspections.severities.weak_warning = false;
+        assert!(!inspections.shows_severity(crate::Severity::Info));
+        assert!(inspections.shows_severity(crate::Severity::Warning));
+        assert!(inspections.shows_severity(crate::Severity::Hint));
     }
 
     /// Half a `sidebar` object, which is what a hand-edited file tends to look like.

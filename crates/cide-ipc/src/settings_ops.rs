@@ -14,8 +14,8 @@ use ts_rs::TS;
 
 use crate::Theme;
 use crate::settings::{
-    ClaudeSettings, EditorSettings, GraphicsSettings, ProxySettings, SidebarSettings,
-    TerminalSettings,
+    ClaudeSettings, EditorSettings, GraphicsSettings, InspectionSettings, ProxySettings,
+    SidebarSettings, TerminalSettings,
 };
 
 /// A partial update to [`crate::Settings`]. `None` means "leave this alone".
@@ -74,6 +74,13 @@ pub struct SettingsPatch {
     /// a stale local copy.
     #[ts(optional)]
     pub sidebar: Option<SidebarSettings>,
+    /// The Inspections screen, sent whole like every other group.
+    ///
+    /// `push_debounce_ms` is clamped where this lands (`cmd::settings::apply_patch`) rather
+    /// than on read, so the stored value is the one the user set and a hand-edited
+    /// `workspace.json` cannot make the app type into a live prompt on every `cargo check`.
+    #[ts(optional)]
+    pub inspections: Option<InspectionSettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

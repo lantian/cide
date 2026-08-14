@@ -58,9 +58,36 @@ export function isSeverity(value: string): value is Severity {
 export interface Diagnostic {
   /** Workspace-relative, forward slashes — the form the tree and the tab strip already use. */
   path: string
+  /**
+   * Absolute. What `file.open` and `requestReveal` act on. (M12)
+   *
+   * Carried beside `path` rather than derived from it, because there is no reliable way back: a
+   * multi-root project prefixes the relative form with a root label, and re-joining that onto a
+   * root is a second place to get the mapping wrong. Optional so every existing fixture — which
+   * omits it — still describes a valid diagnostic; the row falls back to `path`.
+   */
+  absPath?: string | undefined
+  /**
+   * Whether this is about the shape of the text or its meaning. (M12)
+   *
+   * Set by the producer, never inferred from [`source`]: "tree-sitter means syntax" is true today
+   * and stops being true the moment a language server reports a parse error. The per-editor
+   * *Syntax only* highlighting level reads this.
+   */
+  kind?: 'syntax' | 'semantic' | undefined
   /** 1-based, as the user counts and as the status bar's `Ln`/`Col` already read. */
   line: number
   column: number
+  /**
+   * The end of the squiggle, exclusive. (M12)
+   *
+   * Optional because the panel does not need it — a row shows a position, not a span — and
+   * because every fixture written before the editor drew anything omits it. The *editor* needs
+   * it, and falls back to a one-character span when it is absent, which is what a producer that
+   * reports only a point means anyway.
+   */
+  endLine?: number | undefined
+  endColumn?: number | undefined
   severity: Severity
   message: string
   /** Who said so, e.g. `rust-analyzer`. Absent when the producer did not name itself. */
@@ -79,9 +106,64 @@ export interface Diagnostic {
  * - `ready` — a source answered. `items: []` is then a real, reportable zero.
  */
 export type DiagnosticsSnapshot =
+  | { kind: 'unavailable'; reason: string; sources?: readonly SourceReport[] | undefined }
+  | {
+      kind: 'scanning'
+      source: string
+      /**
+       * What the sources that *have* answered found. (M12)
+       *
+       * The reason this arm carries items at all: with four possible analysers there is one
+       * `kind` for the whole snapshot, so rust-analyzer indexing while gopls has answered with
+       * twelve findings must be either `scanning` — hiding twelve real findings — or `ready`, a
+       * clean-ish bill of health for half the workspace. Both are the failure this union exists
+       * to prevent, so the third option is to show what is known beneath a headline naming who
+       * has not answered.
+       *
+       * **This changes none of the load-bearing predicates.** `statusBarCounts` still returns
+       * `null`, `checked` still returns `false`, `metaFigure` still returns `—`, and `headline`
+       * is still toned `unknown`. A partial answer is still not a count.
+       */
+      items?: readonly Diagnostic[] | undefined
+      sources?: readonly SourceReport[] | undefined
+    }
+  | {
+      kind: 'ready'
+      source: string
+      items: readonly Diagnostic[]
+      sources?: readonly SourceReport[] | undefined
+      /**
+       * How many items the producer's emit cap dropped. (M12)
+       *
+       * Non-zero means `items` is a prefix, and [`metaFigure`] reports the sum — a header counter
+       * reading `1000` when there are `1214` is the same quiet lie the panel exists to avoid, one
+       * layer down.
+       */
+      truncated?: number | undefined
+    }
+
+/**
+ * One analyser's line in the panel's source list. (M12)
+ *
+ * The array of these is what lets the panel say *"rust-analyzer is not installed"* beside
+ * *"gopls found nothing"* — which a single `source: string` cannot express, and which is the
+ * whole reason the snapshot was widened.
+ */
+export interface SourceReport {
+  /** `rustAnalyzer` | `gopls` | `treeSitter` | `claude`. */
+  id: string
+  /** What the user sees: `rust-analyzer`. Carried so the panel never rebuilds it. */
+  label: string
+  status: SourceStatus
+  /** How many of the snapshot's items came from here. */
+  items: number
+}
+
+/** What one analyser is doing. The same three states as the snapshot, one level down. */
+export type SourceStatus =
   | { kind: 'unavailable'; reason: string }
-  | { kind: 'scanning'; source: string }
-  | { kind: 'ready'; source: string; items: readonly Diagnostic[] }
+  | { kind: 'scanning'; detail: string }
+  | { kind: 'ready' }
 
 /**
  * The sentence the app uses for "nobody looked".
@@ -92,7 +174,7 @@ export type DiagnosticsSnapshot =
  * constant instead of holding its own string.
  */
 export const NO_DIAGNOSTICS_SOURCE =
-  'Diagnostics need a language server. None runs in v1; counts arrive with the language-server milestone.'
+  'No language server is running for this project. Rust needs rust-analyzer and Go needs gopls on PATH.'
 
 /**
  * The snapshot v1 always has.
@@ -251,7 +333,7 @@ export interface Headline {
  * point of this surface in v1 is that it says "nobody looked" instead of "you are fine", and
  * a component test would be checking JSX rather than the claim.
  */
-export function headline(snapshot: DiagnosticsSnapshot): Headline {
+export function headline(snapshot: DiagnosticsSnapshot, hidden = 0): Headline {
   if (snapshot.kind === 'unavailable') {
     return {
       tone: 'unknown',
@@ -260,17 +342,37 @@ export function headline(snapshot: DiagnosticsSnapshot): Headline {
     }
   }
   if (snapshot.kind === 'scanning') {
+    const known = snapshot.items ?? []
     return {
       tone: 'unknown',
       text: `Waiting for ${snapshot.source}`,
       // Deliberately not "no problems yet": a partial answer rendered as a clean bill of
       // health is the same failure as the empty list, one round trip earlier.
-      detail: 'The analyser has not reported yet. Counts appear when it does.',
+      //
+      // When other sources *have* answered, saying so is what stops a user reading an empty
+      // panel as "nothing is wrong" while twelve findings sit behind a filter.
+      detail:
+        known.length === 0
+          ? 'The analyser has not reported yet. Counts appear when it does.'
+          : `${snapshot.source} has not reported yet. ${summaryLine(countBySeverity(known))} from the sources that have.`,
     }
   }
 
   const counts = countBySeverity(snapshot.items)
   if (snapshot.items.length === 0) {
+    /*
+     * The axiom, applied one layer further in. If the filters hid everything, the workspace is
+     * *not* clean — the user chose not to look at what is there — and headlining it as "No
+     * problems found" would be the same confident-empty-list failure, produced by the panel
+     * itself rather than by a missing analyser.
+     */
+    if (hidden > 0) {
+      return {
+        tone: 'unknown',
+        text: 'No problems match the current filters',
+        detail: `${hidden} hidden by your severity and source settings.`,
+      }
+    }
     return {
       tone: 'clean',
       text: 'No problems found',
@@ -281,7 +383,10 @@ export function headline(snapshot: DiagnosticsSnapshot): Headline {
   return {
     tone: 'counts',
     text: summaryLine(counts),
-    detail: `Reported by ${snapshot.source}.`,
+    detail:
+      hidden > 0
+        ? `Reported by ${snapshot.source}. ${hidden} more hidden by your settings.`
+        : `Reported by ${snapshot.source}.`,
   }
 }
 
@@ -318,5 +423,91 @@ export function summaryLine(counts: SeverityCounts): string {
  */
 export function metaFigure(snapshot: DiagnosticsSnapshot): string {
   if (snapshot.kind !== 'ready') return '—'
-  return String(snapshot.items.length)
+  // The *true* total, not the number of rows on screen. A cap that reports its prefix as the
+  // whole is the same class of quiet lie as an unchecked zero.
+  return String(snapshot.items.length + (snapshot.truncated ?? 0))
+}
+
+/* --------------------------------------------------------------------- the display filter */
+
+/**
+ * How much of a buffer's diagnostics are drawn. IDEA's highlighting-level widget.
+ *
+ * Per *editor*, not global — a 40,000-line generated file is the case it exists for. All three
+ * levels keep the grammar: turning highlighting down is about problems, not colour.
+ */
+export type HighlightLevel = 'none' | 'syntax' | 'all'
+
+/**
+ * The user's three axes, as one value.
+ *
+ * Note what is **not** here: the per-source *process* toggles. Those gate whether an analyser runs
+ * at all, upstream in Rust, so by the time a diagnostic reaches this module its source has already
+ * decided to speak. [`sources`] below is the *display* half — muting `clippy` inside a
+ * rust-analyzer that is still running.
+ */
+export interface DiagnosticFilters {
+  readonly severities: Readonly<Record<Severity, boolean>>
+  /**
+   * Producer name → shown. **A source absent from the map is shown.**
+   *
+   * `countBySeverity`'s `other`-bucket rule applied to producers: this is a list of *exceptions*,
+   * not a registry, and an analyser nobody has heard of must not be silently hidden. `clippy`
+   * arrives inside rust-analyzer's stream under its own name and was never written here by anyone.
+   */
+  readonly sources: Readonly<Record<string, boolean>>
+  readonly level: HighlightLevel
+}
+
+/** Everything on, which is what a caller with no settings yet should pass. */
+export const ALL_VISIBLE: DiagnosticFilters = {
+  severities: { error: true, warning: true, info: true, hint: true },
+  sources: {},
+  level: 'all',
+}
+
+/**
+ * Is this diagnostic shown?
+ *
+ * One predicate, three consumers — the editor's squiggles, the panel's rows, and (through
+ * [`applyFilters`] → `statusBarCounts`) the status bar's counts. That is what makes "the toggles
+ * affect all three consistently" a property of the code rather than a promise in a comment.
+ */
+export function visible(item: Diagnostic, filters: DiagnosticFilters): boolean {
+  if (filters.level === 'none') return false
+  // `Syntax only` reads the producer's own classification rather than guessing from `source`.
+  // An item with no `kind` is treated as semantic, which is the conservative direction: it is
+  // hidden at this level rather than shown under a claim nobody made.
+  if (filters.level === 'syntax' && item.kind !== 'syntax') return false
+  if (filters.sources[item.source ?? ''] === false) return false
+  // An unrecognised severity is *shown*. Same rule as the `other` bucket: a value from another
+  // process must not be filtered out by a table that has not heard of it.
+  if (!isSeverity(item.severity)) return true
+  return filters.severities[item.severity]
+}
+
+/** A snapshot with the hidden items removed, and how many went. */
+export interface FilteredSnapshot {
+  snapshot: DiagnosticsSnapshot
+  hidden: number
+}
+
+/**
+ * Apply the filters once, so every surface reads the same answer.
+ *
+ * `unavailable` passes through untouched: filtering cannot manufacture a state where something
+ * looked. That is the one transformation this function must never perform.
+ */
+export function applyFilters(
+  snapshot: DiagnosticsSnapshot,
+  filters: DiagnosticFilters,
+): FilteredSnapshot {
+  if (snapshot.kind === 'unavailable') return { snapshot, hidden: 0 }
+  const before = snapshot.items ?? []
+  const items = before.filter((item) => visible(item, filters))
+  const hidden = before.length - items.length
+  if (snapshot.kind === 'scanning') {
+    return { snapshot: { ...snapshot, items }, hidden }
+  }
+  return { snapshot: { ...snapshot, items }, hidden }
 }

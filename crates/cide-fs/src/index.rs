@@ -1009,9 +1009,16 @@ mod tests {
         let dir = scratch("index-kind");
         tree(&dir);
         let index = build(&dir);
-        assert_eq!(index.kind_of(&dir.join("src/main.rs")), Some(TreeRowKind::File));
+        assert_eq!(
+            index.kind_of(&dir.join("src/main.rs")),
+            Some(TreeRowKind::File)
+        );
         assert_eq!(index.kind_of(&dir.join("src")), Some(TreeRowKind::Dir));
-        assert_eq!(index.kind_of(&dir), Some(TreeRowKind::Dir), "a root is a row too");
+        assert_eq!(
+            index.kind_of(&dir),
+            Some(TreeRowKind::Dir),
+            "a root is a row too"
+        );
         assert_eq!(index.kind_of(&dir.join("src/nothing.rs")), None);
     }
 

@@ -46,6 +46,22 @@ pub fn project_open(
         servers.ensure(&app, id, roots);
     }
 
+    // The language servers, on the same trigger and idempotent for the same reason. Started here
+    // rather than lazily on the first editor open, because rust-analyzer is 30–120 seconds from
+    // launch to its first useful answer on a real workspace — waiting until a file is opened
+    // would put that whole delay in front of the user at the moment they most want an answer.
+    if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
+        let roots = state.with(|ws| {
+            workspace::project(ws, id)
+                .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        diagnostics.ensure(&app, id, roots);
+        // The IDE server started above cannot have found this project's store — it did not exist
+        // yet — so the link is completed from this side. See `ide::link_diagnostics`.
+        crate::ide::link_diagnostics(&app, id);
+    }
+
     // Recorded here rather than in `cide_core::workspace::open_project`, because the domain
     // function is also how a *restore* re-opens everything in `workspace.json` at launch, and
     // a restore must not reorder the list — every launch would otherwise rewrite the recents
@@ -451,6 +467,13 @@ pub fn project_close(
             cide_ide_mcp::CancelReason::ProjectClosed,
         );
         servers.stop(project);
+    }
+
+    // And its language servers. Dropping the entry runs each one's shutdown ladder, which is
+    // where a `gopls` writes the cache that keeps the *next* open fast — so a project closed and
+    // reopened does not re-index from nothing.
+    if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
+        diagnostics.close(project);
     }
 
     // Closing a project drops the window roles that showed parts of it. Those windows are

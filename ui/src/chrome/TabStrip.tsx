@@ -227,9 +227,6 @@ function viewFor(kind: TabKind): TabView {
           <>
             <span className={styles.swatch} data-audit="consoleSwatch" />
             <span>Claude</span>
-            <span className={styles.pinned} data-audit="pinnedChip">
-              PINNED
-            </span>
           </>
         ),
         closable: false,

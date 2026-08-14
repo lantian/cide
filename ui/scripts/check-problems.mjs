@@ -93,6 +93,9 @@ try {
     severityRank,
     statusBarCounts,
     summaryLine,
+    ALL_VISIBLE,
+    applyFilters,
+    visible,
   } = model
 
   const at = (path, line, column, severity, message, extra = {}) => ({
@@ -291,6 +294,122 @@ try {
   const carried = groupByFile(mixed).flatMap((g) => g.items).filter((d) => d.code !== undefined)
   deep(carried.map((d) => d.code), ['E0308'], 'the producer’s own code survives grouping')
 
+  // --- M12: partial answers, the emit cap, and the filter. --------------------------------
+
+  /*
+   * The most important assertion in this file after the no-source one, and the reason the
+   * `scanning` arm was allowed to carry items at all. A partial answer is **still not a count**:
+   * rust-analyzer indexing while gopls has already found three errors must show the three rows
+   * and must *not* let the status bar print a figure, because the figure would be wrong the
+   * moment rust-analyzer finished.
+   */
+  const partial = {
+    kind: 'scanning',
+    source: 'rust-analyzer',
+    items: [
+      at('src/a.rs', 1, 1, 'error', 'one'),
+      at('src/a.rs', 2, 1, 'error', 'two'),
+      at('src/b.rs', 3, 1, 'error', 'three'),
+    ],
+  }
+  eq(statusBarCounts(partial), null, 'a partial answer yields no counts, however many items it has')
+  eq(checked(partial), false, 'and is still not "checked"')
+  eq(metaFigure(partial), '—', 'and still withholds the header digit')
+  eq(headline(partial).tone, 'unknown', 'and is still toned unknown')
+  ok(
+    !/\bno problems\b/i.test(headline(partial).text),
+    'a partial answer must never headline as a clean bill of health',
+  )
+  ok(
+    headline(partial).text.includes('rust-analyzer'),
+    'it names who has not answered yet',
+  )
+  ok(
+    /3 errors/.test(headline(partial).detail),
+    'and says what the sources that *have* answered found, rather than implying nothing was',
+  )
+
+  // The emit cap. A header counter that reports its own prefix as the whole is the same quiet
+  // lie as an unchecked zero.
+  eq(
+    metaFigure({ kind: 'ready', source: 'x', items: [at('a.rs', 1, 1, 'error', 'e')], truncated: 213 }),
+    '214',
+    'the header figure is the true total, not the number of rows shipped',
+  )
+
+  // --- The filter, and the axiom applied to it. -------------------------------------------
+
+  const filters = (over) => ({ ...ALL_VISIBLE, ...over })
+  const hintAndError = [
+    at('src/a.rs', 1, 1, 'error', 'real'),
+    at('src/a.rs', 2, 1, 'hint', 'nit', { source: 'clippy' }),
+  ]
+  const readyBoth = { kind: 'ready', source: 'rust-analyzer', items: hintAndError }
+
+  const noHints = applyFilters(readyBoth, filters({ severities: { ...ALL_VISIBLE.severities, hint: false } }))
+  eq(noHints.snapshot.items.length, 1, 'a hidden severity leaves the panel')
+  eq(noHints.hidden, 1, 'and is counted rather than forgotten')
+  deep(
+    statusBarCounts(noHints.snapshot),
+    { errors: 1, warnings: 0 },
+    'the bar reads the *filtered* snapshot, so it cannot disagree with the panel',
+  )
+
+  const noClippy = applyFilters(readyBoth, filters({ sources: { clippy: false } }))
+  eq(noClippy.snapshot.items.length, 1, 'a muted producer leaves too')
+  ok(
+    visible(at('a.rs', 1, 1, 'error', 'e', { source: 'some-future-linter' }), ALL_VISIBLE),
+    'a producer nobody has heard of is SHOWN — the map is exceptions, not a registry',
+  )
+
+  const level = applyFilters(readyBoth, filters({ level: 'none' }))
+  eq(level.snapshot.items.length, 0, 'the `none` highlighting level hides everything')
+  const syntaxOnly = applyFilters(
+    { kind: 'ready', source: 'x', items: [
+      at('a.rs', 1, 1, 'error', 'parse', { kind: 'syntax' }),
+      at('a.rs', 2, 1, 'error', 'types', { kind: 'semantic' }),
+    ] },
+    filters({ level: 'syntax' }),
+  )
+  deep(
+    syntaxOnly.snapshot.items.map((d) => d.message),
+    ['parse'],
+    '`syntax` reads the producer\'s own classification rather than guessing from the source name',
+  )
+
+  /*
+   * The failure this whole block exists for. Filters that hide everything leave an empty list —
+   * and an empty list headlined "No problems found" is the confident-clean-bill-of-health lie,
+   * this time produced by the panel itself rather than by a missing analyser.
+   */
+  const allHidden = applyFilters(
+    readyBoth,
+    filters({ severities: { error: false, warning: false, info: false, hint: false } }),
+  )
+  eq(allHidden.snapshot.items.length, 0, 'everything filtered out')
+  eq(allHidden.hidden, 2, 'and both are counted')
+  const hiddenHeadline = headline(allHidden.snapshot, allHidden.hidden)
+  ok(
+    hiddenHeadline.text !== 'No problems found',
+    'a panel whose filters hid every problem must not claim there are none',
+  )
+  ok(/filters/i.test(hiddenHeadline.text), 'it says the filters are why')
+  ok(/2 hidden/.test(hiddenHeadline.detail), 'and how many')
+
+  // A snapshot nothing looked at cannot be filtered into one that did.
+  eq(
+    applyFilters(NO_SOURCE, filters({})).snapshot.kind,
+    'unavailable',
+    'filtering must never manufacture a state where something looked',
+  )
+
+  // The default argument keeps every pre-M12 call site — and every assertion above — unchanged.
+  eq(
+    headline({ kind: 'ready', source: 'x', items: [] }).text,
+    'No problems found',
+    'a genuinely clean workspace still says so when nothing was hidden',
+  )
+
   // --- Source pins: three fixes a later edit would quietly undo. --------------------------
 
   const read = (rel) => readFileSync(join(UI, rel), 'utf8')
@@ -313,6 +432,32 @@ try {
   ok(
     header.includes('disabled={onDetach === undefined}'),
     'and so is ⧉',
+  )
+
+  /*
+   * The panel is *fed*. (M12)
+   *
+   * Every assertion above this line is about the model, and the model is perfectly happy with a
+   * host that never passes it anything — `snapshot` is optional and defaults to `NO_SOURCE`,
+   * which is exactly the shape the panel shipped in for two milestones. So an edit that dropped
+   * the prop would leave this whole file green while the panel went back to saying nothing is
+   * analysing the workspace, on a build where something is.
+   *
+   * Pinned as source text rather than as behaviour because there is no way to render `App.tsx`
+   * under node — it reaches the workspace store, the key gate and every pane kind.
+   */
+  const app = read('src/App.tsx')
+  ok(
+    /<ProblemsPanel[\s\S]{0,400}snapshot=\{/.test(app),
+    'App.tsx passes a live snapshot to ProblemsPanel rather than letting it default to NO_SOURCE',
+  )
+  ok(
+    app.includes('diagnostics={statusBarCounts('),
+    'and derives the status bar’s counts from that same snapshot, so the two cannot disagree',
+  )
+  ok(
+    app.includes('applyFilters('),
+    'and applies the user’s filters exactly once, in the host, rather than in each consumer',
   )
 
   const appCss = read('src/App.module.css')

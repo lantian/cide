@@ -358,6 +358,8 @@ const CLAUDE: &str = "Claude";
 const TERMINAL: &str = "Terminal";
 const FILE: &str = "File";
 const GIT: &str = "Git";
+/// Moving around inside the file the caret is in. IDEA's own menu name. (M12)
+const NAVIGATE: &str = "Navigate";
 const VIEW: &str = "View";
 
 /// Build the table. Order here is palette order.
@@ -544,8 +546,44 @@ fn build() -> Vec<Command> {
                 "needs the Git panel's ticked rows — \"selected\" is that tree's own state, and \
                  nothing outside the panel can read it; stage from the tree or its context menu",
             ),
+        // Navigate — within the file the caret is in. (M12)
+        //
+        // `editorFocused` and nothing weaker throughout. `editorOpen` would offer a member walk
+        // in a window whose focus is in a terminal, and the walk would move a caret the user
+        // cannot see.
+        Command::new("structure.file", "File structure…", NAVIGATE)
+            .when("editorFocused")
+            .keywords(&["outline", "members", "symbols", "popup"]),
+        Command::new("navigate.definition", "Go to definition", NAVIGATE)
+            .when("editorFocused")
+            .keywords(&["declaration", "jump", "resolve", "symbol", "source"]),
+        Command::new("navigate.nextMember", "Next member declaration", NAVIGATE)
+            .when("editorFocused")
+            .keywords(&["method", "function", "down"]),
+        Command::new(
+            "navigate.prevMember",
+            "Previous member declaration",
+            NAVIGATE,
+        )
+        .when("editorFocused")
+        .keywords(&["method", "function", "up"]),
         // View.
         Command::new("picker.files", "Go to file", VIEW).when("projectOpen"),
+        // `picker.symbols` is the id `crates/cide-core/src/keymap.rs`'s own fixture already
+        // reached for before this existed. Ids are API — using the name the codebase had already
+        // chosen costs nothing and means one fewer spelling in the world.
+        Command::new("picker.symbols", "Go to symbol in project", VIEW)
+            .when("projectOpen")
+            // None of these reaches the title through the five title/id tiers, and every one of
+            // them is what somebody would actually type.
+            .keywords(&[
+                "member",
+                "function",
+                "method",
+                "type",
+                "definition",
+                "declaration",
+            ]),
         Command::new("palette.commands", "Show all commands", VIEW),
         Command::new("theme.toggle", "Toggle light/dark theme", VIEW),
         // Settings opens as a *tab inside a project*, so with no project open there is
@@ -566,6 +604,12 @@ fn build() -> Vec<Command> {
         Command::new("sidebar.search", "Show search sidebar", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["find", "grep", "in files"]),
+        // The ⚑ rail button has emitted `'problems'` since M3 and `App.tsx` has handled it since
+        // M11, but there was no command and no binding — so the view was mouse-only. Exactly the
+        // gap `sidebar.search` had, one view later, and closing it is two lines.
+        Command::new("sidebar.problems", "Show problems sidebar", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["diagnostics", "errors", "warnings", "inspections"]),
     ]
 }
 
@@ -757,10 +801,13 @@ mod tests {
 
     #[test]
     fn groups_are_listed_once_each_in_table_order() {
+        // `groups()` derives its order from first appearance in `build()`, so this pins the
+        // *table's* order as much as the list — and "Navigate" sits between Git and View because
+        // that is where the M12 block was inserted, not because anything sorted it.
         assert_eq!(
             groups(),
             vec![
-                "Window", "Project", "Claude", "Terminal", "File", "Git", "View"
+                "Window", "Project", "Claude", "Terminal", "File", "Git", "Navigate", "View",
             ]
         );
     }

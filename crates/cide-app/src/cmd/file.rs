@@ -172,7 +172,8 @@ impl serde::Serialize for TerminalOpenError {
 fn openable(roots: &[PathBuf], path: &Path) -> std::result::Result<(), TerminalOpenError> {
     let shown = path.display().to_string();
 
-    cide_fs::ops::check_within(roots, path).map_err(|_| TerminalOpenError::Outside(shown.clone()))?;
+    cide_fs::ops::check_within(roots, path)
+        .map_err(|_| TerminalOpenError::Outside(shown.clone()))?;
 
     let real = std::fs::canonicalize(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TerminalOpenError::Missing(shown.clone()),
@@ -220,7 +221,8 @@ pub async fn terminal_open_path(
 ) -> std::result::Result<TabId, TerminalOpenError> {
     let roots: Vec<PathBuf> = state
         .with(|ws| {
-            workspace::project(ws, project).map(|p| p.roots.iter().map(|r| r.path.clone()).collect())
+            workspace::project(ws, project)
+                .map(|p| p.roots.iter().map(|r| r.path.clone()).collect())
         })
         .map_err(|e| TerminalOpenError::Failed(e.to_string()))?;
 
@@ -228,7 +230,11 @@ pub async fn terminal_open_path(
     let job = tauri::async_runtime::spawn_blocking(move || openable(&roots, &checked));
     match job.await {
         Ok(result) => result?,
-        Err(e) => return Err(TerminalOpenError::Failed(format!("file worker failed: {e}"))),
+        Err(e) => {
+            return Err(TerminalOpenError::Failed(format!(
+                "file worker failed: {e}"
+            )));
+        }
     }
 
     open_file_tab(&state, project, path).map_err(|e| TerminalOpenError::Failed(e.to_string()))
@@ -1666,10 +1672,8 @@ mod tests {
     #[test]
     fn a_root_reached_through_a_symlink_still_opens_its_own_files() {
         let real = scratch("root-symlink-real");
-        let alias = std::env::temp_dir().join(format!(
-            "cide-openable-root-alias-{}",
-            std::process::id()
-        ));
+        let alias =
+            std::env::temp_dir().join(format!("cide-openable-root-alias-{}", std::process::id()));
         let _ = std::fs::remove_file(&alias);
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &alias).expect("symlink the root itself");

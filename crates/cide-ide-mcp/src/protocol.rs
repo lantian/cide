@@ -271,7 +271,11 @@ pub mod tool {
     pub const CLOSE_TAB: &str = "close_tab";
     /// Close every diff tab. Sent by the CLI's own `beforeExit`.
     pub const CLOSE_ALL_DIFF_TABS: &str = "closeAllDiffTabs";
-    /// Language-server diagnostics. Answers empty in v1 — no language server ships.
+    /// Language-server diagnostics, read from whatever
+    /// [`crate::DiagnosticSource`](crate::DiagnosticSource) the app installed.
+    ///
+    /// Answers `[]` when nothing installed one, which is still a true sentence — see
+    /// [`crate::tools::get_diagnostics`].
     pub const GET_DIAGNOSTICS: &str = "getDiagnostics";
     /// Reveal a file, optionally at a selection.
     pub const OPEN_FILE: &str = "openFile";
@@ -369,6 +373,51 @@ pub struct CloseTabParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdeConnected {
     pub pid: u32,
+}
+
+// --- `getDiagnostics`' answer -------------------------------------------------------------
+//
+// **LSP's shapes, not cide's**, and that is the whole reason they live here rather than being
+// reused from `cide-ipc`: the CLI parses `content[0].text` as a JSON array of
+// `{uri, diagnostics}` where each diagnostic is an LSP one — 0-based `range`, numeric
+// `severity`. Handing it `cide_ipc::Diagnostic` would be handing it 1-based lines and a string
+// severity, which it would read as garbage or drop.
+//
+// This module's header already states the rule for exactly this case: when a CLI release changes
+// something, the diff is confined here.
+
+/// A 0-based LSP position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LspPosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LspRange {
+    pub start: LspPosition,
+    pub end: LspPosition,
+}
+
+/// One diagnostic, in the shape the CLI expects rather than the shape cide stores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspDiagnostic {
+    pub range: LspRange,
+    /// LSP's own numbering: 1 Error, 2 Warning, 3 Information, 4 Hint. Not cide's names.
+    pub severity: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub message: String,
+}
+
+/// One file's worth, as the CLI reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UriDiagnostics {
+    pub uri: String,
+    pub diagnostics: Vec<LspDiagnostic>,
 }
 
 /// The payload the IDE sends on `selection_changed`.
@@ -545,7 +594,10 @@ mod tests {
     /// disagree and only one of them is visible.
     #[test]
     fn the_recorded_range_is_ordered() {
-        assert!(!SUPPORTED_CLI.is_empty(), "a build with no verified version");
+        assert!(
+            !SUPPORTED_CLI.is_empty(),
+            "a build with no verified version"
+        );
 
         let mut previous: Option<Version> = None;
         for entry in SUPPORTED_CLI {
@@ -566,8 +618,14 @@ mod tests {
 
         // And the rendered range therefore names the two ends it actually compares against.
         let range = verified_range();
-        assert!(range.contains(SUPPORTED_CLI.first().expect("a range")), "{range}");
-        assert!(range.contains(SUPPORTED_CLI.last().expect("a range")), "{range}");
+        assert!(
+            range.contains(SUPPORTED_CLI.first().expect("a range")),
+            "{range}"
+        );
+        assert!(
+            range.contains(SUPPORTED_CLI.last().expect("a range")),
+            "{range}"
+        );
     }
 
     #[test]

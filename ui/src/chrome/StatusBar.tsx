@@ -136,13 +136,25 @@ export function StatusBar({
 
       <div className={styles.right}>
         {/*
-         * `crates › cide-core › src › lib.rs`. Empty — and gone, along with its gap — when no
-         * editor is open at all; clicking into a terminal leaves the last buffer's trail
-         * standing, which is what it means. This is the only thing on the bar allowed to give
-         * way when the window narrows, and it gives way from the *left*, so the file name is
-         * the last segment to go.
+         * `crates › cide-core › src › lib.rs › Workspace › open_project`. Empty — and gone, along
+         * with its gap — when no editor is open at all; clicking into a terminal leaves the last
+         * buffer's trail standing, which is what it means. This is the only thing on the bar
+         * allowed to give way when the window narrows, and it gives way from the *left*, so the
+         * innermost symbol is the last segment to go.
+         *
+         * # M12: the tail is now symbols, not only path
+         *
+         * `EditorSurface` appends the caret's `mod › impl › fn` chain to the same array. This
+         * component deliberately does not know where the path ends and the symbols begin — it
+         * draws a flat list of crumbs, which is all either half needs — so the two are not
+         * styled apart and **no crumb is clickable yet**. Clicking one to navigate (and clicking
+         * the last to open the File Structure popup at its siblings, which is what IDEA's
+         * breadcrumb does) needs the split index threaded through, and is not done.
+         *
+         * The tooltip joins with `›` rather than `/` for that reason: with symbols on the end,
+         * `src/main.rs/impl Parser/parse` reads as a path to a file that does not exist.
          */}
-        <div className={styles.path} data-audit="editorPath" title={trail.join('/')}>
+        <div className={styles.path} data-audit="editorPath" title={trail.join(' › ')}>
           {trail.map((segment, i) => (
             // Keyed by position as well as text: a path can repeat a segment
             // (`src/cide/src`), and the text alone would collide.

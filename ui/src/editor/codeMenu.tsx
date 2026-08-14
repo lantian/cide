@@ -11,11 +11,14 @@
  *
  * Cut / Copy / Paste, Select all, Find, Go to definition, and *@-mention the selection*.
  *
- * **Go to definition is drawn and disabled**, with the reason spelled out. That is a
- * deliberate use of `disabledReason` rather than an omission: it is the item people go looking
- * for in a code pane's menu, and "there is no language server yet" is a much better answer
- * than a menu that appears not to have the feature at all. The moment an LSP exists this line
- * gets a `run` and nothing else changes.
+ * **Go to definition is live** as of M12's second half, and the promise this header used to make
+ * — "the moment an LSP exists this line gets a `run` and nothing else changes" — is what came due.
+ * It was drawn-and-disabled for two milestones on purpose: it is the item people go looking for in
+ * a code pane's menu, and "there is no language server yet" is a much better answer than a menu
+ * that appears not to have the feature at all. It now resolves through the server rather than
+ * guessing from the symbol index; the item's own comment says why that distinction is the whole
+ * feature. It is still disabled — with a different sentence — for a pane that is not in a
+ * project, because there is nothing to resolve against.
  *
  * **Paste is the reason this file needed a plugin.** See `clipboard.ts`.
  *
@@ -42,6 +45,8 @@ import { openSearchPanel } from '@codemirror/search'
 import type { EditorView } from '@codemirror/view'
 import { useContextMenu, type ContextMenuHandle, type MenuEntry } from '@/menus'
 import { copyUnavailable, pasteUnavailable, readClipboard, writeClipboard } from './clipboard'
+import { levelFor, setLevel } from './highlightLevel'
+import { goToDefinition } from './goToDefinition'
 import { sendLabel } from './sendToClaude'
 import { useSendToClaude } from './useSendToClaude'
 
@@ -50,8 +55,28 @@ export interface CodeMenuOptions {
   view: () => EditorView | null
   /** Absolute path of the buffer, for the mention. */
   path: string
+  /**
+   * The workspace default the highlighting items tick against when this file has no override.
+   *
+   * Passed in rather than read from settings here, so this module keeps taking everything it
+   * needs as arguments — the same reason it takes `path` rather than reaching for the focused
+   * tab.
+   */
+  defaultLevel?: 'none' | 'syntax' | 'all' | undefined
   /** Read-only buffers offer Copy but not Cut or Paste. */
   readOnly: boolean
+  /**
+   * The project this buffer belongs to, for Go to definition.
+   *
+   * Threaded from `EditorPane` rather than read from `useMentionTarget()`, and the difference is
+   * not cosmetic: that hook derives a project from the window's *role*, which is where a mention
+   * should go, not which project owns this file. For a buffer belonging to another project the
+   * two differ, and the jump would open the target in the wrong project's tab list.
+   *
+   * Absent means "this pane is not in a project", which is a real state — the item stays disabled
+   * and says so rather than guessing.
+   */
+  project?: string | undefined
 }
 
 /** The selected text, and where it is. Empty `text` means the caret is just sitting somewhere. */
@@ -80,7 +105,13 @@ function insert(view: EditorView, text: string): void {
   view.focus()
 }
 
-export function useCodeMenu({ view, path, readOnly }: CodeMenuOptions): ContextMenuHandle {
+export function useCodeMenu({
+  view,
+  path,
+  readOnly,
+  defaultLevel = 'all',
+  project,
+}: CodeMenuOptions): ContextMenuHandle {
   const toClaude = useSendToClaude()
 
   return useContextMenu({
@@ -161,10 +192,58 @@ export function useCodeMenu({ view, path, readOnly }: CodeMenuOptions): ContextM
         {
           id: 'goToDefinition',
           label: 'Go to definition',
-          // Present on purpose. See the module comment: the absence of an LSP is a better
-          // answer than the absence of the line.
-          disabledReason: 'No language server yet — cide does not index symbols',
+          command: 'navigate.definition',
+          /*
+           * Live since M12's second half, and the file header's promise — "the moment an LSP
+           * exists this line gets a `run`" — is what came due here.
+           *
+           * It resolves through the language server's `textDocument/definition` and nothing else.
+           * cide *indexes* declarations (that is what Ctrl+Alt+Shift+N searches) and deliberately
+           * does not use that index for this: jumping to whichever of the eleven `fn new` in a
+           * workspace shares the identifier's spelling is a wrong answer dressed as a right one.
+           * When no server is running, `goToDefinition` reports the server's own sentence rather
+           * than guessing.
+           *
+           * `disabledReason` must **not** be set alongside `run`. `menus/model.ts` resolves
+           * `run: enabled ? (entry.run ?? null) : null`, so an item carrying both looks wired and
+           * is dead — the exact silent-inertness this project keeps re-shipping.
+           */
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is nothing to resolve against'
+              : undefined,
+          run:
+            project === undefined
+              ? undefined
+              : () => {
+                  const { from } = live.state.selection.main
+                  const line = live.state.doc.lineAt(from)
+                  // 1-based line, and a 1-based UTF-16 column — `from - line.from` is already a
+                  // UTF-16 offset because that is what a CodeMirror document position is.
+                  goToDefinition(project, path, line.number, from - line.from + 1)
+                },
         },
+        { kind: 'separator' },
+        /*
+         * IDEA's highlighting-level widget, as three checked items.
+         *
+         * Not a submenu: `MenuItem` has none, and adding submenu support to the whole menu system
+         * for a three-way reading mode is a larger change than the mode is worth. Not the status
+         * bar either — that is window-global and this is per editor, and a control whose scope
+         * disagrees with its position is how a user turns highlighting off in one file and
+         * concludes their language server broke.
+         */
+        ...(['all', 'syntax', 'none'] as const).map((value) => ({
+          id: `highlight:${value}`,
+          label:
+            value === 'all'
+              ? 'Highlighting: all problems'
+              : value === 'syntax'
+                ? 'Highlighting: syntax only'
+                : 'Highlighting: none',
+          checked: levelFor(path, defaultLevel) === value,
+          run: () => setLevel(path, value),
+        })),
         {
           id: 'mention',
           label: sendLabel(toClaude.range(live)),

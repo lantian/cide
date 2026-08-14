@@ -11,6 +11,9 @@ import { useEffect } from 'react'
 import { BranchPopup } from '@/chrome/BranchSelector'
 import { CommandPalette } from './CommandPalette'
 import { FilePicker } from './FilePicker'
+import { StructurePicker } from './StructurePicker'
+import { SymbolPicker } from './SymbolPicker'
+import { focusedCaret } from '@/editor/caretTrack'
 import { useOverlays } from './store'
 import type { KeyContext, Keymap } from '@/keys/keymap'
 import type { Command, ProjectId } from '@/ipc/client'
@@ -26,6 +29,13 @@ export interface OverlayActions {
   runCommand: (id: string) => void
   /** ⌃⏎ in the palette. */
   runCommandInNewSession: (id: string) => void
+  /**
+   * ⏎ in either symbol picker: put the caret on a declaration.
+   *
+   * One callback for both, because the gesture is the same — `requestReveal` *then* `file.open`,
+   * in that order, so the request is parked and spent by the mount the open causes.
+   */
+  goToSymbol: (path: string, line: number, column: number, endColumn: number) => void
 }
 
 export interface OverlayHostProps {
@@ -52,6 +62,11 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
    */
   useEffect(() => {
     if (open === 'files' && project === null) close()
+    if (open === 'symbols' && project === null) close()
+    // The File Structure popup needs a *caret*, not merely a project: it preselects the member
+    // the caret is in and jumps from there. Closed rather than rendered empty, for the reason
+    // above — a store left open with nothing on screen makes `overlayOpen()` lie.
+    if (open === 'structure' && focusedCaret() === null) close()
   }, [open, project, close])
 
   if (open === null) return null
@@ -77,6 +92,19 @@ export function OverlayHost({ project, commands, keymap, context, actions }: Ove
    * outside React, where there is nothing to hand props from.
    */
   if (open === 'branches') return <BranchPopup onDismiss={close} />
+
+  if (open === 'structure') {
+    // Until the effect above runs. One frame, and it draws nothing.
+    if (project === null || focusedCaret() === null) return null
+    return (
+      <StructurePicker project={project} onDismiss={close} onGoTo={actions.goToSymbol} />
+    )
+  }
+
+  if (open === 'symbols') {
+    if (project === null) return null
+    return <SymbolPicker project={project} onDismiss={close} onGoTo={actions.goToSymbol} />
+  }
 
   return (
     <CommandPalette

@@ -383,11 +383,7 @@ mod tests {
 
     #[test]
     fn the_no_proxy_default_touches_nothing() {
-        let env = resolved(
-            &ProxySettings::default(),
-            ProxyTarget::Configured,
-            &[],
-        );
+        let env = resolved(&ProxySettings::default(), ProxyTarget::Configured, &[]);
         assert!(env.is_empty(), "{env:?}");
         assert_eq!(env.describe(), "untouched");
     }

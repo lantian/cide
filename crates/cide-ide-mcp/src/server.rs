@@ -178,6 +178,13 @@ struct Inner {
     /// difference between an agent turn that ends with a decision and one that ends with a
     /// transport error.
     alive: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    /// Where `getDiagnostics` reads from, once the app installs one.
+    ///
+    /// Behind the same kind of lock as [`Self::events`] and set after `start` for the same
+    /// reason: the diagnostics store does not exist until the project's servers do. A server
+    /// that was never given one answers `[]`, which is the true sentence it answered before
+    /// this field existed.
+    diagnostics: Mutex<Option<Arc<dyn tools::DiagnosticSource>>>,
 }
 
 impl Inner {
@@ -229,7 +236,12 @@ impl Inner {
     }
 
     fn client_version(&self, connection: u64) -> Option<String> {
-        self.conns.lock().open.get(&connection)?.client_version.clone()
+        self.conns
+            .lock()
+            .open
+            .get(&connection)?
+            .client_version
+            .clone()
     }
 
     fn pane_for(&self, connection: u64) -> Option<String> {
@@ -396,6 +408,7 @@ impl IdeServer {
             conns: Mutex::new(Connections::default()),
             auth_token,
             alive: Mutex::new(Some(alive_tx)),
+            diagnostics: Mutex::new(None),
         });
 
         let accept = tokio::spawn(accept_loop(listener, Arc::clone(&inner)));
@@ -431,6 +444,17 @@ impl IdeServer {
         let (tx, rx) = mpsc::channel(EVENT_CAPACITY);
         *self.inner.events.lock() = tx;
         rx
+    }
+
+    /// Give this server something for `getDiagnostics` to read.
+    ///
+    /// A setter rather than a parameter to [`start`](Self::start), for the same reason
+    /// [`events`](Self::events) is taken rather than handed in: the diagnostics store does not
+    /// exist until the project's servers do. A server that has never been given one answers
+    /// `[]` — the same true sentence it answered before this existed, which is also what keeps
+    /// every test that calls `attach` compiling unchanged.
+    pub fn set_diagnostics(&self, source: Arc<dyn tools::DiagnosticSource>) {
+        *self.inner.diagnostics.lock() = Some(source);
     }
 
     /// Record which pane a child pid belongs to, so notifications can be addressed.
@@ -933,7 +957,13 @@ async fn call_tool(inner: &Arc<Inner>, connection: u64, params: &Value, id: Valu
         protocol::tool::CLOSE_ALL_DIFF_TABS => {
             tools::close_all_diff_tabs(broker, connection, &events).await
         }
-        protocol::tool::GET_DIAGNOSTICS => tools::get_diagnostics(),
+        protocol::tool::GET_DIAGNOSTICS => {
+            // Cloned out from under the lock, matching `Inner::emit`'s discipline: a
+            // `parking_lot` guard held across the call would be held while the store's own lock
+            // is taken, which is two locks in an order nothing else in this crate establishes.
+            let source = inner.diagnostics.lock().clone();
+            tools::get_diagnostics(&arguments, source.as_deref())
+        }
         protocol::tool::OPEN_FILE => tools::open_file(&arguments, &events).await,
         // A JSON-RPC error rather than a result: the caller asked for something that is not
         // in `tools/list`, which is a mistake about the server rather than about the work.
@@ -1003,7 +1033,9 @@ mod live {
             // and subprotocol, accepted our `initialize` reply, read `tools/list`, and then
             // announced itself. Nothing short of the whole chain produces this event.
             Ok(Some(ServerEvent::Connected {
-                pid, client_version, ..
+                pid,
+                client_version,
+                ..
             })) => {
                 eprintln!(
                     "a real claude connected and named pid {pid}, version {}",
@@ -1147,7 +1179,9 @@ mod tests {
 
         match events.recv().await {
             Some(ServerEvent::Connected {
-                pid, client_version, ..
+                pid,
+                client_version,
+                ..
             }) => {
                 assert_eq!(pid, 6001);
                 assert_eq!(
@@ -1375,7 +1409,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_diagnostics_answers_empty_over_the_wire() {
+    async fn get_diagnostics_answers_empty_over_the_wire_when_no_source_is_installed() {
+        // The assertion is unchanged: this test server installs no `DiagnosticSource`, and a
+        // server that was never given one still answers `[]`. Only the *reason* moved — see
+        // `tools::get_diagnostics`.
         let server = server().await;
         let mut ws = connect(server.port(), TOKEN)
             .await
@@ -1393,6 +1430,66 @@ mod tests {
         assert_eq!(answer["result"]["isError"], false);
         // The CLI runs `JSON.parse` over `content[0].text` and iterates the result.
         assert_eq!(answer["result"]["content"][0]["text"], "[]");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_carries_lsp_shaped_json_over_the_wire() {
+        // The other half: with a source installed, the payload the CLI actually receives is
+        // LSP-shaped text inside `content[0]`. Asserted over the socket rather than against the
+        // tool alone, because the encoding into `content` is the part that has to survive.
+        struct Fixed;
+        impl tools::DiagnosticSource for Fixed {
+            fn diagnostics(&self, _uri: Option<&str>) -> Vec<protocol::UriDiagnostics> {
+                vec![protocol::UriDiagnostics {
+                    uri: "file:///f.rs".into(),
+                    diagnostics: vec![protocol::LspDiagnostic {
+                        range: protocol::LspRange {
+                            start: protocol::LspPosition {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: protocol::LspPosition {
+                                line: 0,
+                                character: 3,
+                            },
+                        },
+                        severity: 2,
+                        code: None,
+                        source: Some("gopls".into()),
+                        message: "unused variable".into(),
+                    }],
+                }]
+            }
+        }
+
+        let server = server().await;
+        server.set_diagnostics(Arc::new(Fixed));
+        let mut ws = connect(server.port(), TOKEN)
+            .await
+            .expect("the CLI connects");
+        handshake(&mut ws).await;
+
+        send(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                   "params":{"name":"getDiagnostics","arguments":{}}}),
+        )
+        .await;
+        let answer = reply(&mut ws).await;
+
+        assert_eq!(answer["result"]["isError"], false);
+        let text = answer["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text");
+        let parsed: Value = serde_json::from_str(text).expect("the CLI can JSON.parse this");
+        assert_eq!(parsed[0]["uri"], "file:///f.rs");
+        assert_eq!(parsed[0]["diagnostics"][0]["severity"], 2);
+        assert_eq!(parsed[0]["diagnostics"][0]["message"], "unused variable");
+        // Absent rather than null: `code` is `skip_serializing_if`, and a null would be a value
+        // the CLI has to handle for no reason.
+        assert!(parsed[0]["diagnostics"][0].get("code").is_none());
 
         server.shutdown().await;
     }

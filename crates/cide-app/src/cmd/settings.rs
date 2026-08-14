@@ -93,6 +93,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         claude,
         proxy,
         sidebar,
+        inspections,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -149,6 +150,14 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // where it lands, so `workspace.json` cannot hold a width no window can honour.
     if let Some(v) = sidebar {
         settings.sidebar = v.clamped();
+    }
+    // Clamped for the same reason, and the failure is louder than a bad width. `pushToClaude`
+    // writes a line into a live Claude pane's PTY; with a debounce of zero, one `cargo check`
+    // over a broken crate would type several hundred of them into a prompt the user is in the
+    // middle of using. The frontend's number input clamps too, and — as above — a clamp that
+    // lives only there is one `invoke` away from being bypassed.
+    if let Some(v) = inspections {
+        settings.inspections = v.clamped();
     }
 }
 

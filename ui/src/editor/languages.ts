@@ -14,7 +14,17 @@ import { StreamLanguage } from '@codemirror/language'
 import type { Extension } from '@codemirror/state'
 
 /** A module identifier in this registry, not a user-visible name. */
-type LanguageId = 'rust' | 'typescript' | 'python' | 'clike' | 'shell' | 'json' | 'toml' | 'yaml' | 'markdown'
+type LanguageId =
+  | 'rust'
+  | 'go'
+  | 'typescript'
+  | 'python'
+  | 'clike'
+  | 'shell'
+  | 'json'
+  | 'toml'
+  | 'yaml'
+  | 'markdown'
 
 interface Entry {
   /** What the status bar readout calls it. */
@@ -26,6 +36,10 @@ const REGISTRY: Record<LanguageId, Entry> = {
   rust: {
     label: 'Rust',
     load: async () => StreamLanguage.define((await import('./languages/rust')).spec),
+  },
+  go: {
+    label: 'Go',
+    load: async () => StreamLanguage.define((await import('./languages/go')).spec),
   },
   typescript: {
     label: 'TypeScript',
@@ -86,7 +100,7 @@ const BY_EXTENSION: Record<string, { id: LanguageId; label?: string }> = {
   cpp: { id: 'clike', label: 'C++' },
   cxx: { id: 'clike', label: 'C++' },
   hpp: { id: 'clike', label: 'C++' },
-  go: { id: 'clike', label: 'Go' },
+  go: { id: 'go' },
   java: { id: 'clike', label: 'Java' },
   sh: { id: 'shell' },
   bash: { id: 'shell' },

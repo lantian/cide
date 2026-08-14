@@ -14,6 +14,7 @@
 # `cargo xtask codegen --check`, which it is deliberately shaped like.
 #
 # ## Why each size is rendered from the SVG instead of resizing a master PNG
+
 #
 # The artwork's straight edges are all on multiples of 4 in a 64-unit viewBox, so at every
 # size below they land on whole pixels. Rendering directly keeps that; rendering a 128px

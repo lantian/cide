@@ -1023,7 +1023,10 @@ mod tests {
         let ws = load(&path);
 
         assert_eq!(Workspace::CURRENT_SCHEMA, 2);
-        assert_eq!(ws.schema_version, 2, "the ladder ran and stopped at current");
+        assert_eq!(
+            ws.schema_version, 2,
+            "the ladder ran and stopped at current"
+        );
         assert_eq!(
             dir.entries(),
             vec!["workspace.json".to_string()],
@@ -1034,8 +1037,14 @@ mod tests {
         // proxied, cide's own `git` inheriting whatever cide itself was launched with.
         // Spelled out rather than compared against `ProxyScope::default()`, because the whole
         // reason the migration writes it is that the default is expected to move.
-        assert_eq!(ws.settings.proxy.scope.claude, cide_ipc::ProxyTarget::Configured);
-        assert_eq!(ws.settings.proxy.scope.shells, cide_ipc::ProxyTarget::Configured);
+        assert_eq!(
+            ws.settings.proxy.scope.claude,
+            cide_ipc::ProxyTarget::Configured
+        );
+        assert_eq!(
+            ws.settings.proxy.scope.shells,
+            cide_ipc::ProxyTarget::Configured
+        );
         assert_eq!(
             ws.settings.proxy.scope.git,
             cide_ipc::ProxyTarget::Untouched,

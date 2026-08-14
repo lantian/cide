@@ -166,9 +166,54 @@ pub fn defaults() -> Vec<Binding> {
         ("ctrl+alt+k", "pane.navigate.up"),
         ("ctrl+alt+j", "pane.navigate.down"),
         ("ctrl+comma", "settings.open"),
+        // M12. `ctrl+f12` is IDEA's own File Structure chord, and no f-key is bound anywhere else
+        // in this workspace; `ctrl+alt+shift+n` is free in every layer (`ctrl+shift+n` is
+        // `claude.split.newSession`, and the two normalise to different keys).
+        ("ctrl+f12", "structure.file"),
+        ("ctrl+alt+shift+n", "picker.symbols"),
     ]
     .into_iter()
     .map(|(key, command)| Binding::new(key, command))
+    // Bindings that carry a `when`, and the first ones in this table that do.
+    //
+    // # Why these two need a clause when nothing above does
+    //
+    // `alt+up` / `alt+down` are IDEA's *Previous/Next Method*. Unconditionally bound they would
+    // also fire in a terminal pane, where the gesture would move a caret the user cannot see —
+    // and the key gate is a window **capture** listener, so a globally-bound chord never reaches
+    // the pane that should have had it.
+    //
+    // # What this costs, named rather than hidden
+    //
+    // `@codemirror/commands` binds `Alt-ArrowUp`/`Alt-ArrowDown` to `moveLineUp`/`moveLineDown`,
+    // so inside a buffer those stop moving lines. `EditorSurface` re-homes them to
+    // `Mod-Shift-Arrow` — IDEA's own chord for the same thing — which is free in both layers, so
+    // a capability moves rather than disappearing.
+    //
+    // The alternative was `ctrl+alt+up`/`ctrl+alt+down`, and it costs strictly more: `ctrl+alt+down`
+    // is already `pane.split.down` above, *and* CodeMirror binds `Mod-Alt-Arrow` to
+    // `addCursorAbove`/`addCursorBelow`. Two breakages against this one.
+    .chain(
+        [
+            ("alt+down", "navigate.nextMember", "editorFocused"),
+            ("alt+up", "navigate.prevMember", "editorFocused"),
+            // IDEA's own Go to Declaration chord, and free in both layers: no binding in
+            // `defaults()` uses `b`, and CodeMirror's `Ctrl-b` lives only in `emacsStyleKeymap`,
+            // which `standardKeymap` re-exposes under a **mac-only** `mac:` property — so on
+            // Linux and Windows nothing is being taken from anyone.
+            //
+            // Scoped to `editorFocused`, and the `when` is doing real work here: unscoped, Ctrl+B
+            // would be swallowed by the window capture gate in every terminal pane in every
+            // window, which is `tmux`'s prefix key. A user running tmux inside cide would lose it
+            // everywhere, to a command that needs a caret to mean anything.
+            //
+            // On macOS `platform_layer` rewrites this to ⌘B, which is IDEA's mac binding for the
+            // same action — correct by luck rather than by exception, but correct.
+            ("ctrl+b", "navigate.definition", "editorFocused"),
+        ]
+        .into_iter()
+        .map(|(key, command, when)| Binding::new(key, command).when(when)),
+    )
     .collect()
 }
 

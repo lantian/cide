@@ -19,3 +19,13 @@ ts-rs = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
+
+# Unix-only, and gated so the crate still compiles for a target with no `prctl` at all.
+# `child_env` needs it for PR_SET_PDEATHSIG; everything else here is portable.
+#
+# This block moved from `cide-claude` along with `child_env::arm`. The rule it implements is
+# not about `claude` — it is about every child this application forks — and leaving it in the
+# Claude supervisor meant a new spawning crate had to depend on that supervisor to be armed.
+# See docs/adr/0008.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

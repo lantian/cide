@@ -24,11 +24,14 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
-# Unix-only, and gated so the crate still compiles for a target with no `prctl` at all.
-# `orphans` needs it for PR_SET_PDEATHSIG; everything else here is portable.
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
 [dev-dependencies]
 # The real-CLI test mints a session id to demand back from the hook payload.
 uuid = { workspace = true }
+
+# A *dev*-dependency, and it was a normal one until `orphans::arm` moved to
+# `cide_core::child_env`. Nothing this crate compiles calls libc any more — the one remaining
+# use is the test that pins `DEATH_SIGNAL == libc::SIGTERM`, which is worth keeping because the
+# alternative is asserting against a bare `15` and losing the name that makes it checkable.
+# Still `cfg(unix)`-gated so the crate builds for a target with no `prctl` at all.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

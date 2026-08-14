@@ -105,7 +105,11 @@ fn apply_env_changes(
 /// the same fact from drifting apart, and puts the `claude`-panes-and-one-shots-are-one-thing
 /// rule where a reader of either can find it.
 fn pane_proxy_target(scope: &cide_ipc::ProxyScope, is_claude: bool) -> cide_ipc::ProxyTarget {
-    if is_claude { scope.claude } else { scope.shells }
+    if is_claude {
+        scope.claude
+    } else {
+        scope.shells
+    }
 }
 
 /// Apply a resolved proxy environment to a pane's spec.
@@ -291,7 +295,11 @@ pub async fn session_spawn(
     // the network, but it is not worth it on every launch of a machine with no proxy at all.
     tracing::debug!(
         "{}",
-        proxy_log_line(if is_claude { "claude" } else { "shell" }, target, &proxy_env)
+        proxy_log_line(
+            if is_claude { "claude" } else { "shell" },
+            target,
+            &proxy_env
+        )
     );
 
     // Minted before the spawn, not after, because for a Claude pane this id is *usually* the
@@ -1072,8 +1080,14 @@ mod tests {
         let env = ProxyEnv::resolve(&proxy, cide_ipc::ProxyTarget::Configured, |_| None);
         let spec = apply_proxy(SpawnSpec::new("/bin/sh", std::env::temp_dir()), &env);
 
-        assert_eq!(value_of(&spec, "HTTP_PROXY"), Some("http://proxy.corp:3128"));
-        assert_eq!(value_of(&spec, "http_proxy"), Some("http://proxy.corp:3128"));
+        assert_eq!(
+            value_of(&spec, "HTTP_PROXY"),
+            Some("http://proxy.corp:3128")
+        );
+        assert_eq!(
+            value_of(&spec, "http_proxy"),
+            Some("http://proxy.corp:3128")
+        );
     }
 
     /// An out-of-scope child gets a spec the proxy pass did not touch at all.
@@ -1240,9 +1254,6 @@ mod tests {
     fn a_dead_pid_answers_nothing_at_all() {
         // The kernel's own maximum plus one cannot name a live process.
         let impossible = u32::MAX;
-        assert_eq!(
-            contained_cwd(impossible, &[std::env::temp_dir()]),
-            None
-        );
+        assert_eq!(contained_cwd(impossible, &[std::env::temp_dir()]), None);
     }
 }

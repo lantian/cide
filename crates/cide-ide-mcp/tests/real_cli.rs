@@ -227,6 +227,12 @@ async fn the_frames_the_cli_sends_get_the_replies_it_expects() {
     assert!(closed["error"].is_null(), "closeAllDiffTabs: {closed}");
 
     // Sent with no arguments at the start of a turn, and again with a `uri` afterwards.
+    //
+    // **This observation is the mechanism, not a curiosity.** The CLI *pulls* diagnostics at the
+    // top of every turn, which is why cide needs no push notification to keep Claude informed —
+    // and there is no such notification to send: `notify` has exactly three names, and an unknown
+    // one would be dropped with no error in either direction. Wiring `getDiagnostics` to a real
+    // store is therefore the whole of "Claude knows what the language servers found".
     for (id, args) in [(3, json!({})), (4, json!({"uri": "file:///tmp/note.txt"}))] {
         let diagnostics = cli
             .request(
@@ -238,8 +244,8 @@ async fn the_frames_the_cli_sends_get_the_replies_it_expects() {
         assert_eq!(
             diagnostics["result"]["content"][0]["text"],
             json!("[]"),
-            "no language server ships in v1, and an empty list is the honest answer to \
-             'what did the language server find'; an error would claim something broke"
+            "this test server installs no `DiagnosticSource`, so nothing in the process has \
+             looked and an empty list is the honest answer; an error would claim something broke"
         );
     }
 
@@ -654,7 +660,9 @@ async fn the_installed_cli_is_one_this_build_has_checked() {
 async fn next_connection(events: &mut Receiver<ServerEvent>) -> Option<Option<String>> {
     while let Some(event) = events.recv().await {
         if let ServerEvent::Connected {
-            pid, client_version, ..
+            pid,
+            client_version,
+            ..
         } = event
         {
             eprintln!("a real claude connected and named pid {pid}");
@@ -671,7 +679,10 @@ async fn next_connection(events: &mut Receiver<ServerEvent>) -> Option<Option<St
 /// test can run a subprocess would point the graph backwards for four lines. This is only the
 /// fallback; the answer that matters comes off the wire.
 fn cide_claude_version_probe(claude: &Path) -> Option<String> {
-    let output = std::process::Command::new(claude).arg("--version").output().ok()?;
+    let output = std::process::Command::new(claude)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

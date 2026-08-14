@@ -108,3 +108,55 @@ export function kindBadge(path: string): KindBadge {
       return { label: '·', tone: 'faint' }
   }
 }
+
+/**
+ * The badge for a symbol's kind — `FN`, `ST`, `TR`.
+ *
+ * Here rather than in either picker, so the File Structure popup and Go-to-Symbol cannot label
+ * the same kind differently, and so `check:picker` compiles it for free.
+ *
+ * Takes `string` rather than `SymbolKind` deliberately, for the reason `isSeverity` in
+ * `ProblemsPanel/model.ts` does: every caller has a value *annotated* by a wire type, and the
+ * whole point of the fallback is that the annotation is a promise from another process. An
+ * unrecognised kind gets the neutral marker and is **never dropped** — the same `other`-bucket
+ * rule, applied to a glyph.
+ */
+export function symbolBadge(kind: string): KindBadge {
+  switch (kind) {
+    case 'function':
+      return { label: 'FN', tone: 'blue' }
+    case 'method':
+      return { label: 'FN', tone: 'blue' }
+    case 'struct':
+      return { label: 'ST', tone: 'cyan' }
+    case 'enum':
+      return { label: 'EN', tone: 'cyan' }
+    case 'union':
+      return { label: 'UN', tone: 'cyan' }
+    case 'interface':
+      return { label: 'IF', tone: 'purple' }
+    case 'trait':
+      return { label: 'TR', tone: 'purple' }
+    case 'impl':
+      return { label: 'IM', tone: 'dim' }
+    case 'module':
+      return { label: 'MOD', tone: 'green' }
+    case 'package':
+      return { label: 'PKG', tone: 'green' }
+    case 'constant':
+      return { label: 'CO', tone: 'yellow' }
+    case 'static':
+      return { label: 'ST8', tone: 'yellow' }
+    case 'variable':
+      return { label: 'VAR', tone: 'yellow' }
+    case 'typeAlias':
+      return { label: 'TY', tone: 'cyan' }
+    case 'macro':
+      return { label: 'MA', tone: 'accent' }
+    case 'field':
+    case 'variant':
+      return { label: '·', tone: 'faint' }
+    default:
+      return { label: '·', tone: 'faint' }
+  }
+}

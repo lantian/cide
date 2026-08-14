@@ -24,6 +24,9 @@ cide-pty = { workspace = true }
 cide-fs = { workspace = true }
 cide-search = { workspace = true }
 cide-git = { workspace = true }
+# M12: the tree-sitter symbol layer, and the language-server client.
+cide-lang = { workspace = true }
+cide-lsp = { workspace = true }
 
 tauri = { workspace = true }
 tauri-plugin-clipboard-manager = { workspace = true }

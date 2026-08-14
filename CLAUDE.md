@@ -82,6 +82,7 @@ Which check covers what you touched:
 | menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
 | terminal input, session state | `check:input`, `check:exit`, `check:awaiting`, `check:format` |
 | overlays, pickers, search | `check:picker`, `check:search`, `check:problems` |
+| `cide-lang`, `cide-lsp`, symbol navigation, diagnostics | `check:outline`, `check:problems`, `check:commands`, `check:keys` |
 
 ## Architecture
 
@@ -103,6 +104,8 @@ crates/
   cide-ide-mcp/   the Claude Code IDE-integration MCP server (openDiff, getDiagnostics, openFile).
   cide-git/       multi-root git, hunk/line staging, changelists, shelf.
   cide-fs/        gitignore-aware indexing and watching.   cide-search/  fuzzy + content search.
+  cide-lang/      tree-sitter over Rust and Go: what a file declares. No tauri, no cide-fs.
+  cide-lsp/       an LSP *client* — rust-analyzer and gopls. Threads, not tokio (see its lib.rs).
   cide-hook/      second binary: bridges a Claude hook to the running IDE over a unix socket.
   cide-headless/  third binary: proves the core links without tauri (`cide-headless tree|commands|keymap`).
 ```
@@ -193,11 +196,15 @@ Claude is hosted three ways at once (ADR 0005): a real PTY, the IDE-integration 
 - **Never read `~/.claude/.credentials.json`, never inject `ANTHROPIC_API_KEY`** — it outranks
   subscription OAuth and would silently bill a Console org. Children inherit auth from the
   environment.
-- **No child inherits the bundle's environment.** Every spawn site passes through
-  `cide-core::child_env` (ADR 0007): an AppImage's `AppRun` leaves `PYTHONHOME` and
-  `LD_LIBRARY_PATH` pointing inside a mount, and a `claude` that inherits them cannot start a
-  single stdio MCP server — it reports `CONNECTION_CLOSED` from three processes below anything
-  cide logs. A new `Command::new`/`SpawnSpec` anywhere in the workspace needs the same line.
+- **No child inherits the bundle's environment, and every child is armed.** Both rules live in
+  `cide-core::child_env`, which is the module every spawn site passes through.
+  `scrub_command` (ADR 0007): an AppImage's `AppRun` leaves `PYTHONHOME` and `LD_LIBRARY_PATH`
+  pointing inside a mount, and a `claude` that inherits them cannot start a single stdio MCP
+  server — it reports `CONNECTION_CLOSED` from three processes below anything cide logs.
+  `arm` (ADR 0008, moved here from `cide-claude` in M12) hands the kernel a pid to kill when cide
+  dies, and its contract is that **the forking thread must outlive the child** — which is what
+  `on_spawn_thread` is for, and why a language server is never spawned from a Tauri command
+  worker. A new `Command::new`/`SpawnSpec` anywhere in the workspace needs both lines.
 
 A `SessionId` *is* the value passed to `claude --session-id`, which is what makes resume free.
 Shutdown is a ladder — SIGHUP, SIGTERM, SIGKILL — so a `claude` finishes writing the transcript

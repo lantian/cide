@@ -1,0 +1,31 @@
+[package]
+name = "cide-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A Language Server Protocol *client*: spawns rust-analyzer and gopls, keeps them fed, and turns
+# `textDocument/publishDiagnostics` into `cide_ipc::Diagnostic`.
+#
+# No tokio, deliberately — see `src/lib.rs` for the `PR_SET_PDEATHSIG` argument that decides it.
+# No tauri. `lsp-types` is used but never re-exported: everything crossing this crate's boundary
+# is cide's own wire type.
+[dependencies]
+cide-ipc = { workspace = true }
+# For `child_env`: the bundle scrub every spawn site must apply (ADR 0007), and `arm`, which hands
+# the kernel a pid to kill when cide dies (ADR 0008). A language server is the second long-lived,
+# memory-hungry child in this app and needs both.
+cide-core = { workspace = true }
+lsp-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# For `kill(2)`. `Child::kill` is `SIGKILL` and skips the polite rung — gopls writes its cache on
+# a clean exit, so the ladder needs `SIGTERM` first. Same reason `cide-app` names it.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

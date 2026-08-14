@@ -11,7 +11,9 @@ pub mod graphics;
 pub mod hooks;
 pub mod ide;
 pub mod lifecycle;
+pub mod lsp;
 pub mod state;
+pub mod symbols;
 pub mod windows;
 pub mod workspace_state;
 
@@ -207,6 +209,11 @@ pub fn run() {
     // so that `search.query` resolves its state and answers `NoIndex` rather than failing to
     // resolve at all.
     builder = builder.manage(cmd::search::SearchRegistry::default());
+    // M12. Empty until a project opens, and managed from the start for the same reason as the two
+    // above: `diagnostics.get` must resolve its state and answer `unavailable` with a sentence
+    // rather than failing to resolve at all — a panel that cannot reach its state looks exactly
+    // like a workspace with no problems.
+    builder = builder.manage(lsp::DiagnosticsRegistry::default());
     // `ide` is deliberately *not* managed here. It is a `PendingIdeServers`, whose one method
     // ensures every restored project's server and registers the state together — so it has to
     // wait for `setup`, where the restored workspace exists to be offered. Registering it here
@@ -349,6 +356,16 @@ pub fn run() {
             cmd::picker::picker_rank,
             cmd::search::search_query,
             cmd::search::search_cancel,
+            cmd::symbols::symbols_outline,
+            cmd::symbols::symbols_index,
+            cmd::symbols::symbol_query,
+            cmd::diagnostics::diagnostics_get,
+            cmd::diagnostics::diagnostics_did_open,
+            cmd::diagnostics::diagnostics_did_change,
+            cmd::diagnostics::diagnostics_did_save,
+            cmd::diagnostics::diagnostics_did_close,
+            cmd::diagnostics::diagnostics_definition,
+            cmd::diagnostics::diagnostics_restart,
         ])
         .on_window_event(|window, event| {
             match event {
@@ -463,6 +480,30 @@ pub fn run() {
                 // Ensuring and managing are one call because they were two, and the bug was
                 // that they could disagree. See `ide::PendingIdeServers`.
                 pending.install(app.handle(), &ws);
+            }
+
+            // And one set of language servers per restored project — the exact same omission as
+            // the block above, one feature over, with the same cause and the same symptom.
+            //
+            // `DiagnosticsRegistry::ensure` is otherwise called only from `project_open`, which a
+            // restoring launch never reaches, so every launch but the one where the user opened
+            // the project by hand came up with no analyser at all: no rust-analyzer process, an
+            // `unavailable` panel, `✗ — ⚠ —` in the status bar, and `getDiagnostics` answering
+            // `[]` to Claude. Each of those is individually indistinguishable from "this
+            // workspace is fine", which is what made it survive a full green gate.
+            //
+            // After `pending.install`, deliberately: `ensure` here links each project's store
+            // into the IDE server that the line above just started, so `getDiagnostics` answers
+            // from live data on a restored launch too. `ide::link_diagnostics` documents why the
+            // link is made from both ends rather than by fixing an order.
+            {
+                let ws = app.state::<WorkspaceState>().snapshot();
+                if let Some(registry) = app.try_state::<lsp::DiagnosticsRegistry>() {
+                    for (project, roots) in ide::servable_projects(&ws) {
+                        registry.ensure(app.handle(), project, roots);
+                        ide::link_diagnostics(app.handle(), project);
+                    }
+                }
             }
 
             restore_windows(app.handle())?;

@@ -9,6 +9,8 @@ members = [
     "crates/cide-git",
     "crates/cide-fs",
     "crates/cide-search",
+    "crates/cide-lang",
+    "crates/cide-lsp",
     "crates/cide-hook",
     "crates/cide-headless",
     "crates/cide-app",
@@ -38,6 +40,8 @@ cide-ide-mcp = { path = "crates/cide-ide-mcp" }
 cide-git = { path = "crates/cide-git" }
 cide-fs = { path = "crates/cide-fs" }
 cide-search = { path = "crates/cide-search" }
+cide-lang = { path = "crates/cide-lang" }
+cide-lsp = { path = "crates/cide-lsp" }
 
 # --- shell (only cide-app may depend on tauri) ---
 # `devtools` so a release build can still open an inspector. Debug builds enable it anyway;
@@ -83,6 +87,45 @@ nucleo = "0.5.0"
 # `ignore`, so naming it here costs no new compilation.
 regex = "1.13.1"
 tree-sitter = "0.26.11"
+# The grammars, for `cide-lang`.
+#
+# They do **not** depend on `tree-sitter`, which is why a grammar crate two minor versions
+# behind the core still links: each depends only on `tree-sitter-language ^0.1` — the decoupling
+# shim that core 0.26.11 also depends on — and names `tree-sitter` as a *dev*-dependency for its
+# own tests. So nothing here forks the graph the way ADR 0001 describes for `wry`/`tao`;
+# verified against crates.io rather than assumed.
+#
+# Both are the newest published versions (`tree-sitter-rust` 2026-03-27, `tree-sitter-go`
+# 2025-08-29) and both generate ABI 15, inside core 0.26's accepted 13..=15. tree-sitter is
+# backwards-compatible with grammars built by an older CLI and not forwards-compatible, and this
+# is the backwards direction. `cide_lang::tables` has a test that fails loudly if a grammar bump
+# ever renames a node kind out from under the extractor — which has already happened once,
+# `method_spec` → `method_elem` in tree-sitter-go 0.25.
+tree-sitter-rust = "0.24.2"
+tree-sitter-go = "0.25.0"
+
+# --- language servers ---
+# The LSP wire types, for `cide-lsp`.
+#
+# This is the same 0.x hazard ADR 0001 describes for `wry`/`tao`, reaching the opposite
+# conclusion, and the reason is containment rather than a different risk appetite: `lsp-types` is
+# a dependency of **exactly one crate**, and `cide-lsp` must never re-export it. Everything that
+# crosses that crate's boundary is cide's own `cide_ipc::Diagnostic`, so a future bump is a diff
+# inside one file rather than a fork of the graph. If a second crate ever wants it, that is the
+# moment to reconsider — not now.
+#
+# Taken rather than hand-rolled because the risk is in what we *receive*, not what we send. The
+# eight messages cide sends are an afternoon's work; `publishDiagnostics` alone carries
+# `relatedInformation`, `tags`, `codeDescription`, `data` and `version`, and a hand-written struct
+# that omits a field drops it in silence. It is data — serde structs and `#[repr]` enums — with no
+# runtime, no transport and no traits to implement, so being wrong about it is a compile error.
+#
+# 0.97.0 is max, newest and max-stable, published 2024-06-04 with nothing since: frozen at LSP
+# 3.17, which is exactly what rust-analyzer and gopls speak. For a pinned dependency that freeze
+# is an asset. `async-lsp` was the alternative and it pins `lsp-types ^0.95`, which would resolve
+# two incompatible 0.x versions into the graph — the exact failure this workspace's rule exists to
+# prevent. `tower-lsp` is a framework for building *servers*.
+lsp-types = "0.97.0"
 
 # --- async / mcp ---
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }

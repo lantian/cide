@@ -80,6 +80,18 @@ pub fn shutdown(app: &AppHandle) {
         servers.stop_all();
     }
 
+    // Then the language servers, and in this order: a blocked `openDiff` needs its socket first
+    // (above), where a `gopls` needs only enough time to write its cache. Each handle's `Drop`
+    // runs `shutdown` → `exit` → SIGTERM → SIGKILL, which is why this can be a single call and
+    // still be a ladder.
+    //
+    // Before the PTY ladder below, because a rust-analyzer holding 1–4 GB is the largest thing
+    // in the process and giving the kernel that memory back early makes the rest of the shutdown
+    // cheaper on a machine that is already under pressure.
+    if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
+        diagnostics.close_all();
+    }
+
     // A store per project, and the only thing on this path that reaches a content search: the
     // ladder below blocks the main thread for as long as the slowest child takes, and a walker
     // thread per core reading a repository nobody will see the results of is disk the dying

@@ -2,6 +2,7 @@
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
+import type { InspectionSettings } from "./InspectionSettings";
 import type { ProxySettings } from "./ProxySettings";
 import type { SidebarSettings } from "./SidebarSettings";
 import type { TerminalSettings } from "./TerminalSettings";
@@ -41,4 +42,12 @@ proxy?: ProxySettings,
  * settings snapshot it renders from, so "currently holds" is the mirror's value and not
  * a stale local copy.
  */
-sidebar?: SidebarSettings, };
+sidebar?: SidebarSettings, 
+/**
+ * The Inspections screen, sent whole like every other group.
+ *
+ * `push_debounce_ms` is clamped where this lands (`cmd::settings::apply_patch`) rather
+ * than on read, so the stored value is the one the user set and a hand-edited
+ * `workspace.json` cannot make the app type into a live prompt on every `cargo check`.
+ */
+inspections?: InspectionSettings, };

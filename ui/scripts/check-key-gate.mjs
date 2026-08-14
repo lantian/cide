@@ -143,6 +143,12 @@ try {
     { key: 'ctrl+k ctrl+w', command: 'tab.closeOthers', when: null },
     { key: 'ctrl+shift+c', command: 'terminal.clear', when: 'terminalFocused' },
     { key: 'ctrl+e', command: 'file.reveal', when: 'editorFocused && !overlayOpen' },
+    // M12. `alt+up`/`alt+down` carry a `when` because the gate is a window capture listener:
+    // unconditionally bound they would fire in a terminal pane and move a caret nobody can see.
+    { key: 'ctrl+f12', command: 'structure.file', when: null },
+    { key: 'ctrl+alt+shift+n', command: 'picker.symbols', when: null },
+    { key: 'alt+down', command: 'navigate.nextMember', when: 'editorFocused' },
+    { key: 'alt+up', command: 'navigate.prevMember', when: 'editorFocused' },
   ]
 
   /* The fixture is a mirror, so check it against the thing it mirrors before trusting it. */

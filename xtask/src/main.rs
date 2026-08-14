@@ -1014,7 +1014,9 @@ mod tests {
         )
         .expect("the real-CLI test is readable");
         assert!(
-            source.contains(&format!("const VERDICT_MARKER: &str = \"{VERIFY_MARKER}\";")),
+            source.contains(&format!(
+                "const VERDICT_MARKER: &str = \"{VERIFY_MARKER}\";"
+            )),
             "`{VERIFY_MARKER}` is not what tests/real_cli.rs prints, so verify-cli would \
              report every run as verdictless"
         );

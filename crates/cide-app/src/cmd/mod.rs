@@ -24,3 +24,10 @@ pub mod picker;
 // Content search. Separate from `picker` on purpose: that one ranks paths, this one greps
 // file contents, and the two share no state and no scoring.
 pub mod search;
+
+// --- M12: language support ---
+// Two modules, because they answer to different producers: `symbols` is tree-sitter's structure
+// (parsed in-process, on demand), `diagnostics` is the merged view over the language servers,
+// tree-sitter and a Claude one-shot. A file has both, and that is not a reason to share a module.
+pub mod diagnostics;
+pub mod symbols;

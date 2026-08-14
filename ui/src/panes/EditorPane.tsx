@@ -18,10 +18,31 @@
  * would mean lifting the `EditorState` out of the component and into a per-path store, and
  * the milestone asks for the split path to exist, not for collaborative buffers.
  */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from 'react'
 import { EditorSurface } from '@/editor/EditorSurface'
 import { claude as claudeApi, diag, events, file as fileApi } from '@/ipc/client'
 import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
+import {
+  fetchOutline,
+  forgetOutline,
+  scheduleOutline,
+  subscribeOutlines,
+  symbolsOf,
+} from '@/editor/outlineStore'
+import { closeDoc, openDoc, resetDoc, savedDoc, scheduleDoc } from '@/editor/docSync'
+import { levelFor, subscribeHighlightLevels } from '@/editor/highlightLevel'
+import { useDiagnostics } from '@/sidebar/diagnosticsStore'
+import { useWorkspace } from '@/store/workspace'
+import { visible, type DiagnosticFilters } from '@/sidebar/ProblemsPanel/model'
+import type { ProjectId } from '@/ipc/client'
 import styles from './EditorPane.module.css'
 
 export interface EditorPaneProps {
@@ -35,6 +56,30 @@ export interface EditorPaneProps {
   tab?: string | undefined
 }
 
+/**
+ * The settings enum into the editor's vocabulary.
+ *
+ * Two spellings for one idea, and they are not merged because they belong to different layers:
+ * `InspectionSettings` is a persisted wire type and `HighlightLevel` is what the CodeMirror
+ * compartment and the context menu speak. `App.tsx` carries the same three-line mapping for the
+ * same reason.
+ *
+ * `undefined` — settings not loaded yet — is `all`, which is the safe direction: showing
+ * everything for one frame is recoverable, hiding a real error is not.
+ */
+function levelOf(
+  level: 'none' | 'syntaxOnly' | 'allProblems' | undefined,
+): 'none' | 'syntax' | 'all' {
+  switch (level) {
+    case 'none':
+      return 'none'
+    case 'syntaxOnly':
+      return 'syntax'
+    default:
+      return 'all'
+  }
+}
+
 /** What the pane is currently showing instead of, or as well as, a buffer. */
 type Load =
   | { kind: 'loading' }
@@ -42,6 +87,60 @@ type Load =
   | { kind: 'failed'; why: string }
 
 export function EditorPane({ path, root, project, tab }: EditorPaneProps): ReactNode {
+  /*
+   * This file's structure, for the status bar's symbol trail.
+   *
+   * `useSyncExternalStore` because `outlineStore` is module-level — the same shape `GitPanel`
+   * uses for its partial-selection store, and for the same reason: three unrelated surfaces read
+   * it, one of them (`keys/dispatch.ts`) from outside React entirely.
+   *
+   * `symbolsOf` must return a **referentially stable** value — `useSyncExternalStore` compares
+   * with `Object.is`, and a fresh `[]` per call is an infinite render loop that unmounts the
+   * whole React tree. It returns a shared frozen constant for the empty case; see `NONE` in
+   * `outlineStore.ts`. This comment previously *claimed* that property without the code
+   * having it, which is how it shipped.
+   */
+  const outline = useSyncExternalStore(
+    subscribeOutlines,
+    () => symbolsOf(path),
+    () => symbolsOf(path),
+  )
+
+  /*
+   * This file's diagnostics, and how much of them to draw.
+   *
+   * The snapshot is read raw here and filtered against *this editor's* level — which is the one
+   * axis that is genuinely per-buffer. The severity and source axes were already applied by
+   * `App.tsx` before the snapshot reached the panel, and re-applying them here would be a second
+   * place for them to disagree; `visible` is called with everything-on for those two so only the
+   * level does any work.
+   */
+  const snapshot = useDiagnostics((s) => s.snapshot)
+  /*
+   * The workspace default this buffer falls back to when it has no override of its own.
+   *
+   * Read from settings rather than hardcoded. It was `levelFor(path, 'all')` in both readers,
+   * which made `Settings ▸ Inspections ▸ default highlighting level` inert for every editor —
+   * the one surface it is defined for — because a file with no per-file override always resolved
+   * to `all` regardless of what the setting said.
+   */
+  const defaultLevel = useWorkspace((s) =>
+    levelOf(s.boot?.workspace.settings.inspections.defaultHighlightLevel),
+  )
+  const level = useSyncExternalStore(
+    subscribeHighlightLevels,
+    () => levelFor(path, defaultLevel),
+    () => levelFor(path, defaultLevel),
+  )
+  const diagnostics = useMemo(() => {
+    const items = snapshot.kind === 'unavailable' ? [] : (snapshot.items ?? [])
+    const filters: DiagnosticFilters = {
+      severities: { error: true, warning: true, info: true, hint: true },
+      sources: {},
+      level,
+    }
+    return items.filter((item) => item.absPath === path && visible(item, filters))
+  }, [snapshot, path, level])
   const [load, setLoad] = useState<Load>({ kind: 'loading' })
   const [reloadKey, setReloadKey] = useState(0)
   /** Set when the file changed on disk while the buffer had unsaved edits. */
@@ -157,6 +256,10 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
       fileApi.write(path, text).then(
         () => {
           setConflict(false)
+          // After the write, not before: `didSave` makes rust-analyzer re-run `cargo check`, and
+          // checking a file that is still mid-write is how you get a diagnostic for a truncated
+          // buffer. This is also the notification the whole panel depends on — see `docSync.ts`.
+          savedDoc(path)
         },
         (error: unknown) => {
           void diag.log(`could not save ${path}: ${String(error)}`)
@@ -235,9 +338,12 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
         </div>
       )}
       <div className={styles.surface}>
+        <OutlineFeed project={project} path={path} text={load.text} />
+        <SyncFeed project={project} path={path} text={load.text} />
         <EditorSurface
           path={path}
           root={root}
+          project={project}
           doc={load.text}
           reloadKey={reloadKey}
           readOnly={!load.writable}
@@ -245,8 +351,98 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           onSave={onSave}
           onSelection={reportSelection}
           onSaveHandle={registerSaveHandle}
+          symbols={outline}
+          onDocChanged={(read) => {
+            // Debounced in the store, and the text is read when the timer fires — so the popup,
+            // the breadcrumb and the member walk follow the buffer rather than the last save.
+            if (project !== undefined) scheduleOutline(project as ProjectId, path, read)
+            // The same reader on its own timer: this is what gives the language server the
+            // *unsaved* text, which is the whole of what it has over `cargo check` in a terminal.
+            scheduleDoc(path, read)
+          }}
+          diagnostics={diagnostics}
+          highlight={level}
         />
       </div>
     </div>
   )
+}
+
+/**
+ * Seed `outlineStore` for this buffer.
+ *
+ * A component with no markup rather than an effect inside `EditorPane`, because it needs to re-run
+ * when the *loaded text* changes and `EditorPane`'s own effects are keyed on the path.
+ *
+ * This is the **load** path only. Keeping up with the user's typing is `onDocChanged` above, which
+ * debounces through `scheduleOutline` — the two together are what make the breadcrumb, the File
+ * Structure popup and the member walk follow the buffer rather than the last save.
+ */
+function OutlineFeed({
+  project,
+  path,
+  text,
+}: {
+  project?: string | undefined
+  path: string
+  text: string
+}): null {
+  useEffect(() => {
+    if (project === undefined) return
+    fetchOutline(project as ProjectId, path, text)
+  }, [project, path, text])
+
+  useEffect(() => () => forgetOutline(path), [path])
+  return null
+}
+
+/**
+ * Tell the language server this buffer exists, and keep telling it.
+ *
+ * A sibling of [`OutlineFeed`] rather than part of it, because the two answer to different owners:
+ * the outline is ours and is derived on demand, while this is a *protocol* whose open/close pairs
+ * have to balance across a process boundary. `docSync.ts` carries the reasoning, including the
+ * measurement showing that without these notifications the panel freezes at the state the project
+ * opened in.
+ *
+ * Typing is handled by `onDocChanged` above; the two effects here are the load path only.
+ */
+function SyncFeed({
+  project,
+  path,
+  text,
+}: {
+  project?: string | undefined
+  path: string
+  text: string
+}): null {
+  /** The text this document was opened with, so the reload effect can recognise its own first run. */
+  const opened = useRef<string | null>(null)
+
+  /*
+   * `text` is deliberately **not** a dependency of this effect.
+   *
+   * Including it would close and re-open the document on every reload from disk, and `didOpen` on
+   * a URI that is already open is a protocol violation — the server would be holding two versions
+   * of one file with no rule for which wins. A reload is a *change*, and that is the effect below.
+   */
+  useEffect(() => {
+    if (project === undefined) return
+    opened.current = text
+    openDoc(project as ProjectId, path, text)
+    return () => {
+      opened.current = null
+      closeDoc(path)
+    }
+  }, [project, path])
+
+  useEffect(() => {
+    if (project === undefined) return
+    // Skips the run that pairs with the `openDoc` above — that text is already the server's.
+    if (opened.current === null || opened.current === text) return
+    opened.current = text
+    resetDoc(path, text)
+  }, [project, path, text])
+
+  return null
 }

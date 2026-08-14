@@ -1,0 +1,387 @@
+//! Wire types for problems: what the analysers found, who found it, and who has not answered
+//! yet. (M12)
+//!
+//! # The one failure this shape exists to prevent
+//!
+//! `ui/src/sidebar/ProblemsPanel/model.ts` states it, and every decision here follows from it:
+//!
+//! > a problems panel has exactly one failure mode it cannot survive: showing a confident empty
+//! > list when nothing has looked.
+//!
+//! `[]` from a language server and `[]` because none is running are opposite claims about the
+//! workspace, and an array cannot tell them apart. So [`DiagnosticsSnapshot`] is a tagged union
+//! with `Unavailable` as a first-class state, and `Ready { items: [] }` is the only shape that
+//! means "something looked and found nothing".
+//!
+//! # Why a snapshot carries *both* a joined label and a per-source array
+//!
+//! There are up to four sources — `rust-analyzer`, `gopls`, tree-sitter, and Claude — and one
+//! `kind` for the whole snapshot. With rust-analyzer still indexing while gopls has answered
+//! with twelve findings, a single-source snapshot must be either `Scanning` (hiding twelve real
+//! findings while saying "the analyser has not reported yet") or `Ready` (a clean-ish bill of
+//! health for the Rust half of the workspace). Both are the failure above.
+//!
+//! So `Scanning` may carry the items that *are* known, and every arm carries
+//! [`SourceReport`]s — which is also the only way the panel can render "rust-analyzer is not
+//! installed" beside "gopls found nothing". Crucially this changes none of the load-bearing
+//! predicates on the frontend: a `Scanning` snapshot with items is still not `checked()`, still
+//! yields `null` from `statusBarCounts` (so the bar shows `✗ —`, not `✗ 0`), and still headlines
+//! as `unknown`. The only thing that changes is that the panel may show rows it genuinely has,
+//! beneath a headline naming who has not answered.
+//!
+//! # Units
+//!
+//! Lines and columns are 1-based, and columns are **UTF-16 code units** — LSP's own
+//! `Position.character` plus one. Deliberately not converted to scalar values: the consumer is
+//! CodeMirror, which is UTF-16-native, so the unconverted offset is what makes "jump to this
+//! problem" land in the right place. See `cide_lsp::convert` for the full argument; it is the
+//! kind of decision a later tidying pass "corrects" into a bug.
+
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+/// The severities an analyser can report, in LSP's own set.
+///
+/// All four are rendered rather than the two the status bar counts: dropping info and hint at
+/// the wire boundary would mean the panel could not show a diagnostic that exists, which is the
+/// same class of lie as an empty list.
+///
+/// IDEA's *weak warning* is this enum's `Info` is LSP's `Information` — one thing, three names.
+/// A fifth variant for it would mean changing `SEVERITIES`, `SEVERITY_RANK`, `SeverityCounts`,
+/// `summaryLine` and every assertion in `check-problems.mjs`, for a distinction neither
+/// rust-analyzer nor gopls makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// Whether a diagnostic is about the shape of the text or about its meaning.
+///
+/// Set by the **producer**, never inferred by the UI. "tree-sitter means syntax" happens to be
+/// true today and stops being true the moment a language server reports a parse error, so the
+/// per-editor `Syntax only` highlighting level reads this field rather than guessing from
+/// [`Diagnostic::source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DiagnosticKind {
+    Syntax,
+    Semantic,
+}
+
+/// Which analyser produced something.
+///
+/// An enum rather than a bare string on the *report*, so the settings screen and the store
+/// agree on the set. [`Diagnostic::source`] stays a string because it carries the producer's own
+/// name (`clippy` arrives inside rust-analyzer's stream) and an unrecognised one must survive to
+/// the panel rather than be dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DiagnosticSourceId {
+    RustAnalyzer,
+    Gopls,
+    TreeSitter,
+    Claude,
+}
+
+impl DiagnosticSourceId {
+    /// What the user sees. Not derived from the variant name: `rustAnalyzer` is not how anyone
+    /// writes it, and this string appears in "Reported by …" and in the settings rows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RustAnalyzer => "rust-analyzer",
+            Self::Gopls => "gopls",
+            Self::TreeSitter => "tree-sitter",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+/// One problem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Diagnostic {
+    /// Workspace-relative, forward slashes — the form the tree, the tab strip and the panel's
+    /// group headings already use. What the row *displays*.
+    pub path: String,
+    /// Absolute. What `file.open` and `requestReveal` act on.
+    ///
+    /// Carried beside `path` rather than derived from it, because the frontend has no reliable
+    /// way back: a multi-root project prefixes `rel` with a root label, and re-joining that onto
+    /// a root is a second place to get the mapping wrong.
+    pub abs_path: String,
+    pub line: u32,
+    pub column: u32,
+    /// The extent of the squiggle. Exclusive, like every other end in this crate.
+    pub end_line: u32,
+    pub end_column: u32,
+    pub severity: Severity,
+    pub kind: DiagnosticKind,
+    pub message: String,
+    /// Who said so — `rust-analyzer`, `clippy`, `gopls`, `tree-sitter`, `claude`.
+    ///
+    /// **Required, not optional.** It is a filter axis, and an unnamed source cannot be toggled
+    /// off. The producer always knows its own name.
+    pub source: String,
+    /// The producer's own code, e.g. `E0308`. Rendered dimmed after the message.
+    ///
+    /// `string | null` on the wire, not `code?: string`: `#[ts(optional)]` changes the emitted
+    /// type without changing what serde writes, so on an outbound DTO it promises an absent
+    /// field and sends a null one. See [`crate::Symbol::detail`].
+    pub code: Option<String>,
+}
+
+/// What one analyser is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum SourceStatus {
+    /// Not running, and `reason` says why in a sentence the user can act on: *"rust-analyzer is
+    /// not on PATH. Install it with `rustup component add rust-analyzer`."*
+    ///
+    /// The prose is built in Rust, where the fact is known — the same call
+    /// `cmd::file::not_connected` makes.
+    Unavailable { reason: String },
+    /// Started, and has not finished its first pass. `detail` is the progress line, because
+    /// "Waiting for rust-analyzer" with nothing after it for two minutes is indistinguishable
+    /// from a hang.
+    Scanning { detail: String },
+    /// Answered. Note that this is reached when the last `$/progress` token ends **and** the
+    /// handshake completed — never "when a diagnostic has been seen". A clean Rust workspace
+    /// publishes nothing at all, and a ready-requires-a-diagnostic rule would leave it
+    /// `Scanning` for ever: the mirror image of the failure this module exists to prevent.
+    Ready,
+}
+
+/// One analyser's line in the panel's source list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SourceReport {
+    pub id: DiagnosticSourceId,
+    /// [`DiagnosticSourceId::label`], carried on the wire so the frontend never rebuilds it.
+    pub label: String,
+    pub status: SourceStatus,
+    /// How many of the snapshot's items came from here.
+    pub items: u32,
+}
+
+/// What the app knows about a project's problems right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum DiagnosticsSnapshot {
+    /// Nothing is analysing this workspace. `reason` is what both the panel body and the status
+    /// bar's tooltip say.
+    Unavailable {
+        reason: String,
+        sources: Vec<SourceReport>,
+    },
+    /// At least one enabled source has not answered yet.
+    ///
+    /// `items` is what the sources that *have* answered found — see the module docs. It is not a
+    /// count and must never be rendered as one.
+    Scanning {
+        /// The still-scanning sources, joined for the headline.
+        source: String,
+        items: Vec<Diagnostic>,
+        sources: Vec<SourceReport>,
+    },
+    /// Every enabled source answered. `items: []` is a real, reportable zero.
+    Ready {
+        /// The sources that answered, joined — "no problems" is only as good as who checked.
+        source: String,
+        items: Vec<Diagnostic>,
+        sources: Vec<SourceReport>,
+        /// How many items were dropped by the emit cap.
+        ///
+        /// Non-zero means `items` is a prefix. The header counter must report
+        /// `items.len() + truncated`: saying `1000` when there are `1214` is the same quiet lie
+        /// the panel exists to avoid, one layer down.
+        truncated: u32,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(path: &str, severity: Severity, message: &str) -> Diagnostic {
+        Diagnostic {
+            path: path.into(),
+            abs_path: format!("/repo/{path}"),
+            line: 12,
+            column: 5,
+            end_line: 12,
+            end_column: 9,
+            severity,
+            kind: DiagnosticKind::Semantic,
+            message: message.into(),
+            source: "rust-analyzer".into(),
+            code: Some("E0308".into()),
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_survives_the_json_round_trip_under_its_wire_names() {
+        let item = at("src/lib.rs", Severity::Error, "mismatched types");
+        let json = serde_json::to_string(&item).expect("serialize");
+
+        // Equality alone would pass with snake_case on both sides, and every multi-word field
+        // would read `undefined` in the webview.
+        for wire in [
+            r#""absPath":"/repo/src/lib.rs""#,
+            r#""endLine":12"#,
+            r#""endColumn":9"#,
+            r#""severity":"error""#,
+            r#""kind":"semantic""#,
+        ] {
+            assert!(json.contains(wire), "{wire} missing from {json}");
+        }
+        assert_eq!(
+            serde_json::from_str::<Diagnostic>(&json).expect("round trip"),
+            item
+        );
+    }
+
+    #[test]
+    fn scanning_with_items_is_a_different_document_from_ready_with_the_same_items() {
+        // The distinction the whole union exists for. If a partial answer serialized the same
+        // as a complete one, the bar would print a count while an analyser was still indexing.
+        let items = vec![at("src/a.rs", Severity::Error, "boom")];
+        let partial = DiagnosticsSnapshot::Scanning {
+            source: "rust-analyzer".into(),
+            items: items.clone(),
+            sources: Vec::new(),
+        };
+        let complete = DiagnosticsSnapshot::Ready {
+            source: "gopls".into(),
+            items,
+            sources: Vec::new(),
+            truncated: 0,
+        };
+
+        let partial = serde_json::to_string(&partial).expect("serialize");
+        let complete = serde_json::to_string(&complete).expect("serialize");
+        assert!(partial.contains(r#""kind":"scanning""#), "{partial}");
+        assert!(complete.contains(r#""kind":"ready""#), "{complete}");
+        assert_ne!(partial, complete);
+        // And only the complete one can carry a truncation count, because only a complete
+        // answer has a total to be a prefix of.
+        assert!(!partial.contains("truncated"), "{partial}");
+    }
+
+    #[test]
+    fn an_unavailable_snapshot_carries_no_items_field_at_all() {
+        // Not `items: []`. A reader that pattern-matched on `kind` would be fine either way, but
+        // one that reached for `.items?.length ?? 0` would read a confident zero.
+        let json = serde_json::to_string(&DiagnosticsSnapshot::Unavailable {
+            reason: "No language server is running for this project.".into(),
+            sources: Vec::new(),
+        })
+        .expect("serialize");
+        assert!(!json.contains("items"), "{json}");
+    }
+
+    #[test]
+    fn every_source_id_has_a_label_that_is_not_its_variant_name() {
+        // The labels are user-visible and appear in "Reported by …". Deriving them from the
+        // variant would print `rustAnalyzer`, which is not how anyone writes it.
+        assert_eq!(DiagnosticSourceId::RustAnalyzer.label(), "rust-analyzer");
+        assert_eq!(DiagnosticSourceId::Gopls.label(), "gopls");
+        assert_eq!(DiagnosticSourceId::TreeSitter.label(), "tree-sitter");
+        assert_eq!(DiagnosticSourceId::Claude.label(), "claude");
+    }
+
+    #[test]
+    fn a_source_status_round_trips_with_its_reason_intact() {
+        // The reason is the whole value of the `Unavailable` state — it is the sentence the user
+        // reads and acts on. A tagged enum that dropped its payload would render an empty
+        // explainer, which looks exactly like a panel that has nothing to say.
+        let status = SourceStatus::Unavailable {
+            reason: "gopls is not on PATH. Install it with `go install \
+                     golang.org/x/tools/gopls@latest`."
+                .into(),
+        };
+        let back: SourceStatus =
+            serde_json::from_str(&serde_json::to_string(&status).expect("serialize"))
+                .expect("round trip");
+        assert_eq!(back, status);
+    }
+
+    #[test]
+    fn severity_orders_worst_first() {
+        // The panel sorts by this, and the derive follows declaration order. Pinned because
+        // reordering the variants for tidiness would silently invert the panel's rows.
+        let mut all = [
+            Severity::Hint,
+            Severity::Error,
+            Severity::Info,
+            Severity::Warning,
+        ];
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                Severity::Error,
+                Severity::Warning,
+                Severity::Info,
+                Severity::Hint
+            ]
+        );
+    }
+}
+
+/// Where the declaration under the caret lives — or why cide cannot say.
+///
+/// # Three variants and never a rejected promise
+///
+/// The same rule `DiagnosticsSnapshot` is built on, one gesture over: "the analyser has not
+/// finished indexing" and "there is no declaration here" are *different answers*, and a user who
+/// is told the second when the first is true concludes the feature is broken. Both are worth a
+/// sentence, and a rejected promise carries neither.
+///
+/// This is why `diagnostics_definition` returns `Self` rather than `Result<Option<_>, _>`: an
+/// `Option` collapses "nothing found" and "nobody looked" into `None`, which is exactly the
+/// distinction the whole diagnostics surface exists to preserve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum DefinitionAnswer {
+    /// A declaration, in cide's units: 1-based line, 1-based UTF-16 column.
+    ///
+    /// `path` is absolute, because the target is frequently a file no pane has open — and often
+    /// outside the project entirely, in `~/.cargo/registry` or `$GOMODCACHE`, where nothing
+    /// relative would resolve.
+    Found {
+        path: String,
+        line: u32,
+        column: u32,
+    },
+    /// The server answered, and its answer was "no declaration here".
+    ///
+    /// Not an error and not a failure: a caret on a keyword, a comment, or a macro-generated name
+    /// legitimately resolves to nothing.
+    NotFound,
+    /// Nobody could be asked. `reason` is shown to the user verbatim.
+    Unavailable { reason: String },
+}

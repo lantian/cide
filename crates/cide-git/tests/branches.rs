@@ -567,16 +567,15 @@ fn a_fast_forward_pull_reports_what_it_brought_down() {
         before[..8],
         "the pull says where the branch was, so the user can `git show` the range"
     );
-    assert_eq!(outcome.new_oid, work.git(&["rev-parse", "HEAD"]).trim()[..8]);
+    assert_eq!(
+        outcome.new_oid,
+        work.git(&["rev-parse", "HEAD"]).trim()[..8]
+    );
 
     // Totals across the whole fast-forward, not summed per commit: `a.txt` was touched once
     // and `b.txt` created, which is two files and two insertions.
     assert_eq!(
-        (
-            outcome.files_changed,
-            outcome.insertions,
-            outcome.deletions
-        ),
+        (outcome.files_changed, outcome.insertions, outcome.deletions),
         (2, 2, 0)
     );
 
@@ -704,7 +703,10 @@ fn a_detached_head_is_told_it_is_detached() {
 
     match branch::pull(&work.root, None, &untouched()) {
         Err(GitError::DetachedHead { head }) => {
-            assert!(tip.starts_with(&head), "the sentence names where you are: {head}");
+            assert!(
+                tip.starts_with(&head),
+                "the sentence names where you are: {head}"
+            );
         }
         other => panic!("expected DetachedHead, got {other:?}"),
     }
@@ -725,7 +727,10 @@ fn an_unborn_branch_cannot_be_pulled() {
         origin.root.to_str().expect("utf-8 path"),
     ]);
 
-    assert_eq!(branch::pull(&work.root, None, &untouched()), Err(GitError::Unborn));
+    assert_eq!(
+        branch::pull(&work.root, None, &untouched()),
+        Err(GitError::Unborn)
+    );
 }
 
 #[test]

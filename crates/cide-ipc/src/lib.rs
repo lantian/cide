@@ -19,10 +19,11 @@ pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use keymap::{Binding, Command, KeymapLayer, ResolvedBinding};
 pub use settings::{
-    ClaudeSettings, DEFAULT_CODE_FONT_SIZE, EditorSettings, GraphicsSettings, MAX_CODE_FONT_SIZE,
-    MIN_CODE_FONT_SIZE, ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH,
-    SIDEBAR_MIN_WIDTH, Settings, SidebarSettings, TerminalRenderer, TerminalSettings,
-    clamp_font_size, normalize_proxy_url, redact_proxy_url,
+    ClaudeSettings, DEFAULT_CODE_FONT_SIZE, EditorSettings, GraphicsSettings, HighlightLevel,
+    InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MIN_CODE_FONT_SIZE,
+    MIN_PUSH_DEBOUNCE_MS, ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH, Settings, SeverityFilter, SidebarSettings, TerminalRenderer,
+    TerminalSettings, clamp_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapProblem, KeymapReport, SettingsPatch,
@@ -45,6 +46,23 @@ pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section
 // comment in `search.rs` for why they are not the picker's.
 pub use search::{SearchFrame, SearchHit, SearchMode, SearchQuery};
+
+// --- M12: language support ---
+//
+// Two modules rather than one, because they answer to different producers and neither knows
+// about the other: `symbols` is `cide-lang`'s tree-sitter output, `diagnostics` is the merged
+// view over `cide-lsp`, `cide-lang` and a Claude one-shot. The only thing they share is that a
+// file has both, and that is not a reason to put them in one file.
+pub mod diagnostics;
+pub mod symbols;
+
+pub use diagnostics::{
+    DefinitionAnswer, Diagnostic, DiagnosticKind, DiagnosticSourceId, DiagnosticsSnapshot,
+    Severity, SourceReport, SourceStatus,
+};
+pub use symbols::{
+    FileOutline, Symbol, SymbolFrame, SymbolIndexStatus, SymbolKind, SymbolRow, SymbolSpan,
+};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

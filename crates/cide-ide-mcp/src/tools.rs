@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::diff_broker::{CancelReason, DiffBroker, DiffRequest};
+use crate::protocol;
 use crate::protocol::{CloseTabParams, Content, DiffOutcome, OpenDiffParams, tool};
 use crate::server::ServerEvent;
 
@@ -186,15 +187,69 @@ pub async fn close_all_diff_tabs(
     ToolResult::ok(Vec::new())
 }
 
+/// Where `getDiagnostics` reads from.
+///
+/// A trait object, and both halves of that are deliberate.
+///
+/// **Not a struct**, because the store lives in `cide-app`'s managed state and this crate must
+/// not depend on tauri. A vtable call carries exactly the one question this tool asks — the same
+/// trade `cide_app::files::FsEvents` already makes for the same reason.
+///
+/// **Not a channel**, because the CLI is *blocked* on this call. A request/response over an mpsc
+/// pair would add a second way for the answer never to arrive, and `openDiff` is this crate's
+/// standing proof that an unanswered request is its worst bug class. A read of a lock cannot hang.
+pub trait DiagnosticSource: Send + Sync + 'static {
+    /// `None` asks for everything.
+    ///
+    /// `uri` arrives as the CLI sent it — a `file://` URI, possibly percent-encoded. Resolving it
+    /// is the implementor's job, because only `cide-app` knows the project's roots.
+    fn diagnostics(&self, uri: Option<&str>) -> Vec<protocol::UriDiagnostics>;
+}
+
 /// Language-server diagnostics for a file, or for everything.
 ///
-/// This is not a stub awaiting an implementation. cide runs no language server, so nothing in
-/// this process has ever looked at the file; an empty list is the true answer to "what did
-/// the language server find". The alternatives are both lies — an error claims something went
-/// wrong, and invented entries claim work nobody did. The CLI parses `content[0].text` as a
-/// JSON array of `{uri, diagnostics}`, so the empty array goes there as text.
-pub fn get_diagnostics() -> ToolResult {
-    ToolResult::text("[]")
+/// # What an empty answer means
+///
+/// `[]` is returned when no [`DiagnosticSource`] was installed — which is still a true sentence
+/// rather than a stub: nothing in this process has looked, so there is nothing to report. The
+/// alternatives are both lies. An error claims something went wrong; invented entries claim work
+/// nobody did.
+///
+/// Note the second, finer distinction the source itself makes: `[{uri, diagnostics: []}]` means
+/// *"we looked at that file and it is clean"*, while `[]` for a named `uri` means *"nothing has
+/// ever looked at it"*. That is the same rule the Problems panel is built on, one layer down and
+/// aimed at an agent rather than at a person.
+///
+/// # No filtering, and this is a rule rather than an omission
+///
+/// The user's severity and highlighting-level settings **do not** reach here. Those are display
+/// preferences — a statement about their own screen, not about what Claude should be told. Only
+/// the per-*source* toggles have any effect, and they have it upstream: a source that is switched
+/// off is not running, so it has nothing to report and Claude correctly sees nothing.
+///
+/// The CLI parses `content[0].text` as a JSON array, so the answer goes there as text.
+pub fn get_diagnostics(arguments: &Value, source: Option<&dyn DiagnosticSource>) -> ToolResult {
+    // Absent, `null`, and the empty string all mean "everything". The CLI sends `{}` at the start
+    // of a turn and `{uri}` afterwards, and being strict about the difference between a missing
+    // key and a null one would answer one of those two with nothing.
+    let uri = arguments
+        .get("uri")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.is_empty());
+
+    let Some(source) = source else {
+        return ToolResult::text("[]");
+    };
+    let files = source.diagnostics(uri);
+    match serde_json::to_string(&files) {
+        Ok(text) => ToolResult::text(text),
+        // Unreachable for these types, and reported rather than unwrapped because a panic here
+        // would poison the connection task and leave the agent's call unanswered for ever.
+        Err(error) => {
+            tracing::warn!(%error, "could not serialize diagnostics");
+            ToolResult::text("[]")
+        }
+    }
 }
 
 /// Arguments to `openFile`.
@@ -358,14 +413,119 @@ mod tests {
         );
     }
 
+    /// A source that answers from a fixed table, so the tool can be driven without an app.
+    struct FakeSource(Vec<protocol::UriDiagnostics>);
+
+    impl DiagnosticSource for FakeSource {
+        fn diagnostics(&self, uri: Option<&str>) -> Vec<protocol::UriDiagnostics> {
+            match uri {
+                None => self.0.clone(),
+                Some(uri) => self.0.iter().filter(|f| f.uri == uri).cloned().collect(),
+            }
+        }
+    }
+
+    fn fake_source() -> FakeSource {
+        FakeSource(vec![
+            protocol::UriDiagnostics {
+                uri: "file:///repo/a.rs".into(),
+                diagnostics: vec![protocol::LspDiagnostic {
+                    range: protocol::LspRange {
+                        start: protocol::LspPosition {
+                            line: 11,
+                            character: 4,
+                        },
+                        end: protocol::LspPosition {
+                            line: 11,
+                            character: 9,
+                        },
+                    },
+                    severity: 1,
+                    code: Some("E0308".into()),
+                    source: Some("rust-analyzer".into()),
+                    message: "mismatched types".into(),
+                }],
+            },
+            // Looked at, and clean. Distinguishable from a file nothing has opened only because
+            // the entry exists at all — which is the point of the next test but one.
+            protocol::UriDiagnostics {
+                uri: "file:///repo/clean.rs".into(),
+                diagnostics: Vec::new(),
+            },
+        ])
+    }
+
     #[tokio::test]
-    async fn get_diagnostics_answers_an_empty_list() {
-        let result = get_diagnostics();
+    async fn get_diagnostics_without_a_source_answers_an_empty_list() {
+        // Unchanged in substance from when nothing in this process could look: an empty array is
+        // the true answer to "what did the language server find" when none has been installed.
+        // What changed is *why* — see the tool's own doc comment.
+        let result = get_diagnostics(&json!({}), None);
         assert!(!result.is_error);
         assert_eq!(result.content, vec![Content::text("[]")]);
         // The CLI runs `JSON.parse` on this text and iterates the result.
         let parsed: Value = serde_json::from_str("[]").expect("the answer is valid JSON");
         assert_eq!(parsed, json!([]));
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_reports_what_the_store_holds() {
+        let source = fake_source();
+        let result = get_diagnostics(&json!({}), Some(&source));
+        assert!(!result.is_error);
+        let Content::Text { text } = &result.content[0];
+        let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+        assert_eq!(parsed.as_array().expect("array").len(), 2);
+        assert_eq!(parsed[0]["uri"], "file:///repo/a.rs");
+        assert_eq!(parsed[0]["diagnostics"][0]["message"], "mismatched types");
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_uses_lsps_numbering_and_not_cides() {
+        // The CLI reads these fields as LSP's: 0-based positions and a *numeric* severity. Handing
+        // it cide's 1-based lines and a string severity would be garbage it silently drops.
+        let source = fake_source();
+        let result = get_diagnostics(&json!({"uri": "file:///repo/a.rs"}), Some(&source));
+        let Content::Text { text } = &result.content[0];
+        let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+        let diagnostic = &parsed[0]["diagnostics"][0];
+        assert_eq!(diagnostic["range"]["start"]["line"], 11);
+        assert_eq!(diagnostic["range"]["start"]["character"], 4);
+        assert_eq!(diagnostic["severity"], 1);
+        assert_eq!(diagnostic["code"], "E0308");
+    }
+
+    #[tokio::test]
+    async fn get_diagnostics_for_one_uri_answers_only_that_uri() {
+        let source = fake_source();
+        let result = get_diagnostics(&json!({"uri": "file:///repo/clean.rs"}), Some(&source));
+        let Content::Text { text } = &result.content[0];
+        let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+        assert_eq!(parsed.as_array().expect("array").len(), 1);
+        // Looked at and clean — **not** the same answer as a file nothing has opened, which is
+        // an empty outer array. Same rule as the Problems panel's, aimed at an agent.
+        assert_eq!(parsed[0]["diagnostics"], json!([]));
+
+        let unopened = get_diagnostics(&json!({"uri": "file:///repo/never.rs"}), Some(&source));
+        let Content::Text { text } = &unopened.content[0];
+        assert_eq!(text, "[]");
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_absent_uri_both_mean_everything() {
+        // The CLI sends `{}` at the start of a turn and `{uri}` afterwards. Being strict about a
+        // missing key versus a null one would answer one of those two with nothing.
+        let source = fake_source();
+        for arguments in [json!({}), json!({ "uri": null }), json!({ "uri": "" })] {
+            let result = get_diagnostics(&arguments, Some(&source));
+            let Content::Text { text } = &result.content[0];
+            let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+            assert_eq!(
+                parsed.as_array().expect("array").len(),
+                2,
+                "{arguments} did not mean everything"
+            );
+        }
     }
 
     #[tokio::test]

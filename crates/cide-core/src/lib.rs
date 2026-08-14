@@ -19,6 +19,7 @@
 
 pub mod child_env;
 pub mod commands;
+pub mod diagnostics;
 pub mod document;
 pub mod error;
 pub mod handshake;

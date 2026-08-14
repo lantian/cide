@@ -239,6 +239,38 @@ pub fn git_status(
     }
 }
 
+// --- diagnostics (M12) ---------------------------------------------------------------------
+
+/// A project's merged diagnostics changed.
+///
+/// Carries no payload beyond the project id, and no `rev`. Both are deliberate.
+///
+/// **No payload**, because the snapshot depends on settings the emitter would have to read and
+/// the receiver already has: the frontend answers with `diagnostics_get`, which projects the
+/// store through the *current* `InspectionSettings`. Pushing a snapshot would mean pushing one
+/// per window whenever a filter changed, for a surface that is usually closed.
+///
+/// **No `rev`**, for the reason `git_status` carries none: a diagnostic moves no pane, and a
+/// revision here would re-hydrate every window's whole workspace on every `publishDiagnostics`.
+///
+/// **Coalesced before it gets here.** rust-analyzer publishes per file and a workspace check is
+/// hundreds of publishes in a burst; ADR 0003's rule about the GTK main loop applies to this the
+/// same way it applies to terminal output. See `crate::lsp`'s 250 ms debounce and 1 s ceiling —
+/// that coalescing is a correctness requirement, not tuning.
+pub const DIAGNOSTICS: &str = "cide://diagnostics";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Diagnostics {
+    project: cide_ipc::ProjectId,
+}
+
+pub fn diagnostics(app: &AppHandle, project: cide_ipc::ProjectId) {
+    if let Err(error) = app.emit(DIAGNOSTICS, Diagnostics { project }) {
+        tracing::debug!(%error, "diagnostics reached no window");
+    }
+}
+
 /// A window-manager close was refused because it would discard unsaved work.
 ///
 /// The only path that needs an event rather than an error. Alt+F4 and the compositor's own
