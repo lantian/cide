@@ -448,31 +448,47 @@ try {
     'a focused pane still lights its border with the accent — the ring exists for the kinds ' +
       'that kept it, and the editor exception below is meaningless without it',
   )
-  const editorBorder = /\.frame\[data-kind='editor'\]\.frameFocused \{([^}]*)\}/.exec(paneCss)?.[1]
+  // Both CodeMirror kinds, and `diff` is here on the user's decision rather than by symmetry.
+  // The case for keeping it on a diff was that the pane is *answerable* — Accept / Reject, on a
+  // turn a claude may be blocked on — but that is an argument about how much the pane matters,
+  // and the ring answers "where do my keystrokes go". A diff answers that itself, the same way
+  // an editor does, because it is the same surface.
+  //
+  // Driven as a loop rather than written twice: the two kinds must not drift into one having a
+  // ring the other does not, which is the state the user has now corrected once.
+  for (const kind of ['editor', 'diff']) {
+    const border = new RegExp(
+      `\\.frame\\[data-kind='${kind}'\\]\\.frameFocused[^{:]*\\{([^}]*)\\}`,
+    ).exec(paneCss)?.[1]
+    ok(
+      border !== undefined && /border-color:\s*var\(--border\)/.test(border),
+      `a focused ${kind} pane's border stays the ordinary \`--border\`, so the frame does not ` +
+        'change colour under the caret',
+    )
+    ok(
+      new RegExp(`\\.frame\\[data-kind='${kind}'\\]\\.frameFocused::after`).test(paneCss),
+      `${kind} panes are named in the \`::after\` override too`,
+    )
+  }
+  const ringOff = /\.frameFocused::after[^{]*\{([^}]*)\}/g
   ok(
-    editorBorder !== undefined && /border-color:\s*var\(--border\)/.test(editorBorder),
-    "a focused editor pane's border stays the ordinary `--border`, so the frame does not " +
-      'change colour under the caret',
-  )
-  const editorRing = /\.frame\[data-kind='editor'\]\.frameFocused::after \{([^}]*)\}/.exec(paneCss)?.[1]
-  ok(
-    editorRing !== undefined && /content:\s*none/.test(editorRing),
-    "and its `::after` declares `content: none`, so the second accent pixel generates no box " +
-      'at all — `display: none` would leave one for a later edit to bring back',
+    [...paneCss.matchAll(ringOff)].some(([, body]) => /content:\s*none/.test(body)),
+    'and the override declares `content: none`, so the second accent pixel generates no box at ' +
+      'all — `display: none` would leave one for a later edit to bring back',
   )
   // Specificity, not source order, is what makes those two win: the base rule is one class
   // (0,1,0) and each override is two classes plus an attribute (0,3,0). Asserted because a
   // future tidy that rewrote the override as a bare `.frameFocusedEditor` would still match
   // both greps above and would then lose the cascade to `.frameFocused`.
-  for (const selector of [
-    ".frame[data-kind='editor'].frameFocused",
-    ".frame[data-kind='editor'].frameFocused::after",
-  ]) {
-    const classes = (selector.match(/\./g) ?? []).length
-    ok(
-      classes >= 2 && selector.includes("[data-kind='editor']"),
-      `${selector} outranks the \`.frameFocused\` rule it is overriding`,
-    )
+  for (const kind of ['editor', 'diff']) {
+    for (const suffix of ['', '::after']) {
+      const selector = `.frame[data-kind='${kind}'].frameFocused${suffix}`
+      const classes = (selector.match(/\./g) ?? []).length
+      ok(
+        classes >= 2 && paneCss.includes(selector),
+        `${selector} is written out, so it outranks the \`.frameFocused\` rule it overrides`,
+      )
+    }
   }
   //
   // And the half that must NOT have moved. Removing the ring removed a decoration; the focus

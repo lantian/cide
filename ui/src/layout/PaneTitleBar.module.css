@@ -127,21 +127,28 @@
  * domain considers focused — `paneAudit` reads the tree, but a human debugging with the
  * inspector reads this.
  *
- * `data-kind='editor'` only. A `diff` pane keeps its ring: it is CodeMirror too, but it is
- * *answerable* — Reject / Accept as proposed / Accept, on a turn a `claude` may be blocked on
- * — and it is routinely opened beside other panes rather than alone in its tab.
+ * **`diff` as well as `editor`**, on the user's decision. The argument for keeping the ring on a
+ * diff was that it is *answerable* — Reject / Accept as proposed / Accept, on a turn a `claude`
+ * may be blocked on — and is routinely opened beside other panes rather than alone in its tab.
+ * That argument is about how much the pane matters, and the ring is not a signal about
+ * importance: it answers *where do my keystrokes go*, and a diff answers that the same way an
+ * editor does, because it is the same CodeMirror surface with the same blurred-cursor and
+ * active-line behaviour. The pane still tells the user it is the focused one — through
+ * `data-focused`, through the domain, and through the controls it carries.
  *
- * These two selectors outrank `.frame[data-awaiting='true']` on specificity (0,3,1 against
- * 0,2,1), which would matter if an editor could ever be awaiting. It cannot: `awaiting` is
- * derived from the pane's *session*, and an editor pane is built with `session: None` and
- * never binds one. Left as a note rather than defended with a `:not()`, because a `:not()`
- * here is exactly what the awaiting rule's own comment forbids.
+ * These selectors outrank `.frame[data-awaiting='true']` on specificity (0,3,1 against 0,2,1),
+ * which would matter if either kind could be awaiting. Neither can: `awaiting` is derived from
+ * the pane's *session*, and both an editor and a diff pane are built with `session: None` and
+ * never bind one. Left as a note rather than defended with a `:not()`, because a `:not()` here
+ * is exactly what the awaiting rule's own comment forbids.
  */
-.frame[data-kind='editor'].frameFocused {
+.frame[data-kind='editor'].frameFocused,
+.frame[data-kind='diff'].frameFocused {
   border-color: var(--border);
 }
 
-.frame[data-kind='editor'].frameFocused::after {
+.frame[data-kind='editor'].frameFocused::after,
+.frame[data-kind='diff'].frameFocused::after {
   content: none;
 }
 
