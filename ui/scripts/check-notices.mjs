@@ -28,7 +28,7 @@
  * Run: `pnpm --dir ui run check:notices`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -231,6 +231,41 @@ try {
   m.notify('after unsubscribing')
   eq(woken, before, 'an unsubscribed listener is not called')
   m.clearNotices()
+
+  /* ------------------------------------------------------- the text has to be copyable out */
+  //
+  // A notice exists to carry something the user cannot get anywhere else — the sentence a
+  // command failed with, the path it refused, the stderr of a resolver that could not run — and
+  // the toast is gone the moment it is dismissed. Unselectable, that means retyping an
+  // `os error 28` by hand.
+  //
+  // Asserted on the stylesheet because there is no DOM here, and asserted as a PAIR because the
+  // engine makes the pair load-bearing: WebKitGTK drops unprefixed `user-select` entirely, so an
+  // opt-in written only in the modern spelling inherits the root's prefixed `none` and silently
+  // takes copy-out away while reading as correct. check:css-prefix enforces the pairing across
+  // every stylesheet; this pins that the opt-in exists here at all.
+  // Comments stripped first. Without it the selector list picks up the prose immediately above
+  // the rule — which names `.summary` and `.dismiss` in order to say they are excluded — and the
+  // negative assertions below would fail on their own explanation.
+  const css = readFileSync(join(UI, 'src', 'chrome', 'Failures.module.css'), 'utf8').replace(
+    /\/\*[\s\S]*?\*\//g,
+    '',
+  )
+  const optIn = /(^|\})[^{]*\{[^}]*-webkit-user-select:\s*text[^}]*\buser-select:\s*text[^}]*\}/m
+  const rule = optIn.exec(css)?.[0] ?? ''
+  eq(rule !== '', true, 'the toast opts back in to selection, in both spellings')
+  for (const part of ['.text', '.hint', '.detail']) {
+    eq(
+      rule.includes(part),
+      true,
+      `${part} is selectable — it is one of the three things a notice carries that is worth copying`,
+    )
+  }
+  // ...and the click targets are NOT, so a drag beginning on the disclosure triangle opens it
+  // rather than starting a selection.
+  for (const part of ['.summary', '.dismiss']) {
+    eq(rule.includes(part), false, `${part} stays unselectable — it is a control, not text`)
+  }
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

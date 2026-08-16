@@ -135,6 +135,36 @@
   overflow-y: auto;
 }
 
+/*
+ * Selectable, against the app-wide `user-select: none`.
+ *
+ * The whole reason a notice exists is that it carries something the user cannot get anywhere
+ * else — the sentence a command failed with, the path it refused, the stderr of a resolver that
+ * could not run. Being unable to copy that out means retyping an `os error 28` by hand into a
+ * search box, from a toast that will be gone the moment it is dismissed.
+ *
+ * It inherits `none` from the app root (`tokens.css`), which is deliberate there: a desktop
+ * chrome that text-selects on drag reads as a web page. The opt-in is per-surface, and this is
+ * the same one `App.module.css`'s bench card and `ProxySection`'s readout already take.
+ *
+ * **Both spellings, prefixed first, and that is not decoration.** WebKitGTK 2.52.3 does not
+ * implement unprefixed `user-select` — its parser drops the declaration outright — so an opt-in
+ * written only in the modern spelling computes `none` from the inherited prefixed rule and takes
+ * copy-out away while looking correct in source. `check:css-prefix` is the gate that keeps the
+ * pair together; the whole argument is written out at the root rule in `tokens.css`.
+ *
+ * Deliberately not on `.summary` or `.dismiss`. Those are click targets — a drag that begins on
+ * the disclosure triangle should open it, not start a selection — and neither carries text worth
+ * taking.
+ */
+.text,
+.hint,
+.detail {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+
 .dismiss {
   appearance: none;
   border: 0;
