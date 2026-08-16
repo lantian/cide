@@ -83,6 +83,40 @@
  * Two things it *does* match that are not files — `and/or` in prose, `crates/cide-app/` — and
  * that is intended. This stage is a candidate generator; the index is the oracle. A candidate
  * that names nothing is dropped in stage 3 without ever being drawn.
+ *
+ * # Claude Code's own tool lines, and what "handling parentheses" does and does not mean
+ *
+ * `Update(…)`, `Read(…)`, `Write(…)`, `Edit(…)` and `Bash(…)` are the shapes a Claude pane
+ * prints most, and every one of them works — not because parentheses are special here, but
+ * because they never were. `(` and `)` are simply not in [`BODY`], so a parenthesised token is
+ * *ended* by them and the run in between is scanned exactly like any other. Verified against the
+ * real shapes rather than assumed (all are cases in `check-paths.mjs`):
+ *
+ * ```text
+ * Update(/home/…/ui/src/chrome/ProjectSwitcher.tsx)  -> the .tsx, span 7..64, no line
+ * ⏺ Read(ui/src/App.tsx)                             -> the .tsx, span 7..21
+ * Read(/abs/f.tsx:42)                                -> the .tsx, line 42, span covers the :42
+ * Bash(cat ui/src/App.tsx)                           -> the .tsx, and NOT `cat`
+ * Bash(cargo test -p cide-git)                       -> nothing
+ * Update(ProjectSwitcher.tsx)                        -> nothing
+ * ```
+ *
+ * **This was checked because the parenthesised form was reported as the cause of a bug and was
+ * not.** A ctrl+click on `Update(/home/…/ProjectSwitcher.tsx)` opened a file manager at
+ * `/home/…/chrome` — the *parent* — and the natural reading is that the matcher had taken the
+ * directory. It had not, and could not: `(` is not a body character, so the token is the file.
+ * The parent directory came from `claude`, which cide had forwarded the click to. See
+ * `clickGate.ts`, which is where the actual defect was.
+ *
+ * The two negatives in that table are the ones worth keeping. `Bash(cargo test -p cide-git)`
+ * yields nothing because `cide-git` has no slash — the two-segment rule, unchanged. And
+ * `Update(ProjectSwitcher.tsx)`, a **bare basename in parentheses**, is still deliberately not
+ * matched even though a human reading the line knows exactly which file it means: resolving a
+ * lone basename against the project index is the rule whose false positives are unbounded (it
+ * would light up `README`, `Cargo.toml` and every `foo.rs` in every sentence), and Claude Code
+ * prints the workspace-relative path whenever it has one. Nothing about parentheses changes
+ * that trade — a matcher that trusted `Word(token)` would light up `Bash(npm run build)`,
+ * `TodoWrite(3 items)` and every other tool line in the transcript.
  */
 
 /** How much of one logical line is scanned. Past this the line is not searched at all. */
@@ -541,10 +575,60 @@ export interface ResolveContext extends Bases {
  * prevent.
  */
 export function resolveCandidate(text: string, ctx: ResolveContext): Resolution {
+  return resolveWith(text, ctx, ctx.isFile)
+}
+
+export interface DirectoryContext extends Bases {
+  /**
+   * Whether an absolute path is a directory.
+   *
+   * The same two oracles [`ResolveContext.isFile`] is fed by, reading the other answer out of the
+   * same probe. No extra round trip: `fs_paths_exist` and `fs_stat_paths` both already answer
+   * `dir` and the caller was already throwing it away.
+   */
+  readonly isDir: (path: string) => boolean
+}
+
+/**
+ * Which **directory** this candidate names: exactly one, several, or none.
+ *
+ * Added in M15, and the reason is worth writing down because a directory used to be a case this
+ * module deliberately produced nothing for. It still produces no *file* link for one — an editor
+ * cannot open a directory, and `ResolveContext.isFile`'s note about
+ * `Compiling cide-app v0.1.0 (/home/…/cide)` stands unchanged. What changed is that "no link"
+ * turned out not to mean "nothing happens": with no link the press was forwarded to the child,
+ * and `claude` answered a ctrl+click on a directory by opening the desktop file manager on it.
+ * A gesture cide declines is a gesture cide has delegated, so declining is not a neutral act.
+ *
+ * So a directory now gets an answer of cide's own — *Select opened file*, on that directory, in
+ * the project's own tree. `pathLinks.ts` only offers it when the pane has somewhere to send it;
+ * a detached pane has no file tree and therefore no directory links, which is the same
+ * `env.open === null` rule one field over.
+ *
+ * Identical machinery to [`resolveCandidate`], including the refusal to guess between two: a
+ * `crates/` that exists under two roots is exactly as ambiguous as a `src/index.ts` that does.
+ */
+export function resolveDirectory(text: string, ctx: DirectoryContext): Resolution {
+  return resolveWith(text, ctx, ctx.isDir)
+}
+
+/**
+ * The shared body of the two resolvers.
+ *
+ * Extracted rather than copied so that the containment argument above — that the in-project and
+ * out-of-project candidate sets are disjoint by construction, and therefore that concatenating
+ * them cannot manufacture a `many` — is made in one place and holds for both. A second copy of
+ * this three-line function is a second place for `outsidePaths` to be forgotten.
+ */
+function resolveWith(
+  text: string,
+  bases: Bases,
+  accept: (path: string) => boolean,
+): Resolution {
   // Concatenated rather than merged: the two sets are disjoint (see [`outsidePaths`]), so this
   // can never turn one inside answer and one outside answer into a `many` the user has to
   // disambiguate. `many` stays what it always was — two roots, or a cwd that agrees with a root.
-  const hits = [...candidatePaths(text, ctx), ...outsidePaths(text, ctx)].filter(ctx.isFile)
+  const hits = [...candidatePaths(text, bases), ...outsidePaths(text, bases)].filter(accept)
   if (hits.length === 0) return NONE
   const only = hits[0]
   if (hits.length === 1 && only !== undefined) return { kind: 'one', path: only }

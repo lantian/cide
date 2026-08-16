@@ -158,13 +158,16 @@ try {
     { key: 'alt+shift+s', command: 'scratch.new', when: null },
     { key: 'ctrl+w', command: 'tab.close', when: null },
     { key: 'ctrl+s', command: 'file.save', when: null },
-    { key: 'ctrl+shift+t', command: 'theme.toggle', when: null },
+    // M15. Ctrl+Shift+T reopens the last closed tab, which is what the chord means in every
+    // browser; `theme.toggle` had it and now ships unbound. `KeyT` is in the sweep's key list,
+    // so this and `ctrl+t` below together pin the property that matters for the pair.
+    { key: 'ctrl+shift+t', command: 'tab.reopenClosed', when: null },
     // Git pull. `KeyT` is already in the sweep below, so this covers the property that
     // matters for a chord the terminal would otherwise get: both entry points must swallow
     // it identically. If they disagree, Ctrl+T pulls *and* sends `^T` to the pty — which is
     // readline's transpose-chars, so the user's line would be silently scrambled by the
     // keystroke that pulled. The sweep also pins that `ctrl+shift+t` still reaches
-    // `theme.toggle` beside it rather than being shadowed by the shorter chord.
+    // `tab.reopenClosed` beside it rather than being shadowed by the shorter chord.
     { key: 'ctrl+t', command: 'git.pull', when: null },
     // M14. Ctrl+Tab is the *tab* switcher now, and the project switcher moved to Ctrl+`.
     // `Tab`, `Backquote` and `Digit1` are all in the sweep's key list below, so these four

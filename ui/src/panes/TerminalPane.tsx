@@ -96,6 +96,16 @@ export interface TerminalPaneProps {
    * offered, because `pathLinks.ts` needs the whole environment or none of it.
    */
   onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
+  /**
+   * Ctrl+click on a *directory* in this pane's output.
+   *
+   * Separate from [`onOpenPath`] because the two answers are different in kind and are offered
+   * by different windows: a directory cannot be opened in an editor, so the gesture shows it in
+   * the file tree instead — and a detached pane has no file tree, so it passes this and only
+   * this as absent. `pathLinks.ts` then offers no directory links there rather than an underline
+   * whose command would refuse.
+   */
+  onRevealPath?: ((path: string) => void) | undefined
   /** Called once, when a spawn succeeds, so the domain can record the binding. */
   onSessionBound?: ((session: string) => void) | undefined
   className?: string | undefined
@@ -399,6 +409,7 @@ export function TerminalPane({
   restore,
   roots,
   onOpenPath,
+  onRevealPath,
   onSessionBound,
   className,
 }: TerminalPaneProps) {
@@ -423,6 +434,8 @@ export function TerminalPane({
   rootsRef.current = roots
   const openPathRef = useRef(onOpenPath)
   openPathRef.current = onOpenPath
+  const revealPathRef = useRef(onRevealPath)
+  revealPathRef.current = onRevealPath
   // A ref, not a dependency: the plan is read once at launch and never refreshed, so its
   // identity changing means the parent re-rendered, not that this pane should respawn.
   const restoreRef = useRef(restore)
@@ -635,6 +648,12 @@ export function TerminalPane({
       // look identical to one that works right up until somebody clicked it.
       get open() {
         return openPathRef.current ?? null
+      },
+      // Same `?? null` and the same reason: a window with no file tree has to be told apart from
+      // one whose reveal quietly does nothing, and only the first of those is allowed to draw an
+      // underline.
+      get reveal() {
+        return revealPathRef.current ?? null
       },
     })
 

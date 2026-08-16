@@ -535,6 +535,25 @@ try {
     ['src/sidebar/FileTree.module.css', ['.row', '.rename'], ['.tag']],
     ['src/sidebar/GitPanel/ChangesTree.module.css', ['.fileName', '.dirName'], ['.count']],
     ['src/sidebar/SearchPanel.module.css', ['.fileRow'], ['.lineText', '.lineNo']],
+    /*
+     * The overlays, added in M15 — and the reason it was added is a finding rather than a
+     * tidy-up.
+     *
+     * This table is *precisely* the gate for "a name is the UI face, code is the mono face", and
+     * `Overlay.module.css` was not in it. So when M14 grew the Find usages popup — a list of file
+     * headings each followed by lines of source, the same shape as the three files above — the
+     * one overlay that needed this sweep was the one file the sweep did not visit. The result
+     * shipped: the heading and the source line differed by half a pixel of font size and nothing
+     * else, and the user's report was "it doesn't see where is filename and where is code".
+     *
+     * `.usageAt` is in the mono list for the same reason `.tag` is above: it is a *column* (a
+     * right-aligned line number), and a proportional digit column jitters by a glyph per row.
+     */
+    [
+      'src/overlays/Overlay.module.css',
+      ['.usageFileName'],
+      ['.usageText', '.usageAt', '.container', '.where'],
+    ],
   ]) {
     const rules = leafRules(readFileSync(file, 'utf8'))
     for (const [selectors, want, why] of [
@@ -559,6 +578,63 @@ try {
         )
       }
     }
+  }
+
+
+  /*
+   * The Find usages heading against the source line under it — the same file, the same list, and
+   * the thing the family sweep above cannot see.
+   *
+   * A family split is necessary and is not sufficient: the shipped bug had the *right* families
+   * available and used the wrong one for the heading, and even after fixing the family a heading
+   * at the source line's size and weight would still read as another line of code. So this asks
+   * for a difference on the two axes a reader actually uses at a glance — size and weight — and
+   * for the one declaration that was written to make the heading stand out to not be a no-op.
+   */
+  {
+    const rules = leafRules(readFileSync('src/overlays/Overlay.module.css', 'utf8'))
+    const rule = (selector) => rules.find((r) => parts(r.selector).includes(selector))?.body ?? ''
+    const number = (body, prop) => Number(new RegExp(`${prop}:\\s*([0-9.]+)`).exec(body)?.[1])
+
+    const head = rule('.usageFileName')
+    const code = rule('.usageText')
+    ok(head !== '' && code !== '', 'the usage heading and the usage source line both have rules')
+    ok(
+      number(head, 'font-size') > number(code, 'font-size'),
+      'a usage file heading is LARGER than the source lines under it. The shipped version was '
+        + '11px against 11.5px — the heading was the smaller of the two — and with the same '
+        + 'family, weight and colour that half-pixel was the entire distinction. The report was '
+        + '"it doesn\'t see where is filename and where is code"',
+    )
+    ok(
+      /font-weight:/.test(head) && !/font-weight:/.test(code),
+      'and it carries a weight the source line does not',
+    )
+    ok(
+      /font-weight:\s*var\(--w-bold\)/.test(head),
+      'through the token, not the literal `600`: a literal is how a mono rule ends up asking for '
+        + 'a weight its family does not ship, CSS matching walks up to 700, and the emphasis '
+        + 'lands two steps heavy — `SearchPanel.module.css` records that exact afternoon, and '
+        + 'the weight sweep in this file cannot catch it because it checks against the union of '
+        + 'both families',
+    )
+    ok(
+      /direction:\s*rtl/.test(head),
+      'and it ellipsises from the FRONT — the tail of `crates/cide-lsp/src/progress.rs` is the '
+        + 'filename, which is the one part of a heading that must survive truncation',
+    )
+    ok(
+      /flex:\s*none/.test(rule('.usageCount')),
+      'the hit count beside it does not flex. It used to be drawn with `.group`, which is '
+        + '`flex: 1`, so a two-character number claimed half a 620px card from a path that was '
+        + 'already truncating from the wrong end',
+    )
+    ok(
+      /background:/.test(rule('.usageFile')) && !/background:\s*var\(--chrome\)/.test(rule('.usageFile')),
+      'and the heading row\'s ground is not `--chrome`, which is exactly `.card`\'s own ground — '
+        + 'the one declaration written to make the heading stand out was painting it the colour '
+        + 'it already was',
+    )
   }
 
   // --- the three sidebar lists are one row height, and the icon centres on a whole pixel ---

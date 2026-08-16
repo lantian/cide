@@ -155,6 +155,10 @@ try {
       // The find bar's arithmetic, split out of `find.ts` — which needs a window — for exactly
       // this reason. See section 12.
       'src/editor/findMatches.ts',
+      // M15, section 14. Autosave's whole policy — pure and import-free, because a feature that
+      // writes the user's files on a timer must have its refusals somewhere a check can drive
+      // them rather than inside a `useEffect`.
+      'src/editor/autosave.ts',
       // M12, section 13: the two position features. `position.ts` is the type both of them
       // speak; `navHistory.ts` is the whole of what Back and Forward decide.
       'src/editor/position.ts',
@@ -199,8 +203,14 @@ try {
   const { exceedsBytes, utf8ByteLength } = load('byteSize.js')
   const buffers = load('openBuffers.js')
   const reveal = load('revealRequest.js')
-  const { basename, languageName, loadLanguage, SCRATCH_TYPES, defaultScratchType } =
-    load('languages.js')
+  const {
+    basename,
+    languageName,
+    loadLanguage,
+    SCRATCH_TYPES,
+    defaultScratchType,
+    filterScratchTypes,
+  } = load('languages.js')
   const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
   const geo = load('minimapGeometry.js')
   const send = load('sendToClaude.js')
@@ -472,6 +482,51 @@ try {
    * preselects TypeScript rather than falling through to the first row because `tsx` is not
    * itself an offered extension.
    */
+  /*
+   * The picker's filter. (M15)
+   *
+   * `ScratchType.tsx` grew a text field, which reverses its own header's argument that there was
+   * "nothing worth fuzzy-matching in `Rust`, `Go`, `JSON`". The ranking behind it lives here,
+   * beside the list, for the same reason the list lives here — and, just as usefully, so that it
+   * can be driven at all. A predicate inside the component would need a DOM to test and would
+   * therefore not be tested.
+   *
+   * What is pinned is the *ordering*, not just membership. Plain substring would answer `js`
+   * with whatever row happens to be highest in the list, and the whole point of two keystrokes
+   * plus Enter is that the top row is the one meant.
+   */
+  const labels = (query) => filterScratchTypes(query).map((t) => t.label)
+
+  eq(labels(''), SCRATCH_TYPES.map((t) => t.label),
+    'an empty query is the whole list in list order — the popup opens looking exactly as it '
+    + 'always has')
+  eq(labels('sql')[0], 'SQL', 'the exact extension wins: `sql` lands on SQL')
+  eq(labels('rs')[0], 'Rust', 'and `rs` on Rust, whose label does not contain those letters '
+    + 'in that order at all')
+  eq(labels('md')[0], 'Markdown', 'and `md` on Markdown')
+  eq(labels('c')[0], 'C', 'an exact extension beats a prefix: `c` is C, not C++')
+  ok(labels('c').includes('C++'), 'and C++ is still offered underneath it')
+  eq(labels('js')[0], 'JavaScript', '`js` is JavaScript — the extension, exactly')
+  eq(labels('java')[0], 'JavaScript',
+    'and `java` reaches JavaScript by label prefix. Java is not an offered type, so there is '
+    + 'nothing here for the extension tier to have found first')
+  eq(labels('ty')[0], 'TypeScript', 'a label prefix: `ty`')
+  ok(labels('script').includes('TypeScript') && labels('script').includes('JavaScript'),
+    'a label substring reaches both scripts')
+  eq(labels('SQL')[0], 'SQL', 'matching is case-insensitive — nobody types `sql` in capitals '
+    + 'looking for `.sql`, and nobody types it in lower case looking for `SQL`')
+  eq(labels('  rust  ')[0], 'Rust', 'and the query is trimmed, so a stray space does not empty '
+    + 'the list')
+  eq(labels('zzzz'), [], 'a query that matches nothing returns nothing — which the popup says '
+    + 'out loud rather than showing an empty box')
+  ok(
+    labels('t').length < SCRATCH_TYPES.length,
+    'a one-letter query still narrows the list rather than reordering all of it',
+  )
+  // The ordering has to be total: ties fall back to list order, so the top row for a query is
+  // decided rather than left to a comparator that returned 0.
+  eq(labels('o')[0], 'Go', '`o` is `go` by extension substring before any label match')
+
   eq(defaultScratchType(null), 0, 'with no file open the picker opens on the first row')
   eq(defaultScratchType('/p/src/main.rs'), 0, 'a Rust buffer opens on Rust, which is first')
   eq(
@@ -763,6 +818,7 @@ try {
     clike: require(join(out, 'editor/languages/clike.js')).spec,
     shell: require(join(out, 'editor/languages/shell.js')).spec,
     markdown: require(join(out, 'editor/languages/markdown.js')).spec,
+    sql: require(join(out, 'editor/languages/sql.js')).spec,
     json: require(join(out, 'editor/languages/data.js')).json,
     toml: require(join(out, 'editor/languages/data.js')).toml,
     yaml: require(join(out, 'editor/languages/data.js')).yaml,
@@ -922,6 +978,33 @@ try {
       '"quoted.key" = 1',
       'dotted.key = 2',
     ].join('\n'),
+    /*
+     * SQL, added in M15 with the grammar. Every line is a shape a C-like table gets wrong: the
+     * shouted keywords the case-folding flag exists for, the doubled quote that is an escape
+     * here and nowhere else, `--` as a line comment (which is a decrement operator in every
+     * other language in this map), and a capitalised table name that must NOT come out purple.
+     */
+    sql: [
+      '-- Recent sessions, per project.',
+      'CREATE TABLE IF NOT EXISTS Sessions (',
+      '  id       UUID PRIMARY KEY,',
+      '  project  TEXT NOT NULL REFERENCES Projects(id) ON DELETE CASCADE,',
+      "  title    VARCHAR(200) DEFAULT 'untitled',",
+      '  started  TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,',
+      '  turns    INTEGER      NOT NULL DEFAULT 0',
+      ');',
+      'select p.name, count(s.id) as n',
+      '  from Projects p left join Sessions s on s.project = p.id',
+      " where p.name like 'cide%' and s.title <> 'it''s a test'",
+      ' group by p.name having count(s.id) > 0',
+      ' order by n desc nulls last',
+      ' limit 10 offset 0;',
+      '/* A block comment with a /* that does not nest */',
+      'INSERT INTO Sessions (id, project) VALUES (:id, :project) ON CONFLICT DO NOTHING;',
+      'UPDATE "Sessions" SET turns = turns + 1 WHERE id = $1 RETURNING turns;',
+      'SELECT 1e3, 0x1f, 3.14, -7 FROM t;',
+      'DROP TABLE Sessions;',
+    ].join('\n'),
     yaml: [
       '---',
       'name: ci',
@@ -1010,6 +1093,88 @@ try {
   // sweep silently tests less than it says it does.
   for (const expected of ['keyword', 'comment', 'string', 'meta', 'propertyName', 'heading']) {
     ok(emittedTags.has(expected), `the corpus still exercises the ${expected} role`)
+  }
+
+  /*
+   * SQL, as tokens. (M15)
+   *
+   * "Does the stream advance" is the sweep above, and it would pass for a grammar that painted
+   * a whole query as `variableName`. The scratch picker now offers SQL, and the standing rule
+   * for that list is that a type it offers is a type the editor can actually highlight — so
+   * what is asserted here is that the four ways SQL is not C are all handled, because each of
+   * them is a way for the highlighting to be *present and wrong*.
+   */
+  {
+    const byText = new Map()
+    for (const { tag, text } of tokenize(grammars.sql, sources.sql, 'sql roles')) {
+      if (!byText.has(text)) byText.set(text, tag)
+    }
+    eq(byText.get('SELECT'), 'keyword',
+      'sql: a shouted keyword is a keyword. The tables are written once, in lowercase, so '
+      + 'without `caseInsensitiveKeywords` the entire conventional SQL style highlights as '
+      + 'nothing at all')
+    eq(byText.get('select'), 'keyword', 'sql: and so is the same word in lower case')
+    eq(byText.get('CREATE'), 'keyword', 'sql: `CREATE`')
+    eq(byText.get('TIMESTAMPTZ'), 'typeName', 'sql: a shouted type is a type')
+    eq(byText.get('current_timestamp'), 'atom', 'sql: `current_timestamp` is a value')
+    eq(byText.get('NULL'), 'atom', 'sql: `NULL` is a value, not a keyword')
+    eq(byText.get('count'), 'variableName.function', 'sql: an aggregate is drawn as a call')
+    eq(byText.get('Sessions'), 'variableName',
+      'sql: a capitalised table name is NOT a type. `capitalisedIsType` is true for C-like and '
+      + 'false here, and with it on every table in a shouted query comes out purple')
+    eq(byText.get('-- Recent sessions, per project.'), 'comment',
+      'sql: `--` starts a line comment. In every other language in this map it is a decrement '
+      + 'operator, so this is the one that a shared table would silently get wrong')
+    eq(byText.get("'untitled'"), 'string', 'sql: a single-quoted literal is a string')
+    eq(byText.get('"Sessions"'), 'string',
+      'sql: a quoted identifier is painted as a string — the knowing inaccuracy recorded in '
+      + '`languages/sql.ts`, because telling one from a literal needs the dialect')
+    /*
+     * `escapes: false` — SQL escapes a quote by doubling it, not with a backslash.
+     *
+     * Two cases, and the **second** is the one that matters. The first version of this block
+     * asserted only the first and a mutation flipping `escapes` to `true` survived it, because
+     * a doubled quote tokenizes identically either way — there is no backslash in `'it''s'` for
+     * the escape rule to act on. That is the "pins today's behaviour rather than the property"
+     * trap, caught by mutation rather than by reading.
+     *
+     * The property `escapes: false` actually buys is what happens to a **backslash before the
+     * closing quote**. A Windows path in a literal — `'C:\temp\'` — ends there in SQL and does
+     * not end there in C. With `escapes: true` the closing quote is eaten as an escape, the
+     * string runs off the end of the line, and every keyword after it loses its colour for the
+     * rest of the statement.
+     */
+    const doubled = tokenize(grammars.sql, "select 'it''s a test' as t;\n", 'sql doubled quote')
+    eq(
+      doubled.filter((t) => t.tag === 'string').map((t) => t.text).join(''),
+      "'it''s a test'",
+      'sql: every character of a literal containing a doubled quote is painted as a string — a '
+        + 'doubled quote does not end it',
+    )
+    const backslash = tokenize(
+      grammars.sql,
+      "select 'C:\\temp\\' as p from t;\n",
+      'sql backslash in a literal',
+    )
+    eq(
+      backslash.find((t) => t.text === 'as')?.tag,
+      'keyword',
+      'sql: a backslash before the closing quote does NOT escape it. `escapes: true` would eat '
+        + 'the quote, run the string to the end of the line, and leave every keyword after it '
+        + 'uncoloured — which is what a Windows path in a literal looks like',
+    )
+    eq(
+      backslash.find((t) => t.text === 'from')?.tag,
+      'keyword',
+      'sql: and the rest of the statement with it',
+    )
+    eq(backslash.at(-1)?.text, ';', 'sql: right through to the terminator')
+    // `--` again, this time proving the *operator* path is not what claims it.
+    const decrement = tokenize(grammars.sql, 'select a --b\nfrom t;\n', 'sql line comment')
+    ok(
+      decrement.some((t) => t.tag === 'comment' && t.text === '--b'),
+      'sql: `--b` is a comment to end of line, not an operator followed by an identifier',
+    )
   }
 
   // What the mock actually specifies for Rust, asserted as tokens rather than as a colour.
@@ -4046,6 +4211,210 @@ try {
       !/kind === 'ready'/.test(intelSrc) && !/Ready/.test(intelSrc),
       'the search is never gated on a readiness flag — the timeout is the readiness answer',
     )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 14. Autosave: every refusal, and the call sites that have to ask
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * This feature writes the user's files on a timer. Its refusals are the difference between an
+   * IDE and one that silently destroys work, and three of them were named as blocking: never
+   * over a pending Claude `openDiff`, never while the conflict bar is up, never a read-only
+   * buffer.
+   *
+   * So the policy is a pure function over a record of facts, driven here as a truth table, and
+   * the *mechanism* — two timers, a blur arm, a cleanup — is pinned by source assertions over
+   * comment-stripped source. Both halves are needed and neither substitutes for the other: a
+   * correct `shouldAutosave` nobody calls is this project's signature defect, and a call site
+   * with the rule inlined is a rule nothing can compile.
+   */
+  {
+    const auto = load('autosave.js')
+    const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+    /** Every fact true in the "yes, save" direction. Each case below turns exactly one off. */
+    const YES = {
+      enabled: true,
+      dirty: true,
+      readOnly: false,
+      conflict: false,
+      agentDiff: false,
+      windowFocused: true,
+      focusInsideEditor: false,
+      overlayOpen: false,
+      contextMenuOpen: false,
+    }
+    const may = (reason, over = {}) => auto.shouldAutosave(reason, { ...YES, ...over })
+
+    /* ------------------------------------------------------- the baseline, both reasons */
+
+    eq(may('blur'), true, 'a dirty buffer whose caret left it is written')
+    eq(may('idle'), true, 'and so is one nobody has touched for a minute')
+
+    /* ---------------------------------------------- the five unconditional refusals */
+
+    for (const reason of ['blur', 'idle']) {
+      eq(may(reason, { enabled: false }), false,
+        `${reason}: the setting is off, so nothing is written. It is a `
+        + '`ToggleRow` in Settings ▸ Editor and it has to actually do something — five of the '
+        + 'seven fields in that section were wired to nothing when this was written')
+      eq(may(reason, { dirty: false }), false,
+        `${reason}: a clean buffer is not written. Not an optimisation — a save is a `
+        + 'didSave, which makes rust-analyzer re-run flycheck over the workspace, so an '
+        + 'unguarded blur save would be a cargo check per alt-tab')
+      eq(may(reason, { readOnly: true }), false,
+        `${reason}: THE BLOCKING ONE — a read-only buffer is never written. External Libraries `
+        + 'sources are read-only by design, and writing one corrupts a crate every project on '
+        + 'the machine compiles against')
+      eq(may(reason, { conflict: true }), false,
+        `${reason}: THE BLOCKING ONE — while the conflict bar is up, nothing is written. The `
+        + 'bar is a question the user has not answered, and autosave answering it for them, in '
+        + 'the direction that discards whatever changed the file, is the worst thing this '
+        + 'feature could do')
+      eq(may(reason, { agentDiff: true }), false,
+        `${reason}: THE BLOCKING ONE — a Claude \`openDiff\` of this file is on screen and the `
+        + 'agent turn is blocked on it. The collision is the ordinary gesture: the user clicks '
+        + 'the diff tab to look at it, which is a tab switch, which is a blur, which would '
+        + 'write the file underneath a proposal computed against the old bytes')
+    }
+
+    /* ------------------------------------------- what only a *blur* has to think about */
+
+    eq(may('blur', { windowFocused: false }), true,
+      'the OS window was deactivated, so the file is written — IDEA\'s frame-deactivation save, '
+      + 'which is most of what people mean by autosave')
+    eq(may('blur', { windowFocused: false, focusInsideEditor: true }), true,
+      'AND THE ORDER MATTERS: `document.activeElement` does not move when a window is '
+      + 'deactivated, so the editor still contains focus. Testing `focusInsideEditor` first '
+      + 'would veto the one save this feature is famous for')
+    eq(may('blur', { windowFocused: false, overlayOpen: true }), true,
+      'and a palette left open does not veto it either — the user has left the application')
+
+    eq(may('blur', { focusInsideEditor: true }), false,
+      'the find bar took the caret, which is a CodeMirror panel INSIDE `view.dom`. One test '
+      + 'covers it and anything else that ever lives in there')
+    eq(may('blur', { overlayOpen: true }), false,
+      'Ctrl+P is not leaving the file')
+    eq(may('blur', { contextMenuOpen: true }), false,
+      'and neither is a right-click')
+
+    eq(may('idle', { focusInsideEditor: true }), true,
+      'but an IDLE timer does not care where the caret is: the user stopped typing a minute '
+      + 'ago, and where they stopped is not information')
+    eq(may('idle', { overlayOpen: true }), true, 'nor whether an overlay happens to be open')
+    eq(may('idle', { windowFocused: false }), true, 'nor whether the window is focused')
+
+    /* --------------------------------------------------- the debounce and its ceiling */
+
+    eq(auto.AUTOSAVE_IDLE_MS, 60_000, 'a minute of no edits')
+    ok(auto.AUTOSAVE_CEILING_MS > auto.AUTOSAVE_IDLE_MS, 'and a ceiling above it')
+    eq(auto.autosaveDelay(0, 0, 0), auto.AUTOSAVE_IDLE_MS, 'a fresh edit waits the idle time')
+    eq(
+      auto.autosaveDelay(auto.AUTOSAVE_CEILING_MS - 1000, auto.AUTOSAVE_CEILING_MS - 1000, 0),
+      1000,
+      'SOMEBODY WHO KEEPS TYPING still gets saved. A straight debounce restarts on every '
+        + 'keystroke, so twenty minutes of steady typing would never autosave at all — this '
+        + 'project has written that starvation down twice already (`docSync`, `gitCountStore`), '
+        + 'and the ceiling measured from when the buffer went dirty is the answer',
+    )
+    eq(auto.autosaveDelay(999_999, 0, 0), 0, 'a delay already past is zero, never negative')
+    eq(auto.autosaveDelay(0, Number.NaN, 0), null, 'and a nonsensical timestamp arms nothing')
+
+    /* ------------------------------------------------- the call sites, over stripped source */
+
+    const autoSrc = strip(readFileSync('src/editor/autosave.ts', 'utf8'))
+    const surface = strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    const pane = strip(readFileSync('src/panes/EditorPane.tsx', 'utf8'))
+    const sections = strip(readFileSync('src/settings/sections.tsx', 'utf8'))
+
+    ok(!/^\s*import /m.test(autoSrc),
+      '`autosave.ts` imports nothing, which is what lets this script compile and drive it — the '
+      + 'property `openBuffers.ts` is kept import-free for')
+
+    // The gate is asked, and by the surface rather than re-derived there.
+    ok(/config\.allow\(reason, domFacts\(view\)\)/.test(surface),
+      'the surface asks the policy before every unasked write, and passes the DOM facts it is '
+      + 'the only thing that can read')
+    ok(!/conflict|agentDiff/.test(surface),
+      'and knows nothing about the conflict bar or a pending agent diff — those are the pane\'s '
+      + 'facts, and a copy of them here would be a second answer to "may I write this file"')
+    ok(/shouldAutosave\(reason, \{/.test(pane),
+      'the pane assembles the facts and hands them to `shouldAutosave` rather than deciding '
+      + 'anything itself — every failure mode in this feature is a refusal that was not made, '
+      + 'and a refusal inside a `useCallback` is one nothing can compile')
+
+    // The blur arm exists, on the losing edge of CodeMirror's own focus tracking.
+    ok(/update\.focusChanged\)?\s*\{[\s\S]{0,400}?autosaveIf\(update\.view, 'blur'\)/.test(surface),
+      'the losing edge of `focusChanged` is what triggers a blur save. One hook covers a click '
+      + 'into another pane, a tab switch (hidden tabs are `visibility: hidden`, never '
+      + 'unmounted) and the OS window being deactivated — a `window.addEventListener("blur")` '
+      + 'would double-fire against it and would be a per-pane listener over a window fact')
+    ok(/document\.hasFocus\(\)/.test(surface),
+      'and it reads `document.hasFocus()`, which is the only thing that separates "the caret '
+      + 'moved" from "the window went away"')
+    ok(/view\.dom\.contains\(document\.activeElement\)/.test(surface),
+      'and whether focus is still inside the editor, which is how the find bar is excluded')
+
+    // The timers, and the cleanup that is the whole defence against the worst bug available.
+    ok(/setTimeout\([\s\S]{0,200}?config\.idleMs\)/.test(surface), 'the idle timer is armed')
+    ok(/setTimeout\([\s\S]{0,200}?config\.ceilingMs\)/.test(surface), 'and so is the ceiling')
+    ok(/if \(dirtyRef\.current\) arm\(update\.view\)/.test(surface),
+      'armed from a DOCUMENT change and not from a selection change: "inactive" in a buffer '
+      + 'means the text stopped changing, and a person reading a dirty file and scrolling would '
+      + 'otherwise never get a save')
+    {
+      const cleanup = surface.slice(surface.lastIndexOf('return () => {'))
+      ok(/disarm\(\)/.test(cleanup),
+        'THE MOST IMPORTANT LINE: the build effect\'s cleanup clears both timers. A `reloadKey` '
+        + 'bump rebuilds the view, and a destroyed CodeMirror view still answers '
+        + '`view.state.doc` — so an orphaned timer would write the pre-reload buffer straight '
+        + 'over the file that replaced it, a minute later, with the correct contents already on '
+        + 'screen')
+    }
+    {
+      const effect = surface.slice(surface.indexOf('const host = hostRef.current'))
+      const deps = /\}, \[path, reloadKey\]\)/.exec(effect)
+      ok(deps !== null,
+        'the build effect is still keyed on `[path, reloadKey]` and nothing else — a changed '
+        + 'identity there tears the view down and takes the user\'s unsaved edits')
+      ok(/const autosaveCb = useRef\(autosave\)/.test(surface),
+        'which is why `autosave` is held in a ref: the pane rebuilds the object every render, '
+        + 'and listing it as a dependency would rebuild the editor on every keystroke')
+    }
+
+    // The failure has to produce a sentence.
+    ok(/notify\(`cide could not save/.test(pane),
+      'A FAILED AUTOSAVE PRODUCES A SENTENCE. `void diag.log(...)` writes to a file the user '
+      + 'never opens, and a save that happened on a timer while they were looking at a browser '
+      + 'is the one that most needs saying out loud — this is also the population where writes '
+      + 'actually fail, because a root-owned mode-644 file reports `writable: true`')
+    ok(/cause === 'autosave'/.test(pane),
+      'and the report is told apart from a failed Ctrl+S, which the user watched not work')
+    ok(/throw error/.test(pane),
+      'and the rejection is rethrown either way, so the tab stays dirty and the close guard '
+      + 'still puts the buffer in front of the user')
+
+    // The precondition token, which is what stops autosave widening the `sed -i` hole.
+    ok(/cause === 'autosave' \? stampRef\.current : null/.test(pane),
+      'an autosave carries the file\'s stamp and an explicit Ctrl+S does not. The conflict bar '
+      + 'is raised by `cide://session-tool`, which a `cargo fmt` never sends — so before this, '
+      + 'switching to a terminal, formatting, and clicking back would silently clobber it')
+    ok(/stampRef\.current = stamp/.test(pane),
+      'and the token moves with the write, or the second autosave compares against the file as '
+      + 'it was when the tab opened and refuses for ever')
+    ok(/fileChanged\(error\)/.test(pane) && /setConflict\(true\)/.test(pane),
+      'and a refused precondition raises the conflict bar rather than a failure toast — which '
+      + 'is what finally gives the `sed -i` path the bar the agent path has had since M12')
+
+    // And the setting is read, not merely offered.
+    ok(/settings\.editor\.autosave/.test(pane),
+      'THE TOGGLE IS READ. Four toggles and a number in this very settings section persist, '
+      + 'survive a relaunch and change nothing — `tabSize`, `insertSpaces`, `showMinimap`, '
+      + '`wordWrap` and `trimTrailingWhitespaceOnSave` all have no reader, and no gate in this '
+      + 'repository can see that. This one ships with an assertion that it is wired')
+    ok(/checked=\{editor\.autosave\}/.test(sections) && /autosave: v/.test(sections),
+      'and it is offered in Settings ▸ Editor, in both directions')
   }
 
   if (failed > 0) {

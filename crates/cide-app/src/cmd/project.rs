@@ -476,6 +476,12 @@ pub fn project_close(
         diagnostics.close(project);
     }
 
+    // And its Ctrl+Shift+T records. They name a `ProjectId` nothing can resolve any more, and
+    // reopening the same directory mints a *new* id — so left here they would be unreachable
+    // rather than merely stale, sitting in a 16-deep stack and pushing live records out of it.
+    app.state::<crate::closed_tabs::ClosedTabs>()
+        .forget_project(project);
+
     // Closing a project drops the window roles that showed parts of it. Those windows are
     // still on screen until something takes them down, and a detached one would sit there
     // blank with an unreachable child behind it.
@@ -615,10 +621,22 @@ pub fn tab_close(
     // makes with that intent. Rejection is recoverable; a write is not.
     let dismissed = crate::ide::request_id_for_tab(&state, project, tab);
 
+    // Read *before* the close, because after it there is nothing left to read. `with` rather
+    // than a second `update`, so the record describes the tab as it stood one instant before it
+    // went — the tree included, with its pane ids and session bindings.
+    let record = state.with(|ws| closing_record(ws, project, tab));
+
     let out = state.update(|ws| {
         workspace::close_tab(ws, project, tab, force)?;
         Ok(Mutated { rev: ws.rev })
     })?;
+
+    // Pushed only once the close has actually happened. `close_tab` refuses a pinned console and
+    // an unsaved buffer, and a record pushed before the refusal would let Ctrl+Shift+T open a
+    // second copy of a tab that never went anywhere.
+    if let Some(record) = record {
+        app.state::<crate::closed_tabs::ClosedTabs>().push(record);
+    }
 
     if let Some(request_id) = dismissed
         && let Some(servers) = app.try_state::<crate::ide::IdeServers>()
@@ -630,4 +648,446 @@ pub fn tab_close(
     // just been pruned.
     crate::cmd::window::reconcile(&app, &state)?;
     Ok(out)
+}
+
+/// What Ctrl+Shift+T would need to bring `tab` back, read off the workspace before it closes.
+///
+/// A free function over `&Workspace` rather than three lines inside [`tab_close`], for the
+/// reason `cmd::file::open_git_diff` gives about itself: a policy reachable only through a
+/// `State<WorkspaceState>` is a policy that gets tested at the level of "does the app start",
+/// and the `dirty` rule below is exactly the kind that is individually obvious and wrong in
+/// combination.
+///
+/// `dirty` is normalised to `false` here rather than in `closed_tabs`, because this is the
+/// moment the fact becomes true: the buffer does not survive the close — a dirty tab only got
+/// this far because the user chose to discard — so a reopened tab is showing what is on disk.
+/// `persist::load` clears the same flag on restore for the same reason, and a record that came
+/// back dirty would refuse its own next close over edits nobody made.
+///
+/// `None` for a tab or project that is not there, which the caller reads as "nothing to
+/// remember" rather than as an error: `close_tab` is about to fail on the same lookup and its
+/// refusal is the one the user should see.
+fn closing_record(
+    ws: &cide_ipc::Workspace,
+    project: ProjectId,
+    tab: TabId,
+) -> Option<crate::closed_tabs::ClosedTab> {
+    let p = workspace::project(ws, project).ok()?;
+    let index = p.tabs.iter().position(|t| t.id == tab)?;
+    let t = &p.tabs[index];
+    let kind = match &t.kind {
+        TabKind::File { path, .. } => TabKind::File {
+            path: path.clone(),
+            dirty: false,
+        },
+        other => other.clone(),
+    };
+    Some(crate::closed_tabs::ClosedTab {
+        project,
+        kind,
+        index,
+        tree: t.tree.clone(),
+    })
+}
+
+/// Put back the last tab this project closed. Ctrl+Shift+T.
+///
+/// Answers `Ok(None)` when the stack has nothing for this project, which the frontend reports
+/// through `unmet` — the shape `keys/dispatch.ts` already uses for a precondition that failed.
+/// An `Err` would land on the failure toast, and "there is nothing to reopen" is not a failure.
+///
+/// # Every press does one visible thing, or says why it did none
+///
+/// A record can be stale in two ways by the time it is popped, and the rule for each is chosen
+/// so that the key is never a key that silently does nothing.
+///
+/// * **The file was deleted since.** `tab_open_file` does not stat, so the tab would open and
+///   the editor would land in its `load: 'failed'` state — honest, but not what "reopen" means.
+///   This stats first, the same test `terminal_open_path` performs, and the record is **dropped
+///   and the next one tried**. Leaving it instead would make Ctrl+Shift+T dead for ever after
+///   one deleted file, which is exactly the failure mode this project keeps finding.
+/// * **It is already open**, because the picker, a ctrl+click or the tree got there first. Then
+///   it depends on *which* tab it is. Not the active one: it is **activated, and that is the
+///   press** — the user asked to be shown that tab and now they are looking at it, which is a
+///   real outcome and not a consolation prize. Already the active one: there is nothing at all
+///   to show, so the record is dropped like a deleted file's and the loop goes on.
+///
+/// [`same_tab`] is deliberately the same question each opener asks — a path for a file, a
+/// singleton for Settings, a repo-and-path pair for a git diff — because a reopen that answered
+/// it its own way is how two tabs over one file come back.
+///
+/// A `while let` over [`crate::closed_tabs::ClosedTabs::pop`] rather than a peek-then-commit:
+/// the stack is a `Mutex<Vec<_>>`, popping under one lock per iteration is simpler, and a record
+/// this call has decided against is one the *next* call must not see again.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_reopen_closed(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+) -> Result<Option<TabId>, CoreError> {
+    let stack = app.state::<crate::closed_tabs::ClosedTabs>();
+
+    while let Some(record) = stack.pop(project) {
+        match state.with(|ws| reopen_plan(ws, &record)) {
+            Reopen::Skip => continue,
+            Reopen::Show(id) => {
+                state.update(|ws| workspace::activate_tab(ws, project, id))?;
+                return Ok(Some(id));
+            }
+            Reopen::Reinsert => {
+                let id = state.update(|ws| {
+                    workspace::reinsert_tab(ws, project, record.index, record.kind, record.tree)
+                })?;
+                return Ok(Some(id));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// What [`tab_reopen_closed`] should do with one record. See that function for the reasoning.
+#[derive(Debug, PartialEq, Eq)]
+enum Reopen {
+    /// Put the tab back where it was.
+    Reinsert,
+    /// It is open already and is not the tab on screen; show it, and that is the press.
+    Show(TabId),
+    /// Nothing this record could do would be visible. Drop it and try the next one.
+    Skip,
+}
+
+/// The three-way decision, as a function of the workspace and the record alone.
+///
+/// A free function rather than three `if`s inside the command, because this is the rule with the
+/// cases in it and a rule that can only be reached through a `State<WorkspaceState>` is a rule
+/// that gets tested at the level of "does the app start". Every branch below is one the user
+/// reaches by ordinary means — deleting a file in another editor, opening it again from Ctrl+P,
+/// pressing the key twice — and the wrong answer to any of them is a key that appears broken.
+///
+/// The `is_file` stat is inside rather than lifted out, so the whole decision is one call: split
+/// across the caller and here, "deleted" and "already open" would be two rules that have to be
+/// read together to know what a press does.
+fn reopen_plan(ws: &cide_ipc::Workspace, record: &crate::closed_tabs::ClosedTab) -> Reopen {
+    // A file that is no longer there. `tab_open_file` does not stat, so without this the tab
+    // opens and the editor lands in `load: 'failed'` — honest, and not what "reopen" means.
+    if let TabKind::File { path, .. } = &record.kind
+        && !path.is_file()
+    {
+        return Reopen::Skip;
+    }
+
+    let Ok(p) = workspace::project(ws, record.project) else {
+        // The project closed between the push and the pop. `forget_project` prunes these, so
+        // this is the race rather than the ordinary case — and skipping is right either way.
+        return Reopen::Skip;
+    };
+    match p.tabs.iter().find(|t| same_tab(&t.kind, &record.kind)) {
+        // Already open and already on screen: there is nothing a press could show.
+        Some(open) if open.id == p.active_tab => Reopen::Skip,
+        Some(open) => Reopen::Show(open.id),
+        None => Reopen::Reinsert,
+    }
+}
+
+/// Whether `open` is the tab a reopen of `wanted` would produce, so it can be activated instead.
+///
+/// Mirrors the dedupe each opener already performs rather than inventing a fourth rule:
+/// `cmd::file::open_file_tab` matches a `File` on its path, `cmd::settings::tab_open_settings`
+/// treats Settings as a per-project singleton, and `cmd::file::open_git_diff` matches a `Git`
+/// diff on its repo and path (never on `side`, which the pane is free to switch while open).
+///
+/// A `ClaudeFull` tab is **never** the same as another: two of them differ only by title, they
+/// hold different conversations, and the record carries the session bindings that say which.
+fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
+    match (open, wanted) {
+        (TabKind::File { path: a, .. }, TabKind::File { path: b, .. }) => a == b,
+        (TabKind::Settings { .. }, TabKind::Settings { .. }) => true,
+        (TabKind::Diff { spec: a, .. }, TabKind::Diff { spec: b, .. }) => {
+            match (&a.origin, &b.origin) {
+                (
+                    cide_ipc::DiffOrigin::Git {
+                        repo: ra, path: pa, ..
+                    },
+                    cide_ipc::DiffOrigin::Git {
+                        repo: rb, path: pb, ..
+                    },
+                ) => ra == rb && pa == pb,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cide_ipc::{DiffOrigin, DiffSpec, RepoId, SettingsSection, Workspace, git::DiffSide};
+
+    /// A workspace with one project and one file tab, and the ids for both.
+    fn with_file(path: &str) -> (Workspace, ProjectId, TabId) {
+        let mut ws = Workspace::default();
+        let project = workspace::open_project(&mut ws, vec![PathBuf::from("/w")], None)
+            .expect("a project opens");
+        let tab = workspace::open_tab(
+            &mut ws,
+            project,
+            TabKind::File {
+                path: PathBuf::from(path),
+                dirty: true,
+            },
+            Pane {
+                id: PaneId::new(),
+                kind: PaneKind::Editor,
+                role: PaneRole::Auxiliary,
+                session: None,
+                title: "f".into(),
+            },
+        )
+        .expect("a tab opens");
+        (ws, project, tab)
+    }
+
+    /// The record carries the tab's position and its tree, and drops `dirty`.
+    ///
+    /// The dirty half is the one worth pinning. A tab only closes dirty because the user chose
+    /// to discard, so the buffer is gone and the file on disk is what a reopen shows — a record
+    /// that remembered `dirty: true` would come back claiming unsaved edits that exist nowhere,
+    /// and the *next* close of that tab would raise a discard dialog about them.
+    #[test]
+    fn a_closing_record_remembers_the_position_and_the_tree_but_not_the_dirty_flag() {
+        let (ws, project, tab) = with_file("/w/src/lib.rs");
+        let panes: Vec<PaneId> = workspace::tab(&ws, project, tab)
+            .expect("exists")
+            .tree
+            .panes
+            .keys()
+            .copied()
+            .collect();
+
+        let record = closing_record(&ws, project, tab).expect("a record");
+        assert_eq!(record.project, project);
+        assert_eq!(record.index, 1, "immediately right of the pinned console");
+        assert_eq!(
+            record.kind,
+            TabKind::File {
+                path: PathBuf::from("/w/src/lib.rs"),
+                dirty: false,
+            }
+        );
+        assert_eq!(
+            record.tree.panes.keys().copied().collect::<Vec<_>>(),
+            panes,
+            "the pane ids come back with it, which is what lets a reopened tab re-adopt its \
+             own parked terminal"
+        );
+    }
+
+    #[test]
+    fn there_is_nothing_to_remember_about_a_tab_that_is_not_there() {
+        let (ws, project, _) = with_file("/w/a.rs");
+        assert!(closing_record(&ws, project, TabId::new()).is_none());
+        assert!(closing_record(&ws, ProjectId::new(), TabId::new()).is_none());
+    }
+
+    /// A temp file that goes away with the test. Nothing in this crate has a fixture for one and
+    /// the deleted-file branch genuinely needs a real `stat`, so this is deliberately the same
+    /// shape `lifecycle::tests::temp_dir` uses.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("cide-reopen-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("a scratch dir");
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").expect("a scratch file");
+            Self(path)
+        }
+        fn delete(&self) {
+            std::fs::remove_file(&self.0).expect("removes");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().expect("a parent"));
+        }
+    }
+
+    /// A workspace with one project holding only its pinned console.
+    fn bare() -> (cide_ipc::Workspace, ProjectId) {
+        let mut ws = cide_ipc::Workspace::default();
+        let project = workspace::open_project(&mut ws, vec![PathBuf::from("/w")], None)
+            .expect("a project opens");
+        (ws, project)
+    }
+
+    /// The whole three-way rule, one branch at a time, on a real file.
+    ///
+    /// Each branch is a state an ordinary session reaches: deleting the file in another editor,
+    /// opening it again from Ctrl+P and walking away from it, and pressing the key while looking
+    /// at the tab it would reopen. The answers differ, and getting any of them wrong shows up as
+    /// "Ctrl+Shift+T does nothing".
+    #[test]
+    fn the_reopen_rule_shows_a_hidden_tab_reinserts_a_gone_one_and_skips_what_it_cannot_show() {
+        let scratch = Scratch::new("lib.rs");
+        let (mut ws, project) = bare();
+        let record = crate::closed_tabs::ClosedTab {
+            project,
+            kind: TabKind::File {
+                path: scratch.0.clone(),
+                dirty: false,
+            },
+            index: 1,
+            tree: cide_core::layout::new_tree(Pane {
+                id: PaneId::new(),
+                kind: PaneKind::Editor,
+                role: PaneRole::Auxiliary,
+                session: None,
+                title: "lib.rs".into(),
+            }),
+        };
+
+        // Not open: put it back.
+        assert_eq!(reopen_plan(&ws, &record), Reopen::Reinsert);
+
+        // Open and active: nothing a press could show, so drop the record and keep looking.
+        let open = workspace::open_tab(
+            &mut ws,
+            project,
+            TabKind::File {
+                path: scratch.0.clone(),
+                dirty: false,
+            },
+            Pane {
+                id: PaneId::new(),
+                kind: PaneKind::Editor,
+                role: PaneRole::Auxiliary,
+                session: None,
+                title: "lib.rs".into(),
+            },
+        )
+        .expect("opens");
+        assert_eq!(reopen_plan(&ws, &record), Reopen::Skip);
+
+        // Open but not active: showing it *is* the gesture. This is the branch that would be
+        // wrong as a `Skip` — the user asked for that tab and would get an unrelated one.
+        let console = workspace::console_tab(&ws, project).expect("exists");
+        workspace::activate_tab(&mut ws, project, console).expect("activates");
+        assert_eq!(reopen_plan(&ws, &record), Reopen::Show(open));
+
+        // Deleted since: skipped whatever else is true, so the stat has to come first.
+        workspace::close_tab(&mut ws, project, open, false).expect("closes");
+        scratch.delete();
+        assert_eq!(reopen_plan(&ws, &record), Reopen::Skip);
+    }
+
+    /// A record whose project closed under it. `forget_project` prunes these, so this is the
+    /// race and not the ordinary path — but a `project(...).expect()` here would take the whole
+    /// window down for it.
+    #[test]
+    fn a_record_for_a_project_that_is_gone_is_skipped_rather_than_fatal() {
+        let scratch = Scratch::new("a.rs");
+        let (ws, _) = bare();
+        let orphan = crate::closed_tabs::ClosedTab {
+            project: ProjectId::new(),
+            kind: TabKind::File {
+                path: scratch.0.clone(),
+                dirty: false,
+            },
+            index: 1,
+            tree: cide_core::layout::new_tree(Pane {
+                id: PaneId::new(),
+                kind: PaneKind::Editor,
+                role: PaneRole::Auxiliary,
+                session: None,
+                title: "a.rs".into(),
+            }),
+        };
+        assert_eq!(reopen_plan(&ws, &orphan), Reopen::Skip);
+    }
+
+    fn git_diff(repo: RepoId, path: &str, side: DiffSide) -> TabKind {
+        TabKind::Diff {
+            spec: DiffSpec {
+                title: "d".into(),
+                old_path: PathBuf::from(path),
+                new_path: PathBuf::from(path),
+                origin: DiffOrigin::Git {
+                    repo,
+                    path: path.into(),
+                    side,
+                },
+            },
+            preview: false,
+        }
+    }
+
+    /// `same_tab` has to agree with each opener's own dedupe, or a reopen produces the second
+    /// tab over one file that those checks exist to prevent.
+    #[test]
+    fn an_already_open_tab_is_recognised_the_way_its_opener_recognises_it() {
+        let a = TabKind::File {
+            path: PathBuf::from("/w/a.rs"),
+            dirty: false,
+        };
+        let a_dirty = TabKind::File {
+            path: PathBuf::from("/w/a.rs"),
+            dirty: true,
+        };
+        let b = TabKind::File {
+            path: PathBuf::from("/w/b.rs"),
+            dirty: false,
+        };
+        assert!(
+            same_tab(&a, &a_dirty),
+            "the path is the identity, not the flag"
+        );
+        assert!(!same_tab(&a, &b));
+
+        // Settings is a per-project singleton, whatever section either one is showing.
+        assert!(same_tab(
+            &TabKind::Settings {
+                section: SettingsSection::Keymap
+            },
+            &TabKind::Settings {
+                section: SettingsSection::default()
+            },
+        ));
+
+        // A git diff matches on repo and path and *not* on side: the pane switches sides while
+        // it is open, so a record made on `Unstaged` names the tab now showing `Staged`.
+        let repo = RepoId::new();
+        assert!(same_tab(
+            &git_diff(repo, "src/lib.rs", DiffSide::Staged),
+            &git_diff(repo, "src/lib.rs", DiffSide::Unstaged),
+        ));
+        assert!(!same_tab(
+            &git_diff(repo, "src/lib.rs", DiffSide::Staged),
+            &git_diff(RepoId::new(), "src/lib.rs", DiffSide::Staged),
+        ));
+
+        // Two Claude tabs are never the same tab. They differ only by title and hold different
+        // conversations, so matching them would silently drop one of the two records.
+        let one = TabKind::ClaudeFull {
+            title: "one".into(),
+        };
+        assert!(!same_tab(&one, &one.clone()));
+
+        // And a diff Claude is blocked on never matches anything — it is never a record in the
+        // first place (`closed_tabs::push` refuses it), and nothing here should make it one.
+        let mcp = TabKind::Diff {
+            spec: DiffSpec {
+                title: "d".into(),
+                old_path: PathBuf::from("a"),
+                new_path: PathBuf::from("a"),
+                origin: DiffOrigin::ClaudeMcp {
+                    request_id: "r".into(),
+                },
+            },
+            preview: false,
+        };
+        assert!(!same_tab(&mcp, &mcp.clone()));
+    }
 }

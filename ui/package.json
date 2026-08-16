@@ -40,6 +40,7 @@
     "check:rows": "node scripts/check-rows.mjs",
     "check:scratch": "node scripts/check-scratch.mjs",
     "check:search": "node scripts/check-search.mjs",
+    "check:speed-search": "node scripts/check-speed-search.mjs",
     "check:select-opened": "node scripts/check-select-opened.mjs",
     "check:sidebar": "node scripts/check-sidebar.mjs",
     "check:switcher": "node scripts/check-switcher.mjs",

@@ -19,7 +19,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use cide_ipc::FileDoc;
+use cide_ipc::{FileDoc, FileStamp};
 
 use crate::error::{CoreError, Result};
 
@@ -81,7 +81,39 @@ pub fn read(path: &Path) -> Result<FileDoc> {
         path: path.to_path_buf(),
         text,
         writable: !meta.permissions().readonly(),
+        stamp: stamp_of(&meta),
     })
+}
+
+/// The "is this still the file I read" token, from metadata already in hand.
+///
+/// `None` rather than a zero for a filesystem that will not answer, and the distinction is
+/// load-bearing: [`write_if_unchanged`] treats `None` on either side as "no precondition to
+/// check" and writes. A zero would compare equal to the next unavailable stamp and would
+/// silently claim the file had not moved.
+///
+/// Nanoseconds since the epoch, saturating at both ends. A pre-epoch mtime is a real thing on
+/// a badly restored archive; clamping it to 0 makes it equal to every other pre-epoch mtime,
+/// which costs a missed conflict on files nobody edits and never a false one.
+pub fn stamp_of(meta: &fs::Metadata) -> Option<FileStamp> {
+    let modified = meta.modified().ok()?;
+    let nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    Some(FileStamp {
+        mtime_nanos: nanos,
+        len: meta.len(),
+    })
+}
+
+/// The file's stamp right now, or `None` if it cannot be read.
+pub fn stamp_at(path: &Path) -> Option<FileStamp> {
+    // Through `canonicalize`, so a symlinked buffer compares the stamp of the file the write
+    // will actually land on rather than the link's own. `document::write` resolves the same way,
+    // and the two disagreeing would be a precondition checked against a different inode.
+    let target = fs::canonicalize(path).ok()?;
+    stamp_of(&fs::metadata(&target).ok()?)
 }
 
 /// Whether a file's leading bytes say it is not text.
@@ -132,6 +164,49 @@ pub fn write(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`write`], but only if the file on disk is still the one the buffer was read from.
+///
+/// Returns the file's new stamp on success, so the caller's token moves with the write and the
+/// *next* save compares against what this one produced rather than against what the file was
+/// half a minute ago.
+///
+/// `expect: None` writes unconditionally, which is what an explicit Ctrl+S passes: that is the
+/// user deciding, and a modal in front of a keystroke they typed on purpose is a modal for the
+/// wrong half of the problem. Autosave passes the token it was handed.
+///
+/// # Why a compare here and not a watcher subscription
+///
+/// See [`cide_ipc::FileStamp`]. In short: our own write emits a watcher event, so a subscription
+/// needs a self-write suppression window, and a suppression window is a race with a timer in it.
+///
+/// # What this deliberately does not close
+///
+/// The gap between the `stat` here and the `rename` below. Another process can replace the file
+/// in it, and nothing short of taking a lock the rest of the system does not honour would stop
+/// that. What this closes is the case that actually happens: a `cargo fmt` that ran *while the
+/// user was looking at their terminal*, seconds or minutes before the blur that triggers the
+/// save. Narrowing a race from minutes to microseconds is the whole of what is on offer, and it
+/// is worth having.
+pub fn write_if_unchanged(
+    path: &Path,
+    text: &str,
+    expect: Option<FileStamp>,
+) -> Result<Option<FileStamp>> {
+    if let Some(expect) = expect {
+        // `None` here is a filesystem that will not answer, not a mismatch — see `stamp_of`.
+        // Refusing to save because a `stat` was unhelpful would be worse than the race.
+        if let Some(actual) = stamp_at(path)
+            && actual != expect
+        {
+            return Err(CoreError::FileChanged {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    write(path, text)?;
+    Ok(stamp_at(path))
+}
+
 /// A sibling temp file, unique to one call.
 ///
 /// A sibling because `rename` is only atomic within one filesystem, and `/tmp` is very often
@@ -176,6 +251,126 @@ mod tests {
         // The whole point: nothing between the disk and the editor is allowed to normalise.
         assert_eq!(doc.text, "one\r\ntwo\r\n");
         assert!(doc.writable);
+    }
+
+    /*
+     * The precondition autosave writes with. Four cases, and the fourth is the whole feature.
+     *
+     * Every one of these is about *autosave*, not about Ctrl+S: an explicit save passes `None`
+     * and is unaffected by all of it.
+     */
+
+    #[test]
+    fn a_write_with_no_precondition_is_unconditional() {
+        // What Ctrl+S passes. The user typed the keystroke on purpose, and a modal in front of
+        // it would be a modal for the wrong half of the problem.
+        let path = tempdir().join("uncond.txt");
+        fs::write(&path, b"before").expect("seed");
+        let stamp = write_if_unchanged(&path, "after", None).expect("writes");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "after");
+        assert!(stamp.is_some(), "and the new stamp comes back");
+    }
+
+    #[test]
+    fn a_matching_precondition_writes_and_hands_back_the_new_stamp() {
+        let path = tempdir().join("match.txt");
+        fs::write(&path, b"before").expect("seed");
+        let opened = read(&path).expect("read").stamp;
+        assert!(
+            opened.is_some(),
+            "an ordinary temp file has a readable mtime"
+        );
+
+        let after = write_if_unchanged(&path, "after", opened).expect("writes");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "after");
+        assert_ne!(
+            after, opened,
+            "the token has to move with the write, or the *next* autosave compares against what \
+             the file was when the tab opened and refuses for ever"
+        );
+    }
+
+    #[test]
+    fn a_stale_precondition_refuses_and_leaves_the_file_alone() {
+        // THE ONE THAT MATTERS. This is `cargo fmt` in a shell pane, followed by the user
+        // clicking back into the editor — which with autosave-on-blur is a *save*, and without
+        // this check is a silent overwrite of the formatting.
+        let path = tempdir().join("stale.txt");
+        fs::write(&path, b"before").expect("seed");
+        let opened = read(&path).expect("read").stamp;
+
+        // Something else rewrites it. The length differs, so this is caught even on a
+        // filesystem whose mtime granularity swallowed the interval.
+        fs::write(&path, b"formatted by something else").expect("another process writes it");
+
+        let refusal = write_if_unchanged(&path, "the buffer", opened).expect_err("refused");
+        assert!(
+            matches!(refusal, CoreError::FileChanged { .. }),
+            "and it is a TAGGED refusal, not an `Io(String)`: the frontend has to tell \
+             \"the file moved under you\" from \"the disk is full\" without matching on prose, \
+             got {refusal:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "formatted by something else",
+            "and nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_length_preserving_change_is_still_caught() {
+        // Mtime alone would be enough here, and length alone would not — which is why the stamp
+        // carries both. A `sed -i s/foo/bar/` is exactly this shape.
+        let path = tempdir().join("samelen.txt");
+        fs::write(&path, b"foofoo").expect("seed");
+        let opened = read(&path).expect("read").stamp;
+        // Far enough apart that no filesystem's mtime granularity can swallow it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"barbar").expect("another process writes it");
+
+        assert!(
+            write_if_unchanged(&path, "the buffer", opened).is_err(),
+            "a same-length rewrite is the ordinary `sed -i` and must not slip through"
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_stamped_is_written_rather_than_refused() {
+        // `stamp_of` answers `None` for a filesystem that will not report an mtime, and the
+        // whole point of the `Option` is that `None` means "no precondition to check" rather
+        // than "assume the worst". Refusing to save because a `stat` was unhelpful would be
+        // strictly worse than the race it guards against — the user loses their edit either
+        // way, and one of the two ways is cide's own doing.
+        let path = tempdir().join("nostamp.txt");
+        fs::write(&path, b"before").expect("seed");
+        assert!(write_if_unchanged(&path, "after", None).is_ok());
+        assert_eq!(fs::read_to_string(&path).expect("read"), "after");
+    }
+
+    #[test]
+    fn a_stamp_survives_the_round_trip_that_a_read_and_a_write_make_of_it() {
+        // The two ends have to agree about *which* inode they are stamping. `write` resolves
+        // symlinks with `canonicalize` so that editing a symlinked file writes through the link;
+        // `stamp_at` therefore has to canonicalize too, or the precondition is compared against
+        // the link's own metadata and every save through a symlink refuses.
+        let dir = tempdir();
+        let real = dir.join("real.txt");
+        let link = dir.join("link.txt");
+        fs::write(&real, b"before").expect("seed");
+        let _ = fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        #[cfg(not(unix))]
+        return;
+
+        let opened = read(&link).expect("read").stamp;
+        write_if_unchanged(&link, "after", opened)
+            .expect("a save through a symlink is not a conflict");
+        assert_eq!(fs::read_to_string(&real).expect("read"), "after");
+        assert!(
+            fs::symlink_metadata(&link).expect("stat").is_symlink(),
+            "the link survived"
+        );
     }
 
     #[test]

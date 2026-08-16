@@ -97,6 +97,8 @@ fn parse(stdout: &[u8]) -> Result<Vec<Package>, DepsError> {
             version: module.version.unwrap_or_default(),
             dir: module.dir,
             note: module.error.map(|e| e.err),
+            // `go list -m all` lists modules, and the standard library is not one. See `sdk.rs`.
+            sdk: false,
         });
     }
 

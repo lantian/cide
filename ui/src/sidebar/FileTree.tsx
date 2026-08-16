@@ -33,6 +33,7 @@
  * the rows underneath it and an unmount of this panel; see the field's comment there.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { blurLeftTheTree } from '@/sidebar/speedSearch'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useShallow } from 'zustand/react/shallow'
 import { useFileTree } from './treeStore'
@@ -54,6 +55,8 @@ import {
   type SelectMods,
 } from './treeSelection'
 import { inDrag, inDropBand, type DragRow } from './treeDrag'
+import { useSpeedSearch } from './useSpeedSearch'
+import { SpeedName, SpeedSearchBar } from './SpeedSearchBar'
 import { useTreeDrag, type TreeDragState } from './useTreeDrag'
 import { clearFocusRequest, useFocusRequested } from '@/chrome/focusRequests'
 import { copyText } from './copyText'
@@ -902,6 +905,55 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
   )
 
   /**
+   * Type-ahead over the rows that are on screen. (M15)
+   *
+   * The rules are in `speedSearch.ts` and in `cide_fs::speed`; the machinery is in
+   * `useSpeedSearch`. What is decided *here* is the three adapters, and each is a fact about
+   * this tree rather than about the feature:
+   *
+   *   * **`search`** goes to `fs_tree_match`, because these rows are not in the webview. The
+   *     panel holds 200-row chunks of a flattening Rust owns, so a match at row 40,000 exists
+   *     only if Rust is the one looking.
+   *   * **`land`** is `moveTo`, unchanged and unwrapped. It already asks for the window around
+   *     a far index before reading it and already scrolls — which is exactly why jumping to an
+   *     arbitrary matched row needed no new code at all.
+   *   * **`revision`** is the row cache. `refresh` installs a fresh `chunks` map precisely when
+   *     a burst moved a row, and this panel already subscribes to it — so the staleness guard
+   *     costs no new store subscription, which `check:tree-flicker` would otherwise see as a
+   *     re-render per watcher burst.
+   */
+  const speedSearch = useSpeedSearch({
+    search: useMemo(
+      () => (project === null ? null : (query: string) => fsApi.treeMatch(project, query)),
+      [project],
+    ),
+    land: moveTo,
+    accept: useCallback(() => {
+      const store = useFileTree.getState()
+      const at = cursor()
+      const row = at < 0 ? undefined : store.rowAt(at)
+      if (row === undefined) return
+      // The same call Enter already makes below, through the same rule — so accepting a match
+      // opens a file, expands a directory and starts a group's resolution exactly as pressing
+      // Enter on that row would. A second spelling here would be a second Enter.
+      apply(enterOn({ expandable: rowVerbs(row.kind, true).expandable }), row, at)
+    }, [apply, cursor]),
+    count,
+    revision: chunks,
+  })
+
+  /*
+   * A project switch takes the search with it.
+   *
+   * `attach` throws away the selection and the draft for the same reason and says so at
+   * length: a query's match list is a list of *indices into the old project's flattening*, so
+   * a search that survived the switch would put the cursor on an unrelated file in a tree the
+   * user has only just started looking at.
+   */
+  const exitSearch = speedSearch.exit
+  useEffect(() => exitSearch(), [project, exitSearch])
+
+  /**
    * Dismiss the trash confirmation, run whatever it was confirming, and give the tree back the
    * caret.
    *
@@ -963,6 +1015,25 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       // move the selection, and would answer Escape by cancelling the draft *and* jumping the
       // cursor to whatever row the arrows were last on.
       if (renaming !== null || draft !== null) return
+      /*
+       * Speed search, and it is **first** — above the clipboard block, above `treeKeyAction`,
+       * above the navigation.
+       *
+       * Order is the safety property here, not a preference. Two keys make it so:
+       *
+       *   * **Escape.** The branch below cancels a pending cut and then collapses a multi-row
+       *     selection. A user who typed three letters and pressed Escape to call the search off
+       *     would otherwise have thrown away their clipboard cut instead.
+       *   * **Delete.** `treeKeyAction` answers a bare Delete with *Move to Trash* over the
+       *     selection — and the selection is wherever the search has just moved it. `speedKey`
+       *     answers `swallow` for that key while a query is armed, and a branch running after
+       *     the clipboard block could not have.
+       *
+       * A key the search does not want comes back `false` and every rule below runs exactly as
+       * it did before this feature existed, including the modified chords: Ctrl+C, Ctrl+X,
+       * Ctrl+V, Ctrl+A and Ctrl+R end the search and then do their own job.
+       */
+      if (speedSearch.onKeyDown(e)) return
       const store = useFileTree.getState()
       const at = cursor()
 
@@ -1239,6 +1310,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       reported,
       roots,
       runPaste,
+      speedSearch,
       startRename,
       takeClip,
     ],
@@ -1714,6 +1786,26 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
 
   return (
     <>
+      {/*
+        * What is being typed, and how many rows it found.
+        *
+        * A sibling of the scroller and never a child, for the two reasons every strip in this
+        * panel is one: the scroller is `role="tree"`, whose children have to be tree items, and
+        * its viewport is as tall as the whole flattened repository — a box inside it would sit a
+        * hundred thousand rows down. It floats over the top-left corner of the tree, which is
+        * IDEA's placement and the only spot that does not push the rows down as it appears.
+        *
+        * This is not decoration. In a windowed tree most matches are never rendered at all, so
+        * the counter — not the highlight — is what makes the feature real; the `<mark>` is the
+        * confirmation once the scroll has arrived.
+        */}
+      {speedSearch.active && (
+        <SpeedSearchBar
+          query={speedSearch.query}
+          summary={speedSearch.summary}
+          audit="fileTreeSpeedSearch"
+        />
+      )}
       <div
         className={styles.scroll}
         ref={scrollRef}
@@ -1735,6 +1827,27 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
            different claims about where the files are going. */
         {...(drag.state === null ? {} : { 'data-dragging': '' })}
         onKeyDown={onKeyDown}
+        /*
+         * Every other way out of a speed search, and each one is necessary.
+         *
+         * A **press** anywhere in the tree is the user choosing a row with the pointer, which is
+         * an answer to the same question the query was asking; leaving the box up over a
+         * selection it did not make would be the tree lying about what it is filtered to.
+         *
+         * A **blur** matters more. A query left armed while the caret goes to a terminal would
+         * eat the first letters typed on the way back — the tree's `onKeyDown` only runs while
+         * the scroller has focus, so the search would sit there invisible until it did. The
+         * capture phase, so a press on a row that moves focus is caught either way.
+         *
+         * Not on the *toggle* separately: Left, Right and a click on a twisty all pass through
+         * one of these two, and `speedKey` answers the keyboard half with `exitThenPass`.
+         */
+        onPointerDownCapture={speedSearch.exit}
+        onBlur={(e) => {
+          // Only when focus really left the tree — `onBlur` is the bubbling
+          // `focusout`, so landing on a match fires it too. See `blurLeftTheTree`.
+          if (blurLeftTheTree(e.currentTarget, e.relatedTarget)) speedSearch.exit()
+        }}
         onContextMenu={onContextMenu}
       >
         <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
@@ -1804,6 +1917,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
                 onRelease={releasePress}
                 onEndRename={() => setRenaming(null)}
                 onFail={fail('Rename')}
+                match={speedSearch.spanFor(toReal(item.index))}
               />
             )
           })}
@@ -2201,6 +2315,17 @@ interface RowProps {
   onEndRename: () => void
   /** Where a rejected `fs_rename` goes. See `problem` in the panel. */
   onFail: (error: unknown) => void
+  /**
+   * Where the speed-search query sits inside this row's name, or `undefined`.
+   *
+   * A prop, threaded down from the panel, and not something the row works out for itself. The
+   * panel's stated rule (see the `statuses` and `iconTheme` subscriptions above) is that per-row
+   * store subscriptions are one zustand listener per visible row torn down on every scroll tick
+   * — and re-deriving the *match* here would be worse still: it would be a second matching rule
+   * in TypeScript beside the one in `cide_fs::speed`, which is the exact duplication this
+   * feature was built to avoid.
+   */
+  match: { start: number; end: number } | undefined
 }
 
 function Row({
@@ -2219,6 +2344,7 @@ function Row({
   renaming,
   project,
   onAct,
+  match,
   onPick,
   onRelease,
   onEndRename,
@@ -2417,7 +2543,10 @@ function Row({
             status.nameClass === undefined ? styles.name : `${styles.name} ${status.nameClass}`
           }
         >
-          {row.name}
+          {/* One element, three text nodes on a matched row and one on every other. `.name` is
+              the block container, so `text-overflow: ellipsis` is unaffected by inline children
+              inside it — the same arrangement `SearchPanel` already draws its hit lines with. */}
+          <SpeedName name={row.name} span={match} />
         </span>
       )}
       {/*

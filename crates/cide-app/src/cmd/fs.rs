@@ -275,6 +275,133 @@ pub async fn fs_tree_rows(
     .await
 }
 
+/// The most matches one speed-search keystroke will return.
+///
+/// A one-letter query over a fully expanded 100k-row tree matches most of it, and serialising
+/// that would spend megabytes on a list whose only consumers are a `3 of 17` counter and a
+/// scroll target. A thousand is far more than anybody walks with the arrow keys and small
+/// enough to be free; past it the frame carries `truncated` and the overlay says so, which is
+/// the difference between an answer that is short and an answer that lies.
+const MAX_MATCHES: usize = 1000;
+
+/// Compose two sources' match lists the way [`compose`] composes their rows.
+///
+/// A named function for the same reason `compose` is one: the failure is invisible. Matches
+/// carry *row indices*, and a match inside *External Libraries* numbered from the group's own
+/// zero rather than from `Index::count()` scrolls the tree to a file in the user's project with
+/// a highlight on a name that does not contain the query — a correct-looking answer about the
+/// wrong file. `compose_serves_every_window_across_the_seam` exists for that class of bug on
+/// the row side; `matches_across_the_seam_are_numbered_from_the_composed_tree` is its twin.
+///
+/// The budget is spent by the first source and the remainder handed to the second, so the two
+/// together never exceed `limit`. When the first has already filled it, the second is still
+/// asked — with a budget of zero, which answers "nothing, and there was more" — because the
+/// truncation flag has to be true whenever *anything* was dropped, from either side.
+fn compose_matches(
+    first_len: usize,
+    limit: usize,
+    first: impl FnOnce(usize) -> (Vec<cide_ipc::TreeMatch>, bool),
+    second: impl FnOnce(usize) -> (Vec<cide_ipc::TreeMatch>, bool),
+) -> (Vec<cide_ipc::TreeMatch>, bool) {
+    let (mut matches, truncated) = first(limit);
+    let (rest, more) = second(limit.saturating_sub(matches.len()));
+    matches.extend(rest.into_iter().map(|m| cide_ipc::TreeMatch {
+        row: m.row + first_len as u32,
+        ..m
+    }));
+    (matches, truncated || more)
+}
+
+/// Which visible rows a speed-search query matches, and where in each row's name.
+///
+/// One round trip per keystroke, like `picker_query`, and for the same reason: the rows this
+/// searches are not in the webview. The explorer holds 200-row chunks of a flattening Rust
+/// owns, so a frontend match would silently miss everything outside the cache — worse than
+/// missing it consistently, because which matches exist would depend on where the user last
+/// scrolled.
+///
+/// The frame echoes the query and carries the row count it was computed against, and the
+/// overlay drops any frame that no longer answers the live question. That is not belt and
+/// braces: a match list describes exactly one flattening, and a watcher burst or an expand
+/// renumbers every index in it, so Down would jump to a different file with nothing on screen
+/// admitting it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_tree_match(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+    query: String,
+) -> Result<cide_ipc::TreeMatches, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_tree_match", move || {
+        prepare(&fs, None);
+        let count = tree_count(&fs) as u32;
+        let Some(needle) = cide_fs::speed::Needle::new(&query) else {
+            return cide_ipc::TreeMatches {
+                query,
+                count,
+                matches: Vec::new(),
+                truncated: false,
+            };
+        };
+        let walked = fs.with_index(|index| index.count());
+        let (matches, truncated) = compose_matches(
+            walked,
+            MAX_MATCHES,
+            |limit| fs.with_index(|index| index.match_rows(&needle, limit)),
+            |limit| fs.groups().match_rows(&needle, limit),
+        );
+        cide_ipc::TreeMatches {
+            query,
+            count,
+            matches,
+            truncated,
+        }
+    })
+    .await
+}
+
+/// The same rule over a list the caller supplies — the git panel's changes tree.
+///
+/// The `picker_rank` shape, and the argument is `picker_rank`'s argument: *two trees that
+/// answer the same query differently reads as a bug even when both answers are defensible on
+/// their own.* The changes tree holds its whole `Row[]` in the webview and could match locally
+/// in a loop, but that loop would be a second implementation of `cide_fs::speed`, and the two
+/// would agree only for as long as nobody edited either — this codebase has already paid for
+/// that twice.
+///
+/// Not in `cmd::picker`, deliberately: this is not ranking and must never become ranking. Match
+/// order is list order in both trees, because Down means "the next one down the list".
+///
+/// `count` echoes the number of labels searched, so the caller can drop a frame computed
+/// against a `git status` that has since been replaced.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn tree_match_labels(
+    query: String,
+    labels: Vec<String>,
+) -> Result<cide_ipc::TreeMatches, FsError> {
+    blocking("tree_match_labels", move || {
+        let count = labels.len() as u32;
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        if let Some(needle) = cide_fs::speed::Needle::new(&query) {
+            for (row, label) in labels.iter().enumerate() {
+                if cide_fs::speed::push_match(&needle, label, row as u32, MAX_MATCHES, &mut matches)
+                {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        cide_ipc::TreeMatches {
+            query,
+            count,
+            matches,
+            truncated,
+        }
+    })
+    .await
+}
+
 /// Expand a directory, or a synthetic group. Returns the new row count.
 ///
 /// The index is asked first and the groups only if it declines, which is the right order for
@@ -2111,6 +2238,160 @@ mod compose_tests {
             }
         }
     }
+
+    // --- speed search across the same seam ----------------------------------------------
+
+    /// A match source over a list of names, numbered from its own zero.
+    fn matches_of(
+        names: &'static [&'static str],
+    ) -> impl Fn(&str, usize) -> (Vec<cide_ipc::TreeMatch>, bool) {
+        move |query: &str, limit: usize| {
+            let needle = match cide_fs::speed::Needle::new(query) {
+                Some(n) => n,
+                None => return (Vec::new(), false),
+            };
+            let mut out = Vec::new();
+            for (row, name) in names.iter().enumerate() {
+                if cide_fs::speed::push_match(&needle, name, row as u32, limit, &mut out) {
+                    return (out, true);
+                }
+            }
+            (out, false)
+        }
+    }
+
+    /// The invisible one, and the twin of `compose_serves_every_window_across_the_seam`.
+    ///
+    /// A match under *External Libraries* numbered from the group's own zero is not an empty
+    /// list or an error — it is a row index that names a file in the user's own project, so the
+    /// tree scrolls somewhere plausible and highlights a name that does not contain the query.
+    /// Nothing about that looks like a bug from either end of the list.
+    #[test]
+    fn matches_across_the_seam_are_numbered_from_the_composed_tree() {
+        const FIRST: &[&str] = &["alpha.rs", "beta.rs", "cargo.toml"];
+        const SECOND: &[&str] = &["External Libraries", "serde", "anyhow"];
+        let all: Vec<&str> = FIRST.iter().chain(SECOND).copied().collect();
+
+        let (matches, truncated) = compose_matches(
+            FIRST.len(),
+            100,
+            |limit| matches_of(FIRST)("a", limit),
+            |limit| matches_of(SECOND)("a", limit),
+        );
+        assert!(!truncated);
+        // Every reported row index, read back through the *composed* list, must contain the
+        // query — which is the property, rather than a hard-coded list of indices that would
+        // pin whatever the arithmetic happens to do today.
+        for m in &matches {
+            let name = all[m.row as usize];
+            assert!(
+                name.to_lowercase().contains('a'),
+                "row {} is {name:?}, which does not match",
+                m.row
+            );
+            // And the span has to describe *that* name.
+            assert!(m.end as usize <= name.chars().count(), "span past {name:?}");
+        }
+        let hit: Vec<&str> = matches.iter().map(|m| all[m.row as usize]).collect();
+        assert_eq!(
+            hit,
+            vec![
+                "alpha.rs",
+                "beta.rs",
+                "cargo.toml",
+                "External Libraries",
+                "anyhow"
+            ]
+        );
+    }
+
+    /// The budget is shared, and truncation is true when *either* source lost something.
+    ///
+    /// The failure this pins is the quiet half: a first source that fills the limit exactly and
+    /// a second source with matches nobody will ever see, reported as a complete answer. The
+    /// overlay would then print `3 of 3` over a tree containing five.
+    #[test]
+    fn a_full_budget_on_one_side_still_reports_what_the_other_side_lost() {
+        const FIRST: &[&str] = &["a1", "a2"];
+        const SECOND: &[&str] = &["a3"];
+        let (matches, truncated) = compose_matches(
+            FIRST.len(),
+            2,
+            |limit| matches_of(FIRST)("a", limit),
+            |limit| matches_of(SECOND)("a", limit),
+        );
+        assert_eq!(matches.len(), 2);
+        assert!(
+            truncated,
+            "the group's match was dropped and nothing said so"
+        );
+
+        // And the ordinary case must not claim truncation it did not suffer.
+        let (matches, truncated) = compose_matches(
+            FIRST.len(),
+            100,
+            |limit| matches_of(FIRST)("a", limit),
+            |limit| matches_of(SECOND)("a", limit),
+        );
+        assert_eq!(matches.len(), 3);
+        assert!(!truncated);
+    }
+
+    /// The real group tree, so the walk that *numbers* the rows and the walk that *emits* them
+    /// cannot drift apart.
+    ///
+    /// `Groups::rows` and `Groups::match_rows` are two separate depth-first walks over the same
+    /// arena, written to look alike precisely because they have to agree; this is what says so.
+    /// Without it, a header counted but not emitted (or the reverse) would put every match under
+    /// it one row out — a highlight on the row above the file the user typed the name of.
+    ///
+    /// **The first group is deliberately collapsed.** The first version of this fixture had one
+    /// expanded group, and a mutation that moved the header's `at += 1` below the
+    /// `if !group.expanded { continue }` survived it — because with every group expanded that
+    /// branch is never taken and the mutation is a no-op. A collapsed header contributes exactly
+    /// one row to `rows()` and must contribute exactly one to the numbering, and only a fixture
+    /// that has one can say so.
+    #[test]
+    fn the_group_walk_that_numbers_rows_agrees_with_the_walk_that_draws_them() {
+        let mut groups = Groups::new();
+        // Collapsed, and holding a row that *would* match if anybody looked inside it — filled
+        // and then folded, because a group that was merely `show`n has no children at all and a
+        // walk that ignored the `expanded` flag would pass over it unpunished.
+        groups.show("scratches", "serde scratches");
+        groups.expand(&group_path("scratches"));
+        groups.fulfil("scratches", vec![Entry::note("serde-hidden.rs")], None);
+        groups.collapse(&group_path("scratches"));
+        groups.show("externalLibraries", "External Libraries");
+        groups.expand(&group_path("externalLibraries"));
+        groups.fulfil(
+            "externalLibraries",
+            vec![
+                Entry::note("serde is not downloaded"),
+                Entry::note("anyhow"),
+                Entry::note("serde_json"),
+            ],
+            Some("3".into()),
+        );
+
+        let drawn = groups.rows(0, groups.count());
+        let needle = cide_fs::speed::Needle::new("serde").expect("non-empty");
+        let (matches, _) = groups.match_rows(&needle, 100);
+        assert!(!matches.is_empty(), "the fixture contains `serde` twice");
+        for m in &matches {
+            let row = &drawn[m.row as usize];
+            assert!(
+                row.name.to_lowercase().contains("serde"),
+                "row {} is {:?}",
+                m.row,
+                row.name
+            );
+            // The span, read as UTF-16 units over the name the tree actually draws.
+            let units: Vec<u16> = row.name.encode_utf16().collect();
+            let slice = String::from_utf16(&units[m.start as usize..m.end as usize])
+                .expect("a span inside one name");
+            assert_eq!(slice.to_lowercase(), "serde");
+        }
+    }
 }
 
 /// The *Scratches* group, through the real command layer.
@@ -2158,6 +2439,81 @@ mod scratch_tests {
         let _ = std::fs::remove_dir_all(cide_core::scratch::dir_for(root));
         let _ = std::fs::remove_file(cide_core::scratch::origin_path(root));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Speed search, end to end over a real walked project.
+    ///
+    /// The unit tests below `Index::match_rows` and `compose_matches` prove the arithmetic, and
+    /// they prove it about functions that a handler has to *call*. This is the link that is
+    /// missing in the failure this repository keeps finding — a complete, correct, well-tested
+    /// module nothing reaches — so it drives `prepare` + `Needle` + `compose_matches` the way
+    /// `fs_tree_match` does, against a project that was actually indexed.
+    ///
+    /// Not the `#[tauri::command]` itself: `State` cannot be built outside a Tauri app, which is
+    /// the reason `index_project` and `query_project` exist as named functions in the first
+    /// place. Everything inside the command's `blocking` closure is here.
+    #[tokio::test]
+    async fn a_speed_search_reaches_the_rows_of_a_real_project() {
+        let (_registry, _id, fs, root) = project("speed").await;
+        prepare(&fs, None);
+
+        let matched = |query: &str| -> Vec<String> {
+            let count = tree_count(&fs);
+            let Some(needle) = cide_fs::speed::Needle::new(query) else {
+                return Vec::new();
+            };
+            let walked = fs.with_index(|index| index.count());
+            let (matches, truncated) = compose_matches(
+                walked,
+                MAX_MATCHES,
+                |limit| fs.with_index(|index| index.match_rows(&needle, limit)),
+                |limit| fs.groups().match_rows(&needle, limit),
+            );
+            assert!(
+                !truncated,
+                "a two-file fixture cannot fill a 1000-row budget"
+            );
+            // Read the reported rows back out of the *composed* window the tree actually draws,
+            // which is the only thing that makes the row index mean anything.
+            let rows = compose(
+                walked,
+                0,
+                count,
+                |offset, len| fs.with_index(|index| index.rows(offset, len)),
+                |offset, len| fs.groups().rows(offset, len),
+            );
+            matches
+                .into_iter()
+                .map(|m| {
+                    let name = rows[m.row as usize].name.clone();
+                    let units: Vec<u16> = name.encode_utf16().collect();
+                    let hit = String::from_utf16(&units[m.start as usize..m.end as usize])
+                        .expect("a span inside one name");
+                    assert_eq!(
+                        hit.to_lowercase(),
+                        query.to_lowercase(),
+                        "the span has to describe {name:?}"
+                    );
+                    name
+                })
+                .collect()
+        };
+
+        // A single root is not drawn, so `src` is a top-level row and `main.rs` is inside it —
+        // collapsed, and therefore not searchable until it is opened. That is the feature, not a
+        // gap: see `Index::match_rows`.
+        assert_eq!(matched("src"), vec!["src".to_string()]);
+        assert_eq!(matched("main"), Vec::<String>::new());
+
+        fs.with_index_mut(|index| {
+            index.expand(&root.join("src"));
+        });
+        assert_eq!(matched("main"), vec!["main.rs".to_string()]);
+        // Case-insensitive, over a real filename off a real disk.
+        assert_eq!(matched("MAIN"), vec!["main.rs".to_string()]);
+        assert_eq!(matched("zzzz"), Vec::<String>::new());
+
+        cleanup(&root);
     }
 
     /// The rows the groups contribute, which start where the walked index ends.

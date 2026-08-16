@@ -57,6 +57,28 @@ pub fn bump(ws: &mut Workspace) -> u64 {
     ws.rev
 }
 
+/// Make `tab` the project's active one **and** put it at the head of its focus order.
+///
+/// The only writer of [`Project::active_tab`] in this crate, and that is the point rather than
+/// tidiness: the two fields are one fact written twice, and any assignment that moved one
+/// without the other would leave `close_tab` choosing a successor from a history that had
+/// stopped recording. `grep -n "active_tab = " crates/` should find this function and nothing
+/// else outside test fixtures.
+///
+/// Deliberately *not* a `pub` mutator and deliberately not bumping `rev`: it is a fragment of
+/// four larger mutations ([`open_project`] via its literal, [`open_tab`], [`close_tab`],
+/// [`activate_tab`]), each of which bumps once for the whole of what it did.
+///
+/// The tab is not checked for membership in `p.tabs`. Every caller has already resolved it —
+/// `open_tab` just pushed it, the other two looked it up — and a second lookup here would be a
+/// second answer to a question already asked, which is how [`close_tab`] and the close dialog
+/// once came to disagree about "unsaved".
+fn set_active(p: &mut Project, tab: TabId) {
+    p.active_tab = tab;
+    p.tab_mru.retain(|id| *id != tab);
+    p.tab_mru.insert(0, tab);
+}
+
 /// Open a project over `roots`, with its pinned console tab already populated.
 ///
 /// The console is created before anything else and holds a single `Primary` Claude pane
@@ -121,6 +143,9 @@ pub fn open_project(
             roots: roots.into_iter().map(project_root).collect(),
             tabs: vec![console],
             active_tab,
+            // The literal rather than `set_active`, because the struct does not exist yet to
+            // pass one a `&mut` to. Same two writes, and `validate` checks the result.
+            tab_mru: vec![active_tab],
             detached: IndexMap::new(),
             dock_anchors: IndexMap::new(),
             primary_session,
@@ -276,7 +301,68 @@ pub fn open_tab(
         kind,
         tree: layout::new_tree(first_pane),
     });
-    p.active_tab = id;
+    set_active(p, id);
+    bump(ws);
+    Ok(id)
+}
+
+/// Put a whole tab back: its kind, its pane tree, and its position in the strip.
+///
+/// [`open_tab`]'s counterpart for Ctrl+Shift+T. It is a separate function rather than an
+/// `Option<PaneTree>` parameter on `open_tab` because the two differ in every interesting way:
+/// `open_tab` mints one pane and appends, this one accepts a tree it did not build and inserts
+/// at a position — and the *checks* it therefore has to run are the whole of its body.
+///
+/// # The pane ids are the ones the tab had, and that is on purpose
+///
+/// `close_tab` removes the tab from `p.tabs`, so its pane ids stop being live and are free to
+/// use again — and the frontend's `paneHosts` map is keyed by pane id and is **not** cleared by
+/// a tab close (only `close_pane` calls `destroyHost`). So a `ClaudeFull` tab reopened this way
+/// re-adopts its own parked terminal, with its scrollback and its live session, instead of
+/// mounting a fresh one and replaying a mirror. Reminting would have cost that for no gain: a
+/// `PaneId` is a UUID, so a preserved one cannot collide with a pane minted meanwhile, and the
+/// check below refuses the case anyway rather than trusting the argument.
+///
+/// The **tab** id is fresh. Nothing outside holds the old one — `close_tab` has already pruned
+/// the detached windows anchored to it — and a `WindowRole` naming a tab id that came back
+/// would re-dock a pane into a tab it never left.
+///
+/// `index` is clamped into `1..=tabs.len()`: 0 is the pinned console's and a record made when
+/// the strip was longer must not be refused for naming a position past its end.
+pub fn reinsert_tab(
+    ws: &mut Workspace,
+    project: ProjectId,
+    index: usize,
+    kind: TabKind,
+    tree: cide_ipc::PaneTree,
+) -> Result<TabId> {
+    // Tree first, and against the *whole* workspace: a pane id is the address every later
+    // command uses, and `validate` refuses a workspace in which one appears twice — so a
+    // reopen that collided would be rolled back by `WorkspaceState::update` with nothing but a
+    // log line to say why. Same refusal, and same wording, as `open_tab`'s.
+    layout::validate(&tree)?;
+    for pane in tree.panes.keys() {
+        if let Some((existing_project, existing_tab)) = find_pane(ws, *pane) {
+            return Err(CoreError::Invariant(format!(
+                "pane {pane} is already live in project {existing_project} tab {existing_tab}",
+            )));
+        }
+        if ws.projects.values().any(|p| p.detached.contains_key(pane)) {
+            return Err(CoreError::Invariant(format!(
+                "pane {pane} is detached into its own window",
+            )));
+        }
+    }
+
+    let p = project_mut(ws, project)?;
+    if matches!(kind, TabKind::ClaudeHome) {
+        return Err(CoreError::TabPinned);
+    }
+
+    let id = TabId::new();
+    let at = index.clamp(1, p.tabs.len());
+    p.tabs.insert(at, Tab { id, kind, tree });
+    set_active(p, id);
     bump(ws);
     Ok(id)
 }
@@ -399,12 +485,41 @@ pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool
 
     let p = project_mut(ws, project)?;
     p.tabs.remove(index);
+    // Out of the focus order whether or not it was the active tab, and *before* the successor
+    // is chosen. Dropping it only in the active branch is the subtle version of this bug:
+    // closing an inactive tab would leave its id in `tab_mru`, and the next close would hand
+    // the user a tab that no longer exists — a ghost with an `index - 1` shape, one gesture
+    // removed from the gesture that caused it.
+    p.tab_mru.retain(|id| *id != tab);
     if p.active_tab == tab {
-        // Removal has already shifted the right-hand neighbour into `index`, so `index - 1`
-        // is the tab to the left. It always exists: `index` is at least 1 and `tabs[0]` is
-        // the console, which cannot be closed.
-        if let Some(left) = p.tabs.get(index - 1) {
-            p.active_tab = left.id;
+        // # Which tab the user lands on
+        //
+        // The **most recently used survivor**, asked for by name. The old rule was the tab to
+        // the *left*, which is strip position — and strip position is insertion order, so
+        // closing a file opened an hour ago dropped the user next to whatever happened to have
+        // been opened just before it, rather than back where they came from.
+        //
+        // `tab_mru[0]` is the tab being closed (it was active), so the successor is the first
+        // entry after the `retain` above. It is checked against `p.tabs` anyway rather than
+        // trusted: `validate` guarantees the order holds only live ids, but this runs on a
+        // workspace read from disk that may predate that guarantee, and activating a tab that
+        // does not exist is the one outcome worse than landing in the wrong place.
+        //
+        // # The fallback is the old rule, and it is reachable
+        //
+        // A `workspace.json` written before `tab_mru` existed loads with an empty order, and a
+        // project whose only activation was its own creation has a one-entry one. Both leave
+        // nothing here, and both then get the left neighbour — which always exists, because
+        // `index` is at least 1 and `tabs[0]` is the console, which cannot be closed. So the
+        // successor is never absent and is never the tab just removed.
+        let successor = p
+            .tab_mru
+            .iter()
+            .copied()
+            .find(|id| p.tabs.iter().any(|t| t.id == *id))
+            .or_else(|| p.tabs.get(index - 1).map(|t| t.id));
+        if let Some(next) = successor {
+            set_active(p, next);
         }
     }
 
@@ -421,13 +536,21 @@ pub fn close_tab(ws: &mut Workspace, project: ProjectId, tab: TabId, force: bool
     Ok(())
 }
 
-/// Make `tab` the project's active tab.
+/// Make `tab` the project's active tab, promoting it to the head of the focus order.
+///
+/// `changed` asks about the *order* as well as the active id, and not for symmetry: a
+/// workspace restored from a build without [`Project::tab_mru`] has an active tab that is not
+/// at the head of an order that is empty, and re-activating it is the first chance to repair
+/// that. Without the second clause the repair is skipped precisely for the tab the user is
+/// looking at, and a `close_tab` on it would take the left-neighbour fallback for ever.
+/// `persist::load` repairs on the way in as well; this is the belt to that pair of braces, and
+/// it settles after one activation because `set_active` puts the tab at the head.
 pub fn activate_tab(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Result<()> {
     let p = project_mut(ws, project)?;
     index_of_tab(p, tab)?;
 
-    let changed = p.active_tab != tab;
-    p.active_tab = tab;
+    let changed = p.active_tab != tab || p.tab_mru.first() != Some(&tab);
+    set_active(p, tab);
     if changed {
         bump(ws);
     }
@@ -935,6 +1058,37 @@ pub fn refresh_display_paths(ws: &mut Workspace) {
 /// Cleared here rather than by the editor reporting clean on mount: the editor's report is
 /// deduplicated against what it last said, so a pane that opens clean says nothing at all,
 /// and a file tab restored into a window nobody activates has no editor to report anything.
+/// Make every project's [`Project::tab_mru`] satisfy [`validate`], dropping what it cannot.
+///
+/// Called by `persist::load`, beside [`clear_dirty_flags`], and **repairing rather than
+/// rejecting is the whole point**. `WorkspaceState::load` throws the entire workspace away and
+/// starts from defaults when validation fails, so a `workspace.json` written by any build
+/// before this field existed would cost its author every open project and every open tab —
+/// paid on upgrade, for a field that holds nothing a user would miss. That is precisely the
+/// "a broken layout must not become a launch loop" rule `persist` opens with.
+///
+/// Three repairs, in order: drop ids that name no live tab, drop duplicates, and put
+/// `active_tab` at the head. The common case is the empty order of a migrated file, which comes
+/// out as `[active_tab]` and nothing else.
+///
+/// The remaining tabs are deliberately **not** appended in strip order. Insertion order is not
+/// use order, and inventing one would put a plausible-looking history in a field whose only
+/// consumer is a decision about where the user lands — [`close_tab`] would then pick a tab the
+/// user has never visited and present it as the one they came from. An order of one is honest,
+/// and `close_tab`'s left-neighbour fallback covers exactly this case.
+pub fn repair_tab_mru(ws: &mut Workspace) {
+    for p in ws.projects.values_mut() {
+        let live: HashSet<TabId> = p.tabs.iter().map(|t| t.id).collect();
+        let mut seen: HashSet<TabId> = HashSet::new();
+        p.tab_mru
+            .retain(|id| live.contains(id) && *id != p.active_tab && seen.insert(*id));
+        // `active_tab` is validated to name a live tab by the check `validate` already had, so
+        // this cannot introduce a dead id — and it cannot duplicate one, because the `retain`
+        // above removed every copy of it first.
+        p.tab_mru.insert(0, p.active_tab);
+    }
+}
+
 pub fn clear_dirty_flags(ws: &mut Workspace) {
     for p in ws.projects.values_mut() {
         for t in &mut p.tabs {
@@ -1025,6 +1179,36 @@ pub fn validate(ws: &Workspace) -> Result<()> {
 
         if !tabs.contains(&p.active_tab) {
             return Err(CoreError::NoSuchTab(p.active_tab));
+        }
+
+        // The focus order names live tabs, each at most once, and starts at the active one.
+        //
+        // A duplicate is the failure mode of a `set_active` that forgot its `retain`, and it is
+        // invisible until a close: the order still *looks* right and Ctrl+Tab still walks it,
+        // but the stale copy becomes the successor the moment the tab in front of it goes away.
+        // A dead id is the same failure one step further on. Both are cheap to check and
+        // impossible to see by inspection, which is the whole argument for checking them here.
+        //
+        // Shorter than `tabs` is legal and stays legal — see [`Project::tab_mru`]; only ids
+        // that name nothing are refused.
+        let mut seen_mru: HashSet<TabId> = HashSet::new();
+        for id in &p.tab_mru {
+            if !tabs.contains(id) {
+                return Err(CoreError::NoSuchTab(*id));
+            }
+            if !seen_mru.insert(*id) {
+                return Err(CoreError::Invariant(format!(
+                    "tab {id} appears twice in project {}'s focus order",
+                    p.id
+                )));
+            }
+        }
+        if p.tab_mru.first() != Some(&p.active_tab) {
+            return Err(CoreError::Invariant(format!(
+                "project {id} is active on tab {} but its focus order starts at {:?}",
+                p.active_tab,
+                p.tab_mru.first()
+            )));
         }
     }
 
@@ -1999,60 +2183,413 @@ mod tests {
         assert_eq!(project(&ws, id).expect("exists").tabs.len(), 1);
     }
 
+    /// A closable full tab, named, so the MRU tests below read as a sequence of gestures
+    /// rather than as six copies of the same twelve-line literal.
+    fn full_tab(ws: &mut Workspace, id: ProjectId, title: &str) -> TabId {
+        open_tab(
+            ws,
+            id,
+            TabKind::ClaudeFull {
+                title: title.into(),
+            },
+            aux_pane(),
+        )
+        .expect("opens")
+    }
+
+    /// The order `tab_mru` holds, for assertions that care about the whole of it.
+    fn mru(ws: &Workspace, id: ProjectId) -> Vec<TabId> {
+        project(ws, id).expect("exists").tab_mru.clone()
+    }
+
+    /// The headline of the feature: closing lands you where you came *from*, not next door.
+    ///
+    /// The arrangement is chosen so the two rules disagree. `first` is the left neighbour of
+    /// `third` after `second` is skipped over, so a test that opened three tabs and closed the
+    /// last would pass under either rule — opening a tab activates it, which makes the focus
+    /// order the reverse of the strip until something moves. The extra `activate_tab` is what
+    /// pulls them apart.
     #[test]
-    fn closing_the_active_tab_activates_the_tab_to_its_left() {
+    fn closing_the_active_tab_activates_the_most_recently_used_survivor() {
         let mut ws = Workspace::default();
         let id = open(&mut ws, "/home/dev/work/cide");
-        let first = open_tab(
-            &mut ws,
-            id,
-            TabKind::ClaudeFull {
-                title: "one".into(),
-            },
-            aux_pane(),
-        )
-        .expect("opens");
-        let second = open_tab(
-            &mut ws,
-            id,
-            TabKind::ClaudeFull {
-                title: "two".into(),
-            },
-            aux_pane(),
-        )
-        .expect("opens");
+        let first = full_tab(&mut ws, id, "one");
+        let second = full_tab(&mut ws, id, "two");
+        let third = full_tab(&mut ws, id, "three");
 
-        assert_eq!(project(&ws, id).expect("exists").active_tab, second);
+        // Read `first` again, then come back to `third` and close it.
+        activate_tab(&mut ws, id, first).expect("activates");
+        activate_tab(&mut ws, id, third).expect("activates");
+        close_tab(&mut ws, id, third, false).expect("a full tab closes");
+
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(p.active_tab, first, "the tab the user came from");
+        assert_ne!(
+            p.active_tab, second,
+            "and not the tab to its left, which is what the rule used to answer"
+        );
+        assert!(
+            !p.tab_mru.contains(&third),
+            "and the closed tab is out of the order"
+        );
+        validate(&ws).expect("still valid");
+    }
+
+    /// The fallback, and the case every existing `workspace.json` starts in.
+    ///
+    /// `tab_mru` is trimmed by hand to exactly what `repair_tab_mru` produces for a file
+    /// written before the field existed: the active tab and nothing behind it. The successor
+    /// then has to come from somewhere else, and the somewhere else is the old left-neighbour
+    /// rule — which is why that code is still in `close_tab` and must stay.
+    #[test]
+    fn closing_the_active_tab_falls_back_to_the_left_neighbour_with_no_history() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let first = full_tab(&mut ws, id, "one");
+        let second = full_tab(&mut ws, id, "two");
+
+        project_mut(&mut ws, id).expect("exists").tab_mru = vec![second];
+        validate(&ws).expect("a one-entry order is a legal one");
+
         close_tab(&mut ws, id, second, false).expect("a full tab closes");
         assert_eq!(project(&ws, id).expect("exists").active_tab, first);
         validate(&ws).expect("still valid");
+    }
+
+    /// The pinned console is a legitimate successor, and `close_tab`'s guarantee rests on it.
+    ///
+    /// Excluding `tabs[0]` from the order was considered and lost for the reason
+    /// `commands::table`'s note on `tab.switcher.next` gives: "from the file I was reading back
+    /// to the conversation about it" is the whole value of the gesture. It also happens to be
+    /// what makes the fallback total — `tabs[0]` cannot be closed, so there is always at least
+    /// one survivor to land on.
+    #[test]
+    fn the_pinned_console_can_be_the_successor() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = project(&ws, id).expect("exists").tabs[0].id;
+        let first = full_tab(&mut ws, id, "one");
+        let second = full_tab(&mut ws, id, "two");
+
+        // Read the conversation, then open the file again from it, then close the file.
+        activate_tab(&mut ws, id, console).expect("activates");
+        activate_tab(&mut ws, id, second).expect("activates");
+        close_tab(&mut ws, id, second, false).expect("closes");
+
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(p.active_tab, console);
+        assert_eq!(
+            p.tab_mru,
+            vec![console, first],
+            "and the order behind it survived intact"
+        );
     }
 
     #[test]
     fn closing_an_inactive_tab_leaves_the_active_one_alone() {
         let mut ws = Workspace::default();
         let id = open(&mut ws, "/home/dev/work/cide");
-        let doomed = open_tab(
-            &mut ws,
-            id,
-            TabKind::ClaudeFull {
-                title: "one".into(),
-            },
-            aux_pane(),
-        )
-        .expect("opens");
-        let kept = open_tab(
-            &mut ws,
-            id,
-            TabKind::ClaudeFull {
-                title: "two".into(),
-            },
-            aux_pane(),
-        )
-        .expect("opens");
+        let doomed = full_tab(&mut ws, id, "one");
+        let kept = full_tab(&mut ws, id, "two");
 
         close_tab(&mut ws, id, doomed, false).expect("closes");
         assert_eq!(project(&ws, id).expect("exists").active_tab, kept);
+    }
+
+    /// The ghost: an inactive tab must leave the order even though it does not move `active_tab`.
+    ///
+    /// This is the failure a webview-supplied successor could not have had and a Rust-owned
+    /// order can, so it is the one worth a test of its own. Drop the id only in the
+    /// active-close branch and nothing is visibly wrong — until the *next* close reads the
+    /// order, finds the tab that went away two gestures ago, and activates it.
+    ///
+    /// `validate` would catch the state, but only after the mutation that produced it, and
+    /// `WorkspaceState::update` answers that by rolling the whole close back: the user's second
+    /// `×` would silently do nothing. The assertion on the order is therefore the real one and
+    /// the assertion on the second close is the symptom.
+    #[test]
+    fn closing_an_inactive_tab_drops_it_from_the_focus_order() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = project(&ws, id).expect("exists").tabs[0].id;
+        let doomed = full_tab(&mut ws, id, "one");
+        let kept = full_tab(&mut ws, id, "two");
+
+        close_tab(&mut ws, id, doomed, false).expect("closes");
+        assert_eq!(mru(&ws, id), vec![kept, console]);
+        validate(&ws).expect("still valid");
+
+        close_tab(&mut ws, id, kept, false).expect("closes");
+        assert_eq!(
+            project(&ws, id).expect("exists").active_tab,
+            console,
+            "the successor is a tab that still exists"
+        );
+    }
+
+    /// "Close others" fires N closes in a row, and each has to see the last one's order.
+    ///
+    /// `menuModel.ts` builds them as concurrent `closeTab` calls; they serialise on
+    /// `WorkspaceState::update`'s lock, so this is what the domain sees. Nothing special is
+    /// done for it — the point of the test is that nothing needs to be.
+    #[test]
+    fn closing_every_other_tab_in_turn_never_lands_on_a_closed_one() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = project(&ws, id).expect("exists").tabs[0].id;
+        let kept = full_tab(&mut ws, id, "keep");
+        let others = ["a", "b", "c"].map(|t| full_tab(&mut ws, id, t));
+
+        activate_tab(&mut ws, id, kept).expect("activates");
+        for other in others {
+            close_tab(&mut ws, id, other, false).expect("closes");
+            let p = project(&ws, id).expect("exists");
+            assert!(
+                p.tabs.iter().any(|t| t.id == p.active_tab),
+                "the active tab exists after every close in the run"
+            );
+        }
+        assert_eq!(mru(&ws, id), vec![kept, console]);
+        validate(&ws).expect("still valid");
+    }
+
+    /// Re-activating the tab that is already active is still a no-op for `rev`.
+    ///
+    /// `activate_tab` gained a second `changed` clause for the repair case, and the clause is
+    /// one `!` away from bumping on every click in the tab strip — which would broadcast the
+    /// whole tree to every window for a gesture that changed nothing.
+    #[test]
+    fn re_activating_the_active_tab_changes_nothing() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let tab = full_tab(&mut ws, id, "one");
+
+        let before = ws.rev;
+        activate_tab(&mut ws, id, tab).expect("activates");
+        assert_eq!(ws.rev, before, "no bump, so no broadcast");
+    }
+
+    /// …and does repair the order when it is the one thing out of step.
+    ///
+    /// The shape a restored workspace is in for exactly one activation. Hand-built rather than
+    /// round-tripped through `persist`, so this test fails if the clause is removed even in a
+    /// build where `repair_tab_mru` still runs on load.
+    #[test]
+    fn activating_the_active_tab_repairs_a_focus_order_that_lost_its_head() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let first = full_tab(&mut ws, id, "one");
+        let second = full_tab(&mut ws, id, "two");
+
+        project_mut(&mut ws, id).expect("exists").tab_mru = vec![first];
+        let before = ws.rev;
+        activate_tab(&mut ws, id, second).expect("activates");
+
+        assert_eq!(mru(&ws, id), vec![second, first]);
+        assert_eq!(ws.rev, before + 1, "a repair is a change and is broadcast");
+        validate(&ws).expect("still valid");
+    }
+
+    /// What a `workspace.json` from before the field turns into.
+    ///
+    /// Three repairs in one fixture, because they interact: a dead id and a duplicate both have
+    /// to go *before* `active_tab` is put at the head, or the head is inserted in front of a
+    /// second copy of itself and `validate` refuses the result.
+    #[test]
+    fn repairing_a_focus_order_drops_dead_ids_and_duplicates_and_leads_with_the_active_tab() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = project(&ws, id).expect("exists").tabs[0].id;
+        let first = full_tab(&mut ws, id, "one");
+        let second = full_tab(&mut ws, id, "two");
+
+        let ghost = TabId::new();
+        let p = project_mut(&mut ws, id).expect("exists");
+        p.active_tab = second;
+        p.tab_mru = vec![first, ghost, console, first, second];
+
+        repair_tab_mru(&mut ws);
+        assert_eq!(mru(&ws, id), vec![second, first, console]);
+        validate(&ws).expect("the repair is enough to satisfy the validator");
+    }
+
+    /// The reopen path: a tab comes back where it was, as the tree it was, and can go again.
+    ///
+    /// The pane ids are asserted equal rather than merely present, and that is the load-bearing
+    /// half: the frontend's `paneHosts` map is keyed by pane id and a tab close does not clear
+    /// it, so a reopened `ClaudeFull` tab re-adopts its own parked terminal — scrollback,
+    /// renderer and live session — instead of mounting a fresh one. Remint them and that becomes
+    /// a silent regression with no failing test anywhere.
+    #[test]
+    fn a_reinserted_tab_lands_at_its_old_index_with_its_own_panes() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let _first = full_tab(&mut ws, id, "one");
+        let doomed = full_tab(&mut ws, id, "two");
+        let _third = full_tab(&mut ws, id, "three");
+
+        let (index, kind, tree) = {
+            let p = project(&ws, id).expect("exists");
+            let at = p
+                .tabs
+                .iter()
+                .position(|t| t.id == doomed)
+                .expect("in the strip");
+            (at, p.tabs[at].kind.clone(), p.tabs[at].tree.clone())
+        };
+        let panes: Vec<PaneId> = tree.panes.keys().copied().collect();
+        let sessions: Vec<Option<SessionId>> = tree.panes.values().map(|p| p.session).collect();
+
+        close_tab(&mut ws, id, doomed, false).expect("closes");
+        let back = reinsert_tab(&mut ws, id, index, kind, tree).expect("reopens");
+
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(
+            p.tabs.iter().position(|t| t.id == back),
+            Some(index),
+            "back in the strip position it was closed from"
+        );
+        assert_ne!(back, doomed, "with a fresh tab id — the old one is spent");
+        assert_eq!(
+            p.active_tab, back,
+            "and active, because a reopen is an arrival"
+        );
+        let restored = &p.tabs[index].tree;
+        assert_eq!(restored.panes.keys().copied().collect::<Vec<_>>(), panes);
+        assert_eq!(
+            restored
+                .panes
+                .values()
+                .map(|p| p.session)
+                .collect::<Vec<_>>(),
+            sessions,
+            "session bindings included, or a reopened Claude tab spawns a second conversation"
+        );
+        validate(&ws).expect("still valid");
+    }
+
+    /// A pane id may be live in exactly one place, and `reinsert_tab` is a new way to break it.
+    ///
+    /// The refusal is not decoration: `validate` rejects a workspace with a pane in two tabs, so
+    /// without this check `WorkspaceState::update` would roll the whole reopen back and log a
+    /// line the user never sees. Reachable in practice by pressing Ctrl+Shift+T twice against a
+    /// stack that somehow held the record twice — which is precisely what a `pop` that peeked
+    /// instead of removing would produce.
+    #[test]
+    fn reinserting_a_tab_whose_panes_are_already_live_is_refused() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let live = full_tab(&mut ws, id, "one");
+        let tree = self::tab(&ws, id, live).expect("exists").tree.clone();
+
+        let refusal = reinsert_tab(
+            &mut ws,
+            id,
+            1,
+            TabKind::ClaudeFull {
+                title: "one".into(),
+            },
+            tree,
+        );
+        assert!(
+            matches!(refusal, Err(CoreError::Invariant(_))),
+            "got {refusal:?}"
+        );
+        validate(&ws).expect("and the workspace was not touched");
+    }
+
+    /// Index 0 is the console's and a record made when the strip was longer must still land.
+    ///
+    /// Both directions in one test because they are one clamp: an unclamped `insert` would
+    /// either put a tab in front of the pinned console — which `validate` refuses outright — or
+    /// panic on an index past the end.
+    #[test]
+    fn a_reinserted_tab_never_displaces_the_console_and_never_runs_off_the_end() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+
+        let low = reinsert_tab(
+            &mut ws,
+            id,
+            0,
+            TabKind::Settings {
+                section: SettingsSection::default(),
+            },
+            layout::new_tree(aux_pane()),
+        )
+        .expect("reopens");
+        assert_eq!(
+            project(&ws, id)
+                .expect("exists")
+                .tabs
+                .iter()
+                .position(|t| t.id == low),
+            Some(1),
+            "clamped past the pinned console rather than in front of it"
+        );
+
+        let high = reinsert_tab(
+            &mut ws,
+            id,
+            99,
+            TabKind::ClaudeFull {
+                title: "far".into(),
+            },
+            layout::new_tree(aux_pane()),
+        )
+        .expect("reopens");
+        let p = project(&ws, id).expect("exists");
+        assert_eq!(
+            p.tabs.iter().position(|t| t.id == high),
+            Some(p.tabs.len() - 1),
+            "and clamped to the end rather than panicking"
+        );
+        validate(&ws).expect("still valid");
+    }
+
+    /// A second console cannot arrive this way either. `open_tab` refuses it and so must this:
+    /// the pinning rule is enforced by *index*, so a `ClaudeHome` anywhere else is a tab that
+    /// reports itself unclosable while sitting outside the guard.
+    #[test]
+    fn reinserting_a_console_is_refused() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        assert_eq!(
+            reinsert_tab(
+                &mut ws,
+                id,
+                1,
+                TabKind::ClaudeHome,
+                layout::new_tree(aux_pane())
+            ),
+            Err(CoreError::TabPinned)
+        );
+    }
+
+    /// The empty order, which is what every existing file has, and the one that matters.
+    ///
+    /// `WorkspaceState::load` discards the whole workspace when `validate` fails, so without
+    /// this repair the first launch after the upgrade would greet the user with no projects.
+    #[test]
+    fn repairing_an_empty_focus_order_leaves_the_active_tab_and_nothing_invented() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let _first = full_tab(&mut ws, id, "one");
+        let second = full_tab(&mut ws, id, "two");
+
+        project_mut(&mut ws, id).expect("exists").tab_mru.clear();
+        assert!(
+            validate(&ws).is_err(),
+            "an empty order is exactly the state the validator refuses"
+        );
+
+        repair_tab_mru(&mut ws);
+        assert_eq!(
+            mru(&ws, id),
+            vec![second],
+            "strip order is not use order; a history nobody lived is worse than none"
+        );
+        validate(&ws).expect("valid");
     }
 
     #[test]
@@ -2339,7 +2876,13 @@ mod tests {
         // `close_tab` can produce.
         let p = project_mut(&mut ws, id).expect("exists");
         p.tabs.retain(|t| t.id != home);
-        p.active_tab = console;
+        // Through `set_active` and a `retain`, because that is what the *file* looks like:
+        // `persist::load` runs `repair_tab_mru` on the way in, so a workspace that arrives with
+        // a tab missing arrives with the focus order already free of it. Assigning `active_tab`
+        // alone would build a state no loaded file can be in, and `validate` at the foot of
+        // this test would rightly refuse it.
+        p.tab_mru.retain(|t| *t != home);
+        set_active(p, console);
 
         redock_pane(&mut ws, &label).expect("redocks into the console");
 

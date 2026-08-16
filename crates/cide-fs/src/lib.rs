@@ -21,6 +21,7 @@ pub mod filter;
 pub mod groups;
 pub mod index;
 pub mod ops;
+pub mod speed;
 #[doc(hidden)]
 pub mod testing;
 pub mod trash;

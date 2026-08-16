@@ -52,6 +52,7 @@ import { findExtensions } from './find'
 import { minimap } from './minimap'
 import { languageName, loadLanguage } from './languages'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
+import type { AutosaveReason } from './autosave'
 import { exceedsBytes } from './byteSize'
 import { pendingReveals, planReveal, registerReveal } from './revealRequest'
 import { planRestore, type FileView } from './position'
@@ -130,7 +131,34 @@ export interface EditorSurfaceProps {
    * which is right for a fixture and wrong for anything that can fail — so anything that
    * writes should return its promise.
    */
-  onSave?: ((text: string) => void | Promise<void>) | undefined
+  onSave?: ((text: string, cause: SaveCause) => void | Promise<void>) | undefined
+  /**
+   * Write a dirty buffer without anybody asking. (M15)
+   *
+   * `undefined` turns the whole thing off, which is what a fixture and a diff pane get. The
+   * **policy** is not here: `allow` is `autosave.shouldAutosave` bound to facts only the pane
+   * knows (the conflict bar, a pending agent diff, the setting), and everything in this file is
+   * the mechanism that asks it.
+   *
+   * `idleMs`/`ceilingMs` are passed rather than imported so the two timers can be driven from a
+   * test without waiting a minute — and, more usefully, so this file states that the ceiling
+   * exists rather than leaving it to be discovered in `autosave.ts`.
+   *
+   * **This must not enter the build effect's dependency list.** That effect is keyed on
+   * `[path, reloadKey]` and its comment says why: a changed identity there tears the view down
+   * and takes the user's unsaved edits with it. Held in a ref like every other callback here,
+   * so toggling the setting takes effect on the next keystroke — which is right.
+   */
+  autosave?:
+    | {
+        idleMs: number
+        ceilingMs: number
+        allow: (
+          reason: AutosaveReason,
+          dom: { windowFocused: boolean; focusInsideEditor: boolean },
+        ) => boolean
+      }
+    | undefined
   /** Called on focus, so the pane tree can follow the caret. */
   onFocus?: (() => void) | undefined
   /**
@@ -223,6 +251,16 @@ export interface EditorSurfaceProps {
 }
 
 /** `Ln 128, Col 24`, one-based in both, which is what every editor and every stack trace uses. */
+/**
+ * Which of the three things asked for this write.
+ *
+ * Carried all the way to `EditorPane`'s rejection handler, because the *report* differs: a
+ * failed Ctrl+S is a keystroke the user watched not work, and the tab staying dirty is arguably
+ * report enough; a failed autosave happened on a timer while they were looking somewhere else,
+ * and a silent one is the worst outcome this feature can have.
+ */
+export type SaveCause = 'manual' | 'autosave'
+
 export function cursorLabel(state: EditorState): string {
   const head = state.selection.main.head
   const line = state.doc.lineAt(head)
@@ -238,6 +276,7 @@ export function EditorSurface({
   readOnly = false,
   onDirtyChange,
   onSave,
+  autosave,
   onFocus,
   onSelection,
   onSaveHandle,
@@ -271,6 +310,17 @@ export function EditorSurface({
   docChangedCb.current = onDocChanged
   const viewCb = useRef(onView)
   viewCb.current = onView
+  /*
+   * In a ref, and **not** in the build effect's dependency list.
+   *
+   * `EditorPane` rebuilds this object every render — `allow` closes over the conflict flag and
+   * over a selector result — so listing it at `[path, reloadKey]` would tear the view down on
+   * every render of the pane and take the user's unsaved edits with it. The file already warns
+   * about exactly that for `onSave`; this is the same hazard with a shorter fuse, because the
+   * facts it carries change while the user types.
+   */
+  const autosaveCb = useRef(autosave)
+  autosaveCb.current = autosave
   const atRef = useRef(at)
   atRef.current = at
   /**
@@ -389,11 +439,11 @@ export function EditorSurface({
      * failed, because closing after a failed write is exactly the loss the confirmation
      * exists to prevent.
      */
-    const saveNow = (view: EditorView): Promise<void> => {
+    const saveNow = (view: EditorView, cause: SaveCause = 'manual'): Promise<void> => {
       if (readOnly) return Promise.resolve()
       const saving = view.state.doc
       const text = restoreLineEndings(saving.toString(), endingRef.current)
-      return Promise.resolve(saveCb.current?.(text)).then(() => {
+      return Promise.resolve(saveCb.current?.(text, cause)).then(() => {
         baseline = saving
         setDirty(!view.state.doc.eq(saving))
       })
@@ -412,7 +462,7 @@ export function EditorSurface({
       // failed save is not a belt-and-braces measure — it is what puts the close
       // confirmation in front of the user, and clearing it early is what would let the next
       // `×` discard the write that never landed.
-      void Promise.resolve(saveCb.current?.(text)).then(
+      void Promise.resolve(saveCb.current?.(text, 'manual')).then(
         () => {
           baseline = saving
           // Compared against the buffer as it is *now*, not as it was when the write
@@ -431,6 +481,113 @@ export function EditorSurface({
       if (dirtyRef.current === next) return
       dirtyRef.current = next
       dirtyCb.current?.(next)
+    }
+
+    /*
+     * ---------------------------------------------------------------------------------------
+     * Autosave. (M15)
+     *
+     * Two `let` handles inside the build effect rather than a module-level registry, and that
+     * placement *is* the defence against the worst bug this feature can have. The effect's
+     * cleanup already runs on every `reloadKey` bump, and a destroyed `EditorView` still
+     * answers `view.state.doc` — so a timer that outlived its view would write the buffer as it
+     * stood **before** the reload straight over the file that replaced it. A registry keyed by
+     * tab (the `paneHosts.ts` shape) is the obvious alternative and is exactly wrong here: it
+     * would outlive the view a reload replaced, which is the one lifetime that must not be
+     * outlived.
+     * ---------------------------------------------------------------------------------------
+     */
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
+    let ceilingTimer: ReturnType<typeof setTimeout> | undefined
+
+    const disarm = (): void => {
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
+      if (ceilingTimer !== undefined) clearTimeout(ceilingTimer)
+      idleTimer = undefined
+      ceilingTimer = undefined
+    }
+
+    /**
+     * The DOM half of the blur question, read at the moment of asking.
+     *
+     * Both facts are about *this instant* and neither is derivable from the `ViewUpdate`, so
+     * they are gathered here and handed to the policy rather than the policy reaching for
+     * globals — which is what keeps `shouldAutosave` drivable under node.
+     */
+    const domFacts = (view: EditorView) => ({
+      // `document.hasFocus()` is false exactly when the OS window is deactivated, which is the
+      // frame-deactivation save IDEA is known for. `view.hasFocus` is `document.hasFocus() &&
+      // activeElement === contentDOM`, so the two together separate "the caret moved" from "the
+      // window went away" — and the policy has to check the second first.
+      windowFocused: typeof document === 'undefined' || document.hasFocus(),
+      // The find bar is a CodeMirror *panel* inside `view.dom`, so opening it blurs the content
+      // without leaving the file. One test covers it and anything else that ever lives there.
+      focusInsideEditor:
+        typeof document !== 'undefined'
+        && document.activeElement !== null
+        && view.dom.contains(document.activeElement),
+    })
+
+    /** Ask, and write if the answer is yes. Never throws into a CodeMirror update. */
+    const autosaveIf = (view: EditorView, reason: AutosaveReason): void => {
+      const config = autosaveCb.current
+      if (config === undefined) return
+      if (!config.allow(reason, domFacts(view))) return
+      /*
+       * Disarmed *before* the write is issued, not after it resolves.
+       *
+       * Both timers describe "this buffer is owed a save", and one is now in flight — so the
+       * other would fire against a buffer that is either clean by then or has just been refused,
+       * and in the refused case it would retry every sixty seconds for the life of the tab. A
+       * keystroke re-arms, which is the moment the user's attention is back on this file.
+       *
+       * Note what this does *not* disarm: a save the policy refused. That path returns above, so
+       * a blur while the palette is open leaves the idle timer running — which is exactly right,
+       * because the buffer really is still owed a save.
+       */
+      disarm()
+      void saveNow(view, 'autosave').catch(() => {
+        /*
+         * Reported by `EditorPane`'s rejection arm, which raises a notice — a *silent* failed
+         * autosave is the worst outcome available here, and this `catch` exists only so the
+         * rejection is not an unhandled one inside an update listener.
+         *
+         * And nothing is re-armed. A refused write — a full disk, a read-only mount, a file
+         * that moved under the buffer — would otherwise retry every sixty seconds for the life
+         * of the tab. The buffer stays dirty, so the next thing the user *types* arms it again,
+         * which is the moment their attention is back on this file.
+         */
+      })
+    }
+
+    /**
+     * Arm the two timers from a document change.
+     *
+     * A 60-second debounce and a five-minute ceiling from the moment the buffer went dirty. The
+     * ceiling is not belt-and-braces: a restarting debounce is starved by continuous input, so
+     * somebody typing steadily for twenty minutes would never autosave at all. `docSync.ts` and
+     * `gitCountStore.ts` both carry the same note about the same trap.
+     *
+     * Reset by **document changes only** — not by scrolling, not by caret moves. "Inactive" in a
+     * buffer means the text stopped changing; a person reading a dirty file and scrolling
+     * through it would otherwise never get a save.
+     */
+    const arm = (view: EditorView): void => {
+      const config = autosaveCb.current
+      if (config === undefined || readOnly) return
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        idleTimer = undefined
+        autosaveIf(view, 'idle')
+      }, config.idleMs)
+      // Armed once per dirty *episode*, not per keystroke — restarting it here is precisely the
+      // starvation the ceiling exists to prevent.
+      if (ceilingTimer === undefined) {
+        ceilingTimer = setTimeout(() => {
+          ceilingTimer = undefined
+          autosaveIf(view, 'idle')
+        }, config.ceilingMs)
+      }
     }
 
     const shared: Extension[] = [
@@ -561,6 +718,17 @@ export function EditorSurface({
           // character, which changes the length — costs two integer comparisons rather than
           // a walk of a five-megabyte rope.
           setDirty(!update.state.doc.eq(baseline))
+          /*
+           * Arm or disarm the autosave timers from what the buffer *became*.
+           *
+           * Inside the `docChanged` branch, so scrolling and caret moves cost nothing — and
+           * after `setDirty`, so `dirtyRef` describes this transaction. A change that made the
+           * buffer clean again (an undo back to the last save) disarms: leaving a timer running
+           * over a clean buffer would fire a save that the policy refuses, which is harmless and
+           * is still a timer nobody needed.
+           */
+          if (dirtyRef.current) arm(update.view)
+          else disarm()
         }
         if (update.focusChanged && update.view.hasFocus) {
           caret?.focus()
@@ -568,6 +736,26 @@ export function EditorSurface({
           // lands on the caret's own position and no selection change follows it.
           readout?.focus()
           focusCb.current?.()
+        } else if (update.focusChanged) {
+          /*
+           * The losing edge — the `else` this listener never had. (M15)
+           *
+           * One hook covers both halves of "the user left this file", which is why it is the
+           * right signal and a `window.addEventListener('blur')` is not:
+           *
+           *   * `view.hasFocus` is `document.hasFocus() && root.activeElement === contentDOM`,
+           *     so `observers.blur` fires for a click into another pane, into the file tree,
+           *     into a terminal's textarea, into a tab-strip button — **and** for the OS window
+           *     being deactivated, which is IDEA's frame-deactivation save arriving free.
+           *   * A **tab switch is a blur**: hidden tabs are `visibility: hidden`, never
+           *     unmounted (`TabContent.tsx` says so, and says the browser drops focus when a
+           *     focused element goes hidden). So clicking another tab reaches here rather than
+           *     unmounting anything.
+           *
+           * A window-level listener would double-fire against this path and would be a per-pane
+           * subscription to a window-scoped fact.
+           */
+          autosaveIf(update.view, 'blur')
         }
       }),
     ]
@@ -778,6 +966,16 @@ export function EditorSurface({
       viewRef.current = null
       lintSlotRef.current = null
       saveHandleCb.current?.(null)
+      /*
+       * **The single most important line in this feature.**
+       *
+       * A `reloadKey` bump rebuilds the view, and a destroyed CodeMirror view still answers
+       * `view.state.doc`. An orphaned autosave timer would therefore write the buffer as it
+       * stood before the reload straight over the file that replaced it — silently, a minute
+       * later, with the correct contents already on screen. That is the whole reason the timers
+       * are `let`s inside this effect rather than entries in a module-level map.
+       */
+      disarm()
       // Hands the bar back to whichever editor is under this one, and blanks it when there
       // is none. A slot left behind would keep a closed file's position on screen.
       readout?.release()

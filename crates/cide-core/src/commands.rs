@@ -404,6 +404,35 @@ fn build() -> Vec<Command> {
         // handler in `keys/dispatch.ts` therefore re-checks the same fact through the same
         // function `keys/context.ts` derives this flag from.
         Command::new("tab.close", "Close tab", WINDOW).when("closableTab"),
+        /*
+         * Ctrl+Shift+T, which is what every browser means by it — asked for by name, and it
+         * took the chord back off `theme.toggle`.
+         *
+         * # No `when`, deliberately, and this is the interesting decision
+         *
+         * The obvious clause is `hasClosedTabs`, and it is the `repoOpen` trap in a new coat.
+         * The stack lives in `cide_app::closed_tabs`, in Tauri state and **not** in `Workspace`
+         * — a close must not bump `rev` and broadcast the whole tree for a record nothing draws,
+         * the argument `positions_state.rs` already makes for view positions. So a flag for it
+         * would need a supplier, and the only supplier is a field on the snapshot, and putting
+         * one there is precisely the broadcast the stack was kept out of the tree to avoid.
+         *
+         * The alternative — a flag with no supplier — is the mistake this file records twice:
+         * `repoOpen` had one, passed the gate, and was false for every user of every build,
+         * which hid the whole Git group from the palette for a milestone. A row that is always
+         * offered and answers "nothing to reopen" in the diagnostic log is honest; a row that is
+         * never offered is not, and `check:commands` permits the first and cannot see the
+         * second.
+         *
+         * # Why the id is `tab.reopenClosed`
+         *
+         * Ids are API — a user's `keymap.json` names them and they are never renamed — so it
+         * says what it does rather than what key it is on. `tab.reopen` was the other candidate
+         * and loses: it reads as "reload this tab", which is a different command someone will
+         * want later.
+         */
+        Command::new("tab.reopenClosed", "Reopen closed tab", WINDOW)
+            .keywords(&["undo", "restore", "closed", "last", "again"]),
         Command::new("tab.next", "Next tab", WINDOW).when("multipleTabs"),
         Command::new("tab.prev", "Previous tab", WINDOW).when("multipleTabs"),
         /*

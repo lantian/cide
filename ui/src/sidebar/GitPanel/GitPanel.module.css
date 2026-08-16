@@ -80,6 +80,9 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* The speed-search readout is `position: absolute` against this box. It cannot be a child of
+     the changes tree — that element is `role="tree"` and its children have to be tree items. */
+  position: relative;
 }
 
 /*

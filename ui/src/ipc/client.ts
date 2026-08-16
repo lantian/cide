@@ -31,6 +31,7 @@ import type {
   KeymapReport,
   ResolvedBinding,
   FileDoc,
+  FileStamp,
   PaneId,
   PaneRestore,
   PickerFrame,
@@ -52,6 +53,7 @@ import type {
   SplitIntent,
   SplitOutcome,
   TabId,
+  TreeMatches,
   TreeRow,
   TreeRowKind,
   UnsavedTab,
@@ -182,6 +184,34 @@ export const tab = {
    */
   close: (projectId: ProjectId, id: TabId, force = false) =>
     invoke<{ rev: number }>('tab_close', { project: projectId, tab: id, force }),
+
+  /**
+   * Put back the last tab this project closed. Ctrl+Shift+T.
+   *
+   * `null` — not a rejection — when there is nothing to reopen, or when every record on the
+   * stack turned out to be stale (the file was deleted, the tab is already the active one).
+   * "Nothing to reopen" is a precondition that failed, not a failure, so it reports through
+   * `unmet` rather than the failure toast; see the Rust handler for the full rule.
+   */
+  reopenClosed: (projectId: ProjectId) =>
+    invoke<TabId | null>('tab_reopen_closed', { project: projectId }),
+}
+
+/**
+ * Was this rejection the write precondition refusing — "something else changed this file"?
+ *
+ * A **tag**, never the message. `CoreError::FileChanged` exists as its own variant precisely so
+ * this question can be answered without matching on prose: the caller has to tell "the file
+ * moved under you, here is the conflict bar" from "the disk is full, here is a failure toast",
+ * and a reworded sentence turning one into the other is a silent regression in the direction
+ * that loses work.
+ *
+ * Structural rather than `as`: the payload comes from another process. Same shape and same
+ * argument as `unsavedChanges` below.
+ */
+export function fileChanged(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  return (error as { kind?: unknown }).kind === 'fileChanged'
 }
 
 /**
@@ -434,6 +464,20 @@ export const fs = {
   treeRows: (projectId: ProjectId, offset: number, len: number) =>
     invoke<TreeRow[]>('fs_tree_rows', { project: projectId, offset, len }),
 
+  /**
+   * Which visible rows a speed-search query matches, and where in each row's name.
+   *
+   * One round trip per keystroke, like `picker.query`, and for the same reason: these rows are
+   * not in the webview. The explorer holds 200-row chunks of a flattening Rust owns, so
+   * matching here would silently miss everything outside the cache — and *which* matches exist
+   * would depend on where the user last scrolled.
+   *
+   * The frame echoes the query and carries the row count it was computed against; see
+   * `sidebar/useSpeedSearch.ts` for what is done with both.
+   */
+  treeMatch: (projectId: ProjectId, query: string) =>
+    invoke<TreeMatches>('fs_tree_match', { project: projectId, query }),
+
   /** Returns the new row count, so the scroller can resize without a second call. */
   expand: (projectId: ProjectId, path: string) =>
     invoke<number>('fs_expand', { project: projectId, path }),
@@ -527,6 +571,18 @@ export const fs = {
    */
   writableRoots: (projectId: ProjectId) =>
     invoke<string[]>('fs_writable_roots', { project: projectId }),
+
+  /**
+   * The same speed-search rule over a list the caller supplies — the git panel's changes tree.
+   *
+   * The `picker.rank` shape, and the same argument: two sidebar trees that answer one query
+   * differently reads as a bug even when both answers are defensible on their own. The changes
+   * tree holds its rows in the webview and could match them in a loop; that loop would be a
+   * second implementation of `cide_fs::speed`, agreeing with the first only until somebody
+   * edited either.
+   */
+  matchLabels: (query: string, labels: readonly string[]) =>
+    invoke<TreeMatches>('tree_match_labels', { query, labels }),
 }
 
 /**
@@ -1288,7 +1344,19 @@ export const file = {
 
   read: (path: string) => invoke<FileDoc>('file_read', { path }),
 
-  write: (path: string, text: string) => invoke<void>('file_write', { path, text }),
+  /**
+   * Write a buffer back, optionally only if the file on disk has not moved.
+   *
+   * `ifUnchanged: null` writes unconditionally — what Ctrl+S passes, because that is the user
+   * deciding. **Autosave** passes the stamp `FileDoc` came back with, and a mismatch rejects
+   * with `CoreError::FileChanged`, which `fileChanged()` above recognises and `EditorPane` turns
+   * into the conflict bar. See `cide_ipc::FileStamp` for why this is a precondition rather than
+   * a watcher subscription.
+   *
+   * Returns the file's new stamp, so the caller's token moves with the write.
+   */
+  write: (path: string, text: string, ifUnchanged: FileStamp | null = null) =>
+    invoke<FileStamp | null>('file_write', { path, text, ifUnchanged }),
 
   /**
    * Remember where the user is in a file. (M12)

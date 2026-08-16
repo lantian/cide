@@ -197,11 +197,15 @@ export function focusedFilePath(boot: Bootstrap | null): string | null {
  * file answers `null`, and the handler says so.
  *
  * The rule is about *caches*, not about the idea of an order, and M14 drew the line where it
- * belongs. `store/workspace.ts` now keeps a per-project tab MRU stack, and it is admissible for
- * precisely the reason the sentence above is not: it is re-derived from **every**
- * `cide://workspace-changed` snapshot and reconciled against `project.tabs`, over
- * `Project::active_tab` — a field Rust writes on every open, every activation and every close.
- * That is the invalidation this note demands. `ProjectRoot::repo`, by contrast, was a constant.
+ * belongs: `store/workspace.ts` kept a per-project tab MRU stack, re-derived from **every**
+ * `cide://workspace-changed` snapshot over `Project::active_tab` — which is the invalidation this
+ * note demands, where `ProjectRoot::repo` was a constant.
+ *
+ * **M15 moved that order into Rust** (`Project::tab_mru`), because `close_tab` has to consult it
+ * to pick a successor and `close_tab` is in the domain. So the store now *reads* the order rather
+ * than deriving it, and the question of invalidation does not arise at all — which strengthens
+ * this note rather than weakening it: the webview holds no order of its own.
+ *
  * Deriving a *file* answer from it here would still be wrong, because the question this function
  * answers is "what is the tab in front of me about", which has one honest source.
  */

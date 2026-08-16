@@ -124,6 +124,15 @@ impl ProjectGroups {
         self.rows.read().rows(offset, len)
     }
 
+    /// Speed search's second source. See [`Groups::match_rows`].
+    pub fn match_rows(
+        &self,
+        needle: &cide_fs::speed::Needle,
+        limit: usize,
+    ) -> (Vec<cide_ipc::TreeMatch>, bool) {
+        self.rows.read().match_rows(needle, limit)
+    }
+
     pub fn kind_of(&self, path: &Path) -> Option<TreeRowKind> {
         self.rows.read().kind_of(path)
     }

@@ -28,6 +28,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { groupHits, splitHighlight } from '@/sidebar/SearchModel'
+import { basename } from '@/editor/languages'
+import { FileIcon, useIconTheme } from '@/icons'
 import styles from './Overlay.module.css'
 import { Hint, ModalShell } from './ModalShell'
 import { matchCounter } from './format'
@@ -56,6 +58,10 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
   const rows = useUsages((s) => s.rows)
   const truncated = useUsages((s) => s.truncated)
   const failed = useUsages((s) => s.failed)
+  /* One subscription for the whole list rather than one per heading — the icon set has a second
+     *file* per icon for the light theme rather than a CSS filter, so every heading needs it.
+     `FileTree` states the argument at length for a list a thousand times longer. */
+  const iconTheme = useIconTheme()
 
   /*
    * What the *server* says it is doing, appended to "Finding usages…".
@@ -198,8 +204,15 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
                   className={`${styles.row} ${styles.usageFile}`}
                   style={style}
                 >
-                  <span className={styles.path}>{row.rel}</span>
-                  <span className={styles.group}>{row.hits}</span>
+                  {/*
+                    * The icon, and then the name in the UI face. Both are the search panel's,
+                    * because both lists show the same thing and the one the user already reads
+                    * is the one to agree with. `HEADER_HEIGHT` is 22 and `FileIcon` is a 16px
+                    * box, so it fits without moving the row.
+                    */}
+                  <FileIcon row={{ name: basename(row.rel), kind: 'file' }} theme={iconTheme} />
+                  <span className={styles.usageFileName}>{row.rel}</span>
+                  <span className={styles.usageCount}>{row.hits}</span>
                 </div>
               )
             }

@@ -3,6 +3,7 @@
 //! This crate is glue. It owns window creation, the command surface and process
 //! lifecycle; everything else lives in a domain crate that does not link a webview.
 
+pub mod closed_tabs;
 pub mod cmd;
 pub mod emit;
 // M8: one file index, picker and watcher per project.
@@ -236,6 +237,11 @@ pub fn run() {
         // Behind an `Arc` because the flusher thread outlives the call that starts it; Tauri's
         // `State` hands out a reference, which a `thread::spawn` cannot keep.
         .manage(std::sync::Arc::new(positions_state::PositionsState::load()))
+        // The Ctrl+Shift+T stack. Empty at launch by design — see `closed_tabs`'s note on why
+        // it does not survive a restart — and managed here rather than in `setup` for the
+        // plainer reason the two above are: `tab_close` pushes to it, and a command that cannot
+        // resolve its state fails rather than merely losing a record.
+        .manage(closed_tabs::ClosedTabs::default())
         .invoke_handler(tauri::generate_handler![
             cmd::app::app_quit_requested,
             cmd::app::app_ready,
@@ -315,6 +321,7 @@ pub fn run() {
             cmd::project::tab_new_claude,
             cmd::project::tab_activate,
             cmd::project::tab_close,
+            cmd::project::tab_reopen_closed,
             cmd::session::session_spawn,
             cmd::session::session_attach,
             cmd::session::claude_diff_content,
@@ -355,6 +362,8 @@ pub fn run() {
             cmd::fs::fs_status,
             cmd::fs::fs_tree_count,
             cmd::fs::fs_tree_rows,
+            cmd::fs::fs_tree_match,
+            cmd::fs::tree_match_labels,
             cmd::fs::fs_expand,
             cmd::fs::fs_collapse,
             cmd::fs::fs_reveal,

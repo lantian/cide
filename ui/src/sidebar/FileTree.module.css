@@ -11,6 +11,10 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* The speed-search readout is `position: absolute` against this box. It cannot be a child of
+     the scroller — that element is `role="tree"` and its viewport is as tall as the whole
+     flattened repository — so the containing block has to be the panel. */
+  position: relative;
   background: var(--panel);
   border-right: 1px solid var(--border);
 }

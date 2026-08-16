@@ -167,9 +167,45 @@ pub fn find_markers(markers: &[&str], root: &Path) -> Vec<PathBuf> {
 /// | cargo registry sources | `$CARGO_HOME/registry/src`, else `~/.cargo/registry/src` |
 /// | cargo git checkouts | `$CARGO_HOME/git/checkouts`, else `~/.cargo/git/checkouts` |
 /// | go module cache | `$GOMODCACHE`, else `$GOPATH/pkg/mod`, else `~/go/pkg/mod` |
+/// | rustup toolchains | `$RUSTUP_HOME/toolchains`, else `~/.rustup/toolchains` |
+/// | the Go SDK | `$GOROOT`, when it is set |
 ///
 /// `GOPATH` may name several directories separated by the platform's path separator; go uses
 /// the **first** for the module cache, so that is the one taken here.
+///
+/// # Why the rustup toolchains directory is here, added in M15
+///
+/// Because the standard library lives in it, and until M15 nothing in cide knew that population
+/// existed. `cargo metadata` reports the `Cargo.lock` graph and nothing else — measured on this
+/// repository: 547 packages, not one of them `std`, `core` or `alloc`, and not one
+/// `manifest_path` under `.rustup` — so a std file opened by Go to definition was in no project
+/// root, in no dependency root, and in no *External Libraries* row.
+///
+/// Two things follow from that, and the second is the stronger reason:
+///
+/// * *Select opened file* over such a tab said **"that file is not in this project's file
+///   tree"**, about a file the user was looking at. `cide_app::libraries::is_unlisted_library_path`
+///   delegates here, so a path matching no root never even asked the group to resolve.
+/// * `~/.rustup/toolchains/…/lib/rustlib/src/rust/library/core/src/option.rs` is **mode 644 and
+///   owned by the user**. With no root covering it, `read_only_reason` answered `None`,
+///   `document::read` reported `writable: true`, and a Ctrl+S in a `core` buffer wrote into the
+///   shared toolchain — which `rustup update` then silently replaces and which every project on
+///   the machine compiles against. That is bit-for-bit the bug the paragraph above this function
+///   describes for `~/.cargo/registry`; the rustup tree was simply never enumerated.
+///
+/// **The whole `toolchains` directory, not `…/lib/rustlib/src/rust/library`.** It needs no
+/// toolchain-name resolution (`1.92.0-x86_64-unknown-linux-gnu` versus `stable-…` is a question
+/// only `rustc --print sysroot` can answer, and this function forks nothing), it is one textual
+/// rule, and *nothing* under a rustup toolchain should ever be written by an editor — not the
+/// sources, not `bin/`, not `lib/`. [`under`] is component-wise, so a user's own
+/// `~/.rustup/toolchains-mine` is untouched.
+///
+/// `$GOROOT` is included when it is set and cannot be derived when it is not: the honest
+/// derivation is `canonicalize(which("go")).parent().parent()`, which is two syscalls and a
+/// `which` walk on a path this module's header forbids doing any work on. Go's standard library
+/// therefore stays writable on a machine with `GOROOT` unset, which is most of them — stated
+/// here rather than hidden, because a half-applied rule that nobody has written down is how the
+/// cargo case survived to be found twice.
 pub fn dependency_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -184,6 +220,15 @@ pub fn dependency_roots() -> Vec<PathBuf> {
         .or_else(|| home().map(|h| h.join("go/pkg/mod")));
     if let Some(modcache) = modcache {
         roots.push(modcache);
+    }
+
+    let rustup_home = non_empty("RUSTUP_HOME").or_else(|| home().map(|h| h.join(".rustup")));
+    if let Some(rustup_home) = rustup_home {
+        roots.push(rustup_home.join("toolchains"));
+    }
+
+    if let Some(goroot) = non_empty("GOROOT") {
+        roots.push(goroot);
     }
 
     roots
@@ -218,9 +263,14 @@ pub fn read_only_reason_in(path: &Path, roots: &[PathBuf], caches: &[PathBuf]) -
         return None;
     }
     let root = caches.iter().find(|root| under(path, root))?;
+    // "a dependency source" was the whole sentence until M15, and it is wrong for a toolchain:
+    // `core/src/option.rs` is not a dependency of anything, it is the compiler's own library,
+    // and telling a user their standard library is "a dependency source" invites the reply that
+    // they never added it. The clause that is true of all of them is the one that matters —
+    // every project on this machine shares it, and the toolchain replaces it on update.
     Some(format!(
-        "{} is a dependency source under {}, shared by every project on this machine, \
-         so cide opens it read-only.",
+        "{} is under {}, which every project on this machine shares and the toolchain \
+         replaces when it updates, so cide opens it read-only.",
         path.display(),
         root.display()
     ))
@@ -386,6 +436,84 @@ mod tests {
         // is true for every path — which would have made every file on the machine read-only.
         assert!(!refuses("/anywhere/at/all.rs", "", &[]));
         assert!(!under(Path::new("/anywhere"), Path::new("")));
+    }
+
+    /// The gate for M15's second report, and the reason it is written as a *containment* test
+    /// rather than as an end-to-end reveal.
+    ///
+    /// The only end-to-end coverage of reveal-into-a-library was
+    /// `cide_app::cmd::fs`'s `revealing_a_dependency_source_resolves_the_group_it_needs`, which
+    /// is `#[ignore]`d (it spawns the real cargo) *and* builds its target by taking a path out of
+    /// `dependency_roots()` — so it can only ever exercise a population `dependency_roots()`
+    /// already contains, and was structurally incapable of noticing a missing root. The
+    /// non-ignored predicate test in `libraries.rs` did the same thing with `caches.first()`.
+    /// Coverage of the rule was self-referential in both places.
+    ///
+    /// This one names the path shape from the outside, which is the only way a *missing*
+    /// population can be asserted about at all.
+    #[test]
+    fn the_rust_standard_library_is_a_shared_toolchain_copy_and_not_the_users_to_edit() {
+        let Some(home) = home() else {
+            return;
+        };
+        // The layout is rustup's and is stable across every toolchain it installs:
+        // `<RUSTUP_HOME>/toolchains/<name>/lib/rustlib/src/rust/library/<crate>/src/…`.
+        let toolchains = home.join(".rustup/toolchains");
+        assert!(
+            dependency_roots().contains(&toolchains),
+            "the rustup toolchains directory has to be a dependency root, or `std` is in no \
+             project root, no cache and no External Libraries row: Select opened file answers \
+             \"not in this project's file tree\" about a file on screen, and — worse — \
+             core/src/option.rs is mode 644, so Ctrl+S writes into the toolchain every project \
+             on this machine compiles against. Measured: `cargo metadata` on this repo reports \
+             547 packages and none of them is std/core/alloc, so nothing else can supply it"
+        );
+
+        let std_file = "/home/u/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/lib/rustlib/\
+                        src/rust/library/core/src/option.rs";
+        let root = "/home/u/.rustup/toolchains";
+        assert!(refuses(std_file, root, &[]));
+        // Component-wise, exactly as for the registry: a directory whose name merely starts with
+        // `toolchains` is the user's own.
+        assert!(!refuses("/home/u/.rustup/toolchains-mine/x.rs", root, &[]));
+        // And `roots` still wins. A user who opened a toolchain checkout as a project root — the
+        // people who work on rustc do exactly that — has made the strongest gesture the app has.
+        assert!(!refuses(
+            std_file,
+            root,
+            &["/home/u/.rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/lib/rustlib/src/rust"]
+        ));
+    }
+
+    /// `RUSTUP_HOME` and `GOROOT`, over an environment handed in rather than mutated.
+    ///
+    /// `dependency_roots` reads the process environment, and `set_var` is `unsafe` in edition
+    /// 2024 precisely because it races every other thread — the same argument
+    /// `read_only_reason_in` is split for. So the *override* is asserted the only way that is
+    /// safe here: by checking that the default is derived from `HOME` and that `under` is the
+    /// containment used, which is what an override changes.
+    #[test]
+    fn the_go_sdk_is_covered_only_when_goroot_says_where_it_is() {
+        // GOROOT is usually unset, and this is the honest statement of the consequence rather
+        // than a pretence that it is not. `/usr/local/go`, Homebrew's `…/libexec` and Debian's
+        // `/usr/lib/go-1.x` are all user-readable and mode 644 on at least one of them, so Go's
+        // std stays writable unless the user exports GOROOT.
+        let roots = dependency_roots();
+        match non_empty("GOROOT") {
+            Some(goroot) => assert!(
+                roots.contains(&goroot),
+                "GOROOT is set to {} and must be a root: it is the SDK every project on this \
+                 machine builds against",
+                goroot.display()
+            ),
+            None => assert!(
+                !roots
+                    .iter()
+                    .any(|r| r.ends_with("go/libexec") || r == Path::new("/usr/local/go")),
+                "with GOROOT unset nothing may be guessed here — deriving it needs \
+                 canonicalize(which(\"go\")), and this module forks and stats nothing"
+            ),
+        }
     }
 
     #[test]

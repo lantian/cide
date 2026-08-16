@@ -46,7 +46,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cide_ipc::{NO_ROOT, TreeRow, TreeRowKind};
+use cide_ipc::{NO_ROOT, TreeMatch, TreeRow, TreeRowKind};
 
 /// A row the owner of a group supplies.
 ///
@@ -347,6 +347,41 @@ impl Groups {
         out
     }
 
+    /// Which visible rows' names match a speed-search query, in walk order.
+    ///
+    /// The second half of `cmd::fs`'s composed tree, and it exists for the same reason the
+    /// composed `rows` does: a query that found `serde` inside *External Libraries* but only
+    /// searched the walked index would answer nothing, and a query whose group matches were
+    /// numbered from zero rather than from `Index::count()` would scroll the user to a file in
+    /// their own project instead. The caller offsets these; see `compose_matches`.
+    ///
+    /// Row indices are counted with exactly the same walk [`Groups::rows`] emits with — header,
+    /// then children when expanded, depth-first — because the two have to agree about what row
+    /// 12 is or the highlight lands on a different line from the scroll.
+    pub fn match_rows(
+        &self,
+        needle: &crate::speed::Needle,
+        limit: usize,
+    ) -> (Vec<TreeMatch>, bool) {
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        for group in &self.groups {
+            if crate::speed::push_match(needle, &group.label, at, limit, &mut out) {
+                return (out, true);
+            }
+            at += 1;
+            if !group.expanded {
+                continue;
+            }
+            for node in &group.children {
+                if match_node(node, needle, limit, &mut at, &mut out) {
+                    return (out, true);
+                }
+            }
+        }
+        (out, false)
+    }
+
     /// Expand a group header or a directory inside one.
     ///
     /// `None` when this tree holds no such path, which is how the caller tells a group row from
@@ -578,6 +613,32 @@ impl Groups {
 }
 
 /// Append the rows of one node's subtree that fall inside the window.
+/// One node of a group's subtree, counted and tested. `true` means stop.
+///
+/// Recursive in the same shape as [`emit`], and deliberately so: the two walks have to number
+/// the rows identically, and the cheapest way to keep them in step is for them to look the same.
+fn match_node(
+    node: &Node,
+    needle: &crate::speed::Needle,
+    limit: usize,
+    at: &mut u32,
+    out: &mut Vec<TreeMatch>,
+) -> bool {
+    if crate::speed::push_match(needle, &node.name, *at, limit, out) {
+        return true;
+    }
+    *at += 1;
+    if !node.expanded {
+        return false;
+    }
+    for child in node.children.iter().flatten() {
+        if match_node(child, needle, limit, at, out) {
+            return true;
+        }
+    }
+    false
+}
+
 fn emit(
     node: &Node,
     depth: u16,

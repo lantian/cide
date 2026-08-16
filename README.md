@@ -89,6 +89,330 @@ CIDE_AUDIT_PANES=1 ./target/debug/cide # re-check the pane host registry under c
 CIDE_AUDIT_WINDOWS=1 ./target/debug/cide # re-check detach/re-dock and window modes
 ```
 
+## Panes, tabs and the reopen stack (M15), and what is not done
+
+| key | what it does |
+| --- | --- |
+| **Ctrl+Shift+T** | reopen the last closed tab, and the one before that |
+| **Ctrl+W** | close a tab — and land on the tab you came *from*, not the one to the left |
+
+**The focus ring is gone from editor panes, and only from editor panes.** It was added in M14 for
+every pane kind and the user asked for half of it back: two accent pixels around the file you are
+reading are noise. It stays on `claude`, `shell` and `diff` panes, where several terminals share a
+tab and nothing else answers "which one am I typing into" — an editor answers that itself, because
+CodeMirror hides its cursor when the surface is blurred. **The state behind it did not move.** The
+removal is two CSS rules under `.frame[data-kind='editor']`; `PaneTitleBar.tsx` still applies
+`frameFocused` from `focused` for every kind and still publishes `data-focused`, so
+`keys/context.ts` goes on deriving `paneFocused`, `editorFocused` and `fileTabActive` from
+`tree.focused` and the clauses that gate `file.save`, the find bar, the outline, Find Usages and
+`pane.navigate.*` are untouched. `check:rows` pins both halves — that the exception exists, and
+that the class and the attribute are still unconditional — because the rationale for *adding* the
+ring is still a dozen lines above the exception and has to be, the ring is still drawn for three
+kinds out of four. The canvas's 3px gutter stays too: it was justified by the ring in the comment,
+but what it actually fixes is a pane's ordinary `--border` sitting flush against the app's.
+
+**Closing a tab activates the most recently used survivor, and that moved the MRU into Rust.** The
+old rule was the tab to the *left*, which is strip position, which is insertion order — so closing
+a file opened an hour ago dropped you beside whatever happened to be opened just before it.
+`Project::tab_mru` is now a workspace field, written by the one `set_active` that every writer of
+`active_tab` goes through, and `close_tab` picks the first survivor in it. The webview's
+`localStorage` copy under `cide.tabMru` is **deleted**; `ui/src/store/workspace.ts` reads the order
+off the snapshot and only `reconcile`s tabs the order has never seen onto the end so the switcher
+can walk to them.
+
+The argument that had kept it in the webview is in `store/workspace.ts`'s own note, which admitted
+it was weak. What settled it: **`close_tab` has to pick a successor and `close_tab` is in Rust**,
+and two of its callers have no webview to ask — `cide_app::ide` closes a withdrawn diff from the
+MCP server's thread, and the quit ladder closes projects wholesale. A successor computed in a
+renderer would have had to exist twice, and the copy in Rust would have been the rule this replaces.
+The two objections evaporated: the field moves only inside mutations that already bump `rev`, so it
+costs no extra broadcast, and `#[serde(default)]` plus `repair_tab_mru` on load is not a schema
+break — `CURRENT_SCHEMA` stays at 2.
+
+**A workspace written by any earlier build still opens.** That is the expensive thing to get wrong:
+`tab_mru` defaults to empty, `validate` refuses an empty order, and `WorkspaceState::load` answers a
+failed validation by replacing the whole workspace with defaults — so a missing repair would greet
+every existing user with no projects, with their file intact on disk and never read again.
+`persist::load` repairs to `[active_tab]` and **invents nothing else**: strip order is not use
+order, and a plausible-looking history would make the first close land somewhere the user has never
+been. `close_tab`'s left-neighbour rule is kept as the fallback for exactly that state.
+
+**Ctrl+Shift+T reopens closed tabs, and keeps going.** The stack is 16 deep (`persist::MAX_RECENT`'s
+number), lives in `cide_app::closed_tabs` — Tauri state, *not* `Workspace`, so a close does not
+broadcast the tree for a record nothing draws — and is popped **project-scoped**, so Ctrl+Shift+T in
+a window showing project A can never resurrect a file from B. A record carries the project, the tab
+kind, the strip index and the pane tree *with its original pane ids and session bindings*: the
+frontend's `paneHosts` map is keyed by pane id and a tab close does not clear it, so a reopened
+`ClaudeFull` tab re-adopts its own parked terminal and its live conversation rather than starting a
+second one. Scroll and caret need no record at all — `positions.json` is keyed by path and
+`EditorPane` flushes on unmount.
+
+Three things it deliberately does not do. It **does not survive a restart**: the gesture means "I
+closed that ten seconds ago by accident", and the first press of a session reopening something
+deliberately closed last week is the opposite of that. It **never remembers a diff Claude is
+blocked on** — closing that tab cancels the agent's request, so the `request_id` names nothing —
+and it filters at *push* rather than at pop, because a record that can never be popped is a hole
+the user counts through. And it carries **no `when` clause**: the depth is not in the snapshot by
+design, so a flag for it would need a supplier the snapshot has no business carrying, and a flag
+with no supplier is the `repoOpen` mistake that hid the whole Git group for a milestone. The row is
+always offered and reports "nothing to reopen" instead.
+
+`theme.toggle` gave up `ctrl+shift+t` and ships **unbound** — palette-only, like
+`project.switcher.prev`, and one line of `keymap.json` takes it back. No gate requires a registered
+command to carry a binding, and `theme_toggle_ships_unbound_and_is_still_a_command` exists to stop
+one being added: "every palette row has a key" sounds like an invariant and is not one. **Ctrl+T
+still pulls.**
+
+**Not done.** None of it has been confirmed on screen — same reason as M14, KDE will not raise a
+shell-launched window. The reopen decision is covered by `reopen_plan`'s test and the stack by
+`closed_tabs`'s, but `tab_reopen_closed` itself is a Tauri command and the three lines that wire
+`stack.pop` to `reinsert_tab` are checked by nothing. A **`ClaudeFull` tab reopened after its child
+has exited** comes back as a Resume splash rather than as a live pane; that is the existing restore
+behaviour and not new, but Ctrl+Shift+T is a new way to reach it. The stack is not offered in the
+tab strip's right-click menu: a menu item that cannot be honestly disabled — the depth is not in the
+webview — and that silently does nothing is the surface where silence is worst, so the two routes
+are the chord and the palette.
+
+## Speed search in both sidebar trees (M15)
+
+**Type into the explorer or the changes tree and it filters to rows whose name contains what you
+typed.** Up and Down walk the matches in tree order, Enter opens the one you are on, Escape leaves,
+and two seconds of silence clears it. A small box at the top-left of the panel shows the query and
+`3 of 17`.
+
+| key, while a query is armed | what it does |
+| --- | --- |
+| a letter, digit, `.`, `-`, `_` | extends the query — a bare keystroke *starts* one |
+| Space | extends it, **once something has been typed**; a bare Space is still the changes tree's tick |
+| ↑ ↓ | previous / next match, wrapping |
+| Enter | opens the row and leaves |
+| Escape, Backspace past the first character | leaves |
+| Delete | **swallowed** — a bare Delete is *Move to Trash*, and a typo must not put a delete dialog on screen |
+| ← → Home End, and every modified chord | leaves, then does exactly what it always did |
+
+Nothing is taken from the keymap: `cide_core::keymap` binds no unmodified printable key, which
+until M15 was a coincidence and is now `no_default_binds_an_unmodified_printable_key`. It had to
+become an assertion, because the key gate resolves global bindings on a **window capture**
+listener — a default of `r → git.pull` would eat the letter `r` in the file tree, the rename box,
+the commit message, CodeMirror and every terminal, and speed search would go dead for that one
+letter with nothing reporting it.
+
+**One matching rule, in Rust, with two entry points.** `cide_fs::speed` decides what matches and
+where; `fs_tree_match` walks the explorer's flattening and `tree_match_labels` takes a list the
+changes tree supplies. That is the `picker_rank` shape rather than the `score.ts` shape, and one
+fact decided it: the explorer's rows are not in the webview — it holds 200-row chunks of a
+flattening Rust owns, so a match at row 40,000 exists only if Rust is the one looking. Once that
+exists, a TypeScript copy for the other tree is a second answer to a settled question. The spans
+come back in **UTF-16 code units**, because the only consumer is `String.prototype.slice`; a byte
+offset agrees for ASCII and puts the highlight four characters early on any name with an emoji in
+it. The *key* rule — which keystroke does what — is `ui/src/sidebar/speedSearch.ts`, pure and
+import-free, driven row by row by `check:speed-search`.
+
+**Only what is expanded is searched**, and the empty answer says so: `no match in the expanded
+tree`, not `no match`. Expanding to reveal a match would re-flatten the tree and renumber every
+index in the list being built, so each keystroke would invalidate its own results — and Ctrl+P
+already searches the whole repository including collapsed directories. A capped list says `first
+1000 matches` rather than answering short.
+
+**Not done.** There is no way to reach speed search from the palette or a menu — typing *is* the
+gesture, and nothing on screen advertises it. Matching is substring, not fuzzy, and not ranked. A
+match list is dropped and re-issued when the rows move underneath it, so a burst mid-query costs
+one round trip and a frame with no highlight.
+
+## The Find usages popup, and the scratch type picker (M15)
+
+**"It doesn't see where is filename and where is code."** The Find usages popup drew its file
+headings with `.path` and its source lines with `.usageText`: same family, same weight, same colour
+token, and **half a pixel** of font size between them — with the heading being the *smaller* of the
+two. Three more defects were in the same three lines: `.path` ellipsises at the tail, and the tail
+of `crates/cide-lsp/src/progress.rs` is the filename; `.group` is `flex: 1`, so a two-character hit
+count claimed half a 620px card; and `.usageFile`'s `background: var(--chrome)` is exactly the
+card's own ground, so the one rule written to make the heading stand out painted it the colour it
+already was. The heading is now the UI face at 12.5px in `--w-bold`, front-truncated, with the
+file's icon beside it — the search panel's treatment, because the two lists show the same thing.
+Go to symbol had the same defect in a smaller form (two adjacent `.path` spans reading as one grey
+run) and is fixed in the same pass.
+
+**The gate that missed it is the finding.** `check-theme.mjs` has a table asserting exactly this —
+"a name is the UI face, code is the mono face" — over three stylesheets, and
+`src/overlays/Overlay.module.css` was not one of them. So the one overlay that grew a
+heading-plus-source-line list in M14 was never swept. It is in the table now, plus assertions that
+the heading is *larger* than the source line and carries a weight it does not.
+
+**SQL is a real grammar, not a row.** `ui/src/editor/languages/sql.ts` is a `streamGrammar` data
+module: `--` line comments, case-insensitive keywords (the flag exists for this one language), a
+doubled quote rather than a backslash escape, and `capitalisedIsType`/`callSyntax` both **off**,
+because `Users` is a table and `Sessions (` is a table followed by a bracket. The last of those was
+found by the check rather than reasoned about — with `callSyntax` on, every table in a schema was
+drawn as a function. There is no `@codemirror/lang-sql` in this project and adding one is the
+100 KB-of-parser-tables decision `streamGrammar.ts` exists to avoid; `check:editor` would have
+failed a bare `{ label: 'SQL', ext: 'sql' }` outright, which is the gate doing its job.
+
+**The scratch picker has a filter field, and it is focused on the first frame.** `useLayoutEffect`,
+not `useEffect` — `ModalShell` records the reason and it is a bug this project has already shipped:
+the overlay is opened by a keystroke, and a frame in which the field is not yet focused is a frame
+in which the next character goes to whatever had focus before, which is a terminal. The ranking is
+`filterScratchTypes` in `editor/languages.ts` beside the list it filters (exact extension, then
+extension prefix, then label prefix, then label substring), so `sql`+⏎ is the whole gesture. A query
+that matches nothing says `No type matches ‘xyz’` and Enter does nothing — deliberately not
+creating a scratch of the typed extension, which would be a free-text path into `check_ext` and a
+separate decision.
+
+## Autosave (M15)
+
+**On by default.** A changed file is written when it loses focus, and after a minute with no edits.
+*Settings ▸ Editor ▸ Save automatically*.
+
+The signal is CodeMirror's own `focusChanged`, on the edge this listener never had, and one hook
+covers everything: a click into another pane, into the file tree, into a terminal; a **tab switch**
+(hidden tabs are `visibility: hidden`, never unmounted, so switching tabs is a blur); and the OS
+window being deactivated, which is IDEA's frame-deactivation save arriving free. The idle timer is
+a 60-second debounce **with a five-minute ceiling** measured from when the buffer went dirty,
+because a restarting debounce is starved by continuous input — somebody typing steadily for twenty
+minutes would otherwise never autosave, a trap `docSync.ts` and `gitCountStore.ts` had both already
+written down.
+
+**Every refusal, and how it is enforced.** All of them are `shouldAutosave` in
+`ui/src/editor/autosave.ts` — pure, import-free, and driven as a truth table by `check:editor`,
+because a feature that writes the user's files on a timer must not keep its rules inside a
+`useEffect`.
+
+| autosave refuses | because |
+| --- | --- |
+| the setting is off | and the toggle is *read*, which `check:editor` asserts — see below |
+| the buffer is clean | a save is a `didSave`, which re-runs flycheck; otherwise every alt-tab is a `cargo check` |
+| **the buffer is read-only** | External Libraries and toolchain sources; writing one corrupts a crate every project on the machine builds against |
+| **the conflict bar is up** | it is the user's unanswered question, and autosave would answer it in the direction that discards whatever changed the file |
+| **a Claude `openDiff` of this file is open** | `openDiff` blocks the agent's turn. Clicking the diff tab to look at it is a tab switch, is a blur, is a save underneath a proposal computed against the old bytes |
+| focus is still inside the editor | the find bar is a CodeMirror panel inside `view.dom` |
+| an overlay or context menu is open | Ctrl+P is not leaving the file |
+
+Window deactivation is checked **before** the last two: `document.activeElement` does not move when
+an OS window is deactivated, so testing "is focus still in the editor" first would veto the one
+save this feature is best known for. An explicit Ctrl+S ignores all of it — that is the user
+deciding.
+
+**A failed autosave produces a sentence.** `void diag.log(...)` writes to a file nobody opens, and
+a save that happened on a timer while the user was looking at a browser is the one that most needs
+saying out loud — this is also the population where writes actually fail, because a root-owned
+mode-644 file reports `writable: true` (the mode bits, not "can *you* write it"). The notice
+dedupes by text, and the timers are not re-armed after a failure, so a full disk gives one toast
+rather than sixty. The tab stays dirty either way, which is what keeps the close confirmation in
+front of the user.
+
+**The `sed -i` hole is closed, for autosave.** The conflict bar is raised by `cide://session-tool`,
+which a `cargo fmt`, a `sed -i` or a `git checkout` never sends. Before autosave, clobbering one of
+those took a deliberate Ctrl+S; with autosave-on-blur it would take *switching to the terminal,
+running `cargo fmt`, and clicking back* — three things nobody decides to do. So `FileDoc` now
+carries a `FileStamp` (mtime + length) and a background write hands it back as `ifUnchanged`;
+Rust refuses with a **tagged** `CoreError::FileChanged`, and the pane turns that into the same
+conflict bar. Subscribing the editor to `cide://fs-changed` was the alternative and is worse: our
+own write emits one, so it needs a self-write suppression window, which is a race with a timer in
+it. What remains open is the microsecond between the `stat` and the `rename`, and an explicit
+Ctrl+S, which still forces.
+
+**The dirty dot is unchanged**, and deliberately: its meaning is "this buffer differs from disk",
+which stays exactly true, and it is load-bearing rather than decorative — `tab_set_dirty` is what
+makes `close_tab` refuse without `force` and what `app_quit_requested` reports by name. There is no
+save-on-quit either. The honest consequence is that the unsaved-at-quit dialog becomes rare, which
+is the feature working; the guard stays for the cases autosave refuses, which are precisely the
+cases where the user most needs to be asked.
+
+**Migration is explicit.** `Workspace::CURRENT_SCHEMA` moves to **3** and `persist::v2_to_v3`
+*writes* `settings.editor.autosave = true` into every existing document. `#[serde(default)]` would
+have loaded a schema-2 file perfectly well and given the same behaviour — deleting the migration
+changes nothing today. It is there for the day the default moves: "make it opt-in" is the obvious
+next request, and a defaulted field would silently turn autosave *off* for everyone relying on it,
+with nothing on their disk to explain it. Same argument as 1 → 2's proxy scope, applied to a
+setting whose blast radius is the contents of files. A value the user already chose is left alone.
+
+### Finding: five of the seven editor settings are wired to nothing
+
+`tabSize`, `insertSpaces`, `showMinimap`, `wordWrap` and `trimTrailingWhitespaceOnSave` all
+persist, survive a relaunch, and change nothing — `EditorSurface` hardcodes `tabSize.of(4)`,
+`indentUnit.of('    ')`, an unconditional `minimap()` and an unconditional `lineWrapping`, and
+nothing anywhere reads the trim flag. `tsc --noEmit`, `codegen --check` and `contract-check` are
+all green over that, because every one of them is a *field nobody reads*, which no existing gate
+can see. **Not fixed in M15.** The direct lesson was applied instead: the autosave toggle ships
+with an assertion in `check:editor` that it is read, not merely offered.
+
+## Three things that shipped and did not work (M15), and why no gate saw it
+
+Each of these was built, verified and reported broken by the user. In every case the mechanism was
+correct and something outside it — a dependency, a child process, an absent population — decided
+the outcome. The second half of each entry is the more useful one.
+
+**The mouse's thumb buttons did nothing, because wry got the press first.**
+`wry-0.55.1/src/webkitgtk/synthetic_mouse_events.rs` connects its own `button-press-event` handler
+to the WebKitWebView inside `WebviewWindowBuilder::build()`; for buttons 8 and 9 it returns
+`Propagation::Stop` and spends them on `window.history.back()`, which in an SPA with one history
+entry is a silent no-op. GTK3's `button-press-event` uses the true-handled accumulator, so the
+*first* handler returning TRUE ends the emission — and `install_mouse_nav` runs after `build()` and
+defers itself onto the GTK loop besides, so it was always second and **never ran**. The handler now
+goes on the generic `event` signal, which `gtk_widget_event_internal` emits before any specific one
+whatever the connection order (measured against the real GTK 3, both directions). The window-label
+filter was checked first and exonerated: both sides derive from the same `label.as_str()`.
+*The comments in `windows.rs` and `emit.rs` claiming WebKit flattens both buttons to `button === 0`
+were false and are corrected in place* — a DOM-only implementation was possible all along, and the
+wrong premise is what stopped anyone looking at wry. **No gate saw it** because every gate tested
+one link of a five-link chain and the broken link was the dependency's: `check:keys` starts one
+call downstream of the whole broken segment, `keymap.rs` proves the binding resolves,
+`contract-check` records the event's *name*. Nothing asserted that a GDK button reaches a
+`Decision`. The new gate is structural — the signal cide connects to, over comment-stripped source,
+with the whole diagnosis in its failure message — plus `nav_action` extracted from the closure so
+the press rules are drivable at all. A refused Back also went to `diag.log` and now goes to
+`notify`, so an empty history can be told from a dead button; that indistinguishability is most of
+why this took a milestone to notice.
+
+**A ctrl+click on a path in a Claude pane opened the desktop file manager on the parent folder.**
+Not cide's matcher — `(` and `)` are not body characters, so `Update(/home/…/Foo.tsx)` yields the
+*file*, verified for every shape Claude Code prints. The gate returned early when nothing had
+hovered yet, xterm's own always-on `mousedown` then wrote an SGR mouse report to the pty, and
+`claude` answered it with `dbus-send … org.freedesktop.FileManager1.ShowItems`. In a Claude pane
+the early return is the common case, not the exotic one: the alt-screen TUI repaints under a
+stationary pointer, so no `mousemove` fires and no hover is ever recorded. The press is now claimed
+**unconditionally** and resolved against the buffer afterwards, which also fixes the mirror-image
+bug in the same three lines (a *stale* hover surviving a repaint). Claude Code stands down for
+xterm.js hosts — `xtversionName?.startsWith("xterm.js")` — and cide failed that test only because
+`@xterm/xterm` 6 implements no XTVERSION at all; it now answers `DCS > | xterm.js(6.0.0) ST`
+truthfully, which is the only thing covering **alt+click**, a chord the CLI also claims and cide
+deliberately does not. **No gate saw it** because `check-paths.mjs`'s own pin — *"a path parsed out
+of terminal bytes reaches a workspace tab and nothing else — not the desktop opener"* — was true of
+cide's source and false of the user's screen: a grep over cide cannot see a file manager opened by
+a program cide forwarded the click to. *Anything cide does not swallow is a gesture cide has
+delegated.* The rules moved into `ui/src/terminal/clickGate.ts`, whose `pressVerdict` is **not
+given the hover state**, so the early return cannot come back; and the old pin turned out to name
+only Rust command strings that could never appear in a frontend module, which a mutation found.
+
+**Select opened file said "not in this project's file tree" about a `std` file on screen.** Nothing
+was broken: the rustup sysroot is a population no part of cide knew existed. `cargo metadata`
+reports the `Cargo.lock` graph — measured here, 547 packages, none of them `std`/`core`/`alloc` —
+so there was no row for a reveal to find and `is_unlisted_library_path` never even asked the group
+to resolve. The **second, unreported** half is worse: `…/library/core/src/option.rs` is mode 644 and
+user-owned, so `writable` was true and Ctrl+S wrote into the toolchain every project on the machine
+compiles against — bit for bit the bug the read-only rule was written for. `dependency_roots()` now
+covers the whole `~/.rustup/toolchains` directory (textual, no toolchain-name resolution, no
+syscall), and `cide-deps::sdk` adds one SDK row per unit from `rustc --print sysroot` with the
+project's cwd — which is the *only* honest way to get the toolchain rustup would pick, and this
+repo proves it: `rust-toolchain.toml` pins 1.92.0 while the machine's default is `stable`. **No
+gate saw it** because both existing tests were self-referential: the end-to-end one is `#[ignore]`d
+*and* builds its target out of `dependency_roots()`, and the predicate test took `caches.first()` —
+neither can notice a *missing* root. The new ones name the rustup path shape from the outside and
+sweep every root. One more gap was found by mutation while writing this: deleting `sdk::probe`'s
+single call site left every gate green, which is this project's recurring defect appearing inside
+the batch that was fixing three instances of it.
+
+**Not done.** None of the three has been confirmed on screen (KDE will not raise a shell-launched
+window); `CIDE_INPUT_PROBE=1 ./run.sh` is the one-command runtime confirmation for the thumb buttons
+and must now print `button=8` on a press. The GTK signal choice is held by a source assertion, not
+by a synthesized GDK event — an `--audit-windows` leg that injects one through `gtk_main_do_event`
+and asserts `cide://mouse-nav` arrives is the check that would have caught the original bug for
+real, and it would also be the first execution of `client.ts`'s label filter in any test. Go's
+standard library stays **writable** unless `$GOROOT` is exported: deriving it needs
+`canonicalize(which("go"))`, and `cide_core::toolchain` forks and `stat`s nothing on the per-open
+path. A directory ctrl+clicked in a *detached pane* is offered no link at all, because that window
+has no file tree.
+
 ## Switching, and the panel toggle (M14), and what is not done
 
 Four keys, and one of them is a chord that moved.
@@ -119,15 +443,13 @@ Shift, so the whole walk would be a Ctrl+Shift hold, and the capture reads Shift
 and is reached from the palette, or by holding Shift while the popup is up.
 
 **The tab order is a real MRU stack and it survives a restart.** There was no per-tab focus history
-anywhere: `Tab` has no timestamp, `p.tabs` is insertion order, and `close_tab` picks the *left
-neighbour*. `ui/src/store/workspace.ts` now derives one per project from every
-`cide://workspace-changed` snapshot, over `Project::active_tab`, and mirrors it to
-`localStorage` under `cide.tabMru` beside the project stack. It is *not* in Rust, and the honest
-version of that argument is in the code: a keystroke that bumped `rev` would repaint every other
-window, and it would be a schema migration — the domain-purity argument is weaker here than it is
-for projects, because `active_tab` is already workspace state. The list contains **tabs**, console
-and settings included, which is the point: one Ctrl+Tab from a file gets you back to the
-conversation about it.
+anywhere: `Tab` has no timestamp, `p.tabs` is insertion order, and `close_tab` picked the *left
+neighbour*. M14 derived one per project in `ui/src/store/workspace.ts` from every
+`cide://workspace-changed` snapshot and mirrored it to `localStorage` under `cide.tabMru`, with a
+note in the code admitting that the argument for keeping it out of Rust was weak. **In M15 it moved
+into `Project::tab_mru` and the `localStorage` key is gone** — see the M15 section above for what
+settled it. The list contains **tabs**, console and settings included, which is the point: one
+Ctrl+Tab from a file gets you back to the conversation about it.
 
 **What Ctrl+Tab costs a user who already rebound it.** Nothing, and no migration: their
 `{"key":"ctrl+tab","command":"project.switcher.next"}` has no `when` and the new default has one, so
@@ -455,6 +777,10 @@ source opened by Go to definition. That last case is the one that would otherwis
 inline — once per project per process, gated on an I/O-free "is this path in a dependency cache"
 test — rather than telling the user that a file they are looking at is not in the tree.
 
+That gate is only as wide as `dependency_roots()`, which is how it kept saying exactly that for
+**standard-library** files until M15: the rustup sysroot was in no root, no cache and no group. See
+*Three things that shipped and did not work* above.
+
 **Divergences and what is not done.** ⌃⇧E is *Recent Locations* in IDEA, where Select Opened File
 has no default chord at all; cide has no Recent Locations, so nothing is lost, but the chord will
 surprise somebody. ⇧⌥S costs every terminal pane the `ESC S` byte pair, unconditionally and in
@@ -488,11 +814,30 @@ can read: `cargo` is not on PATH (with the install command), the lockfile is out
 own sentence, verbatim), a module go could not load (`-e` gives that per row), or *No external
 dependencies*.
 
+**The toolchain's own library is a row too (M15).** `Rust  1.92.0-x86_64-unknown-linux-gnu` and
+`Go  go1.25.5` sort above the alphabetised crates, pointing at `<sysroot>/lib/rustlib/src/rust/
+library` and `$GOROOT/src`. It is a `Package` with an `sdk` flag rather than a third group — a
+group would need an id, a probe, state fields, a `STEMS` entry, an icon and a `view.*` command with
+a dispatch case *or it is unreachable*, and IDEA puts its SDK node inside External Libraries too.
+Neither resolver can report it (`cargo metadata` describes the lockfile graph; the Go standard
+library is not a module), so it comes from `rustc --print sysroot` / `go env GOROOT` on the
+resolution thread, independent of whether the dependency resolution itself succeeded — a stale
+lockfile still gets a browsable `std` beside the sentence explaining its missing crates. **A
+missing `rust-src` is an ordinary state, not an error**: the row stays, and says
+`rustup component add rust-src`. `rust-toolchain.toml` joins the stamp, so editing the pin
+re-resolves.
+
 **Dependency sources are read-only, and that fixed a live bug.** Cargo unpacks a crate mode 644, so
 before M13 a Go-to-definition into `serde` gave an editable buffer whose Ctrl+S wrote into the copy
 every project on the machine builds against. `cide_core::toolchain::read_only_reason` now clears
 `FileDoc::writable` for anything under a toolchain's dependency cache and `file_write` refuses it a
-second time — unless the user opened that directory as a project root, which overrides.
+second time — unless the user opened that directory as a project root, which overrides. **M15 found
+the same bug still live one directory over**: `~/.rustup/toolchains/…/library/core/src/option.rs` is
+also mode 644 and user-owned, and the rustup tree was simply never enumerated, so a Ctrl+S in a
+`core` buffer wrote into the toolchain `rustup update` then silently replaces. That directory is now
+a root in full — sources, `bin/`, `lib/`, everything, since nothing under a rustup toolchain should
+be written by an editor. `$GOROOT` joins it when it is set, which it usually is not; Go's std
+therefore stays writable on most machines, and that is stated rather than hidden.
 
 **Not done.** *Reveal in File Manager* is disabled for a row outside the project rather than
 relaxing `fs_show_in_manager`'s containment check; the resolver has no timeout (`--frozen` and
@@ -509,7 +854,7 @@ Rust and Go get a tree-sitter symbol layer (`cide-lang`) and a language-server c
 
 **Works, and is checked.** `Ctrl+F12` (File Structure popup), `Ctrl+Alt+Shift+N` (Go to Symbol in
 project), `Alt+Up`/`Alt+Down` (previous/next member), `Ctrl+G` (Go to line), per-file position
-memory, the mouse's back/forward buttons, the `getDiagnostics` MCP tool answering from a real store,
+memory, the `getDiagnostics` MCP tool answering from a real store,
 and the whole Rust pipeline underneath: extraction for both languages, a parallel project walk, the
 merged diagnostic store, the LSP codec/session/supervisor.
 
@@ -811,9 +1156,19 @@ spawns when asked, so reopening a six-pane project does not silently start six a
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the
-producer named. The bytes a pane prints are attacker-influenced by definition — a build log, a
-tool result, an agent's transcript — so `terminal_open_path` is the one command in the app whose
-path argument is untrusted, and it is the only route from a pane to the tab list.
+producer named. A **directory** is shown in the file tree instead (M15) — the same `file.reveal`
+Ctrl+Shift+E runs, so the sidebar comes to Files first and a path with no row says so. The bytes a
+pane prints are attacker-influenced by definition — a build log, a tool result, an agent's
+transcript — so `terminal_open_path` is the one command in the app whose path argument is
+untrusted, and it is the only route from a pane to the tab list.
+
+**The press is cide's the moment it happens**, before anything is known about what is under it.
+That is not a detail: until M15 the gate waited for a completed hover, and in a Claude pane — where
+the alt-screen TUI repaints under a stationary pointer and no `mousemove` fires — it usually never
+came, so the press reached xterm, xterm wrote a mouse report to the pty, and `claude` answered a
+ctrl+click by forking a desktop file manager. cide also answers XTVERSION now, truthfully, which is
+how the CLI knows to stand down from ctrl+click and alt+click on an xterm.js host. Every claimed
+press ends in an open, a reveal, or a sentence; none ends in silence.
 
 Four guards sit on that path and they answer four different questions. Only one of them is about
 the project boundary:

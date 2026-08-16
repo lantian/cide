@@ -53,6 +53,7 @@
  * panel refreshes while the user types.
  */
 import { useCallback, useMemo, useRef, type KeyboardEvent, type ReactNode } from 'react'
+import { blurLeftTheTree } from '@/sidebar/speedSearch'
 import {
   checkState,
   diffOpenMode,
@@ -68,6 +69,9 @@ import { useChangesDrag, type ChangesDragState } from './useChangesDrag'
 import { TriCheckbox } from './TriCheckbox'
 import type { DiffOpenMode, RepoId, StatusView } from './types'
 import { gestureOf, gitTreeClick } from '../clickSemantics'
+import { useSpeedSearch } from '../useSpeedSearch'
+import { SpeedName, SpeedSearchBar } from '../SpeedSearchBar'
+import { fs as fsApi } from '@/ipc/client'
 /*
  * Reached by file rather than through the `@/icons` barrel, which is what every other caller
  * uses. The barrel also exports `useIconTheme`, which reads `@/store/workspace`, which touches
@@ -145,6 +149,14 @@ export interface ChangesTreeProps {
   /** The portalled menu itself. It must be rendered or nothing appears. */
   menu?: ReactNode
 }
+
+/**
+ * A plain move: no band, no ctrl.
+ *
+ * A module constant rather than an object literal at the call site, because `land` is in a
+ * `useCallback` dependency list and a fresh `{}` on every render would rebuild it every render.
+ */
+const NO_KEY_MODS: SelectMods = { ctrl: false, shift: false }
 
 const ARIA_CHECKED: Record<CheckState, 'true' | 'false' | 'mixed'> = {
   checked: 'true',
@@ -230,8 +242,57 @@ export function ChangesTree({
     [rows, onKeyTo],
   )
 
+  /**
+   * Type-ahead over this tree's rows. (M15)
+   *
+   * The same hook and the same rules as the explorer's, which is the point: two sidebar trees
+   * that filtered differently, or that disagreed about what Escape does, would be one feature
+   * with two behaviours. Only the three adapters differ, and each is a fact about this tree:
+   *
+   *   * **`search`** goes to `tree_match_labels`, which is the *same* Rust rule the explorer's
+   *     `fs_tree_match` uses — the `picker_rank` shape. Matching these rows in a local loop
+   *     would have been cheaper by one round trip and would have been a second implementation
+   *     of `cide_fs::speed`.
+   *   * **`land`** is `move`, which already focuses the row and takes the roving tabindex with
+   *     it.
+   *   * **`revision`** is `rows` itself, which `GitPanel` rebuilds whenever a `git status`
+   *     lands — so a match list computed against the previous walk is re-issued rather than
+   *     drawn against rows that have moved.
+   */
+  const labels = useMemo(() => rows.map((row) => row.label), [rows])
+  const speedSearch = useSpeedSearch({
+    search: useCallback((query: string) => fsApi.matchLabels(query, labels), [labels]),
+    land: useCallback((row: number) => move(row, NO_KEY_MODS), [move]),
+    accept: useCallback(() => {
+      const row = rows[at]
+      if (row === undefined) return
+      // Exactly what Enter does below, and reached the same way — a second spelling here would
+      // be a second Enter, and the two would agree only until somebody edited one.
+      if (row.expandable) onToggleExpand(row)
+      else onOpenDiff(row, 'open')
+    }, [rows, at, onToggleExpand, onOpenDiff]),
+    count: rows.length,
+    revision: rows,
+  })
+
   const onKeyDown = useCallback(
     (e: KeyboardEvent, row: Row, index: number) => {
+      /*
+       * Speed search, and it is **first** — above Space, above Escape, above everything.
+       *
+       * Two collisions make the order load-bearing here rather than tidy:
+       *
+       *   * **Space is the tick.** With a query typed it continues the query (`check tree` has
+       *     a space in it) and with nothing typed it stays the tick, untouched. `speedKey` owns
+       *     that rule, which is why it takes the query rather than a boolean.
+       *   * **Escape collapses the selection.** A user who typed three letters and pressed
+       *     Escape to call the search off would otherwise have collapsed their multi-row
+       *     selection instead — and would have to press it twice to get what they asked for.
+       *
+       * Ctrl+A is untouched: `speedKey` hands every modified chord back after ending the
+       * search, so select-all still selects all.
+       */
+      if (speedSearch.onKeyDown(e)) return
       const isOpen = expanded.has(row.id)
       const mods: SelectMods = { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey }
       const last = rows.length - 1
@@ -318,6 +379,7 @@ export function ChangesTree({
       onToggleCheckSelected,
       onToggleExpand,
       onOpenDiff,
+      speedSearch,
     ],
   )
 
@@ -331,6 +393,17 @@ export function ChangesTree({
   }
 
   return (
+    <>
+      {/* A sibling of the scroller, never a child: that element is `role="tree"` and its
+          children have to be tree items. `GitPanel.module.css`'s `.body` is the containing
+          block — see the `position: relative` there. */}
+      {speedSearch.active && (
+        <SpeedSearchBar
+          query={speedSearch.query}
+          summary={speedSearch.summary}
+          audit="gitTreeSpeedSearch"
+        />
+      )}
     <div
       ref={container}
       className={styles.tree}
@@ -347,6 +420,16 @@ export function ChangesTree({
          rule and the two reasons it could never have worked from this attribute are in
          `ChangesTree.module.css`. */
       {...(drag.state === null ? {} : { 'data-dragging': '' })}
+      /* The two exits that are not keystrokes, and the same pair the explorer installs: a
+         press is the user choosing a row with the pointer, and a blur would otherwise leave a
+         query armed to swallow the first letters typed on the way back. Capture phase, so a
+         press that moves focus is caught either way. */
+      onPointerDownCapture={speedSearch.exit}
+      onBlur={(e) => {
+        // Only when focus really left the tree — `onBlur` is the bubbling
+        // `focusout`, so landing on a match fires it too. See `blurLeftTheTree`.
+        if (blurLeftTheTree(e.currentTarget, e.relatedTarget)) speedSearch.exit()
+      }}
       onContextMenu={onContextMenu}
     >
       {rows.map((row, index) => {
@@ -548,9 +631,9 @@ export function ChangesTree({
             </span>
 
             {row.kind === 'file' ? (
-              <FileLabel row={row} iconTheme={iconTheme} />
+              <FileLabel row={row} iconTheme={iconTheme} match={speedSearch.spanFor(index)} />
             ) : (
-              <GroupLabel row={row} />
+              <GroupLabel row={row} match={speedSearch.spanFor(index)} />
             )}
           </div>
         )
@@ -559,6 +642,7 @@ export function ChangesTree({
       {menu}
       {drag.state !== null && <DragGhost state={drag.state} />}
     </div>
+    </>
   )
 }
 
@@ -618,7 +702,13 @@ function rowClass(row: Row, isCurrent: boolean, isSelected: boolean): string {
  * work tree as a tooltip — the row itself shows only the last path component, and in a
  * workspace with two roots called `core` that is the only way to tell them apart.
  */
-function GroupLabel({ row }: { row: Row }) {
+function GroupLabel({
+  row,
+  match,
+}: {
+  row: Row
+  match: { start: number; end: number } | undefined
+}) {
   return (
     <>
       <span
@@ -630,7 +720,7 @@ function GroupLabel({ row }: { row: Row }) {
            where that sits is the question compaction raises and cannot answer in 420px. */
         {...title(row)}
       >
-        {row.label}
+        <SpeedName name={row.label} span={match} />
       </span>
       {row.count !== undefined && <span className={styles.count}>{row.count}</span>}
     </>
@@ -660,15 +750,37 @@ function title(row: Row): { title?: string } {
  * each leaf spent the row's width saying what the row above already said — and it was the
  * widest thing in a 420px panel. The full path is still the row's tooltip.
  */
-function FileLabel({ row, iconTheme }: { row: Row; iconTheme: IconTheme }) {
+function FileLabel({
+  row,
+  iconTheme,
+  match,
+}: {
+  row: Row
+  iconTheme: IconTheme
+  match: { start: number; end: number } | undefined
+}) {
   const entry = row.entry
   if (entry === undefined) return null
-  const { name } = splitPath(entry.path)
+  /*
+   * `row.label`, not `splitPath(entry.path).name`.
+   *
+   * They are the same string — `buildRows` sets the label with that very call — and that is
+   * exactly the problem: it was two derivations of one name, and speed search would have made
+   * it three. The query is matched against `Row.label` in Rust, so the *span* is an offset into
+   * that string; rendering a differently-derived one would put the highlight over the wrong
+   * glyphs the first time the two came apart. The icon still needs a bare filename, which is
+   * what `splitPath` is left doing.
+   */
+  const name = row.label
   return (
     <>
-      <FileIcon row={{ name, kind: 'file' }} theme={iconTheme} className={styles.icon} />
+      <FileIcon
+        row={{ name: splitPath(entry.path).name, kind: 'file' }}
+        theme={iconTheme}
+        className={styles.icon}
+      />
       <span className={styles.fileName} data-status={entryStatus(entry)} title={entry.path}>
-        {name}
+        <SpeedName name={name} span={match} />
       </span>
       {entry.origPath !== null && (
         <span className={styles.dir}>← {splitPath(entry.origPath).name}</span>

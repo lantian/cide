@@ -53,6 +53,7 @@ use std::process::Command;
 
 pub mod cargo;
 pub mod go;
+pub mod sdk;
 pub mod version;
 
 /// A toolchain whose dependency graph cide can read.
@@ -113,6 +114,19 @@ pub struct Package {
     /// but the cache does not hold answers with an `Error` of its own and every *other* module
     /// still resolves. Cargo has no `-e` equivalent, so a cargo failure is a group-level note.
     pub note: Option<String>,
+    /// This row is the toolchain's own library — `std`/`core`/`alloc`, or `$GOROOT/src`.
+    ///
+    /// A flag rather than a separate group, and that choice is the whole design of the SDK row
+    /// (see [`sdk`]). A third `Groups::show` would need an id, a `probe_*`, state fields in
+    /// `ProjectGroups`, a `STEMS` entry, an icon that exists on disk, and a `view.*` command
+    /// with a `dispatch.ts` case — *or it is unreachable*, which is this project's recurring
+    /// defect by construction. As a `Package` it needs **zero** frontend change:
+    /// `rowVerbs('file', false)` already makes library files openable-and-immutable and
+    /// `FileTree` already opens them. IDEA puts its SDK node inside External Libraries too.
+    ///
+    /// All it does here is sort: the SDK goes above 500 alphabetised crates, because it is one
+    /// row and it is the one a user scrolling for `core` is looking for.
+    pub sdk: bool,
 }
 
 /// Everything one project's resolution produced.
@@ -227,7 +241,17 @@ impl Unit {
     fn stamped_files(&self) -> Vec<PathBuf> {
         let dir = self.dir();
         match self.kind {
-            Toolchain::Cargo => vec![self.manifest.clone(), dir.join("Cargo.lock")],
+            // `rust-toolchain.toml` and `rust-toolchain` are here for the SDK row, not for the
+            // dependency graph: editing the pin swaps the sysroot, and without them the group
+            // would go on showing the old toolchain until the app restarted. `restamp` is
+            // `stat`-only, so this costs two extra syscalls per unit per watcher burst rather
+            // than a `read_dir`.
+            Toolchain::Cargo => vec![
+                self.manifest.clone(),
+                dir.join("Cargo.lock"),
+                dir.join("rust-toolchain.toml"),
+                dir.join("rust-toolchain"),
+            ],
             Toolchain::Go => vec![
                 self.manifest.clone(),
                 dir.join("go.sum"),
@@ -305,17 +329,46 @@ pub fn resolve(roots: &[PathBuf]) -> Resolved {
         };
         out.packages.extend(one.packages);
         out.notes.extend(one.notes);
+
+        // Deliberately **independent** of the resolver above, and not inside its `Ok` arm: a
+        // project with a stale lockfile is refused by `--frozen` (see the crate header) and
+        // still deserves a browsable standard library beside the sentence explaining why its
+        // crates are missing. The two questions — "what does this project depend on" and "which
+        // toolchain is it built with" — have nothing to do with each other, and letting one
+        // failure take the other's answer down is how a group ends up empty for a reason it
+        // does not state.
+        out.packages.extend(sdk::probe(unit.kind, unit.dir()));
     }
 
+    finalize(out, !units.is_empty())
+}
+
+/// Order the rows and guarantee the group is never silently empty.
+///
+/// **Split out of [`resolve`] so it can be driven from a test at all.** Everything above it in
+/// `resolve` forks a toolchain, so every behavioural test of that function has to be
+/// `#[ignore]`d — and the two rules below are precisely the ones a later edit gets wrong
+/// quietly. Both were added or changed in M15 when the SDK row arrived, and both have a failure
+/// mode with no visible symptom: a mis-ordered SDK row is merely buried under 593 crates, and a
+/// broken emptiness guarantee is a group that shows nothing and says nothing.
+pub fn finalize(mut out: Resolved, had_units: bool) -> Resolved {
     // Identity is the **directory**, not the name and not `name@version`. This repository has 41
     // crate names present at two versions at once; two rows called `base64` are two different
     // sources and both belong. A directory, on the other hand, cannot legitimately appear twice
     // — two units in one project sharing a lockfile resolve to the same unpacked crate.
+    //
+    // The SDK first, then the ordinary rows by `row_cmp`. `b.sdk.cmp(&a.sdk)` rather than
+    // `a.sdk.cmp(&b.sdk)` because `false < true` and the SDK has to come out on top; spelled as a
+    // reversed compare rather than a `Reverse` wrapper so the two halves read in the same
+    // direction. `version::row_cmp` itself is untouched — it is well tested, and teaching it
+    // about a flag it has no business knowing would be the tempting alternative.
     out.packages.sort_by(|a, b| {
-        version::row_cmp(
-            (&a.name, &a.version, dir_key(a)),
-            (&b.name, &b.version, dir_key(b)),
-        )
+        b.sdk.cmp(&a.sdk).then_with(|| {
+            version::row_cmp(
+                (&a.name, &a.version, dir_key(a)),
+                (&b.name, &b.version, dir_key(b)),
+            )
+        })
     });
     out.packages
         .dedup_by(|a, b| a.dir.is_some() && a.dir == b.dir);
@@ -323,11 +376,18 @@ pub fn resolve(roots: &[PathBuf]) -> Resolved {
     // The guarantee the group depends on: never silently empty. "Resolved fine, and this project
     // genuinely has no external dependencies" is a real answer and a surprising one, so it gets
     // a sentence like every other outcome.
-    if out.packages.is_empty() && out.notes.is_empty() {
-        out.notes.push(if units.is_empty() {
-            "No Cargo or Go project under this project's roots.".to_string()
-        } else {
+    //
+    // `all(|p| p.sdk)` and not `is_empty()`, since M15. The SDK row is present for every Cargo
+    // and Go unit whether or not the project has a single dependency, so an emptiness test that
+    // counted it would have retired this sentence for ever — and a group showing nothing but
+    // `Rust 1.92.0-…` is exactly the silence the guarantee exists to prevent: it cannot be told
+    // apart from a resolution that produced nothing for a reason nobody printed. The SDK is an
+    // answer to *which toolchain builds this*, never to *what does this depend on*.
+    if out.packages.iter().all(|package| package.sdk) && out.notes.is_empty() {
+        out.notes.push(if had_units {
             "No external dependencies.".to_string()
+        } else {
+            "No Cargo or Go project under this project's roots.".to_string()
         });
     }
     out
@@ -531,6 +591,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn package(name: &str, sdk: bool) -> Package {
+        Package {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            dir: Some(PathBuf::from(format!("/somewhere/{name}"))),
+            note: None,
+            sdk,
+        }
+    }
+
+    #[test]
+    fn the_toolchains_own_library_is_the_first_row_and_not_the_five_hundredth() {
+        let out = finalize(
+            Resolved {
+                packages: vec![
+                    package("adler2", false),
+                    package("Rust", true),
+                    package("zerocopy", false),
+                ],
+                notes: Vec::new(),
+            },
+            true,
+        );
+        assert_eq!(
+            out.packages
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Rust", "adler2", "zerocopy"],
+            "the SDK sorts above the alphabet. `R` falls in the middle of 593 crate names, so \
+             without the flag the one row a user scrolling for `core` wants is buried among them \
+             — a failure with no symptom other than not finding it"
+        );
+    }
+
+    #[test]
+    fn a_group_holding_only_the_sdk_still_says_it_found_no_dependencies() {
+        // The guarantee that would have been silently retired. Before the SDK row, `packages`
+        // was empty for a project with no dependencies and the sentence fired; afterwards
+        // `packages` is never empty, so an `is_empty()` test would have stopped firing for ever
+        // — and a group showing nothing but `Rust 1.92.0-…` cannot be told apart from one whose
+        // resolution produced nothing for a reason nobody printed.
+        let out = finalize(
+            Resolved {
+                packages: vec![package("Rust", true)],
+                notes: Vec::new(),
+            },
+            true,
+        );
+        assert_eq!(
+            out.notes,
+            ["No external dependencies."],
+            "the SDK is an answer to *which toolchain builds this*, never to *what does this \
+             depend on*, so it cannot be what makes the group look answered"
+        );
+
+        let with_one = finalize(
+            Resolved {
+                packages: vec![package("Rust", true), package("serde", false)],
+                notes: Vec::new(),
+            },
+            true,
+        );
+        assert!(
+            with_one.notes.is_empty(),
+            "and one real dependency is an answer, so nothing is added"
+        );
+    }
+
+    /// The SDK row's one call site, asserted because nothing else can see it.
+    ///
+    /// Found by mutation: deleting `out.packages.extend(sdk::probe(…))` from [`resolve`] left
+    /// **every** gate in this workspace green — `sdk.rs`'s own tests pass over fixtures, the
+    /// real-toolchain test is `#[ignore]`d, and `finalize`'s tests are handed their packages. A
+    /// complete, correct, well-tested module reachable from nothing is this project's most
+    /// repeated defect, and it very nearly shipped again in the batch that was fixing three
+    /// instances of it.
+    ///
+    /// It is a source assertion because the behavioural path forks two toolchains and every
+    /// test of it must therefore be ignored. It runs over comment-stripped source, so the
+    /// paragraph above `sdk::probe` explaining why it is where it is cannot satisfy it.
+    #[test]
+    fn the_sdk_probe_is_actually_called_and_is_not_conditional_on_the_resolver_succeeding() {
+        let source = include_str!("lib.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("lib.rs still ends with its test module");
+        let code = source
+            .replace("\r\n", "\n")
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => line[..at].to_string(),
+                None => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = code
+            .split("pub fn resolve(roots: &[PathBuf]) -> Resolved {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("resolve() still has a findable body");
+
+        assert!(
+            body.contains("sdk::probe(unit.kind, unit.dir())"),
+            "resolve() must call sdk::probe for every unit, or the standard library has no row, \
+             Select opened file answers \"not in this project's file tree\" about a std file on \
+             screen, and cide-deps::sdk is a complete module nothing reaches"
+        );
+        /*
+         * Unconditional, asserted through **indentation**, which in a rustfmt-checked crate is
+         * an exact statement of nesting depth: eight spaces is the `for unit in &units` body,
+         * the same level as `out.packages.extend(one.packages);` beside it. Anything that made
+         * the probe conditional — an `if`, a match arm, a `let … else` — indents it to twelve or
+         * more and this fails.
+         *
+         * Written this way after the first spelling ("no `Ok(` between the resolver and the
+         * probe") *survived its own mutation*: wrapping the call in `if one.notes.is_empty()`
+         * kept every substring it looked for. That is the trap the batch instructions name —
+         * an assertion that pins an incidental fact rather than the property — and it is
+         * recorded here rather than quietly corrected, because the fixed version looks just as
+         * plausible as the broken one did.
+         */
+        assert!(
+            body.contains("\n        out.packages.extend(sdk::probe(unit.kind, unit.dir()));\n"),
+            "and it must sit at the loop's top level — eight spaces, beside the resolver rather \
+             than inside a branch on its result. A project whose lockfile is stale is refused by \
+             --frozen and still deserves a browsable standard library beside the sentence saying \
+             why its crates are missing: the two questions have nothing to do with each other"
+        );
     }
 
     #[test]

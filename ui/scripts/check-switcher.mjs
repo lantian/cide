@@ -698,24 +698,76 @@ try {
     const ws = read('../src/store/workspace.ts')
     const wsCode = ws.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
     ok(/restack\(/.test(wsCode), 'the workspace store derives its stacks through `restack`')
-    for (const [fn, key] of [
-      ['function nextMru', 'cide.projectMru'],
-      ['function nextTabMru', 'cide.tabMru'],
-    ]) {
-      ok(wsCode.includes(fn), `${fn} derives its stack from the snapshot`)
-      ok(
-        wsCode.includes(`'${key}'`),
-        `and is persisted under ${key} — a stack that resets every launch makes the first press ` +
-          'of every session land on whatever happens to be second, which is the strip order the ' +
-          'switchers exist to replace',
-      )
-    }
-    // The tab stack is derived per project *from the snapshot*, not patched when a tab is
-    // activated: `activateTab` is one of five routes to a new active tab and the only one all
-    // five share is `cide://workspace-changed`. Asserted through the field it reads.
+    ok(wsCode.includes('function nextMru'), 'nextMru derives its stack from the snapshot')
     ok(
-      /nextTabMru[\s\S]*?project\.activeTab/.test(wsCode),
-      'nextTabMru reads `activeTab` off the snapshot rather than being hung off an action',
+      wsCode.includes(`'cide.projectMru'`),
+      'and is persisted under cide.projectMru — a stack that resets every launch makes the ' +
+        'first press of every session land on whatever happens to be second, which is the strip ' +
+        'order the switchers exist to replace',
+    )
+
+    /*
+     * The **tab** stack moved into Rust in M15 and its assertion had to move with it, which is
+     * the interesting half of this block.
+     *
+     * It used to be pinned exactly like the project stack: derived here from `project.activeTab`
+     * and cached under `localStorage`'s `cide.tabMru`. Both of those assertions would now pass
+     * for the wrong reason, and one of them is a trap rather than merely stale — a
+     * `cide.tabMru` key still written here would be a *second* order, mirroring a field Rust now
+     * owns, and the two would silently disagree the moment a tab was closed from a window that
+     * is not this one (`cide_app::ide` closes a withdrawn diff with no webview in the loop at
+     * all). So the check is inverted: the key must be **gone**.
+     *
+     * What replaces it is the same claim one level down. The order is read off the snapshot's
+     * `project.tabMru` — `cide_ipc::workspace::Project::tab_mru`, which `close_tab` consults to
+     * pick a successor — and the only thing this file may still do to it is `reconcile`, which
+     * appends tabs the order has never seen so the switcher can walk to them. `restack` here
+     * would be the old derivation coming back: it *touches* the active id, which would re-derive
+     * an order that Rust is now the author of.
+     */
+    ok(wsCode.includes('function nextTabMru'), 'nextTabMru reads the tab order off the snapshot')
+    ok(
+      !wsCode.includes(`'cide.tabMru'`),
+      'and no longer caches one under cide.tabMru — a webview copy of an order Rust owns is a ' +
+        'second answer to "which tab do I land on when this one closes"',
+    )
+    const nextTabMru = /function nextTabMru[\s\S]*?\n\}/.exec(wsCode)?.[0] ?? ''
+    ok(
+      /project\.tabMru/.test(nextTabMru),
+      'nextTabMru reads `project.tabMru`, the field `close_tab` picks its successor from',
+    )
+    ok(
+      /reconcile\(/.test(nextTabMru) && !/restack\(/.test(nextTabMru),
+      'and only reconciles it against the live tabs — `restack` would re-derive from ' +
+        '`activeTab` the order Rust is now the author of',
+    )
+    // And the Rust half is actually there. A grep over `cide-ipc` rather than over the generated
+    // TypeScript: `generated.ts` is written by `xtask codegen` from these types, so the DTO is
+    // the thing that has to carry the field and the binding follows it.
+    const projectRs = read('../../crates/cide-ipc/src/workspace.rs').replace(
+      /\/\/\/[^\n]*/g,
+      '',
+    )
+    ok(
+      /pub tab_mru:\s*Vec<TabId>/.test(projectRs),
+      '`Project` carries the tab focus order in Rust, where the close decision is made',
+    )
+    ok(
+      /#\[serde\(default\)\]\s*\n\s*pub tab_mru:/.test(projectRs),
+      'and defaults, so every `workspace.json` written before it still deserialises rather ' +
+        'than being quarantined with every project in it',
+    )
+    const closeTab = /pub fn close_tab[\s\S]*?\n\}/.exec(
+      read('../../crates/cide-core/src/workspace.rs').replace(/\/\/[^\n]*/g, ''),
+    )?.[0]
+    ok(
+      closeTab !== undefined && /tab_mru/.test(closeTab),
+      'and `close_tab` consults it — which is the whole reason it is in Rust and not here',
+    )
+    ok(
+      closeTab !== undefined && /tabs\.get\(index - 1\)/.test(closeTab),
+      'while keeping the left-neighbour rule as the fallback, for the migrated workspace whose ' +
+        'order holds nothing but the tab being closed',
     )
   }
 

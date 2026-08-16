@@ -88,6 +88,18 @@ pub enum CoreError {
     #[error("pane tree invariant violated: {0}")]
     Invariant(String),
 
+    /// A write carried a precondition and the file on disk no longer matched it. (M15)
+    ///
+    /// A **tagged** variant rather than an `Io(String)` carrying the sentence, and the tag is
+    /// the whole reason it exists: the frontend has to tell "the file moved under you, here is
+    /// the conflict bar" from "the disk is full, here is a failure toast", and matching on prose
+    /// is how a translated or reworded message silently turns one into the other.
+    ///
+    /// Only ever produced when the caller *asked* for the check — an explicit Ctrl+S passes no
+    /// stamp and cannot see this. See `cide_core::document::write_if_unchanged`.
+    #[error("{path} changed on disk since it was opened")]
+    FileChanged { path: String },
+
     #[error("{0}")]
     Io(String),
 

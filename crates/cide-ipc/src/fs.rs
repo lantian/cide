@@ -55,6 +55,47 @@ pub struct TreeRow {
     pub detail: Option<String>,
 }
 
+/// One row of the tree that a speed-search query matched, and where in its name.
+///
+/// `row` is an index into the *composed* flattening — the same address `fs.treeRows` serves and
+/// the same one the frontend's cursor moves to — so the seam between the walked index and the
+/// synthetic groups is closed in Rust and never reaches the webview.
+///
+/// `start`/`end` are offsets into [`TreeRow::name`] in **UTF-16 code units**, which is the unit
+/// `String.prototype.slice` indexes in. See `cide_fs::speed` for why the conversion happens here
+/// rather than in the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TreeMatch {
+    pub row: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Everything one speed-search keystroke gets back.
+///
+/// `query` and `count` are both here so a frame that describes a *different* question can be
+/// discarded rather than drawn, which is the sharpest hazard in this feature: match indices
+/// describe one flattening, and a watcher burst or an expand renumbers every one of them. The
+/// frontend keeps a frame only while `query` is still what is typed and `count` is still the
+/// tree's row count; `PickerFrame` echoes its query back for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TreeMatches {
+    /// The query these matches answer, echoed back. A reply that lands after a newer keystroke
+    /// is discardable without a request id.
+    pub query: String,
+    /// How many rows were searched — the tree's row count at the moment of the walk.
+    pub count: u32,
+    /// In walk order, which is tree order. Deliberately not ranked: see `cide_fs::speed`.
+    pub matches: Vec<TreeMatch>,
+    /// The limit cut the list short and there was more. Said out loud in the overlay, because a
+    /// silently short answer is indistinguishable from a tree that does not contain the file.
+    pub truncated: bool,
+}
+
 /// [`TreeRow::root`] for a row no project root contains.
 ///
 /// A reserved value rather than an `Option<u16>`: the field is on every row of a 100k-row tree,

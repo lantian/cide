@@ -155,7 +155,17 @@ pub fn defaults() -> Vec<Binding> {
         ("alt+shift+s", "scratch.new"),
         ("ctrl+w", "tab.close"),
         ("ctrl+s", "file.save"),
-        ("ctrl+shift+t", "theme.toggle"),
+        // Reopen the last closed tab, which is what this chord means in every browser and in
+        // every IDE that has the gesture. It was `theme.toggle`, and that command is now
+        // **palette-only**: switching the theme is a thing a user does twice a year, and it was
+        // holding the one chord whose muscle memory is universal.
+        //
+        // Nothing in this workspace requires a registered command to carry a binding —
+        // `check-commands.mjs` checks the other direction only, that every bound key names a
+        // registered and available command — so `theme.toggle` losing its default costs it
+        // nothing but the chord. `project.switcher.prev` is the existing precedent and
+        // `the_default_layer_binds_every_command_the_palette_shows` names both.
+        ("ctrl+shift+t", "tab.reopenClosed"),
         // Pull, asked for by name: "need hotkey CTRL+T for git pull".
         //
         // # What it costs, precisely
@@ -1226,6 +1236,45 @@ mod tests {
         }
     }
 
+    /// **No default may bind a bare printable key.** (M15)
+    ///
+    /// The sidebar trees' speed search is a *type-ahead*: pressing `t` in the explorer starts a
+    /// search for `t`, exactly as it does in IDEA, Explorer and Finder. That works today because
+    /// [`defaults`] happens to contain no unmodified single-character binding — every entry
+    /// carries ctrl, alt, shift or meta, and the three bare exceptions are `f4`, `mouseback` and
+    /// `mouseforward`, none of which is a character.
+    ///
+    /// It was a *coincidence* with nothing behind it, and the failure mode is severe and silent.
+    /// `ui/src/keys/gate.ts` resolves global bindings on a **window capture** listener, which
+    /// runs before the event reaches its target — so a default of, say, `r → git.pull` would eat
+    /// the letter `r` in the file tree, in the rename box, in the commit message box, in
+    /// CodeMirror and in every terminal. Speed search would go dead for that one letter with no
+    /// error anywhere, and the tree would look like it had stopped listening.
+    ///
+    /// Written as an assertion about *what the default layer may contain* rather than about the
+    /// tree, because the tree cannot defend itself: by the time its `onKeyDown` runs, the gate
+    /// has already decided.
+    #[test]
+    fn no_default_binds_an_unmodified_printable_key() {
+        for binding in defaults().into_iter().chain(platform_defaults()) {
+            let key = normalize_key(&binding.key);
+            // A modified chord is fine; so is a named key (`f4`, `escape`, `mouseback`), which
+            // is more than one character and therefore not something a keyboard types into a
+            // text field.
+            if key.contains('+') || key.chars().count() != 1 {
+                continue;
+            }
+            panic!(
+                "`{key}` is bound to {} with no modifier. The key gate's window capture \
+                 listener would swallow that character everywhere — the file tree's speed \
+                 search, the rename box, the commit message, CodeMirror and every terminal — \
+                 before the focused element ever saw it. Add a modifier, or the binding is a \
+                 letter the user can no longer type.",
+                binding.command
+            );
+        }
+    }
+
     #[test]
     fn spellings_of_one_keystroke_all_normalise_alike() {
         let canonical = normalize_key("ctrl+shift+p");
@@ -1323,8 +1372,15 @@ mod tests {
             "picker.files",
             "palette.commands",
             "tab.close",
+            "tab.reopenClosed",
             "file.save",
-            "theme.toggle",
+            // M15. `theme.toggle` was in this list and is deliberately gone: `ctrl+shift+t` is
+            // now `tab.reopenClosed`, which is what that chord means everywhere else, and
+            // switching the theme is a twice-a-year gesture that does not need a chord at all.
+            // The command still exists, still appears in the palette and is still bindable in
+            // `keymap.json`; it simply ships with no default. Listing it here would be
+            // asserting a binding that does not exist — the same note as
+            // `project.switcher.prev` below.
             "pane.navigate.left",
             "pane.navigate.right",
             "pane.navigate.up",
@@ -1733,12 +1789,14 @@ mod tests {
     /// pty (`ui/src/keys/gate.ts` answers `passThrough` for an unbound chord).
     ///
     /// `ctrl+shift+t` is asserted beside it because the two are one keystroke apart and a
-    /// resolver that folded shift away would silently swap the theme on every pull.
+    /// resolver that folded shift away would reopen a closed tab on every pull. That used to
+    /// read "silently swap the theme", which was the same claim about the same defect — the
+    /// chord's command changed in M15 and the reason for asserting it did not.
     #[test]
     fn ctrl_t_pulls_and_can_be_given_back_to_the_terminal() {
         let shipped = resolve(&[]);
         assert_eq!(command_for(&shipped, "ctrl+t"), ["git.pull"]);
-        assert_eq!(command_for(&shipped, "ctrl+shift+t"), ["theme.toggle"]);
+        assert_eq!(command_for(&shipped, "ctrl+shift+t"), ["tab.reopenClosed"]);
 
         let freed = resolve(&[Binding::new("ctrl+t", "-git.pull")]);
         assert!(
@@ -1747,9 +1805,34 @@ mod tests {
         );
         assert_eq!(
             command_for(&freed, "ctrl+shift+t"),
-            ["theme.toggle"],
+            ["tab.reopenClosed"],
             "and it must not take the neighbouring chord with it"
         );
+    }
+
+    /// A registered command with no default binding is a supported state, and `theme.toggle`
+    /// is now the second one in this table.
+    ///
+    /// Worth a test of its own rather than an absence, because "every palette row has a key" is
+    /// the assertion a future reader is most likely to *add* — it sounds like an invariant and
+    /// it is not one. Two commands deliberately ship unbound (`project.switcher.prev`, whose
+    /// reverse chord is taken, and this one, whose chord was worth more to another command), and
+    /// both are still reachable: the palette lists them, and `keymap.json` binds them.
+    #[test]
+    fn theme_toggle_ships_unbound_and_is_still_a_command() {
+        let shipped = resolve(&[]);
+        assert!(
+            !shipped.iter().any(|r| r.command == "theme.toggle"),
+            "no default layer binds it any more"
+        );
+        assert!(
+            crate::commands::by_id("theme.toggle").is_some(),
+            "and it is still in the registry, so the palette still offers it"
+        );
+
+        // And a user can take it back with one line, which is the whole of what it lost.
+        let bound = resolve(&[Binding::new("alt+shift+d", "theme.toggle")]);
+        assert_eq!(command_for(&bound, "alt+shift+d"), ["theme.toggle"]);
     }
 
     /// Ctrl+G goes to a line, and the escape hatch the README offers for it actually works —

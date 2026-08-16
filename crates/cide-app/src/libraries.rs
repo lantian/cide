@@ -211,12 +211,7 @@ impl ProjectGroups {
             .into_iter()
             .map(|package| Entry {
                 name: package.name,
-                // The version, and — for a row with no source on disk — the reason instead. Two
-                // facts, one dim column: `serde  1.0.229` and `go-spew  v1.1.1 · not downloaded`.
-                detail: Some(match package.note {
-                    Some(note) => format!("{} · {note}", package.version),
-                    None => package.version,
-                }),
+                detail: Some(detail_of(package.version, package.note)),
                 dir: package.dir.is_some(),
                 path: package.dir,
             })
@@ -234,6 +229,24 @@ impl ProjectGroups {
             // would be two ways of saying the same thing, and one of them looks like a bug.
             (count > 0).then(|| count.to_string()),
         );
+    }
+}
+
+/// The dim second column of a library row: the version, and the reason if there is one.
+///
+/// A free function so it can be driven from a test. `fill` around it forks two toolchains, so
+/// every behavioural test of *that* has to be `#[ignore]`d — and this is the half a later edit
+/// gets subtly wrong with no visible symptom beyond a row that reads oddly.
+///
+/// Two facts, one column: `serde  1.0.229` and `go-spew  v1.1.1 · not downloaded`. The
+/// empty-version arm is not hypothetical tidiness — the SDK row (M15) has no version to show
+/// when the probe itself failed, and `Rust   · error: toolchain '1.99.0' is not installed` reads
+/// as a missing field rather than as a sentence.
+fn detail_of(version: String, note: Option<String>) -> String {
+    match (version.is_empty(), note) {
+        (true, Some(note)) => note,
+        (false, Some(note)) => format!("{version} · {note}"),
+        (_, None) => version,
     }
 }
 
@@ -375,8 +388,16 @@ mod tests {
         groups.fill(std::slice::from_ref(&dir));
         let rows = library_rows(&groups);
         assert!(rows.len() >= 2, "{rows:#?}");
-        assert_eq!(rows[1].kind, TreeRowKind::Note);
-        assert!(!rows[1].name.is_empty());
+        // A note *somewhere* under the header, not at a fixed index. Since M15 the SDK row sits
+        // above it — `Go  go1.25.5`, which is a true and useful row and is not an answer to
+        // "what does this project depend on". The property being pinned is unchanged and is the
+        // only one that was ever meant: a group that resolved to no dependencies has a row
+        // saying why, rather than being silently empty.
+        let note = rows[1..]
+            .iter()
+            .find(|row| row.kind == TreeRowKind::Note)
+            .unwrap_or_else(|| panic!("a resolution with no dependencies must say so: {rows:#?}"));
+        assert!(!note.name.is_empty());
         assert_eq!(groups.rows.read().state(GROUP_ID), Some(GroupState::Ready));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -506,6 +527,125 @@ mod tests {
             !groups.is_unlisted_library_path(&crate_source, &roots),
             "a resolved group is not asked again: re-forking cargo would cost a quarter of a \
              second per press and collapse the rows the user had open, to learn nothing new"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Every** root, not `caches.first()`. This is the gate that would have caught M15's
+    /// second report, and the way the old one was written is itself the finding.
+    ///
+    /// The test above takes `dependency_roots().first()` and builds a serde path out of it. That
+    /// is self-referential: it can only ever exercise a population the function already returns,
+    /// so a root that was *missing* — the rustup toolchains directory, which held every byte of
+    /// the standard library — could never make it fail. The end-to-end test in `cmd/fs.rs` has
+    /// the same shape and is `#[ignore]`d besides. Coverage of the predicate proved only that
+    /// the predicate agreed with itself.
+    ///
+    /// Sweeping the whole list fixes the *form* of the mistake; the containment test in
+    /// `cide_core::toolchain` names the rustup path shape from the outside and fixes the
+    /// instance. Both are needed, because only the second can notice an absence.
+    #[test]
+    fn every_dependency_root_reaches_the_resolution_gate_including_the_toolchains_own_library() {
+        let dir = temp("all-roots");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").expect("write");
+        let roots = vec![dir.clone()];
+        let groups = ProjectGroups::new();
+        groups.probe_libraries(&roots);
+
+        let caches = cide_core::toolchain::dependency_roots();
+        assert!(
+            caches.len() >= 3,
+            "at least the two cargo caches and the go module cache; got {caches:?}"
+        );
+        for cache in &caches {
+            // A plausible file under each root. The predicate is textual, so nothing has to
+            // exist — which is the point: it must answer for a toolchain this machine does not
+            // happen to have installed just as it does for one it does.
+            let file = cache.join("some/nested/source.rs");
+            assert!(
+                groups.is_unlisted_library_path(&file, &roots),
+                "{} is a dependency root, so a file under it must reach resolve_now. If this \
+                 fails for the rustup toolchains directory, `std` is invisible to Select opened \
+                 file AND writable by Ctrl+S — see cide_core::toolchain::dependency_roots",
+                cache.display()
+            );
+        }
+
+        // The one that matters, spelled out rather than left to the loop, because it is the
+        // exact path the bug was reported against.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let std_file = home.join(
+                ".rustup/toolchains/1.92.0-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/\
+                 library/core/src/option.rs",
+            );
+            assert!(
+                groups.is_unlisted_library_path(&std_file, &roots),
+                "Go to definition lands here and Ctrl+Shift+E used to answer \"that file is not \
+                 in this project's file tree\" about it"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_with_no_version_reads_as_a_sentence_and_not_as_a_missing_field() {
+        assert_eq!(detail_of("1.0.229".into(), None), "1.0.229");
+        assert_eq!(
+            detail_of("v1.1.1".into(), Some("not downloaded".into())),
+            "v1.1.1 · not downloaded",
+            "two facts in one dim column, which is what the separator is for"
+        );
+        assert_eq!(
+            detail_of(
+                String::new(),
+                Some("error: toolchain '1.99.0' is not installed".into())
+            ),
+            "error: toolchain '1.99.0' is not installed",
+            "and with no version there is nothing to separate it FROM: a leading ` · ` in front \
+             of the one thing the row has to say reads as a field that failed to render, which \
+             is the opposite of the legibility the note row exists for"
+        );
+    }
+
+    /// The link that was actually missing: a group holding an SDK row can be *revealed into*.
+    ///
+    /// Everything either side of this was correct — the reveal walks the groups, the group
+    /// materialises an unopened chain — but there was no row for `std` to be found under,
+    /// because `cargo metadata` cannot report one. Driven over a fixture group rather than a
+    /// real toolchain, so it fails on a machine with no rustup rather than being skipped there.
+    #[test]
+    fn a_file_under_the_sdk_row_has_a_row_in_the_tree() {
+        let dir = temp("sdk-reveal");
+        let library = dir.join("library");
+        std::fs::create_dir_all(library.join("core/src")).expect("mkdir");
+        std::fs::write(library.join("core/src/option.rs"), "// std\n").expect("write");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        std::fs::write(project.join("Cargo.toml"), "[package]\n").expect("write");
+        let roots = vec![project];
+        let groups = ProjectGroups::new();
+        groups.probe_libraries(&roots);
+
+        groups.rows.write().fulfil(
+            GROUP_ID,
+            vec![Entry {
+                name: "Rust".to_string(),
+                detail: Some("1.92.0-x86_64-unknown-linux-gnu".to_string()),
+                dir: true,
+                path: Some(library.clone()),
+            }],
+            Some("1".to_string()),
+        );
+
+        assert!(
+            groups.reveal(&library.join("core/src/option.rs")).is_some(),
+            "with an SDK row present the reveal finds a file under it — this is the link the \
+             whole report was about, and it needed no change at all once the row existed"
+        );
+        assert_eq!(
+            groups.reveal(&dir.join("elsewhere/x.rs")),
+            None,
+            "and a path under no row is still no row: the group answers for what it lists"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

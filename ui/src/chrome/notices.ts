@@ -89,6 +89,18 @@ export function describe(reason: unknown): string {
   if (reason !== null && typeof reason === 'object') {
     const message = (reason as { message?: unknown }).message
     if (typeof message === 'string' && message.length > 0) return message
+    /*
+     * `detail` before `kind`, because that is the shape every rejected Rust command actually has.
+     *
+     * `CoreError` is `#[serde(tag = "kind", content = "detail")]`, so an I/O failure arrives as
+     * `{kind: "io", detail: "No space left on device (os error 28)"}` — no `message` field at all.
+     * Falling through to `kind` turned every disk-full, permission-denied, file-deleted and
+     * read-only failure into the single word **io**, which is the tag's name and tells the user
+     * nothing they can act on. Autosave is where that stopped being cosmetic: it fails on a timer,
+     * silently, and the toast was the only thing that could have said why.
+     */
+    const detail = (reason as { detail?: unknown }).detail
+    if (typeof detail === 'string' && detail.length > 0) return detail
     const kind = (reason as { kind?: unknown }).kind
     if (typeof kind === 'string' && kind !== '') return kind
   }

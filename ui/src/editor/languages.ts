@@ -25,6 +25,7 @@ type LanguageId =
   | 'toml'
   | 'yaml'
   | 'markdown'
+  | 'sql'
 
 interface Entry {
   /** What the status bar readout calls it. */
@@ -73,6 +74,10 @@ const REGISTRY: Record<LanguageId, Entry> = {
     label: 'Markdown',
     load: async () => StreamLanguage.define((await import('./languages/markdown')).spec),
   },
+  sql: {
+    label: 'SQL',
+    load: async () => StreamLanguage.define((await import('./languages/sql')).spec),
+  },
 }
 
 /**
@@ -114,6 +119,7 @@ const BY_EXTENSION: Record<string, { id: LanguageId; label?: string }> = {
   yml: { id: 'yaml' },
   md: { id: 'markdown' },
   markdown: { id: 'markdown' },
+  sql: { id: 'sql' },
 }
 
 /**
@@ -166,10 +172,75 @@ export const SCRATCH_TYPES: readonly ScratchType[] = [
   { label: 'TOML', ext: 'toml' },
   { label: 'Markdown', ext: 'md' },
   { label: 'Shell', ext: 'sh' },
+  // After Shell and before C, which is where a person looking for it would scan. Added in M15
+  // with its grammar (`languages/sql.ts`) rather than as a bare row: `check-editor.mjs` requires
+  // every offered extension to resolve through `lookup` to that entry's own label *and* to load
+  // a real grammar, so a type the editor cannot highlight is a build failure rather than a
+  // scratch that quietly opens as plain text.
+  { label: 'SQL', ext: 'sql' },
   { label: 'C', ext: 'c' },
   { label: 'C++', ext: 'cpp' },
   { label: 'Plain Text', ext: 'txt' },
 ]
+
+/**
+ * The rows [`SCRATCH_TYPES`] offers for a typed query, best first.
+ *
+ * # Why the picker gained a filter at all
+ *
+ * `ScratchType.tsx` used to argue, in its header, that "there is nothing worth fuzzy-matching
+ * in `Rust`, `Go`, `JSON`". That was true of thirteen rows read as a list and false of the
+ * gesture: reaching SQL from the top of the list is five Down presses, while `sql` is three
+ * characters and lands on it. This reverses that decision, and the header there is rewritten
+ * rather than left standing.
+ *
+ * # Ranked, not plain-substring
+ *
+ * A bare `label.includes(q)` answers `js` with **JSON** — `J`… no, with nothing, and `s` with
+ * *TypeScript, JavaScript, JSON, Shell, SQL* in list order, so the top row for `s` is whichever
+ * happens to be highest rather than the one whose name starts that way. So: five tiers, exact
+ * extension first, and list order inside a tier.
+ *
+ *   1. the extension exactly — `sql` is SQL, `md` is Markdown, `c` is C and not C++
+ *   2. the extension by prefix — `ja` reaches nothing, `j` reaches JavaScript and JSON
+ *   3. the label by prefix — `ru` is Rust, `ty` is TypeScript
+ *   4. the label by substring — `script` reaches TypeScript and JavaScript
+ *   5. the extension by substring — the long tail
+ *
+ * Case-insensitive throughout, because the labels are capitalised and the extensions are not,
+ * and nobody types `SQL` looking for `.sql`.
+ *
+ * # Why here and not in the overlay
+ *
+ * The same argument [`SCRATCH_TYPES`] makes above: this file is the thing the picker must not
+ * disagree with, and a filter beside the list it filters cannot drift from it. It is also what
+ * makes the rule *drivable* — `check-editor.mjs` already requires the compiled `languages.js`,
+ * so this needs no new plumbing to be tested, where a predicate inside the component would have
+ * needed a DOM.
+ *
+ * An empty query is every row, in list order — which is what makes the popup's initial state
+ * the same list it has always shown.
+ */
+export function filterScratchTypes(query: string): readonly ScratchType[] {
+  const q = query.trim().toLowerCase()
+  if (q === '') return SCRATCH_TYPES
+  const tier = (type: ScratchType): number => {
+    const ext = type.ext.toLowerCase()
+    const label = type.label.toLowerCase()
+    if (ext === q) return 0
+    if (ext.startsWith(q)) return 1
+    if (label.startsWith(q)) return 2
+    if (label.includes(q)) return 3
+    if (ext.includes(q)) return 4
+    return 5
+  }
+  return SCRATCH_TYPES.map((type, index) => ({ type, index, tier: tier(type) }))
+    .filter((row) => row.tier < 5)
+    // Ties by list order, so the ordering is total and the top row for a given query never
+    // depends on `Array.prototype.sort`'s stability guarantees for a comparator that returned 0.
+    .sort((a, b) => a.tier - b.tier || a.index - b.index)
+    .map((row) => row.type)
+}
 
 /**
  * Which row the type picker opens on, given the file the user is looking at.

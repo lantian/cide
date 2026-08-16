@@ -113,6 +113,9 @@ fn parse(stdout: &[u8]) -> Result<Vec<Package>, DepsError> {
             // that is the directory the row opens, which the user can see.
             dir: package.manifest_path.parent().map(Path::to_path_buf),
             note: None,
+            // A crate from the lockfile graph, never the toolchain's own library — see `sdk.rs`
+            // for why `cargo metadata` can never report that one.
+            sdk: false,
         })
         .collect())
 }

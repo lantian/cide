@@ -62,7 +62,24 @@ impl Workspace {
     /// `serde_json`'s `preserve_order` feature was turned on for: without it a migrated
     /// document goes through a `serde_json::Value` whose object keys are sorted, and
     /// `projects` insertion order **is** the header tab order.
-    pub const CURRENT_SCHEMA: u32 = 2;
+    /// # 2 → 3: autosave
+    ///
+    /// Bumped when `EditorSettings::autosave` arrived, and again **not** because serde would
+    /// have failed without it: the field defaults to `true`, so a schema-2 document loads and
+    /// gets exactly the behaviour a fresh install gets.
+    ///
+    /// The bump is because of what the field *does*. Autosave writes the user's files on a
+    /// timer, and a defaulted field means every existing workspace's answer to "may cide do
+    /// that" is an inference from a constant in this build rather than a statement on the
+    /// user's disk. If the default is ever narrowed — and "off by default, opt in" is the
+    /// obvious first request for a feature like this — a defaulted field would silently turn
+    /// autosave *off* for everyone who had been relying on it, with nothing in their
+    /// `workspace.json` to explain it. `persist::v2_to_v3` therefore writes `true` into every
+    /// upgraded document, so a later change to the default is a change to new installs only.
+    ///
+    /// This is the same argument 1 → 2 makes about the proxy scope, applied to a setting whose
+    /// blast radius is the contents of files rather than an environment variable.
+    pub const CURRENT_SCHEMA: u32 = 3;
 }
 
 impl Default for Workspace {
@@ -130,6 +147,40 @@ pub struct Project {
     /// `tabs[0]` is **always** the pinned Claude console. Enforced in `cide-core`.
     pub tabs: Vec<Tab>,
     pub active_tab: TabId,
+    /// This project's tabs in most-recently-*active* order, `tab_mru[0]` being [`Self::active_tab`].
+    ///
+    /// # Why the focus history is domain state and `mru` (projects) is not
+    ///
+    /// It was in the webview until M15, derived per snapshot from `active_tab` and cached under
+    /// `localStorage`'s `cide.tabMru`; `ui/src/store/workspace.ts` carried a long note admitting
+    /// the argument for keeping it there was weak, because `active_tab` is already a workspace
+    /// field and a history behind it is less of an outlier than a history of *window* activations.
+    ///
+    /// What settled it is that **`close_tab` has to pick a successor and `close_tab` is here.**
+    /// A tab closing is the one moment the order is consulted rather than merely walked, and two
+    /// of its call sites have no webview to ask: `cide_app::ide`'s withdrawn-diff path closes a
+    /// tab straight from the MCP server's thread, and the quit ladder closes projects wholesale.
+    /// A successor computed in a renderer and passed down would therefore have to exist twice,
+    /// and the second copy — the one in Rust — would be the left-neighbour rule this replaces.
+    ///
+    /// The two objections the frontend note raised both evaporate for this field. *Broadcast
+    /// cost*: it moves only inside `activate_tab`, `open_tab` and `close_tab`, each of which
+    /// already bumps `rev` and broadcasts, so it costs no additional event. *Migration*:
+    /// `#[serde(default)]` reads every existing `workspace.json` as an empty order, which
+    /// `close_tab` handles by falling back to the left neighbour and which
+    /// `persist::load`'s repair fills in from `active_tab` on the way through — so
+    /// `CURRENT_SCHEMA` does not move.
+    ///
+    /// Holds **live tab ids only, without duplicates**, and `cide_core::workspace::validate`
+    /// enforces both. It may legitimately be *shorter* than `tabs`: a workspace restored from an
+    /// older build starts with one entry, and `reconcile` in `keys/switcher.ts` appends the rest
+    /// in strip order when the switcher walks it.
+    ///
+    /// The pinned console is in here like any other tab, deliberately — see
+    /// `cide_core::commands`'s note on `tab.switcher.next`: "from the file I was reading back to
+    /// the conversation about it" is the whole value of the gesture.
+    #[serde(default)]
+    pub tab_mru: Vec<TabId>,
     /// Panes torn out into their own windows.
     ///
     /// A detached pane cannot stay in its tab's `panes` map: the tree invariant is that the
@@ -317,8 +368,14 @@ pub enum TabKind {
         /// tab* means a diff the user opened on purpose and then walked away from gets
         /// silently re-pointed the moment they come back to it — the click that was supposed
         /// to be cheap eats the tab they were comparing against. *The most recently focused
-        /// one* needs a focus history that `Workspace` does not record and that nothing else
-        /// would ever read.
+        /// one* needed a focus history that `Workspace` did not record.
+        ///
+        /// M15 added one — [`Project::tab_mru`] — and this decision does **not** change with it,
+        /// which is worth saying rather than leaving for someone to "fix". The second candidate
+        /// lost on two counts and the missing history was only one: re-pointing whichever diff
+        /// the user last looked at is still the click eating a tab they opened on purpose, one
+        /// step less predictably than the active-tab rule because "last looked at" is invisible.
+        /// A marked slot is a fact the gesture set; an inferred one is a guess about intent.
         ///
         /// So the slot is marked instead of inferred, and the mark is set by the gesture
         /// that made the tab: a double-click (`tab_open_diff`) means "open this properly"

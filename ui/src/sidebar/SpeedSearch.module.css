@@ -1,0 +1,78 @@
+/*
+ * Speed search's two pieces of paint: the floating box that says what is being typed, and the
+ * highlight inside a matched row's name.
+ *
+ * One stylesheet for both sidebar trees, imported by each of them, because the two are the same
+ * feature and a user who learned what the accent-coloured substring means in the explorer must
+ * not have to learn it again one panel over. The trees' own stylesheets stay about rows.
+ */
+
+/*
+ * The readout, floating over the top-left of the tree — IDEA's placement.
+ *
+ * `position: absolute` against the panel, which is why `FileTree.module.css`'s `.panel` and
+ * `GitPanel.module.css`'s `.body` each grew a `position: relative`. It is emphatically **not** a
+ * child of the scroller: that element is `role="tree"`, whose children have to be tree items,
+ * and its viewport is as tall as the whole flattened repository — a box inside it would sit a
+ * hundred thousand rows down. Every existing strip in `FileTree` is a sibling for that reason.
+ */
+.bar {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  z-index: 3;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: calc(100% - 12px);
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  box-shadow: var(--shadow);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  /* A readout, never a target: a click that landed here instead of on the row underneath would
+     move the caret out of the tree and end the search the click was aimed at. */
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* What has been typed. The one thing on screen that says the tree is filtering rather than
+   ignoring the keyboard. */
+.query {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: pre;
+  color: var(--text-hi);
+}
+
+/* `3 of 17`, or one of the two sentences the dead ends need. In a windowed tree most matches
+   are never rendered, so this counter — not the highlight — is what makes the feature real. */
+.summary {
+  flex: none;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The matched substring inside a row's name.
+ *
+ * The search panel's treatment, verbatim (`SearchPanel.module.css`'s `.hitMatch`), so a
+ * highlighted substring means one thing across the application. `background: transparent`
+ * because `<mark>` has a yellow user-agent default that ignores the palette entirely — which
+ * looks acceptable in the light theme and unreadable in the dark one, i.e. exactly the class of
+ * bug that ships.
+ *
+ * 500 and not `var(--w-bold)`: this sits inside a row whose family is `--font-ui` (Inter, which
+ * has 400/500/600) in one tree and inside `.fileName` in the other, and one step of weight is
+ * all a five-character run needs to separate from the name around it.
+ */
+.match {
+  background: transparent;
+  color: var(--accent);
+  font-weight: 500;
+}

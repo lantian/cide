@@ -60,7 +60,9 @@
 }
 
 /*
- * Focus, when the bar is no longer there to carry it.
+ * Focus, when the bar is no longer there to carry it. **Terminal panes only** — see the
+ * `data-kind='editor'` exception immediately below, which is not a tweak to this rule but the
+ * user's reversal of half of it.
  *
  * The old ring was 1px of `--accent-dim`, with the bar's lit title doing most of the work.
  * On its own that ring is not a ring: light `--accent-dim` is `#f6d0bf` against a
@@ -87,6 +89,60 @@
   /* Above the body, below the cluster. Never a hit target. */
   z-index: 1;
   pointer-events: none;
+}
+
+/*
+ * An **editor** pane does not get the ring. Asked for by name, after living with it:
+ * the two accent pixels around a file the user is reading were noise, not information.
+ *
+ * # Why an editor is the one kind that can afford to lose it
+ *
+ * The ring answers "where do my keystrokes go?", and that question is only hard when the
+ * answer is invisible. A Claude or shell pane is a terminal: its cursor blinks in both
+ * states (xterm draws a hollow block when it is not focused, and at a glance a hollow block
+ * and a filled one are the same block), several of them sit side by side in one tab, and
+ * nothing else on screen says which one a keystroke reaches. An editor answers it itself —
+ * CodeMirror hides its cursor entirely when the surface is blurred and draws its active-line
+ * highlight only while focused — and a file tab is one pane in a tab of its own, so there is
+ * no sibling to be confused with in the first place.
+ *
+ * # This removes a *decoration*, and must not remove the state behind it
+ *
+ * `focused` still arrives from `tree.focused` for every kind, `data-focused` on the frame
+ * still reports it, and the `onFocusCapture` / `onPointerDownCapture` handlers that *set* it
+ * are untouched. That matters more than the pixels: `keys/context.ts` derives `paneFocused`,
+ * `editorFocused` and `fileTabActive` from the same value, and those clauses gate `file.save`,
+ * the find bar, the outline, Find Usages and `pane.navigate.*`. `editor/revealPane.ts` says in
+ * as many words that the ring and the key gate must not disagree — and the way they must not
+ * disagree is that the *gate* keeps working, not that the ring keeps being drawn.
+ *
+ * # `content: none`, not `display: none`
+ *
+ * A `::after` declaring no content generates no box at all, so no later edit to `inset`,
+ * `border` or `z-index` in the rule above can resurrect a half-drawn ring here. `display:
+ * none` would leave the box in the cascade for a future `display: block` to bring back.
+ *
+ * A selector rather than withholding `styles.frameFocused` in `PaneTitleBar.tsx`: the class is
+ * a pure mirror of `focused`, and keeping it that way means the DOM still says which pane the
+ * domain considers focused — `paneAudit` reads the tree, but a human debugging with the
+ * inspector reads this.
+ *
+ * `data-kind='editor'` only. A `diff` pane keeps its ring: it is CodeMirror too, but it is
+ * *answerable* — Reject / Accept as proposed / Accept, on a turn a `claude` may be blocked on
+ * — and it is routinely opened beside other panes rather than alone in its tab.
+ *
+ * These two selectors outrank `.frame[data-awaiting='true']` on specificity (0,3,1 against
+ * 0,2,1), which would matter if an editor could ever be awaiting. It cannot: `awaiting` is
+ * derived from the pane's *session*, and an editor pane is built with `session: None` and
+ * never binds one. Left as a note rather than defended with a `:not()`, because a `:not()`
+ * here is exactly what the awaiting rule's own comment forbids.
+ */
+.frame[data-kind='editor'].frameFocused {
+  border-color: var(--border);
+}
+
+.frame[data-kind='editor'].frameFocused::after {
+  content: none;
 }
 
 /*

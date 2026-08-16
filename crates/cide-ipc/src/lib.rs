@@ -45,7 +45,7 @@ pub mod search;
 
 pub use fs::{
     FsChange, FsStatus, NO_ROOT, PasteChoice, PasteCollision, PasteDecision, PasteMode,
-    PastedEntry, TreeRow, TreeRowKind, WatchBackend, WatchStatus,
+    PastedEntry, TreeMatch, TreeMatches, TreeRow, TreeRowKind, WatchBackend, WatchStatus,
 };
 pub use search::{PickerFrame, PickerItem, PickerRow};
 // M11: the content search's own wire types. Same module, different job — see the section
@@ -508,4 +508,124 @@ pub struct FileDoc {
     /// failure — but it catches the common `chmod -w` case early rather than letting the
     /// user type for ten minutes into something that will not save.
     pub writable: bool,
+    /// What the file was when this buffer was read. See [`FileStamp`].
+    ///
+    /// `None` when the metadata could not be read as a stamp — a filesystem with no mtime, a
+    /// platform that reports one before the epoch. A `None` here means the precondition below
+    /// simply cannot be checked, and the write proceeds unconditionally: refusing to save
+    /// because a `stat` was unhelpful would be worse than the race it is guarding against.
+    pub stamp: Option<FileStamp>,
+}
+
+/// `u64` nanoseconds as a decimal string on the wire. See [`FileStamp::mtime_nanos`].
+mod nanos_as_string {
+    pub fn serialize<S: serde::Serializer>(value: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        use serde::Deserialize as _;
+        let text = String::deserialize(d)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A cheap "is this still the file I read" token: modification time and length.
+///
+/// # Why autosave needed this and Ctrl+S did not
+///
+/// `EditorPane` raises its conflict bar from `cide://session-tool`, which arrives as a Claude
+/// Code tool call completes. That is the fast path and it is deliberately not the whole story:
+/// a `sed -i`, a `cargo fmt` or a `git checkout` in a shell pane goes through no tool and raises
+/// nothing. Before autosave, clobbering such a change took a deliberate Ctrl+S. With
+/// autosave-on-blur it takes *switching to the terminal, running `cargo fmt`, and clicking back*
+/// — three things a person does without deciding anything.
+///
+/// So the buffer carries what the file was when it was read, and hands it back on the write. A
+/// mismatch is refused with [`crate::FileWriteRefusal::Changed`], which `EditorPane` turns into
+/// the same conflict bar the tool path raises. An explicit Ctrl+S passes no token and forces,
+/// because that is the user deciding.
+///
+/// # Why not subscribe the editor to `cide://fs-changed`
+///
+/// Because our own write emits one. A watcher subscription needs a self-write suppression
+/// window, and a suppression window is a race with a timer in it — precisely the shape that
+/// ships broken. A precondition compared inside the same `write` call has no window at all.
+///
+/// Mtime **and** length, not mtime alone: coarse-grained filesystems and fast tools can produce
+/// two writes inside one mtime tick, and the length is free (`metadata` already has it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileStamp {
+    /// Nanoseconds since the epoch. A `u64`, which runs out in the year 2554.
+    ///
+    /// **Carried as a decimal string, because it does not fit in a JavaScript number.** The
+    /// comment here used to claim it was "far inside JavaScript's exact-integer range", and that
+    /// arithmetic was simply wrong: nanoseconds since the epoch is around 1.79e18 today, while
+    /// `Number.MAX_SAFE_INTEGER` is 9.007e15 — about two hundred times smaller. The reasoning
+    /// held for seconds, or even milliseconds, and was carried over to a unit it is false for.
+    ///
+    /// The consequence was total rather than marginal. Tauri's transport is JSON in both
+    /// directions, so the stamp handed to the webview was silently rounded to a multiple of
+    /// 256 ns, and the token the webview passed back therefore never equalled the file's real
+    /// stamp. `write_if_unchanged` refused **every** autosave on any filesystem with
+    /// nanosecond mtimes — ext4, btrfs, xfs — and the refusal is indistinguishable from a real
+    /// conflict, so the user was shown "this file changed on disk" about a file nothing had
+    /// touched, on a timer, for ever.
+    ///
+    /// A string round-trips exactly and stays opaque: the frontend only ever hands it back.
+    /// Reducing the precision instead would have made the check *miss* a real edit inside the
+    /// rounding window, which is the failure this stamp exists to prevent.
+    #[serde(with = "nanos_as_string")]
+    #[ts(type = "string")]
+    pub mtime_nanos: u64,
+    #[ts(type = "number")]
+    pub len: u64,
+}
+
+#[cfg(test)]
+mod file_stamp_tests {
+    use super::FileStamp;
+
+    /// The stamp survives a JSON round trip **exactly**, at a real present-day value.
+    ///
+    /// This is the regression test for a total failure, not a rounding nicety. `mtime_nanos` was
+    /// declared to TypeScript as a `number`, on a comment claiming the value sat "far inside
+    /// JavaScript's exact-integer range". Nanoseconds since the epoch is ~1.79e18 and
+    /// `Number.MAX_SAFE_INTEGER` is 9.007e15, so every stamp that crossed the IPC boundary came
+    /// back rounded — and `write_if_unchanged`, which compares the returned token against the
+    /// file's real stamp, refused **every** autosave on ext4, btrfs and xfs while telling the user
+    /// their file had changed on disk.
+    ///
+    /// The literal is a genuine ext4 nanosecond mtime rather than a round number, because a value
+    /// ending in zeros is exactly the one that would survive the rounding and pass a broken
+    /// implementation.
+    #[test]
+    fn a_nanosecond_stamp_survives_the_wire_exactly() {
+        let stamp = FileStamp {
+            mtime_nanos: 1_786_998_123_456_789_123,
+            len: 4096,
+        };
+        let wire = serde_json::to_string(&stamp).expect("serialises");
+
+        // A string, and asserted as one: this is the property, not an implementation detail. A
+        // future "tidy" back to a bare integer is precisely the regression.
+        assert!(
+            wire.contains("\"1786998123456789123\""),
+            "the stamp travels as a decimal string, not a JSON number: {wire}"
+        );
+
+        let back: FileStamp = serde_json::from_str(&wire).expect("deserialises");
+        assert_eq!(back.mtime_nanos, stamp.mtime_nanos, "not one nanosecond lost");
+
+        // And the value really is past what a double can hold, so the test is testing something.
+        const JS_MAX_SAFE: u64 = 9_007_199_254_740_991;
+        assert!(stamp.mtime_nanos > JS_MAX_SAFE);
+        assert_ne!(
+            stamp.mtime_nanos as f64 as u64,
+            stamp.mtime_nanos,
+            "a double genuinely cannot hold this — if this ever passes, the premise has changed"
+        );
+    }
 }

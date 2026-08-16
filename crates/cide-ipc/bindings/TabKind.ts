@@ -15,8 +15,14 @@ export type TabKind = { "kind": "claudeHome" } | { "kind": "claudeFull", title: 
  * tab* means a diff the user opened on purpose and then walked away from gets
  * silently re-pointed the moment they come back to it — the click that was supposed
  * to be cheap eats the tab they were comparing against. *The most recently focused
- * one* needs a focus history that `Workspace` does not record and that nothing else
- * would ever read.
+ * one* needed a focus history that `Workspace` did not record.
+ *
+ * M15 added one — [`Project::tab_mru`] — and this decision does **not** change with it,
+ * which is worth saying rather than leaving for someone to "fix". The second candidate
+ * lost on two counts and the missing history was only one: re-pointing whichever diff
+ * the user last looked at is still the click eating a tab they opened on purpose, one
+ * step less predictably than the active-tab rule because "last looked at" is invisible.
+ * A marked slot is a fact the gesture set; an inferred one is a guess about intent.
  *
  * So the slot is marked instead of inferred, and the mark is set by the gesture
  * that made the tab: a double-click (`tab_open_diff`) means "open this properly"

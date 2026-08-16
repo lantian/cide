@@ -259,9 +259,9 @@ pub fn create(
         let _ = window.set_size(LogicalSize::new(width, height));
     }
 
-    // Every window, shell and detached alike: the thumb buttons have to be swallowed even in a
-    // window that has nothing to navigate, or the phantom left click described below survives
-    // in exactly the windows nobody thought to test.
+    // Every window, shell and detached alike: the thumb buttons have to be taken off wry even in
+    // a window that has nothing to navigate, or `window.history.back()` fires there — see
+    // `install_mouse_nav`, whose whole subject is the handler that runs before ours.
     install_mouse_nav(app, &window);
 
     Ok(window)
@@ -271,8 +271,10 @@ pub fn create(
 ///
 /// X11 delivers the thumb buttons as 8 and 9, and GTK3's Wayland backend produces the same
 /// numbers — `pointer_handle_button` in `gdk/wayland/gdkdevice-wayland.c` computes
-/// `button - BTN_LEFT + 1 + 3`, so `BTN_SIDE` is 8 and `BTN_EXTRA` is 9. The same values on
-/// both backends is what keeps this independent of ADR 0006's graphics ladder.
+/// `button - BTN_LEFT + 5` for anything above `BTN_MIDDLE`, so `BTN_SIDE` (0x113) is 8 and
+/// `BTN_EXTRA` (0x114) is 9. The same values on both backends is what keeps this independent of
+/// ADR 0006's graphics ladder. (This comment previously quoted the formula as `- BTN_LEFT + 1 +
+/// 3`, which yields 7 for `BTN_SIDE`; the constants were right and the arithmetic was not.)
 #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -290,28 +292,122 @@ const GDK_BUTTON_BACK: u32 = 8;
 ))]
 const GDK_BUTTON_FORWARD: u32 = 9;
 
+/// What one GDK event that reached the webview means for mouse navigation.
+///
+/// A value rather than three branches inside the signal handler, and that split is the whole
+/// reason this feature is testable at all: the previous version made every decision inside a
+/// closure GTK owns, where no test in this workspace can reach it, and it shipped broken for a
+/// milestone. See [`nav_action`].
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavAction {
+    /// Not ours. GTK carries on and the web process sees the event exactly as before.
+    Ignore,
+    /// Ours, and it is the press that means something: swallow it and send `button`.
+    Emit(&'static str),
+    /// Ours, but not a press to act on. Swallow it and say nothing.
+    Swallow,
+}
+
+/// The rule, as a pure function of the two things GDK tells us about an event.
+///
+/// # Why the double and triple presses are swallowed but not acted on
+///
+/// GDK emits `ButtonPress`, `DoubleButtonPress`, `ButtonPress`, `TripleButtonPress` for a triple
+/// press, so treating every press-shaped event as a step would walk three history entries for two
+/// physical clicks. WebKit peeks ahead for the same reason (`WebKitWebViewBase.cpp`). They still
+/// have to be swallowed: an unhandled `DoubleButtonPress` on button 8 is one more event for wry's
+/// shim (below) to turn into a `window.history.back()`.
+///
+/// # Why the release is swallowed too
+///
+/// A release with no matching press leaves WebKit's event handler believing a drag is in
+/// progress — which is how a swallowed press turns into a selection that will not let go.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn nav_action(kind: gtk::gdk::EventType, button: Option<u32>) -> NavAction {
+    use gtk::gdk::EventType;
+
+    let Some(name) = button.and_then(nav_button) else {
+        return NavAction::Ignore;
+    };
+    match kind {
+        EventType::ButtonPress => NavAction::Emit(name),
+        EventType::DoubleButtonPress | EventType::TripleButtonPress | EventType::ButtonRelease => {
+            NavAction::Swallow
+        }
+        // `gdk_event_get_button` answers `None` for every other type, so this arm is defensive
+        // rather than reachable — but `EventType` is `#[non_exhaustive]` and "a new GDK event
+        // type is silently claimed as a thumb press" is not a failure worth leaving open.
+        _ => NavAction::Ignore,
+    }
+}
+
 /// Route the mouse's thumb buttons into the key gate, and stop them reaching the web process.
 ///
-/// # Why this is in GTK and not in JavaScript
+/// # Why this is in GTK: wry claims buttons 8 and 9 before the DOM ever hears about them
 ///
-/// It cannot be in JavaScript. WebKitGTK's `buttonForEvent` maps GDK buttons 1, 2 and 3 and
-/// leaves everything else at `WebMouseEventButton::None`, and `MouseEvent`'s constructor turns
-/// `None` into `Left` — so both thumb buttons arrive in the DOM as an ordinary `button === 0`
-/// press, indistinguishable from each other and from a real click. Back and Forward cannot be
-/// told apart there at all.
+/// This is **not** the reason that stood here until M15, and the wrong reason is what made the
+/// feature dead on arrival for a whole milestone, so the true one is worth stating in full.
 ///
-/// That also means there is a **phantom left click today, before any of this**: a thumb press
-/// over terminal output already reaches `pathLinks.ts` (Ctrl+thumb-press opens the file under
-/// the pointer), over a buffer it already fires Go to definition, and a plain press starts a
-/// selection. Returning `Propagation::Stop` below is what removes it.
+/// `wry-0.55.1/src/webkitgtk/synthetic_mouse_events.rs` connects its own `button-press-event`
+/// and `button-release-event` handlers to the WebKitWebView, from `attach_handlers`
+/// (`webkitgtk/mod.rs:463`) inside `create_webview` — i.e. **before `WebviewWindowBuilder::build`
+/// returns**. For buttons 8 and 9 it returns `Propagation::Stop` and instead
+/// `run_javascript`s a synthetic DOM `mousedown`/`mouseup` with `button: 3` / `button: 4` at
+/// `document.elementFromPoint()`, then, if nothing called `preventDefault`, runs
+/// `window.history.back()` / `.forward()`. In a single-entry SPA session history that is a no-op,
+/// which is precisely the symptom: *the thumb buttons do nothing*.
+///
+/// GTK3's `button-press-event` uses the `true-handled` accumulator, so the **first** handler
+/// returning `TRUE` ends the emission. wry connects during `build()`; [`install_mouse_nav`] runs
+/// after it and additionally defers itself onto the GTK loop with `run_on_main_thread`. A
+/// `connect_button_press_event` here is therefore always second, and never ran. Measured against
+/// the real GTK 3 on the development machine:
+///
+/// ```text
+/// two button-press-event handlers, first returns True  -> ['A(first, True)']
+/// an `event` handler connected SECOND, returns False   -> ['cide-event', 'wry-press(True)']
+/// an `event` handler connected SECOND, returns True    -> ['cide-event']
+/// ```
+///
+/// So the handler goes on the **generic `event` signal** instead. `gtk_widget_event_internal`
+/// emits `event` first and only emits `button-press-event` if that returned `FALSE`, whatever
+/// order anything was connected in. Returning `Propagation::Stop` there means wry's handler never
+/// runs, no synthetic DOM event is injected, and no `history.back()` fires.
+///
+/// The cost of the generic signal is that it carries motion too, which is why [`nav_action`] is a
+/// single cheap function: `gdk_event_get_button` is one C call that switches on the event type and
+/// answers `FALSE` for everything that is not a button, so a drag pays one call per motion event
+/// and nothing else.
+///
+/// # What is *not* true, and was written here before
+///
+/// It is not the case that both thumb buttons reach the DOM as `button === 0`. WebKitGTK's
+/// `buttonForEvent` would indeed flatten them, but wry intercepts long before WebKit's event
+/// factory ever sees the press and synthesizes `button: 3` / `button: 4`. There was consequently
+/// never a "phantom left click": `pathLinks.ts`'s gate tests `ev.button !== 0` and would have
+/// rejected a synthetic 3 or 4 anyway. A DOM-only implementation was in fact possible — reading
+/// wry's synthetic events — and it lost because it inherits wry's `elementFromPoint` dispatch and
+/// would die silently the day wry drops the shim, which is the failure mode this whole batch is
+/// about.
 ///
 /// # Why the handler goes on the webview widget rather than the toplevel
 ///
 /// `webkitWebViewBaseButtonPressEvent` has no button filter and returns `GDK_EVENT_STOP` for
 /// every press, so the event never propagates up to the GTK window — a handler on
-/// `gtk_window()` would never see one. Connecting to the WebKitWebView widget itself works
-/// because GTK3 declares `button-press-event` `G_SIGNAL_RUN_LAST`: a normally-connected handler
-/// runs *before* the class closure, so stopping here means the web process is never told.
+/// `gtk_window()` would never see one.
 ///
 /// # Not `with_webview`
 ///
@@ -348,55 +444,49 @@ fn install_mouse_nav(app: &AppHandle, window: &WebviewWindow) {
         // appear" is a weaker thing to read in a log than "it installed".
         tracing::debug!(window = %label, "mouse back/forward handler installed");
 
+        // Stated rather than assumed. `WebKitWebViewBase`'s own realize already asks for both,
+        // and wry adds `BUTTON_PRESS_MASK` on top — but "the events arrive because a dependency
+        // happens to want them" is exactly the reasoning that produced the bug above, and
+        // `gtk_widget_add_events` on a realized widget merges into the GdkWindow's mask.
+        webview.add_events(
+            gtk::gdk::EventMask::BUTTON_PRESS_MASK | gtk::gdk::EventMask::BUTTON_RELEASE_MASK,
+        );
+
         let probe = std::env::var_os("CIDE_INPUT_PROBE").is_some();
         let press_app = handle.clone();
         let press_label = label.clone();
-        webview.connect_button_press_event(move |_, event| {
+        webview.connect_event(move |_, event| {
+            let kind = event.event_type();
             let button = event.button();
-            if probe {
+            if probe && button.is_some() {
                 tracing::info!(
-                    button,
-                    event_type = ?event.event_type(),
-                    "CIDE_INPUT_PROBE: gdk button press"
+                    ?button,
+                    event_type = ?kind,
+                    "CIDE_INPUT_PROBE: gdk button event"
                 );
             }
-            let Some(name) = nav_button(button) else {
-                return gtk::glib::Propagation::Proceed;
-            };
-            /*
-             * Double and triple presses are swallowed and *not* acted on.
-             *
-             * GDK emits `ButtonPress`, `2ButtonPress`, `ButtonPress`, `3ButtonPress` for a
-             * triple press, so treating every press event as a step would walk three entries for
-             * two physical clicks. WebKit peeks ahead for the same reason
-             * (`WebKitWebViewBase.cpp`). Swallowing them is still required: an unhandled
-             * `2ButtonPress` would reach the web process as yet another phantom left click.
-             */
-            if event.event_type() == gtk::gdk::EventType::ButtonPress {
-                let state = event.state();
-                emit::mouse_nav(
-                    &press_app,
-                    &press_label,
-                    name,
-                    (
-                        state.contains(gtk::gdk::ModifierType::CONTROL_MASK),
-                        state.contains(gtk::gdk::ModifierType::MOD1_MASK),
-                        state.contains(gtk::gdk::ModifierType::SHIFT_MASK),
-                        state.contains(gtk::gdk::ModifierType::SUPER_MASK),
-                    ),
-                );
+            match nav_action(kind, button) {
+                NavAction::Ignore => gtk::glib::Propagation::Proceed,
+                NavAction::Swallow => gtk::glib::Propagation::Stop,
+                NavAction::Emit(name) => {
+                    // `state()` is `None` on an event GDK carries no modifier field for, which
+                    // cannot happen for a button event — but the default is "no modifiers held",
+                    // which is the reading that makes an unmodified thumb press still navigate.
+                    let state = event.state().unwrap_or_else(gtk::gdk::ModifierType::empty);
+                    emit::mouse_nav(
+                        &press_app,
+                        &press_label,
+                        name,
+                        (
+                            state.contains(gtk::gdk::ModifierType::CONTROL_MASK),
+                            state.contains(gtk::gdk::ModifierType::MOD1_MASK),
+                            state.contains(gtk::gdk::ModifierType::SHIFT_MASK),
+                            state.contains(gtk::gdk::ModifierType::SUPER_MASK),
+                        ),
+                    );
+                    gtk::glib::Propagation::Stop
+                }
             }
-            gtk::glib::Propagation::Stop
-        });
-
-        // The release too. A mouseup with no matching mousedown leaves WebKit's event handler
-        // believing a drag is in progress — which is how a swallowed press turns into a
-        // selection that will not let go.
-        webview.connect_button_release_event(move |_, event| {
-            if nav_button(event.button()).is_none() {
-                return gtk::glib::Propagation::Proceed;
-            }
-            gtk::glib::Propagation::Stop
         });
     });
     if let Err(error) = queued {
@@ -1134,6 +1224,222 @@ mod tests {
             "retitle must take its hint from windows::announce, which is the one place that \
              knows both facts. A bare `count > 0` asks a focused window to flash, the window \
              manager drops the request, and nothing ever asks again"
+        );
+    }
+
+    // --- mouse back and forward -----------------------------------------------------------
+
+    /// Rust source with its comments removed, so a source assertion cannot be satisfied by prose.
+    ///
+    /// This project has been bitten by the other kind: `check-*.mjs` greps that matched a string
+    /// inside the very comment explaining why the feature exists, so deleting the feature left
+    /// the gate green. Here the hazard is the mirror image and just as real — the assertion below
+    /// is a *negative* one, and `install_mouse_nav`'s own documentation has to name
+    /// `connect_button_press_event` in order to explain what wry does with it. Without this the
+    /// only way to keep the test green would be to stop writing the explanation down.
+    ///
+    /// Deliberately small: block comments, line comments, and enough string-literal awareness
+    /// that a `"//"` inside a string does not eat the rest of the line. It is not a Rust lexer
+    /// and does not need to be — it runs over one file in this crate.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    fn without_comments(source: &str) -> String {
+        let bytes: Vec<char> = source.chars().collect();
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0;
+        let mut in_string = false;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i];
+            let next = bytes.get(i + 1).copied();
+            if depth > 0 {
+                if c == '*' && next == Some('/') {
+                    depth -= 1;
+                    i += 2;
+                    continue;
+                }
+                if c == '/' && next == Some('*') {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_string {
+                if c == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = false;
+                }
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_string = true;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if c == '/' && next == Some('/') {
+                while i < bytes.len() && bytes[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                depth = 1;
+                i += 2;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// The gate that would have caught the shipped-and-dead mouse buttons.
+    ///
+    /// Nothing in this repository asserted that a GDK button ever reaches a `Decision`.
+    /// `check:keys` sweeps `gate.mouseHandler('mouseback', …)` — one function call *downstream*
+    /// of the entire broken segment; `keymap.rs` proves the binding resolves; `contract-check`
+    /// records the event's name. Every gate tested one link of a five-link chain and the broken
+    /// link was the one owned by a dependency, so no behavioural test could have found it: the
+    /// bug is *which GTK signal we connect to*, and the answer is only wrong in the presence of
+    /// wry's handler on the same widget.
+    ///
+    /// A structural assertion is therefore the honest gate, and it is a strong one, because the
+    /// failure message carries the whole diagnosis to whoever trips it.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    #[test]
+    fn the_thumb_buttons_are_taken_on_a_signal_wry_has_not_already_claimed() {
+        // Everything above `mod tests` — the module below has to *name* the thing it forbids,
+        // both in the assertions and in their failure messages, and a negative source assertion
+        // that includes its own text can only ever fail. Caught by writing it the other way
+        // round first, which is recorded here because the mistake is not obvious until it fires.
+        let source = include_str!("windows.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("windows.rs still has a #[cfg(test)] module at the end");
+        let source = without_comments(source);
+
+        assert!(
+            !source.contains("connect_button_press_event")
+                && !source.contains("connect_button_release_event"),
+            "wry connects its OWN button-press-event/button-release-event handlers to the \
+             WebKitWebView inside `WebviewWindowBuilder::build()` (wry-0.55.1 \
+             src/webkitgtk/synthetic_mouse_events.rs), returns Propagation::Stop for buttons 8 \
+             and 9, and spends them on window.history.back(). GTK3's button-press-event uses the \
+             true-handled accumulator, so the first handler to return TRUE ends the emission — \
+             and anything cide connects after build() is second. Connecting there means this \
+             handler NEVER RUNS and the thumb buttons silently do nothing, which is exactly how \
+             this shipped for a milestone. Use WidgetExt::connect_event: GTK emits the generic \
+             `event` signal before any specific one, whatever the connection order."
+        );
+        assert!(
+            source.contains("webview.connect_event(move |_, event|"),
+            "the thumb buttons must be claimed on the generic `event` signal, on the webview \
+             widget — that is the only place in this process that runs before wry's handler"
+        );
+        assert!(
+            source.contains("NavAction::Emit(name) =>") && source.contains("emit::mouse_nav("),
+            "and a press that resolves to a nav button must still reach emit::mouse_nav — a \
+             handler that swallows the event and sends nothing is a thumb button that does \
+             nothing, told apart from today's bug only by reading the source"
+        );
+    }
+
+    /// The rules, driven directly. These are cheap and they are also the half that a rewrite of
+    /// the signal plumbing would be most likely to get subtly wrong.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    #[test]
+    fn only_the_first_press_of_a_thumb_button_walks_the_history() {
+        use super::{NavAction, nav_action};
+        use gtk::gdk::EventType;
+
+        assert_eq!(
+            nav_action(EventType::ButtonPress, Some(8)),
+            NavAction::Emit("mouseback")
+        );
+        assert_eq!(
+            nav_action(EventType::ButtonPress, Some(9)),
+            NavAction::Emit("mouseforward")
+        );
+
+        // GDK sends ButtonPress, DoubleButtonPress, ButtonPress, TripleButtonPress for a triple
+        // press. Acting on each would walk three entries for two physical clicks; letting them
+        // through would hand wry three more chances to run history.back().
+        for kind in [
+            EventType::DoubleButtonPress,
+            EventType::TripleButtonPress,
+            EventType::ButtonRelease,
+        ] {
+            assert_eq!(
+                nav_action(kind, Some(8)),
+                NavAction::Swallow,
+                "{kind:?} on a thumb button is swallowed and not acted on"
+            );
+        }
+
+        // Everything else keeps propagating, and this is the load-bearing negative: the handler
+        // is on the *generic* event signal, so an over-eager Stop here would swallow every left
+        // click, every motion event and every scroll in the whole application.
+        for button in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(10)] {
+            assert_eq!(
+                nav_action(EventType::ButtonPress, button),
+                NavAction::Ignore,
+                "button {button:?} is not cide's"
+            );
+        }
+        assert_eq!(nav_action(EventType::MotionNotify, None), NavAction::Ignore);
+        assert_eq!(nav_action(EventType::Scroll, None), NavAction::Ignore);
+        assert_eq!(nav_action(EventType::KeyPress, None), NavAction::Ignore);
+    }
+
+    /// The other half of the report: a refusal the user cannot see is a dead gesture.
+    ///
+    /// `jump.ts` writes a sentence for Back-with-nothing-behind-it specifically so that "refused"
+    /// can be told from "wired to nothing". Routing it through `unmet` put it in `diag.log`, so
+    /// on screen the two were identical — which is why the buttons being *completely dead* went
+    /// unnoticed for a milestone by everyone including the person who wrote the sentence.
+    #[test]
+    fn a_refused_navigation_is_shown_to_the_user_and_not_only_logged() {
+        let dispatch = include_str!("../../../ui/src/keys/dispatch.ts");
+        let arm = dispatch
+            .split("case 'navigate.back':")
+            .nth(1)
+            .and_then(|rest| rest.split("case 'navigate.nextMember':").next())
+            .expect("dispatch.ts still has a navigate.back arm");
+        assert!(
+            arm.contains("notify(refusal"),
+            "the navigate.back/forward arm must surface jump.ts's refusal with notify(...). \
+             `unmet` writes one line through diag.log and nothing else, so a Back with an empty \
+             history looks exactly like a Back wired to nothing"
+        );
+        assert!(
+            !arm.contains("unmet(command, refusal)"),
+            "and it must not ALSO go through unmet — two reports for one refusal, one of them \
+             invisible, is how the visible half gets deleted later as a duplicate"
         );
     }
 }

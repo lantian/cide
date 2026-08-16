@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use cide_ipc::{FsChange, TreeRow, TreeRowKind};
+use cide_ipc::{FsChange, TreeMatch, TreeRow, TreeRowKind};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::filter::Filter;
@@ -204,6 +204,54 @@ impl Index {
             }
         }
         out
+    }
+
+    /// Which visible rows' names match a speed-search query, in walk order.
+    ///
+    /// The same `seek`/`advance` walk [`Index::rows`] uses, and that is the whole cost argument:
+    /// `rows` builds a `TreeRow` per row, which is a `path_of` — `O(depth)` allocations —
+    /// plus a name clone, so asking it for a 100k-row window to filter it in the frontend would
+    /// allocate several megabytes per keystroke. This tests `node.name` in place and allocates
+    /// nothing but the result vector. Measured shape: one `str` scan per visible row.
+    ///
+    /// **Only what is expanded is searched**, which falls out of `seek`/`advance` descending
+    /// exclusively into `expanded` nodes and is also the behaviour that is wanted. Expanding to
+    /// reveal a match would re-flatten the tree and renumber every index in the list being
+    /// built, so each keystroke would invalidate its own results; and there is no capability
+    /// gap, because Ctrl+P already searches the whole repository including collapsed
+    /// directories. The overlay says `no match in the expanded tree` rather than `no match` so
+    /// that a user who knows the file exists does not read a true answer as a broken feature.
+    ///
+    /// The second half of the pair is whether the list was cut short — see
+    /// [`crate::speed::push_match`], which reports truncation only when something was actually
+    /// lost.
+    pub fn match_rows(
+        &self,
+        needle: &crate::speed::Needle,
+        limit: usize,
+    ) -> (Vec<TreeMatch>, bool) {
+        let Some(mut stack) = self.seek(0) else {
+            return (Vec::new(), false);
+        };
+        let mut out = Vec::new();
+        let mut row = 0u32;
+        loop {
+            let (container, i) = *stack.last().expect("seek leaves a non-empty stack");
+            let node = self.list(container)[i];
+            if crate::speed::push_match(
+                needle,
+                &self.nodes[node as usize].name,
+                row,
+                limit,
+                &mut out,
+            ) {
+                return (out, true);
+            }
+            row += 1;
+            if !self.advance(&mut stack, node) {
+                return (out, false);
+            }
+        }
     }
 
     /// Expand a directory. Returns the new total row count.
@@ -994,6 +1042,106 @@ mod tests {
             BuildOptions::default(),
             &|_: &[WalkItem]| {},
         )
+    }
+
+    /// Speed search's walk, against the walk that draws the rows.
+    ///
+    /// Every reported row index is read back through `rows()` and required to contain the
+    /// query — the *property*, rather than a hard-coded list of indices that would pass just as
+    /// happily against an off-by-one. And the whole point of the feature is the second half:
+    /// only what is **expanded** is searched, so a collapsed directory's contents are absent
+    /// and become present the moment it opens.
+    #[test]
+    fn a_speed_search_walks_the_visible_rows_and_only_the_visible_rows() {
+        let dir = scratch("index-speed");
+        tree(&dir);
+        let mut index = build(&dir);
+
+        let drawn = |index: &Index| -> Vec<String> {
+            index
+                .rows(0, index.count())
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        let hits = |index: &Index, query: &str| -> Vec<String> {
+            let needle = crate::speed::Needle::new(query).expect("non-empty");
+            let (matches, truncated) = index.match_rows(&needle, 100);
+            assert!(!truncated);
+            let names = drawn(index);
+            matches
+                .into_iter()
+                .map(|m| {
+                    let name = names[m.row as usize].clone();
+                    // The span has to describe the name the tree draws at that row, in the
+                    // units JavaScript will slice with.
+                    let units: Vec<u16> = name.encode_utf16().collect();
+                    let slice =
+                        String::from_utf16(&units[m.start as usize..m.end as usize]).expect("span");
+                    assert_eq!(
+                        slice.to_lowercase(),
+                        query.to_lowercase(),
+                        "span in {name:?}"
+                    );
+                    name
+                })
+                .collect()
+        };
+
+        // A single root is not drawn, so the top rows are its children: `.gitignore`,
+        // `Cargo.toml`, `src`. `src` is collapsed, so nothing under it is searchable yet.
+        assert_eq!(hits(&index, "rs"), Vec::<String>::new());
+        assert_eq!(hits(&index, "cargo"), vec!["Cargo.toml".to_string()]);
+
+        index.expand(&dir.join("src"));
+        // Now `src`'s children are rows. `deep` is still collapsed, so `mod.rs` is not.
+        assert_eq!(
+            hits(&index, "rs"),
+            vec!["lib.rs".to_string(), "main.rs".to_string()]
+        );
+
+        index.expand(&dir.join("src/deep"));
+        // Directories sort before files, so `deep/mod.rs` is drawn *above* its siblings — and
+        // the match list is in that same order, because match order is walk order and never a
+        // relevance ranking. Down therefore means "the next one down the list", which is the
+        // whole gesture.
+        assert_eq!(
+            hits(&index, "rs"),
+            vec![
+                "mod.rs".to_string(),
+                "lib.rs".to_string(),
+                "main.rs".to_string()
+            ]
+        );
+
+        // Nothing matches nothing, and that is not an error state.
+        assert_eq!(hits(&index, "zzzz"), Vec::<String>::new());
+    }
+
+    /// The cap, and what the flag on it means.
+    #[test]
+    fn the_match_limit_reports_that_it_cut_the_list_short() {
+        let dir = scratch("index-speed-limit");
+        tree(&dir);
+        let mut index = build(&dir);
+        index.expand(&dir.join("src"));
+        let needle = crate::speed::Needle::new("rs").expect("non-empty");
+        let (all, truncated) = index.match_rows(&needle, 100);
+        assert!(!truncated);
+        assert!(
+            all.len() >= 2,
+            "the fixture has several rows containing `rs`"
+        );
+
+        let (capped, truncated) = index.match_rows(&needle, 1);
+        assert_eq!(capped.len(), 1);
+        assert!(
+            truncated,
+            "a capped answer that does not say so reads as a complete one"
+        );
+        // And the rows that survive the cap are the first ones in walk order, which is what
+        // makes the counter's `1 of 1000` mean the top of the list rather than a random slice.
+        assert_eq!(capped[0], all[0]);
     }
 
     #[test]

@@ -35,6 +35,17 @@ import '@xterm/xterm/css/xterm.css'
 /** How many terminals may hold a WebGL context at once. */
 export const MAX_WEBGL = 5
 
+/**
+ * The version cide reports in its XTVERSION reply — see the handler in [`createTerminal`].
+ *
+ * A literal, because `@xterm/xterm` exports no version constant and importing its
+ * `package.json` would need a bundler resolution `check:paths` cannot reproduce. `check:paths`
+ * asserts it equals the pinned dependency instead, so the drift this literal invites is caught
+ * by the one gate that can see both numbers. It is a claim about what cide *is*; announcing a
+ * version cide does not run would be the same lie as announcing VS Code, only smaller.
+ */
+export const XTERM_VERSION = '6.0.0'
+
 export interface TerminalHandle {
   term: Terminal
   fit: FitAddon
@@ -341,6 +352,59 @@ export function createTerminal(kind: TerminalPaneKind): TerminalHandle {
     ev.preventDefault()
     term.input(bytes, true)
     return false
+  })
+
+  /*
+   * XTVERSION (`CSI > 0 q`), answered truthfully, because a program that asks it is asking
+   * whether it is talking to xterm.js — and cide is.
+   *
+   * This is the second half of M15's terminal-click report, and it fixes a hole cide's own
+   * click gate cannot reach. Claude Code claims ctrl+click **and alt+click** for its own
+   * hyperlink opener, gated on `(button & 24) !== 0` — Ctrl(16) or Alt(8) in the SGR mouse
+   * encoding — and for a `file:` target that opener forks
+   * `dbus-send … org.freedesktop.FileManager1.ShowItems`, which opens the desktop file manager
+   * on the containing directory. cide claims ctrl+click (`clickGate.ts`) and deliberately does
+   * not claim alt+click, because alt+click means something to the child; so without this line
+   * an alt+click in a Claude pane would still fork a file manager, and nothing in cide's source
+   * would say so.
+   *
+   * Claude Code already has a rule for exactly this situation. Read out of the shipped binary:
+   *
+   * ```js
+   * function tx(){ if(YA()?.isVscodeTerm) return true
+   *                if(process.env.TERM_PROGRAM==="vscode") return true
+   *                return qY().xtversionName?.startsWith("xterm.js") ?? false }
+   * ```
+   *
+   * and the click path is guarded on `!tx()`. It stands down for xterm.js-family hosts because
+   * they do their own ctrl+click — which is precisely the division of labour cide wants. cide
+   * failed the test only because `@xterm/xterm` 6.0.0 does not implement XTVERSION at all
+   * (verified: no `XTVERSION`, no `>|` anywhere in `lib/xterm.js`), so `xtversionName` stayed
+   * undefined and `tx()` was false.
+   *
+   * The reply shape is `DCS > | <name> ST`, which is what the CLI's own parser expects
+   * (`/^\x1bP>\|(.*?)(?:\x07|\x1b\\)$/`). `prefix: '>'` keeps this clear of DECSCUSR
+   * (`CSI Ps SP q`), which has an intermediate space and no prefix.
+   *
+   * **Not** `TERM_PROGRAM=vscode`, which was the tempting one-line alternative and is a lie:
+   * that variable moves half a dozen other Claude Code behaviours (OSC 52 clipboard
+   * workarounds, the modifier hint text, DECSTBM gating), and cide is not VS Code. Announcing
+   * `xterm.js(6.0.0)` is simply true. It has one other effect, and it is the wanted one:
+   * `tx()` also selects Claude Code's xterm.js wheel/drain profile (`useAdaptiveDrain`), which
+   * is the profile written for this renderer.
+   *
+   * `term.input(reply, false)` — `false` for `wasUserInput`, because this is not a keystroke:
+   * `true` would scroll the viewport to the bottom and clear the selection behind the user's
+   * back. The bytes leave through the same `onData` the pane already listens on.
+   */
+  term.parser.registerCsiHandler({ prefix: '>', final: 'q' }, (params) => {
+    // `CSI > 0 q` and `CSI > q` both mean XTVERSION; anything else with this prefix and final is
+    // not a request this knows how to answer, and must fall through rather than be swallowed.
+    const first = params[0]
+    const ps = Array.isArray(first) ? first[0] : first
+    if (ps !== undefined && ps !== 0) return false
+    term.input(`\x1bP>|xterm.js(${XTERM_VERSION})\x1b\\`, false)
+    return true
   })
 
   const handle: TerminalHandle = {

@@ -429,15 +429,87 @@ try {
       'those layers are scoped to the pane body instead of escaping over the frame',
   )
 
+  // --- the ring is withheld from editor panes, and only the *paint* is withheld ----------
+  //
+  // The user asked for the focus ring back off file editors after living with it: two accent
+  // pixels around the file you are reading are noise, and CodeMirror already says whether it
+  // holds the caret. It stays on `claude`, `shell` and `diff` panes, where several terminals
+  // share a tab and nothing else answers "which one am I typing into".
+  //
+  // This block exists because the rationale for *adding* the ring is still in
+  // `PaneTitleBar.module.css` a dozen lines above the exception — it has to be, the ring is
+  // still drawn for three kinds out of four — so the next reader of that paragraph is one
+  // deletion away from putting it back on editors without noticing. Both halves are pinned:
+  // the pseudo-element must generate no box at all, and the border must go back to `--border`
+  // rather than merely being left at `--accent` with the second pixel gone.
+  const focusedRule = /(^|\})\s*\.frameFocused \{([^}]*)\}/.exec(paneCss)?.[2] ?? ''
+  ok(
+    /border-color:\s*var\(--accent\)/.test(focusedRule),
+    'a focused pane still lights its border with the accent — the ring exists for the kinds ' +
+      'that kept it, and the editor exception below is meaningless without it',
+  )
+  const editorBorder = /\.frame\[data-kind='editor'\]\.frameFocused \{([^}]*)\}/.exec(paneCss)?.[1]
+  ok(
+    editorBorder !== undefined && /border-color:\s*var\(--border\)/.test(editorBorder),
+    "a focused editor pane's border stays the ordinary `--border`, so the frame does not " +
+      'change colour under the caret',
+  )
+  const editorRing = /\.frame\[data-kind='editor'\]\.frameFocused::after \{([^}]*)\}/.exec(paneCss)?.[1]
+  ok(
+    editorRing !== undefined && /content:\s*none/.test(editorRing),
+    "and its `::after` declares `content: none`, so the second accent pixel generates no box " +
+      'at all — `display: none` would leave one for a later edit to bring back',
+  )
+  // Specificity, not source order, is what makes those two win: the base rule is one class
+  // (0,1,0) and each override is two classes plus an attribute (0,3,0). Asserted because a
+  // future tidy that rewrote the override as a bare `.frameFocusedEditor` would still match
+  // both greps above and would then lose the cascade to `.frameFocused`.
+  for (const selector of [
+    ".frame[data-kind='editor'].frameFocused",
+    ".frame[data-kind='editor'].frameFocused::after",
+  ]) {
+    const classes = (selector.match(/\./g) ?? []).length
+    ok(
+      classes >= 2 && selector.includes("[data-kind='editor']"),
+      `${selector} outranks the \`.frameFocused\` rule it is overriding`,
+    )
+  }
+  //
+  // And the half that must NOT have moved. Removing the ring removed a decoration; the focus
+  // *state* behind it gates `file.save`, the find bar, the outline, Find Usages and
+  // `pane.navigate.*` through `keys/context.ts`, and `editor/revealPane.ts` is explicit that
+  // the two must not disagree. So the class is still applied from `focused` alone with no test
+  // on the kind — the withholding happens in CSS, where it cannot reach the domain — and the
+  // frame still publishes `data-focused`. Read from comment-stripped source, or the phrase
+  // "data-focused" in the paragraph explaining it would satisfy this on its own.
+  const paneTsx = readFileSync('src/layout/PaneTitleBar.tsx', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+  ok(
+    /className=\{focused \? `\$\{styles\.frame\} \$\{styles\.frameFocused\}` : styles\.frame\}/.test(
+      paneTsx,
+    ),
+    'the frame still carries `frameFocused` for every pane kind — a `pane.kind === ' +
+      "'editor'` test here would be the same pixels and a second source of truth about focus",
+  )
+  ok(
+    /data-focused=\{focused \? 'true' : 'false'\}/.test(paneTsx),
+    'and still publishes `data-focused`, which is the DOM view of `tree.focused` and the only ' +
+      'thing left saying which pane the domain thinks is focused',
+  )
+
   // --- every pane edge gets the same gutter, including the ones with no neighbour -------
   //
   // A splitter track is 6px, which is two 3px half-gutters back to back. At the edges of the
-  // tree there is no neighbour and so there was no half-gutter: the outermost pane's frame
-  // sat flush against the tab strip, the sidebar and the status bar. Invisible in the Claude
-  // tab, where the pane you are looking at usually has a neighbour — and the whole story in a
-  // **file tab**, which always opens as one pane in a tab of its own, so every edge is an
-  // outer edge and the accent focus ring was drawn immediately against the app's own 1px
-  // border on three sides with no ground between them.
+  // tree there is no neighbour and so there was no half-gutter: the outermost pane's frame sat
+  // flush against the tab strip, the sidebar and the status bar, and two 1px `--border` lines
+  // touching read as one 2px line belonging to neither box.
+  //
+  // This used to be justified by the editor's accent focus ring, which the block above has
+  // just removed. The padding survives it: the gutter is about the frame's *ordinary* border,
+  // which every pane of every kind carries in both focus states. The worst case is still the
+  // same one — a **file tab** always opens as a single pane in a tab of its own, so every edge
+  // is an outer edge and there is no interior gutter anywhere to set the scale by.
   //
   // Tied to `--w-splitter` rather than asserted as a literal, because the two numbers are one
   // decision: a splitter that stops being 6px leaves the edges out of step with the middle.
@@ -450,7 +522,7 @@ try {
     canvasPad,
     splitter / 2,
     'the tree canvas pads by half a splitter, so a pane against the window chrome shows the ' +
-      'same gutter as a pane against its neighbour and its focus ring reads as a ring',
+      'same gutter as a pane against its neighbour rather than merging into it',
   )
 
   if (failed === 0) console.log('rows layout: ok')

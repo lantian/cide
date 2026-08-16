@@ -30,6 +30,41 @@ roots: Array<ProjectRoot>,
  */
 tabs: Array<Tab>, activeTab: TabId, 
 /**
+ * This project's tabs in most-recently-*active* order, `tab_mru[0]` being [`Self::active_tab`].
+ *
+ * # Why the focus history is domain state and `mru` (projects) is not
+ *
+ * It was in the webview until M15, derived per snapshot from `active_tab` and cached under
+ * `localStorage`'s `cide.tabMru`; `ui/src/store/workspace.ts` carried a long note admitting
+ * the argument for keeping it there was weak, because `active_tab` is already a workspace
+ * field and a history behind it is less of an outlier than a history of *window* activations.
+ *
+ * What settled it is that **`close_tab` has to pick a successor and `close_tab` is here.**
+ * A tab closing is the one moment the order is consulted rather than merely walked, and two
+ * of its call sites have no webview to ask: `cide_app::ide`'s withdrawn-diff path closes a
+ * tab straight from the MCP server's thread, and the quit ladder closes projects wholesale.
+ * A successor computed in a renderer and passed down would therefore have to exist twice,
+ * and the second copy — the one in Rust — would be the left-neighbour rule this replaces.
+ *
+ * The two objections the frontend note raised both evaporate for this field. *Broadcast
+ * cost*: it moves only inside `activate_tab`, `open_tab` and `close_tab`, each of which
+ * already bumps `rev` and broadcasts, so it costs no additional event. *Migration*:
+ * `#[serde(default)]` reads every existing `workspace.json` as an empty order, which
+ * `close_tab` handles by falling back to the left neighbour and which
+ * `persist::load`'s repair fills in from `active_tab` on the way through — so
+ * `CURRENT_SCHEMA` does not move.
+ *
+ * Holds **live tab ids only, without duplicates**, and `cide_core::workspace::validate`
+ * enforces both. It may legitimately be *shorter* than `tabs`: a workspace restored from an
+ * older build starts with one entry, and `reconcile` in `keys/switcher.ts` appends the rest
+ * in strip order when the switcher walks it.
+ *
+ * The pinned console is in here like any other tab, deliberately — see
+ * `cide_core::commands`'s note on `tab.switcher.next`: "from the file I was reading back to
+ * the conversation about it" is the whole value of the gesture.
+ */
+tabMru: Array<TabId>, 
+/**
  * Panes torn out into their own windows.
  *
  * A detached pane cannot stay in its tab's `panes` map: the tree invariant is that the

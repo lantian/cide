@@ -22,22 +22,25 @@
  * The tree itself. One stretched cell, so the root node fills whatever is left over the
  * strip whether it is a leaf or a chain.
  *
- * # The 3px is the outer half of the gutter system, and it is what makes a focus ring legible
+ * # The 3px is the outer half of the gutter system
  *
  * A splitter track is 6px, which is really two 3px half-gutters back to back: each pane gives
  * up 3px to the space between it and its neighbour. At the *edges* of the tree there was no
  * neighbour and therefore no half-gutter, so the outermost pane's frame sat flush against the
  * app's own chrome — the tab strip's `border-bottom`, the sidebar's `border-right`, the status
- * bar's `border-top`, each a 1px `--border` line.
+ * bar's `border-top`, each a 1px `--border` line. Two 1px borders touching read as one 2px
+ * border belonging to neither box, and the pane stops looking like a thing sitting in the
+ * window and starts looking like part of the window.
  *
- * That is fine in the Claude tab, where the pane you are looking at usually has a neighbour and
- * the accent edge is read against the gutter between them. It is not fine in a **file tab**,
- * which always opens as one pane in a tab of its own (`cmd/file.rs::open_file_tab` builds a
- * tree with a single `Editor` pane), so every edge of that pane is an outer edge: the 2px accent
- * ring was drawn immediately against a 1px border line on three sides, with no ground between
- * them and no unfocused sibling to be brighter than. The ring was there — `PaneTitleBar.tsx`
- * sets `focused` from `tree.focused`, which is correct for editor panes and always has been —
- * and it read as part of the window frame rather than as a mark on the pane.
+ * **This paragraph used to justify the padding by the editor's accent focus ring**, which is
+ * gone: `PaneTitleBar.module.css` now withholds it from `data-kind='editor'` at the user's
+ * request. The padding is not gone with it, and reinstating either from the other's absence is
+ * the mistake this note exists to head off. The gutter is about the frame's *ordinary*
+ * `--border`, which every pane of every kind carries in both focus states, and the case it
+ * fixes is still live and still worst in the same tab: a **file tab** always opens as one pane
+ * in a tab of its own (`cmd/file.rs::open_file_tab` builds a tree with a single `Editor` pane),
+ * so every one of its edges is an outer edge and there is no interior gutter anywhere to set
+ * the scale by. A Claude tab with one pane in it is the same picture.
  *
  * Padding on the canvas rather than a margin on the leaf, because the leaf's box is a grid
  * *track* and a margin there would come out of the `fr` fractions the splitters commit — the

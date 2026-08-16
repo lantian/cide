@@ -172,8 +172,19 @@ export function SymbolPicker({ project, onDismiss, onGoTo }: SymbolPickerProps) 
               >
                 <span className={`${styles.badge} ${styles[badge.tone] ?? ''}`}>{badge.label}</span>
                 <span className={styles.name}>{row.name}</span>
-                {row.container !== null && <span className={styles.path}>{row.container}</span>}
-                <span className={styles.path}>
+                {/*
+                  * The container and the location, told apart.
+                  *
+                  * They used to be two adjacent `.path` spans — both `flex: 1`, both mono, both
+                  * 11px, both `--dim` — which read as one run of grey text with no boundary in
+                  * it. Same class of defect as the usage heading two files over, found in the
+                  * same pass and fixed the same way: the one that identifies the row keeps the
+                  * width, and the one that locates it shrinks first and dims further.
+                  */}
+                {row.container !== null && (
+                  <span className={styles.container}>{row.container}</span>
+                )}
+                <span className={styles.where}>
                   {row.rel}:{row.line}
                 </span>
               </div>

@@ -67,6 +67,7 @@ import {
   diag,
   git as gitApi,
   settings as settingsApi,
+  tab as tabApi,
   type Axis,
   type Direction,
   type PaneId,
@@ -329,6 +330,44 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           return unmet(command, 'the project console is pinned and cannot be closed')
         }
         return void ws.closeTab(on.project, on.tab)
+      }
+
+      /*
+       * Ctrl+Shift+T — put back the last tab this project closed, and the one before that, and
+       * the one before that. It took the chord from `theme.toggle`, which is palette-only now.
+       *
+       * The stack is Rust's (`cide_app::closed_tabs`), so this arm is three decisions and no
+       * policy: which project to pop for, what to do with nothing, and where the caret ends up.
+       *
+       * **Which project.** `activeProjectOf`, this window's — never a global pop. Ctrl+Shift+T
+       * in a window showing project A must not resurrect a file from B, and in `perProject`
+       * window mode every shell window is showing a different one.
+       *
+       * **Nothing to reopen** answers `null` rather than throwing, and `unmet` writes it to the
+       * diagnostic log. `notifyFailure` would be wrong: an empty undo stack is a precondition,
+       * the same shape as "no focused pane" three arms up, and a toast for it would fire on the
+       * very first Ctrl+Shift+T of every session. The command deliberately carries no `when`
+       * clause either — `cide_core::commands` argues that at length; the short version is that
+       * a flag for it would need a supplier the snapshot has no business carrying.
+       *
+       * **Where the caret ends up.** `revealPane`, the way `tab.console` below does. Rust has
+       * already made the tab active, but "active" and "typing in it" are two different things —
+       * `TabContent` keeps every tab mounted and hides the inactive ones, so the keyboard is
+       * still wherever it was. `hydrate` first, because the pane to reveal is read out of the
+       * snapshot: the `cide://workspace-changed` broadcast would deliver the same tree a moment
+       * later, and racing it would reveal a pane the mirror has not heard of yet.
+       */
+      case 'tab.reopenClosed': {
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        return void tabApi.reopenClosed(project.id).then(async (tab) => {
+          if (tab === null) return unmet(command, 'nothing to reopen')
+          await ws.hydrate()
+          const reopened = boot()?.workspace.projects[project.id]?.tabs.find((t) => t.id === tab)
+          if (reopened === undefined) return
+          const refusal = await revealPane(project.id, reopened.tree.focused)
+          if (refusal !== null) void diag.log(`[cide] ${command}: ${refusal}`)
+        })
       }
 
       case 'tab.next':
@@ -657,7 +696,17 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
             if (!shown) {
               notify(`${path} is not in this project's file tree, so there is no row to show.`, {
                 kind: 'info',
-                hint: 'Files git ignores have no row in the tree, and neither does a file that has been deleted since it was opened.',
+                /*
+                 * The third clause is M15's. A standard-library file used to land here always —
+                 * `~/.rustup/toolchains/…/library/core/src/option.rs` was in no root, no
+                 * dependency cache and no External Libraries row, so this sentence fired about a
+                 * file the user was looking at. That is fixed at the source (`cide_deps::sdk`
+                 * lists the toolchain, `dependency_roots` contains it), and one case survives
+                 * legitimately: with `rust-src` uninstalled the SDK row is a note with no path,
+                 * so there is genuinely nothing to select. A hint that did not mention it would
+                 * send that user looking for a bug in the wrong half.
+                 */
+                hint: 'Files git ignores have no row in the tree, neither does a file that has been deleted since it was opened, and a standard-library file has none until `rustup component add rust-src` has been run.',
               })
               return
             }
@@ -987,18 +1036,34 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         /*
          * The mouse's thumb buttons, and anything a user binds to these ids.
          *
-         * Every decision is `editor/navHistory.ts`'s and every refusal is `editor/jump.ts`'s;
-         * this arm turns the second into an `unmet` line. That is the whole of what it does,
-         * and it is deliberately not less: "nothing to go back to" is the state a Back button
-         * spends most of its life in, and a gesture with no visible effect is indistinguishable
-         * from one wired to nothing — which is exactly the report that produced this file.
+         * Every decision is `editor/navHistory.ts`'s and every refusal is `editor/jump.ts`'s.
+         *
+         * The refusal goes to `notify`, not to `unmet`. That is a deliberate exception to this
+         * file's own rule and it is the second half of M15's mouse-button report: `unmet` writes
+         * one line through `diag.log`, into a file the user never opens, so a Back that refuses
+         * is on screen indistinguishable from a Back that is wired to nothing — which is
+         * *precisely* the state the thumb buttons were actually in, and precisely why nobody
+         * could tell the two apart while diagnosing it. `jump.ts`'s own header says the refusal
+         * is a value rather than a silence "because a mouse button that does nothing is
+         * indistinguishable from a mouse button wired to nothing"; routing it to a log defeats
+         * the sentence it went to the trouble of writing.
+         *
+         * Every other `unmet` in this file reports a *precondition a `when` clause should
+         * already have caught* — a programming error, whose audience is a developer reading the
+         * log. This one is an ordinary, expected state ("you have not jumped anywhere yet") whose
+         * audience is the user, and the empty history is the state Back spends most of its life
+         * in: nothing records an entry for Ctrl+Tab, a tab-strip click, caret motion or
+         * scrolling, so a first press very often lands here.
          *
          * The `when` clause is `projectOpen`, so this is reachable with focus anywhere,
          * including a terminal. That is the point: the thumb button is pressed wherever the
          * pointer is.
          */
         const refusal = navigate(command === 'navigate.back' ? 'back' : 'forward')
-        if (refusal !== null) return unmet(command, refusal)
+        if (refusal !== null) {
+          notify(refusal, { kind: 'info' })
+          return
+        }
         return
       }
 

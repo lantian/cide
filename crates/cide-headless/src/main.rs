@@ -642,6 +642,7 @@ mod tests {
                 label: "cide".into(),
             }],
             active_tab: home.id,
+            tab_mru: vec![home.id],
             tabs: vec![home, editor],
             detached: Default::default(),
             dock_anchors: Default::default(),

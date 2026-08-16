@@ -236,6 +236,39 @@
   font-size: 11px;
 }
 
+/*
+ * Go to symbol: the declaring container, and where the symbol is.
+ *
+ * Two spans that used to be `.path` twice — same family, size and colour, both `flex: 1`, and
+ * therefore indistinguishable from one grey run. `impl Parser` and `src/parse.rs:88` answer two
+ * different questions, so the one that identifies the symbol keeps the room and the one that
+ * merely locates it gives way first.
+ */
+.container {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.where {
+  /* Shrinks before the container does, and never grows: a file and a line number are the least
+     identifying thing in the row. `direction: rtl` keeps the line number, which is the half a
+     truncated location still needs. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: right;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
 /* Command palette: the group sits right-aligned, before the key chip. */
 .group {
   flex: 1;
@@ -318,18 +351,78 @@
 }
 
 /*
- * Find usages. (M14)
+ * Find usages. (M14, corrected in M15)
  *
  * A file heading and then its usages, which is the search panel's shape — the two lists show the
  * same thing (a source line with an occurrence in it) and looking different would be an
  * inconsistency the user has no way to explain.
  *
- * The heading is drawn with `.path` and `.group`, which already exist and already ellipsise from
- * the right end; only the height and the ground differ, and both are here.
+ * # What was wrong with it, in the user's words: "it doesn't see where is filename and where is
+ * code"
+ *
+ * The heading used to be drawn with `.path` and `.group`, which already existed. Four separate
+ * defects came out of that reuse, and every one of them is invisible in a diff:
+ *
+ *  1. **The heading and the source line were the same face, size and colour.** `.path` is
+ *     `--font-mono` 11px `--dim`; `.usageText` is `--font-mono` 11.5px `--dim`. Half a pixel of
+ *     size and *nothing else* separated a filename from a line of code. The search panel one
+ *     directory over gets this right — icon, proportional face, 13px — and the two lists show
+ *     the same thing.
+ *  2. **`.path` ellipsises at the tail**, and the tail of `crates/cide-lsp/src/progress.rs` is
+ *     the filename. `SearchPanel.module.css`'s `.fileName` solved exactly this with
+ *     `direction: rtl` and a comment saying why; the popup inherited the wrong truncation.
+ *  3. **`.group` is `flex: 1`**, so the hit count claimed half a 620px card and a two-character
+ *     number pushed the path — already truncating from the wrong end — down to about forty
+ *     characters. Ordinary paths in this repository are longer than that.
+ *  4. **This rule's own `background: var(--chrome)` was a no-op**: `--chrome` is exactly
+ *     `.card`'s ground, so the one declaration written to make the heading stand out painted it
+ *     the colour it already was.
+ *
+ * The source line below is untouched and must stay `--font-mono`: `splitHighlight`'s `<mark>`
+ * sits over it, and a proportional face puts the highlight over glyphs of a width the file does
+ * not have. That is the whole point of the split, and `check-theme.mjs` now sweeps this file for
+ * it — `src/overlays/Overlay.module.css` was simply not in that script's table, which is why the
+ * one overlay that grew a heading-plus-source-line list was never checked.
  */
 .usageFile {
-  background: var(--chrome);
+  /* Not `--chrome`, which is the card's own ground. `--panel-2` is a real step away from it in
+     both themes, which is what a heading needs to be a heading. */
+  background: var(--panel-2);
   cursor: default;
+}
+
+/*
+ * The filename in a usage heading. A *name*, so the proportional face — the split this whole
+ * block is about.
+ *
+ * `var(--w-bold)` is 600, which Inter genuinely ships. Writing `600` here as a literal would be
+ * the trap `SearchPanel.module.css:307` records: mono has no 600, CSS font matching walks *up*
+ * to 700, and the emphasis lands two steps heavy instead of one — and `check-theme.mjs` cannot
+ * see it, because it checks weights against the *union* of both families. Reaching for the token
+ * makes the mistake unavailable rather than merely unmade.
+ */
+.usageFileName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* The tail of a path identifies it, so the ellipsis goes at the front. `SearchPanel`'s
+     `.fileName` makes the same argument for the same list. */
+  direction: rtl;
+  text-align: left;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: var(--w-bold);
+  color: var(--text-hi);
+}
+
+/* `12`, at the right end of the heading. `flex: none`, unlike `.group`, so a two-character
+   number cannot claim half the card from the path beside it. */
+.usageCount {
+  flex: none;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* The line number. Fixed width so the source lines start on one column — the same argument

@@ -222,6 +222,20 @@ pub struct EditorSettings {
     pub show_minimap: bool,
     pub word_wrap: bool,
     pub trim_trailing_whitespace_on_save: bool,
+    /// Write a changed file when it loses focus, and after a minute with no edits. (M15)
+    ///
+    /// **On by default**, which is why `persist::v2_to_v3` writes the value into every existing
+    /// document rather than letting `#[serde(default)]` supply it. The distinction matters for
+    /// exactly the reason [`crate::ProxyScope`]'s did: a defaulted field means an existing
+    /// user's setting is an *inference* from a constant in this build, so the day somebody
+    /// changes the default for new installs, every workspace on disk silently changes behaviour
+    /// — and this particular behaviour writes the user's files. Written down, an upgrade is a
+    /// fact on disk and a later change to the default touches new installs only.
+    ///
+    /// The *interval* is deliberately not here. Rust does nothing with it; a single
+    /// `AUTOSAVE_IDLE_MS` in `ui/src/editor/autosave.ts` has one home and nothing to disagree
+    /// with. What crosses the wire is the yes/no.
+    pub autosave: bool,
     /// How a diff is laid out. See [`DiffView`].
     pub diff_view: DiffView,
 }
@@ -235,6 +249,7 @@ impl Default for EditorSettings {
             show_minimap: true,
             word_wrap: false,
             trim_trailing_whitespace_on_save: false,
+            autosave: true,
             diff_view: DiffView::Unified,
         }
     }

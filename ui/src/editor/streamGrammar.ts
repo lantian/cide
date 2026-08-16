@@ -39,6 +39,20 @@ export interface GrammarSpec {
   /** Shown in the status bar readout: `Rust · UTF-8 · LF · …`. */
   name: string
   keywords?: readonly string[]
+  /**
+   * Whether `SELECT`, `select` and `Select` are all the same word.
+   *
+   * SQL is the only language here that needs it and it genuinely does: the tables below are
+   * written once in lowercase, and without this a `SELECT` in the ordinary shouting style
+   * matches nothing while the table named `select` in the line under it matches everything.
+   *
+   * A flag rather than listing every keyword twice, which would double four tables, and rather
+   * than lowercasing unconditionally, which would break Go (`String` and `string` are two
+   * different things) and every case-sensitive language in the directory. The lowercasing is one
+   * `toLowerCase` on a token this branch has already isolated, so it costs nothing on the
+   * languages that leave it off.
+   */
+  caseInsensitiveKeywords?: boolean
   /** Coloured as keywords too; kept separate so a language can tag control flow if it wants. */
   types?: readonly string[]
   /** `true`, `null`, `self` — anything that reads as a keyword-shaped literal. */
@@ -260,12 +274,15 @@ export function grammar(spec: GrammarSpec) {
           if (next === undefined || !isIdentifierPart(next, extra)) break
           stream.next()
         }
-        const word = stream.current()
+        const raw = stream.current()
+        // Folded once, for the four lookups below and for nothing else — `capitalisedIsType`
+        // and the call-syntax lookahead still see the word as the user typed it.
+        const word = spec.caseInsensitiveKeywords === true ? raw.toLowerCase() : raw
         if (keywords.has(word)) return 'keyword'
         if (atoms.has(word)) return 'atom'
         if (types.has(word)) return 'typeName'
         if (builtins.has(word)) return 'variableName.function'
-        if (spec.capitalisedIsType && /^[A-Z]/.test(word)) return 'typeName'
+        if (spec.capitalisedIsType && /^[A-Z]/.test(raw)) return 'typeName'
         // Lookahead only, never consumed: `stream.match(/…/, false)` leaves the position
         // alone, so the `(` is still there to be tokenized as a bracket on the next call.
         if (spec.callSyntax && stream.match(/^\s*\(/, false)) return 'variableName.function'

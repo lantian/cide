@@ -55,6 +55,8 @@ export interface PaneBodyProps {
   /** The project's roots and the open gesture, for file links in terminal output. */
   roots?: readonly string[] | undefined
   onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
+  /** Ctrl+click on a directory. Absent in a window with no file tree — see `TerminalPane`. */
+  onRevealPath?: ((path: string) => void) | undefined
   onSessionBound?: ((session: string) => void) | undefined
 }
 
@@ -68,6 +70,7 @@ export function PaneBody({
   restore,
   roots,
   onOpenPath,
+  onRevealPath,
   onSessionBound,
 }: PaneBodyProps): ReactNode {
   // Every hook first, unconditionally, before the dispatch below returns for anything.
@@ -176,6 +179,7 @@ export function PaneBody({
       restore={restore}
       roots={roots}
       onOpenPath={onOpenPath}
+      onRevealPath={onRevealPath}
       onSessionBound={onSessionBound}
     />
   )

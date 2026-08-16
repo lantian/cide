@@ -27,8 +27,8 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from 'react'
-import { EditorSurface } from '@/editor/EditorSurface'
-import { claude as claudeApi, diag, events, file as fileApi } from '@/ipc/client'
+import { EditorSurface, type SaveCause } from '@/editor/EditorSurface'
+import { claude as claudeApi, diag, events, fileChanged, file as fileApi } from '@/ipc/client'
 import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
 import {
   fetchOutline,
@@ -40,9 +40,15 @@ import {
 import { closeDoc, openDoc, resetDoc, savedDoc, scheduleDoc } from '@/editor/docSync'
 import type { FileView } from '@/editor/position'
 import { levelFor, subscribeHighlightLevels } from '@/editor/highlightLevel'
+import { basename } from '@/editor/languages'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { useWorkspace } from '@/store/workspace'
 import { visible, type DiagnosticFilters } from '@/sidebar/ProblemsPanel/model'
+import { AUTOSAVE_CEILING_MS, AUTOSAVE_IDLE_MS, shouldAutosave } from '@/editor/autosave'
+import { describe, notify } from '@/chrome/notices'
+import { contextMenuOpen } from '@/menus/menuState'
+import { overlayOpen } from '@/overlays/store'
+import type { FileStamp } from '@/ipc/generated'
 import type { ProjectId } from '@/ipc/client'
 import styles from './EditorPane.module.css'
 
@@ -153,11 +159,61 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
     }
     return items.filter((item) => item.absPath === path && visible(item, filters))
   }, [snapshot, path, level])
+  /**
+   * `settings.editor.autosave`, from the mirror. Defaults to **on** before bootstrap, which is
+   * the value `EditorSettings::default()` carries and the value `persist::v2_to_v3` writes into
+   * every upgraded workspace — so the three answers to "is autosave on" cannot disagree.
+   */
+  const autosaveOn = useWorkspace((s) => s.boot?.workspace.settings.editor.autosave ?? true)
+  /**
+   * Is a Claude Code diff of **this file** on screen, with the agent blocked on it?
+   *
+   * `crates/cide-app/src/ide.rs`: *"`openDiff` blocks an agent turn. The CLI sends it and waits;
+   * nothing else happens in that turn."* The collision is the ordinary gesture, not an edge
+   * case: the user has unsaved edits in `foo.rs`, Claude proposes a diff of `foo.rs`, and the
+   * user clicks the diff tab to look at it — which is a tab switch, which is a blur, which is a
+   * save of `foo.rs` underneath a proposal computed against the old bytes.
+   *
+   * Selected as a **boolean**, deliberately: the selector runs on every workspace snapshot, and
+   * returning the matching tabs would hand `useSyncExternalStore` a fresh array every time and
+   * re-render this pane on every keystroke in every window.
+   *
+   * `claudeMcp` only. A diff the *user* opened blocks nobody and is not a reason to stop saving
+   * the file it came from.
+   */
+  const agentDiff = useWorkspace((s) =>
+    (project === undefined ? [] : (s.boot?.workspace.projects[project]?.tabs ?? [])).some(
+      (t) =>
+        t.kind.kind === 'diff'
+        && t.kind.spec.origin.kind === 'claudeMcp'
+        && (t.kind.spec.newPath === path || t.kind.spec.oldPath === path),
+    ),
+  )
   const [load, setLoad] = useState<Load>({ kind: 'loading' })
   const [reloadKey, setReloadKey] = useState(0)
   /** Set when the file changed on disk while the buffer had unsaved edits. */
   const [conflict, setConflict] = useState(false)
   const dirtyRef = useRef(false)
+  /**
+   * What the file was when this buffer last agreed with the disk.
+   *
+   * Set by every read and moved by every successful write, so an autosave compares against the
+   * bytes it last produced rather than against the file as it stood when the tab opened. `null`
+   * means "no precondition available" — a filesystem that would not answer — which Rust reads as
+   * "write anyway"; see `cide_ipc::FileStamp`.
+   *
+   * A ref, not state: nothing renders differently for it, and a re-render per save would be a
+   * re-render per minute of typing.
+   */
+  const stampRef = useRef<FileStamp | null>(null)
+  /**
+   * Whether the file on disk carries write permission, as `file_read` answered.
+   *
+   * A ref because `load` is state that the autosave gate would otherwise have to be rebuilt for
+   * on every read; the value only ever arrives with a new file, exactly as `EditorSurface`'s own
+   * `readOnly` prop does.
+   */
+  const writableRef = useRef(true)
 
   /**
    * Tell the workspace whether this file has unsaved edits.
@@ -310,6 +366,8 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
                 ? null
                 : { path: at.path, line: at.line, column: at.column, topLine: at.topLine },
           })
+          stampRef.current = doc.stamp
+          writableRef.current = doc.writable
           setConflict(false)
           reportDirty(false)
           if (bump) setReloadKey((n) => n + 1)
@@ -336,9 +394,28 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
    * staying dirty is itself the signal that nothing was written.
    */
   const onSave = useCallback(
-    (text: string) =>
-      fileApi.write(path, text).then(
-        () => {
+    (text: string, cause: SaveCause) =>
+      /*
+       * `ifUnchanged` for an autosave and **not** for a Ctrl+S.
+       *
+       * The gap this closes is one autosave opens. The conflict bar below is raised from
+       * `cide://session-tool`, which arrives as a Claude Code tool call completes and names the
+       * file exactly — and which a `sed -i`, a `cargo fmt` or a `git checkout` never sends.
+       * Before autosave, clobbering one of those took a deliberate Ctrl+S; with autosave-on-blur
+       * it takes switching to the terminal, running `cargo fmt`, and clicking back into the
+       * editor. Three things nobody decides to do.
+       *
+       * So a background write carries what the file was when the buffer last agreed with it, and
+       * Rust refuses if the disk no longer matches. An explicit Ctrl+S passes `null` and forces,
+       * because that is the user deciding — the same asymmetry `write_if_unchanged` documents
+       * from the other end.
+       */
+      fileApi.write(path, text, cause === 'autosave' ? stampRef.current : null).then(
+        (stamp) => {
+          // The token moves with the write. Without this the *next* autosave would compare
+          // against the file as it stood when the tab opened and refuse for ever after the
+          // first save — a feature that works exactly once is worse than one that does not.
+          stampRef.current = stamp
           setConflict(false)
           // After the write, not before: `didSave` makes rust-analyzer re-run `cargo check`, and
           // checking a file that is still mid-write is how you get a diagnostic for a truncated
@@ -347,10 +424,81 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
         },
         (error: unknown) => {
           void diag.log(`could not save ${path}: ${String(error)}`)
+          if (fileChanged(error)) {
+            /*
+             * The precondition refused: something else wrote this file. That is not a failure,
+             * it is the *question* the conflict bar exists to ask — and raising it here is what
+             * gives the `sed -i` path the same bar the agent path has had since M12.
+             */
+            setConflict(true)
+          } else if (cause === 'autosave') {
+            /*
+             * A silent failed autosave is the worst outcome this feature can have.
+             *
+             * A failed Ctrl+S is a keystroke the user watched not work, and the tab staying
+             * dirty plus the close guard is arguably report enough. A failed autosave happened
+             * on a timer while they were looking somewhere else — at a browser, at a terminal —
+             * and `void diag.log(...)` writes it to a file nobody opens. This population is
+             * exactly where writes fail, too: a root-owned mode-644 file reports
+             * `writable: true` (the mode bits, not "can *you* write it"), so `/etc/hosts` opened
+             * through the out-of-project confirmation is a buffer that types fine and cannot be
+             * saved.
+             *
+             * `notices.admit` dedupes by text, so a full disk gives one toast rather than sixty.
+             * The timers are not rearmed after a failure either — see `EditorSurface` — so the
+             * retries stop until the user touches the file again.
+             */
+            notify(`cide could not save ${basename(path)}: ${describe(error)}`, {
+              kind: 'error',
+              hint: 'Your changes are still in the buffer.',
+            })
+          }
+          // Rethrown either way: the surface leaves the tab dirty on a rejected promise, and the
+          // dirty flag is what puts the close confirmation in front of the user. Swallowing it
+          // here would make a tab that looks saved over a buffer that is not.
           throw error
         },
       ),
     [path],
+  )
+
+  /**
+   * Everything autosave refuses, assembled and handed to the one function that decides.
+   *
+   * The *facts* are gathered here because this is where they live — the setting is in the
+   * mirror, the conflict bar is local state, the agent diff is a selector, the DOM half comes
+   * from the surface — and the *decision* is `shouldAutosave`, which is pure and import-free so
+   * `check:editor` can drive its whole truth table. That split is the point: every failure mode
+   * in this feature is a refusal that was not made, and a refusal spelled inside a `useEffect`
+   * is a refusal no check script can compile.
+   *
+   * `overlayOpen()` and `contextMenuOpen()` are read **at call time**, not captured, because
+   * they are module-level getters over transient chrome and the answer at the moment of the blur
+   * is the only one that matters. `cide_core::commands` already lists both as host context
+   * flags — "transient chrome that only the React tree knows about" — so this is the
+   * application's existing vocabulary for exactly this question rather than a new one.
+   *
+   * `readOnly` is passed even though a read-only buffer can never become dirty and therefore
+   * never arms a timer. Stated rather than inferred: "unreachable" here is a property of two
+   * other modules agreeing, and External Libraries sources are read-only by design.
+   */
+  const allowAutosave = useCallback(
+    (
+      reason: 'blur' | 'idle',
+      dom: { windowFocused: boolean; focusInsideEditor: boolean },
+    ): boolean =>
+      shouldAutosave(reason, {
+        enabled: autosaveOn,
+        dirty: dirtyRef.current,
+        readOnly: !writableRef.current,
+        conflict,
+        agentDiff,
+        windowFocused: dom.windowFocused,
+        focusInsideEditor: dom.focusInsideEditor,
+        overlayOpen: overlayOpen(),
+        contextMenuOpen: contextMenuOpen(),
+      }),
+    [autosaveOn, conflict, agentDiff],
   )
 
   /**
@@ -415,7 +563,24 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           <button
             type="button"
             className={styles.conflictButton}
-            onClick={() => setConflict(false)}
+            /*
+             * Re-stamp, not just dismiss.
+             *
+             * `stampRef` still holds what the file looked like BEFORE whatever changed it, so
+             * clearing the flag alone left every later autosave failing its own precondition:
+             * the write is refused, the bar comes straight back, and the buffer is never written
+             * again for the life of the tab. The user answered the question and the answer did
+             * nothing.
+             *
+             * "Keep mine" means *my buffer is the truth now*, so the next write must be allowed
+             * to land on top of what is there — which is exactly what dropping the guard says.
+             * The following successful write records the new stamp, so the protection is back
+             * one save later rather than gone.
+             */
+            onClick={() => {
+              stampRef.current = null
+              setConflict(false)
+            }}
           >
             Keep mine
           </button>
@@ -433,6 +598,18 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           readOnly={!load.writable}
           onDirtyChange={reportDirty}
           onSave={onSave}
+          /*
+           * A fresh object every render, and that is safe *only* because `EditorSurface` holds
+           * it in a ref and keeps it out of the build effect's dependency list. It has to be
+           * fresh: `allow` closes over the conflict flag and the agent-diff selector, both of
+           * which change while the user is typing, and a stale closure here would be a save
+           * refused for a reason that stopped being true.
+           */
+          autosave={{
+            idleMs: AUTOSAVE_IDLE_MS,
+            ceilingMs: AUTOSAVE_CEILING_MS,
+            allow: allowAutosave,
+          }}
           onSelection={reportSelection}
           at={load.at}
           onView={reportPosition}

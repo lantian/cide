@@ -109,6 +109,12 @@ pub fn load(path: &Path) -> Workspace {
             // flag has to start false or `close_tab` refuses it over edits that no longer
             // exist. See `workspace::clear_dirty_flags`.
             crate::workspace::clear_dirty_flags(&mut workspace);
+            // `tab_mru` arrived after `Project` did and is `#[serde(default)]`, so every file
+            // written before it reads back with an empty order — which `workspace::validate`
+            // refuses, and `WorkspaceState::load` answers a refusal by discarding the whole
+            // workspace. Repairing here is what keeps an upgrade from costing the user their
+            // layout; see `workspace::repair_tab_mru` for what it will and will not invent.
+            crate::workspace::repair_tab_mru(&mut workspace);
             workspace
         }
         // First launch, or the user deleted the file. Nothing to warn about, and nothing to
@@ -187,6 +193,7 @@ pub fn migrate(value: Value) -> Result<Workspace> {
     match version {
         CURRENT => Ok(serde_json::from_value(value)?),
         1 => migrate(v1_to_v2(value)),
+        2 => migrate(v2_to_v3(value)),
         v if v > CURRENT => Err(CoreError::Serde(format!(
             "workspace schema {v} is newer than this build's {CURRENT}; refusing to downgrade it"
         ))),
@@ -243,6 +250,61 @@ fn v1_to_v2(mut value: Value) -> Value {
                 if let Ok(scope) = serde_json::to_value(cide_ipc::ProxyScope::default()) {
                     proxy.insert("scope".into(), scope);
                 }
+            }
+        }
+    }
+    value
+}
+
+/// Schema 2 → 3: write down that autosave is on.
+///
+/// # Why this is not left to `#[serde(default)]`
+///
+/// `EditorSettings::autosave` defaults to `true`, so a schema-2 document loads perfectly well
+/// without this and behaves exactly as a fresh install does. Deleting this function would change
+/// no behaviour today — which is the same sentence [`v1_to_v2`] opens with, and the argument is
+/// the same one, sharpened by what the field controls.
+///
+/// Autosave **writes the user's files on a timer**. A defaulted field means every existing
+/// workspace's answer to "may cide do that" is an inference from a constant in this build. The
+/// obvious next request for a feature like this is "make it opt-in", and on the day somebody
+/// grants it, a defaulted field turns autosave off for every user who had come to rely on it —
+/// with nothing on their disk to explain why the file they alt-tabbed away from is suddenly
+/// dirty again, and no error anywhere. Writing the value makes an upgraded user's setting a fact
+/// rather than a consequence of a constant, so a later change to the default is a change to new
+/// installs and to nothing else.
+///
+/// # What it refuses to touch
+///
+/// A `settings` or `settings.editor` that is not an object is left exactly as found and allowed
+/// to fail in `from_value` with serde's own message — the same refusal [`v1_to_v2`] makes, and
+/// for the same reason: "your settings block is corrupt" and "your editor configuration silently
+/// became the default" are different answers, and only one of them is honest.
+///
+/// An `autosave` key that is somehow already present is **left alone**. It cannot occur in a
+/// document this build wrote (schema 2 predates the field), but a hand-edited file or a
+/// downgrade-then-upgrade could carry one, and overwriting a value the user typed is exactly
+/// what this whole ladder exists to avoid.
+fn v2_to_v3(mut value: Value) -> Value {
+    if let Some(root) = value.as_object_mut() {
+        root.insert("schemaVersion".into(), Value::from(3u32));
+
+        let settings = root
+            .entry("settings")
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Some(settings) = settings.as_object_mut() {
+            let editor = settings
+                .entry("editor")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(editor) = editor.as_object_mut() {
+                // Serialized from the type rather than written as `Value::Bool(true)`, for the
+                // reason `v1_to_v2` gives about its own literal: the default is the type's to
+                // state, and a literal here is a second copy of it that the first change to
+                // `EditorSettings::default()` silently invalidates.
+                let default_on = cide_ipc::EditorSettings::default().autosave;
+                editor
+                    .entry("autosave")
+                    .or_insert_with(|| Value::from(default_on));
             }
         }
     }
@@ -857,6 +919,7 @@ mod tests {
             }],
             tabs: vec![home, settings],
             active_tab,
+            tab_mru: vec![active_tab],
             detached: IndexMap::new(),
             dock_anchors: IndexMap::new(),
             primary_session,
@@ -872,6 +935,49 @@ mod tests {
         save_atomic(&path, &workspace).expect("save");
 
         assert_eq!(load(&path), workspace);
+    }
+
+    /// A `workspace.json` written before `tabMru` existed still loads, and loads *usable*.
+    ///
+    /// This is the upgrade path for every file on every disk, and it is the expensive one to
+    /// get wrong: `tabMru` is `#[serde(default)]`, so the document parses to an empty order,
+    /// `workspace::validate` refuses that, and `WorkspaceState::load` answers a refusal by
+    /// replacing the whole workspace with `Workspace::default()`. Miss the repair and the first
+    /// launch after the upgrade greets the user with no projects and no tabs — with the file
+    /// still on disk, intact, and never read again.
+    ///
+    /// Renaming the key stands in for the field not being there, the way the `dockAnchors` test
+    /// below does: that is the only state that has ever been on anyone's disk.
+    #[test]
+    fn a_workspace_written_before_the_tab_focus_order_loads_and_validates() {
+        let dir = TempDir::new("mru-migration");
+        let path = dir.join("workspace.json");
+        // `demo_workspace` rather than this module's `fixture`, which carries a maximized pane
+        // that does not hold focus and so fails `validate` for a reason that has nothing to do
+        // with this test. The demo is the one shared fixture the validator accepts.
+        save_atomic(&path, &crate::workspace::demo_workspace()).expect("save");
+
+        let raw = fs::read_to_string(&path).expect("read back");
+        assert!(
+            raw.contains(r#""tabMru""#),
+            "the order is written, not skipped"
+        );
+        fs::write(&path, raw.replace(r#""tabMru""#, r#""wasNotAFieldYet""#)).expect("rewrite");
+
+        let loaded = load(&path);
+        assert!(
+            !loaded.projects.is_empty(),
+            "the file was read rather than quarantined"
+        );
+        for p in loaded.projects.values() {
+            assert_eq!(
+                p.tab_mru,
+                vec![p.active_tab],
+                "the order is repaired to the one thing the file actually knew"
+            );
+        }
+        crate::workspace::validate(&loaded)
+            .expect("and it passes the validator that decides whether the layout survives");
     }
 
     /// The shape `demo_workspace` claims, asserted on **both** sides of a round trip.
@@ -1123,10 +1229,10 @@ mod tests {
 
         let ws = load(&path);
 
-        assert_eq!(Workspace::CURRENT_SCHEMA, 2);
+        assert_eq!(Workspace::CURRENT_SCHEMA, 3);
         assert_eq!(
-            ws.schema_version, 2,
-            "the ladder ran and stopped at current"
+            ws.schema_version, 3,
+            "the ladder ran every rung — 1 → 2 → 3 — and stopped at current"
         );
         assert_eq!(
             dir.entries(),
@@ -1150,6 +1256,28 @@ mod tests {
             ws.settings.proxy.scope.git,
             cide_ipc::ProxyTarget::Untouched,
             "schema 1 never put a proxy into cide's own git, and an upgrade must not either"
+        );
+
+        /*
+         * Autosave, on. (M15, schema 3)
+         *
+         * The `editor` block in this captured document lists six fields and no `autosave` — it
+         * predates the field by two milestones, which is exactly what makes it the right thing
+         * to assert against. An upgrading user gets autosave on, which is what a fresh install
+         * gets, so the upgrade changes nothing they can see today.
+         *
+         * The literal above is deliberately left alone. Adding `autosave` to it would turn this
+         * into a test of a document no user has, which is the one thing a captured fixture is
+         * for not being.
+         */
+        assert!(
+            !LEGACY_WORKSPACE.contains("autosave"),
+            "the captured document must stay the one that predates the field"
+        );
+        assert!(
+            ws.settings.editor.autosave,
+            "a workspace written before autosave existed comes back with it on — the same \
+             answer a fresh install gives, so nothing changes under an upgrading user"
         );
 
         let project = ws.projects.values().next().expect("the project loaded");
@@ -1835,6 +1963,81 @@ mod tests {
         assert_eq!(
             migrated["settings"]["proxy"]["http"],
             serde_json::json!("http://proxy.corp:3128")
+        );
+    }
+
+    /// The autosave migration writes the value down rather than leaning on the serde default.
+    ///
+    /// Asserted on the **document**, not on the loaded struct, and that distinction is the
+    /// entire test: a struct-level assertion passes identically whether the value was written
+    /// or defaulted, which is precisely the two cases this exists to tell apart. The same shape
+    /// as `the_migration_records_the_scope_in_the_document_rather_than_defaulting_it` one screen
+    /// up, because it is the same argument about a setting with a larger blast radius —
+    /// autosave writes the user's files.
+    #[test]
+    fn the_migration_records_autosave_in_the_document_rather_than_defaulting_it() {
+        let v2 = serde_json::json!({
+            "schemaVersion": 2,
+            "rev": 7,
+            "settings": { "editor": { "fontSize": 13.0, "wordWrap": true } },
+            "projects": {},
+            "windows": {},
+        });
+
+        let migrated = v2_to_v3(v2);
+
+        assert_eq!(migrated["schemaVersion"], serde_json::json!(3));
+        assert_eq!(
+            migrated["settings"]["editor"]["autosave"],
+            serde_json::json!(true),
+            "the value has to be in the document. A default is an inference from a constant in \
+             this build, and the day somebody makes autosave opt-in that inference silently \
+             turns it off for every user who had come to rely on it"
+        );
+        // And the settings the user actually chose are not disturbed on the way past.
+        assert_eq!(
+            migrated["settings"]["editor"]["wordWrap"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            migrated["settings"]["editor"]["fontSize"],
+            serde_json::json!(13.0)
+        );
+    }
+
+    /// A schema-2 document with no `settings` block at all — the majority, since every field of
+    /// `Settings` defaults and most users never open it — still gets the value recorded.
+    #[test]
+    fn a_schema_2_document_with_no_editor_block_still_gets_autosave_recorded() {
+        let v2 = serde_json::json!({
+            "schemaVersion": 2, "rev": 0, "projects": {}, "windows": {},
+        });
+        let migrated = v2_to_v3(v2);
+        assert_eq!(
+            migrated["settings"]["editor"]["autosave"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// A value already in the document is left exactly as the user left it.
+    ///
+    /// It cannot occur in a file this build wrote — schema 2 predates the field — but a
+    /// hand-edited workspace or a downgrade-then-upgrade can carry one, and a migration that
+    /// overwrites a value somebody typed is the failure this whole ladder exists to avoid.
+    #[test]
+    fn a_migration_does_not_overwrite_an_autosave_the_user_already_chose() {
+        let v2 = serde_json::json!({
+            "schemaVersion": 2,
+            "rev": 0,
+            "settings": { "editor": { "autosave": false } },
+            "projects": {},
+            "windows": {},
+        });
+        let migrated = v2_to_v3(v2);
+        assert_eq!(
+            migrated["settings"]["editor"]["autosave"],
+            serde_json::json!(false),
+            "somebody turned it off on purpose; an upgrade must not turn it back on"
         );
     }
 

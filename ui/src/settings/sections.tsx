@@ -333,6 +333,12 @@ function Editor({ settings, patch }: SectionProps) {
           checked={editor.trimTrailingWhitespaceOnSave}
           onChange={(v) => set({ trimTrailingWhitespaceOnSave: v })}
         />
+        <ToggleRow
+          label="Save automatically"
+          hint="Writes a changed file when it loses focus, and after a minute with no edits. Never over a Claude diff, a conflict, or a read-only file."
+          checked={editor.autosave}
+          onChange={(v) => set({ autosave: v })}
+        />
       </Group>
     </>
   )

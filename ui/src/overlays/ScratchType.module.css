@@ -46,8 +46,9 @@
   overflow: hidden;
 }
 
-/* The box itself takes the keyboard — there is no text field here — so it must not draw the
-   platform focus ring around a dialog the user is looking straight at. */
+/* The box no longer takes the keyboard — the filter field does — but the rule stays, because
+   the box is still `tabIndex={-1}`-less and a stray programmatic focus on a `role="dialog"` the
+   user is looking straight at must not draw a platform ring around the whole popup. */
 .popup:focus {
   outline: none;
 }
@@ -74,6 +75,58 @@
   letter-spacing: 0;
   text-transform: none;
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The filter field. (M15)
+ *
+ * Geometry copied from `GoToLine.module.css`'s `.row`/`.input` pair, which is the third copy in
+ * this directory and therefore the trigger the header above names for hoisting a shared
+ * `Popup.module.css`. It is not hoisted *in this change*, deliberately: doing it here would make
+ * a regression in Go to line indistinguishable from a bug in the scratch picker, which is the
+ * same argument that kept the two apart in the first place.
+ *
+ * `--font-ui` and no `tabular-nums`, unlike Go to line's: the content here is `TypeScript`, not
+ * a line number.
+ */
+/* `.filterRow`, not `.row` — this stylesheet already has a `.row`, which is a list row 24px
+   tall. Copying Go to line's selector name verbatim would have silently merged the two. */
+.filterRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px 2px;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+/* What a query that matched nothing says, where the list would be. Without it, the fifth
+   indistinguishable empty state: an empty box that could equally be a popup that failed to
+   load. */
+.none {
+  padding: 12px 14px;
+  color: var(--dim);
+  font-size: 11.5px;
 }
 
 /*

@@ -49,6 +49,53 @@ const ok = (cond, what) => {
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 
+/**
+ * Source with comments removed.
+ *
+ * A grep over raw source matches the *explanation* of a rule as happily as the rule, so an
+ * assertion written that way stays green after the code is deleted and only the prose is left.
+ * That is a lesson this repository has paid for; `check-paths.mjs` and `windows.rs` strip for
+ * the same reason. String-aware, so a `'//'` inside a literal does not eat the rest of the line.
+ */
+const stripComments = (source) => {
+  let out = ''
+  let i = 0
+  while (i < source.length) {
+    const ch = source[i]
+    if (ch === '/' && source[i + 1] === '/') {
+      while (i < source.length && source[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && source[i + 1] === '*') {
+      i += 2
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch
+      out += ch
+      i++
+      while (i < source.length && source[i] !== quote) {
+        if (source[i] === '\\') {
+          out += source[i]
+          i++
+        }
+        if (i < source.length) {
+          out += source[i]
+          i++
+        }
+      }
+      out += quote
+      i++
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
 try {
   execFileSync(
     'node',
@@ -82,7 +129,7 @@ try {
   const tree = read('../src/sidebar/FileTree.tsx')
   const host = read('../src/overlays/OverlayHost.tsx')
   const overlayStore = read('../src/overlays/store.ts')
-  const picker = read('../src/overlays/ScratchType.tsx')
+  const picker = stripComments(read('../src/overlays/ScratchType.tsx'))
 
   // --- 1. the id, which is a string two languages share ------------------------------------
 
@@ -310,14 +357,64 @@ try {
     'and opens on the type of the file the user is looking at, which makes the common case ⇧⌥S ⏎',
   )
   ok(
-    /listAction\(ev, SCRATCH_TYPES\.length, at\)/.test(picker),
+    /listAction\(ev, shown\.length, at\)/.test(picker),
     'arrows, Enter and Escape come from `overlays/listKeys.ts`, so this list cannot feel ' +
-      'different from the other four',
+      'different from the other four — and it is asked about the FILTERED list, because `at` ' +
+      'indexes that one. Handing it `SCRATCH_TYPES.length` would let Down walk past the end of ' +
+      'what is on screen onto rows the query excluded',
   )
   ok(
     /type\.ext/.test(picker),
     'and the row shows the extension, because that is what the file will be called and what ' +
       'decides the highlighting',
+  )
+
+  // --- 6b. the filter field, and where the caret is when the popup opens --------------------
+  //
+  // The focus handoff is the assertion this section exists for. An overlay opened by a keystroke
+  // that is not focused on its first frame sends the user's next character to whatever had focus
+  // before — a terminal, which receives it as shell input. That bug has shipped here once
+  // already, out of the find bar, and "it is focused, usually" reads perfectly well in a review.
+
+  ok(
+    /useLayoutEffect\(\(\) => \{\s*field\.current\?\.focus\(\)/.test(picker),
+    'the filter field is focused in a **layout** effect. `ModalShell` states the reason at ' +
+      'length: a passive `useEffect` leaves one frame in which the field is not focused, and ' +
+      'the character typed in that frame goes to the terminal underneath. `GoToLine` uses the ' +
+      'weaker spelling; this must not',
+  )
+  ok(
+    /<input[\s\S]{0,600}?onKeyDown=/.test(picker),
+    'and the keys are handled on the field rather than on the box. The box used to hold focus ' +
+      'because there was no field; with one, a handler left on the box would answer for a ' +
+      'caret that is somewhere else',
+  )
+  ok(
+    !/tabIndex=\{-1\}/.test(picker),
+    'and the box no longer takes the caret itself — two focusable things in a fourteen-row ' +
+      'popup is how Enter ends up acting on a row the highlight is not on',
+  )
+  ok(/data-audit="scratchFilter"/.test(picker), 'the field is auditable by name')
+  ok(
+    /filterScratchTypes\(query\)/.test(picker) && /from '@\/editor\/languages'/.test(picker),
+    'the filtering rule comes from `editor/languages.ts` beside the list it filters, not from a ' +
+      'predicate inside this component — which is also what makes it drivable by `check:editor`',
+  )
+  ok(
+    /matchCounter\(shown\.length, SCRATCH_TYPES\.length\)/.test(picker),
+    'the head counts what is SHOWN against the total. It was the constant `13 types`, which a ' +
+      'filter turns into a number that contradicts the list under it',
+  )
+  ok(
+    /No type matches/.test(picker) && /shown\.length === 0/.test(picker),
+    'and a query that matches nothing says so where the list would be. `listAction` already ' +
+      'answers `none` for Enter with an empty list, so the popup correctly stays open and does ' +
+      'nothing — which without a sentence is the fifth indistinguishable empty state',
+  )
+  ok(
+    !/onCreate\(query/.test(picker),
+    'and Enter on an empty list does NOT create a scratch of the typed extension: that is a ' +
+      'free-text path into `cide_core::scratch::check_ext` and a separate decision',
   )
 
   // --- 7. the Rust side's own promises, in the strings that cross ---------------------------

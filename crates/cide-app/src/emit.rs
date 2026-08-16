@@ -350,14 +350,20 @@ pub fn close_blocked(
 ///
 /// # Why this has to come from Rust at all
 ///
-/// The webview cannot tell Back from Forward. WebKitGTK's `buttonForEvent`
-/// (`Source/WebKit/Shared/gtk/WebEventFactory.cpp`) maps GDK buttons 1, 2 and 3 and leaves
-/// everything else at `WebMouseEventButton::None`; `MouseEvent`'s constructor then turns `None`
-/// into `Left`. So both thumb buttons arrive in JavaScript as `button === 0`, `buttons === 0`,
-/// indistinguishable from each other and from an ordinary click. A DOM-only implementation is
-/// impossible rather than merely awkward — and, worse, the phantom left click is *live today*:
-/// a Ctrl+thumb-press over a path in terminal output already opens the file, and over a buffer
-/// already fires Go to definition. Swallowing the press in GTK fixes that as a side effect.
+/// Because **wry gets the press first and spends it on `window.history.back()`**, and taking it
+/// away from wry can only be done in GTK. `wry-0.55.1/src/webkitgtk/synthetic_mouse_events.rs`
+/// connects a `button-press-event` handler to the WebKitWebView during `create_webview`; for
+/// buttons 8 and 9 it stops the emission and injects a synthetic DOM `mousedown` with `button: 3`
+/// / `button: 4`, then calls `history.back()`/`.forward()` on the mouseup unless something
+/// cancelled it. In an SPA with one history entry that is a silent no-op. `windows.rs`'s
+/// `install_mouse_nav` carries the full account, including why the handler is on the generic
+/// `event` signal and not on `button-press-event`.
+///
+/// This entry used to claim that WebKitGTK's `buttonForEvent` flattens both thumb buttons to
+/// `button === 0` in the DOM, and that a "phantom left click" was live. Neither is true: wry
+/// intercepts before WebKit's event factory runs, so what the DOM would see is `button` 3 or 4,
+/// and `pathLinks.ts`'s gate rejects any `ev.button !== 0`. The correction is recorded rather
+/// than quietly deleted because the false premise is what stopped anyone looking at wry.
 ///
 /// # Why `emit_to` and not a broadcast
 ///

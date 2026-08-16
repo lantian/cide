@@ -1066,6 +1066,23 @@ export function App() {
                           restore={restorePlan.get(paneNode.id)}
                           roots={activeProject.roots.map((r) => r.path)}
                           onOpenPath={openTerminalPath(activeProject.id)}
+                          /*
+                           * A ctrl+click on a *directory* in terminal output.
+                           *
+                           * Straight to `file.reveal` and to nothing else, so the sidebar is
+                           * brought to Files first and a path with no row reports itself in a
+                           * sentence — both of which are that arm's rules, and neither of which
+                           * is worth a second copy here. It is the same routing
+                           * `Explorer`'s ⌖ button makes (`onSelectOpened` above), for the same
+                           * reason: a second call site with its own preconditions is how three
+                           * gestures come to behave in three ways.
+                           *
+                           * Passed only in the shell branch. The detached-pane window above has
+                           * no sidebar, so it passes no handler, and `pathLinks.ts` then draws
+                           * no directory underline there at all rather than one whose command
+                           * would refuse.
+                           */
+                          onRevealPath={(path) => runCommand('file.reveal', { path })}
                           onSessionBound={(session) =>
                             void bindSession(activeProject.id, tab.id, paneNode.id, session)
                           }

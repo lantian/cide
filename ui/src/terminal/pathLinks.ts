@@ -25,7 +25,7 @@
  * overlaps. That is the right precedence: a program that went to the trouble of emitting a
  * real hyperlink has said more than our matcher can infer.
  *
- * # Decision 1: the click gate is ours, in capture, on the host element
+ * # Decision 1: the click gate is ours, in capture, on the host element — unconditionally
  *
  * xterm's activation has no modifier check and fires on `mouseup` for *any* button
  * (`Linkifier._handleMouseUp`, `:220`). Left alone, a plain left click — the gesture a user
@@ -44,15 +44,28 @@
  * every listener xterm has. Exactly the idiom and exactly the element `inputHost.ts` already
  * relies on for the keyboard.
  *
+ * **The claim is unconditional**, and that is M15's correction. The gate used to require a
+ * completed hover before it would swallow anything, and in a Claude Code pane that condition is
+ * routinely false — the whole account is in `clickGate.ts`, which now owns the rule. The
+ * consequence of the old spelling was not "the click does nothing": the press reached xterm,
+ * xterm wrote an SGR report with the Ctrl bit to the pty, and `claude` answered it by forking
+ * `dbus-send … FileManager1.ShowItems` — a desktop file manager, opened on the parent directory
+ * of the file the user pointed at, from a gesture cide had declined and thereby handed over.
+ *
+ * So the sequence is now: claim the press synchronously, then work out what it landed on from
+ * the *buffer*, at press time. That also fixes the mirror-image bug the old three lines had — a
+ * stale `hovered` surviving a repaint, so the gate could act on a candidate from a line that had
+ * since been overwritten.
+ *
  * Consequence, and it decides the architecture: stopping the event in capture also hides it
  * from xterm's own `Linkifier`, so `ILink.activate` will not fire for the click we swallowed.
- * That is why **the provider records what is under the pointer and the capture listener
- * performs the open**, using `ILink.hover`/`leave` as the channel — which is what they are for,
- * and which needs no coordinate mapping of our own. `activate` is still implemented and still
- * guarded on the modifier, as the belt-and-braces path for a click we did not swallow.
+ * `activate` is still implemented and still guarded on the modifier, as the belt-and-braces path
+ * for a press that reached xterm some other way.
  *
  * Nothing else is touched: middle-click paste, the pane's own `contextmenu`, shift-drag
- * force-selection and ordinary selection all see their events exactly as before.
+ * force-selection and ordinary selection all see their events exactly as before. Alt+click in
+ * particular is **not** claimed — see `clickGate.ts` for why, and `xterm.ts`'s XTVERSION reply
+ * for what answers it instead.
  *
  * # Decision 2: hover underlines, the modifier opens, and a plain click says so
  *
@@ -81,11 +94,13 @@
 import type { IBufferLine, ILink, IDisposable } from '@xterm/xterm'
 import { notify } from '@/chrome/notices'
 import { events, fs as fsApi, session as sessionApi, type TreeRowKind } from '@/ipc/client'
+import { cellFromPoint, linkAtCell, pressVerdict, type Cell } from './clickGate'
 import {
   candidatePaths,
   matchPaths,
   outsidePaths,
   resolveCandidate,
+  resolveDirectory,
   type Candidate,
   type Resolution,
 } from './pathMatch'
@@ -114,6 +129,19 @@ export interface PathLinkEnv {
    * has now found twelve times, and it is one `?? null` away here.
    */
   readonly open: ((path: string, at: { line: number; column: number } | null) => void) | null
+  /**
+   * Show a **directory** in the project's file tree, or `null` when this window has no tree.
+   *
+   * Wired to `runCommand('file.reveal', { path })` and to nothing else, so the whole policy —
+   * open the Files panel first, then report in a sentence when the path has no row — stays in
+   * `keys/dispatch.ts`'s one arm. A second call site straight into `treeStore.reveal` is how
+   * three gestures come to behave in three ways, which that arm's own comment says out loud.
+   *
+   * `null` in a detached pane window, deliberately: that window has no sidebar, so a directory
+   * there is offered no link at all rather than an underline whose command would refuse. Same
+   * rule, same reason, one field over from [`open`].
+   */
+  readonly reveal: ((path: string) => void) | null
 }
 
 const envs = new Map<string, PathLinkEnv>()
@@ -358,39 +386,75 @@ export function attachPathLinks(
   const term = handle.term
 
   /**
-   * What the pointer is over, as recorded by `ILink.hover`.
+   * Whether the pointer is over a link at all, as reported by `ILink.hover`/`leave`.
    *
-   * The single piece of state this module keeps, and the reason it exists is written in the
-   * header: the capture listener swallows the click before xterm's `Linkifier` can see it, so
-   * `ILink.activate` cannot be the route.
+   * A **boolean**, not the action. It used to carry the `act` closure, and that made it the
+   * channel through which a swallowed press performed its open — which is precisely the design
+   * M15 removed: a hover that had not happened (a TUI repainting under a stationary pointer) or
+   * had happened for a line since overwritten made the gate either forward the press to the
+   * child or act on the wrong candidate. The press now resolves against the buffer itself.
+   *
+   * What is left is the one thing hover legitimately knows and a press cannot cheaply re-derive:
+   * whether an underline is currently drawn under the pointer, which is all
+   * [`onClick`]'s "ctrl+click to open it" hint needs.
    */
-  let hovered: { readonly act: () => void } | null = null
+  let hovered = false
 
   const provider = {
     provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
-      void linksFor(y).then(
-        (links) => callback(links),
+      void scanLine(y).then(
+        (scan) =>
+          callback(scan.links.length > 0 ? scan.links.map((entry) => entry.link) : undefined),
         () => callback(undefined),
       )
     },
   }
 
-  async function linksFor(y: number): Promise<ILink[] | undefined> {
+  /**
+   * What one logical line holds: the links to draw, and the candidates that resolved to nothing.
+   *
+   * The second half is not decoration. A press this module has claimed **must** end in something
+   * the user can see, and "`src/foo.rs` does not name a file in this project" is a far better
+   * answer than a generic shrug — but only the scan knows the text that failed. Keeping misses
+   * costs one `rangeOf` per unresolved candidate, which the walk was going to have to do sooner
+   * or later anyway; see [`rangeOf`] on why that stays linear.
+   */
+  interface Scan {
+    /**
+     * Each link, paired with the closure that performs it.
+     *
+     * Paired rather than reached through `ILink.activate`, because that takes a `MouseEvent` it
+     * exists to read modifiers from — and the press handler would have to *fabricate* one to
+     * call it. A synthetic event whose only purpose is to satisfy a guard is a guard that has
+     * stopped meaning anything, and the next reader cannot tell which of the two callers is
+     * real.
+     */
+    links: Array<{ link: ILink; act: () => void }>
+    misses: Array<{ range: ILink['range']; text: string }>
+  }
+
+  const EMPTY_SCAN: Scan = { links: [], misses: [] }
+
+  async function scanLine(y: number): Promise<Scan> {
     const env = envs.get(ctx.paneId)
     // No project, no roots, or nowhere to send an open. The first two mean there is nothing to
     // resolve against — `candidatePaths` would answer `[]` for every candidate anyway — and the
     // third means a link would be drawn that could not do anything. All three return before the
     // line is even scanned, which is what makes "no link" the visible state rather than "a link
     // that swallows clicks".
-    if (env === undefined || env.project === '' || env.roots.length === 0) return undefined
-    if (env.open === null) return undefined
+    //
+    // `reveal` is deliberately NOT part of this test: a window with no file tree still opens
+    // files perfectly well, it simply offers no directory links. Requiring both would take file
+    // links away from every detached pane.
+    if (env === undefined || env.project === '' || env.roots.length === 0) return EMPTY_SCAN
+    if (env.open === null) return EMPTY_SCAN
 
     const [lines, topIdx] = windowedLineStrings(y - 1, term)
-    if (lines.length === 0) return undefined
+    if (lines.length === 0) return EMPTY_SCAN
     const logical = lines.join('')
 
     const candidates = matchPaths(logical)
-    if (candidates.length === 0) return undefined
+    if (candidates.length === 0) return EMPTY_SCAN
 
     // The pane's own cwd first, the spawn cwd second. `candidatePaths` de-duplicates, so a
     // pane that never changed directory pays for one base and not two.
@@ -419,35 +483,63 @@ export function attachPathLinks(
 
     const isFile = (path: string): boolean =>
       existence.get(path) === 'file' || outsideKnown(path) === 'file'
-    const links: ILink[] = []
+    const isDir = (path: string): boolean =>
+      existence.get(path) === 'dir' || outsideKnown(path) === 'dir'
+    const scan: Scan = { links: [], misses: [] }
     let cursor: Cursor = { y: topIdx, x: 0, idx: 0 }
     for (const candidate of candidates) {
-      const resolution = resolveCandidate(candidate.text, { ...bases, isFile })
-      if (resolution.kind === 'none') continue
+      /*
+       * A file first, a directory second, and never both.
+       *
+       * The order is not arbitrary and it is not "files are more interesting": a path cannot be
+       * a regular file and a directory at the same absolute location, so the only way both
+       * answer is a multi-root project where one root holds a file and another a directory of
+       * the same relative name. Taking the file there is the same rule `resolveCandidate`'s
+       * `many` arm refuses to apply — except that here the two answers are of *different kinds*,
+       * and offering "open this file" is strictly more useful than offering to reveal a folder
+       * the user did not point at. The genuinely ambiguous case — two files, or two directories
+       * — still comes back `many` and is still refused.
+       */
+      const asFile = resolveCandidate(candidate.text, { ...bases, isFile })
+      const asDir =
+        asFile.kind === 'none' && env.reveal !== null
+          ? resolveDirectory(candidate.text, { ...bases, isDir })
+          : NONE_RESOLUTION
+      const resolution = asFile.kind === 'none' ? asDir : asFile
       const range = rangeOf(candidate, cursor)
       if (range === null) continue
-      // Advance only on success: a failed mapping leaves the cursor where it was, so the next
-      // candidate still walks from a position we know is correct rather than from a guess.
+      // Advance on every successful mapping, resolved or not: the cursor's only job is to make
+      // the next candidate's walk short, and a candidate that named nothing still tells us
+      // exactly where in the buffer we have reached.
       cursor = { y: range.start.y - 1, x: range.start.x - 1, idx: candidate.start }
-      const act = (): void => activate(env, candidate, resolution)
-      links.push({
-        range,
-        text: candidate.text,
-        // Guarded on the modifier, so a plain click — or the mouseup of a right click, which
-        // `Linkifier._handleMouseUp` does not distinguish — opens nothing. This path only runs
-        // for a press the capture listener below did not swallow.
-        activate: (event: MouseEvent) => {
-          if (event.ctrlKey || event.metaKey) act()
-        },
-        hover: () => {
-          hovered = { act }
-        },
-        leave: () => {
-          hovered = null
+      if (resolution.kind === 'none') {
+        // Kept, not dropped. A press that lands here has already been swallowed, and this is the
+        // only place that still knows what text failed to resolve.
+        scan.misses.push({ range, text: candidate.text })
+        continue
+      }
+      const act = (): void => activate(env, candidate, resolution, resolution === asDir)
+      scan.links.push({
+        act,
+        link: {
+          range,
+          text: candidate.text,
+          // Guarded on the modifier, so a plain click — or the mouseup of a right click, which
+          // `Linkifier._handleMouseUp` does not distinguish — opens nothing. This path only runs
+          // for a press the capture listener below did not swallow.
+          activate: (event: MouseEvent) => {
+            if (event.ctrlKey || event.metaKey) act()
+          },
+          hover: () => {
+            hovered = true
+          },
+          leave: () => {
+            hovered = false
+          },
         },
       })
     }
-    return links.length > 0 ? links : undefined
+    return scan
   }
 
   /** A position in the wrapped block, paired with the string offset it corresponds to. */
@@ -519,6 +611,32 @@ export function attachPathLinks(
     return [line, start]
   }
 
+  /**
+   * Where in the buffer a press landed, in `ILink.range`'s own 1-based coordinates.
+   *
+   * The DOM half of `clickGate.ts`: this reads the rect and the grid, that does the arithmetic.
+   * The split is the point — the arithmetic is what `check-paths.mjs` drives, and a division
+   * written inline here would be back in the one place no check script can compile.
+   */
+  function cellUnder(ev: MouseEvent): Cell | null {
+    // `undefined` before `term.open()`, which a press cannot precede — but the typing is
+    // `HTMLElement | undefined` and a non-null assertion here would be the one place this file
+    // guessed at a lifecycle it does not own.
+    const el = term.element
+    if (el === undefined) return null
+    // The *screen* element, not the terminal element: `term.element` includes the viewport's
+    // scrollbar and any padding, and dividing that by `cols` puts every column half a cell out
+    // by the right-hand edge. `TerminalHandle.cellSize` looks in the same place for the same
+    // reason.
+    const screen = el.querySelector('.xterm-screen')
+    if (!(screen instanceof HTMLElement)) return null
+    return cellFromPoint(ev, screen.getBoundingClientRect(), {
+      cols: term.cols,
+      rows: term.rows,
+      viewportY: term.buffer.active.viewportY,
+    })
+  }
+
   /*
    * The gate. Capture phase, on the host element, before every listener xterm owns — see the
    * header for what is downstream of it and why merely being first is not enough.
@@ -531,14 +649,62 @@ export function attachPathLinks(
     // the next ordinary click in this pane — a swallowed press that opens nothing is the same
     // dead control this whole file is careful to avoid.
     swallowed = false
-    if (ev.button !== 0) return
-    if (!ev.ctrlKey && !ev.metaKey) return
-    const target = hovered
-    if (target === null) return
+    if (pressVerdict(ev) === 'ignore') return
+
+    /*
+     * Claimed before anything is known about what is under the pointer, and that ordering is the
+     * whole fix. Everything below this line is asynchronous — the cwd probe and the existence
+     * probe are IPC round trips — so a design that decided first and swallowed afterwards would
+     * have handed the press to xterm, and through xterm to the child, in the window between.
+     */
     ev.preventDefault()
     ev.stopPropagation()
     swallowed = true
-    target.act()
+
+    const cell = cellUnder(ev)
+    if (cell === null) {
+      // The press was inside the pane but not over the grid — the scrollbar, or the padding
+      // below the last row. Nothing to resolve and nothing worth a sentence: the user pointed at
+      // no text.
+      return
+    }
+    void scanLine(cell.y).then(
+      (scan) => actOnCell(scan, cell),
+      () => {
+        // The scan itself failed — a disposed terminal, or a probe that threw. The press is
+        // already swallowed, so silence here would be the dead gesture this file exists to
+        // avoid.
+        notify('cide could not read the line under the pointer.', { kind: 'info' })
+      },
+    )
+  }
+
+  /**
+   * Do whatever the press pointed at, or say why there is nothing to do.
+   *
+   * **Every branch ends in an action or a sentence.** That is not politeness: the press has
+   * already been taken away from the child, so a branch that returns quietly is a gesture the
+   * user made, cide consumed, and nobody answered — which is the shape of the defect this
+   * project has now found sixteen times.
+   */
+  function actOnCell(scan: Scan, cell: Cell): void {
+    const hit = scan.links.find((entry) => linkAtCell(entry.link.range, cell))
+    if (hit !== undefined) {
+      hit.act()
+      return
+    }
+    const miss = scan.misses.find((candidate) => linkAtCell(candidate.range, cell))
+    if (miss !== undefined) {
+      notify(`${miss.text} does not name a file or folder cide can reach from this pane.`, {
+        kind: 'info',
+        hint: 'Paths resolve against the pane’s working directory and the project’s roots.',
+      })
+      return
+    }
+    notify('There is no file path under the pointer.', {
+      kind: 'info',
+      hint: 'Ctrl+click a path in terminal output to open it, or a folder to show it in the tree.',
+    })
   }
 
   const onClick = (ev: MouseEvent): void => {
@@ -552,7 +718,7 @@ export function attachPathLinks(
       return
     }
     if (ev.button !== 0 || ev.ctrlKey || ev.metaKey) return
-    if (hovered === null) return
+    if (!hovered) return
     // A drag that selected the path is not a click that missed; staying silent there is the
     // whole reason this is on `click` and reads the selection.
     if (term.getSelection() !== '') return
@@ -572,7 +738,7 @@ export function attachPathLinks(
   return () => {
     el.removeEventListener('mousedown', onMouseDown, true)
     el.removeEventListener('click', onClick, true)
-    hovered = null
+    hovered = false
     try {
       registration?.dispose()
     } catch {
@@ -592,10 +758,16 @@ export function attachPathLinks(
  * without a new surface. What it must never do is take the first one — `resolveCandidate` went
  * to the trouble of distinguishing `one` from `many` precisely so this arm could exist.
  */
-function activate(env: PathLinkEnv, candidate: Candidate, resolution: Resolution): void {
+function activate(
+  env: PathLinkEnv,
+  candidate: Candidate,
+  resolution: Resolution,
+  isDirectory: boolean,
+): void {
   if (resolution.kind === 'many') {
+    const what = isDirectory ? 'folders' : 'files'
     notify(
-      `${candidate.text} names ${resolution.paths.length} files in this project, so cide will ` +
+      `${candidate.text} names ${resolution.paths.length} ${what} in this project, so cide will ` +
         'not guess which one you meant.',
       {
         kind: 'info',
@@ -606,11 +778,27 @@ function activate(env: PathLinkEnv, candidate: Candidate, resolution: Resolution
     return
   }
   if (resolution.kind !== 'one') return
+  if (isDirectory) {
+    /*
+     * A directory is shown in the tree, not opened in an editor. `reveal` is
+     * `runCommand('file.reveal', …)` — the same command Ctrl+Shift+E and the Explorer's ⌖ button
+     * run — so the sidebar is brought to Files first and a path with no row reports itself,
+     * both of which are that arm's rules and neither of which is restated here.
+     *
+     * `env.reveal` cannot be null on this path: `scanLine` only resolves a candidate as a
+     * directory when it is non-null. The `?.` is the type system's, not a second opinion.
+     */
+    env.reveal?.(resolution.path)
+    return
+  }
   env.open?.(
     resolution.path,
     candidate.line === null ? null : { line: candidate.line, column: candidate.column ?? 1 },
   )
 }
+
+/** The `none` answer, so `scanLine` can skip the directory probe without an `undefined`. */
+const NONE_RESOLUTION: Resolution = { kind: 'none' }
 
 /**
  * Rebuild the logical line the pointer is on, following the terminal's own wrapping.

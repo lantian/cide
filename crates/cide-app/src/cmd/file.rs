@@ -700,15 +700,32 @@ pub(crate) fn read_document(path: &Path, roots: &[PathBuf], caches: &[PathBuf]) 
 ///
 /// The refusal carries the sentence rather than a code, because the only useful thing to do with
 /// it is show it.
+/// # `ifUnchanged`, and which caller passes it
+///
+/// `None` writes unconditionally. That is what Ctrl+S passes, and it is the right thing for a
+/// keystroke the user typed on purpose.
+///
+/// `Some(stamp)` refuses with [`CoreError::FileChanged`] when the file on disk is no longer the
+/// one the buffer was read from. **Autosave** passes it, and the gap it closes is one autosave
+/// creates: `EditorPane` raises its conflict bar from `cide://session-tool`, which a `sed -i`,
+/// a `cargo fmt` or a `git checkout` never sends. Before autosave, clobbering one of those took
+/// a deliberate Ctrl+S; with autosave-on-blur it takes switching to a terminal, running
+/// `cargo fmt`, and clicking back into the editor — three things nobody decides to do.
+///
+/// The new stamp comes back on success so the buffer's token moves with the write, and the next
+/// autosave compares against what *this* one produced rather than against what the file was
+/// when the tab opened.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn file_write(
     state: State<'_, WorkspaceState>,
     path: String,
     text: String,
-) -> Result<()> {
+    if_unchanged: Option<cide_ipc::FileStamp>,
+) -> Result<Option<cide_ipc::FileStamp>> {
     let roots = open_roots(&state);
     let caches = cide_core::toolchain::dependency_roots();
-    blocking(move || write_document(&PathBuf::from(path), &text, &roots, &caches)).await
+    blocking(move || write_document(&PathBuf::from(path), &text, &roots, &caches, if_unchanged))
+        .await
 }
 
 /// [`file_write`]'s body, over values. See [`read_document`].
@@ -717,11 +734,15 @@ pub(crate) fn write_document(
     text: &str,
     roots: &[PathBuf],
     caches: &[PathBuf],
-) -> Result<()> {
+    if_unchanged: Option<cide_ipc::FileStamp>,
+) -> Result<Option<cide_ipc::FileStamp>> {
     if let Some(reason) = cide_core::toolchain::read_only_reason_in(path, roots, caches) {
         return Err(CoreError::Io(reason));
     }
-    document::write(path, text)
+    // Checked **after** the read-only rule and before anything is written. Order matters only
+    // for the message: a buffer over a registry source that also happens to have moved should
+    // report the rule the user can act on.
+    document::write_if_unchanged(path, text, if_unchanged)
 }
 
 /// Remember where the user is in a file. (M12)
@@ -2290,7 +2311,7 @@ mod read_only_tests {
 
         // The second lock. `writable` is a flag that travelled through the webview and is not
         // evidence about what the disk should accept.
-        let error = write_document(&path, "wiped", &roots, &caches)
+        let error = write_document(&path, "wiped", &roots, &caches, None)
             .expect_err("a dependency source must not be written");
         let message = error.to_string();
         assert!(message.contains("read-only"), "{message}");
@@ -2330,7 +2351,8 @@ mod read_only_tests {
                 &path,
                 "patched\n",
                 std::slice::from_ref(&crate_dir),
-                &caches
+                &caches,
+                None
             )
             .is_ok()
         );
@@ -2354,7 +2376,7 @@ mod read_only_tests {
                 .expect("read")
                 .writable
         );
-        assert!(write_document(&path, "fn main() { }\n", &roots, &caches).is_ok());
+        assert!(write_document(&path, "fn main() { }\n", &roots, &caches, None).is_ok());
         assert_eq!(
             std::fs::read_to_string(&path).expect("written"),
             "fn main() { }\n"
