@@ -1,6 +1,6 @@
 /**
  * Checks `src/sidebar/clipboardModel.ts`, `src/sidebar/fsError.ts` and
- * `src/chrome/pasteConfirm.ts` — every decision the file tree's Copy / Cut / Paste makes
+ * `src/chrome/pasteConfirmModel.ts` — every decision the file tree's Copy / Cut / Paste makes
  * before it calls Rust, what the collision dialog asks, and how the result is reported back.
  *
  * All three in one script rather than a fourth `check:*` beside it: they are one gesture. The
@@ -38,9 +38,9 @@ try {
       'node_modules/typescript/bin/tsc',
       'src/sidebar/clipboardModel.ts',
       'src/sidebar/fsError.ts',
-      // Import-free and DOM-free by design, exactly like `chrome/closeConfirm.ts` — which is
+      // Import-free and DOM-free by design, exactly like `chrome/closeConfirmModel.ts` — which is
       // what lets it be compiled here beside a module that does import something.
-      'src/chrome/pasteConfirm.ts',
+      'src/chrome/pasteConfirmModel.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS and `node10`, like `check-picker.mjs`, and for the reason that script does not
@@ -68,7 +68,7 @@ try {
   const require = createRequire(import.meta.url)
   const m = require(join(out, 'sidebar', 'clipboardModel.js'))
   const errors = require(join(out, 'sidebar', 'fsError.js'))
-  const ask = require(join(out, 'chrome', 'pasteConfirm.js'))
+  const ask = require(join(out, 'chrome', 'pasteConfirmModel.js'))
 
   let failed = 0
   const eq = (actual, expected, what) => {

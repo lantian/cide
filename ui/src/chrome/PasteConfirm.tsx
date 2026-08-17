@@ -21,7 +21,7 @@
  * 3. **Ten collisions are not ten dialogs.** The checkbox answers the rest in one go, naming
  *    how many "the rest" is.
  *
- * The decisions themselves are in `pasteConfirm.ts`, which `check-fs-clipboard.mjs` compiles
+ * The decisions themselves are in `pasteConfirmModel.ts`, which `check-fs-clipboard.mjs` compiles
  * and exercises on its own. Mounted by `sidebar/FileTree.tsx` — the panel that owns the paste
  * gesture — rather than by the shell, so the feature is reachable without touching `App.tsx`.
  */
@@ -39,7 +39,7 @@ import {
   replaceLabel,
   type PasteAnswer,
   type PasteAsk,
-} from './pasteConfirm'
+} from './pasteConfirmModel'
 import styles from './PasteConfirm.module.css'
 
 export interface PasteConfirmProps {
@@ -47,7 +47,7 @@ export interface PasteConfirmProps {
    * The questions and the answers so far.
    *
    * Typed as the model's own structural `CollisionLike`, not as the generated `PasteCollision`
-   * — `pasteConfirm.ts` is compiled on its own by the check script and cannot import the
+   * — `pasteConfirmModel.ts` is compiled on its own by the check script and cannot import the
    * bindings. The two are pinned together at `startAsk` in `FileTree.tsx`, which is handed the
    * real generated array and stops compiling if `cargo xtask codegen` renames a field.
    */

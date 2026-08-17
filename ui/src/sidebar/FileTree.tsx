@@ -87,7 +87,7 @@ import {
   startAsk,
   type PasteAnswer,
   type PasteAsk,
-} from '@/chrome/pasteConfirm'
+} from '@/chrome/pasteConfirmModel'
 import {
   diag,
   fs as fsApi,
@@ -2037,7 +2037,7 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
         * exactly as it would from the root — and being a sibling of the scroller rather than a
         * child keeps it out of the `role="tree"` subtree.
         *
-        * Nothing has been written when this is on screen; see `pasteConfirm.ts`.
+        * Nothing has been written when this is on screen; see `pasteConfirmModel.ts`.
         */}
       {pendingPaste !== null && (
         <PasteConfirm ask={pendingPaste.ask} onAnswer={answerPaste} onCancel={cancelPaste} />

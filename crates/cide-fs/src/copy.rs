@@ -1587,7 +1587,7 @@ mod tests {
 
     /// *Apply to all remaining* is a list of decisions, and it covers exactly the rest.
     ///
-    /// The frontend builds the list (`ui/src/chrome/pasteConfirm.ts`); this is the half that
+    /// The frontend builds the list (`ui/src/chrome/pasteConfirmModel.ts`); this is the half that
     /// has to honour it — three answers arriving as three entries and three overwrites, with
     /// nothing renamed and nothing asked about twice.
     #[test]

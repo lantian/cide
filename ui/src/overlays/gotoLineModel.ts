@@ -16,6 +16,10 @@
  * standalone and drive every case. This project has paid three times for a rule that lived only
  * in an event handler, which is the one place no check script can reach.
  *
+ * The `…Model` suffix is the same repair `closeConfirmModel.ts` explains: `gotoLine.ts` beside
+ * `GoToLine.tsx` differs only in case, which is one path on macOS and a build failure there.
+ * `ui/scripts/check-casing.mjs` is the gate that sees it from Linux.
+ *
  * # The syntax, and the three things deliberately left out
  *
  * `120` and `120:8`, and nothing else.

@@ -87,6 +87,7 @@ Which check covers what you touched:
 | terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
 | `windows/`, detach and re-dock | `check:detached`, `check:window-controls` |
 | `cide-lang`, `cide-lsp`, symbol navigation, diagnostics | `check:outline`, `check:problems`, `check:commands`, `check:keys` |
+| **added, renamed or moved any file** | `check:casing` — a name differing from a sibling's only in case is one path on macOS, and it cost a Mac build once (see README's Platforms) |
 
 ## Architecture
 

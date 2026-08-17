@@ -13,7 +13,7 @@
  */
 import { create } from 'zustand'
 import type { SessionSummary, UnsavedTab } from '@/ipc/client'
-import { advanceClose, parkClose, type CloseScope } from './closeConfirm'
+import { advanceClose, parkClose, type CloseScope } from './closeConfirmModel'
 
 export interface PendingClose {
   scope: CloseScope

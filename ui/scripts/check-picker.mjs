@@ -63,7 +63,7 @@ try {
       'src/overlays/score.ts',
       'src/overlays/format.ts',
       'src/overlays/listKeys.ts',
-      'src/overlays/gotoLine.ts',
+      'src/overlays/gotoLineModel.ts',
       // M14. The Find usages popup's four indistinguishable-looking empty states, its filter
       // predicate and its file count. Import-free for exactly this reason.
       'src/overlays/usagesModel.ts',
@@ -90,7 +90,7 @@ try {
   const { groupDigits, matchCounter, basename, dirname, kindBadge, pickerEmptyState, pickerEmptyText } =
     require(join(out, 'overlays/format.js'))
   const { listAction, PAGE_ROWS } = require(join(out, 'overlays/listKeys.js'))
-  const { canGo, gotoNote, parseGoto } = require(join(out, 'overlays/gotoLine.js'))
+  const { canGo, gotoNote, parseGoto } = require(join(out, 'overlays/gotoLineModel.js'))
   const usages = require(join(out, 'overlays/usagesModel.js'))
   const { chunkOf, chunkRequest, chunksFor, chunksToEvict } = require(
     join(out, 'sidebar/rowWindow.js'),

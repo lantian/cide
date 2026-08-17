@@ -155,6 +155,34 @@ behaviour-identical. It is kept on the platforms that have it because the commen
 records *why* the window is opaque, and a comment attached to a live line survives a change of
 tauri's default loudly instead of silently.
 
+### And what the first Mac *bundle* reported: the filesystem, not the code
+
+Two failures, in order, neither of them visible from Linux and neither in Rust.
+
+**One: no `pnpm`.** `cargo tauri build` runs `beforeBuildCommand` before it compiles anything, so
+the run ended in `sh: pnpm: command not found` — after the release build of `cide-hook`. That is
+now a preflight verdict; see *Packaging* below and *What the Mac itself needs* above.
+
+**Two: three pairs of file names that differ only in case.** `chrome/CloseConfirm.tsx` (the
+dialog) sat beside `chrome/closeConfirm.ts` (its rules), and the same for `PasteConfirm` and
+`GoToLine`. That is this codebase's documented split — the component in PascalCase, the testable
+half in camelCase — and on Linux it is three ordinary pairs. APFS is **case-insensitive** by
+default, and TypeScript resolves a bare specifier `.ts` before `.tsx`, so on a Mac
+`import { CloseConfirm } from '@/chrome/CloseConfirm'` asked for `CloseConfirm.ts`, got
+`closeConfirm.ts`, and reported the component missing from its own module. Seven errors in three
+files, every one blaming an import that is correct.
+
+The rules modules are now `closeConfirmModel.ts`, `pasteConfirmModel.ts` and `gotoLineModel.ts`,
+following `branchModel.ts` and `menuModel.ts`, which have the same shape and never collided
+because they were never a component's name. **`pnpm --dir ui run check:casing` is the gate**, and
+it is the interesting part: the collision cannot be observed on the platform this is developed
+on, so the check does not look for it — it walks the tree and refuses any directory holding two
+names that differ only in case (whole names, anywhere in the repository, because such a pair
+cannot be checked out on a Mac at all; and module *stems* under the TypeScript extensions,
+because that pair resolves to the wrong file). It carries a positive control over the exact names
+that broke, since every other assertion in it is a "no such pair exists" that would go green for
+ever if the detector stopped detecting.
+
 ### Type-checking for macOS from Linux — partly, and not where it would have helped
 
 `cargo check` never links, so Apple's linker and SDK are irrelevant to it. What stops a

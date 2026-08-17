@@ -29,14 +29,14 @@
  * rebind it.
  *
  * What was worth taking from it is the *semantics*, and those are taken: `line`, `line:column`,
- * and a clamp rather than an error for a line past the end. The parsing lives in `gotoLine.ts`,
+ * and a clamp rather than an error for a line past the end. The parsing lives in `gotoLineModel.ts`,
  * which imports nothing so `check:picker` can drive every case — including the ones that are only
  * visible as a wrong caret position.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { focusedCaret } from '@/editor/caretTrack'
-import { canGo, resolveGoto, gotoNote, parseGoto } from './gotoLine'
+import { canGo, resolveGoto, gotoNote, parseGoto } from './gotoLineModel'
 import styles from './GoToLine.module.css'
 
 export interface GoToLineProps {

@@ -7,7 +7,7 @@
  * may be asked at all and what it says; `chrome/outsideOpenStore.ts` holds the pending one and
  * `chrome/ConfirmDestructive.tsx` draws it.
  *
- * Split out for the reason `chrome/pasteConfirm.ts` is split out of `PasteConfirm.tsx`, and for
+ * Split out for the reason `chrome/pasteConfirmModel.ts` is split out of `PasteConfirm.tsx`, and for
  * the reason this project has now paid for twice: a rule that lives in a `useCallback` or a
  * `.catch` is in the one place no check script can compile. `ui/scripts/check-outside-open.mjs`
  * compiles this file on its own and runs the rules below, so it is DOM-free and import-free —

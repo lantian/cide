@@ -15,7 +15,7 @@ import { windowProjectsOf } from '@/keys/target'
 import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
-import type { CloseScope } from '@/chrome/closeConfirm'
+import type { CloseScope } from '@/chrome/closeConfirmModel'
 import { planFileIndex, type IndexTarget } from './fileIndex'
 import {
   app as appApi,

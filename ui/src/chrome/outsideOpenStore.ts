@@ -24,7 +24,7 @@
  * terminal to ctrl+click and a second request cannot be made by hand. A request arriving anyway
  * — a stray programmatic call — is **dropped**, not queued and not allowed to replace: replacing
  * would swap the path under a user who is mid-read, which is the one thing a dialog whose entire
- * job is *read this path* must never do. `closeConfirm` queues because "Close others" genuinely
+ * job is *read this path* must never do. `closeConfirmStore` queues because "Close others" genuinely
  * fires one refusal per tab; nothing here fires in bulk.
  */
 import { create } from 'zustand'

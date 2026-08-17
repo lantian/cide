@@ -1,5 +1,5 @@
 /**
- * Checks `src/chrome/closeConfirm.ts` — the decision and the wording behind the close
+ * Checks `src/chrome/closeConfirmModel.ts` — the decision and the wording behind the close
  * confirmation.
  *
  * Two properties are worth pinning, and they pull in opposite directions, which is exactly
@@ -44,7 +44,7 @@ try {
     'node',
     [
       'node_modules/typescript/bin/tsc',
-      'src/chrome/closeConfirm.ts',
+      'src/chrome/closeConfirmModel.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -66,7 +66,7 @@ try {
     count,
     parkClose,
     advanceClose,
-  } = await import(`file://${join(out, 'closeConfirm.js')}`)
+  } = await import(`file://${join(out, 'closeConfirmModel.js')}`)
 
   const file = (title, path) => ({ title, path, projectName: 'cide' })
   const session = (paneTitle, state) => ({ paneTitle, projectName: 'cide', state: { state } })

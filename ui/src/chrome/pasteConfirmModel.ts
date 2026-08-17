@@ -8,7 +8,11 @@
  * the common case — *I meant to replace that file* — impossible without deleting first. This
  * module is the decision half of the dialog that fixes it; `PasteConfirm.tsx` is the markup.
  *
- * Split out for the reason `closeConfirm.ts` is split out of `CloseConfirm.tsx`: the mistakes
+ * The `…Model` suffix is not decoration: `pasteConfirm.ts` beside `PasteConfirm.tsx` is one path
+ * on macOS, where it broke the build in the way `closeConfirmModel.ts`'s header records and
+ * `ui/scripts/check-casing.mjs` now prevents.
+ *
+ * Split out for the reason `closeConfirmModel.ts` is split out of `CloseConfirm.tsx`: the mistakes
  * are all in here, and in here they can be tested. `ui/scripts/check-fs-clipboard.mjs` compiles
  * this file on its own and runs the rules below, so it is DOM-free and import-free —
  * [`CollisionLike`] is a structural subset of the generated `PasteCollision`, declared rather

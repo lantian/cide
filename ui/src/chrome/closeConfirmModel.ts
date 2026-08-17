@@ -11,6 +11,13 @@
  *  2. It **names** what would be lost. "3 items" tells a user nothing they can act on;
  *     `main.rs`, `Cargo.toml`, `notes.md` tells them whether to stop.
  *
+ * **`…Model` and not `closeConfirm.ts`, which is what this file was called.** A module whose
+ * name differs from a component's only in case is one path on a case-insensitive filesystem, so
+ * on macOS `import '@/chrome/CloseConfirm'` resolved *here* — TypeScript tries `.ts` before
+ * `.tsx` — and reported the component missing from its own file. `ui/scripts/check-casing.mjs`
+ * is the gate that now catches that from Linux; `branchModel.ts` and `menuModel.ts` are the
+ * naming it follows.
+ *
  * DOM-free and import-free, so the check script can compile it with nothing but `tsc` — the
  * same shape as `overlays/score.ts` and `store/statusFormat.ts`. The types below are
  * structural subsets of the generated `UnsavedTab` and `SessionSummary`, declared here

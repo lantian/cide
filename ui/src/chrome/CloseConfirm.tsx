@@ -31,7 +31,7 @@ import {
   sessionRow,
   unsavedRow,
   type CloseScope,
-} from './closeConfirm'
+} from './closeConfirmModel'
 import styles from './CloseConfirm.module.css'
 
 export interface CloseConfirmProps {

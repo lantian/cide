@@ -7,6 +7,7 @@
     "build": "tsc --noEmit && vite build",
     "check:awaiting": "node scripts/check-awaiting.mjs",
     "check:branches": "node scripts/check-branches.mjs",
+    "check:casing": "node scripts/check-casing.mjs",
     "check:claude-cli": "node scripts/check-claude-cli.mjs",
     "check:claude-env": "node scripts/check-claude-env.mjs",
     "check:close": "node scripts/check-close-confirm.mjs",
