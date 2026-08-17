@@ -22,7 +22,7 @@
  * Run: `pnpm --dir ui run check:menu-model`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -190,15 +190,29 @@ try {
   const extra = tab('t2', { kind: 'claudeFull', title: 'Claude' })
   const tabs = [console_, file, extra]
 
+  /**
+   * Record every bulk close as **one call with a list**, not as N calls.
+   *
+   * The list-of-lists shape is the assertion, not a convenience: the defect being fixed is three
+   * menu items that fired one close per tab and so raised one confirmation dialog per unsaved
+   * file, for a gesture the user made once. `[['t1','t2']]` and `[['t1'],['t2']]` both flatten to
+   * the same ids, so a check that only looked at the ids would pass against the bug.
+   */
+  const recorder = () => {
+    const calls = []
+    return { calls, closeMany: (ids) => calls.push(ids) }
+  }
+
   ok(!closable(console_), 'the pinned console is not closable')
   ok(closable(file) && closable(extra), 'everything else is')
   eq(pathOf(file), '/repo/src/main.rs', 'a file tab is about its path')
   eq(pathOf(console_), null, 'a console tab is about nothing on disk')
 
   {
-    const closed = []
+    const bulk = recorder()
     const entries = tabMenuEntries(tabs, file, 't1', {
-      close: (id) => closed.push(id),
+      close: () => {},
+      closeMany: bulk.closeMany,
       split: () => {},
       detach: () => {},
       copy: () => {},
@@ -206,21 +220,65 @@ try {
 
     eq(
       shape(entries),
-      ['close', 'close-others', 'close-right', '--', 'split', 'detach', '--', 'copy-path'],
-      'the workspace tab menu is the six items the request named, in three groups',
+      [
+        'close',
+        'close-others',
+        'close-left',
+        'close-right',
+        '--',
+        'split',
+        'detach',
+        '--',
+        'copy-path',
+      ],
+      'the workspace tab menu is the seven items, in three groups, with left before right',
     )
     item(entries, 'close-right').run()
-    eq(closed, ['t2'], 'Close to the right closes only what follows this tab')
+    eq(bulk.calls, [['t2']], 'Close to the right closes only what follows this tab, in one call')
 
-    closed.length = 0
+    bulk.calls.length = 0
     item(entries, 'close-others').run()
-    eq(closed, ['t2'], 'Close others skips the pinned console as well as this tab')
+    eq(bulk.calls, [['t2']], 'Close others skips the pinned console as well as this tab')
+  }
+
+  // ---------------------------------------------------------------- Close to the left
+  //
+  // The whole point of the item, and the case the naive `slice(0, index)` gets wrong: the
+  // console is at index 0, so it is to the left of *everything*. An implementation that did not
+  // filter by `closable` would offer this on `t1` and then fail against `CoreError::TabPinned` —
+  // a menu entry that errors, which is worse than one that is not offered.
+  {
+    const bulk = recorder()
+    const four = [console_, file, extra, tab('t3', { kind: 'settings', section: 'general' })]
+    const entries = tabMenuEntries(four, four[2], 't0', { close: () => {}, ...bulk })
+    item(entries, 'close-left').run()
+    eq(bulk.calls, [['t1']], 'Close to the left closes what precedes this tab and never the console')
+  }
+  {
+    const bulk = recorder()
+    const entries = tabMenuEntries(tabs, file, 't1', { close: () => {}, ...bulk })
+    eq(
+      item(entries, 'close-left').disabledReason,
+      'Nothing to the left can be closed',
+      'the first closable tab has only the pinned console to its left, and the line says so '
+        + 'rather than being absent or present-and-inert',
+    )
+    ok(item(entries, 'close-left').run === undefined, 'and it genuinely cannot be run')
+  }
+  {
+    const bulk = recorder()
+    const entries = tabMenuEntries(tabs, console_, 't0', { close: () => {}, ...bulk })
+    eq(
+      item(entries, 'close-left').disabledReason,
+      'Nothing to the left can be closed',
+      'and the console itself has nothing to its left at all',
+    )
   }
 
   {
     // Offered and disabled with a reason rather than dropped: an item that comes and goes with
     // the tab order is one the user has to hunt for.
-    const entries = tabMenuEntries(tabs, extra, 't2', { close: () => {} })
+    const entries = tabMenuEntries(tabs, extra, 't2', { close: () => {}, closeMany: () => {} })
     eq(
       item(entries, 'close-right').disabledReason,
       'Nothing to the right can be closed',
@@ -228,8 +286,31 @@ try {
     )
   }
 
+  /*
+   * A host that supplies `close` but not `closeMany` gets three disabled lines, not three lines
+   * that quietly close one tab at a time.
+   *
+   * This is the assertion that stops the loop coming back. The tempting "fallback to `close`"
+   * would leave two behaviours in the app for one gesture — one asking once, one asking per file
+   * — and the wrong one would survive in whichever surface nobody re-tested.
+   */
   {
-    const entries = tabMenuEntries(tabs, console_, 't0', { close: () => {} })
+    // A tab with something on *both* sides, so all three sets are non-empty and the only reason
+    // any of them could be off is the missing door. On `t1` the left set is legitimately empty
+    // (only the console precedes it) and that more specific sentence wins, which is right — and
+    // would make this assertion pass for the wrong reason.
+    const four = [console_, file, extra, tab('t3', { kind: 'settings', section: 'general' })]
+    const entries = tabMenuEntries(four, extra, 't2', { close: () => {} })
+    for (const id of ['close-others', 'close-left', 'close-right']) {
+      eq(item(entries, id).disabledReason, NO_HOST, `${id} needs the bulk door, not \`close\``)
+      ok(item(entries, id).run === undefined, `and ${id} is not runnable without it`)
+    }
+    ok(typeof item(entries, 'close').run === 'function', 'while single Close still works')
+  }
+
+  {
+    const bulk = recorder()
+    const entries = tabMenuEntries(tabs, console_, 't0', { close: () => {}, ...bulk })
     eq(
       item(entries, 'close').disabledReason,
       PINNED_REASON,
@@ -237,6 +318,8 @@ try {
     )
     const right = item(entries, 'close-right')
     ok(typeof right.run === 'function', 'the console can close the tabs to its right')
+    right.run()
+    eq(bulk.calls, [['t1', 't2']], 'and it closes both of them in one gesture, not two')
   }
 
   {
@@ -307,6 +390,54 @@ try {
     'p1',
     'a window showing one project still names it',
   )
+
+  // =====================================================================================
+  // 5. The bulk close, as source — because everything above passes with nothing wired
+  // =====================================================================================
+  //
+  // Section 3 drives `tabMenuEntries` against a fixture `closeMany`, so all of it stays green
+  // while the app hands the model nothing: the three items would simply read *"Not available in
+  // this window"* for ever, on a surface where the reason sounds plausible. That is this
+  // project's signature defect wearing its most convincing disguise, and only a grep over the
+  // wiring catches it.
+  //
+  // Stripped of comments first. `TabActions.closeMany` and `TabStripProps.onCloseMany` are each
+  // documented in a paragraph that names the identifier several times, so a raw grep would
+  // certify the prose of a feature that had been removed.
+  {
+    const strip = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+    const tabStrip = strip(readFileSync('src/chrome/TabStrip.tsx', 'utf8'))
+    const app = strip(readFileSync('src/App.tsx', 'utf8'))
+    const store = strip(readFileSync('src/store/workspace.ts', 'utf8'))
+    const model = strip(readFileSync('src/chrome/menuModel.ts', 'utf8'))
+
+    ok(
+      /closeMany: onCloseMany/.test(tabStrip),
+      'the strip hands the model its bulk-close door — without it all three items are disabled ' +
+        'with a reason that reads like a legitimate state',
+    )
+    ok(
+      /onCloseMany=\{\(ids\) => void closeTabs\(activeProject\.id, ids\)\}/.test(app),
+      'and App.tsx supplies it, which is the one call site and the whole difference between a ' +
+        'menu item and a sentence about one',
+    )
+    /*
+     * The store asks ONCE. This is the assertion that stops the loop coming back: the model can
+     * hand over a list and the store can still spend it one `closeTab` at a time, which is the
+     * behaviour being replaced — one risk round trip per tab, one refusal per dirty file, and
+     * `closeConfirmStore` queueing a modal for each.
+     */
+    ok(
+      /tabsCloseRisk\(get\(\)\.boot, project, tabs\)/.test(store) && /scope: 'tabs'/.test(store),
+      'and the store asks about the whole batch once, under the plural scope — not once per tab',
+    )
+    ok(
+      !/forEach\(\(t\) => close\(t\.id\)\)/.test(model),
+      'and the model no longer closes tabs in a loop of its own: two doors for one gesture is ' +
+        'how the wrong one survives in whichever surface nobody re-tested',
+    )
+  }
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

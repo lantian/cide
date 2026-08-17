@@ -1059,11 +1059,21 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * including a terminal. That is the point: the thumb button is pressed wherever the
          * pointer is.
          */
-        const refusal = navigate(command === 'navigate.back' ? 'back' : 'forward')
-        if (refusal !== null) {
-          notify(refusal, { kind: 'info' })
-          return
-        }
+        /*
+         * Awaited now, because one refusal is only known after a round trip: a Back into a file
+         * that has been deleted since answers `gone`, and the sentence naming it is worth as
+         * much as the empty-history one — more, since a tab reading "This file could not be
+         * opened" with no path in it was what the user used to get instead.
+         *
+         * `void` with a `.then` rather than making this arm `async`: the dispatcher is
+         * synchronous by design — it decides whether a key was consumed, and a promise cannot
+         * answer that in time for `preventDefault`.
+         */
+        void navigate(command === 'navigate.back' ? 'back' : 'forward').then((refusal) => {
+          if (refusal !== null) {
+            notify(refusal, { kind: 'info' })
+          }
+        })
         return
       }
 

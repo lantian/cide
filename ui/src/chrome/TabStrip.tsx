@@ -28,12 +28,13 @@
  * could say which is behind a tab you have to guess at. The tab strip is the one part of a
  * background tab that stays visible, which is why the count goes here.
  */
-import type { ReactNode } from 'react'
+import { useRef, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
 import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { tabMenuEntries } from './menuModel'
+import { useTabDrag } from './useTabDrag'
 import styles from './TabStrip.module.css'
 
 export interface TabStripProps {
@@ -41,6 +42,14 @@ export interface TabStripProps {
   activeTab: TabId
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
+  /**
+   * Close several tabs as one gesture — the menu's *Close others* / *to the left* / *to the
+   * right*.
+   *
+   * Separate from `onClose` because it must ask about unsaved work **once**, naming every file
+   * at stake, rather than once per tab. See `TabActions.closeMany` and the store's `closeTabs`.
+   */
+  onCloseMany?: ((ids: TabId[]) => void) | undefined
   /**
    * Split the **active** tab's focused pane sideways.
    *
@@ -72,6 +81,19 @@ export interface TabStripProps {
    * pretending.
    */
   onDetach?: (() => void) | undefined
+  /**
+   * Move a tab along the strip. Absent makes the strip inert rather than pretending.
+   *
+   * `before` is the tab the dragged one lands **in front of**, `null` for the end — the shape
+   * `tab.reorder` takes, and ids rather than indices for the reason that command documents: the
+   * boundary is computed here against a snapshot, and the strip can change before the drop.
+   *
+   * Optional because `App.tsx` renders a second, handler-free `<TabStrip>` for the chrome audit,
+   * and a fixture whose tabs could be dragged into a workspace that does not exist would be a
+   * crash rather than a feature. `useTabDrag` refuses to start a gesture without it, so the
+   * audit strip is inert by construction rather than by remembering not to touch it.
+   */
+  onReorder?: ((tab: TabId, before: TabId | null) => void) | undefined
 }
 
 export function TabStrip({
@@ -79,9 +101,23 @@ export function TabStrip({
   activeTab,
   onActivate,
   onClose,
+  onCloseMany,
   onSplit,
   onDetach,
+  onReorder,
 }: TabStripProps) {
+  const tablist = useRef<HTMLDivElement | null>(null)
+  const drag = useTabDrag({
+    tabs,
+    container: tablist,
+    // Narrowed back to the branded ids at the seam. `tabDrag.ts` works in plain strings so a bare
+    // `tsc` can compile it standalone — the constraint its header states — and this is the one
+    // place that knows those strings are `TabId`s.
+    ...(onReorder
+      ? { onReorder: (tab: string, before: string | null) => onReorder(tab as TabId, before as TabId | null) }
+      : {}),
+  })
+
   const menu = useContextMenu({
     label: 'Tab',
     items: ({ target }) => {
@@ -96,6 +132,7 @@ export function TabStrip({
       const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard
       return tabMenuEntries(tabs, tab, activeTab, {
         close: onClose,
+        closeMany: onCloseMany,
         split: onSplit,
         detach: onDetach,
         ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
@@ -106,10 +143,25 @@ export function TabStrip({
   // The `data-audit` attributes below are how chrome/layoutAudit.ts locates this surface:
   // CSS Module class names are hashed at build time, so nothing outside can select on them.
   return (
-    <div className={styles.strip} data-audit="tabStrip" onContextMenu={menu.onContextMenu}>
+    <div
+      className={styles.strip}
+      data-audit="tabStrip"
+      // A right-click mid-drag would open a menu about a tab that is in flight, over a caret the
+      // user is still aiming — and the menu's own pointer handling would fight the capture.
+      onContextMenu={(e) => {
+        if (drag.state !== null) return
+        menu.onContextMenu(e)
+      }}
+      // Kills the hover wash while a drag is in flight: the pointer is captured, so the tab under
+      // it lights up as though it were the target when the caret is the only thing that says so.
+      // The same channel `ChangesTree` and `FileTree` use, on the same attribute name.
+      {...(drag.state !== null ? { 'data-dragging': '' } : {})}
+    >
       {/* The tablist holds tabs and nothing else. It used to share the strip with a split and
-          a detach button; both are gone — see `TabStripProps`. */}
-      <div className={styles.tabs} role="tablist" aria-label="Open tabs">
+          a detach button; both are gone — see `TabStripProps`. It is `position: relative` so the
+          insertion caret can be absolutely positioned against it, which is also what makes
+          `offsetLeft` in `useTabDrag` measure from its left edge. */}
+      <div className={styles.tabs} role="tablist" aria-label="Open tabs" ref={tablist}>
         {tabs.map((tab) => (
           <TabItem
             key={tab.id}
@@ -117,8 +169,29 @@ export function TabStrip({
             active={tab.id === activeTab}
             onActivate={onActivate}
             onClose={onClose}
+            onPick={drag.onPointerDown}
+            dragged={drag.dragged}
+            inFlight={drag.state?.drag.tab === tab.id}
           />
         ))}
+        {/*
+         * The insertion caret: a 2px rule in the accent, drawn in the gap the drop would land in.
+         *
+         * A caret rather than opening a gap between two tabs, and that is a rule this stylesheet
+         * already states at length for the awaiting marker: the strip is 30px tall with 12-13px
+         * paddings and it reflows *under the pointer* — a tab that moves as it is being aimed at
+         * is a tab that gets clicked wrong. A gap-based preview violates that on every pointer
+         * move; a zero-width overlay cannot. It is also why the caret is `position: absolute`
+         * rather than a flex child: a flex child would shift every tab after it by 2px and the
+         * layout audit measures those positions.
+         */}
+        {drag.state !== null && (
+          <div
+            className={styles.caret}
+            style={{ left: `${drag.state.caretX}px` }}
+            aria-hidden="true"
+          />
+        )}
       </div>
       <div className={styles.spacer} />
       {menu.menu}
@@ -131,9 +204,15 @@ interface TabItemProps {
   active: boolean
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
+  /** The press that may become a reorder. Decides for itself whether this tab can start one. */
+  onPick: (e: React.PointerEvent, tab: Tab) => void
+  /** Whether the gesture just ending was a drag — see the guard on `onClick` below. */
+  dragged: () => boolean
+  /** This is the tab in flight, so it is dimmed to show what is being moved. */
+  inFlight: boolean
 }
 
-function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
+function TabItem({ tab, active, onActivate, onClose, onPick, dragged, inFlight }: TabItemProps) {
   const view = viewFor(tab.kind)
   const shell = active ? `${styles.tab} ${styles.tabActive}` : styles.tab
   const label = view.closable ? styles.label : `${styles.label} ${styles.labelPinned}`
@@ -157,6 +236,11 @@ function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
       data-tab-id={tab.id}
       data-active={active ? 'true' : 'false'}
       data-awaiting={waiting > 0 ? String(waiting) : 'false'}
+      // The press that may become a reorder. On the row rather than on the label button, so a
+      // grab anywhere in the tab's box starts it — the same "one box the pointer can hit
+      // anywhere" contract the label's negative margins exist to preserve.
+      onPointerDown={(e) => onPick(e, tab)}
+      {...(inFlight ? { 'data-drag': '' } : {})}
     >
       <button
         type="button"
@@ -167,7 +251,14 @@ function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
         // stays one box the pointer can hit anywhere — so the tab's own tooltip carries the
         // sentence, and the exact count that `9+` stops spelling out.
         title={hint ? `${view.hint} — ${hint}` : view.hint}
-        onClick={() => onActivate?.(tab.id)}
+        // Guarded by the drag, because `click` fires after `pointerup` and a drop would
+        // otherwise *also* activate the tab it just moved. Harmless-looking and not: dropping a
+        // background tab into a new position would yank the user out of whatever they were
+        // reading, which is a second, unasked-for consequence of a gesture about order alone.
+        onClick={() => {
+          if (dragged()) return
+          onActivate?.(tab.id)
+        }}
       >
         {view.body}
       </button>
@@ -197,7 +288,16 @@ function TabItem({ tab, active, onActivate, onClose }: TabItemProps) {
           type="button"
           className={view.dirty ? `${styles.close} ${styles.closeDirty}` : styles.close}
           title={view.dirty ? 'Close (unsaved changes)' : 'Close tab'}
-          onClick={() => onClose?.(tab.id)}
+          // Guarded by the drag for the same reason the label is, and the stakes here are
+          // higher: a press that starts on `×` and turns into a reorder must not *also* close
+          // the tab it just moved. Pointer capture normally retargets the `click` to the row and
+          // this button never hears it — but capture can fail (a pointer released before the
+          // threshold, an engine that refuses the call), and the fallback path of a guard that
+          // discards work is not a fallback worth having.
+          onClick={() => {
+            if (dragged()) return
+            onClose?.(tab.id)
+          }}
         >
           {view.dirty ? '•' : '×'}
         </button>

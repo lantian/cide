@@ -173,6 +173,147 @@ tab strip's right-click menu: a menu item that cannot be honestly disabled — t
 webview — and that silently does nothing is the surface where silence is worst, so the two routes
 are the chord and the palette.
 
+## Scrolling a Claude session (M16), and what is not done
+
+**The scrolling belongs to Claude Code, not to cide.** A Claude pane runs on the alternate
+screen (`ESC[?1049h`, confirmed live from the spawned CLI's first 60 bytes), and the alternate
+buffer has no scrollback by definition — so there is no cide-side scrollback to give. What
+happens instead is that xterm.js forwards the wheel to the child as an SGR mouse report and the
+CLI scrolls its own transcript. That path works: driving a resumed 2.3 MB session, 400 wheel-ups
+travelled roughly 1200 transcript lines without ever reaching the top, and every single report
+produced a repaint. `PageUp`/`PageDown` scroll it too, and are bound to no command in
+`cide_core::keymap`, so the gate passes them straight through.
+
+Two numbers multiply to give what one notch of the wheel is worth, and **cide owns only one of
+them**. xterm.js sends at most **one report per DOM wheel event** — `sendEvent` computes a line
+count and then discards it — and `CoreMouseService.consumeWheelEvent` scales any event with
+`|deltaY| < 50` by `0.3`, believing it to be a trackpad. A high-resolution wheel under Wayland
+delivers one notch as several small deltas, which is exactly that regime. The other number is
+`CLAUDE_CODE_SCROLL_SPEED`, the transcript lines the CLI moves per report, and that is now
+**Settings → Claude sessions → Scroll speed**, 1 to 20.
+
+**Three environment switches were reachable from nothing, and that is case #20.** `disableMouse`,
+`altScreenFullRepaint` and `disableAlternateScreen` were declared in `cide-ipc` with doc comments
+naming the variable each one sets, persisted, bound to TypeScript, and drawn as switches under a
+panel reading *"Applied at spawn — these reach a pane's child process when it starts"*. Nothing in
+the workspace read any of them; `resumeAllOnLaunch` was the struct's only field with a consumer.
+It mattered more than the usual instance, because *"Disable the alternate screen"* is precisely
+the control a user chasing a scrollable transcript reaches for. They are wired now, through
+`cide_core::child_env::claude_env` into `base_env`, and `check:claude-env` compares the set of
+variables the Settings screen names against the set a spawn actually sets, in both directions.
+
+**Not done.** Whether this machine's mouse is in the `< 50` regime is **unmeasured** — it needs a
+physical wheel over a running window, and no lane may launch the app while sibling `claude`
+children are alive. The measurement is `./run.sh --inspect`, then
+`addEventListener('wheel', e => console.log(e.deltaMode, e.deltaY), {capture: true})` over a Claude
+pane, one notch. Several events each under 50 means the trackpad clamp is eating the gesture, and
+the fix is `scrollSensitivity` — a real xterm 6.0.0 option, and the *only* lever that does not
+require cide to encode mouse reports itself, which ADR 0003 assigns to xterm. It must be applied
+**only while the pane is in the mouse-reporting regime**: the normal-screen path is a separate
+VS Code `ScrollableElement` with no trackpad clamp, so raising it globally would speed up a bash
+pane's scrollback, which is not broken. `shift`+wheel is inert in a Claude pane and stays that
+way — xterm drops it in `consumeWheelEvent` before any protocol runs, confirmed at zero bytes.
+
+## The tab strip: drag to reorder, Close to the left, and Back into a closed file (M16)
+
+| gesture | what it does |
+| --- | --- |
+| **drag a tab** | move it along the strip; an accent caret shows where it will land |
+| **right-click → Close to the left** | close everything before this tab, asking about unsaved work once |
+| **Back / Forward** (the mouse's thumb buttons) | reopen a closed file *as it was* — split, pane ids and all |
+
+`navigate.back` and `navigate.forward` have **no key binding by default** — the thumb buttons are
+it. `Ctrl+Alt+←`/`→` are not them and must not be written down as if they were: `ctrl+alt+right` is
+`pane.split.right`, which on any tab but the console splits the pane and spawns a *new* `claude`
+child, so a reader who trusted that line got a running process instead of a navigation. *Language
+support (M12)* below carries the `keymap.json` entries if you want keys as well —
+`ctrl+alt+shift+left`/`right` are free in every layer.
+
+**Reordering was implemented and reachable from nothing, and that is two more for the count.**
+`cide_core::workspace::reorder_tab` has been complete, invariant-preserving and covered by three
+passing tests since M4, and no `#[tauri::command]` called it: the domain rule existed, the seam did
+not, and the tests said nothing about whether a user could do the thing. That is case #18 of this
+project's signature defect. **Case #19 is still open beside it**: `project_reorder` is complete end
+to end — `workspace.rs:217` → `cmd/project.rs` → registered in `lib.rs` → exposed as
+`project.reorder` in `ui/src/ipc/client.ts` — and `grep -rn reorder ui/src` finds that definition
+line and **zero call sites**. The header's project tabs have no drag handling at all. It is written
+here rather than fixed, because the fix is the same shape as this one and belongs with a gate.
+
+`tab_reorder` takes **ids, not indices**, and a `before` boundary rather than a destination. The
+drop position is computed in the webview at pointer-move time against a snapshot, and an agent's
+`openDiff` or another window's close can move the strip before `pointerup`; an index would then
+move whichever tab now sits there, silently and somewhere nobody aimed. Both ids resolve to indices
+*inside* the workspace lock. The boundary→index conversion (`to = boundary > from ? boundary - 1 :
+boundary`) is a free function with tests, because the wrong version makes every rightward drag a
+no-op while every leftward drag works perfectly — the sort of half-working a manual test passes.
+
+**Pointer events, not HTML5 drag and drop**, the third time this repository has settled that
+question: Tauri's native drag-drop handler is on, `windows.rs` never calls
+`disable_drag_drop_handler()`, and a gesture that works in `pnpm dev` and does nothing in the
+shipped app is the worse failure. The rules live in `ui/src/chrome/tabDrag.ts`, which imports
+nothing so `check:tab-drag` can compile and run it; `useTabDrag.ts` is the mechanism and no check
+in this repo can execute it. Feedback is a **2px caret**, never a gap that opens between two tabs —
+the strip is 30px tall and reflows *under the pointer*, which is the rule its stylesheet already
+spends a paragraph on for the awaiting marker. The pinned console is refused three ways so the
+refusal is never reached: the grab returns `null` for it, the caret clamps to boundary 1, and the
+drop refuses a boundary of 0. Rust refuses it a fourth time, and that is the authority.
+
+**The three bulk closes ask once.** *Close others*, *Close to the left* and *Close to the right*
+used to fire one `closeTab` per tab; each did its own risk round trip, each parked its own refusal,
+and the queue in `closeConfirmStore` showed them one after another — three modals each headed
+*"Closing this tab"*, each naming a different file, for a gesture the user made once. They now go
+through one `closeTabs`, which asks `quitRequested` once, narrows it to the tabs actually closing,
+and raises **one** dialog under the new `tabs` scope that names every file at stake. `Close to the
+left` filters by `closable` rather than testing `index === 0`, which is what makes it skip the
+pinned console without knowing it exists — and it is offered-and-disabled rather than dropped when
+the set is empty, because that is the *common* state (every tab at index 1 has only the console to
+its left) and an item that comes and goes with the tab order is one the user has to hunt for.
+
+**Back reopens a closed file through the closed-tab stack, and peeks rather than pops.** It used to
+call `tab_open_file`, which mints one fresh single-pane editor and knows nothing about how the tab
+left. Two things were wrong with that. A file tab's pane tree can hold a **live Claude session** —
+splitting a File tab defaults to `NewClaude` — and `reinsert_tab` exists precisely to hand those
+pane ids back to `paneHosts`. And it silently poisoned Ctrl+Shift+T: Back opened a fresh tab for X
+while X's record was still on the stack, so the next press popped that record, found X open and
+*consumed it anyway*, landing the user on an unrelated tab with the split gone for good.
+
+`tab_reopen_file` therefore stats first, then **peeks** at the record and **takes it only when it
+actually reinserts the tab**. The cost of each alternative, since both were tempting: popping would
+hand Back whatever closed most recently rather than the file it has in mind, and consuming on a
+mere activation would spend a record with nothing on screen to explain where it went — while
+ignoring the stack entirely is the fresh-single-pane behaviour above, every time. A walk into a
+file that is gone answers `gone` instead of minting a permanent tab reading *"This file could not
+be opened"* with the path nowhere in the sentence; the entry is dropped so the next press does not
+walk into the same wall, and `navHistory::abandon` puts the cursor back where the user actually is
+rather than where the failed walk left it.
+
+**A refused terminal open is no longer a place you have been.** `App.tsx` recorded the history
+entry *before* `openFromTerminal`, so a path the user was shown and **declined** in the
+out-of-project dialog stayed on the Back stack — where Back reached it again through a command that
+by its own documentation enforces nothing. The entry is now written from the `.then()`. The
+*origin* is still read before the call, through `pendingJump`'s closure: the open broadcasts from
+inside the workspace lock, so the destination's editor can already have claimed `caretTrack`'s slot
+by the time the promise settles, and reading the caret there would record the destination as its
+own origin and leave Back with nowhere to go.
+
+A Back entry's recorded position beats the per-file view memory, and that was confirmed rather than
+assumed: `planRestore` refuses to restore while a reveal is parked for the path, `EditorSurface`
+runs it *before* `registerReveal` spends the request, and `check:editor` pins that ordering. An
+`UNKNOWN_LINE` entry parks nothing and correctly defers to the view memory, because that entry
+never named a line.
+
+**Not done.** None of it has been confirmed on screen — same reason as M14 and M15, and this batch
+adds a pointer gesture, which is the kind that most wants a real window: `--audit-chrome` is worth
+one run to confirm the caret changed no measured dimension. The strip **clips rather than scrolls**
+(`.tabs` is `overflow: hidden`), so a tab past the right edge is neither painted nor hit-testable
+and cannot be a drop target; the caret clamps to the last visible boundary. That is inherited, not
+introduced — making the strip scrollable interacts with the awaiting marker's reserved box and is a
+separate change. `tab_reopen_file` resolves its plan under one lock and reinserts under another, so
+a second shell window opening the same file in between can produce two tabs over one path; that is
+the same window `tab_reopen_closed` has always had. And the **bulk close stops at the first
+unanticipated refusal** rather than marching on — a file that turns dirty between the one question
+and the closes parks a dialog about itself, and the tabs after it stay open.
+
 ## Speed search in both sidebar trees (M15)
 
 **Type into the explorer or the changes tree and it filters to rows whose name contains what you

@@ -42,16 +42,14 @@
   align-items: center;
   gap: 6px;
   min-height: var(--h-panetitle);
-  /* Room for the floating pane cluster, which now lands exactly where this header's own
-     right-aligned controls sit. `--pane-corner` is published by `.frame` and reserved by the
-     cluster's `min-width`, so the number cannot drift from the box it is avoiding. */
-  padding-right: calc(8px + var(--pane-corner, 0px));
   /*
    * Reserved for the pane frame's floating controls — same reason as `DiffPane.module.css`'s
-   * header, which see. Both switchers below hang off one `margin-left: auto` wrapper and so
-   * land squarely under ⊞ ⛶ ⧉ ×, which float over this header rather than above it now.
+   * header, which see, including why this reads `--pane-corner-clear` rather than the cluster's
+   * bare width and why the dead `padding-right` that used to sit above this line is gone. Both
+   * switchers below hang off one `margin-left: auto` wrapper and so land squarely under
+   * ⊞ ⛶ ⧉ ×, which float over this header rather than above it now.
    */
-  padding: 0 calc(8px + var(--pane-corner, 0px)) 0 8px;
+  padding: 0 calc(8px + var(--pane-corner-clear, 0px)) 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);

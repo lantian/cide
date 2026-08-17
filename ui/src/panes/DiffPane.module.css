@@ -34,10 +34,6 @@
   align-items: baseline;
   gap: 6px;
   height: var(--h-panetitle);
-  /* Room for the floating pane cluster, which now lands exactly where this header's own
-     right-aligned controls sit. `--pane-corner` is published by `.frame` and reserved by the
-     cluster's `min-width`, so the number cannot drift from the box it is avoiding. */
-  padding-right: calc(8px + var(--pane-corner, 0px));
   /*
    * The right pad is the pane frame's floating control cluster, not decoration.
    *
@@ -45,11 +41,20 @@
    * pane's top-right *over* the content, at exactly this header's height. `.layout` below is
    * `margin-left: auto`, so the inline/side-by-side switcher lands under those buttons and
    * stops answering the pointer the moment the cluster reveals — which is whenever the mouse
-   * is anywhere in this pane. `--pane-corner` is published by `.frame` and reserved there
-   * with `min-width`, so it is the width the cluster actually occupies rather than a guess;
-   * the fallback is for this header rendered outside a pane frame.
+   * is anywhere in this pane. `--pane-corner-clear` is published by `.frame`; the fallback is
+   * for this header rendered outside a pane frame.
+   *
+   * `--pane-corner-clear`, not `--pane-corner`: the band to keep clear is where the cluster
+   * *is*, which is its width plus however far in from the right edge the pane kind parks it.
+   * The two are the same number here — a diff pane insets by 0 — and are not on an editor,
+   * which is where reserving the width alone shipped a broken conflict bar. One vocabulary,
+   * so this header cannot inherit that bug the day a diff grows something down its right edge.
+   *
+   * There was a second, dead `padding-right` above this line saying the same thing in different
+   * words; the shorthand resets all four sides, so it had never done anything, and two copies
+   * of one number in one rule is the drift this reserve exists to prevent.
    */
-  padding: 0 calc(8px + var(--pane-corner, 0px)) 0 8px;
+  padding: 0 calc(8px + var(--pane-corner-clear, 0px)) 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);

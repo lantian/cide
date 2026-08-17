@@ -13,7 +13,10 @@
  *
  *  1. **The key table, row by row**, in both states (nothing typed / a query armed) and across
  *     the modifier matrix. This is the assertion that "must not steal keys that already work in
- *     a tree" is a property rather than an intention.
+ *     a tree" is a property rather than an intention. Including — section 2b — the keydown of a
+ *     modifier **by itself**, which is a distinct class this script did not try for a whole
+ *     milestone: every modifier row here used to be a flag on a printable key, so nothing
+ *     noticed that reaching for Shift to type a capital destroyed the query one press earlier.
  *  2. **Wrap-around and expiry.** `nextMatch` cycles rather than clamping; `expired` is a
  *     comparison of timestamps rather than a timer, for the reason `keys/gate.ts` gives.
  *  3. **The sentences.** The two dead ends — no match, and a truncated list — have to be
@@ -104,6 +107,25 @@ function withoutComments(source) {
     i++
   }
   return out
+}
+
+/** A source file with its comments gone. Every grep and every parse below reads through this. */
+const source = (path) => withoutComments(readFileSync(path, 'utf8'))
+
+/**
+ * The `MODIFIER_KEYS` set a module declares, as an array of the names in it.
+ *
+ * Parsed rather than imported because the two copies live in modules with incompatible
+ * compilation stories — `speedSearch.ts` is compiled standalone by this script and `chords.ts`
+ * is compiled as a cluster by `check-key-gate.mjs` — and the thing that has to be pinned is not
+ * either set's contents but the fact that they are *the same set*. Reads comment-stripped
+ * source, so the entry `chords.ts` keeps behind an explanatory comment still counts and a name
+ * that survives only inside a comment does not.
+ */
+function modifierKeysIn(path) {
+  const body = /const MODIFIER_KEYS = new Set\(\[([\s\S]*?)\]\)/.exec(source(path))
+  if (body === null) return null
+  return [...body[1].matchAll(/'([^']+)'/g)].map((hit) => hit[1])
 }
 
 try {
@@ -262,6 +284,67 @@ try {
     + 'does or does not answer F2 is unchanged')
   eq(key('tr', 'Tab'), 'exitThenPass', 'Tab moves focus out, so the search must not survive it')
 
+  // ---------------------------------------------------------------------------------------
+  // 2b. The bare modifier keydown — the class that made the whole gesture unusable
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * Pressing Shift to reach for a capital must not throw the query away.
+   *
+   * This is the bug the feature shipped with, and it was invisible to the rows above because
+   * every one of them passes a modifier as a *flag on a printable key*. The browser sends a
+   * keydown for the modifier ITSELF first, one press earlier, and during that keydown the
+   * modifier's own flag is already true — so `Shift` arrived as `speedKey('App', 'Shift',
+   * { shift: true })` and `Control` as `speedKey('App', 'Control', { ctrl: true })`. Two
+   * different routes to one symptom: the ctrl/meta/alt guard ate `Control`/`Alt`/`Meta`/`OS`/
+   * `AltGraph`, and `Shift`/`CapsLock`/`Dead`/`Process` fell past the whole switch, failed
+   * `isTypedCharacter` (`'Shift'` is five characters) and hit the trailing `exitThenPass`.
+   * Either way `applyKey` returned `null` and the hook cleared the search mid-word.
+   *
+   * The list is spelled out here rather than read from the module, because a loop over the
+   * module's own set would test only what the module still remembers — deleting `'Shift'` from
+   * it would delete the assertion with it. The two sets are separately pinned as equal below.
+   */
+  const MODIFIER_KEYS = [
+    'Control',
+    'Alt',
+    'AltGraph',
+    'Shift',
+    'Meta',
+    'OS',
+    'CapsLock',
+    'NumLock',
+    'ScrollLock',
+    'Fn',
+    'FnLock',
+    'Hyper',
+    'Super',
+    'Dead',
+    'Process',
+    'Unidentified',
+  ]
+  for (const k of MODIFIER_KEYS) {
+    // Every flag combination a real keydown for this key can carry, including the one it sets
+    // itself: WebKitGTK reports `shiftKey` true on Shift's own keydown, `ctrlKey` on Control's,
+    // and Firefox reports `altKey` on AltGraph's while Blink reports nothing at all.
+    for (const held of [{}, { shift: true }, { ctrl: true }, { alt: true }, { meta: true }]) {
+      for (const query of ['', 'tr']) {
+        eq(
+          key(query, k, held),
+          'pass',
+          `${k} held as ${JSON.stringify(held)} with query ${JSON.stringify(query)} is not a `
+          + 'keystroke, it is the first half of one — pressing a modifier must never end a '
+          + 'search. This is the bug that made speed search unable to type a capital letter',
+        )
+      }
+    }
+  }
+
+  eq(act('tr', 'T', { shift: true }), { kind: 'extend', char: 'T' },
+    'and the press AFTER it still extends: `App` + Shift + `T` is `AppT`. The empty-query row '
+    + 'above pinned only the first character of a search, which is why a feature that could not '
+    + 'spell `App.tsx` past letter one passed this script for a whole milestone')
+
   // The two verdicts that consume a key must be distinguishable from the two that do not:
   // collapsing `exit` and `exitThenPass` into one "not handled" would leave a query armed under
   // a fold that renumbered every match.
@@ -284,6 +367,11 @@ try {
   eq(m.applyKey('tr', { kind: 'exit' }), null, 'Escape ends it')
   eq(m.applyKey('tr', { kind: 'accept' }), null, 'so does accepting a match')
   eq(m.applyKey('tr', { kind: 'exitThenPass' }), null, 'so does a fold')
+  eq(m.applyKey('tr', { kind: 'pass' }), 'tr',
+    'and a `pass` leaves the query exactly as it was. Every verdict above ends a search, so '
+    + 'this is the row that says `pass` is the one that does not — it is what the bare-modifier '
+    + 'guard buys, and without it `pass` and `exitThenPass` are pinned only by their names')
+  eq(m.applyKey('tr', { kind: 'swallow' }), 'tr', 'and so does a swallowed Delete')
 
   // ---------------------------------------------------------------------------------------
   // 4. Wrap-around
@@ -335,7 +423,6 @@ try {
   // 7. The call sites, over comment-stripped source
   // ---------------------------------------------------------------------------------------
 
-  const source = (path) => withoutComments(readFileSync(path, 'utf8'))
   const fileTree = source('src/sidebar/FileTree.tsx')
   const changes = source('src/sidebar/GitPanel/ChangesTree.tsx')
   const hook = source('src/sidebar/useSpeedSearch.ts')
@@ -348,6 +435,29 @@ try {
     '`speedSearch.ts` imports nothing, which is what lets this script compile it standalone — '
     + 'the same property `clickSemantics.ts` and `rowWindow.ts` are kept import-free for',
   )
+
+  /*
+   * The two `MODIFIER_KEYS` sets are one set spelled twice, and that has to be pinned.
+   *
+   * `speedSearch.ts` cannot import `keys/chords.ts` — the assertion directly above is why, and
+   * the `--module esnext` this script compiles with is the mechanism: a TS-emitted extensionless
+   * specifier does not resolve under node ESM. So the set is copied, which is exactly the
+   * duplication this project keeps paying for, and the price of the copy is this gate. Both
+   * files are also checked against the literal list the loop in section 2b drives, so that
+   * deleting a name from *both* copies does not quietly delete its coverage.
+   */
+  const ours = modifierKeysIn('src/sidebar/speedSearch.ts')
+  const theirs = modifierKeysIn('src/keys/chords.ts')
+  ok(ours !== null, '`speedSearch.ts` declares a `MODIFIER_KEYS` set outside its comments')
+  ok(theirs !== null, 'and so does `keys/chords.ts`, which is the set it was copied from')
+  const sorted = (names) => (names === null ? null : [...names].sort().join(','))
+  eq(sorted(ours), sorted(theirs),
+    'and the two have IDENTICAL membership. A key the gate treats as a bare modifier but speed '
+    + 'search treats as a keystroke is a key that ends a search in a tree and does nothing '
+    + 'anywhere else — the exact asymmetry that shipped')
+  eq(sorted(ours), sorted(MODIFIER_KEYS),
+    'and both match the list section 2b actually drives through `speedKey`, so the coverage '
+    + 'cannot be narrowed by editing the modules alone')
 
   // Both trees ask the *same Rust rule*, and neither matches locally.
   ok(

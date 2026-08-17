@@ -114,6 +114,36 @@ impl ClosedTabs {
         Some(list.remove(at))
     }
 
+    /// The record for a specific **file** path, without consuming it.
+    ///
+    /// Back is not Ctrl+Shift+T and must never call [`pop`](Self::pop): a walk of the navigation
+    /// history has a *path* in hand and wants that file back, whereas `pop` hands over whatever
+    /// closed most recently. A Back into `main.rs` that resurrected an unrelated `Cargo.toml` —
+    /// and threw away its record on the way — is a worse outcome than not restoring the split.
+    ///
+    /// Peek rather than take, because the caller cannot know whether it will *spend* the record
+    /// until it has consulted the workspace: a tab that is already open is shown rather than
+    /// reinserted, and in that case the record must stay for a later Ctrl+Shift+T. See
+    /// `cmd::file::tab_reopen_file`.
+    pub fn peek_file(&self, project: ProjectId, path: &std::path::Path) -> Option<ClosedTab> {
+        let list = self.inner.lock();
+        list.iter()
+            .find(|t| is_file_record(t, project, path))
+            .cloned()
+    }
+
+    /// Take the record for a specific file path, if there is one.
+    ///
+    /// Removes **only** the matching record and leaves the rest of the stack in order — the
+    /// difference from [`pop`](Self::pop), and the reason this is not implemented in terms of
+    /// it. Called after the caller has decided the record is actually being honoured, so the
+    /// stack only ever loses a record whose tab the user can now see on screen.
+    pub fn take_file(&self, project: ProjectId, path: &std::path::Path) -> Option<ClosedTab> {
+        let mut list = self.inner.lock();
+        let at = list.iter().position(|t| is_file_record(t, project, path))?;
+        Some(list.remove(at))
+    }
+
     /// Forget everything belonging to a project that is closing.
     ///
     /// Without this the stack outlives its project and every record in it names a `ProjectId`
@@ -132,6 +162,18 @@ impl ClosedTabs {
             .filter(|t| t.project == project)
             .count()
     }
+}
+
+/// Whether this record is *that project's* record for *that file*.
+///
+/// Both halves matter and the project one is the half that would be silently wrong: two projects
+/// open on two checkouts of the same repository hold the same absolute paths only when one is a
+/// worktree of the other, but a scratch file or a `/tmp` path is genuinely shared — and a Back in
+/// project A reinserting a tab whose record names project B would put the tab in the wrong strip
+/// (or, once `reinsert_tab` refused the id, in none at all).
+fn is_file_record(record: &ClosedTab, project: ProjectId, path: &std::path::Path) -> bool {
+    record.project == project
+        && matches!(&record.kind, TabKind::File { path: p, .. } if p.as_path() == path)
 }
 
 /// Whether a tab of this kind is worth remembering. See [`ClosedTabs::push`].
@@ -242,6 +284,50 @@ mod tests {
             "newest of *a*'s, not of all"
         );
         assert_eq!(stack.depth(b), 1, "and b's record is untouched");
+    }
+
+    /// Back names a *path*, so it must take that path's record and leave the stack alone.
+    ///
+    /// Ordered to catch the two implementations that would pass a friendlier arrangement. The
+    /// wanted record is **not** the newest, so a `remove(0)` — or a `pop`-shaped scan that stops
+    /// at the first record for the project — hands back `b` and fails here. And a second record
+    /// for another *project* sits on the same path, so a match that forgot `project` takes the
+    /// wrong one.
+    #[test]
+    fn back_takes_the_record_for_its_own_file_and_leaves_the_rest() {
+        let stack = ClosedTabs::default();
+        let (a, other) = (ProjectId::new(), ProjectId::new());
+        stack.push(record(other, "wanted")); // same path, wrong project
+        stack.push(record(a, "wanted"));
+        stack.push(record(a, "b")); // newest, and not what Back asked for
+
+        let path = PathBuf::from("/tmp/wanted");
+        let peeked = stack.peek_file(a, &path).expect("a record for that file");
+        assert_eq!(
+            peeked.project, a,
+            "and it is this project's, not the other's"
+        );
+        assert_eq!(stack.depth(a), 2, "a peek consumes nothing");
+
+        let taken = stack.take_file(a, &path).expect("a record for that file");
+        assert_eq!(taken.project, a);
+        assert_eq!(stack.depth(a), 1, "only the matching record went");
+        assert_eq!(
+            stack.depth(other),
+            1,
+            "and the other project's is untouched"
+        );
+
+        // The newest is still there, still `b`: Ctrl+Shift+T after a Back gets what it always
+        // would have. This is the whole point of not popping.
+        let TabKind::File { path: newest, .. } = stack.pop(a).expect("a record").kind else {
+            panic!("a file record");
+        };
+        assert_eq!(newest, PathBuf::from("/tmp/b"));
+        assert!(
+            stack.take_file(a, &path).is_none(),
+            "and a second Back finds nothing left to spend"
+        );
     }
 
     #[test]

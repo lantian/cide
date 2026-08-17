@@ -16,7 +16,7 @@ use cide_core::{CoreError, Result};
 use cide_ipc::git::DiffSide;
 use cide_ipc::{
     ClaudeSendTarget, DiffOrigin, DiffSpec, FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId,
-    RepoId, TabId, TabKind,
+    ReopenedFile, RepoId, TabId, TabKind,
 };
 use tauri::{Manager, State};
 
@@ -74,6 +74,157 @@ fn open_file_tab(state: &WorkspaceState, project: ProjectId, path: PathBuf) -> R
             },
         )
     })
+}
+
+/// Reopen a file the navigation history remembers — the Back/Forward half of `tab_open_file`.
+///
+/// # Why Back does not simply call `tab_open_file`
+///
+/// It did, and the result was a *fresh single-pane editor tab* every time. That is wrong twice
+/// over, and the second one is the expensive one:
+///
+/// * A file tab's `PaneTree` is not always one editor. `cmd::pane::default_intent` gives a File
+///   tab `SplitIntent::NewClaude`, so splitting one produces a `PaneKind::Claude` pane bound to a
+///   live conversation — and `closing_record` clones that whole tree, pane ids included, exactly
+///   so `reinsert_tab` can hand the parked terminal back to `paneHosts`. A plain open discards
+///   all of it.
+/// * **It silently poisoned Ctrl+Shift+T.** Back opened a fresh tab for X and activated it while
+///   X's record was still on the closed-tab stack; the next Ctrl+Shift+T popped that record,
+///   found X open *and active*, answered `Reopen::Skip`, and **consumed the record anyway** —
+///   so one press did the work of two, landed the user on an unrelated tab, and destroyed the
+///   split and the pane id naming a still-running `claude`. That is precisely the
+///   one-press-two-records hole `ClosedTabs::push` filters at push time to avoid.
+///
+/// # What it does with the stack: peek, then take only what it spends
+///
+/// Never [`crate::closed_tabs::ClosedTabs::pop`] — that hands over the newest record for the
+/// project, and Back has a *path* in mind. The rule, and the cost of the alternative in each
+/// case:
+///
+/// * `Reinsert` — the tab is genuinely coming back, so the record is **taken**. The stack loses
+///   exactly the record that has just been honoured, visibly, on screen. Leaving it would be the
+///   poisoning above with the tabs swapped: Ctrl+Shift+T would later find the tab open and burn
+///   the record for nothing.
+/// * `Show` / `Skip` — the tab is open already, so this activates it and **leaves the record**.
+///   Back's job is done by the activation; the record is still the right answer for a
+///   Ctrl+Shift+T after the user closes that tab again. Consuming it here would be the classic
+///   invisible spend — nothing on screen changes to explain where it went.
+///
+/// # And the stat, which is not belt-and-braces
+///
+/// `tab_open_file` does not stat, by its own documentation, so a Back into a deleted file or a
+/// discarded scratch used to mint a permanent tab reading *"This file could not be opened / No
+/// such file or directory (os error 2)"* — a sentence that does not even contain the path. The
+/// same `is_file` test `reopen_plan` already runs answers it here, and the caller turns it into
+/// a notice naming the file.
+///
+/// # What this does *not* re-check, and why that is now safe
+///
+/// Containment. A Back entry can legitimately name a path outside every root — a dependency
+/// source under *External Libraries*, a scratch under `scratches_root()`, an out-of-project
+/// terminal open the user approved by name — and refusing those would break the feature for the
+/// files it most exists to serve. What made that dangerous was not the missing check here but
+/// `App.tsx` recording a terminal jump **before** `openFromTerminal` had been refused: a path the
+/// user *declined* in the out-of-project dialog sat on the Back stack, and Back walked into it
+/// through a command that enforces nothing. That is fixed at the source — the entry is now
+/// written from the `.then()`, so only an open that actually succeeded is a place the user has
+/// been, which is `navHistory.ts`'s own stated rule. `openable`'s guards therefore still stand
+/// in front of every untrusted path; this command is reachable only from places one has already
+/// cleared.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_reopen_file(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    path: String,
+) -> Result<ReopenedFile> {
+    let path = PathBuf::from(path);
+    let stack = app.state::<crate::closed_tabs::ClosedTabs>();
+
+    // Peeked, never popped, and *before* the plan — the plan needs the record to decide. The stat
+    // is folded into `reopen_file_step` beside it so the whole decision is one call.
+    let record = stack.peek_file(project, &path);
+    let plan = record
+        .as_ref()
+        .map(|record| state.with(|ws| crate::cmd::project::reopen_plan(ws, record)));
+
+    match reopen_file_step(path.is_file(), plan) {
+        ReopenFile::Gone => Ok(ReopenedFile::Gone {
+            path: path.display().to_string(),
+        }),
+        ReopenFile::Restore => {
+            // Taken only now, once the step has committed to spending it. Between the peek and
+            // here the workspace lock has been released, so `take_file` can find nothing if
+            // another window reopened the same tab in the meantime — in which case this falls
+            // back to an ordinary open rather than reinserting a record somebody else owns.
+            let Some(record) = stack.take_file(project, &path) else {
+                return Ok(ReopenedFile::Opened {
+                    tab: open_file_tab(&state, project, path)?,
+                });
+            };
+            let tab = state.update(|ws| {
+                workspace::reinsert_tab(ws, project, record.index, record.kind, record.tree)
+            })?;
+            Ok(ReopenedFile::Restored { tab })
+        }
+        // `open_file_tab` rather than a hand-rolled insert or a bare `activate_tab`, because it
+        // already matches an open File tab on its path: it activates the one that is there and
+        // opens one when there is not. `reinsert_tab` performs no such dedupe, and a second
+        // opener with its own idea of "already open" is how two tabs over one file come back —
+        // and with them the save that silently discards the other buffer.
+        ReopenFile::Open => Ok(ReopenedFile::Opened {
+            tab: open_file_tab(&state, project, path)?,
+        }),
+    }
+}
+
+/// What a Back or Forward into a path should do. See [`reopen_file_step`].
+#[derive(Debug, PartialEq, Eq)]
+enum ReopenFile {
+    /// Nothing is at that path. Open nothing, spend nothing, say so.
+    Gone,
+    /// Put the remembered tab back where it was, and spend the record that describes it.
+    Restore,
+    /// An ordinary open — or an activation of the tab that is already showing this file. Any
+    /// record for it stays on the stack.
+    Open,
+}
+
+/// The reopen rule, as a function of the disk and the closed-tab record alone.
+///
+/// A free function rather than three arms inside the command above, for the reason
+/// `cmd::project::reopen_plan` gives about itself: a rule reachable only through a
+/// `State<WorkspaceState>` is a rule that gets tested at the level of "does the app start", and
+/// this is the rule where **a record gets spent**. Spending one invisibly is not a crash; it is a
+/// Ctrl+Shift+T months later that opens the wrong tab, which is precisely the class of bug no
+/// integration test notices.
+///
+/// `plan` is `reopen_plan`'s answer for the record, or `None` when the stack has no record for
+/// this path. The three rules, and what the other choice would cost in each:
+///
+/// * **The stat wins over everything.** A file that is gone is `Gone` *even when a record exists*,
+///   and the record is left alone. Consulting the stack first and discovering the deletion
+///   afterwards would burn a record on a tab that never appeared — the invisible spend again, with
+///   nothing on screen to explain it. (`reopen_plan` also stats, and answers `Skip`; that is the
+///   right answer for Ctrl+Shift+T, which moves on to the next record, and the wrong one here,
+///   where the user named *this* file and deserves to be told about it.)
+/// * **`Reinsert` is the only case that spends the record.** The tab is genuinely coming back with
+///   its pane tree, so the stack loses exactly the record the user can now see honoured. Leaving
+///   it would poison the next Ctrl+Shift+T: that press would pop it, find the tab open, and
+///   consume it for nothing.
+/// * **`Show`, `Skip` and no record at all are one answer.** The tab is open already (or has never
+///   been closed), so the press is an activation and the record — if there is one — is still the
+///   right answer for a Ctrl+Shift+T after the user closes that tab again. Consuming it here is
+///   the invisible spend a third time.
+fn reopen_file_step(exists: bool, plan: Option<crate::cmd::project::Reopen>) -> ReopenFile {
+    use crate::cmd::project::Reopen;
+    if !exists {
+        return ReopenFile::Gone;
+    }
+    match plan {
+        Some(Reopen::Reinsert) => ReopenFile::Restore,
+        Some(Reopen::Show(_)) | Some(Reopen::Skip) | None => ReopenFile::Open,
+    }
 }
 
 /// Why a path named by terminal output was not opened.
@@ -1202,6 +1353,59 @@ pub fn claude_send_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole of what Back does with the closed-tab stack, driven.
+    ///
+    /// This is the decision the feature was designed around and it is the one that is invisible
+    /// when it goes wrong: a record spent here is a Ctrl+Shift+T *later* that opens a tab the
+    /// user did not ask for, with the split and the pane id naming a live `claude` gone for
+    /// good. Nothing on screen reports it at the moment it happens, which is why it is a rule
+    /// with a test rather than three arms in a Tauri command.
+    #[test]
+    fn back_spends_a_closed_tab_record_only_when_it_actually_puts_the_tab_back() {
+        use crate::cmd::project::Reopen;
+
+        assert_eq!(
+            reopen_file_step(true, Some(Reopen::Reinsert)),
+            ReopenFile::Restore,
+            "the tab is coming back with its pane tree, so the record is honoured — and spent"
+        );
+
+        // The three that must NOT spend it. `Show` and `Skip` mean the tab is open already, so
+        // the press is an activation and the record is still the right answer for a Ctrl+Shift+T
+        // after the user closes that tab again; `None` means there was never a record at all.
+        assert_eq!(
+            reopen_file_step(true, Some(Reopen::Show(TabId::new()))),
+            ReopenFile::Open,
+            "a tab that is open is shown, and its record stays where it is"
+        );
+        assert_eq!(
+            reopen_file_step(true, Some(Reopen::Skip)),
+            ReopenFile::Open,
+            "and so is the one that is open AND active — `open_file_tab` finds it either way"
+        );
+        assert_eq!(
+            reopen_file_step(true, None),
+            ReopenFile::Open,
+            "with no record, Back is an ordinary open"
+        );
+
+        /*
+         * The stat outranks the stack, and this is the row that says a record is not burned on
+         * the way to discovering the file is gone. Note the input: `reopen_plan` answers `Skip`
+         * for a deleted file — which is right for Ctrl+Shift+T, whose loop moves on to the next
+         * record, and wrong here, where the user named *this* file. `Reinsert` is driven too,
+         * because it is what a record for a live path answers and the version that consulted the
+         * plan first would restore a tab over nothing.
+         */
+        for plan in [None, Some(Reopen::Skip), Some(Reopen::Reinsert)] {
+            assert_eq!(
+                reopen_file_step(false, plan),
+                ReopenFile::Gone,
+                "a file that is not there is reported, whatever the stack remembers about it"
+            );
+        }
+    }
 
     fn spec(path: &str, old: Option<&str>) -> DiffSpec {
         git_diff_spec(

@@ -36,27 +36,71 @@
   isolation: isolate;
 
   /*
-   * How much of the pane's top-right corner the floating controls claim.
+   * How far in from the right edge this kind of pane parks the cluster. Overridden above for
+   * an editor, whose minimap owns those 96px.
+   *
+   * Stated here as well as there, and `0px` rather than nothing, so that `--pane-corner-clear`
+   * below is a real sum on every pane instead of a `var()` riding its fallback — a fallback
+   * resolves silently, which is the whole failure mode this reserve exists to prevent. The
+   * cascade is unaffected: `.frame[data-kind='editor']` is (0,2,0) against this rule's (0,1,0),
+   * so the editor's inset wins wherever it applies regardless of source order.
+   */
+  --pane-cluster-inset: 0px;
+
+  /*
+   * How WIDE the floating control cluster is. Not the band it occupies — see
+   * `--pane-corner-clear` below, which is the number a pane's own content must reserve.
    *
    * Published as a custom property because it is a contract with whatever is *inside* the
    * pane: a pane whose content puts its own controls in its top-right puts them exactly where
    * this cluster lands, and the cluster wins, so they stop answering the pointer. Three
    * surfaces did — `panes/DiffPane.module.css` and `panes/GitDiffPane.module.css` (the
    * inline/side-by-side switchers, on a `margin-left: auto`) and `panes/EditorPane.module.css`
-   * (the conflict bar's `Keep mine`) — and all three now pad by
-   * `calc(<their own pad> + var(--pane-corner, 0px))`. `check:rows` pins that they keep doing
-   * it, because the failure is silent: the control is drawn, it just cannot be clicked.
+   * (the conflict bar's `Keep mine`). `check:rows` pins that they keep reserving it, because
+   * the failure is silent: the control is drawn, it just cannot be clicked.
    *
-   * The cluster is controls only now, so this is the whole of it and not a part: 2+2px of
-   * padding, the awaiting marker (7px in 10px of margin), four 22px controls, three 2px gaps.
-   * 4 + 17 + 88 + 6 = 115.
+   * The cluster is controls only now, so this is the whole of it and not a part:
+   *
+   *   `.cluster`  padding 0 2px                                            =   4
+   *   `.reveal`   padding 0 3px                                            =   6
+   *   `.actions`  `.actionMenu` min-width 26 + 3 x `.action` 22 + 3 x gap 2 =  98
+   *   `.marker`   7px in 4+6px of margin                                    =  17
+   *                                                                          ---
+   *                                                                          125
+   *
+   * It read 115 until M13, and the two missing pieces were `.reveal`'s own 6px of padding and
+   * the fact that the menu button is `.actionMenu` — `min-width: 26px`, not the 22px the other
+   * three are. Ten pixels of under-count is not a rounding error here: it is ten columns of a
+   * control that is drawn, hovered, and answers the cluster's click instead of its own.
+   * `check:rows` derives the sum from these very rules rather than restating it, so the next
+   * button added to the cluster fails there instead of quietly eating a neighbour's edge.
    *
    * It was 126 while an index and a title lived here too — and the user's report was that the
    * buttons sat away from the corner. That reserve *was* the margin: `min-width` held the box
    * open and `flex-end` pushed the controls to its right edge, so the slack showed up as space
    * nobody had asked for.
    */
-  --pane-corner: 115px;
+  --pane-corner: 125px;
+
+  /*
+   * **What anything at the top of a pane must keep clear**, and the property every consumer
+   * outside this file should be reading.
+   *
+   * The cluster's width alone is only the right answer for a pane that parks it flush against
+   * the frame (`--pane-cluster-inset: 0`), which a diff does and an editor does not. On an
+   * editor the cluster floats 96px in, so its left edge is 96 + 125 = 221px from the right
+   * edge — and a consumer that reserved the width alone left a 96px strip of its own content
+   * underneath it. `panes/EditorPane.module.css`'s conflict bar did exactly that and shipped:
+   * `Keep mine` and `Reload from disk` sat wholly inside the cluster's live `.actions` box, so
+   * the click that offered to preserve unsaved edits closed the pane instead. It was *wired to
+   * this mechanism and passing `check:rows`* — the mechanism simply handed it the wrong number
+   * for its own pane kind, which is a worse failure than not being wired at all.
+   *
+   * A `calc()` here rather than the arithmetic at four call sites, because the two terms live
+   * in this file and the sum is the only thing anyone else needs. `check:rows` asserts that no
+   * module outside this one still reads bare `--pane-corner`.
+   */
+  --pane-corner-clear: calc(var(--pane-cluster-inset) + var(--pane-corner));
 }
 
 /*

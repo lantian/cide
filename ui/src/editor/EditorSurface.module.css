@@ -393,6 +393,39 @@
 
 .body :global(.cm-panels.cm-panels-top) {
   border-bottom: 1px solid var(--border);
+  /*
+   * Stop short of the pane frame's floating ⊞ ⛶ ⧉ × cluster.
+   *
+   * The panel is `position: sticky` at `top: 0`, spanning the editor's full width, at the very
+   * top of the pane — which is precisely where `layout/PaneTitleBar.module.css` floats the
+   * cluster since the 26px title bar was deleted. They are the same 33 rows of pixels, and the
+   * cluster wins: `.body` there is a stacking context at `z-index: 0`, so CodeMirror's
+   * `z-index: 300` is atomised inside it and cannot outrank a `z-index: 2` sibling of its own
+   * ancestor. `Match case` landed under `×` and `3 of 12` under `⧉`, so opening Ctrl+F and
+   * clicking the toggle closed the pane.
+   *
+   * **Raising the panel instead is not an untried option — it is the bug that was already
+   * fixed once.** `.body`'s `z-index: 0` was added deliberately to produce this order, because
+   * before it the find bar painted *over* the four buttons and they could not be clicked at
+   * all while the bar was open; `check-rows.mjs` compares the cluster's z-index against the
+   * real literals in `node_modules` to keep it that way. So the fix is to give the bar room,
+   * through the reserve mechanism three other pane surfaces already use.
+   *
+   * `margin-right` on the panel rather than `padding-right` on `.findBar`: the panel is in
+   * normal flow (sticky is), so a margin shortens the box itself — which also stops it painting
+   * across the top 33px of the minimap canvas, and ends its `border-bottom` where the bar
+   * actually ends rather than under a control that belongs to the frame. Panel height, which
+   * CodeMirror measures for `scrollMargins`, is untouched.
+   *
+   * The cost, stated rather than discovered later: the reserve is 221px on an editor pane and
+   * `.findBar`'s own intrinsic width is about 217px, so in a pane body under roughly 440px the
+   * bar's buttons run out of room and are clipped by `.body`'s `overflow: hidden` instead of
+   * spilling under the cluster. Editors open as a single pane in a tab of their own, so that is
+   * the uncommon case; if it becomes real the answer is a container query on the frame, not a
+   * clamped reserve — a clamp puts the right-hand end of the bar back inside the cluster's box
+   * and re-introduces the unclickable control in silence, which is the failure this replaces.
+   */
+  margin-right: var(--pane-corner-clear, 0px);
 }
 
 .findBar {
@@ -402,6 +435,9 @@
   padding: 5px 8px;
   font-family: var(--font-mono);
   font-size: 11.5px;
+  /* Contained rather than spilling: below the width its own controls need, the bar clips at
+     the reserve above instead of putting a button back under the pane cluster. */
+  overflow: hidden;
 }
 
 .findInput {

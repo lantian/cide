@@ -69,6 +69,62 @@ export type SpeedAction =
   /** Swallow it and do nothing at all. Reserved for keys that would destroy something. */
   | { readonly kind: 'swallow' }
 
+/**
+ * Keys that are only ever modifiers — a keydown for one of these is not a keystroke, it is the
+ * first half of one.
+ *
+ * This is the fix for the bug that made the whole gesture unusable: **a modifier's own flag is
+ * already true during its own keydown**. So pressing Shift to reach for a capital arrived here
+ * as `speedKey('App', 'Shift', { shift: true })`; `Control` arrived as
+ * `speedKey('App', 'Control', { ctrl: true })` and was consumed by the chord guard below as
+ * though the user had pressed a chord. Two different routes to one symptom:
+ *
+ *   * `Control`, `Alt`, `Meta`, `OS` and Firefox's `AltGraph` set `ctrl`/`meta`/`alt`, so they
+ *     tripped `if (mods.ctrl || mods.meta || mods.alt)` and returned `exitThenPass`.
+ *   * `Shift` set only `shift`, which that guard deliberately ignores, so it fell all the way
+ *     through the `switch`, failed `isTypedCharacter` — `[...'Shift'].length` is five — and hit
+ *     the trailing `return active ? EXIT_THEN_PASS : PASS`. `CapsLock`, `NumLock`, `Dead` and
+ *     `Process` took the same route.
+ *
+ * Either way the query was thrown away before the user's second finger landed, and the visible
+ * complaint was that speed search could not type a capital letter. Which also hid the *other*
+ * half of the report — case-insensitive matching has always worked (`cide_fs::speed`), but
+ * reaching for a capital destroyed the query first, so nobody could ever observe it.
+ *
+ * `pass` rather than a new `ignore` verdict, because `pass` is already this repository's answer
+ * to this exact question: `keys/gate.ts` returns `PASS` for a bare modifier and `chords.ts`
+ * returns `null` for the same set. And `pass` is verifiably a no-op in both trees —
+ * `treeKeyAction('Shift', …)` and `moveIndex('Shift', …)` are both `null`, and `ChangesTree`'s
+ * `switch (e.key)` falls to its `default: return` — so an eighth verdict would have been a
+ * second name for an identical outcome, at the price of moving `SpeedAction`, `applyKey` and
+ * the hook's dispatch.
+ *
+ * **Membership is a verbatim copy of `keys/chords.ts`'s set**, and `check-speed-search.mjs`
+ * parses both files and fails when the two drift. Copied rather than imported because this
+ * module is import-free on purpose (see the header): the check compiles it standalone with
+ * `--module esnext`, under which a TS-emitted extensionless specifier does not resolve in node.
+ * The same trade `overlays/score.ts` makes, kept honest the same way — by a gate.
+ */
+const MODIFIER_KEYS = new Set([
+  'Control',
+  'Alt',
+  'AltGraph',
+  'Shift',
+  'Meta',
+  'OS',
+  'CapsLock',
+  'NumLock',
+  'ScrollLock',
+  'Fn',
+  'FnLock',
+  'Hyper',
+  'Super',
+  // Composition in progress (fcitx5, ibus). The keystroke belongs to the input method.
+  'Dead',
+  'Process',
+  'Unidentified',
+])
+
 const PASS: SpeedAction = { kind: 'pass' }
 const ERASE: SpeedAction = { kind: 'erase' }
 const EXIT: SpeedAction = { kind: 'exit' }
@@ -116,15 +172,31 @@ export function isTypedCharacter(key: string): boolean {
  * | Enter | `pass` | `accept` | |
  * | ← → Home End | `pass` | `exitThenPass` | a fold renumbers every match index, so the search has to be gone before the fold happens |
  * | any modified chord | `pass` | `exitThenPass` | Ctrl+C, Ctrl+X, Ctrl+V, Ctrl+A and Ctrl+R all still do exactly what they did |
+ * | a bare modifier keydown | `pass` | **`pass`** | Shift is how a capital is typed; see [`MODIFIER_KEYS`] |
  * | anything else (F2, Tab, …) | `pass` | `exitThenPass` | |
  *
- * The two rows in bold type are the ones this function exists for. Everything else could have
- * been written inline in a handler; *Delete must not delete* and *Escape must not reach the
- * clipboard* are decisions, and a decision inside an event handler is a decision no check
- * script can compile.
+ * The three rows in bold type are the ones this function exists for. Everything else could have
+ * been written inline in a handler; *Delete must not delete*, *Escape must not reach the
+ * clipboard* and *Shift must not end the search* are decisions, and a decision inside an event
+ * handler is a decision no check script can compile.
  */
 export function speedKey(query: string, key: string, mods: SpeedMods): SpeedAction {
   const active = query.length > 0
+
+  /*
+   * A bare modifier keydown is never a keystroke, in either state — and this must be the FIRST
+   * statement in the function.
+   *
+   * Ordering is load-bearing, not tidiness. Below the chord guard, `Control`/`Alt`/`Meta`/
+   * `AltGraph` never reach here at all: their own flag is true during their own keydown, so the
+   * guard eats them and returns `exitThenPass` — only `Shift` would have been fixed, and a user
+   * pressing Ctrl on the way to Ctrl+C would still watch the query vanish. It has to sit above
+   * the `switch` too, because `Dead`, `Process` and `Unidentified` carry no modifier flag at all
+   * and would fall through to the trailing `exitThenPass`.
+   *
+   * See [`MODIFIER_KEYS`] for the full argument and for why this is `pass` and not a new verdict.
+   */
+  if (MODIFIER_KEYS.has(key)) return PASS
 
   /*
    * A modified chord is never speed search's, in either state.
@@ -136,6 +208,11 @@ export function speedKey(query: string, key: string, mods: SpeedMods): SpeedActi
    *
    * Shift is deliberately **not** in the list. Shift+A is how a capital `A` is typed, and a
    * speed search that could not spell `App.tsx` would be a curiosity rather than a feature.
+   * That note used to end here, and being *incomplete* was the whole bug: it covers Shift as a
+   * modifier **flag** on some other key, and says nothing about Shift as a **keydown of its
+   * own** — which is what actually reaches this function first, one press earlier, and which
+   * this guard never sees because `key` is then the string `'Shift'`. Handled above, in
+   * [`MODIFIER_KEYS`].
    */
   if (mods.ctrl || mods.meta || mods.alt) return active ? EXIT_THEN_PASS : PASS
 

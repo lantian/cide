@@ -62,22 +62,50 @@ impl serde::Serialize for SessionError {
 /// reported by the CLI as `CONNECTION_CLOSED` against a configuration that is perfectly
 /// correct. It runs first so that the explicit settings below are the ones that survive a
 /// collision, and it is a no-op for every non-bundled launch.
-fn base_env(spec: SpawnSpec) -> SpawnSpec {
-    apply_env_changes(spec, cide_core::child_env::bundle_scrub())
+///
+/// # The `CLAUDE_CODE_*` pass, and why it is last
+///
+/// [`cide_core::child_env::claude_env`] turns the user's [`cide_ipc::ClaudeSettings`] into the
+/// same `EnvChange` list, and is folded **after** the constants below so that a switch the user
+/// actually set wins over anything this function assumed. It carries
+/// `CLAUDE_CODE_SCROLL_SPEED`, which used to be a literal `3` here.
+///
+/// The comment that literal carried was wrong, and the correction is the point of this
+/// paragraph. It read *"xterm.js reports one wheel event per notch, unamplified"*. Claude Code's
+/// own renderer heuristic concludes the opposite: it classifies a terminal announcing itself as
+/// `xterm.js` — which cide's XTVERSION reply deliberately does, see `ui/src/terminal/xterm.ts`
+/// — as a wheel **flooder**, and on that branch its unset default is `1` rather than the `3` it
+/// gives other renderers. So this variable was never the amplifier the comment described; it
+/// was cancelling a penalty cide had asked for two files away, and landing back on the ordinary
+/// default. Setting it remains right. The stated reason was not.
+///
+/// What a notch is actually worth is the product of two numbers, and cide only owns one of
+/// them. xterm.js sends **at most one mouse report per DOM wheel event** — `sendEvent` computes
+/// a line count and then discards it — and under a high-resolution wheel on Wayland one notch
+/// arrives as several small deltas, each of which `CoreMouseService.consumeWheelEvent` scales by
+/// `0.3` when `|deltaY| < 50` on the theory that it is a trackpad. Whether this machine's mouse
+/// lands in that regime is not knowable from here, and is not knowable without a wheel and a
+/// window. That is why the number is now the user's: it is the half of the product cide can
+/// move, from a control, without guessing at the other half.
+///
+/// Applied to every pane rather than only to `claude` ones, which is deliberate and matches
+/// what the literal did before. These variables mean nothing to `bash`, and a user who types
+/// `claude` at a shell pane's prompt should get the settings they configured rather than the
+/// defaults of a program cide did not notice starting.
+fn base_env(spec: SpawnSpec, claude: &cide_ipc::ClaudeSettings) -> SpawnSpec {
+    let spec = apply_env_changes(spec, cide_core::child_env::bundle_scrub())
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env("TERM_PROGRAM", "cide")
         .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
-        // xterm.js reports one wheel event per notch, unamplified, which makes the TUI
-        // scroll a single line at a time and feel broken.
-        .env("CLAUDE_CODE_SCROLL_SPEED", "3")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         // A terminal that inherits stale COLUMNS/LINES lies to the child about its size
         // until the first SIGWINCH.
         .env_remove("COLUMNS")
         .env_remove("LINES")
-        .env_remove("CI")
+        .env_remove("CI");
+    apply_env_changes(spec, cide_core::child_env::claude_env(claude))
 }
 
 /// Fold a list of [`cide_core::child_env::EnvChange`]s into a spec.
@@ -284,13 +312,16 @@ pub async fn session_spawn(
     // under a non-reentrant lock that nothing further down should be holding. `try_state`
     // because a test harness may have no workspace, in which case the default — inherit,
     // touch nothing — is the right answer anyway.
-    let proxy = app
+    // The Claude environment toggles come out of the same read, for the same reason and at the
+    // same cost: one lock acquisition on this thread rather than two, and none at all inside
+    // the spawn. `Copy`, so unlike the proxy settings it needs no clone.
+    let (proxy, claude_settings) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
-        .map(|state| state.with(|ws| ws.settings.proxy.clone()))
+        .map(|state| state.with(|ws| (ws.settings.proxy.clone(), ws.settings.claude)))
         .unwrap_or_default();
     let target = pane_proxy_target(&proxy.scope, is_claude);
     let proxy_env = ProxyEnv::for_target(&proxy, target);
-    let mut spec = apply_proxy(base_env(spec), &proxy_env);
+    let mut spec = apply_proxy(base_env(spec, &claude_settings), &proxy_env);
     // Redacted, and at debug level: one line per spawn is worth it when a pane cannot reach
     // the network, but it is not worth it on every launch of a machine with no proxy at all.
     tracing::debug!(
@@ -1042,6 +1073,111 @@ mod tests {
         let spec = apply_env_changes(SpawnSpec::new("/bin/sh", std::env::temp_dir()), []);
         assert!(spec.env.is_empty(), "set {:?}", spec.env);
         assert!(spec.env_remove.is_empty(), "removed {:?}", spec.env_remove);
+    }
+
+    // --- the Claude settings reach a real spec --------------------------------------------
+    //
+    // `cide_core::child_env::claude_env` decides *what* the switches mean and has its own
+    // tests. What is only checkable here is that `base_env` folds that list at all — which is
+    // the exact step that did not exist: for three releases the switches were declared,
+    // persisted, bound to TypeScript and drawn on screen under a panel promising they were
+    // "applied at spawn", and no code anywhere read them. A rule with no call site is this
+    // project's most-repeated defect, and it is invisible to every test of the rule itself.
+
+    /// The switches survive the trip into the spec a pane is actually spawned from.
+    #[test]
+    fn base_env_carries_the_claude_settings_into_the_spec() {
+        let spec = base_env(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &cide_ipc::ClaudeSettings {
+                disable_alternate_screen: true,
+                scroll_speed: 12,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            value_of(&spec, "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            Some("1"),
+            "the alternate-screen switch is the one a user chasing a scrollable transcript \
+             presses; if it does not reach the spec it reaches nothing at all"
+        );
+        assert_eq!(
+            value_of(&spec, "CLAUDE_CODE_SCROLL_SPEED"),
+            Some("12"),
+            "and the scroll rate is the user's number, not the constant this used to hardcode"
+        );
+    }
+
+    /// A switch left off removes its variable from the child rather than ignoring it.
+    ///
+    /// Asserted at *this* end and not only in `cide-core` because the two arms of an
+    /// `EnvChange` land in two different fields of a `SpawnSpec`, and a fold that dropped the
+    /// removal arm would leave a user's exported `CLAUDE_CODE_DISABLE_MOUSE=1` in force under
+    /// a switch sitting at off.
+    #[test]
+    fn a_claude_switch_left_off_reaches_the_spec_as_a_removal() {
+        let spec = base_env(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &cide_ipc::ClaudeSettings::default(),
+        );
+        for var in [
+            "CLAUDE_CODE_DISABLE_MOUSE",
+            "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT",
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN",
+        ] {
+            assert!(
+                spec.env_remove.iter().any(|k| k == var),
+                "{var} is off, so it must be removed from the inherited environment; \
+                 removed {:?}",
+                spec.env_remove
+            );
+            assert!(
+                value_of(&spec, var).is_none(),
+                "{var} is off and must not also be set — the CLI reads any defined value as on"
+            );
+        }
+    }
+
+    /// The settings pass runs after the constants, so a user's value is the one that survives.
+    ///
+    /// The ordering is the whole reason `claude_env` is folded last rather than first. Were it
+    /// first, the literal `CLAUDE_CODE_SCROLL_SPEED` this function used to carry would have
+    /// overwritten it, and the control would have moved a number nothing read.
+    #[test]
+    fn the_settings_pass_wins_over_the_constants_above_it() {
+        let spec = base_env(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &cide_ipc::ClaudeSettings {
+                scroll_speed: 9,
+                ..Default::default()
+            },
+        );
+        // `SpawnSpec::env` is applied in order, so the *last* entry for a name is the one the
+        // child gets; asserting on the last is asserting on what the child sees.
+        let last = spec
+            .env
+            .iter()
+            .rfind(|(k, _)| k == "CLAUDE_CODE_SCROLL_SPEED")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(last, Some("9"));
+    }
+
+    /// A shell pane gets them too, and that is deliberate.
+    ///
+    /// `CLAUDE_CODE_*` means nothing to `bash`, and a user who types `claude` at a shell
+    /// pane's prompt is running the same program with the same settings. Gating the pass on
+    /// `program_is_claude` was the tempting version and would have made the Settings screen
+    /// true for panes cide spawned and false for the identical session started by hand.
+    #[test]
+    fn a_shell_pane_is_given_the_same_switches() {
+        let spec = base_env(
+            SpawnSpec::new("/bin/bash", std::env::temp_dir()),
+            &cide_ipc::ClaudeSettings {
+                disable_mouse: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(value_of(&spec, "CLAUDE_CODE_DISABLE_MOUSE"), Some("1"));
     }
 
     fn manual(http: &str, https: &str, all: &str, no_proxy: &str) -> ProxySettings {

@@ -167,6 +167,22 @@ export function projectTabEntries(
 
 export interface TabActions {
   close?: ((id: TabId) => void) | undefined
+  /**
+   * Close several tabs as one gesture — what the three bulk items below run.
+   *
+   * A **separate action from `close`**, rather than the model calling `close` in a loop, and the
+   * separation is the fix for a real defect rather than tidiness. Looping meant one close per
+   * tab, one refusal per dirty tab, and one queued dialog per refusal: closing eight tabs with
+   * three unsaved files put three modals in front of the user, each headed "Closing *this tab*",
+   * for a gesture they made once. The store's `closeTabs` asks once and names everything at
+   * stake; keeping the two doors distinct at the type level is what stops the loop coming back.
+   *
+   * All three bulk items require it. Falling back to `close` when it is absent was the
+   * alternative and it loses for the reason this whole indirection exists: it would leave two
+   * behaviours in the app for one gesture, and the wrong one would be the one that survives in
+   * whichever surface nobody re-tested.
+   */
+  closeMany?: ((ids: TabId[]) => void) | undefined
   /** Splits the **active** tab's focused pane. See `TabStripProps.onSplit`. */
   split?: (() => void) | undefined
   /** Detaches the **active** tab's focused pane. See `TabStripProps.onDetach`. */
@@ -208,12 +224,30 @@ export function tabMenuEntries(
   activeTab: TabId,
   actions: TabActions,
 ): MenuEntry[] {
-  const { close, split, detach, copy } = actions
+  const { close, closeMany, split, detach, copy } = actions
   const index = tabs.indexOf(tab)
   const others = tabs.filter((t) => t !== tab && closable(t))
+  /*
+   * The three bulk sets, and every one of them is filtered by `closable`.
+   *
+   * That filter is what makes the pinned console disappear from all three without any of them
+   * knowing it exists. `toLeft` is the set that would otherwise get it wrong: the console is at
+   * index 0, so it is to the left of *everything*, and a `slice(0, index)` alone would offer
+   * "Close to the left" on the first file tab and then fail against `CoreError::TabPinned` — a
+   * menu entry that errors, which the brief for this change rightly calls worse than one that is
+   * not offered. Reusing `closable` rather than testing `index === 0` is the same discipline
+   * `TabStrip` applies to the close button: the pin is a property of the tab, not of its
+   * position, and reordering is now a gesture that makes the position lie.
+   */
+  const toLeft = tabs.slice(0, index).filter(closable)
   const toRight = tabs.slice(index + 1).filter(closable)
   const path = pathOf(tab)
   const active = tab.id === activeTab
+  /** Run a bulk close, or say why the line is off. Shared by the three items below. */
+  const bulk = (set: readonly Tab[], nothing: string) =>
+    closeMany && set.length > 0
+      ? { run: () => closeMany(set.map((t) => t.id)) }
+      : { disabledReason: set.length === 0 ? nothing : NO_HOST }
 
   return [
     {
@@ -227,16 +261,28 @@ export function tabMenuEntries(
     {
       id: 'close-others',
       label: 'Close others',
-      ...(close && others.length > 0
-        ? { run: () => others.forEach((t) => close(t.id)) }
-        : { disabledReason: 'Nothing else here can be closed' }),
+      ...bulk(others, 'Nothing else here can be closed'),
+    },
+    /*
+     * Left before right, because that is the order they are on screen and a menu that lists them
+     * the other way makes the reader translate.
+     *
+     * Offered-and-disabled rather than dropped when the set is empty, the rule `close-right`
+     * already follows: an item that comes and goes with the tab order is one the user has to
+     * hunt for. That matters more here than for its sibling, because the empty state is the
+     * *common* one — every tab at index 1 has only the pinned console to its left — so the
+     * sentence has to explain rather than merely refuse, and "Nothing to the left can be closed"
+     * is true of a lone console in a way that "there is nothing to the left" would not be.
+     */
+    {
+      id: 'close-left',
+      label: 'Close to the left',
+      ...bulk(toLeft, 'Nothing to the left can be closed'),
     },
     {
       id: 'close-right',
       label: 'Close to the right',
-      ...(close && toRight.length > 0
-        ? { run: () => toRight.forEach((t) => close(t.id)) }
-        : { disabledReason: 'Nothing to the right can be closed' }),
+      ...bulk(toRight, 'Nothing to the right can be closed'),
     },
     { kind: 'separator' },
     {

@@ -3409,6 +3409,143 @@ try {
         'bounds or the list over its cap')
     }
 
+    /*
+     * ------------------------------------------------ a walk into a file that is gone
+     *
+     * `tab_reopen_file` stats before it opens, so a Back or Forward into a deleted file — or a
+     * discarded scratch, which is the same thing — answers `gone` instead of minting a tab that
+     * reads *"This file could not be opened"* with the path nowhere in it. `abandon` is what the
+     * history does about that, and it is arithmetic with a direction in it, which is why it is
+     * here rather than inside `navigate`.
+     *
+     * The property, stated once and driven both ways: **a refused walk leaves the history exactly
+     * as if it had never been attempted, minus the dead entry.** The user did not go anywhere, so
+     * the cursor must not have either.
+     */
+    {
+      const three = nav.record(nav.record(nav.EMPTY_HISTORY, A1, B1), B1, C1)
+      eq(three.entries.map((e) => e.path), ['/a.rs', '/b.rs', '/c.rs'], 'three places visited')
+
+      /*
+       * Forward is the direction that catches the bug, and it is worth saying what the bug was
+       * because the wrong version passes every Back assertion. Dropping the dead entry and
+       * leaving the cursor where the removal put it moves it one place PAST the user: standing
+       * on `/a.rs`, a Forward into a deleted `/b.rs` left the cursor on `/c.rs`. Forward then
+       * refused — "already at the most recent place" — with `/c.rs` live and one press away,
+       * and Back returned to `/a.rs`, which the user was already looking at, so it read as a
+       * button wired to nothing. Two symptoms, one wrong index.
+       */
+      const atStart = nav.walk(three, 'back', null).history // standing on /a.rs
+      eq(atStart.index, 1, 'a Back from the newest lands on the middle entry')
+      const backAgain = nav.walk(atStart, 'back', null)
+      eq(backAgain.to.path, '/a.rs', 'and a second Back reaches the oldest')
+
+      const fromA = nav.walk(backAgain.history, 'forward', null)
+      eq(fromA.to.path, '/b.rs', 'from there, Forward aims at the middle entry')
+      const droppedFwd = nav.abandon(fromA.history, 'forward')
+      eq(
+        droppedFwd.entries.map((e) => e.path),
+        ['/a.rs', '/c.rs'],
+        'a Forward into a file that is gone drops that entry',
+      )
+      eq(
+        droppedFwd.entries[droppedFwd.index].path,
+        '/a.rs',
+        'and leaves the cursor on the entry the user is actually looking at — NOT on the one ' +
+          'beyond the dead file, which they have never been to',
+      )
+      ok(
+        nav.canWalk(droppedFwd, 'forward'),
+        'so the live entry past the dead one is still one press away, rather than being ' +
+          'silently skipped and then refused',
+      )
+      eq(nav.walk(droppedFwd, 'forward', null).to.path, '/c.rs', 'and that press reaches it')
+
+      /* Back, the mirror image. */
+      const fromC = nav.walk(three, 'back', null)
+      eq(fromC.to.path, '/b.rs', 'from the newest, Back aims at the middle entry')
+      const droppedBack = nav.abandon(fromC.history, 'back')
+      eq(
+        droppedBack.entries.map((e) => e.path),
+        ['/a.rs', '/c.rs'],
+        'a Back into a file that is gone drops that entry too',
+      )
+      eq(
+        droppedBack.entries[droppedBack.index].path,
+        '/c.rs',
+        'and the cursor stays on the place the user is standing in',
+      )
+      eq(nav.walk(droppedBack, 'back', null).to.path, '/a.rs', 'so a second Back skips the wall')
+
+      /* Both ends, where the clamp is the only thing between this and an index out of range. */
+      const two = nav.record(nav.EMPTY_HISTORY, A1, B1)
+      const emptied = nav.abandon(nav.walk(two, 'back', null).history, 'back')
+      eq(
+        emptied.entries.map((e) => e.path),
+        ['/b.rs'],
+        'the oldest entry going leaves the one the user is on',
+      )
+      eq(emptied.index, 0, 'with the cursor on it')
+      eq(
+        nav.abandon(nav.EMPTY_HISTORY, 'back'),
+        nav.EMPTY_HISTORY,
+        'an empty history has nothing to abandon and is handed back unchanged, rather than ' +
+          'growing an index of -1 into a list of 0',
+      )
+
+      /*
+       * Total over **every** coherent history, not only over the ones `walk` hands it.
+       *
+       * The clamp inside `abandon` is unreachable through `navigate` — a Back never lands on the
+       * last entry and a Forward never lands on the first, so the shifted cursor is always in
+       * range — and an unreachable branch guarded by nothing is a branch that gets deleted as
+       * dead, right up until a second caller appears. So the contract is the stronger one: hand
+       * it any coherent history and any direction and the answer is coherent. `back` on a cursor
+       * standing at the end and `forward` on one standing at the start are exactly the two rows
+       * that need the clamp, and both are shapes a future caller could produce.
+       */
+      for (let len = 1; len <= 5; len++) {
+        const shape = Array.from({ length: len }, (_, i) => at(`/f${i}.rs`, i + 1))
+        for (let index = 0; index < len; index++) {
+          for (const direction of ['back', 'forward']) {
+            const out = nav.abandon({ entries: shape, index }, direction)
+            ok(
+              nav.isCoherent(out),
+              `abandon(${len} entries, cursor at ${index}, ${direction}) leaves a walkable ` +
+                'history rather than a cursor pointing off the end',
+            )
+            eq(
+              out.entries.length,
+              len - 1,
+              `and drops exactly one entry (${len} entries, cursor at ${index}, ${direction})`,
+            )
+          }
+        }
+      }
+
+      /* And the invariant, over random shapes: the cursor can never leave the list. */
+      let seed = 987654321
+      const rand = (n) => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        return seed % n
+      }
+      let h = nav.EMPTY_HISTORY
+      let broke = null
+      for (let i = 0; i < 4000 && broke === null; i++) {
+        const op = rand(3)
+        if (op === 0) h = nav.record(h, null, at(`/f${rand(6)}.rs`, rand(400)))
+        else {
+          const direction = op === 1 ? 'back' : 'forward'
+          const stepped = nav.walk(h, direction, null)
+          // Exactly the shape `navigate` has: walk, and if the destination turns out to be gone,
+          // abandon the walk. A one-entry history is the case that would throw.
+          if (stepped !== null) h = rand(2) === 0 ? stepped.history : nav.abandon(stepped.history, direction)
+        }
+        if (!nav.isCoherent(h)) broke = `${i}: ${JSON.stringify(h)}`
+      }
+      eq(broke, null, 'four thousand random walk/abandon operations keep the history coherent')
+    }
+
     /* ------------------------------------------------ the call sites, which is where the bugs are */
 
     const stripJs = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
@@ -3470,6 +3607,76 @@ try {
         'the other',
     )
 
+    /* ---------------------------------------- Back reopens a closed file, through the right door */
+
+    /*
+     * **`file.reopen`, never `file.open`.** The difference is not a nicety:
+     *
+     * * `tab_open_file` mints one fresh single-pane editor tab. A file tab's pane tree can hold
+     *   a live Claude pane — splitting a File tab defaults to `NewClaude` — and `reinsert_tab`
+     *   exists to hand those pane ids back to `paneHosts`. A plain open drops all of it.
+     * * It left the closed-tab record on the stack while opening the same file, so the next
+     *   Ctrl+Shift+T popped that record, found the tab already open and **consumed it for
+     *   nothing** — one press doing the work of two, landing on an unrelated tab.
+     * * It does not stat, so Back into a deleted file made a permanent tab reading "This file
+     *   could not be opened" with no path in the sentence.
+     *
+     * The negative half is the load-bearing one: an `open(` creeping back in beside the `reopen(`
+     * would restore every one of those without failing anything above.
+     */
+    ok(
+      /fileApi\.reopen\(project, to\.path\)/.test(jumpSrc),
+      'a walk reopens through `file.reopen`, which consults the closed-tab stack and stats first',
+    )
+    ok(
+      !/fileApi\.open\(/.test(jumpSrc),
+      'and never through `file.open`, which knows nothing about how the tab left',
+    )
+    ok(
+      /outcome\.kind === 'gone'/.test(jumpSrc) && /abandon\(current, direction\)/.test(jumpSrc),
+      'a walk into a file that is gone drops the entry through `abandon` — without it the next ' +
+        'press offers the same dead file for ever, and Back becomes the one gesture in the app ' +
+        'that keeps walking into a wall',
+    )
+
+    /*
+     * The terminal ctrl+click writes its history entry from the `.then()`, and reads the origin
+     * before the call. Both halves, because either alone is a bug:
+     *
+     * * Recording before the open put a path the user **declined** in the out-of-project dialog
+     *   on the Back stack, where Back reached it again through a command that enforces nothing.
+     * * Reading the origin *in* the `.then()` reads it too late: `terminal_open_path` broadcasts
+     *   from inside the workspace lock, so the destination's editor can already have mounted and
+     *   claimed `caretTrack`'s slot. The origin would then be the destination, `near` would merge
+     *   them into one entry, and Back from a terminal click would land nowhere at all.
+     */
+    const appSrc = stripJs(readFileSync('src/App.tsx', 'utf8'))
+    ok(
+      /const arrived =\s*at === null \? null : pendingJump\(/.test(appSrc),
+      'the terminal open prepares its history entry through `pendingJump`',
+    )
+    /*
+     * Position, not merely presence: both halves of the fix are orderings, and both compile
+     * perfectly in the wrong order. `pendingJump` must be *called* before the invoke and its
+     * result *invoked* after it, so the assertion is two indices rather than two regexes.
+     */
+    ok(
+      appSrc.indexOf('pendingJump(') > 0 &&
+        appSrc.indexOf('pendingJump(') <
+          appSrc.indexOf('.openFromTerminal(project, path, approvedTarget)'),
+      'and reads the origin caret BEFORE that IPC — the open broadcasts from inside the ' +
+        'workspace lock, so afterwards the destination’s own editor may already hold the caret ' +
+        'slot, and the entry would record the destination as its own origin',
+    )
+    ok(
+      /\.then\(\(\) => \{\s*arrived\?\.\(\)/.test(appSrc) &&
+        appSrc.indexOf('arrived?.()') >
+          appSrc.indexOf('.openFromTerminal(project, path, approvedTarget)'),
+      'and writes the entry only once that open has succeeded — a refused open is not a place ' +
+        'the user has been, and one left on the stack is one Back walks into through a command ' +
+        'that enforces nothing',
+    )
+
     const dispatchSrc = stripJs(readFileSync('src/keys/dispatch.ts', 'utf8'))
     for (const id of ['navigate.back', 'navigate.forward']) {
       ok(
@@ -3481,6 +3688,20 @@ try {
     ok(
       /navigate\(command === 'navigate\.back'/.test(dispatchSrc),
       'and the arm calls into jump.ts rather than deciding anything itself',
+    )
+    /*
+     * The refusal still reaches the user, and it now has to survive a round trip to do it.
+     *
+     * `navigate` became async when the walk started reopening through `file.reopen`: "that file
+     * is gone" is only known after Rust has stat'ed it. A `void navigate(...)` without the
+     * `.then` type-checks perfectly and swallows every refusal — including the two synchronous
+     * ones that used to work — leaving a thumb button that is indistinguishable from a thumb
+     * button wired to nothing, which is the exact defect `WalkRefusal` exists to prevent.
+     */
+    ok(
+      /\.then\(\(refusal\) => \{/.test(dispatchSrc) && /notify\(refusal, \{ kind: 'info' \}\)/.test(dispatchSrc),
+      'and it awaits the answer and says it out loud — a refusal that is only known after the ' +
+        'round trip is still a refusal the user has to be told about',
     )
 
     /* The producer, the restore, and the two props that carry them. */

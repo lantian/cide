@@ -156,6 +156,77 @@ pub fn bundle_scrub_from(
     changes
 }
 
+/// The environment a [`cide_ipc::ClaudeSettings`] asks for.
+///
+/// # Why this exists at all
+///
+/// Three of the four toggles this reads — `disable_mouse`, `alt_screen_full_repaint`,
+/// `disable_alternate_screen` — were declared in `cide-ipc`, persisted, bound to TypeScript,
+/// and rendered as switches in Settings under a panel headed *"Applied at spawn: these reach
+/// a pane's child process when it starts"*. They reached nothing. `resume_all_on_launch` was
+/// the only field of that struct with a consumer anywhere in the workspace. That is this
+/// project's most-repeated defect — built, correct, and wired to nothing — and it mattered
+/// here more than usual, because *"Disable the alternate screen"* is precisely the switch a
+/// user reaching for a scrollable transcript would press.
+///
+/// # Why a `Vec<EnvChange>` rather than a `SpawnSpec`
+///
+/// This crate must not link `cide-pty`, and `base_env` already folds one of these lists
+/// ([`bundle_scrub`]) through the same helper. Handing back the same shape means the settings
+/// pass and the bundle pass compose instead of being two mechanisms, and it keeps the rule
+/// testable without a PTY: the failure this guards against is a *missing* variable, which is
+/// invisible unless something can read the list back.
+///
+/// # Why `false` removes rather than omits
+///
+/// A toggle that is off states that the variable must not be set — it does not merely decline
+/// to set it. The alternative, omitting the entry, loses to one case that is not exotic: a
+/// user with `CLAUDE_CODE_DISABLE_MOUSE=1` exported from their shell profile would see the
+/// switch sitting at *off* while mouse reporting stayed dead in every pane, with the Settings
+/// screen quietly wrong about the state of the program. Since cide promises this panel is what
+/// a child gets, the panel has to be authoritative in both directions. The cost is real and
+/// accepted: an expert who exports one of these deliberately is overridden by a switch they
+/// never touched, which is why the removal is total rather than silent — it applies to a
+/// variable cide's own UI names.
+///
+/// # Why removal, and never `=0`
+///
+/// The CLI tests these with `V.CLAUDE_CODE_DISABLE_MOUSE !== undefined` before reading the
+/// value, so *defined* is most of the decision. Writing `0` or `false` to say "off" is the
+/// trap: those are non-empty strings, and on the truthiness test that follows, a `0` turns the
+/// mouse **off** — the exact opposite of the switch that produced it. `None` is unambiguous
+/// and is the only safe way to spell "off".
+pub fn claude_env(settings: &cide_ipc::ClaudeSettings) -> Vec<EnvChange> {
+    // Clamped rather than validated-and-rejected. Out of range there is no useful error to
+    // raise at a spawn site — the pane must still open — and the CLI's own failure mode is the
+    // reason this cannot simply be passed through: it drops a value it dislikes and falls back
+    // to a per-renderer default which, for a terminal announcing itself as xterm.js (which
+    // cide's XTVERSION reply does, deliberately), is 1. So an unclamped 0 arriving here would
+    // not mean "no change", it would mean a third of the scrolling the default gives.
+    let range = cide_ipc::ClaudeSettings::SCROLL_SPEED;
+    let speed = settings.scroll_speed.clamp(*range.start(), *range.end());
+
+    let flag = |on: bool| on.then(|| "1".to_string());
+    vec![
+        (
+            "CLAUDE_CODE_SCROLL_SPEED".to_string(),
+            Some(speed.to_string()),
+        ),
+        (
+            "CLAUDE_CODE_DISABLE_MOUSE".to_string(),
+            flag(settings.disable_mouse),
+        ),
+        (
+            "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT".to_string(),
+            flag(settings.alt_screen_full_repaint),
+        ),
+        (
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
+            flag(settings.disable_alternate_screen),
+        ),
+    ]
+}
+
 /// Is this path-list entry inside the bundle?
 ///
 /// The boundary is a whole path component, so `/tmp/.mount_cideAAA` does not swallow
@@ -613,6 +684,162 @@ mod tests {
             "an armed child whose parent was already gone ran its command anyway \
              ({status:?} after {:?})",
             started.elapsed()
+        );
+    }
+}
+
+/// The settings-to-environment rule.
+///
+/// Kept apart from the bundle tests above because they share nothing but the return type, and
+/// because these are the assertions that would have caught three switches wired to nothing.
+#[cfg(test)]
+mod claude_env_tests {
+    use super::*;
+    use cide_ipc::ClaudeSettings;
+
+    fn value(changes: &[EnvChange], name: &str) -> Option<Option<String>> {
+        changes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Every variable the rule is responsible for, so a field added to `ClaudeSettings` and
+    /// forgotten here shows up as a name this list knows and the output does not.
+    const VARS: [&str; 4] = [
+        "CLAUDE_CODE_SCROLL_SPEED",
+        "CLAUDE_CODE_DISABLE_MOUSE",
+        "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT",
+        "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN",
+    ];
+
+    #[test]
+    fn every_toggle_reaches_the_environment_it_documents() {
+        // The whole point. Each field is turned on one at a time so that a rule which happened
+        // to read the *wrong* field would still be caught — an `alt_screen_full_repaint` that
+        // secretly reports `disable_mouse`'s value passes any test that sets both at once.
+        let on = ClaudeSettings {
+            disable_mouse: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            value(&claude_env(&on), "CLAUDE_CODE_DISABLE_MOUSE"),
+            Some(Some("1".to_string())),
+            "the mouse switch is the one a user presses when a TUI has taken their selection, \
+             and it has to arrive in the child's environment to do anything at all"
+        );
+        assert_eq!(
+            value(&claude_env(&on), "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT"),
+            Some(None),
+            "and turning one switch on must not turn its neighbours on"
+        );
+
+        let on = ClaudeSettings {
+            alt_screen_full_repaint: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            value(&claude_env(&on), "CLAUDE_CODE_ALT_SCREEN_FULL_REPAINT"),
+            Some(Some("1".to_string()))
+        );
+
+        let on = ClaudeSettings {
+            disable_alternate_screen: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            value(&claude_env(&on), "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            Some(Some("1".to_string())),
+            "this is the switch a user chasing a scrollable transcript reaches for, and it \
+             spent its whole life so far reaching nothing"
+        );
+    }
+
+    #[test]
+    fn a_switch_that_is_off_removes_the_variable_rather_than_leaving_it_alone() {
+        // The inherited-value case: a user whose shell profile exports one of these would
+        // otherwise see the switch at `off` and the behaviour at `on`, for ever.
+        let changes = claude_env(&ClaudeSettings::default());
+        for var in VARS.iter().filter(|v| **v != "CLAUDE_CODE_SCROLL_SPEED") {
+            assert_eq!(
+                value(&changes, var),
+                Some(None),
+                "{var} is off by default, and off has to mean removed: an inherited value \
+                 would make the Settings screen lie about what the child is doing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_off_switch_is_never_spelled_zero() {
+        // `V.CLAUDE_CODE_DISABLE_MOUSE !== undefined` gates the read, and the truthiness test
+        // after it treats the string "0" as true. Spelling "off" as `=0` would disable the
+        // mouse from a switch that is off.
+        let changes = claude_env(&ClaudeSettings::default());
+        for (name, value) in &changes {
+            if name == "CLAUDE_CODE_SCROLL_SPEED" {
+                continue;
+            }
+            assert!(
+                value.is_none(),
+                "{name} was set to {value:?} to mean `off`; the CLI reads any defined value as \
+                 on, so the only safe spelling of off is removal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scroll_speed_is_clamped_into_the_range_the_cli_honours() {
+        // Both ends, and the reason they differ: above 20 the CLI clamps to 20 anyway, so
+        // sending more is merely useless; at or below 0 it *discards* the value and falls back
+        // to 1 for an xterm.js renderer, so sending 0 would be actively worse than sending
+        // nothing. The clamp exists for the second case.
+        let speed = |n: u8| {
+            value(
+                &claude_env(&ClaudeSettings {
+                    scroll_speed: n,
+                    ..Default::default()
+                }),
+                "CLAUDE_CODE_SCROLL_SPEED",
+            )
+            .flatten()
+        };
+        assert_eq!(
+            speed(0),
+            Some("1".to_string()),
+            "0 is a value the CLI throws away, and a thrown-away value scrolls slower than the default"
+        );
+        assert_eq!(speed(200), Some("20".to_string()));
+        assert_eq!(
+            speed(7),
+            Some("7".to_string()),
+            "and a value inside the range is passed through untouched"
+        );
+    }
+
+    #[test]
+    fn the_default_speed_is_the_constant_base_env_used_to_hardcode() {
+        // Nobody who never opens Settings may notice this field appearing.
+        assert_eq!(
+            value(
+                &claude_env(&ClaudeSettings::default()),
+                "CLAUDE_CODE_SCROLL_SPEED"
+            ),
+            Some(Some("3".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_rule_answers_for_every_variable_it_claims() {
+        let changes = claude_env(&ClaudeSettings::default());
+        let mut names: Vec<&str> = changes.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        let mut expected = VARS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            names, expected,
+            "a field added to ClaudeSettings whose environment variable never got a line here \
+             is exactly the defect this module was written to end"
         );
     }
 }

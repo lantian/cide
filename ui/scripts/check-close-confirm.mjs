@@ -144,6 +144,39 @@ try {
   ok(confirmBody('app', busyOnly).includes('cide'), 'the app scope names the app')
   ok(confirmBody('tab', oneFile).includes('this tab'), 'the tab scope names the tab')
 
+  // --- the bulk close says "these tabs", and still names the one file ------------------
+  //
+  // `tabs` is *Close others* / *Close to the left* / *Close to the right*, which now ask once for
+  // the whole gesture instead of once per refused tab. Both assertions are about the sentence
+  // being true of what is actually happening: a heading reading "Closing this tab" over a list of
+  // four files is the state this scope was added to end, and it is the state a `subject` that
+  // fell through to the singular would silently restore.
+  ok(
+    confirmBody('tabs', threeFiles).includes('these tabs'),
+    'the bulk scope is plural, because the list underneath it is',
+  )
+  ok(
+    !confirmBody('tabs', threeFiles).includes('this tab'),
+    'and it never says "this tab" about several of them',
+  )
+  /*
+   * One dirty file among eight closing tabs is named outright, exactly as a single-tab close
+   * names it. This is the case the heading matters most for — "1 file with unsaved changes" over
+   * a bulk close makes the user open the list to find out *which*, which is the question they
+   * already have — and it is the one an implementation that simply added `'tabs'` to `CloseScope`
+   * without touching `confirmTitle` would get wrong.
+   */
+  eq(
+    confirmTitle('tabs', oneFile),
+    'main.rs has unsaved changes',
+    'one file at stake in a bulk close is named, not counted',
+  )
+  eq(
+    confirmTitle('tabs', threeFiles),
+    '3 files with unsaved changes',
+    'and several are counted in the heading and listed in the body',
+  )
+
   // --- the destructive button says what it destroys -----------------------------------
   eq(
     confirmLabel(oneFile),
@@ -154,10 +187,15 @@ try {
 
   // --- several refusals from one gesture ----------------------------------------------
   //
-  // `Close others` in the tab context menu issues one close per tab and they run
-  // concurrently, so two can be refused for unsaved changes in the same tick. The store used
-  // to let the second replace the first: the user answered about one file and the other tab
-  // stayed open with nothing said. These four assertions are that bug.
+  // `Close others` used to issue one close per tab, concurrently, so two could be refused for
+  // unsaved changes in the same tick. The store let the second replace the first: the user
+  // answered about one file and the other tab stayed open with nothing said. These four
+  // assertions are that bug.
+  //
+  // The bulk closes now ask once, through the `tabs` scope above, so they are no longer the
+  // gesture that produces two refusals at once. The queue stays for the routes that still can —
+  // a quit racing a tab close, two shell windows over one project, a file that turns dirty
+  // between the pre-flight question and the close — and these stay with it.
   eq(parkClose(null, [], 'a'), { pending: 'a', queued: [] }, 'the first refusal is the dialog')
   eq(
     parkClose('a', [], 'b'),

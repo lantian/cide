@@ -39,8 +39,18 @@ export interface SessionLike {
   state: { state: string }
 }
 
-/** What the user asked to close. Only the wording depends on it. */
-export type CloseScope = 'pane' | 'tab' | 'project' | 'window' | 'app'
+/**
+ * What the user asked to close. Only the wording depends on it.
+ *
+ * `tabs` is the **bulk** close — *Close others*, *Close to the left*, *Close to the right* — and
+ * it is a separate scope from `tab` for one reason: the sentence has to be true. Those three
+ * gestures used to fire one `closeTab` per tab and get one refusal per dirty tab, which the
+ * queue in `closeConfirmStore` then showed one after another — a dialog saying "Closing **this
+ * tab** discards these edits" three times, each naming a different file, for a gesture the user
+ * made once. Now they ask once in total, and the plural is what makes the heading and the body
+ * agree with the list underneath them.
+ */
+export type CloseScope = 'pane' | 'tab' | 'tabs' | 'project' | 'window' | 'app'
 
 /** Everything a close would cost, in the shape `app.quitRequested` answers. */
 export interface CloseRisk {
@@ -66,7 +76,11 @@ export function confirmTitle(scope: CloseScope, risk: CloseRisk): string {
   // A pane close discards one editor's buffer, so it names the file for the same reason a
   // single-file tab close does: "1 file with unsaved changes" tells the user nothing they
   // can act on when they are looking straight at it.
-  if (risk.unsaved.length === 1 && (scope === 'tab' || scope === 'pane')) {
+  //
+  // `tabs` is here too, and it is the case that most needs it: closing eight tabs of which one
+  // is dirty is answered by a heading naming *that file*, which is the whole question the user
+  // has. "1 file with unsaved changes" would make them open the list to find out which.
+  if (risk.unsaved.length === 1 && (scope === 'tab' || scope === 'tabs' || scope === 'pane')) {
     return `${risk.unsaved[0]!.title} has unsaved changes`
   }
   if (risk.unsaved.length > 0) {
@@ -146,16 +160,21 @@ export function count(n: number, noun: string): string {
 /**
  * Park a refusal: it becomes the dialog if none is up, and joins the tail if one is.
  *
- * The rule it replaces was "a second request replaces the first", which was right while
- * every close was one tab — two requests could only be the same gesture asked twice. The
- * tab and project context menus broke that: **Close others** issues one close per tab, they
- * run concurrently, and two of them can be refused for unsaved changes in the same tick.
- * Replacing meant the user answered about one file and the other tab quietly stayed open
- * with nothing said — a gesture that half-works, which is the failure this whole surface
- * exists to remove.
+ * The rule it replaces was "a second request replaces the first", which was right while every
+ * close was one tab — two requests could only be the same gesture asked twice. The tab and
+ * project context menus broke that: **Close others** issued one close per tab, they ran
+ * concurrently, and two could be refused for unsaved changes in the same tick. Replacing meant
+ * the user answered about one file and the other tab quietly stayed open with nothing said — a
+ * gesture that half-works, which is the failure this whole surface exists to remove.
  *
- * Still only ever one dialog on screen. Stacking them was the alternative and lost: two
- * modals over each other is how a user loses track of which Discard belongs to which file.
+ * **That gesture no longer works that way.** The three bulk items ask once, through the [`tabs`
+ * scope](CloseScope) and the store's `closeTabs`, so the queue is not what makes *them* correct
+ * any more. It stays because concurrent refusals are still reachable by other routes — a quit
+ * racing a tab close, two shell windows over one project, a file that turns dirty mid-batch —
+ * and because the alternative is silence, which is strictly worse than a second dialog.
+ *
+ * Still only ever one dialog on screen. Stacking them was the other option and lost: two modals
+ * over each other is how a user loses track of which Discard belongs to which file.
  */
 export function parkClose<T>(
   pending: T | null,
@@ -179,6 +198,8 @@ function subject(scope: CloseScope): string {
       return 'this pane'
     case 'tab':
       return 'this tab'
+    case 'tabs':
+      return 'these tabs'
     case 'project':
       return 'this project'
     case 'window':

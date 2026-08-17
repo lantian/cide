@@ -3,11 +3,18 @@
 /**
  * Environment toggles passed to `claude` children, and how many of them come back on launch.
  *
- * The three environment toggles default off. [`Self::resume_all_on_launch`] does not, which
- * is why this has a hand-written [`Default`] rather than a derived one — a derive would give
- * it `false` silently, and it did: the field was added with a `true` written into a `Default`
- * impl that did not exist, the edit was a no-op, and only a test asserting the default caught
- * it.
+ * The three environment toggles default off. [`Self::resume_all_on_launch`] and
+ * [`Self::scroll_speed`] do not, which is why this has a hand-written [`Default`] rather than
+ * a derived one — a derive would give them `false` and `0` silently, and it did once: the
+ * resume field was added with a `true` written into a `Default` impl that did not exist, the
+ * edit was a no-op, and only a test asserting the default caught it. `scroll_speed` would
+ * have failed the same way and louder, since a derived `0` is a value the CLI discards.
+ *
+ * Everything here except [`Self::resume_all_on_launch`] is turned into an environment by
+ * [`cide_core::child_env::claude_env`], which is the only consumer and the only place the
+ * spelling of these variables is decided. Adding a field to this struct without adding a line
+ * there produces a switch that persists, renders, and does nothing — which is what three of
+ * these were until that function existed.
  */
 export type ClaudeSettings = { 
 /**
@@ -39,4 +46,22 @@ disableAlternateScreen: boolean,
  * Default **on**, because the splash is a screen asking a question whose answer is
  * always yes: a pane restored into a saved layout is a pane the user left open.
  */
-resumeAllOnLaunch: boolean, };
+resumeAllOnLaunch: boolean, 
+/**
+ * `CLAUDE_CODE_SCROLL_SPEED` — transcript lines the TUI moves per wheel *report*.
+ *
+ * This is the one lever cide has over how far a Claude pane scrolls, and it needs to be
+ * a setting rather than the constant it used to be, because the number that feels right
+ * depends on hardware nobody here can see: a high-resolution wheel under KDE Wayland
+ * delivers a notch as several small deltas, and xterm.js emits at most one report per
+ * wheel event, so the lines-per-notch a user actually gets is this number times a factor
+ * between roughly a third and one that varies by mouse. See `cmd/session.rs`'s `base_env`.
+ *
+ * Not a float, and not unbounded: the CLI parses this with `parseFloat` and then
+ * `Math.min(n, 20)`, and *discards* anything that is `NaN` or `<= 0` — falling back to a
+ * per-renderer default which, for a terminal announcing itself as xterm.js, is **1**.
+ * So an out-of-range value here would not be ignored, it would make scrolling four times
+ * worse than leaving it alone. [`crate::settings::ClaudeSettings::SCROLL_SPEED`] is the
+ * range, and `cide_core::child_env::claude_env` is where it is enforced.
+ */
+scrollSpeed: number, };

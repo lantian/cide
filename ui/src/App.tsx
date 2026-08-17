@@ -59,7 +59,7 @@ import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
 import { outsideAsk } from '@/terminal/outsideOpen'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
 import { revealPane } from '@/editor/revealPane'
-import { jumpTo } from '@/editor/jump'
+import { jumpTo, pendingJump } from '@/editor/jump'
 import { UNKNOWN_LINE } from '@/editor/navHistory'
 import { claudeSend } from '@/ipc/client'
 import { useKeyGate } from '@/keys/useKeyGate'
@@ -188,6 +188,8 @@ export function App() {
   const closeProject = useWorkspace((s) => s.closeProject)
   const activateTab = useWorkspace((s) => s.activateTab)
   const closeTab = useWorkspace((s) => s.closeTab)
+  const closeTabs = useWorkspace((s) => s.closeTabs)
+  const reorderTab = useWorkspace((s) => s.reorderTab)
 
   const splitPane = useWorkspace((st) => st.splitPane)
   const closePane = useWorkspace((st) => st.closePane)
@@ -732,27 +734,59 @@ export function App() {
          * precisely how the previous batch nearly shipped a commit-corrupting bug, so it is
          * named as a gap instead of being half-built.
          */
-        const park = (record: boolean): void => {
-          if (at === null) return
-          jumpTo(
-            project,
-            { path, line: at.line, column: at.column, endColumn: at.column + 1 },
-            record,
-          )
-        }
         // Re-parked on the retry rather than only once, because `REVEAL_TTL_MS` is 10 seconds
         // and reading a confirmation can easily take longer than that. Without this the approved
         // open lands at line 1 — the file opens, and the caret quietly does not go where the
         // user pointed, which is the shape of bug that gets reported months later as "sometimes".
-        // Recorded on the first attempt only. The *reveal* is re-parked on every retry for the
-        // TTL reason above; the *history entry* must not be, or approving the confirmation
-        // leaves two identical origin/destination pairs on the stack and Back appears to do
-        // nothing — it arrives at an entry indistinguishable from the one it left.
+        const park = (): void => {
+          if (at === null) return
+          jumpTo(
+            project,
+            { path, line: at.line, column: at.column, endColumn: at.column + 1 },
+            // Never from here. See `pendingJump` below.
+            false,
+          )
+        }
+        /*
+         * The history entry is prepared before the call and **written only once it succeeds**,
+         * and that is a fix rather than a tidy-up.
+         *
+         * It used to be written by `park`, on the first attempt, before anything was asked. So a
+         * path the user was shown and **declined** — the out-of-project confirmation — stayed on
+         * the Back stack, and Back then walked into it through `tab_open_file`, which by its own
+         * documentation "enforces nothing": no containment, no `is_file`, none of the four
+         * guards `openable` applies to exactly this class of path. A refusal the user had just
+         * given was reachable again with a thumb button, and the same door reopened a declined
+         * FIFO, which parks a blocking-pool worker in `read_to_end` for ever.
+         *
+         * `navHistory.ts` already states the rule this restores: an entry is a place the user
+         * has *been*. A refused open is not one. The reveal still has to be parked first — it
+         * has a TTL and the open is what mounts the editor that spends it — which is why the two
+         * halves are separable at all, and why `pendingJump` exists beside `jumpTo`.
+         *
+         * Two halves and not one call in the `.then()`, because the *origin* must be read here,
+         * synchronously, while the caret is still in the editor the user is leaving. See
+         * `pendingJump`: the open broadcasts from inside the workspace lock, so the destination's
+         * editor can have mounted and claimed the caret slot before this promise settles.
+         *
+         * Recorded once and not per retry: an attempt that throws never reaches the commit, so
+         * the approved retry is the first and only writer. That also preserves what the old
+         * first-attempt-only flag was for — two identical origin/destination pairs on the stack
+         * would make Back appear to do nothing, arriving at an entry indistinguishable from the
+         * one it left.
+         */
         const attempt = (approvedTarget?: string): void => {
-          park(approvedTarget === undefined)
+          park()
+          const arrived =
+            at === null ? null : pendingJump(project, { path, line: at.line, column: at.column })
           void fileApi
             .openFromTerminal(project, path, approvedTarget)
-            .then(() => hydrate())
+            .then(() => {
+              // Before the hydrate, so the entry is on the stack by the time anything can render
+              // — and after the open, so a refusal never becomes a place the user has been.
+              arrived?.()
+              hydrate()
+            })
             .catch((reason: unknown) => {
               const ask = outsideAsk(reason)
               if (ask === null) return notifyFailure(reason)
@@ -974,6 +1008,8 @@ export function App() {
                   activeTab={activeProject.activeTab}
                   onActivate={(id) => void activateTab(activeProject.id, id)}
                   onClose={(id) => void closeTab(activeProject.id, id)}
+                  onCloseMany={(ids) => void closeTabs(activeProject.id, ids)}
+                  onReorder={(id, before) => void reorderTab(activeProject.id, id, before)}
                   onSplit={() => {
                     // Splits the focused pane sideways with the tab's default intent —
                     // a shell in the pinned console, a new session in a ClaudeFull tab.

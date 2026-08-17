@@ -650,6 +650,99 @@ pub fn tab_close(
     Ok(out)
 }
 
+/// Move a tab within its strip — the drop half of a tab drag.
+///
+/// # The domain rule has existed since M4 and nothing could reach it
+///
+/// `cide_core::workspace::reorder_tab` is complete, invariant-preserving and covered by three
+/// tests, and until this command there was **no `#[tauri::command]` that called it**: the whole
+/// feature was implemented and reachable from nothing, which is this project's signature defect
+/// and the eighteenth recorded instance. (`project_reorder` beside it is the nineteenth and is
+/// still in that state — registered, exposed at `ui/src/ipc/client.ts:165`, and called by no
+/// line of TypeScript. It is named in `README.md` rather than fixed here.) The lesson this
+/// batch takes from it: a domain function with no command is not "half done", it is *absent*,
+/// and its tests passing says nothing about whether a user can do the thing.
+///
+/// # Ids on the wire, indices in the lock
+///
+/// `reorder_tab` takes indices, and this command deliberately does not. The drop index is
+/// computed in the webview at pointer-move time, off a `Tab[]` that arrived in some earlier
+/// snapshot; between that move and the `pointerup` that commits it, an agent's `openDiff`, a
+/// ctrl+click or another window's close can insert or remove a tab. An index-based wire call
+/// would then move a tab the user was not dragging — silently, and into a position they did not
+/// aim at. Ids name the thing itself, so the worst a stale drag can do is fail to find it.
+///
+/// Both ids are resolved **inside** `state.update`'s closure, where the workspace lock is held,
+/// so the resolution and the mutation cannot be separated by another command. Resolving them in
+/// the frontend and sending numbers is the same bug one layer up.
+///
+/// `before` is the tab the dragged one lands *in front of*; `None` means the end of the strip.
+/// A boundary rather than a destination index, because "insert before this tab" is stable under
+/// the removal that precedes the insert, whereas an index means one thing before the tab is
+/// lifted out and another after it — the off-by-one that every hand-rolled reorder ships once.
+///
+/// Two refusals come back from the domain, and the frontend is built so a user cannot reach
+/// either: [`CoreError::TabPinned`] for moving the console or dropping anything ahead of it
+/// (`tabDrag.ts` refuses the grab and clamps the caret to boundary 1), and
+/// [`CoreError::IndexOutOfRange`] for an id that is no longer in the strip. They are enforcement
+/// regardless — the same division of labour `tab_close` documents.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_reorder(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    tab: TabId,
+    before: Option<TabId>,
+) -> Result<Mutated, CoreError> {
+    state.update(|ws| {
+        let (from, to) = reorder_target(&workspace::project(ws, project)?.tabs, tab, before)?;
+        workspace::reorder_tab(ws, project, from, to)?;
+        Ok(Mutated { rev: ws.rev })
+    })
+}
+
+/// Resolve (dragged tab, drop boundary) to [`workspace::reorder_tab`]'s (from, to) indices.
+///
+/// A free function over a slice rather than four lines inside the closure above, because it is
+/// **arithmetic with an off-by-one in it** and a rule that can only be reached through a
+/// `State<WorkspaceState>` is a rule that gets tested at the level of "does the app start". This
+/// project has paid for that six times over; the tests below drive it directly.
+///
+/// `before` is a *boundary* — the tab the dragged one lands in front of, `None` for the end of
+/// the strip — and the conversion to a destination index is the whole subtlety. `reorder_tab`
+/// removes `from` and then inserts at `to`, so `to` addresses the list **with the dragged tab
+/// already lifted out**: every position after `from` has shifted down by one. A boundary to the
+/// right of `from` therefore loses one; a boundary at or to the left of it does not.
+///
+/// Get it wrong in the obvious way — pass the boundary through unchanged — and dragging a tab
+/// one place to the right puts it back exactly where it started. The gesture then reads as
+/// "reordering does not work" for the single most common drag there is, while every leftward drag
+/// behaves perfectly, which is the sort of half-working that survives a manual test.
+fn reorder_target(
+    tabs: &[cide_ipc::Tab],
+    tab: TabId,
+    before: Option<TabId>,
+) -> Result<(usize, usize), CoreError> {
+    let from = tabs
+        .iter()
+        .position(|t| t.id == tab)
+        .ok_or(CoreError::NoSuchTab(tab))?;
+    let boundary = match before {
+        Some(id) => tabs
+            .iter()
+            .position(|t| t.id == id)
+            .ok_or(CoreError::NoSuchTab(id))?,
+        None => tabs.len(),
+    };
+    Ok((
+        from,
+        if boundary > from {
+            boundary - 1
+        } else {
+            boundary
+        },
+    ))
+}
+
 /// What Ctrl+Shift+T would need to bring `tab` back, read off the workspace before it closes.
 ///
 /// A free function over `&Workspace` rather than three lines inside [`tab_close`], for the
@@ -748,7 +841,7 @@ pub fn tab_reopen_closed(
 
 /// What [`tab_reopen_closed`] should do with one record. See that function for the reasoning.
 #[derive(Debug, PartialEq, Eq)]
-enum Reopen {
+pub(crate) enum Reopen {
     /// Put the tab back where it was.
     Reinsert,
     /// It is open already and is not the tab on screen; show it, and that is the press.
@@ -768,7 +861,10 @@ enum Reopen {
 /// The `is_file` stat is inside rather than lifted out, so the whole decision is one call: split
 /// across the caller and here, "deleted" and "already open" would be two rules that have to be
 /// read together to know what a press does.
-fn reopen_plan(ws: &cide_ipc::Workspace, record: &crate::closed_tabs::ClosedTab) -> Reopen {
+pub(crate) fn reopen_plan(
+    ws: &cide_ipc::Workspace,
+    record: &crate::closed_tabs::ClosedTab,
+) -> Reopen {
     // A file that is no longer there. `tab_open_file` does not stat, so without this the tab
     // opens and the editor lands in `load: 'failed'` — honest, and not what "reopen" means.
     if let TabKind::File { path, .. } = &record.kind
@@ -881,6 +977,131 @@ mod tests {
             panes,
             "the pane ids come back with it, which is what lets a reopened tab re-adopt its \
              own parked terminal"
+        );
+    }
+
+    /// Open `n` extra file tabs beside the console, and hand back every tab id in strip order.
+    fn strip(n: usize) -> (Workspace, ProjectId, Vec<TabId>) {
+        let (mut ws, project, first) = with_file("/w/f0.rs");
+        let mut ids = vec![
+            workspace::project(&ws, project).expect("a project").tabs[0].id,
+            first,
+        ];
+        for i in 1..n {
+            ids.push(
+                workspace::open_tab(
+                    &mut ws,
+                    project,
+                    TabKind::File {
+                        path: PathBuf::from(format!("/w/f{i}.rs")),
+                        dirty: false,
+                    },
+                    Pane {
+                        id: PaneId::new(),
+                        kind: PaneKind::Editor,
+                        role: PaneRole::Auxiliary,
+                        session: None,
+                        title: "f".into(),
+                    },
+                )
+                .expect("a tab opens"),
+            );
+        }
+        (ws, project, ids)
+    }
+
+    /// The off-by-one, driven in both directions.
+    ///
+    /// The rightward rows are the ones that catch the bug: pass the boundary through unchanged
+    /// and `(1, 2)` becomes `(1, 2)`, which `reorder_tab` turns into remove-then-insert at the
+    /// same place — the tab does not move. Every leftward drag still works, so a manual test of
+    /// "does dragging work" passes while half the gesture is dead.
+    #[test]
+    fn a_drop_boundary_becomes_the_index_the_tab_lands_on_after_it_is_lifted_out() {
+        // The console plus four file tabs: ids 0..=4, and 4 is the last index.
+        let (ws, project, ids) = strip(4);
+        let tabs = &workspace::project(&ws, project).expect("a project").tabs;
+        assert_eq!(tabs.len(), 5, "console + four files");
+        let at = |tab: usize, before: Option<usize>| {
+            reorder_target(tabs, ids[tab], before.map(|b| ids[b]))
+                .expect("both ids are in the strip")
+        };
+
+        // Rightward: the boundary is past the lifted tab, so it loses one.
+        assert_eq!(
+            at(1, Some(3)),
+            (1, 2),
+            "tab 1 dropped before tab 3 lands at 2"
+        );
+        assert_eq!(at(1, None), (1, 4), "and dropped past the end, at the end");
+        // The smallest rightward move there is, and the one the naive version turns into a no-op.
+        assert_eq!(
+            at(1, Some(2)),
+            (1, 1),
+            "dropped just before its own neighbour: unchanged"
+        );
+
+        // Leftward: the boundary is at or before the lifted tab, so it passes through.
+        assert_eq!(
+            at(3, Some(1)),
+            (3, 1),
+            "tab 3 dropped before tab 1 lands at 1"
+        );
+        assert_eq!(at(3, Some(3)), (3, 3), "dropped on itself is a no-op");
+    }
+
+    /// The two refusals, and the point is that they are the **domain's** rather than a second copy.
+    ///
+    /// `reorder_target` is pure arithmetic and deliberately does not know what a pinned tab is:
+    /// it happily resolves a drop before the console to `to = 0`, and `reorder_tab` is what
+    /// refuses it. One authority, so the frontend's clamp cannot drift into being the only guard.
+    #[test]
+    fn the_console_cannot_be_moved_and_nothing_can_be_moved_in_front_of_it() {
+        let (mut ws, project, ids) = strip(3);
+        // Resolved first, and the borrow released, so the domain call below can take `&mut ws`.
+        let resolve = |tab: TabId, before: Option<TabId>| {
+            reorder_target(
+                &workspace::project(&ws, project).expect("a project").tabs,
+                tab,
+                before,
+            )
+            .expect("resolves")
+        };
+        let in_front = resolve(ids[2], Some(ids[0]));
+        let the_console = resolve(ids[0], Some(ids[2]));
+
+        assert_eq!(in_front, (2, 0), "the arithmetic does not editorialise");
+        assert_eq!(
+            workspace::reorder_tab(&mut ws, project, in_front.0, in_front.1),
+            Err(CoreError::TabPinned),
+            "and the domain refuses the drop in front of the console"
+        );
+        assert_eq!(
+            workspace::reorder_tab(&mut ws, project, the_console.0, the_console.1),
+            Err(CoreError::TabPinned),
+            "and refuses moving the console itself"
+        );
+    }
+
+    /// A tab that left the strip between the pointer-move and the drop.
+    ///
+    /// This is why the wire carries ids and not indices: the drop boundary is computed in the
+    /// webview against a snapshot, and an agent's `openDiff` or another window's close can move
+    /// the strip under it. With indices the stale call would silently reorder *some other tab*;
+    /// with ids the worst case is this refusal.
+    #[test]
+    fn an_id_that_is_no_longer_in_the_strip_refuses_rather_than_moving_a_neighbour() {
+        let (ws, project, ids) = strip(3);
+        let tabs = &workspace::project(&ws, project).expect("a project").tabs;
+        let gone = TabId::new();
+
+        assert_eq!(
+            reorder_target(tabs, gone, Some(ids[1])),
+            Err(CoreError::NoSuchTab(gone))
+        );
+        assert_eq!(
+            reorder_target(tabs, ids[1], Some(gone)),
+            Err(CoreError::NoSuchTab(gone))
         );
     }
 

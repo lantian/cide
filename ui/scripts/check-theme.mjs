@@ -391,19 +391,27 @@ try {
    * The one thing that is a `var()` and is *not* tokens.css's to supply: a custom property one
    * CSS module publishes for another.
    *
-   * `--pane-corner` is the width of the floating control cluster the pane frame parks in every
-   * pane's top-right. Three pane surfaces draw their own controls in that corner and pad by it
-   * so the cluster does not sit on them, which makes it a measurement passed between modules
-   * rather than a colour. It cannot go in tokens.css: it is one box's geometry, it is reserved
-   * with a `min-width` in the same rule that publishes it, and a theme has no opinion on it.
+   * `--pane-corner-clear` is the band the floating control cluster occupies in every pane's
+   * top-right: the cluster's own width plus however far in from the right edge the pane kind
+   * parks it. Four pane surfaces draw something in that corner — two diff headers, the editor's
+   * conflict bar and the find bar — and reserve it so the cluster does not sit on them, which
+   * makes it a measurement passed between modules rather than a colour. It cannot go in
+   * tokens.css: it is one box's geometry, it is a `calc()` over two properties published in the
+   * same rule, and a theme has no opinion on it.
    *
    * It still has to resolve, and for the same reason as everything above: the consumers write
-   * `var(--pane-corner, 0px)`, so a renamed or deleted publisher turns the reserve into a
+   * `var(--pane-corner-clear, 0px)`, so a renamed or deleted publisher turns the reserve into a
    * silent zero and puts a diff's layout switcher back underneath the pane's ⧉ — drawn, hovered
    * and unclickable, which is the state review found it in. So the exemption is not a blanket
    * one: the property is excused from the palette walk only while some module actually defines
    * it, and the publisher list is pinned below so a second one is a decision rather than a
    * surprise.
+   *
+   * `--pane-corner` and `--pane-cluster-inset`, the two halves of that sum, do not appear here:
+   * they are defined and read inside `PaneTitleBar.module.css` alone, which the walk above
+   * treats as local. That is the shape `check:rows` now enforces — a consumer reading the bare
+   * width reserves 125px where an editor pane needs 221, which is how the conflict bar came to
+   * be drawn, hovered, and answering the close button's click.
    */
   const publishers = new Map()
   for (const file of cssModules('src')) {
@@ -433,7 +441,7 @@ try {
     wanted
       .filter((t) => (darkAll[t] ?? '') === '' && contract(t))
       .map((t) => `${t} <- ${publishers.get(t)[0]}`),
-    ['--pane-corner <- src/layout/PaneTitleBar.module.css'],
+    ['--pane-corner-clear <- src/layout/PaneTitleBar.module.css'],
     'the only custom property one CSS module publishes to another is the pane corner reserve, ' +
       'and exactly one file publishes it',
   )

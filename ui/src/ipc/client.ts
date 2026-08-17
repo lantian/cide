@@ -41,6 +41,7 @@ import type {
   SymbolIndexStatus,
   ProjectId,
   QuitDecision,
+  ReopenedFile,
   SearchFrame,
   SearchQuery,
   SessionExit,
@@ -184,6 +185,23 @@ export const tab = {
    */
   close: (projectId: ProjectId, id: TabId, force = false) =>
     invoke<{ rev: number }>('tab_close', { project: projectId, tab: id, force }),
+
+  /**
+   * Move a tab within its strip — what a tab drag commits on `pointerup`.
+   *
+   * `before` is the tab the dragged one lands **in front of**; `null` drops it at the end. A
+   * boundary rather than a destination index, and **ids rather than indices**, both deliberate:
+   * the drop position is computed in the webview at pointer-move time against a snapshot, and
+   * between that move and the release an agent's `openDiff` or another window can insert or
+   * remove a tab. An index would then move whichever tab now sits there — silently, and
+   * somewhere nobody aimed. Rust resolves both ids to indices under the workspace lock.
+   *
+   * Refuses with `tabPinned` for the console — moving it, or dropping anything ahead of it. The
+   * frontend does not let a user reach either (`chrome/tabDrag.ts` refuses the grab and clamps
+   * the caret to boundary 1), but that is the courtesy; this is the enforcement.
+   */
+  reorder: (projectId: ProjectId, id: TabId, before: TabId | null) =>
+    invoke<{ rev: number }>('tab_reorder', { project: projectId, tab: id, before }),
 
   /**
    * Put back the last tab this project closed. Ctrl+Shift+T.
@@ -1306,6 +1324,23 @@ export const file = {
   /** Open a file tab, or activate the one already showing this path. */
   open: (projectId: ProjectId, path: string) =>
     invoke<TabId>('tab_open_file', { project: projectId, path }),
+
+  /**
+   * Reopen a file the **navigation history** remembers. What Back and Forward walk into.
+   *
+   * Not `open`, and the difference is two things `open` cannot do. It consults the closed-tab
+   * stack, so a Back into a file that was closed while split brings the *split* back — pane ids
+   * and live Claude sessions included — instead of minting a fresh single-pane editor and
+   * leaving the record behind to poison the next Ctrl+Shift+T. And it stats first, so a Back
+   * into a deleted file or a discarded scratch answers `gone` instead of creating a permanent
+   * tab reading "This file could not be opened".
+   *
+   * Answers rather than rejects, because none of the three outcomes is a failure: `restored`
+   * and `opened` both just need a hydrate, and `gone` is an informational notice — the same
+   * division `tab.reopenClosed` makes for the same reason.
+   */
+  reopen: (projectId: ProjectId, path: string) =>
+    invoke<ReopenedFile>('tab_reopen_file', { project: projectId, path }),
 
   /**
    * Open a file a **terminal pane** named. Same tab list, entirely different trust.

@@ -487,6 +487,37 @@ pub struct SplitOutcome {
     pub intent: SplitIntent,
 }
 
+/// What a Back or Forward into a file actually did. (M16)
+///
+/// Tagged rather than a bare `TabId`, and an `Ok` rather than an `Err`, because the three
+/// outcomes are three different things to *say* and only one of them is a failure — which none
+/// of them is. `cmd::file::tab_reopen_file` argues the split at length; the short version is
+/// that "that file is no longer there" belongs in an informational notice, exactly where
+/// `tab_reopen_closed` puts the same fact, and putting it on the failure toast would make an
+/// ordinary consequence of deleting a file look like a bug in the app.
+///
+/// [`Self::Restored`] and [`Self::Opened`] are distinguished for the user's sake and not the
+/// caller's: both end in a hydrate. The distinction is kept because it is the observable
+/// difference between Back putting a *split* tab back — panes, ids, live Claude sessions — and
+/// Back minting a fresh single-pane editor, and a wire type that could not express it would make
+/// that regression invisible to every check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[ts(export)]
+pub enum ReopenedFile {
+    /// The closed-tab record was spent: the tab is back with its original pane tree.
+    Restored { tab: TabId },
+    /// An ordinary open — there was no record for this path, or the tab was open already and
+    /// was activated. The record, if there was one, is deliberately still on the stack.
+    Opened { tab: TabId },
+    /// Nothing is at that path any more. No tab was opened and nothing was consumed.
+    Gone { path: String },
+}
+
 /// A text file as the editor loads it. (M9)
 ///
 /// The text is the file's bytes verbatim, line endings included. Normalising here would be
@@ -617,14 +648,16 @@ mod file_stamp_tests {
         );
 
         let back: FileStamp = serde_json::from_str(&wire).expect("deserialises");
-        assert_eq!(back.mtime_nanos, stamp.mtime_nanos, "not one nanosecond lost");
+        assert_eq!(
+            back.mtime_nanos, stamp.mtime_nanos,
+            "not one nanosecond lost"
+        );
 
         // And the value really is past what a double can hold, so the test is testing something.
         const JS_MAX_SAFE: u64 = 9_007_199_254_740_991;
         assert!(stamp.mtime_nanos > JS_MAX_SAFE);
         assert_ne!(
-            stamp.mtime_nanos as f64 as u64,
-            stamp.mtime_nanos,
+            stamp.mtime_nanos as f64 as u64, stamp.mtime_nanos,
             "a double genuinely cannot hold this — if this ever passes, the premise has changed"
         );
     }

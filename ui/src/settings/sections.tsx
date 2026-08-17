@@ -268,6 +268,25 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
           checked={claude.disableAlternateScreen}
           onChange={(v) => set({ disableAlternateScreen: v })}
         />
+        {/* A number rather than a switch because there is no right value to default to: what a
+            wheel notch is worth is this figure multiplied by how many reports the mouse
+            produces per notch, and the second factor is a property of the pointer and the
+            compositor that cide cannot read. Raising this is the one lever that works whichever
+            way that lands. `max` is the CLI's own clamp and `min` is 1 because 0 is a value it
+            discards — see `ClaudeSettings::SCROLL_SPEED`, which is where both come from. */}
+        <Row
+          label="Scroll speed"
+          hint="CLAUDE_CODE_SCROLL_SPEED. Transcript lines a Claude pane moves per wheel report, 1 to 20. Raise it if the wheel scrolls too little; a high-resolution mouse can spend several reports on one notch. PageUp and PageDown scroll a Claude pane too, and are not affected."
+          control={
+            <NumberField
+              label="Claude scroll speed"
+              value={claude.scrollSpeed}
+              min={1}
+              max={20}
+              onChange={(scrollSpeed) => set({ scrollSpeed })}
+            />
+          }
+        />
       </Group>
 
       <Note title="Applied at spawn">

@@ -33,10 +33,18 @@
    * `layout/PaneTitleBar.module.css` now floats in the pane's top-right — and `Keep mine` is
    * the last thing in the row, which put it entirely inside those 126px. A button that
    * preserves unsaved edits must not be one the user can only click the bottom four pixels
-   * of. `--pane-corner` is the frame's own reserve, so this tracks it; the fallback is for
-   * the bar rendered outside a pane.
+   * of. The fallback is for the bar rendered outside a pane.
+   *
+   * `--pane-corner-clear` and not `--pane-corner`, and that is a bug fix rather than a rename:
+   * an editor pane insets the cluster by the minimap's 96px, so the band to keep clear is
+   * 96 + 125 = 221px and this bar was reserving 125. Both of its buttons therefore landed
+   * *entirely* inside the cluster's live `.actions` box — drawn, hovered, and answering
+   * somebody else's click, which on this bar means the ⧉ or the × instead of the choice
+   * between the user's unsaved edits and what is on disk. It was wired to the mechanism and
+   * passing `check:rows` the whole time; the number the mechanism gave it was wrong for this
+   * pane kind, and `--pane-corner-clear` is the mechanism learning to answer per kind.
    */
-  padding: 6px calc(10px + var(--pane-corner, 0px)) 6px 10px;
+  padding: 6px calc(10px + var(--pane-corner-clear, 0px)) 6px 10px;
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-size: 12px;

@@ -128,6 +128,51 @@ async function tabCloseRisk(
 }
 
 /**
+ * What closing **several** tabs would cost, asked once for the whole gesture.
+ *
+ * Not `tabCloseRisk` in a loop, and the difference is the entire point of this function. That
+ * one short-circuits to "nothing" when a tab has no session bound, deliberately, so a single `×`
+ * does not pay a round trip to be told what Rust's refusal would say anyway. Run over eight
+ * tabs, that produces eight independent refusals, which `closeConfirmStore` queues into eight
+ * dialogs for a gesture the user made once — the behaviour *Close others* and *Close to the
+ * right* shipped with, and which the queue was built to make survivable rather than to endorse.
+ *
+ * So this asks `quitRequested` **once** and narrows the answer to the tabs actually closing. One
+ * round trip for the gesture, where the loop paid one per tab that had a session bound and none
+ * for the rest. That is cheaper whenever the answer matters and one trip dearer when nothing is
+ * at stake, which is the right way round: the trip nobody needed is a millisecond, and the
+ * dialogs it replaces were the user's afternoon.
+ *
+ * The narrowing is by tab id on the unsaved half and by bound session on the other, exactly as
+ * the single-tab version does — a dirty file in a tab that is *not* in this batch is not at risk
+ * and must not be listed, or the user is asked to discard work that was never going anywhere.
+ */
+async function tabsCloseRisk(
+  boot: Bootstrap | null,
+  project: ProjectId,
+  tabs: readonly TabId[],
+): Promise<{ unsaved: UnsavedTab[]; sessions: SessionSummary[] }> {
+  const nothing = { unsaved: [], sessions: [] }
+  const open = boot?.workspace.projects[project]?.tabs
+  if (!open || tabs.length === 0) return nothing
+
+  const closing = new Set<TabId>(tabs)
+  const bound = new Set<SessionId>()
+  for (const tab of open) {
+    if (!closing.has(tab.id)) continue
+    for (const pane of Object.values(tab.tree.panes)) {
+      if (pane.session !== null) bound.add(pane.session)
+    }
+  }
+
+  const decision = await appApi.quitRequested(project)
+  return {
+    unsaved: decision.unsaved.filter((u) => closing.has(u.tab)),
+    sessions: decision.blocking.filter((s) => bound.has(s.session)),
+  }
+}
+
+/**
  * Which projects this window has asked Rust to index, and over which roots.
  *
  * Module scope rather than store state, for the reason `treeStore`'s `inFlight` is: nothing
@@ -438,6 +483,24 @@ interface WorkspaceStore {
    * bypassed this store still could not discard a buffer.
    */
   closeTab: (project: ProjectId, tab: TabId, force?: boolean) => Promise<void>
+  /**
+   * Move a tab along the strip. What a tab drag commits on `pointerup`.
+   *
+   * `before` is the tab it lands in front of, `null` for the end. Ids rather than indices for
+   * the reason `tab.reorder` documents at length: the boundary is computed in the webview at
+   * pointer-move time and the strip can change before the release.
+   */
+  reorderTab: (project: ProjectId, tab: TabId, before: TabId | null) => Promise<void>
+  /**
+   * Close several tabs as **one** gesture — *Close others*, *Close to the left*, *Close to the
+   * right*.
+   *
+   * Not a loop over `closeTab`, which is what those three used to be. That asked once per tab at
+   * risk and queued the dialogs, so closing eight tabs with three dirty files meant three
+   * modals, each saying "Closing *this tab*", for a gesture made once. This asks once in total,
+   * names every file in the one list, and `force` comes back from that single answer.
+   */
+  closeTabs: (project: ProjectId, tabs: readonly TabId[], force?: boolean) => Promise<void>
 
   splitPane: (
     project: ProjectId,
@@ -613,6 +676,55 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   },
   activateTab: async (project, tab) => {
     await tabApi.activate(project, tab)
+    await get().hydrate()
+  },
+  reorderTab: async (project, tab, before) => {
+    await tabApi.reorder(project, tab, before)
+    await get().hydrate()
+  },
+  closeTabs: async (project, tabs, force = false) => {
+    if (tabs.length === 0) return
+    if (!force) {
+      // One question for the whole gesture. See `tabsCloseRisk` for why this is not
+      // `tabCloseRisk` in a loop, and `CloseScope`'s `tabs` variant for why the wording differs.
+      const risk = await tabsCloseRisk(get().boot, project, tabs)
+      if (risk.sessions.length > 0 || risk.unsaved.length > 0) {
+        requestCloseConfirm({
+          scope: 'tabs',
+          unsaved: risk.unsaved,
+          sessions: risk.sessions,
+          proceed: () => get().closeTabs(project, tabs, true),
+        })
+        return
+      }
+    }
+
+    /*
+     * Sequential, not `Promise.all`, and that is not caution about load.
+     *
+     * Every close is a workspace mutation that bumps `rev`, and `tab_close` also reconciles
+     * windows and can resolve an agent's pending `openDiff`. Firing eight at once interleaves
+     * eight read-modify-writes against one lock and eight `workspace-changed` broadcasts, and
+     * the strip visibly flickers through seven intermediate layouts. In order, the user sees the
+     * tabs go.
+     *
+     * Each one still goes to Rust **unforced** unless the dialog was answered, so the domain
+     * stays the authority: `tabsCloseRisk` read a snapshot, and a file that turned dirty between
+     * that read and this call must still be refused. That refusal parks its own dialog through
+     * `refused`, which is the pre-existing per-tab path doing what it is for — catching a race,
+     * rather than being the ordinary way this gesture asks.
+     */
+    for (const tab of tabs) {
+      const parked = await refused(
+        'tab',
+        () => tabApi.close(project, tab, force),
+        () => get().closeTab(project, tab, true),
+      )
+      // A refusal we did not anticipate stops the batch rather than closing the tabs after it
+      // behind the user's back: the dialog on screen is about *this* tab, and marching on would
+      // mean answering it decides the fate of files it never named.
+      if (parked) break
+    }
     await get().hydrate()
   },
   closeTab: async (project, tab, force = false) => {

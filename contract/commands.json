@@ -140,6 +140,8 @@
   "tab_open_file",
   "tab_open_settings",
   "tab_reopen_closed",
+  "tab_reopen_file",
+  "tab_reorder",
   "tab_retarget_diff",
   "tab_set_dirty",
   "terminal_open_path",

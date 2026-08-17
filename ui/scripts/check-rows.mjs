@@ -16,8 +16,26 @@
  * Run: `pnpm --dir ui run check:rows`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+
+/**
+ * Every CSS module under `dir`, recursively.
+ *
+ * Enumerated rather than listed, because the assertion it serves — that nobody outside
+ * `PaneTitleBar.module.css` reads the cluster's bare width — is only worth anything if a
+ * *new* stylesheet reaching for the wrong property is caught. A hard-coded list is a list of
+ * the files that were wrong last time. Same walker as `check-theme.mjs`'s.
+ */
+function cssModules(dir) {
+  const out = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...cssModules(path))
+    else if (entry.name.endsWith('.module.css')) out.push(path)
+  }
+  return out
+}
 
 // Under `node_modules/.cache` rather than the system temp dir: the bundle keeps
 // `react-dom/server` external, so node resolves it relative to wherever the output sits.
@@ -331,25 +349,72 @@ try {
   //    This is the regression that shipped and was found in review: the cluster takes the
   //    pointer over whatever is beneath it, and it reveals whenever the mouse is anywhere in
   //    the pane — so a control the pane drew there was still painted, still hovered, and no
-  //    longer clickable. `.frame` publishes `--pane-corner` and reserves exactly that width
-  //    with `min-width`; every surface that puts something in that corner pads by it.
+  //    longer clickable. `.frame` publishes the band and every surface that puts something in
+  //    that corner reserves it.
+  //
+  //    The property consumers read is `--pane-corner-clear`, NOT `--pane-corner`, and that
+  //    distinction is the whole of the bug this loop grew a fourth entry for. `--pane-corner`
+  //    is the cluster's *width*; the band it occupies is that width plus `--pane-cluster-inset`,
+  //    which an editor pane sets to the minimap's 96px. `EditorPane`'s conflict bar reserved
+  //    the width alone, was in this list, and passed — while both of its buttons sat wholly
+  //    inside the cluster's live box, so the click that chose between the user's unsaved edits
+  //    and what is on disk closed the pane. A gate that pins presence and not the right number
+  //    protects the bug; this section now pins the number too.
+  const frameRule = /\.frame \{[^}]*\}/.exec(paneCss)?.[0] ?? ''
   ok(
-    /--pane-corner:\s*\d+px/.test(/\.frame \{[^}]*\}/.exec(paneCss)?.[0] ?? ''),
+    /--pane-corner:\s*\d+px/.test(frameRule),
     '`.frame` publishes `--pane-corner`, the width the cluster reserves',
+  )
+  ok(
+    /--pane-cluster-inset:\s*0px/.test(frameRule),
+    '`.frame` states the default inset explicitly rather than leaving the sum below to ride a '
+      + '`var()` fallback — a fallback resolves in silence, which is this reserve\'s failure mode',
+  )
+  ok(
+    /--pane-corner-clear:\s*calc\(\s*var\(--pane-cluster-inset\)\s*\+\s*var\(--pane-corner\)\s*\)/
+      .test(frameRule),
+    '`--pane-corner-clear` is the SUM of the inset and the width — the band the cluster '
+      + 'actually occupies, which is what a pane\'s own content has to keep clear',
   )
   for (const [file, selector] of [
     ['src/panes/DiffPane.module.css', '.header'],
     ['src/panes/GitDiffPane.module.css', '.header'],
     ['src/panes/EditorPane.module.css', '.conflict'],
+    // The find bar. A CodeMirror top panel is `position: sticky; top: 0` across the editor's
+    // full width, so it is the same 33 rows of pixels as the cluster — `Match case` under `×`,
+    // `3 of 12` under `⧉`. It cannot be raised out of the way: `.body`'s `z-index: 0` was added
+    // deliberately to put the cluster on top (the block further down pins that against the real
+    // literals in `node_modules`), because before it the bar covered all four buttons. So the
+    // panel reserves the band like every other surface that lands in that corner.
+    ['src/editor/EditorSurface.module.css', '.body :global(.cm-panels.cm-panels-top)'],
   ]) {
-    const rule = new RegExp(`\\${selector} \\{[^}]*\\}`).exec(css(file))?.[0] ?? ''
+    // The selector is matched literally rather than built into a character-escaped pattern:
+    // `:global(.cm-panels...)` has parentheses and dots in it, and the `"\\" + selector` trick
+    // the first three entries were written with escapes only the leading character.
+    const body = css(file)
+    const at = body.indexOf(`${selector} {`)
+    const rule = at < 0 ? '' : body.slice(at, body.indexOf('}', at) + 1)
     ok(rule !== '', `${file} still has a \`${selector}\` rule to check`)
     ok(
-      /var\(--pane-corner/.test(rule),
-      `${file} \`${selector}\` reserves \`--pane-corner\` — its right-hand controls sit under `
-        + 'the pane cluster otherwise, drawn but unclickable',
+      /var\(--pane-corner-clear/.test(rule),
+      `${file} \`${selector}\` reserves \`--pane-corner-clear\` — its right-hand controls sit `
+        + 'under the pane cluster otherwise, drawn but unclickable',
     )
   }
+
+  // And nobody outside the publishing file reads the bare width any more. This is the
+  // assertion that would have caught the conflict bar: it *was* wired to `--pane-corner`, and
+  // `--pane-corner` is the wrong number on any pane kind that insets the cluster.
+  const bareCornerReaders = cssModules('src')
+    .filter((f) => f !== 'src/layout/PaneTitleBar.module.css')
+    .filter((f) => /var\(\s*--pane-corner\s*[,)]/.test(css(f)))
+  eq(
+    bareCornerReaders,
+    [],
+    'no module outside `PaneTitleBar.module.css` reads bare `--pane-corner`. It is the '
+      + "cluster's width, not the band it occupies; a consumer reading it reserves 125px where "
+      + 'an editor pane needs 221 and leaves a 96px strip of its own controls unclickable',
+  )
 
   // 4. And the detached window does not hide the cluster's buttons. Those are that window's
   //    only minimize/zoom/close — it carries no WM decorations — and the rule that used to
@@ -363,31 +428,51 @@ try {
 
   // --- the floating cluster's reserve is a measurement, not a guess ---------------------
   //
-  // `--pane-corner` is what three other stylesheets pad by so their own right-aligned
-  // controls are not covered by the cluster, and it went stale the moment the index and the
-  // title were removed from it: 126px of reserve for 115px of controls. `min-width` holds the
-  // box open and `flex-end` pushes the buttons to its right edge, so the slack showed up as
-  // the margin the user reported.
+  // `--pane-corner` is what four other stylesheets reserve (through `--pane-corner-clear`) so
+  // their own right-aligned controls are not covered by the cluster, and it went stale the
+  // moment the index and the title were removed from it: 126px of reserve for 115px of
+  // controls. `min-width` holds the box open and `flex-end` pushes the buttons to its right
+  // edge, so the slack showed up as the margin the user reported.
   //
   // Derived from the parts rather than restated, so the next control added to the cluster
   // fails here instead of quietly widening the gap again.
+  //
+  // The derivation itself was wrong until M13, in a way that matters more than an arithmetic
+  // slip: it summed FOUR `.control`s, and `.control` is the *detached window's* button. The
+  // docked cluster — the one every consumer is avoiding — is `.actions`, whose first child is
+  // `.actionMenu` at `min-width: 26px`, not 22. It also forgot `.reveal`'s own `padding: 0 3px`
+  // entirely. Two omissions, ten pixels, and the assertion was *labelled* "`--pane-corner`
+  // equals the controls it reserves for" while agreeing with a number that did not. An
+  // assertion that pins today's value rather than the property it names will do that.
   const px = (re) => Number(re.exec(paneCss)?.[1] ?? NaN)
   const reserve = px(/--pane-corner:\s*(\d+)px/)
-  const button = px(/\.control \{[\s\S]*?width:\s*(\d+)px/)
+  // The three plain actions, and the menu button, which is wider and sets its floor with
+  // `min-width` because its content is an icon plus a caret.
+  const action = px(/\.action \{[\s\S]*?width:\s*(\d+)px/)
+  const actionMenu = px(/\.actionMenu \{[\s\S]*?min-width:\s*(\d+)px/)
   const marker = px(/\.marker \{[\s\S]*?width:\s*(\d+)px/)
   const markerMargin = /\.marker \{[\s\S]*?margin:\s*0 (\d+)px 0 (\d+)px/.exec(paneCss)
   const gap = px(/\.actions \{[\s\S]*?gap:\s*(\d+)px/)
   const pad = /\.cluster \{[\s\S]*?padding:\s*0 (\d+)px 0 (\d+)px/.exec(paneCss)
+  const revealPad = px(/\.reveal \{[\s\S]*?padding:\s*0 (\d+)px/)
   ok(
-    Number.isFinite(reserve) && Number.isFinite(button) && markerMargin !== null && pad !== null,
-    'the cluster still declares a reserve, a control size, a marker and its padding',
+    Number.isFinite(reserve) && Number.isFinite(action) && Number.isFinite(actionMenu)
+      && Number.isFinite(revealPad) && markerMargin !== null && pad !== null,
+    'the cluster still declares a reserve, an action size, a menu-button floor, the reveal '
+      + 'padding, a marker and its own padding',
   )
   if (markerMargin && pad) {
     const want =
-      Number(pad[1]) + Number(pad[2]) +
-      marker + Number(markerMargin[1]) + Number(markerMargin[2]) +
-      button * 4 + gap * 3
+      Number(pad[1]) + Number(pad[2]) +          // `.cluster`  padding 0 2px      ->   4
+      revealPad * 2 +                            // `.reveal`   padding 0 3px      ->   6
+      actionMenu + action * 3 + gap * 3 +        // `.actions`  26 + 22*3 + 2*3    ->  98
+      marker + Number(markerMargin[1]) + Number(markerMargin[2]) // `.marker`      ->  17
     eq(reserve, want, '`--pane-corner` equals the controls it reserves for')
+    eq(reserve, 125,
+      'and that sum is 125px. Spelled out as well as derived, because the derivation above '
+        + 'agreed with 115 for a milestone by reading the wrong button: two ways of being '
+        + 'wrong have to disagree before either is worth trusting',
+    )
   }
 
   // And an editor insets it, because a 96px minimap lives where the cluster would land.

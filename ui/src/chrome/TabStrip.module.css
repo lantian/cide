@@ -19,6 +19,10 @@
   gap: 1px;
   min-width: 0;
   overflow: hidden;
+  /* The insertion caret is absolutely positioned against this box, and `useTabDrag` reads the
+     tabs' `offsetLeft` — which is relative to the nearest positioned ancestor. Both depend on
+     this line; without it the caret escapes to the window and lands somewhere in the header. */
+  position: relative;
 }
 
 /*
@@ -49,6 +53,59 @@
 
 .tab:hover {
   background: var(--chrome-hi);
+}
+
+/*
+ * No hover wash while a tab is being dragged.
+ *
+ * The pointer is captured for the whole gesture, so the tab under it keeps matching `:hover` and
+ * lights up exactly as though it were the drop target — when the target is a *boundary*, which
+ * only the caret shows. Two competing answers to "where will this land" is worse than one.
+ *
+ * Written so it cannot out-specify the active tab's own background: `.tabActive` is a class on
+ * the same element and would lose to a `.strip[data-dragging] .tab` rule, which would make the
+ * active tab visibly deactivate for the length of every drag. `:not(.tabActive)` is the same
+ * shape `FileTree` uses to protect its selection band, and for the identical reason.
+ */
+.strip[data-dragging] .tab:not(.tabActive):hover {
+  background: transparent;
+}
+
+/*
+ * The tab in flight.
+ *
+ * Dimmed rather than hidden or lifted into a floating ghost. A ghost is what the file tree and
+ * the git panel draw, and both need one because their load can be several rows and their refusals
+ * are sentences. Here the payload is one tab that stays exactly where the user can see it, and
+ * the only refusal — never in front of the console — is expressed by the caret clamping instead
+ * of by prose. Removing the tab from the strip during the drag was the other option and it loses
+ * badly: the strip would reflow under the pointer, which is the one thing this stylesheet's
+ * awaiting-marker rule spends a paragraph forbidding.
+ */
+.tab[data-drag] {
+  opacity: 0.45;
+}
+
+/*
+ * Where the drop lands: a 2px rule in the gap between two tabs.
+ *
+ * `pointer-events: none` because it sits over the strip during a gesture that is hit-testing it —
+ * `useTabDrag.aim` walks `[data-tab-id]` rects rather than `elementFromPoint`, so this is
+ * belt-and-braces there, but it also keeps the caret from swallowing the `pointerup` that ends
+ * the drag on some engines.
+ *
+ * `top`/`bottom` of 0 rather than `inset-block`: this file is prefixed-property checked
+ * (`check:css-prefix`) and the physical pair is what the rest of the stylesheet uses. The strip
+ * has no writing-mode of its own to respect.
+ */
+.caret {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+  pointer-events: none;
 }
 
 .tabActive,

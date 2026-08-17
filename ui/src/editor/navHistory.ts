@@ -222,6 +222,48 @@ export function walk(
 }
 
 /**
+ * Undo the walk just made in `direction`, and drop the entry it landed on: that file is gone.
+ *
+ * Called when a walk arrives somewhere the disk no longer has — `tab_reopen_file` answers `gone`.
+ * Without it the entry stays and the *next* press offers the same dead file for ever, which is
+ * the dead key `tab_reopen_closed` already refuses to be (`reopen_plan` drops a deleted record
+ * and tries the next one). Back should not be the one gesture in the app that keeps walking into
+ * a wall.
+ *
+ * # Why this takes a direction rather than an index
+ *
+ * Because the cursor has to go back to **where the user actually is**, and after a refused walk
+ * that is *not* recoverable from the history alone. [`walk`] has already moved the cursor onto
+ * the entry that turned out to be dead; the user, meanwhile, never went anywhere — they are
+ * still looking at the entry they walked *from*, which is `index + 1` for a Back and `index - 1`
+ * for a Forward. Only the direction says which.
+ *
+ * The first version of this was `forget(history, index)`: remove the entry, and let the cursor
+ * sit where the removal leaves it. That is right for Back by coincidence and **wrong for
+ * Forward**, which is the sort of half-correct that survives a manual test. With `[A, B, C]` and
+ * the user standing on `A`, Forward into a deleted `B` left the cursor on `C` — a place they had
+ * not been. Forward then refused ("already at the most recent place") while `C` was live and one
+ * press away, and Back returned to `A`, which they were already looking at, so it read as a
+ * button that does nothing. Both symptoms of one wrong index.
+ *
+ * The removal shifts everything after the dead entry down by one, so the home position moves with
+ * it when it was to the right and stays put when it was to the left. Clamped, so it can never
+ * point past the end; an emptied history returns to [`EMPTY_HISTORY`] rather than to
+ * `{ entries: [], index: 0 }`, which [`isCoherent`] would reject.
+ */
+export function abandon(history: NavHistory, direction: NavDirection): NavHistory {
+  const dead = history.index
+  if (dead < 0 || dead >= history.entries.length) return history
+  const entries = history.entries.slice(0, dead).concat(history.entries.slice(dead + 1))
+  if (entries.length === 0) return EMPTY_HISTORY
+
+  // Where the user is standing: the entry the walk came from, before the removal renumbers it.
+  const home = direction === 'back' ? dead + 1 : dead - 1
+  const shifted = home > dead ? home - 1 : home
+  return { entries, index: Math.min(Math.max(shifted, 0), entries.length - 1) }
+}
+
+/**
  * Whether `history` is in a state it could not have reached by construction. For checks only.
  *
  * A fuzz walk over thousands of random operations asserts this stays true, because the one
