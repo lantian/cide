@@ -912,6 +912,28 @@ pub struct EditOutcome {
 /// back. Nothing here touches the disk, so the whole surgery is testable without one — the
 /// same split `cide_app::cmd::settings::apply_patch` already makes.
 pub fn apply_edit(user: &mut Vec<Binding>, edit: &KeymapEdit) -> EditOutcome {
+    apply_edit_layered(&platform_defaults(), user, edit)
+}
+
+/// [`apply_edit`] with the platform layer injected, the exact counterpart of [`resolve_layers`].
+///
+/// An edit is not platform-independent even though it looks it: every branch below asks what is
+/// *standing* underneath the user's file, and on macOS the answer has been rewritten by
+/// [`platform_layer`] — `picker.files` is on `meta+p` there, not `ctrl+p`. So a rebind writes a
+/// removal naming a different chord, and a command the macOS layer gives a second chord to needs
+/// two removal lines rather than one.
+///
+/// This seam exists for the reason `resolve_layers` does, and it was added for a concrete one:
+/// sixteen tests below drove `apply_edit`/`resolve` and asserted a literal `ctrl+…` spelling, so
+/// they passed on Linux and failed on macOS — against an editor that was behaving *correctly for
+/// macOS*. Naming the layer under test makes each of them assert one platform's rule on every
+/// host, which is what a unit test of the editing algebra should do; the platform layers keep
+/// their own dedicated tests. Nothing here consults `cfg!` — only [`platform_defaults`] does.
+fn apply_edit_layered(
+    platform: &[Binding],
+    user: &mut Vec<Binding>,
+    edit: &KeymapEdit,
+) -> EditOutcome {
     match edit {
         KeymapEdit::ResetAll => {
             let removed = user.len();
@@ -926,7 +948,7 @@ pub fn apply_edit(user: &mut Vec<Binding>, edit: &KeymapEdit) -> EditOutcome {
             let removed = strip(user, command, when.as_deref());
             // Nothing kept: every key the layers below still put this command on has to be
             // taken away, or "unbound" would mean "unbound unless a default says otherwise".
-            let added = suppress(user, command, when.as_deref(), None);
+            let added = suppress(platform, user, command, when.as_deref(), None);
             EditOutcome { removed, added }
         }
         KeymapEdit::Rebind { command, when, key } => {
@@ -936,14 +958,14 @@ pub fn apply_edit(user: &mut Vec<Binding>, edit: &KeymapEdit) -> EditOutcome {
             let removed = taken.len();
             let args = taken.into_iter().find_map(|binding| binding.args);
             let target = normalize_key(key);
-            let mut added = suppress(user, command, when.as_deref(), Some(&target));
+            let mut added = suppress(platform, user, command, when.as_deref(), Some(&target));
 
             // Asked of the resolution rather than of `defaults()`, and after the removals have
             // been appended, so this reads the table as it will actually be. When the answer is
             // yes the file gets no entry at all: rebinding a command back onto its own default
             // chord *is* a reset, and writing the default in would freeze it.
             let when = normalize_when(when.as_deref());
-            let standing = resolve(user)
+            let standing = resolve_layers(platform, user)
                 .into_iter()
                 .any(|r| r.key == target && r.command == *command && r.when == when);
             if !standing {
@@ -1011,14 +1033,15 @@ fn strip_taking(user: &mut Vec<Binding>, command: &str, when: Option<&str>) -> V
 /// Append the removals that take (`command`, `when`) off every key the layers below still put
 /// it on, except `keep`.
 ///
-/// Call **after** [`strip`], never before: it asks `resolve` what is standing, and a user entry
-/// for the same command that has not been stripped yet would answer for the defaults.
+/// Call **after** [`strip`], never before: it asks `resolve_layers` what is standing, and a user
+/// entry for the same command that has not been stripped yet would answer for the defaults.
 ///
 /// The key each removal names is the one `resolve` reports, which is already normalised — the
 /// third rule at the top of this section, applied to the other half of the identity. Writing
 /// the key the *caller* typed would work for every chord a user spells canonically and fail
 /// silently for the ones they do not.
 fn suppress(
+    platform: &[Binding],
     user: &mut Vec<Binding>,
     command: &str,
     when: Option<&str>,
@@ -1026,7 +1049,7 @@ fn suppress(
 ) -> usize {
     let when = normalize_when(when);
     let mut keys: Vec<String> = Vec::new();
-    for binding in resolve(user) {
+    for binding in resolve_layers(platform, user) {
         if binding.command != command || binding.when != when {
             continue;
         }
@@ -1311,6 +1334,41 @@ mod tests {
             .filter(|r| r.key == key)
             .map(|r| r.command.clone())
             .collect()
+    }
+
+    /* ---- Naming the platform layer under test -------------------------------------------
+     *
+     * `resolve` and `apply_edit` consult `platform_defaults()`, which is the module's only
+     * `cfg!`. Every test that asserts a *literal chord spelling* therefore asserts a platform,
+     * whether or not it means to — and the ones below meant to test the layering and editing
+     * algebra, using `defaults()` merely as a fixture. On macOS `platform_layer` moves every
+     * `ctrl` default onto `meta`, so sixteen of them failed there against an editor that was
+     * doing exactly the right thing. That is a test bug, not a product bug, and gating them off
+     * macOS would have been the wrong repair twice over: it deletes the coverage on the platform
+     * that has the least, and it leaves the remaining assertions passing *vacuously*.
+     *
+     * So the layer is named instead. `resolve_pc`/`edit_pc` pin the PC layer — empty, as Linux
+     * and Windows both get — so these tests assert one platform's rule identically on every
+     * host. The macOS layer is not thereby untested: it has `the_macos_layer_*` tests of its
+     * own, and `an_unbind_on_macos_takes_away_both_chords_the_layer_gave` below covers the one
+     * place where the editing algebra genuinely differs between the two.
+     */
+
+    /// [`resolve`] against the PC platform layer, whatever host this is compiled on.
+    fn resolve_pc(user: &[Binding]) -> Vec<ResolvedBinding> {
+        resolve_layers(&platform_layer(false), user)
+    }
+
+    /// [`apply_edit`] against the PC platform layer, whatever host this is compiled on.
+    fn edit_pc(user: &mut Vec<Binding>, edit: &KeymapEdit) -> EditOutcome {
+        apply_edit_layered(&platform_layer(false), user, edit)
+    }
+
+    /// [`resolve_with_diagnostics`] against the PC platform layer, ditto.
+    fn resolve_with_diagnostics_pc(
+        user: &[Binding],
+    ) -> (Vec<ResolvedBinding>, Vec<KeymapDiagnostic>) {
+        resolve_layers_reporting(&platform_layer(false), user)
     }
 
     /// **Ctrl+C and Ctrl+V are not the keymap's, and must never become the keymap's.**
@@ -1688,7 +1746,7 @@ mod tests {
     #[test]
     fn a_user_binding_with_a_different_when_coexists_with_the_default() {
         let user = vec![Binding::new("ctrl+p", "terminal.paste").when("terminalFocused")];
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
         let mut commands = command_for(&resolved, "ctrl+p");
         commands.sort();
         assert_eq!(commands, ["picker.files", "terminal.paste"]);
@@ -1723,7 +1781,7 @@ mod tests {
         // (key, command) is what makes it mean what it reads as, and is what VS Code — the
         // format this module implements — does.
         let user = vec![Binding::new("ctrl+w", "-tab.close").when("tabPinned")];
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
 
         // The unconditional default is a different binding and survives untouched.
         assert_eq!(command_for(&resolved, "ctrl+w"), vec!["tab.close"]);
@@ -1735,7 +1793,7 @@ mod tests {
             Binding::new("ctrl+w", "tab.close").when("tabPinned"),
             Binding::new("ctrl+w", "-tab.close").when("tabPinned"),
         ];
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
 
         // Only the scoped one went; the unconditional default is still there.
         let pinned: Vec<_> = resolved
@@ -1804,7 +1862,7 @@ mod tests {
 
     #[test]
     fn resolved_bindings_carry_the_layer_they_came_from() {
-        let resolved = resolve(&[Binding::new("ctrl+s", "file.saveAll")]);
+        let resolved = resolve_pc(&[Binding::new("ctrl+s", "file.saveAll")]);
         let overridden = resolved
             .iter()
             .find(|r| r.key == "ctrl+s")
@@ -1916,7 +1974,7 @@ mod tests {
     ///   release note, and it is asserted rather than described.
     #[test]
     fn ctrl_tab_switches_tabs_and_an_old_keymap_json_still_wins() {
-        let shipped = resolve(&[]);
+        let shipped = resolve_pc(&[]);
         assert_eq!(command_for(&shipped, "ctrl+tab"), ["tab.switcher.next"]);
         assert_eq!(command_for(&shipped, "ctrl+`"), ["project.switcher.next"]);
         assert_eq!(command_for(&shipped, "ctrl+1"), ["tab.console"]);
@@ -1929,7 +1987,7 @@ mod tests {
         // *different* binding — so both survive and the user's, being last, wins the resolve.
         // Asserted as the whole list rather than as "theirs is in there", because a shadowed
         // default that still fires in some other context would be the silent half of this.
-        let rebound = resolve(&[Binding::new("ctrl+tab", "project.switcher.next")]);
+        let rebound = resolve_pc(&[Binding::new("ctrl+tab", "project.switcher.next")]);
         let mut on_tab = command_for(&rebound, "ctrl+tab");
         on_tab.sort();
         assert_eq!(on_tab, ["project.switcher.next", "tab.switcher.next"]);
@@ -1958,14 +2016,14 @@ mod tests {
              the release that made that reachable"
         );
 
-        let unbound = resolve(&[Binding::new("ctrl+tab", "-project.switcher.next")]);
+        let unbound = resolve_pc(&[Binding::new("ctrl+tab", "-project.switcher.next")]);
         assert_eq!(
             command_for(&unbound, "ctrl+tab"),
             ["tab.switcher.next"],
             "an unbind of the old command no longer matches anything"
         );
         let (_, diags) =
-            resolve_with_diagnostics(&[Binding::new("ctrl+tab", "-project.switcher.next")]);
+            resolve_with_diagnostics_pc(&[Binding::new("ctrl+tab", "-project.switcher.next")]);
         assert!(
             diags.iter().any(|d| matches!(
                 d,
@@ -2022,11 +2080,11 @@ mod tests {
     /// chord's command changed in M15 and the reason for asserting it did not.
     #[test]
     fn ctrl_t_pulls_and_can_be_given_back_to_the_terminal() {
-        let shipped = resolve(&[]);
+        let shipped = resolve_pc(&[]);
         assert_eq!(command_for(&shipped, "ctrl+t"), ["git.pull"]);
         assert_eq!(command_for(&shipped, "ctrl+shift+t"), ["tab.reopenClosed"]);
 
-        let freed = resolve(&[Binding::new("ctrl+t", "-git.pull")]);
+        let freed = resolve_pc(&[Binding::new("ctrl+t", "-git.pull")]);
         assert!(
             command_for(&freed, "ctrl+t").is_empty(),
             "the documented one-liner has to actually restore transpose-chars"
@@ -2079,25 +2137,25 @@ mod tests {
     /// the README cannot document the wrong line.
     #[test]
     fn ctrl_g_goes_to_a_line_and_can_be_given_back_to_codemirror() {
-        let shipped = resolve(&[]);
+        let shipped = resolve_pc(&[]);
         assert_eq!(command_for(&shipped, "ctrl+g"), ["navigate.line"]);
         // The neighbouring chord is a *different* stroke, so find-previous survives untouched —
         // which is the asymmetry the binding's own comment names.
         assert!(command_for(&shipped, "ctrl+shift+g").is_empty());
 
-        let scoped = resolve(&[Binding::new("ctrl+g", "-navigate.line").when("editorFocused")]);
+        let scoped = resolve_pc(&[Binding::new("ctrl+g", "-navigate.line").when("editorFocused")]);
         assert!(
             command_for(&scoped, "ctrl+g").is_empty(),
             "the documented one-liner has to actually give Mod-g back to the editor"
         );
 
-        let unscoped = resolve(&[Binding::new("ctrl+g", "-navigate.line")]);
+        let unscoped = resolve_pc(&[Binding::new("ctrl+g", "-navigate.line")]);
         assert_eq!(
             command_for(&unscoped, "ctrl+g"),
             ["navigate.line"],
             "a removal that forgets the `when` matches nothing — the README must not print it"
         );
-        let (_, diags) = resolve_with_diagnostics(&[Binding::new("ctrl+g", "-navigate.line")]);
+        let (_, diags) = resolve_with_diagnostics_pc(&[Binding::new("ctrl+g", "-navigate.line")]);
         assert!(
             diags.iter().any(|d| matches!(
                 d,
@@ -2397,7 +2455,7 @@ mod tests {
     #[test]
     fn rebinding_a_default_writes_a_removal_and_an_add_and_nothing_else() {
         let mut user = Vec::new();
-        let outcome = apply_edit(
+        let outcome = edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "picker.files".into(),
@@ -2421,7 +2479,7 @@ mod tests {
             }
         );
 
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
         assert_eq!(command_for(&resolved, "ctrl+shift+o"), ["picker.files"]);
         assert!(
             command_for(&resolved, "ctrl+p").is_empty(),
@@ -2437,7 +2495,7 @@ mod tests {
         // there for a diagnostic log line. An editor that dropped the clause would silently
         // widen every scoped binding it touched.
         let mut user = Vec::new();
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "tab.console".into(),
@@ -2454,7 +2512,7 @@ mod tests {
             ]
         );
 
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
         let moved = resolved
             .iter()
             .find(|r| r.command == "tab.console")
@@ -2471,7 +2529,7 @@ mod tests {
         // itself started. Three rebinds, two entries.
         let mut user = Vec::new();
         for key in ["ctrl+shift+o", "alt+o", "ctrl+alt+o"] {
-            apply_edit(
+            edit_pc(
                 &mut user,
                 &KeymapEdit::Rebind {
                     command: "picker.files".into(),
@@ -2485,7 +2543,7 @@ mod tests {
             spell(&user),
             ["ctrl+p -picker.files", "ctrl+alt+o picker.files"]
         );
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
         assert_eq!(command_for(&resolved, "ctrl+alt+o"), ["picker.files"]);
         assert_eq!(conflicts(&resolved), Vec::new());
     }
@@ -2497,7 +2555,7 @@ mod tests {
         // picker.files` would freeze *today's* default into the file — the exact failure the
         // overrides-only format exists to avoid.
         let mut user = Vec::new();
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "picker.files".into(),
@@ -2505,7 +2563,7 @@ mod tests {
                 key: "ctrl+shift+o".into(),
             },
         );
-        let outcome = apply_edit(
+        let outcome = edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "picker.files".into(),
@@ -2522,7 +2580,7 @@ mod tests {
                 added: 0
             }
         );
-        assert_eq!(command_for(&resolve(&user), "ctrl+p"), ["picker.files"]);
+        assert_eq!(command_for(&resolve_pc(&user), "ctrl+p"), ["picker.files"]);
     }
 
     #[test]
@@ -2562,7 +2620,7 @@ mod tests {
     #[test]
     fn unbinding_a_command_the_user_had_already_moved_leaves_one_removal() {
         let mut user = Vec::new();
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "git.pull".into(),
@@ -2570,7 +2628,7 @@ mod tests {
                 key: "ctrl+alt+t".into(),
             },
         );
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Unbind {
                 command: "git.pull".into(),
@@ -2581,7 +2639,7 @@ mod tests {
         // The add is gone and the default is still suppressed — not two removals, and not a
         // removal aimed at the key the user had chosen, which would match nothing.
         assert_eq!(spell(&user), ["ctrl+t -git.pull"]);
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
         assert!(command_for(&resolved, "ctrl+t").is_empty());
         assert!(command_for(&resolved, "ctrl+alt+t").is_empty());
     }
@@ -2589,7 +2647,7 @@ mod tests {
     #[test]
     fn reset_deletes_the_pair_and_the_default_comes_back() {
         let mut user = vec![Binding::new("ctrl+shift+u", "some.other.command")];
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "file.save".into(),
@@ -2599,7 +2657,7 @@ mod tests {
         );
         assert_eq!(user.len(), 3);
 
-        let outcome = apply_edit(
+        let outcome = edit_pc(
             &mut user,
             &KeymapEdit::Reset {
                 command: "file.save".into(),
@@ -2619,7 +2677,7 @@ mod tests {
             ["ctrl+shift+u some.other.command"],
             "a reset touches this command's entries and nobody else's"
         );
-        assert_eq!(command_for(&resolve(&user), "ctrl+s"), ["file.save"]);
+        assert_eq!(command_for(&resolve_pc(&user), "ctrl+s"), ["file.save"]);
     }
 
     #[test]
@@ -2683,7 +2741,7 @@ mod tests {
             Binding::new("ctrl+w", "-tab.close").when("tabPinned"),
             Binding::new("alt+z", "theme.toggle"),
         ];
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "git.pull".into(),
@@ -2764,24 +2822,29 @@ mod tests {
     }
 
     /// Every default can be unbound, and unbinding is the only thing it does.
+    ///
+    /// Pinned to the PC layer, and the "exactly one line" assertion at the foot is *why*: it is
+    /// a property of `defaults()`, where no command carries two chords. The macOS layer breaks
+    /// that by design — see the test directly below, which states the other half rather than
+    /// leaving this one silently platform-specific.
     #[test]
     fn every_default_binding_can_be_given_back_to_whatever_is_underneath() {
         for binding in defaults() {
             let mut user = Vec::new();
-            apply_edit(
+            edit_pc(
                 &mut user,
                 &KeymapEdit::Unbind {
                     command: binding.command.clone(),
                     when: binding.when.clone(),
                 },
             );
-            let resolved = resolve(&user);
+            let resolved = resolve_pc(&user);
             assert!(
                 !resolved.iter().any(|r| r.command == binding.command),
                 "{} is still bound after an unbind",
                 binding.command
             );
-            let (_, diags) = resolve_with_diagnostics(&user);
+            let (_, diags) = resolve_with_diagnostics_pc(&user);
             assert!(
                 diags.is_empty(),
                 "unbinding {} matched nothing: {diags:?}",
@@ -2790,6 +2853,76 @@ mod tests {
             // Exactly one line per unbind, so a user's file stays readable.
             assert_eq!(user.len(), 1);
         }
+    }
+
+    /// On macOS an unbind of `navigate.back` writes **two** removals, and that is correct.
+    ///
+    /// The macOS layer does not only rewrite; it *adds* — `meta+bracketleft`/`meta+bracketright`
+    /// go on top of the `mouseback`/`mouseforward` defaults, which carry no `ctrl` and so are
+    /// left alone by the rewrite loop. So `navigate.back` stands on two chords there, and
+    /// "unbound" has to mean both of them: suppressing one would leave the command live on the
+    /// other, which is the precise failure `suppress` exists to prevent.
+    ///
+    /// Worth its own test because the invariant above ("exactly one line per unbind") reads like
+    /// a property of the editor and is really a property of `defaults()`. Discovered by running
+    /// the suite against the macOS layer, where it was one of sixteen failures — the only one
+    /// that was not merely a hard-coded `ctrl+` spelling.
+    #[test]
+    fn an_unbind_on_macos_takes_away_both_chords_the_layer_gave() {
+        let mac = platform_layer(true);
+
+        // The premise, asserted rather than assumed: two chords, not one.
+        let standing: Vec<String> = resolve_layers(&mac, &[])
+            .into_iter()
+            .filter(|r| r.command == "navigate.back")
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(
+            standing,
+            ["mouseback", "meta+bracketleft"],
+            "the macOS layer adds ⌘[ beside the thumb button rather than replacing it"
+        );
+
+        let mut user = Vec::new();
+        let outcome = apply_edit_layered(
+            &mac,
+            &mut user,
+            &KeymapEdit::Unbind {
+                command: "navigate.back".into(),
+                when: None,
+            },
+        );
+        assert_eq!(
+            outcome,
+            EditOutcome {
+                removed: 0,
+                added: 2
+            }
+        );
+        assert_eq!(
+            spell(&user),
+            [
+                "mouseback -navigate.back",
+                "meta+bracketleft -navigate.back"
+            ]
+        );
+        assert!(
+            !resolve_layers(&mac, &user)
+                .iter()
+                .any(|r| r.command == "navigate.back"),
+            "a command left standing on its second chord is not unbound"
+        );
+
+        // And the PC layer still answers with one line, which is what the test above pins.
+        let mut pc = Vec::new();
+        edit_pc(
+            &mut pc,
+            &KeymapEdit::Unbind {
+                command: "navigate.back".into(),
+                when: None,
+            },
+        );
+        assert_eq!(spell(&pc), ["mouseback -navigate.back"]);
     }
 
     #[test]
@@ -2850,7 +2983,7 @@ mod tests {
     #[test]
     fn a_chord_recorded_in_the_webview_still_displaces_the_default_it_lands_on() {
         let mut user = Vec::new();
-        apply_edit(
+        edit_pc(
             &mut user,
             &KeymapEdit::Rebind {
                 command: "picker.files".into(),
@@ -2863,7 +2996,7 @@ mod tests {
             ["ctrl+p -picker.files", "ctrl+backquote picker.files"]
         );
 
-        let resolved = resolve(&user);
+        let resolved = resolve_pc(&user);
         assert!(command_for(&resolved, "ctrl+p").is_empty());
         assert_eq!(command_for(&resolved, "ctrl+backquote"), ["picker.files"]);
         // The project switcher is still on its own spelling of the same physical key, and

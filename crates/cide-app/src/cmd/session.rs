@@ -837,7 +837,18 @@ pub fn session_cwd(
 /// and refusing a cwd outside the project — are exercised against a real process in the test at
 /// the foot of this file, rather than only against a running `claude`.
 fn contained_cwd(pid: u32, roots: &[PathBuf]) -> Option<PathBuf> {
-    let cwd = cwd_of_pid(pid)?;
+    contain(cwd_of_pid(pid)?, roots)
+}
+
+/// The containment half of [`contained_cwd`], over a cwd that has already been read.
+///
+/// Separated from the reading so the security-relevant rule is testable on **every** host, which
+/// is what [`cwd_of_pid`]'s comment below already claims and what the code did not deliver: with
+/// the two fused, every containment assertion off Linux ran against a `cwd_of_pid` that returns
+/// `None`, so each one passed by getting `None` for the wrong reason. A refusal test that cannot
+/// tell "refused because it was outside the project" from "refused because this platform cannot
+/// look" is not evidence of anything, and it is the shape a reader is least likely to doubt.
+fn contain(cwd: PathBuf, roots: &[PathBuf]) -> Option<PathBuf> {
     // A deleted working directory reads back as `/path (deleted)`, which is neither a directory
     // nor a path anybody has — `is_dir` refuses that and a cwd that has since been removed with
     // one syscall.
@@ -1625,42 +1636,97 @@ mod tests {
 
     // --- session_cwd -----------------------------------------------------------------------
 
-    /// Driven against *this* process, which is the only pid a test can be sure exists.
+    /// The containment rule, on every host.
     ///
-    /// The two questions are the ones the resolution ladder rests on: does `/proc` actually
-    /// answer, and is a cwd outside every root refused. The second is the one that matters —
-    /// the child chooses its own cwd, so a `chdir` into `~/.ssh` must not become a base for
-    /// resolving relative paths out of that same child's output.
+    /// This is the half that matters — the child chooses its own cwd, so a `chdir` into `~/.ssh`
+    /// must not become a base for resolving relative paths out of that same child's output — and
+    /// it is identical on every platform, so it is driven through [`contain`] with the cwd handed
+    /// in rather than through `contained_cwd`, which would first have to read `/proc`. Before the
+    /// split these assertions lived in the `/proc` test below and passed off Linux for the wrong
+    /// reason: `cwd_of_pid` answers `None` there, so every refusal was already `None` before the
+    /// rule was consulted, and the two accepting cases failed outright.
     #[test]
-    fn a_child_cwd_is_read_from_proc_and_only_when_it_is_inside_the_project() {
+    fn a_cwd_is_reported_only_when_it_is_inside_the_project() {
         let here = std::env::current_dir().expect("a cwd");
-        let me = std::process::id();
 
         assert_eq!(
-            contained_cwd(me, std::slice::from_ref(&here)),
+            contain(here.clone(), std::slice::from_ref(&here)),
             Some(here.clone()),
             "a cwd inside a root is exactly what the resolver wants"
         );
 
         let parent = here.parent().expect("a parent").to_path_buf();
         assert_eq!(
-            contained_cwd(me, std::slice::from_ref(&parent)),
+            contain(here.clone(), std::slice::from_ref(&parent)),
             Some(here.clone()),
             "and being *under* a root, not equal to it, is the ordinary case"
         );
 
         let elsewhere = std::env::temp_dir();
         assert_eq!(
-            contained_cwd(me, std::slice::from_ref(&elsewhere)),
+            contain(here.clone(), std::slice::from_ref(&elsewhere)),
             None,
             "a cwd outside every root is refused rather than reported: it is a base a program \
              could choose, and choosing it is how output names files outside the project"
         );
 
         assert_eq!(
-            contained_cwd(me, &[]),
+            contain(here.clone(), &[]),
             None,
             "a project with no roots contains nothing"
+        );
+
+        // The `(deleted)` suffix a removed cwd reads back with, and any other path that is not a
+        // directory: refused before containment is even asked, so a root that happens to be a
+        // prefix of the string cannot let it through.
+        assert_eq!(
+            contain(here.join("no-such-directory"), std::slice::from_ref(&here)),
+            None,
+            "a cwd that is not a directory is refused even inside a root"
+        );
+    }
+
+    /// And that the reading half really does answer, where there is a `/proc` to read.
+    ///
+    /// Driven against *this* process, which is the only pid a test can be sure exists. Gated to
+    /// Linux because that is the only platform [`cwd_of_pid`] is implemented on; the arm below
+    /// covers everywhere else, so neither platform is left with a silently absent assertion.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_cwd_is_read_from_proc() {
+        let here = std::env::current_dir().expect("a cwd");
+        assert_eq!(
+            cwd_of_pid(std::process::id()),
+            Some(here.clone()),
+            "/proc/<pid>/cwd is what makes a relative path in a child's output resolvable"
+        );
+        assert_eq!(
+            contained_cwd(std::process::id(), std::slice::from_ref(&here)),
+            Some(here)
+        );
+    }
+
+    /// Off Linux the answer is `None` **by design**, and this is the guard on that being noticed.
+    ///
+    /// It looks like a test of nothing. It is a tripwire: the day somebody implements
+    /// `cwd_of_pid` for macOS with `proc_pidinfo`/`PROC_PIDVNODEPATHINFO` — the twenty lines its
+    /// comment sketches — this fails, and whoever wrote them is sent to re-enable the real
+    /// assertions above instead of shipping a feature no test covers on the platform that just
+    /// gained it. Without it the new code would be silently untested exactly where it is new.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_child_cwd_cannot_be_read_off_linux_and_says_so_by_answering_nothing() {
+        assert_eq!(
+            cwd_of_pid(std::process::id()),
+            None,
+            "cwd_of_pid is unimplemented off Linux; if this now answers, the test above it is \
+             the one to turn on — see README.md's Platforms section"
+        );
+        let here = std::env::current_dir().expect("a cwd");
+        assert_eq!(
+            contained_cwd(std::process::id(), std::slice::from_ref(&here)),
+            None,
+            "so terminal links resolve only from absolute paths on this platform"
         );
     }
 

@@ -14,6 +14,21 @@ use cide_ipc::{SessionId, Theme, WindowLabel};
 use tauri::window::Color;
 use tauri::{AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
+// Gated to match its only consumer, exactly. The sole use of `emit` in this module is
+// `emit::mouse_nav` inside `install_mouse_nav`, which is `cfg`-ed to the five targets that have a
+// GTK window to hang a button handler on; the two other occurrences of the name are string
+// literals inside a source assertion, which do not count as a use. Leaving the import
+// unconditional made `clippy --all-targets -D warnings` fail on macOS with `unused import` — the
+// fourth step of the advisory macOS CI job — and it is what the user's first build reported. The
+// same fix, for the same reason, is already applied to `use crate::srcgrep::without_comments` in
+// the test module below; the precedent is deliberate and this is its second instance.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 use crate::emit;
 use crate::workspace_state::WorkspaceState;
 
@@ -204,7 +219,7 @@ pub fn create(
         });
     let (initial_width, initial_height) = forced.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
-    let window = WebviewWindowBuilder::new(app, label.as_str(), url)
+    let builder = WebviewWindowBuilder::new(app, label.as_str(), url)
         .title(title)
         // We draw the titlebar ourselves — traffic lights, project tabs and the icon
         // cluster all live in one 34px bar. The cost is that the window manager no longer
@@ -212,10 +227,32 @@ pub fn create(
         // implements eight grips and `core:window:allow-start-resize-dragging` is granted.
         .decorations(false)
         .inner_size(initial_width, initial_height)
-        .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
-        // Not transparent: on Linux `transparent(true)` needs a running compositor and
-        // renders opaque black or garbage without one. The frontend paints --bg.
-        .transparent(false)
+        .min_inner_size(MIN_WIDTH, MIN_HEIGHT);
+
+    // Not transparent: on Linux `transparent(true)` needs a running compositor and renders
+    // opaque black or garbage without one. The frontend paints --bg.
+    //
+    // Split out of the chain because the method does not exist on macOS. tauri declares it
+    // `#[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]`
+    // (tauri-2.11.5 src/webview/webview_window.rs:1075), so a Mac build of the unsplit chain
+    // fails with E0599 — which is what the first build on a Mac reported.
+    //
+    // The feature is deliberately NOT the answer. `macos-private-api` turns on private Apple
+    // SPI and is grounds for App Store rejection, it additionally requires `macOSPrivateApi` in
+    // `tauri.conf.json`, and we are passing `false` — so it would buy exactly nothing. Nor is
+    // deleting the call, even though `WindowConfig::default()` already sets `transparent: false`
+    // (tauri-utils-2.9.2 src/config.rs:2320) and the call therefore only asserts the default:
+    // stating it is what keeps the reasoning above attached to a line of code that a future
+    // tauri default-flip would break loudly rather than silently.
+    //
+    // macOS consequence, written down rather than left to be inferred: the window is opaque
+    // there too, which is the same answer this asserts on Linux — the platforms differ in how
+    // the value is set, not in what it ends up being. `background_color` below still runs on
+    // every target, so the first-frame fill is unaffected.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.transparent(false);
+
+    let window = builder
         // The toolkit's own fill, for the frames between the window being mapped and the
         // webview having any content — before this it was the toolkit default, which is
         // white on GTK and was the last visible white frame a dark-theme user saw.

@@ -2965,10 +2965,15 @@ mod tests {
     /// A dirty tree the caller never asked about warns, and the archive step is dropped.
     ///
     /// The other half of the verdict above, and the two must agree or the feature is worse than
-    /// either. `src` is in `Targets::LINUX`, so a bare `cargo xtask package --run` — which is
-    /// what `build.sh` invokes — inherits it. Failing there means a developer testing an AppImage
-    /// of their work in progress builds nothing at all, and reads advice to commit or stash the
-    /// very changes they are testing.
+    /// either. `src` is in `Targets::LINUX`, so a bare `cargo xtask package --run` — which is what
+    /// `./build.sh --all` invokes — inherits it. Failing there means a developer testing an
+    /// AppImage of their work in progress builds nothing at all, and reads advice to commit or
+    /// stash the very changes they are testing.
+    ///
+    /// A bare `./build.sh` passes `--appimage` and so never reaches this case at all, which is the
+    /// point of naming the target: the common reason to run that script is to try uncommitted
+    /// work, and the tarball is not what the caller came for. This test still guards the path,
+    /// because `--all` is one flag away and the release run is exactly the default set.
     ///
     /// Warning and leaving the step in the plan would be the worse mistake still: it would print
     /// a caution and then produce the exact artefact the caution is about. So this asserts BOTH —
@@ -2986,7 +2991,9 @@ mod tests {
                 Verdict::Warn(text) if text.contains("uncommitted") => Some(text.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("an unrequested tarball warns rather than fails: {verdicts:?}"));
+            .unwrap_or_else(|| {
+                panic!("an unrequested tarball warns rather than fails: {verdicts:?}")
+            });
         assert!(
             warn.contains("skipped") && warn.contains("--src"),
             "the warning says what was skipped and how to ask for it deliberately: {warn}"
@@ -3013,10 +3020,21 @@ mod tests {
     /// can drive it.
     #[test]
     fn a_dirty_tree_only_cuts_a_tarball_that_was_asked_for() {
-        let inherited = Targets { src: true, src_named: false, ..Targets::LINUX };
-        let asked = Targets { src: true, src_named: true, ..Targets::LINUX };
+        let inherited = Targets {
+            src: true,
+            src_named: false,
+            ..Targets::LINUX
+        };
+        let asked = Targets {
+            src: true,
+            src_named: true,
+            ..Targets::LINUX
+        };
 
-        assert!(archives_source(inherited, 0), "a clean tree cuts one either way");
+        assert!(
+            archives_source(inherited, 0),
+            "a clean tree cuts one either way"
+        );
         assert!(archives_source(asked, 0));
         assert!(
             !archives_source(inherited, 1),
@@ -3029,7 +3047,13 @@ mod tests {
              is where the user is told why"
         );
         assert!(
-            !archives_source(Targets { src: false, ..asked }, 0),
+            !archives_source(
+                Targets {
+                    src: false,
+                    ..asked
+                },
+                0
+            ),
             "and not wanting it at all still means not cutting one"
         );
     }

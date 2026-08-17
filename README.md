@@ -98,17 +98,25 @@ CIDE_AUDIT_WINDOWS=1 ./target/debug/cide # re-check detach/re-dock and window mo
 written from source — the workspace's own and its dependencies' — and *none of it has been
 observed*. That distinction is the whole point of this section, so it is made once, plainly:
 
-> **macOS: not done.** The workspace has never been compiled, run or bundled on macOS, and it
-> cannot be from a Linux machine. Cross-compiling to Darwin needs Apple's linker and the macOS
-> SDK, whose licence restricts it to Apple hardware; `rustup target add aarch64-apple-darwin`
-> installs a `std` and nothing that can link Cocoa, AppKit or WebKit. Tauri documents
-> cross-compiling *Windows* from Linux and nothing else. So the next step is a Mac or a
-> `macos-15` runner, and there is no version of this work that does not need one.
+> **macOS: not done.** The workspace has never been *run* or bundled on macOS, and it cannot be
+> from a Linux machine. Linking to Darwin needs Apple's linker and the macOS SDK, whose licence
+> restricts it to Apple hardware; `rustup target add aarch64-apple-darwin` installs a `std` and
+> nothing that can link Cocoa, AppKit or WebKit. Tauri documents cross-compiling *Windows* from
+> Linux and nothing else. So the next step is a Mac or a `macos-15` runner, and there is no
+> version of this work that does not need one.
+>
+> **It has now been compiled once, on somebody's Mac, and it failed.** M16 said reading every
+> `cfg` arm suggested `cargo build` would succeed there "with few or no changes". Two errors say
+> otherwise, and both are now fixed — see *What the first Mac build actually reported* below.
+> That paragraph is left in the history rather than quietly deleted, because the lesson is the
+> section's whole subject: reading arms is not compiling them, and the estimate was wrong in the
+> direction estimates are always wrong.
 >
 > What exists now: the bundle configuration, an **advisory** CI job that compiles, tests and
-> lints the workspace on `macos-15`, and `cfg` arms that keep the Linux-only pieces out of the
-> graph and say what the platform does instead. What is known to be broken or absent there is
-> the table below.
+> lints the workspace on `macos-15`, `cfg` arms that keep the Linux-only pieces out of the graph
+> and say what the platform does instead, and — new — a **type-check for `aarch64-apple-darwin`
+> that runs on Linux**, which is what turned the round trip below into a local command. What is
+> known to be broken or absent there is the table below.
 
 Windows is not a target and nothing here has been written with it in mind; where a `cfg` arm
 says "not Linux" rather than "macOS", that is honesty about the BSDs and Windows too, not
@@ -123,14 +131,122 @@ already behind a `cfg` with a counterpart that compiles: `gtk` is target-gated t
 BSDs in `crates/cide-app/Cargo.toml`, the GTK mouse-button handler has a non-GTK arm, the folder
 picker falls back to `tauri_plugin_dialog` (which parents the dialog itself off Linux, which is
 the only reason the GTK arm exists), the signal handlers are `cfg(unix)` and macOS is a unix,
-and `git2`/tree-sitter build with `cc` everywhere. Reading every arm suggests `cargo build`
-succeeds on a Mac with few or no changes.
+and `git2`/tree-sitter build with `cc` everywhere. Reading every arm suggested `cargo build`
+would succeed on a Mac with few or no changes.
 
-**That is an estimate, and it is deliberately not written down as a fact.** Nobody has run the
-compiler. The `macos (advisory)` job in `.github/workflows/ci.yml` exists to convert it into
-one; it is `continue-on-error: true` until it has been green once, because a job that has never
-passed cannot tell a regression from a first attempt. The comment on that job says what to
-delete when it does.
+**That estimate was wrong, and this is the correction.** The `macos (advisory)` job in
+`.github/workflows/ci.yml` exists to convert reading into knowing; it is `continue-on-error:
+true` until it has been green once, because a job that has never passed cannot tell a regression
+from a first attempt. The comment on that job says what to delete when it does.
+
+### What the first Mac build actually reported
+
+Two diagnostics, on the same file, both in `cide-app` as predicted — and neither one predictable
+by reading a `cfg` arm in *this* workspace, because both are about a **dependency's** `cfg`:
+
+| what | why | fix |
+| --- | --- | --- |
+| `warning: unused import: crate::emit` — `windows.rs:17` | `emit`'s only use is `emit::mouse_nav` inside `install_mouse_nav`, which is gated to Linux and the four BSDs. Off those targets the import is unused. A *warning* — but the macOS job's fourth step is `clippy --all-targets -- -D warnings`, where it is an error | gated with the identical five-target `cfg(any(…))`, matching its consumer exactly rather than approximately |
+| `error[E0599]: no method named transparent` — `windows.rs:218` | tauri declares it `#[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]` (`tauri-2.11.5` `src/webview/webview_window.rs:1075`). The method does not exist on a Mac | the builder chain is split and the call omitted there. **Not** by enabling `macos-private-api`: that turns on private Apple SPI, is grounds for App Store rejection, additionally requires `macOSPrivateApi` in `tauri.conf.json`, and we pass `false` — so it would buy nothing at all |
+
+`transparent(false)` only asserts what `WindowConfig::default()` already sets
+(`tauri-utils-2.9.2` `src/config.rs:2320`), so deleting it outright would have been
+behaviour-identical. It is kept on the platforms that have it because the comment above it
+records *why* the window is opaque, and a comment attached to a live line survives a change of
+tauri's default loudly instead of silently.
+
+### Type-checking for macOS from Linux — partly, and not where it would have helped
+
+`cargo check` never links, so Apple's linker and SDK are irrelevant to it. What stops a
+`--target aarch64-apple-darwin` check on Linux is a handful of *dependency build scripts*
+compiling C with flags a GNU `cc` rejects. `scripts/darwin-cc.sh` strips those flags and compiles
+for the host instead — the objects are wrong for Darwin and nothing a check produces is linked, so
+that does not matter — and `DOCS_RS=1` is `objc2-exception-helper`'s own early return:
+
+```sh
+rustup target add aarch64-apple-darwin
+DOCS_RS=1 CC_aarch64_apple_darwin=$PWD/scripts/darwin-cc.sh \
+         CXX_aarch64_apple_darwin=$PWD/scripts/darwin-cc.sh \
+  cargo check --locked --workspace --all-targets --target aarch64-apple-darwin \
+    --exclude cide-app --exclude cide-git --exclude xtask
+```
+
+**Note the three exclusions, because they are the whole caveat.** `git2` is configured
+`vendored-openssl`, so anything depending on it builds OpenSSL from source *for Darwin*, and that
+needs a real cross toolchain rather than a flag-stripping shim — it fails in OpenSSL's own `make`.
+That rules out `cide-git`, `xtask` and **`cide-app`**.
+
+So this covers nine of the twelve crates, including `cide-core`, where `child_env`'s
+`PR_SET_PDEATHSIG` arms live — the macOS `cfg` code that matters most. It does **not** cover the
+one crate that links tauri, and both errors in the table above were in `cide-app`. This would not
+have caught either of them. It is worth running before touching a `cfg` arm in a domain crate, and
+it is not a substitute for the `macos` CI job.
+
+
+### What the Mac itself needs, and what it will spend
+
+* **Xcode Command Line Tools**, and the failure without them does not look like a missing
+  toolchain. Eight build scripts in the macOS graph invoke a C or Objective-C compiler —
+  `blake3`, `libgit2-sys`, `libz-sys` (probe only), `openssl-sys`/`openssl-src`,
+  `objc2-exception-helper`, `tree-sitter` and both grammars — and the first one dies with
+  `xcrun: error: invalid active developer path`, which reads like a Rust problem. `xcode-select
+  --install` is the fix. Full Xcode is not required; CLT supplies clang, the SDK, `make` and
+  `libiconv`. `perl` (`/usr/bin/perl`) is present already and `openssl-src` needs it.
+* **No pkg-config, GTK, dbus or X11.** `tao`, `wry`, `muda`, `tray-icon` and `rfd` declare all of
+  those under Linux/BSD-only sections, so tauri's default `x11` and `dbus` features — which this
+  workspace does inherit — are inert there. The Linux-only half of the graph is about a hundred
+  crates that simply do not build.
+* **`--locked` is safe.** `Cargo.lock` already carries the Darwin crates (`objc2`,
+  `objc2-app-kit`, `embed_plist`, `window-vibrancy`, `plist`, `fsevent-sys`, `core-graphics`), so
+  nothing re-resolves. `swift-rs` appears in the lockfile and in tauri's dependency list but is
+  gated `cfg(all(target_vendor = "apple", not(target_os = "macos")))` — iOS only. No Swift
+  toolchain is needed.
+* **Budget 15–25 minutes for the first `cargo build`**, and note that
+  `[profile.dev.package."*"] opt-level = 2` means even a debug build optimises all ~357
+  dependencies. Three C builds dominate: libgit2, `tree-sitter-rust`'s `parser.c` as a single
+  6.3 MB translation unit — and **OpenSSL, which is 1210 C files that nothing ever links.**
+  `git2` is configured `vendored-openssl` without `https`; `libgit2-sys` declares
+  `https = ["openssl-sys"]` and gates every use of it behind that feature (`build.rs:256,280,289`),
+  so `libssl.a` is built and discarded. It is wasted on Linux too — this is a macOS-*visible*
+  cost, not a macOS defect — and dropping the feature is a dependency change that wants its own
+  look, not a line in a platform sweep.
+
+### And then `cargo test`, which was the next thing to go red
+
+The macOS job runs fmt → build → test → clippy, and `cargo test` carries no `--no-fail-fast`, so
+it stops at the first failing binary. Compiling is therefore not the end of the round trip; it is
+the start of it. The `cfg`-driven *values* can be simulated on Linux even though the target
+cannot — `platform_defaults()` forced to the macOS layer, `cwd_of_pid` compiled through its
+non-Linux arm, `LADDER_APPLIES` and `PARENT_DEATH_IS_ENFORCED` forced `false` — and running the
+suite that way found **17 failures**, none of them visible to the compiler. All 17 are fixed; the
+last two constants cost nothing, which is itself worth knowing.
+
+**Sixteen were in `cide-core::keymap`, and every one was a test bug rather than a product bug.**
+They drove `resolve`/`apply_edit` and asserted a literal `ctrl+…` spelling, so on macOS — where
+the platform layer moves every `ctrl` default onto `meta` — they failed against an editor that
+was behaving exactly as designed. The repair is not to gate them off macOS, which would delete
+coverage on the platform that has least and leave the surviving assertions passing *vacuously*.
+It is to **name the layer under test**: `apply_edit` grew an `apply_edit_layered` seam, the exact
+counterpart of the `resolve_layers` seam that already existed for this reason, and those sixteen
+now pin the PC layer explicitly and assert one platform's rule identically on every host.
+
+One of the sixteen was not a spelling and deserved a decision.
+`every_default_binding_can_be_given_back_to_whatever_is_underneath` asserts *exactly one line per
+unbind, so a user's file stays readable* — which is a property of `defaults()`, where no command
+carries two chords, and **not** of the editor.
+The macOS layer *adds* ⌘[ / ⌘] beside `mouseback`/`mouseforward` rather
+than rewriting them, so `navigate.back` stands on two chords there and an unbind correctly writes
+two removals. That is now stated by its own test instead of being an accident of the host.
+
+**The seventeenth** was `cmd::session`'s `/proc` test. Its four assertions were two that need
+`/proc` and two containment refusals — and off Linux the refusals passed *for the wrong reason*,
+because `cwd_of_pid` answers `None` there and every input was refused before the rule was ever
+consulted. `contained_cwd` is now split: `contain` takes the cwd as an argument, so the
+security-relevant half is driven on every host, which is what `cwd_of_pid`'s comment already
+claimed and the code did not deliver. The `/proc` half is Linux-gated, and the non-Linux arm gets
+a **tripwire** — it asserts `cwd_of_pid` is still `None`, so the day somebody implements it with
+`proc_pidinfo` the test fails and sends them to turn the real assertions back on, instead of the
+new code shipping untested exactly where it is new.
 
 ### Where a Linux guarantee has no macOS equivalent
 
@@ -198,8 +314,54 @@ at before choosing:
 * **The cwd probe.** `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, …)` is about twenty lines of
   `libc`. Whether it answers for a same-user child under the hardened runtime is the part that
   has to be observed rather than read.
+* **Ctrl+click is the system context-menu gesture there, and cide claims it four times.** AppKit
+  turns Control-click into a secondary click, and WebKit dispatches *both* a `mousedown` with
+  `ctrlKey: true` and a `contextmenu`. `ui/src/menus/native.ts` installs a capture listener that
+  `preventDefault()`s the webview's own menu but does not stop propagation, so cide's bubble-phase
+  `onContextMenu` still opens cide's. Meanwhile every mouse gesture is spelled
+  `ctrlKey || metaKey`: `terminal/clickGate.ts`'s `pressVerdict` (open a path link),
+  `sidebar/FileTree.tsx` and `sidebar/GitPanel/ChangesTree.tsx` (toggle-select a row), and
+  `editor/codeIntelGate.ts` (jump to definition). Each fires its action **and** opens a menu over
+  the result. The correct macOS behaviour is ⌘-click only. The fix is a platform predicate of the
+  shape `windowControls.ts::isMacUserAgent` already has — but it is roughly seven mouse-gesture
+  call sites with different call paths, and getting it wrong breaks Ctrl+click file opening on the
+  platform that works, so it wants a check script and a Mac rather than a sweep. Note
+  `clickGate.ts` reasons explicitly that it accepts `metaKey` "because macOS spells the same
+  gesture with Cmd" — it added the Mac spelling without removing the one macOS had already
+  spoken for.
+* **Three default bindings sit on F-keys a stock Mac keyboard does not send.** `f4`
+  (`sidebar.toggle`), `ctrl+f12` → `meta+f12` (`structure.file`) and `alt+f7`
+  (`navigate.usages`). On every Mac laptop and Magic Keyboard the F-row defaults to
+  media/system keys — F4 is Spotlight, F7 previous-track, F12 volume-up — so all three need Fn
+  held unless the user has flipped *Use F1, F2, etc. keys as standard function keys*.
+  `MACOS_MENU_CHORDS` cannot see this: it is scoped to AppKit's menu accelerators, and this is a
+  hardware-layer interception. It is deliberately **not** encoded as a computed list beside
+  `macos_menu_conflicts()`, because unlike that one the rule is not crisp — it depends on the
+  keyboard and on a system setting — and a computed list would overstate what is known.
+* **The "come back here" signal is one Dock bounce, and clearing it does nothing.**
+  `windows.rs::demand_attention` is built on the hint being a *standing* state that returning
+  lowers and leaving re-raises. macOS has no such state: `tao-0.35.3`'s
+  `request_user_attention` maps `Informational` to `NSApp requestUserAttention`, which bounces
+  the icon once and stops, and the unset path is `if let Some(ty)` — with `None` it calls
+  **nothing at all**, never `cancelUserAttentionRequest`. So a user who walks away from a turn
+  awaiting permission gets one bounce, spent, never re-raised. `Critical` — which bounces until
+  the app is activated — is the arm that would say the right thing there, and macOS is the one
+  platform where that choice is the whole difference between a signal and none.
+* **The shell pane opens `/bin/bash -l`, hardcoded.** `ui/src/panes/TerminalPane.tsx`'s
+  `DEFAULT_SHELL` ignores `$SHELL` and `getpwuid`. On macOS `/bin/bash` is 3.2.57 (2007, the last
+  GPLv2 release Apple shipped) and the user's login shell since Catalina is `/bin/zsh`, so
+  `bash -l` reads `/etc/profile` and `~/.bash_profile` and the user's entire `~/.zshrc` never
+  runs — including the `eval "$(/opt/homebrew/bin/brew shellenv)"` that is how Homebrew tells
+  people to get on `PATH`, which compounds the `claude`-not-found entry above. The comment there
+  says Settings → Terminal would take it over in M11; at M16 it has not, and
+  `cide-headless/src/main.rs` reads `$SHELL` correctly, so the headless binary is more right than
+  the app.
 * **Move to trash.** `NSFileManager trashItemAtURL:` or the `trash` crate. `cide_fs::trash`
-  rejected that crate *for Linux*, on reasoning that does not carry to macOS.
+  rejected that crate *for Linux*, on reasoning that does not carry to macOS. It is wrong in
+  **two** places, not one: the home case writes `~/.local/share/Trash` (already in the table
+  above), and a file deleted from an external volume goes to `$topdir/.Trash-<uid>` per the
+  freedesktop spec where macOS's own convention is `$topdir/.Trashes/<uid>`. Finder's *Put Back*
+  can see neither.
 * **Settings → Appearance** offers three graphics switches that persist and do nothing there.
   `graphics::LADDER_APPLIES` is the seam to gate them on; the screen wants eyes before it grows
   a fourth state.
@@ -209,7 +371,74 @@ at before choosing:
   normalise it, so `cide_fs::ops::check_within` — textual by design — would refuse a terminal
   link naming `/Users/x/proj/…` for a project opened as `/Users/x/Proj`. Unquantified.
 * **FSEvents.** `notify` uses it there, not inotify, and the debouncer timings were tuned
-  against inotify. Expected to work; unverified.
+  against inotify. ~~Expected to work; unverified.~~ **Expected to be dead under any symlinked
+  path** — see the entry below, which is the one macOS finding that is a defect in the product
+  rather than in a test.
+
+### The file watcher, and why it is expected to be silent under `/tmp` and `/var`
+
+This one is not a missing API or an untested arm. It is a real defect, reasoned from dependency
+source, and it is written here rather than fixed because the fix is not the one line it looks
+like.
+
+`cide_fs::filter::Filter::admits` is the only gate on an incoming watch event (`watch.rs`), and
+it answers `false` for any path whose `root_of` is `None`. `root_of` is a textual `starts_with`
+against `WatchConfig.roots`, and `cide_app::files` fills those from the workspace
+**uncanonicalised**. FSEvents, meanwhile, reports paths in the volume's canonical namespace.
+`notify`'s own backend corroborates that: `notify-8.2.0/src/fsevent.rs:376,392` canonicalises the
+watch path before storing it, and the callback builds each event path verbatim from the C string
+and matches with `starts_with` against that canonical copy — a `canonicalize` that only makes
+sense because the events arrive canonical.
+
+So a project opened at `/tmp/…` or `/var/…`, or through any symlink, gets a watcher that binds
+successfully, reports `WatchBackend::Native`, and then admits nothing at all. `/Users/…` is a
+firmlink rather than a symlink, so an ordinary `~/project` is unaffected — which is exactly what
+would let this ship. **`cide-fs`'s watcher tests build their fixtures in `std::env::temp_dir()`,
+which on macOS is `$TMPDIR` under `/var/folders/…`**, so the macOS CI job should show five of
+them failing; `polling_mode_still_reports_changes_and_says_why` should pass, because
+`PollWatcher` stats the paths it was handed, and
+`writes_under_an_ignored_directory_are_never_reported` should pass *vacuously*, which is the
+tell.
+
+**Why it is not fixed here.** Canonicalising the roots is one line, but the roots are shared
+identity: `Index` is built from the same list, `Filter` computes `rel` by `strip_prefix(root)`,
+and `per_dir`/`excludes` are keyed on the walked directories. Canonicalising only the filter's
+copy admits the events and then silently skips every gitignore rule — noise instead of silence,
+which is worse. Canonicalising at the source moves path identity for the index, the UI and
+`check_within` together, on the platform where all of it currently works and none of it can be
+observed failing. It wants a Mac and one change, not a Linux guess in two halves.
+
+### Finding `claude` from a Finder-launched `.app`
+
+Two problems that compound, neither of which has a compile or test signal, and together they are
+the likeliest way a Mac user concludes cide is broken.
+
+**`search_paths()` names the wrong directories for the platform.** It is `PATH` plus
+`~/.cargo/bin` and `~/go/bin` (`cide_core::toolchain`), and its own comment names precisely the
+failure it is guarding — *added by a shell rc file, so a cide started from a terminal sees them
+and the same cide started from a desktop launcher does not* — while fixing only the Linux
+instance of it. An app launched from Finder, the Dock or Spotlight inherits **launchd's**
+environment, not a shell's: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. `/etc/paths` and `path_helper`
+are a shell mechanism and do not run. So none of `~/.local/bin` (where Claude Code's own native
+installer puts `claude`), `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/local/go/bin` is on it.
+The pinned Claude tab then reports *claude: not found on PATH* on a machine where the user runs
+`claude` in Terminal every day. `rust-analyzer` and `gopls` survive only because `~/.cargo/bin`
+and `~/go/bin` happen to be where `rustup` and `go install` put them.
+
+**And the preflight and the spawn do not agree about where to look.** `claude_cli::resolve`
+validates against `search_paths()` — PATH *plus* those two extras — but the spawn deliberately
+passes the binary through as stored, so a bare `claude` reaches `execvp`, which searches **`PATH`
+only**. A `claude` in `~/.cargo/bin` and not on `PATH` therefore passes cide's check and then
+fails at exec with no cide-authored explanation. That is latent on Linux today and materially
+more likely on macOS, where the two path sets diverge much further.
+
+They are recorded together because **fixing either one alone makes things worse**: adding
+`/opt/homebrew/bin` to `search_paths` without closing the exec gap converts a clear refusal with
+a remedy in it into an opaque `ENOENT` from portable-pty. The honest fix is one change — let the
+spawn use the resolved absolute path *when, and only when, the bare name is not on `PATH`*, so
+the self-update property that makes a bare name right in the common case is kept — plus the macOS
+directories. It touches the most load-bearing spawn in the app and wants the platform in front of
+it.
 
 ### Packaging, and the half that money buys
 
