@@ -143,6 +143,9 @@ export function sessionRow(session: SessionLike): { name: string; where: string 
 export function stateLabel(state: string): string {
   if (state === 'busy') return 'working'
   if (state === 'awaitingPermission') return 'waiting for permission'
+  // Distinct from `idle`, and the distinction is the point: this session has DONE something and
+  // is holding the result for the user. `idle` is a session that has not been asked anything.
+  if (state === 'awaitingInput') return 'finished, waiting for you'
   if (state === 'idle') return 'idle'
   return state
 }

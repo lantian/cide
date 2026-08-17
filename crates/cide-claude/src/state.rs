@@ -54,8 +54,38 @@ pub fn next_state(current: SessionState, event: HookEvent) -> Option<SessionStat
         // A subagent finished; the turn has not. See the doc comment.
         HookEvent::SubagentStop => return None,
 
-        // The turn ended.
-        HookEvent::Stop => SessionState::Idle,
+        /*
+         * The turn ended — and *how* it ended is the whole of the finished-work notification.
+         *
+         * `Stop` after work is the CLI handing the conversation back: it is not merely not-busy,
+         * it is waiting on a human, which is what `AwaitingInput` means and what nothing in this
+         * workspace produced until now. `AwaitingInput` was defined, handled by the frontend as
+         * "waiting on the user", and emitted by no code path at all.
+         *
+         * That gap is why the notification kept not firing. The webview inferred "finished" by
+         * remembering whether it had ever *seen* this session go `Busy` — a per-window bit that
+         * `Idle` alone cannot supply. But whether a window sees the `Busy` depends on what the
+         * CLI happened to send and on this machine's own dedupe: a session whose first observed
+         * hook is a `Stop` goes `Spawning -> Idle` with no `Busy` between, and the bit stays
+         * false for ever. Measured on a live instance: nine transitions, eight of them straight
+         * to `Idle`, and exactly one session showed `Idle -> Busy -> Idle` — that one, and only
+         * that one, raised the marker.
+         *
+         * Deciding it here removes the inference. This end knows `current`, so `Busy -> Stop` is
+         * unambiguous, and the answer is the same in every window because it is on the wire
+         * rather than reconstructed from history each window may or may not have witnessed.
+         *
+         * A `Stop` from anywhere else really is just idle: a session that has not been working
+         * has not finished anything, and announcing it is the noise `awaitingRule` was written
+         * to avoid.
+         */
+        HookEvent::Stop => {
+            if current == SessionState::Busy {
+                SessionState::AwaitingInput
+            } else {
+                SessionState::Idle
+            }
+        }
 
         // Handled by the caller, which can see the payload: only a permission request means
         // `AwaitingPermission`, and an ordinary notification means nothing about liveness.
@@ -95,9 +125,33 @@ mod tests {
         assert_eq!(s, SessionState::Busy);
         assert!(s.is_live());
 
-        let s = next_state(s, HookEvent::Stop).expect("busy -> idle");
-        assert_eq!(s, SessionState::Idle);
-        assert!(!s.is_live(), "an idle session must not prompt on close");
+        // `AwaitingInput`, not `Idle`, and this test used to pin the weaker answer.
+        //
+        // A `Stop` that ends work is the CLI handing the conversation back — waiting on a human,
+        // which is exactly what `AwaitingInput` means. Saying `Idle` here left the webview to
+        // infer "finished" from whether it had happened to witness the `Busy`, and a window that
+        // had not could never raise the marker. `AwaitingInput` was defined and handled and
+        // produced by nothing at all until this arm.
+        let s = next_state(s, HookEvent::Stop).expect("busy -> awaiting input");
+        assert_eq!(s, SessionState::AwaitingInput);
+        assert!(
+            !s.is_live(),
+            "a finished turn is not work in flight, so it must not prompt on close"
+        );
+
+        // ...and a `Stop` with no work behind it is still just idle. A session that has not been
+        // asked anything has not finished anything, and announcing it is the noise the whole
+        // `ranATurn` idea existed to avoid.
+        assert_eq!(
+            next_state(SessionState::Idle, HookEvent::Stop),
+            None,
+            "idle -> Stop moves nothing"
+        );
+        assert_eq!(
+            next_state(SessionState::Spawning, HookEvent::Stop),
+            Some(SessionState::Idle),
+            "a session whose first observed hook is a Stop has finished nothing"
+        );
     }
 
     #[test]

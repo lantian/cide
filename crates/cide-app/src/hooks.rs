@@ -417,15 +417,18 @@ mod tests {
             "the other session was not touched"
         );
 
+        // `AwaitingInput`: a Stop that ends work is the CLI handing the conversation back, and
+        // saying so on the wire is what stopped the finished-work marker depending on whether a
+        // given window had witnessed the Busy. See `cide_claude::state::next_state`.
         let effects = decide(&frame("Stop", &busy.to_string()), &states);
         assert_eq!(
             effects,
             vec![Effect::State {
                 session: busy.to_string(),
-                state: SessionState::Idle,
+                state: SessionState::AwaitingInput,
             }]
         );
-        assert_eq!(state_of(&states, busy), Some(SessionState::Idle));
+        assert_eq!(state_of(&states, busy), Some(SessionState::AwaitingInput));
     }
 
     #[test]
@@ -614,8 +617,8 @@ mod tests {
         }
         assert_eq!(
             state_of(&in_order, session),
-            Some(SessionState::Idle),
-            "in arrival order the turn ends idle, which is what raises the marker"
+            Some(SessionState::AwaitingInput),
+            "in arrival order the turn ends waiting on the user, which is what raises the marker"
         );
 
         let reordered = States::new();
