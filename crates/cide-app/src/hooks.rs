@@ -308,6 +308,17 @@ fn decide(frame: &HookFrame, states: &DashMap<SessionId, SessionState>) -> Vec<E
 
     if let Some(next) = next {
         states.insert(session, next);
+        // The first of three lines that make the attention chain traceable end to end.
+        //
+        // Three reports of "the finished-turn notification does nothing" have each been chased
+        // by reading code, and each time every link read correctly. The chain crosses a process
+        // boundary the log cannot see into — hook -> here -> the webview -> back through
+        // `window_set_awaiting` -> `retitle` — and a successful frame logged nothing at all, so
+        // silence proved nothing about where it stopped. These three say which link is quiet:
+        // no line here means the hooks are not arriving; a line here with none from
+        // `window_set_awaiting` means the webview is not hearing the event or not reporting it;
+        // both, with a zero count in `retitle`, means the window-to-session mapping is wrong.
+        tracing::info!(session = raw, ?next, "hook: session state changed");
         effects.push(Effect::State {
             session: raw.to_owned(),
             state: next,

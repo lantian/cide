@@ -273,6 +273,10 @@ pub fn window_set_awaiting(
     session: SessionId,
     awaiting: bool,
 ) -> Result<(), CoreError> {
+    // Second of the three attention-chain lines — see the note in `hooks.rs`. Logged BEFORE the
+    // early return, because "the webview reported and the set did not move" is a different
+    // failure from "the webview never reported" and the two are indistinguishable afterwards.
+    tracing::info!(%session, awaiting, "attention: the webview reported");
     if !windows::set_awaiting(session, awaiting) {
         // Nothing moved. Retitling every window and re-broadcasting on a repeat report would
         // put one round trip per window per tool call in front of the user's keystrokes.
@@ -343,7 +347,18 @@ pub fn window_awaiting_sessions() -> Vec<SessionId> {
 ///   windows is the truth rather than a multiple of it.
 pub(crate) fn retitle(app: &AppHandle, ws: &Workspace) {
     for (label, role) in &ws.windows {
-        let count = windows::awaiting_among(&sessions_of(ws, role));
+        let sessions = sessions_of(ws, role);
+        let count = windows::awaiting_among(&sessions);
+        // Third of the three attention-chain lines — see the note in `hooks.rs`. `debug`, not
+        // `info`: this runs on every workspace mutation, so at `info` it would drown the two
+        // above, which fire once per turn. What it answers is the last question — whether the
+        // sessions this window is judged to hold are the ones the awaiting set knows about.
+        tracing::debug!(
+            %label,
+            count,
+            shown = sessions.len(),
+            "attention: retitle"
+        );
         // One call for both surfaces, so they cannot be computed from two different readings
         // of the same facts. The focus is read per window: "is the user here" is a question
         // about one OS window, not about the application.

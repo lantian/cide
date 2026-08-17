@@ -201,6 +201,16 @@ it is not a substitute for the `macos` CI job.
   nothing re-resolves. `swift-rs` appears in the lockfile and in tauri's dependency list but is
   gated `cfg(all(target_vendor = "apple", not(target_os = "macos")))` — iOS only. No Swift
   toolchain is needed.
+* **Node and `pnpm`, and this one is not a Rust prerequisite at all — it is the first thing a
+  bundle needs.** `cargo tauri build` runs `build.beforeBuildCommand` (`pnpm build` in `ui/`)
+  through `sh -c` before it compiles a line of Rust, so a Mac with no pnpm fails packaging with
+  `sh: pnpm: command not found` and `beforeBuildCommand failed with exit code 127`. **Observed on
+  the first Mac to run `./build.sh`** — and it arrived *after* the release build of `cide-hook`,
+  which is step one of the plan. `corepack enable pnpm` (corepack ships with Node), `brew install
+  pnpm` or `npm install -g pnpm`, then `pnpm --dir ui install` once. Vite 8.2.1 requires Node
+  `^20.19.0 || >=22.12.0`; CI uses 22. Both the tool and `ui/node_modules` are now preflight
+  checks in `cargo xtask package`, so a machine missing either is told in the first second and in
+  one pass rather than over two long failures.
 * **Budget 15–25 minutes for the first `cargo build`**, and note that
   `[profile.dev.package."*"] opt-level = 2` means even a debug build optimises all ~357
   dependencies. Three C builds dominate: libgit2, `tree-sitter-rust`'s `parser.c` as a single
@@ -450,6 +460,17 @@ sidecar rides along unchanged — `externalBin` copies into `Contents/MacOS/`, w
 where `current_exe().parent()` looks — and the overlay must never carry that key, because
 `tauri-build` reads the *host's* platform overlay on every `cargo build` and it would break the
 workspace build on macOS and nowhere else. A test asserts it does not.
+
+**The first Mac packaging run got as far as the frontend and stopped there**, and the fault was
+the preflight's rather than the Mac's: `./build.sh` preflighted fourteen things, built
+`cide-hook` in release, and only then handed over to `cargo tauri build`, whose *first* action is
+`beforeBuildCommand` — `sh -c 'pnpm build'`, on a machine with no pnpm. Exit code 127. Every fact
+needed to predict it was on hand before anything compiled: the config names the command and
+`PATH` says whether it exists. So the preflight now reads `build.beforeBuildCommand` out of
+`tauri.conf.json`, checks that program is on `PATH` and that the frontend's `node_modules` is
+installed, and reports both in one pass — the tool it names is whatever the config says, so
+renaming the command moves the check with it. See *What the Mac itself needs* above for the
+install lines.
 
 What no amount of configuration can do:
 

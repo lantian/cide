@@ -416,6 +416,27 @@ pub struct AppInfo {
     /// invocation, so a sidecar key here would break `cargo build --workspace` there while
     /// leaving Linux green — a red build on the one platform nobody here can reproduce.
     pub macos_external_bin: Vec<String>,
+    /// `build.beforeBuildCommand` from `TAURI_CONF` — the frontend build `cargo tauri build`
+    /// runs before it compiles anything. `None` when the config configures none.
+    pub before_build: Option<BeforeBuild>,
+}
+
+/// `build.beforeBuildCommand`: the shell line, and the directory it runs in.
+///
+/// Its own type rather than two `Option<String>` fields on [`AppInfo`], because the pair is what
+/// the preflight has a question about — *which program does this line need, and does this machine
+/// have it* — and a `cwd` without a script means nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeforeBuild {
+    /// The whole line, exactly as `cargo tauri build` hands it to `sh -c`
+    /// (`tauri-cli-2.11.4` `src/helpers/mod.rs:105`; `cmd /S /C` on Windows, which is not a
+    /// platform here).
+    pub script: String,
+    /// The config's own `cwd` string, which `tauri-cli` passes straight to
+    /// `Command::current_dir` — so it is relative to the *process* working directory, and the
+    /// bundler step in [`plan`] runs from [`APP_CRATE`]. `None` when the config gives none, in
+    /// which case tauri uses its own frontend directory instead.
+    pub cwd: Option<String>,
 }
 
 impl AppInfo {
@@ -980,6 +1001,10 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
 
     if targets.appimage || targets.deb || targets.app || targets.dmg {
         out.push(tauri_cli_check());
+        // Beside the CLI check and not below the sidecar one, because this is the *first* thing
+        // `cargo tauri build` does — before it compiles a line of Rust. A machine that cannot run
+        // the frontend build cannot produce any bundle at all, on either platform.
+        out.extend(frontend_checks(root, info));
         out.push(if info.bundles_the_hook() {
             Verdict::Ok(format!(
                 "{TAURI_BUNDLE_CONF} ships {HOOK_BIN} as a sidecar (bundle.externalBin)"
@@ -1328,6 +1353,183 @@ fn parse_cli_major(output: &str) -> Option<u64> {
     output
         .split_whitespace()
         .find_map(|word| word.split('.').next()?.parse::<u64>().ok())
+}
+
+/// Whether this machine can run the frontend build, which is the bundler's first step.
+///
+/// # This is what the first Mac packaging run actually died on, and it died late
+///
+/// `cargo tauri build` runs `build.beforeBuildCommand` through `sh -c` before it compiles
+/// anything (`tauri-cli-2.11.4` `src/helpers/mod.rs:105`). On a Mac with no `pnpm` that is:
+///
+/// ```text
+/// Running beforeBuildCommand `pnpm build`
+/// sh: pnpm: command not found
+/// Error beforeBuildCommand `pnpm build` failed with exit code 127
+/// ```
+///
+/// — and it arrived *after* `cargo build --release -p cide-hook`, because that is step one of the
+/// plan and this is step three. Every fact needed to predict it was available in the first
+/// second: the config names the command and `PATH` says whether it exists. The preflight had a
+/// verdict for `cargo-tauri` and none for the tool the build reaches for first, so the run spent
+/// a release build to report a missing package manager.
+///
+/// The Rust half of the toolchain is not checked here for the same reason `cargo` itself is not:
+/// this task is *running under* cargo, so its presence is not in question. The frontend half can
+/// be absent on a machine that runs this command perfectly well — and on a fresh clone it is
+/// absent twice over, once for the tool and once for `node_modules`. Both are reported in one
+/// pass, so a Mac that has neither needs one round trip rather than two long ones.
+fn frontend_checks(root: &Path, info: &AppInfo) -> Vec<Verdict> {
+    let Some(build) = info.before_build.as_ref() else {
+        // Not a failure: a config with no hook is a legitimate arrangement — it means the
+        // frontend is built by hand — and `ui/dist` may well be sitting there already. It is a
+        // warning because nothing in the plan then rebuilds it, so the bundle can silently carry
+        // the frontend from whenever somebody last ran `pnpm build`.
+        return vec![Verdict::Warn(format!(
+            "{TAURI_CONF} has no build.beforeBuildCommand, so nothing in this plan rebuilds the \
+             frontend: the bundle will carry whatever `ui/dist` already holds, and `cargo tauri \
+             build` fails with \"Unable to find your web assets\" if it holds nothing"
+        ))];
+    };
+
+    // Resolved the way `tauri-cli` resolves it — against the directory the bundler step runs
+    // from, which is `APP_CRATE`. See `BeforeBuild::cwd`.
+    let dir = root
+        .join(APP_CRATE)
+        .join(build.cwd.as_deref().unwrap_or("."));
+    frontend_verdicts(
+        build,
+        frontend_tool(&build.script).and_then(which),
+        // `None` — nothing to say — unless there is a `package.json` to have installed from. The
+        // question is about *this* frontend; a `beforeBuildCommand` that is not a node build has
+        // no `node_modules` to be missing, and inventing a failure for it would refuse a build
+        // that would have worked.
+        dir.join("package.json")
+            .is_file()
+            .then(|| dir.join("node_modules").is_dir()),
+    )
+}
+
+/// The wording, over facts rather than over the machine.
+///
+/// Split from [`frontend_checks`] the way [`signing_verdicts`] is split from its caller, and for
+/// the same reason: these sentences are the whole value of the check, and a verdict that reads
+/// `PATH` while it decides what to say can only be asserted on a machine that happens to be
+/// missing the tool — which is to say, never on the machine this is developed on.
+fn frontend_verdicts(
+    build: &BeforeBuild,
+    tool_path: Option<PathBuf>,
+    deps_installed: Option<bool>,
+) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    let dir = frontend_dir(build);
+    let script = &build.script;
+
+    match (frontend_tool(script), tool_path) {
+        (Some(tool), Some(path)) => out.push(Verdict::Ok(format!(
+            "build.beforeBuildCommand is `{script}` in {dir}; {tool} at {}",
+            path.display()
+        ))),
+        (Some(tool), None) => {
+            // Named for `pnpm` only, because that is what this repository ships and a guessed
+            // install line for some other tool would be advice nobody checked.
+            let install = if tool == "pnpm" {
+                ". Install it with `corepack enable pnpm` (corepack ships with Node), \
+                 `brew install pnpm`, or `npm install -g pnpm`"
+            } else {
+                ""
+            };
+            out.push(Verdict::Fail(format!(
+                "`{tool}` is not on PATH, and {TAURI_CONF} runs `{script}` in {dir} as \
+                 build.beforeBuildCommand. `cargo tauri build` runs that line through `sh -c` \
+                 before it compiles anything, so the run ends in `sh: {tool}: command not found` \
+                 and `beforeBuildCommand failed with exit code 127` — after the release build of \
+                 {HOOK_BIN} has already been spent{install}"
+            )));
+        }
+        (None, _) => out.push(Verdict::Warn(format!(
+            "build.beforeBuildCommand is `{script}`, which is not a plain `program args…` line, \
+             so which program it needs was not checked. If the build dies with `command not \
+             found`, that is what it means"
+        ))),
+    }
+
+    match deps_installed {
+        Some(false) => {
+            let install = match frontend_tool(script) {
+                // `--dir` is pnpm's spelling (npm's is `--prefix`), so the run-it-from-the-root
+                // form — which is how README and CLAUDE.md write it — is only offered for the
+                // tool this repository actually ships.
+                Some("pnpm") => format!("Run `pnpm --dir {dir} install`"),
+                Some(tool) => format!("Run `{tool} install` in {dir}/"),
+                None => format!("Install the frontend's dependencies in {dir}/"),
+            };
+            out.push(Verdict::Fail(format!(
+                "{dir}/node_modules does not exist, so `{script}` has nothing to run with: the \
+                 tools its package.json script invokes live there, and it will exit before \
+                 anything is written to the frontend's dist directory. {install}"
+            )));
+        }
+        Some(true) => out.push(Verdict::Ok(format!("{dir}/node_modules is installed"))),
+        None => {}
+    }
+
+    out
+}
+
+/// The program `sh -c` will resolve on `PATH` for a `beforeBuildCommand` — its first word, and
+/// only when the line is a plain `program args…`.
+///
+/// `None` for anything else: an environment assignment (`FOO=1 pnpm build`), a pipeline, a
+/// subshell, a `cd … && …`. This check earns its place only while it is certain, because a wrong
+/// answer here is a *failure* that refuses to build something which would have worked — so the
+/// shapes it cannot read become a warning that says so rather than a guess.
+///
+/// The syntax test is over the **whole line** and not just its first word, and that is the case
+/// worth spelling out: `cd ui && pnpm build` has a perfectly ordinary first word, and `cd` is a
+/// shell builtin that is nevertheless a real file at `/usr/bin/cd` on macOS and on no ordinary
+/// Linux — so a first-word-only rule would refuse that config here and pass it there, for a
+/// reason having nothing to do with the tool anybody cares about.
+fn frontend_tool(script: &str) -> Option<&str> {
+    let shell_syntax = |c: char| "|&;<>()$`\\\"'*?[]{}=".contains(c);
+    if script.contains(shell_syntax) {
+        return None;
+    }
+    script.split_whitespace().next()
+}
+
+/// Where the frontend build runs, spelled from the workspace root.
+///
+/// A path and not the config's own `../../ui`, because the reader of a verdict is standing at
+/// the workspace root and not inside `crates/cide-app`. With no `cwd` in the config it is
+/// tauri's own frontend directory, which this task does not compute — so it is named rather
+/// than invented.
+fn frontend_dir(build: &BeforeBuild) -> String {
+    match build.cwd.as_deref() {
+        Some(cwd) => normalize(&Path::new(APP_CRATE).join(cwd))
+            .display()
+            .to_string(),
+        None => "tauri's frontend directory".into(),
+    }
+}
+
+/// Resolve `..` and `.` textually, the way `Path::join` does not.
+///
+/// Used to answer "which file will the bundler open", which `canonicalize` cannot: the paths
+/// this is asked about — the sidecar, the frontend directory of a checkout that may not be this
+/// one — need not exist at the moment the question is asked.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// This machine's target triple, which the sidecar's file name has to carry.
@@ -1976,6 +2178,31 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         macos_bundle_targets: list(macos.pointer("/bundle/targets")),
         macos_icons: list(macos.pointer("/bundle/icon")),
         macos_external_bin: list(macos.pointer("/bundle/externalBin")),
+        before_build: read_before_build(conf.pointer("/build/beforeBuildCommand")),
+    })
+}
+
+/// Read `build.beforeBuildCommand`, which tauri accepts in two shapes.
+///
+/// A bare string (`"pnpm build"`) runs in tauri's own frontend directory; the object form
+/// (`{"script": …, "cwd": …}`) names where. Both are read although this repository uses only the
+/// second, because a parser that understood one shape would answer `None` for the other — and
+/// `None` is a verdict that says "nothing rebuilds the frontend", which would be the opposite of
+/// the truth and would send a reader looking in the wrong place.
+fn read_before_build(value: Option<&serde_json::Value>) -> Option<BeforeBuild> {
+    let value = value?;
+    if let Some(script) = value.as_str() {
+        return Some(BeforeBuild {
+            script: script.to_string(),
+            cwd: None,
+        });
+    }
+    Some(BeforeBuild {
+        script: value.get("script")?.as_str()?.to_string(),
+        cwd: value
+            .get("cwd")
+            .and_then(|cwd| cwd.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -1997,6 +2224,16 @@ mod tests {
             macos_bundle_targets: vec!["app".into(), "dmg".into()],
             macos_icons: vec!["icons/32x32.png".into()],
             macos_external_bin: Vec::new(),
+            before_build: Some(before_build()),
+        }
+    }
+
+    /// The checked-in `build.beforeBuildCommand`, spelled out here so the verdict tests do not
+    /// depend on a file they are not about.
+    fn before_build() -> BeforeBuild {
+        BeforeBuild {
+            script: "pnpm build".into(),
+            cwd: Some("../../ui".into()),
         }
     }
 
@@ -2007,25 +2244,6 @@ mod tests {
     /// every gate in this repository runs on, so it is the default in the helpers below.
     const LINUX: &str = "x86_64-unknown-linux-gnu";
     const MACOS: &str = "aarch64-apple-darwin";
-
-    /// Resolve `..` and `.` textually, the way `Path::join` does not.
-    ///
-    /// Used to answer "which file will the bundler open", which is the only question the
-    /// sidecar path test is asking. `canonicalize` cannot: the sidecar does not exist until
-    /// the plan has run, and the test has to hold before that.
-    fn normalize(path: &Path) -> PathBuf {
-        let mut out = PathBuf::new();
-        for part in path.components() {
-            match part {
-                std::path::Component::ParentDir => {
-                    out.pop();
-                }
-                std::path::Component::CurDir => {}
-                other => out.push(other),
-            }
-        }
-        out
-    }
 
     #[test]
     fn the_real_config_is_readable() {
@@ -2396,6 +2614,153 @@ mod tests {
         assert_eq!(parse_cli_major("tauri-cli 2.11.4\n"), Some(2));
         assert_eq!(parse_cli_major("cargo-tauri 2.0.0-rc.3"), Some(2));
         assert_eq!(parse_cli_major("no version here"), None);
+    }
+
+    // --- the frontend build, which is the bundler's first step -------------------------------
+
+    #[test]
+    fn a_missing_frontend_tool_is_a_failure_that_says_what_the_build_will_print() {
+        // Observed on the first Mac to run `./build.sh`: `sh: pnpm: command not found`, exit code
+        // 127, after `cargo build --release -p cide-hook` had already run. Every fact needed to
+        // say so was available before the first compile, which is what this verdict is.
+        let checks = frontend_verdicts(&before_build(), None, Some(true));
+        let refusal = checks
+            .iter()
+            .find(|c| matches!(c, Verdict::Fail(d) if d.contains("pnpm")))
+            .unwrap_or_else(|| panic!("no missing-tool refusal in {checks:?}"));
+        let detail = refusal.detail();
+        assert!(
+            detail.contains("127") && detail.contains("command not found"),
+            "the refusal has to match what the build would print, or a reader cannot connect \
+             the two: {detail}"
+        );
+        assert!(
+            detail.contains("corepack") || detail.contains("brew"),
+            "and say how to fix it, since this is the one prerequisite a Mac is likely to be \
+             missing: {detail}"
+        );
+    }
+
+    #[test]
+    fn uninstalled_frontend_dependencies_are_the_other_half_of_the_same_round_trip() {
+        // A fresh clone is missing both, and reporting only the tool would send somebody back for
+        // a second twenty-minute failure. Both verdicts come out of one pass.
+        let checks = frontend_verdicts(&before_build(), None, Some(false));
+        assert_eq!(
+            checks
+                .iter()
+                .filter(|c| matches!(c, Verdict::Fail(_)))
+                .count(),
+            2,
+            "{checks:?}"
+        );
+        assert!(
+            checks.iter().any(|c| matches!(c, Verdict::Fail(d)
+                if d.contains("ui/node_modules") && d.contains("pnpm --dir ui install"))),
+            "the dependency failure names the directory and the command: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn an_installed_toolchain_says_where_it_found_it() {
+        let checks = frontend_verdicts(&before_build(), Some("/usr/bin/pnpm".into()), Some(true));
+        assert!(
+            checks.iter().all(|c| matches!(c, Verdict::Ok(_))),
+            "{checks:?}"
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.detail().contains("/usr/bin/pnpm") && c.detail().contains("pnpm build")),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_is_not_a_plain_program_is_warned_about_rather_than_guessed_at() {
+        // A wrong answer here refuses a build that would have worked, so the shapes this cannot
+        // read say so instead of failing on a first word that is not a program.
+        assert_eq!(frontend_tool("pnpm build"), Some("pnpm"));
+        assert_eq!(frontend_tool("npm run build"), Some("npm"));
+        assert_eq!(frontend_tool("VITE_FOO=1 pnpm build"), None);
+        // Not `Some("cd")`: `cd` is a builtin here and a real /usr/bin/cd on a Mac, so a
+        // first-word-only rule would refuse this config on one platform and pass it on the other.
+        assert_eq!(frontend_tool("cd ui && pnpm build"), None);
+        assert_eq!(frontend_tool("(pnpm build)"), None);
+        assert_eq!(frontend_tool(""), None);
+
+        let odd = BeforeBuild {
+            script: "VITE_FOO=1 pnpm build".into(),
+            cwd: Some("../../ui".into()),
+        };
+        let checks = frontend_verdicts(&odd, None, Some(true));
+        assert!(
+            checks.iter().all(|c| !matches!(c, Verdict::Fail(_)))
+                && checks.iter().any(|c| matches!(c, Verdict::Warn(_))),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn the_verdicts_name_the_directory_from_the_workspace_root() {
+        // `../../ui` is right only if you are standing in crates/cide-app, and a reader of a
+        // preflight is standing at the root.
+        assert_eq!(frontend_dir(&before_build()), "ui");
+        assert_eq!(
+            frontend_dir(&BeforeBuild {
+                script: "pnpm build".into(),
+                cwd: None
+            }),
+            "tauri's frontend directory"
+        );
+    }
+
+    #[test]
+    fn the_real_config_still_names_a_frontend_build() {
+        // The whole check is driven by the config rather than by a hardcoded "pnpm", so that
+        // renaming the command in `tauri.conf.json` moves the verdict with it instead of quietly
+        // checking a tool nothing runs.
+        let root = crate::workspace_root().expect("a workspace root");
+        let info = read_app_info(&root).expect("the checked-in config is readable");
+        let build = info
+            .before_build
+            .expect("tauri.conf.json configures beforeBuildCommand");
+        assert_eq!(frontend_tool(&build.script), Some("pnpm"));
+        assert_eq!(frontend_dir(&build), "ui");
+    }
+
+    #[test]
+    fn both_shapes_of_before_build_command_are_understood() {
+        // tauri accepts a bare string as well as the object form, and a parser that read only one
+        // would report "nothing rebuilds the frontend" for a config that does.
+        let string = read_before_build(Some(&serde_json::json!("pnpm build")));
+        assert_eq!(
+            string,
+            Some(BeforeBuild {
+                script: "pnpm build".into(),
+                cwd: None
+            })
+        );
+        let object = read_before_build(Some(
+            &serde_json::json!({"script": "pnpm build", "cwd": "../../ui"}),
+        ));
+        assert_eq!(object, Some(before_build()));
+        assert_eq!(read_before_build(None), None);
+        assert_eq!(read_before_build(Some(&serde_json::json!({}))), None);
+    }
+
+    #[test]
+    fn no_frontend_build_at_all_is_a_warning_and_never_a_failure() {
+        // A config with no hook means somebody builds the frontend by hand, which is a legitimate
+        // arrangement — but nothing in the plan then refreshes `ui/dist`, and a bundle carrying
+        // last week's frontend is the failure worth naming.
+        let mut info = info();
+        info.before_build = None;
+        let checks = frontend_checks(Path::new("/nonexistent"), &info);
+        assert!(
+            checks.len() == 1 && matches!(&checks[0], Verdict::Warn(d) if d.contains("ui/dist")),
+            "{checks:?}"
+        );
     }
 
     #[test]

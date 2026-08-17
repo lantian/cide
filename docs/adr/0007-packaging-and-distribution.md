@@ -230,7 +230,19 @@ cd crates/cide-app && cargo tauri build --config tauri.bundle.conf.json --bundle
 The last from the app crate, because `cargo tauri build` finds `tauri.conf.json` by walking up
 from the working directory and this workspace has no `src-tauri`. That config's
 `beforeBuildCommand` already runs `pnpm build` in `ui/`, so the frontend is not a separate
-step; adding one would build it twice. The host triple comes from `rustc -vV` rather than
+step; adding one would build it twice.
+
+**It is a separate *preflight* check, though, and that is the correction M16 needed.** The
+frontend build is the bundler's first action — `sh -c 'pnpm build'`, before a line of Rust is
+compiled — and the first Mac to run `./build.sh` had no pnpm, so the run died there with exit
+code 127 having already spent a release build of `cide-hook`. Nothing about that was
+undiscoverable in advance: the config names the command and `PATH` says whether it exists. So
+the preflight reads `build.beforeBuildCommand`, resolves its first word on `PATH`, and checks
+that the frontend's `node_modules` exists — both in one pass, because a fresh clone is missing
+both and reporting one at a time costs two round trips. It is read from the config rather than
+hardcoded as "pnpm" so that renaming the command moves the check with it instead of leaving one
+that tests a tool nothing runs; a line the parser cannot read as a plain `program args…` becomes
+a warning rather than a guess, since a wrong answer here refuses a build that would have worked. The host triple comes from `rustc -vV` rather than
 `std::env::consts`, which knows the arch and the OS but not the vendor or the libc. Artefacts
 land in `target/release/bundle/`, and the task prints their sizes — a bundle that came out at
 12 MiB has not picked up WebKit's helper processes, and the number is the cheapest way to
