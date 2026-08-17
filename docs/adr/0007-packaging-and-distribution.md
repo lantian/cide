@@ -17,7 +17,8 @@ that with exactly one: **AppImage**. That is the whole of its Linux support, not
 
 ## Decision
 
-Three artefacts, with clearly different standing.
+Three artefacts, with clearly different standing — and, since M16, a fourth that installs
+nothing: a source tarball for the release page, described under "How to run it" below.
 
 ### AppImage — the channel
 
@@ -206,6 +207,7 @@ avoids.
 ```sh
 cargo xtask package                 # preflight every target, print the plan, build nothing
 cargo xtask package --appimage      # preflight one target
+cargo xtask package --src --run     # the source tarball, and nothing compiled
 cargo xtask package --write         # regenerate packaging/flatpak/*
 cargo xtask package --check         # fail if those files are stale (CI gate)
 cargo xtask package --run           # actually build
@@ -243,6 +245,61 @@ flatpak-builder --force-clean --install --user target/flatpak/dev.cide.ide \
 
 Installed into the user's own installation rather than published to a repository: publishing
 needs signing keys the task must not go looking for.
+
+`--run` for the source tarball executes:
+
+```sh
+mkdir -p target/release/bundle/src
+git archive --format=tar.gz --prefix=cide-0.1.0/ \
+  -o target/release/bundle/src/cide-0.1.0-src.tar.gz HEAD
+```
+
+The `mkdir` is not decoration: `git archive -o` does not create its output directory, it exits
+128 with `could not open '…' for writing`. The `--prefix` is not either — without it the archive
+unpacks 889 files into whatever directory the user was standing in.
+
+### The source tarball is a claim about a commit
+
+`git archive` rather than `tar`, for three reasons that all reduce to the same one. The contents
+are exactly the tracked set at `HEAD`, so `.gitignore` is the single rule for what ships instead
+of a `--exclude` list that silently stops covering the next generated directory. The entries are
+normalised — `root/root`, mode 0644/0755, mtime = the commit date — so two clones of a commit
+produce the same tar. And the stream opens with a `pax_global_header` whose payload is
+`comment=<commit sha>`, which `git get-tar-commit-id` reads back out, so the tarball identifies
+its own commit without a synthesised `.commit` file.
+
+**One step, because of gzip's timestamp.** `--format=tar.gz` compresses inside git, and git's
+built-in gzip writes `MTIME 0`; measured on the reference machine (git 2.54.0), two runs two
+seconds apart are byte-identical and the header reads `1f 8b 08 00 00 00 00 00`. The two-step
+form — `git archive --format=tar -o foo.tar` then `gzip foo.tar` — is *not* reproducible, because
+gzip stores the file's mtime, so the same commit yields a different sha256 on every run. `gzip -n`
+would fix it; a form with no flag to forget is better. (Piping to `gzip` happens to be safe too:
+gzip stores no timestamp for stdin. Relying on that is relying on an accident.)
+
+The honest limit: byte-identity holds for repeated runs on one machine and for any machine with
+the same git build. Across git or zlib versions the *gzip* layer may differ while the *tar* layer
+cannot, so `gunzip -c | sha256sum` is the comparison that always holds. The one thing that changes
+the bytes on a given machine is a configured `tar.tar.gz.command`, which replaces git's compressor
+— measured, a different sha and a different size (3,041,136 vs 3,044,533 bytes) for one commit —
+and the preflight reports it as a warning. `--run` prints the sha256 of every artefact it
+produced, which is what a release script copies into the notes.
+
+**A dirty tree fails the preflight.** `git archive` packages `HEAD` and nothing else, so a tree
+with uncommitted work produces a perfectly valid tarball of something nobody is looking at, with
+no warning anywhere; the mistake surfaces weeks later as a bug report against code that was never
+released, or as a checksum matching nothing. The verdict names the commit and the files, because
+"the tree is dirty" only sends a reader to `git status` for what the check already knows.
+Untracked files are a *warning* — they are usually scratch, and the narrow dangerous case is a new
+source file the committed code already imports, which makes the tarball fail to build while the
+author's tree builds fine. There is deliberately no `--allow-dirty`: a flag exists to be pasted
+into a script, and there is no legitimate reason to publish source nobody can reconstruct.
+
+**One artefact, one producer.** `--src` works on any host — `impossible_on` never names it, so it
+is never the cross-compilation refusal — but it is in the *Linux* default set only. A release
+matrix producing it on both hosts would upload two files with one name whose gzip layers differ
+(the tar layers are identical), and whichever upload lost would leave the published checksum
+matching neither job's log. This is the one place `Targets::for_host` means "responsible for"
+rather than "capable of", and it is written down in that constant.
 
 ### appimagetool fetches a runtime, and when that stalls the build hangs forever
 
@@ -290,6 +347,21 @@ it would otherwise have read, and the merged value is identical. What has *not* 
 end-to-end since the move is `cargo xtask package --appimage --run` itself; the mechanism was
 verified one layer down, by putting the same patch in `TAURI_CONFIG` — which is exactly what
 `--config` sets — and watching `cargo check -p cide-app` demand the sidecar and then accept it.
+
+`cargo xtask package --src --run` was measured on the same machine (git 2.54.0), against a clean
+tagged checkout:
+
+```
+target/release/bundle/src/cide-0.1.0-src.tar.gz             3,055,297 bytes (2.9 MiB)
+```
+
+889 files, which is exactly `git ls-files` — the two sorted lists `diff` empty. Two consecutive
+runs produced the same sha256; the printed checksum matches `sha256sum` on the file. Unpacked, it
+holds `Cargo.lock`, `ui/pnpm-lock.yaml` and the generated `ui/src/ipc/generated.ts`, holds no
+`.git`, `.claude/`, `target/` or `node_modules`, resolves its whole dependency graph under
+`cargo metadata --locked --offline`, and runs `contract-check` green (158 commands, 13 events).
+`git get-tar-commit-id` reads the building commit back out of the tar. It carries no licence
+text, which is the one thing wrong with it — see README.
 
 `cide` links fifteen libraries. Eleven are inside the bundle: `libgtk-3.so.0`,
 `libgdk-3.so.0`, `libgdk_pixbuf-2.0.so.0`, `libcairo.so.2`, `libglib-2.0.so.0`,

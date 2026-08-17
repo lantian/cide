@@ -68,7 +68,7 @@ pnpm --dir ui build
   entry through Vite) and asserts on the output. Adding a `check:foo` script to
   `ui/package.json` is enough — CI enumerates them rather than listing them. Several modules
   are import-free *so that* their check can compile them standalone; keep them that way.
-- Icon drift: `scripts/gen-icons.sh --check`. Packaging: `cargo xtask package [--appimage|--deb|--flatpak|--app|--dmg] [--check|--write|--run]` — without `--run` it only prints a plan. Naming no target means everything *this host* can build; naming one the host cannot (`--dmg` on Linux) is a preflight failure, because nothing here cross-compiles.
+- Icon drift: `scripts/gen-icons.sh --check`. Packaging: `cargo xtask package [--appimage|--deb|--flatpak|--app|--dmg|--src] [--check|--write|--run]` — without `--run` it only prints a plan. Naming no target means everything *this host* is responsible for; naming a bundle the host cannot build (`--dmg` on Linux) is a preflight failure, because nothing here cross-compiles. `--src` is the exception and the cheap one: `git archive` of HEAD into `target/release/bundle/src/cide-<version>-src.tar.gz`, byte-reproducible, buildable on any host but in the **Linux** default set only, so a release matrix uploads one source tarball rather than two that differ. It refuses a dirty tree — a tarball cut from one is a false claim about a commit.
 - **Linux is the only platform cide has ever run on.** `README.md`'s Platforms section is the record: what a `cfg` arm does on macOS instead, which guarantees have no equivalent there (`PR_SET_PDEATHSIG` above all), and what still needs a Mac. The `macos` CI job is advisory until it has passed once.
 
 Which check covers what you touched:

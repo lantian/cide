@@ -100,6 +100,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 /// The Tauri configuration, which is where the identifier, version and bundle targets live.
 const TAURI_CONF: &str = "crates/cide-app/tauri.conf.json";
@@ -125,6 +126,40 @@ fn bundle_conf_arg() -> String {
 
 /// Where the generated Flatpak files are checked in.
 const FLATPAK_DIR: &str = "packaging/flatpak";
+
+/// Where the source tarball is written, relative to the workspace root.
+///
+/// Under `target/release/bundle/` beside the compiled artefacts, and not at the root of
+/// `target/`, because that directory is what `artefacts` enumerates and what the completion
+/// line points a reader at. A release script globs one directory; a tarball anywhere else is
+/// the asset somebody forgets to upload.
+const SRC_BUNDLE_DIR: &str = "target/release/bundle/src";
+
+/// The tarball's file name: `cide-0.1.0-src.tar.gz`.
+///
+/// It has to carry the version, because a release asset is downloaded away from the page that
+/// explains it, and it has to be distinguishable from GitHub's own auto-attached "Source code
+/// (tar.gz)" — which is named after the *tag* and is a different file (no prefix control, and
+/// nothing guarantees what a future GitHub puts in it). `-src` after the version rather than
+/// before it so this sorts next to `cide_0.1.0_amd64.AppImage` and reads as a variant of the
+/// same product.
+fn src_archive_name(info: &AppInfo) -> String {
+    format!("{}-{}-src.tar.gz", info.product_name, info.version)
+}
+
+/// The directory the tarball unpacks into: `cide-0.1.0/`.
+///
+/// Never empty. `git archive` with no prefix writes 889 entries at the top level, so unpacking
+/// it in a downloads directory scatters the whole repository across it. The trailing slash is
+/// required — `--prefix` is a string prepended to every path, not a directory name.
+fn src_prefix(info: &AppInfo) -> String {
+    format!("{}-{}/", info.product_name, info.version)
+}
+
+/// The tarball's path, relative to the workspace root.
+fn src_archive_path(info: &AppInfo) -> String {
+    format!("{SRC_BUNDLE_DIR}/{}", src_archive_name(info))
+}
 
 /// The directory `cargo tauri build` must run from — the crate holding `tauri.conf.json`.
 const APP_CRATE: &str = "crates/cide-app";
@@ -167,7 +202,7 @@ const TAURI_MACOS_CONF: &str = "crates/cide-app/tauri.macos.conf.json";
 
 /// Which artefacts to produce.
 ///
-/// Five flags rather than a `Vec<String>` so that the host check below can ask "did you name
+/// A flag each rather than a `Vec<String>` so that the host check below can ask "did you name
 /// anything this machine cannot build" as a compile-checked question rather than by matching
 /// strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,28 +215,68 @@ pub struct Targets {
     pub app: bool,
     /// macOS: the disk image, which is what a person downloads.
     pub dmg: bool,
+    /// The source tarball for a release page: `git archive` of `HEAD`, nothing compiled.
+    ///
+    /// The one target that is not platform-bound. Every other field names a bundle that only
+    /// one kind of host can produce; this one is `git` and a gzip, so `impossible_on` never
+    /// names it and `--src` is honoured everywhere. What *is* platform-bound is who produces it
+    /// by default — see [`Targets::MACOS`].
+    pub src: bool,
+    /// Whether the source tarball was **named on the command line** rather than inherited from
+    /// the host's default set.
+    ///
+    /// It changes exactly one verdict: a dirty working tree. Asked for explicitly, that is a
+    /// `Fail` — the caller is cutting a release artifact, and one built from a tree that does not
+    /// match HEAD is a claim nobody can reproduce from the tag. Inherited from the default set,
+    /// the same tree is a `Warn` and the archive step is dropped, because the caller typed
+    /// `package --run` to build an AppImage of their work in progress and refusing to build
+    /// anything at all, over a tarball they never mentioned, answers a question they did not ask.
+    /// The advice differs too: "commit or stash" is right for a release and wrong for someone
+    /// deliberately testing uncommitted work.
+    pub src_named: bool,
 }
 
 impl Targets {
-    /// Everything Linux can produce.
+    /// Everything Linux is responsible for producing.
     pub const LINUX: Self = Self {
         appimage: true,
         deb: true,
         flatpak: true,
         app: false,
         dmg: false,
+        src: true,
+        // Inherited, not asked for. A dirty tree therefore warns and drops the archive step
+        // rather than failing the whole run — see the field's own docs.
+        src_named: false,
     };
 
-    /// Everything macOS can produce.
+    /// Everything macOS is responsible for producing.
+    ///
+    /// `src` is deliberately false here and true in [`Targets::LINUX`], and it is the one place
+    /// this struct stops meaning "what the host *can* build". A Mac runs `git archive` perfectly
+    /// well — `--src` on a Mac is honoured, and `impossible_on` never names it. But the source
+    /// tarball is not a per-platform artefact: a release matrix that produced it on both hosts
+    /// would upload two files with the same name whose bytes differ in the gzip layer alone (the
+    /// tar layers are identical, and `git get-tar-commit-id` reads the same commit out of both),
+    /// and whichever upload lost would leave a published checksum matching neither. One artefact,
+    /// one producer, and the producer is the platform every gate in this repository runs on.
     pub const MACOS: Self = Self {
         appimage: false,
         deb: false,
         flatpak: false,
         app: true,
         dmg: true,
+        src: false,
+        src_named: false,
     };
 
-    /// Everything the host named by `triple` can build, which is what naming no target means.
+    /// Everything the host named by `triple` is responsible for producing, which is what naming
+    /// no target means.
+    ///
+    /// "Responsible for" and not "capable of", and the difference is exactly one field: `src`.
+    /// See [`Targets::MACOS`] for why the source tarball has one producer rather than two.
+    /// Everything else here is the stronger statement — a target absent from a host's set is one
+    /// that host cannot build at all, which is what [`Targets::impossible_on`] refuses.
     ///
     /// Taking a triple rather than reading `cfg!(target_os)` is what makes both branches
     /// testable from one machine — the same reason `cide_core::keymap::platform_layer` takes a
@@ -219,6 +294,11 @@ impl Targets {
     ///
     /// Returned as names rather than as a bool so the failure can say which ones, which is the
     /// difference between a verdict a reader can act on and one they have to guess at.
+    ///
+    /// `src` has no row on purpose: no host is unable to produce it, so `--src` on a Mac is a
+    /// plan and not a refusal. It is absent from `Targets::MACOS` for a different reason
+    /// entirely — one artefact, one producer — and conflating the two would turn a defaults
+    /// decision into a refusal nobody could override.
     fn impossible_on(self, triple: &str) -> Vec<&'static str> {
         let macos_host = is_macos_triple(triple);
         [
@@ -235,7 +315,8 @@ impl Targets {
     }
 
     /// The `--bundles` value for `cargo tauri build`, or `None` when no Tauri target was
-    /// asked for. (Flatpak is not one: it is built by `flatpak-builder` from a manifest.)
+    /// asked for. (Flatpak is not one: it is built by `flatpak-builder` from a manifest. Nor is
+    /// `src`: it is `git archive`, and it compiles nothing at all.)
     fn bundles(self) -> Option<String> {
         let mut names = Vec::new();
         if self.appimage {
@@ -419,8 +500,25 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
     println!("\npackaging complete; artefacts are under target/release/bundle/");
     for (path, bytes) in artefacts(root) {
         println!("  {path}  {:.1} MiB", bytes as f64 / (1024.0 * 1024.0));
+        // The checksum of the file that will actually be uploaded, printed where a release
+        // script can copy it. It matters most for the source tarball, whose whole promise is
+        // that anyone who checks out the tag can reproduce these bytes — but a release page
+        // wants one per asset, and computing it here means the number quoted in the notes came
+        // from the artefact rather than from a second command somebody might run on a stale
+        // file. Silent for the `.app`, which is a directory.
+        if let Some(sum) = sha256_file(&root.join(&path)) {
+            println!("      sha256  {sum}");
+        }
     }
     Ok(())
+}
+
+/// The sha256 of a file, or `None` when it is not a readable regular file.
+fn sha256_file(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// The bundles that exist under `target/release/bundle`, with their sizes.
@@ -431,20 +529,19 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
 fn artefacts(root: &Path) -> Vec<(String, u64)> {
     let mut found = Vec::new();
     let bundle = root.join("target/release/bundle");
-    // `macos` is where tauri-bundler puts the `.app`, `dmg` where it puts the disk image. The
-    // `.app` is a *directory*, so its `metadata().len()` is the directory entry's size and not
-    // the bundle's — it is listed anyway, because "the .app exists" is the fact worth printing
-    // and the `.dmg` beside it carries the number that means something.
-    for sub in ["appimage", "deb", "macos", "dmg"] {
+    // `macos` is where tauri-bundler puts the `.app`, `dmg` where it puts the disk image, `src`
+    // where the plan above puts the source tarball. The `.app` is a *directory*, so its
+    // `metadata().len()` is the directory entry's size and not the bundle's — it is listed
+    // anyway, because "the .app exists" is the fact worth printing and the `.dmg` beside it
+    // carries the number that means something.
+    for sub in ["appimage", "deb", "macos", "dmg", "src"] {
         let Ok(entries) = fs::read_dir(bundle.join(sub)) else {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let is_artefact = path
-                .extension()
-                .is_some_and(|e| e == "AppImage" || e == "deb" || e == "app" || e == "dmg");
-            if is_artefact && let Ok(meta) = entry.metadata() {
+            if is_artefact(&entry.file_name().to_string_lossy())
+                && let Ok(meta) = entry.metadata()
+            {
                 found.push((
                     format!(
                         "target/release/bundle/{sub}/{}",
@@ -457,6 +554,20 @@ fn artefacts(root: &Path) -> Vec<(String, u64)> {
     }
     found.sort();
     found
+}
+
+/// Whether a file under `target/release/bundle/*` is one of the things this task produced.
+///
+/// Over the whole file name rather than `Path::extension`, which answers `"gz"` for
+/// `cide-0.1.0-src.tar.gz`. The obvious fix — adding `"gz"` to the extension list — would be
+/// wrong in the other direction, reporting any stray `.gz` in that tree as a release asset; and
+/// leaving it out is worse still, because the listing is what a release script reads, so the
+/// tarball would be built, never printed, and never uploaded.
+fn is_artefact(file_name: &str) -> bool {
+    file_name.ends_with(".tar.gz")
+        || Path::new(file_name)
+            .extension()
+            .is_some_and(|e| e == "AppImage" || e == "deb" || e == "app" || e == "dmg")
 }
 
 /// One command in the plan.
@@ -544,6 +655,26 @@ impl Step {
 pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<Step> {
     let mut steps = Vec::new();
 
+    // First, and deliberately. It costs a second and compiles nothing, while everything below
+    // it is a twenty-minute build that can die inside a bundler; a release that lost its
+    // AppImage should still have the source it was built from. It is also the one step whose
+    // *inputs* are already fixed — `git archive HEAD` reads the object database, not the working
+    // tree — so running it before or after a build cannot change its bytes.
+    /*
+     * ...and skipped, not merely warned about, when a DEFAULT run meets a dirty tree.
+     *
+     * `src_verdicts` downgrades that case from `Fail` to `Warn` so the AppImage somebody asked
+     * for still builds. A warning that left the archive step in the plan would then produce the
+     * exact artefact the warning is about: a tarball claiming a commit whose contents it does not
+     * have. The two halves are one decision and have to agree.
+     *
+     * `dirty_total == 0`, not `!dirty_total > 0` — `!` on a `usize` is bitwise NOT in Rust, so
+     * that spelling compiles, reads as the negation, and is true for every value but `usize::MAX`.
+     */
+    if archives_source(targets, read_src_status(root).dirty_total) {
+        steps.extend(src_steps(info));
+    }
+
     if let Some(bundles) = targets.bundles() {
         // The sidecar, first. `cargo tauri build` builds only the app crate, so nothing else
         // in the plan would produce `cide-hook`, and the bundler's failure when the sidecar is
@@ -610,6 +741,64 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
     }
 
     steps
+}
+
+/// Archive `HEAD` into `target/release/bundle/src/<product>-<version>-src.tar.gz`.
+///
+/// # Why `git archive` and not `tar`
+///
+/// The set of files is the question, and `git` already answers it: the archive is exactly the
+/// tracked set at `HEAD`, so `.gitignore` decides what a release ships and there is one rule
+/// rather than two that drift. A `tar --exclude` list would have to restate `target/`,
+/// `node_modules/`, `ui/dist/` and `.claude/` and would silently start shipping the next
+/// directory nobody remembered to add.
+///
+/// It also normalises what `tar` would not: every entry is `root/root`, mode 0644 or 0755, and
+/// mtime = the commit date, so two clones of the same commit produce the same bytes. And the
+/// tar stream opens with a `pax_global_header` carrying `comment=<commit sha>` — `git
+/// get-tar-commit-id` reads it back — so the tarball self-identifies the commit it came from
+/// without a synthesised `.commit` file.
+///
+/// # One step, not two, because of gzip's timestamp
+///
+/// `--format=tar.gz` compresses inside git, whose built-in gzip writes **MTIME 0** in the
+/// header (measured: bytes 4–7 of the output are zero, and two runs two seconds apart are
+/// byte-identical). Writing `foo.tar` and then running `gzip foo.tar` would not be: gzip stores
+/// the *file's* mtime, so the same commit would produce a different sha256 every run and the
+/// checksum on the release page would be reproducible by nobody. `gzip -n` fixes that, and this
+/// form never needs it, which is the better kind of fix — there is no flag to forget.
+///
+/// # The `mkdir` is not decoration
+///
+/// `git archive -o` does not create its output directory; it exits 128 with
+/// `could not open '…' for writing: No such file or directory`. Measured, not assumed.
+fn src_steps(info: &AppInfo) -> Vec<Step> {
+    vec![
+        Step {
+            program: "mkdir".into(),
+            args: vec!["-p".into(), SRC_BUNDLE_DIR.into()],
+            cwd: ".".into(),
+            env: Vec::new(),
+            optional: false,
+        },
+        Step {
+            program: "git".into(),
+            args: vec![
+                "archive".into(),
+                // One argument, so the printed plan stays pasteable.
+                "--format=tar.gz".into(),
+                format!("--prefix={}", src_prefix(info)),
+                "-o".into(),
+                src_archive_path(info),
+                "HEAD".into(),
+            ],
+            cwd: ".".into(),
+            env: Vec::new(),
+            // Never optional: an absent `git` is a preflight *failure*, because skipping this
+            // step would report a release run as complete with no source artefact in it.
+            optional: false,
+        },
+    ]
 }
 
 /// Build `cide-hook` and leave it under the name the Tauri bundler resolves `externalBin` to.
@@ -867,6 +1056,10 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
                 )),
             });
         }
+    }
+
+    if targets.src {
+        out.extend(src_checks(root, info, targets.src_named));
     }
 
     out
@@ -1199,6 +1392,294 @@ fn arch() -> &'static str {
         "aarch64" => "aarch64",
         other => other,
     }
+}
+
+// --- the source tarball --------------------------------------------------------------------
+
+/// How many file names a verdict lists before it says "and N more".
+///
+/// A dirty tree during a release is usually one or two files; a tree with sixty is one nobody
+/// should be releasing from, and printing sixty paths would bury the sentence that says so.
+const NAMED_FILES: usize = 5;
+
+/// What `git` says about this checkout, gathered once so the verdicts over it can be pure.
+///
+/// Split the same way [`signing_verdicts`] is split, and for the same reason: a verdict that
+/// shells out while it is deciding what to say can only be tested by fabricating a repository
+/// on disk, and the wording — which is the whole value of these checks — would then be asserted
+/// against whatever the fabrication happened to produce.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SrcStatus {
+    /// Whether `git` is on `PATH` at all. Everything else below is unknown when it is not.
+    git: bool,
+    /// `git rev-parse --show-toplevel`. `None` means this is not a git checkout.
+    toplevel: Option<String>,
+    /// Whether that toplevel is the workspace root, rather than an enclosing repository.
+    toplevel_is_root: bool,
+    /// The abbreviated commit `HEAD` names. `None` means a repository with no commits.
+    head: Option<String>,
+    /// Tracked files that differ from `HEAD`, staged or not, capped at [`NAMED_FILES`].
+    dirty: Vec<String>,
+    dirty_total: usize,
+    /// Files git has never been told about, capped the same way.
+    untracked: Vec<String>,
+    untracked_total: usize,
+    /// Every tag pointing at `HEAD`, verbatim. Whether one of them *matches the version* is a
+    /// judgement (is `v0.1.0` the same as `0.1.0`?) and belongs in `src_verdicts`, not here.
+    tags: Vec<String>,
+    /// `tar.tar.gz.command`, when this machine has configured one. The only thing that changes
+    /// the tarball's bytes for a fixed commit.
+    compressor: Option<String>,
+}
+
+/// Run `git` and judge what it said.
+/// Whether the plan should actually cut a source tarball.
+///
+/// A free function taking the dirty count rather than a branch inside [`plan`], because [`plan`]
+/// reads the real repository and a rule that can only be exercised against a live git checkout is
+/// a rule no test can drive — which is exactly what happened: the verdict half of this decision
+/// was asserted and the plan half was not, so removing the skip left every test green while a
+/// warning printed a caution and the archive step produced the artefact the caution was about.
+///
+/// The pair it belongs to is in `src_verdicts`: a dirty tree is a `Fail` when the tarball was
+/// named and a `Warn` when it was inherited. This is what makes the warning true.
+///
+/// `dirty_total == 0`, not `!dirty_total > 0` — `!` on a `usize` is bitwise NOT in Rust, so that
+/// spelling compiles, reads as the negation, and is true for every value but `usize::MAX`.
+fn archives_source(targets: Targets, dirty_total: usize) -> bool {
+    targets.src && (targets.src_named || dirty_total == 0)
+}
+
+fn src_checks(root: &Path, info: &AppInfo, named: bool) -> Vec<Verdict> {
+    src_verdicts(&read_src_status(root), info, named)
+}
+
+fn read_src_status(root: &Path) -> SrcStatus {
+    let mut status = SrcStatus::default();
+    if which("git").is_none() {
+        return status;
+    }
+    status.git = true;
+
+    // `success()` on purpose: every question below is asked in a form whose failure means "the
+    // answer does not exist" (no repository, no commit, no configured key), which is exactly
+    // what `None` says. Nothing here uses an exit code as data — `git diff --quiet` would, and
+    // that is why the dirty check asks for names instead.
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let lines = |text: Option<String>| -> Vec<String> {
+        text.into_iter()
+            .flat_map(|t| {
+                t.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    status.toplevel = git(&["rev-parse", "--show-toplevel"]);
+    status.toplevel_is_root = status
+        .toplevel
+        .as_deref()
+        .is_some_and(|top| same_dir(Path::new(top), root));
+    status.head = git(&["rev-parse", "--short", "HEAD"]);
+
+    if status.head.is_some() {
+        // Names rather than `--quiet`, because the verdict has to say *which* files would be
+        // left out; "the tree is dirty" sends a reader to `git status` to learn what this
+        // command already knows. Against HEAD rather than against the index, so a staged-but-
+        // uncommitted change counts — it is just as absent from the archive as an unstaged one.
+        //
+        // Measured in a throwaway repository, because "which of the four kinds of local change
+        // does this see" is not a thing to assume. `git diff --name-only HEAD` reports an
+        // unstaged edit, a deletion *and* a staged new file, and reports each once; an untracked
+        // file appears only in `ls-files --others` below, so nothing is counted twice. All three
+        // of the first kind are silent in the archive: the edited file goes in with its old
+        // contents, the deleted one goes in, the staged-new one does not go in at all.
+        let dirty = lines(git(&["diff", "--name-only", "HEAD"]));
+        status.dirty_total = dirty.len();
+        status.dirty = dirty.into_iter().take(NAMED_FILES).collect();
+
+        status.tags = lines(git(&["tag", "--points-at", "HEAD"]));
+    }
+
+    let untracked = lines(git(&["ls-files", "--others", "--exclude-standard"]));
+    status.untracked_total = untracked.len();
+    status.untracked = untracked.into_iter().take(NAMED_FILES).collect();
+
+    status.compressor = git(&["config", "--get", "tar.tar.gz.command"]).filter(|c| !c.is_empty());
+
+    status
+}
+
+/// Whether two paths name the same directory, `..` and symlinks resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `a, b and 3 more`, for a capped list.
+fn name_some(named: &[String], total: usize) -> String {
+    let mut text = named.join(", ");
+    if total > named.len() {
+        text.push_str(&format!(" and {} more", total - named.len()));
+    }
+    text
+}
+
+/// The verdicts, over a gathered [`SrcStatus`] rather than over a live `git`.
+///
+/// # The dirty-tree failure is the reason this function exists
+///
+/// A source tarball is a *claim about a commit*: it says "this is what cide 0.1.0 is", and its
+/// checksum is supposed to be reproducible by anyone who checks out the tag. `git archive`
+/// packages `HEAD` and nothing else, so a tree with uncommitted work produces a perfectly valid
+/// tarball of something the developer is not looking at, with no warning anywhere. The mistake
+/// surfaces weeks later as a bug report against code that was never released, or as a checksum
+/// that matches nothing. So it is a `Fail`, it names the commit, and it names the files.
+///
+/// There is deliberately no `--allow-dirty`. A flag exists to be pasted into a script, and
+/// there is no legitimate reason to publish a source tarball from a tree whose contents nobody
+/// can reconstruct.
+///
+/// # …and untracked files are only a warning
+///
+/// They are just as absent from the archive, but they are usually scratch — a note, a profile
+/// dump, a screenshot. The dangerous case is narrow: a *new source file* that committed code
+/// already imports, which makes the tarball fail to build while the author's tree builds fine.
+/// That is worth a sentence and not a refusal; this file's own rule is that a preflight people
+/// learn to ignore is worse than one that says less.
+fn src_verdicts(status: &SrcStatus, info: &AppInfo, named: bool) -> Vec<Verdict> {
+    let mut out = Vec::new();
+
+    if !status.git {
+        out.push(Verdict::Fail(
+            "git is not on PATH, and the source tarball is `git archive`: the tracked set at \
+             HEAD is the only definition of \"the source\" this repository has, and a `tar` of \
+             the working directory would ship target/, node_modules/ and every ignored file"
+                .into(),
+        ));
+        return out;
+    }
+
+    let Some(toplevel) = status.toplevel.as_deref() else {
+        out.push(Verdict::Fail(
+            "this tree is not a git checkout, so there is nothing to archive. An unpacked \
+             source tarball has no `.git` — it is a tree you build in, not one you cut a \
+             release from"
+                .into(),
+        ));
+        return out;
+    };
+
+    if !status.toplevel_is_root {
+        out.push(Verdict::Fail(format!(
+            "this workspace sits inside a larger git repository, whose root is {toplevel}. \
+             `git archive HEAD` packages that project, not this one, and the result would look \
+             plausible — right name, right version, wrong contents"
+        )));
+        return out;
+    }
+
+    let Some(head) = status.head.as_deref() else {
+        out.push(Verdict::Fail(
+            "HEAD names no commit, so `git archive` has nothing to package. A source tarball is \
+             a claim about a commit; there is not one yet"
+                .into(),
+        ));
+        return out;
+    };
+
+    out.push(Verdict::Ok(format!(
+        "will archive {head} into {}, unpacking as {}",
+        src_archive_path(info),
+        src_prefix(info)
+    )));
+
+    if status.dirty_total > 0 {
+        /*
+         * A `Fail` only when the tarball was asked for by name.
+         *
+         * The hazard is the same either way — `git archive` packages HEAD and drops uncommitted
+         * work silently, so the artefact claims a commit whose contents it does not have — but
+         * who is standing in front of it is not. Someone typing `--src` is cutting a release and
+         * wants to be stopped. Someone typing `package --run` is building an AppImage of the work
+         * in progress, and `src` arrived in their target set from `Targets::LINUX` without being
+         * mentioned; refusing to build anything at all, and printing advice to commit or stash
+         * the very changes they are testing, answers a question they did not ask.
+         *
+         * So the default run warns and drops the archive step. Everything else still builds, and
+         * the one artefact that would have been a lie is the one that is not produced.
+         */
+        let detail = format!(
+            "the working tree has uncommitted changes to {} tracked file(s) ({}). `git archive` \
+             packages HEAD ({head}) and would leave them out silently, so the tarball would \
+             claim a commit whose contents it does not have",
+            status.dirty_total,
+            name_some(&status.dirty, status.dirty_total)
+        );
+        out.push(if named {
+            Verdict::Fail(format!(
+                "{detail}. Commit, stash, or check out the tag you mean to release"
+            ))
+        } else {
+            Verdict::Warn(format!(
+                "{detail}. The source tarball is skipped; every other target still builds. Ask \
+                 for it by name with `--src` once the tree is clean"
+            ))
+        });
+    }
+
+    if status.untracked_total > 0 {
+        out.push(Verdict::Warn(format!(
+            "{} untracked file(s) will not be in the tarball ({}). Usually that is exactly \
+             right; if one of them is a new source file the committed code already imports, the \
+             tarball will not build and this tree will, so nothing else would notice",
+            status.untracked_total,
+            name_some(&status.untracked, status.untracked_total)
+        )));
+    }
+
+    if let Some(compressor) = &status.compressor {
+        out.push(Verdict::Warn(format!(
+            "tar.tar.gz.command is configured (`{compressor}`), so the gzip layer is this \
+             machine's compressor rather than git's built-in one: the same commit produces a \
+             different file, and a different sha256, elsewhere. The tar layer inside is \
+             identical either way — `gunzip -c | sha256sum` is the comparison that holds"
+        )));
+    }
+
+    // `v0.1.0` and `0.1.0` are the same release; both spellings are in wide use, and a preflight
+    // that accepted only one would warn about a correctly tagged tree half the time.
+    if !status
+        .tags
+        .iter()
+        .any(|tag| tag.trim_start_matches('v') == info.version)
+    {
+        // A warning and never a failure: `actions/checkout` fetches no tags by default, so this
+        // fires on every CI run that has not asked for `fetch-depth: 0`, and a release cut from
+        // a branch before the tag is pushed is a normal order of operations.
+        out.push(Verdict::Warn(format!(
+            "no tag at {head} matches {}, so the tarball's name comes from {TAURI_CONF} alone. \
+             A release page pairs the artefact with a tag, and nothing here checks that they \
+             agree (in CI this also fires whenever tags were not fetched)",
+            info.version
+        )));
+    }
+
+    out
 }
 
 /// Find an executable on `PATH`.
@@ -1729,6 +2210,8 @@ mod tests {
             flatpak: true,
             app: false,
             dmg: false,
+            src: false,
+            src_named: false,
         };
         let steps = plan(
             Path::new("/nonexistent"),
@@ -1802,6 +2285,8 @@ mod tests {
             flatpak: false,
             app: false,
             dmg: false,
+            src: false,
+            src_named: false,
         };
         let steps = plan(
             Path::new("/nonexistent"),
@@ -2001,6 +2486,8 @@ mod tests {
             flatpak: true,
             app: false,
             dmg: false,
+            src: false,
+            src_named: false,
         };
         assert_eq!(targets.bundles(), None);
         let steps = plan(
@@ -2289,5 +2776,494 @@ mod tests {
             !printed.iter().any(|s| s.contains("flatpak-builder")),
             "the mac plan runs flatpak-builder: {printed:?}"
         );
+    }
+
+    // --- the source tarball ------------------------------------------------------------------
+
+    /// A checkout with nothing wrong with it, as `read_src_status` would report one.
+    fn clean() -> SrcStatus {
+        SrcStatus {
+            git: true,
+            toplevel: Some("/home/dev/cide".into()),
+            toplevel_is_root: true,
+            head: Some("144260a".into()),
+            dirty: Vec::new(),
+            dirty_total: 0,
+            untracked: Vec::new(),
+            untracked_total: 0,
+            tags: vec!["v0.1.0".into()],
+            compressor: None,
+        }
+    }
+
+    #[test]
+    fn the_source_tarball_is_the_only_target_no_host_refuses() {
+        // Every other field of `Targets` names a bundler that exists on one platform. This one
+        // is `git archive`, so `--src` on a Mac has to be a plan and not the cross-compilation
+        // refusal — which is a different thing entirely from it being absent from that host's
+        // *defaults*, and conflating the two would make the choice below unoverridable.
+        let src_only = Targets {
+            appimage: false,
+            deb: false,
+            flatpak: false,
+            app: false,
+            dmg: false,
+            src: true,
+            src_named: true,
+        };
+        assert!(src_only.impossible_on(LINUX).is_empty());
+        assert!(src_only.impossible_on(MACOS).is_empty());
+        assert_eq!(src_only.bundles(), None, "it is not a Tauri bundle");
+    }
+
+    #[test]
+    fn only_one_host_produces_the_source_tarball_by_default() {
+        // The one place `for_host` stops meaning "what this host can build". Two hosts producing
+        // it means a release matrix uploading two files called `cide-0.1.0-src.tar.gz` whose
+        // bytes differ — the tar layers are identical but the gzip layer belongs to whichever
+        // compressor that runner shipped — and whichever upload lost would leave a published
+        // checksum matching neither job's log.
+        assert!(Targets::for_host(LINUX).src);
+        assert!(!Targets::for_host(MACOS).src);
+        // …and it is still not a refusal there, so `--src` on a Mac works.
+        assert!(Targets::MACOS.impossible_on(MACOS).is_empty());
+
+        let mac_default = plan(Path::new("/nonexistent"), &info(), Targets::MACOS, MACOS);
+        assert!(
+            mac_default.iter().all(|s| s.program != "git"),
+            "a bare `package --run` on a Mac must not cut a second source tarball: {mac_default:?}"
+        );
+    }
+
+    #[test]
+    fn the_source_step_runs_before_anything_expensive() {
+        // It costs a second and compiles nothing, while everything after it is a twenty-minute
+        // build that can die inside a bundler. A release that lost its AppImage should still
+        // have the source it was built from.
+        let steps = plan(Path::new("/nonexistent"), &info(), Targets::LINUX, LINUX);
+        let archive = steps
+            .iter()
+            .position(|s| s.program == "git")
+            .expect("a step that archives the source");
+        let first_cargo = steps
+            .iter()
+            .position(|s| s.program == "cargo")
+            .expect("a step that compiles something");
+        assert!(archive < first_cargo, "{steps:?}");
+    }
+
+    #[test]
+    fn the_output_directory_is_created_first() {
+        // `git archive -o` does not create it: measured, `fatal: could not open '…' for
+        // writing: No such file or directory`, exit 128. Without the mkdir the whole plan fails
+        // on its second command, after the preflight has said everything is fine.
+        let steps = src_steps(&info());
+        assert_eq!(steps[0].program, "mkdir");
+        assert!(steps[0].args.contains(&SRC_BUNDLE_DIR.to_string()));
+        assert_eq!(steps[1].program, "git");
+        assert!(
+            steps[1]
+                .args
+                .iter()
+                .any(|a| a.starts_with(&format!("{SRC_BUNDLE_DIR}/"))),
+            "the archive must land in the directory the mkdir made: {:?}",
+            steps[1]
+        );
+    }
+
+    #[test]
+    fn the_tarball_is_named_and_prefixed_for_a_release_page() {
+        let steps = src_steps(&info());
+        let archive = &steps[1];
+        assert_eq!(archive.args[0], "archive");
+        assert!(
+            archive.args.contains(&"--format=tar.gz".to_string()),
+            "one argument, so the printed plan is pasteable: {archive:?}"
+        );
+        assert!(
+            archive.args.last().is_some_and(|r| r == "HEAD"),
+            "the archive is of a commit, never of the working tree: {archive:?}"
+        );
+        assert!(
+            archive
+                .args
+                .iter()
+                .any(|a| a.ends_with("cide-0.1.0-src.tar.gz")),
+            "the name carries the version, because an asset is downloaded away from its \
+             release page: {archive:?}"
+        );
+
+        // The prefix is what stops a tarbomb: without it, unpacking scatters ~900 files across
+        // whatever directory the user was in. `git archive` prepends the string verbatim, so
+        // the trailing slash is load-bearing rather than cosmetic.
+        let prefix = archive
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("--prefix="))
+            .expect("a --prefix, or the tarball unpacks into the current directory");
+        assert_eq!(prefix, "cide-0.1.0/");
+        assert!(prefix.ends_with('/'));
+    }
+
+    #[test]
+    fn asking_for_src_alone_builds_no_hook_and_runs_no_bundler() {
+        let targets = Targets {
+            appimage: false,
+            deb: false,
+            flatpak: false,
+            app: false,
+            dmg: false,
+            src: true,
+            src_named: true,
+        };
+        let steps = plan(Path::new("/nonexistent"), &info(), targets, LINUX);
+        assert_eq!(
+            steps.len(),
+            2,
+            "mkdir and git archive, nothing else: {steps:?}"
+        );
+        assert!(
+            steps.iter().all(|s| s.program != "cargo"),
+            "nothing is compiled to produce a source tarball: {steps:?}"
+        );
+        assert!(steps.iter().all(|s| s.program != "curl"), "{steps:?}");
+        assert!(
+            steps.iter().all(|s| s.program != "flatpak-builder"),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_dirty_tree_is_a_failure_and_names_the_commit_and_the_files() {
+        // The failure this whole preflight exists for. `git archive` packages HEAD, so a tree
+        // with uncommitted work produces a valid tarball of something nobody is looking at —
+        // a false claim about a commit, discovered later as a checksum that matches nothing.
+        let mut status = clean();
+        status.dirty = vec!["crates/cide-app/src/lib.rs".into(), "ui/src/App.tsx".into()];
+        status.dirty_total = 2;
+        let verdicts = src_verdicts(&status, &info(), true);
+        let failure = verdicts
+            .iter()
+            .find(|v| matches!(v, Verdict::Fail(_)))
+            .unwrap_or_else(|| panic!("a dirty tree must fail: {verdicts:?}"));
+        let detail = failure.detail();
+        assert!(
+            detail.contains("144260a"),
+            "it has to name the commit that would be archived: {detail}"
+        );
+        assert!(
+            detail.contains("crates/cide-app/src/lib.rs") && detail.contains("ui/src/App.tsx"),
+            "and the files, or the reader goes to `git status` to learn what this already \
+             knows: {detail}"
+        );
+        assert!(
+            detail.contains("stash") || detail.contains("Commit"),
+            "and what to do about it: {detail}"
+        );
+    }
+
+    /// A dirty tree the caller never asked about warns, and the archive step is dropped.
+    ///
+    /// The other half of the verdict above, and the two must agree or the feature is worse than
+    /// either. `src` is in `Targets::LINUX`, so a bare `cargo xtask package --run` — which is
+    /// what `build.sh` invokes — inherits it. Failing there means a developer testing an AppImage
+    /// of their work in progress builds nothing at all, and reads advice to commit or stash the
+    /// very changes they are testing.
+    ///
+    /// Warning and leaving the step in the plan would be the worse mistake still: it would print
+    /// a caution and then produce the exact artefact the caution is about. So this asserts BOTH —
+    /// the verdict is a warning, and the plan has no archive step.
+    #[test]
+    fn an_unrequested_tarball_warns_on_a_dirty_tree_and_is_skipped() {
+        let mut status = clean();
+        status.dirty = vec!["crates/cide-app/src/lib.rs".into()];
+        status.dirty_total = 1;
+
+        let verdicts = src_verdicts(&status, &info(), false);
+        let warn = verdicts
+            .iter()
+            .find_map(|v| match v {
+                Verdict::Warn(text) if text.contains("uncommitted") => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("an unrequested tarball warns rather than fails: {verdicts:?}"));
+        assert!(
+            warn.contains("skipped") && warn.contains("--src"),
+            "the warning says what was skipped and how to ask for it deliberately: {warn}"
+        );
+        assert!(
+            !verdicts.iter().any(|v| matches!(v, Verdict::Fail(_))),
+            "nothing fails, so every other target still builds: {verdicts:?}"
+        );
+
+        // ...and the same tree, named explicitly, is still a refusal. A release artefact that
+        // does not match HEAD is the thing this preflight exists to stop.
+        assert!(
+            src_verdicts(&status, &info(), true)
+                .iter()
+                .any(|v| matches!(v, Verdict::Fail(_))),
+            "asking for it by name still refuses"
+        );
+    }
+
+    /// The plan half of the dirty-tree decision, which was the untested one.
+    ///
+    /// Mutation-checked: deleting the skip from `plan` left all 89 other tests green, because
+    /// `plan` reads the live repository and nothing could fixture it. The rule moved out so this
+    /// can drive it.
+    #[test]
+    fn a_dirty_tree_only_cuts_a_tarball_that_was_asked_for() {
+        let inherited = Targets { src: true, src_named: false, ..Targets::LINUX };
+        let asked = Targets { src: true, src_named: true, ..Targets::LINUX };
+
+        assert!(archives_source(inherited, 0), "a clean tree cuts one either way");
+        assert!(archives_source(asked, 0));
+        assert!(
+            !archives_source(inherited, 1),
+            "an inherited tarball is SKIPPED on a dirty tree — the warning that replaced the \
+             failure is only true if the step really goes"
+        );
+        assert!(
+            archives_source(asked, 1),
+            "asked for by name it is still planned; `src_verdicts` fails the run instead, which \
+             is where the user is told why"
+        );
+        assert!(
+            !archives_source(Targets { src: false, ..asked }, 0),
+            "and not wanting it at all still means not cutting one"
+        );
+    }
+
+    #[test]
+    fn a_long_dirty_list_is_capped_and_says_how_many_it_hid() {
+        let mut status = clean();
+        status.dirty = (0..NAMED_FILES).map(|i| format!("f{i}.rs")).collect();
+        status.dirty_total = 40;
+        let detail = src_verdicts(&status, &info(), true)
+            .into_iter()
+            .find_map(|v| match v {
+                Verdict::Fail(d) => Some(d),
+                _ => None,
+            })
+            .expect("a failure");
+        assert!(detail.contains("40 tracked file(s)"), "{detail}");
+        assert!(
+            detail.contains("and 35 more"),
+            "forty paths would bury the sentence that matters: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_untracked_file_is_a_warning_not_a_failure() {
+        // They cannot reach the archive either, but they are usually scratch. The narrow
+        // dangerous case — a new source file the committed code already imports — is worth a
+        // sentence, not a refusal.
+        let mut status = clean();
+        status.untracked = vec!["ui/src/chrome/tabDrag.ts".into()];
+        status.untracked_total = 1;
+        let verdicts = src_verdicts(&status, &info(), true);
+        assert!(
+            verdicts.iter().all(|v| !matches!(v, Verdict::Fail(_))),
+            "an untracked scratch file must not refuse a release: {verdicts:?}"
+        );
+        assert!(
+            verdicts.iter().any(|v| matches!(v, Verdict::Warn(d)
+                if d.contains("ui/src/chrome/tabDrag.ts") && d.contains("will not build"))),
+            "{verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn an_unpacked_tarball_cannot_produce_another_one() {
+        // Measured in an extracted tree: `git rev-parse --is-inside-work-tree` exits 128. The
+        // tarball ships no `.git`, so this is the state anyone who downloaded one is in, and
+        // "not a git checkout" is a far better answer than whatever `git archive` says.
+        let status = SrcStatus {
+            git: true,
+            ..SrcStatus::default()
+        };
+        let verdicts = src_verdicts(&status, &info(), true);
+        assert!(
+            verdicts
+                .iter()
+                .any(|v| matches!(v, Verdict::Fail(d) if d.contains("not a git checkout"))),
+            "{verdicts:?}"
+        );
+        assert_eq!(verdicts.len(), 1, "nothing else is knowable: {verdicts:?}");
+    }
+
+    #[test]
+    fn a_nested_checkout_is_refused() {
+        // A workspace vendored inside somebody else's repository. `git archive HEAD` run from
+        // here packages *that* project, and the result looks entirely plausible: right file
+        // name, right version, wrong contents.
+        let mut status = clean();
+        status.toplevel = Some("/home/dev/monorepo".into());
+        status.toplevel_is_root = false;
+        let verdicts = src_verdicts(&status, &info(), true);
+        assert!(
+            verdicts
+                .iter()
+                .any(|v| matches!(v, Verdict::Fail(d) if d.contains("/home/dev/monorepo"))),
+            "the refusal must name the repository it found: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_git_is_a_failure_that_says_why_a_tar_would_not_do() {
+        let verdicts = src_verdicts(&SrcStatus::default(), &info(), true);
+        let detail = verdicts.first().expect("a verdict").detail();
+        assert!(detail.contains("git is not on PATH"), "{detail}");
+        assert!(
+            detail.contains("target/") || detail.contains("node_modules"),
+            "a reader will reach for `tar` next; the answer is why that ships the wrong \
+             files: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_configured_compressor_is_a_warning() {
+        // Measured: `git -c tar.tar.gz.command='gzip -c' archive` is deterministic across runs
+        // but produces different bytes and a different size from git's built-in (3,041,136 vs
+        // 3,044,533). It is the only thing on a machine that can change the tarball for a
+        // fixed commit, so it is the only reproducibility caveat worth printing.
+        let mut status = clean();
+        status.compressor = Some("gzip -c".into());
+        let verdicts = src_verdicts(&status, &info(), true);
+        assert!(
+            verdicts.iter().any(|v| matches!(v, Verdict::Warn(d)
+                if d.contains("tar.tar.gz.command") && d.contains("gzip -c"))),
+            "{verdicts:?}"
+        );
+        assert!(
+            verdicts.iter().all(|v| !matches!(v, Verdict::Fail(_))),
+            "a different-but-valid gzip is not a reason to refuse: {verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn an_untagged_head_is_a_warning_and_never_a_failure() {
+        // `actions/checkout` fetches no tags without `fetch-depth: 0`, so a failure here would
+        // make every CI packaging run red for a reason that is about the checkout.
+        let mut status = clean();
+        status.tags = Vec::new();
+        let verdicts = src_verdicts(&status, &info(), true);
+        assert!(
+            verdicts
+                .iter()
+                .any(|v| matches!(v, Verdict::Warn(d) if d.contains("0.1.0"))),
+            "{verdicts:?}"
+        );
+        assert!(
+            verdicts.iter().all(|v| !matches!(v, Verdict::Fail(_))),
+            "{verdicts:?}"
+        );
+
+        // A tag that is not this version does not count, and both spellings of one that is do.
+        // `v` is the dominant convention and a bare version is common enough that accepting
+        // only one would warn about half the correctly tagged trees there are.
+        let with = |tag: &str| {
+            let mut s = clean();
+            s.tags = vec![tag.into()];
+            src_verdicts(&s, &info(), true)
+        };
+        assert_eq!(with("v0.1.0").len(), 1, "{:?}", with("v0.1.0"));
+        assert_eq!(with("0.1.0").len(), 1, "{:?}", with("0.1.0"));
+        assert!(
+            with("v0.2.0").iter().any(|v| matches!(v, Verdict::Warn(_))),
+            "a tag for another release is not this release's tag: {:?}",
+            with("v0.2.0")
+        );
+    }
+
+    #[test]
+    fn a_clean_checkout_says_exactly_what_it_will_produce() {
+        let verdicts = src_verdicts(&clean(), &info(), true);
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "a clean tagged checkout has nothing to warn about: {verdicts:?}"
+        );
+        let Verdict::Ok(detail) = &verdicts[0] else {
+            panic!("{verdicts:?}");
+        };
+        assert!(detail.contains("144260a"), "{detail}");
+        assert!(
+            detail.contains("target/release/bundle/src/cide-0.1.0-src.tar.gz"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("cide-0.1.0/"),
+            "and what it unpacks as: {detail}"
+        );
+    }
+
+    /// # Why this one returns early instead of asserting unconditionally
+    ///
+    /// It runs against the actual repository rather than a fixture, and the actual repository is
+    /// not always a git checkout: **the source tarball this feature produces unpacks into a tree
+    /// with no `.git`**, and `CLAUDE.md` lists `cargo test --workspace` as a gate a consumer is
+    /// expected to run. Asserted unconditionally, the artifact could not pass its own documented
+    /// suite — a distro packager, a Homebrew formula or a Nix `checkPhase` would see one red test
+    /// and reasonably read it as a broken release rather than as a missing directory.
+    ///
+    /// The early return is not a hole. `an_unpacked_tarball_cannot_produce_another_one` covers
+    /// exactly the state this skips, with a fixture, so the no-git path is asserted either way;
+    /// what only a real checkout can check is that `read_src_status` still gets a true answer out
+    /// of a live git, and that is what remains below.
+    #[test]
+    fn the_real_checkout_is_one_a_source_tarball_can_be_cut_from() {
+        let root = crate::workspace_root().expect("a workspace root");
+        let status = read_src_status(&root);
+        if !status.git || !root.join(".git").exists() {
+            eprintln!("skipped: not a git checkout — this is the unpacked-tarball case");
+            return;
+        }
+        assert!(
+            status.toplevel_is_root,
+            "the workspace root must be the git root: {status:?}"
+        );
+        assert!(status.head.is_some(), "{status:?}");
+    }
+
+    #[test]
+    fn an_artefact_listing_finds_the_tarball() {
+        // `Path::extension` answers `"gz"` for `cide-0.1.0-src.tar.gz`, so the extension list
+        // the other four artefacts use silently drops it — built, never printed, never
+        // uploaded. That is the whole reason this is a named function.
+        assert!(is_artefact("cide-0.1.0-src.tar.gz"));
+        assert!(is_artefact("cide_0.1.0_amd64.AppImage"));
+        assert!(is_artefact("cide_0.1.0_amd64.deb"));
+        assert!(is_artefact("cide.app"));
+        assert!(is_artefact("cide_0.1.0_aarch64.dmg"));
+        // …and not everything else that ends up in that tree.
+        assert!(!is_artefact("cide-0.1.0-src.tar"));
+        assert!(!is_artefact("build.log.gz"));
+        assert!(!is_artefact("cide"));
+    }
+
+    #[test]
+    fn the_printed_checksum_is_the_one_sha256sum_would_print() {
+        // The number goes onto a release page for people to verify with `sha256sum -c`. A
+        // different-but-respectable digest would be worse than none, so this is pinned to the
+        // NIST vector for "abc" rather than to whatever the code currently computes.
+        let dir = std::env::temp_dir().join(format!("cide-xtask-sha-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abc");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            sha256_file(&path).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        // A directory — which is what a macOS `.app` is — must not produce a checksum line.
+        assert_eq!(sha256_file(&dir), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_capped_list_reads_as_a_sentence() {
+        assert_eq!(name_some(&["a".into()], 1), "a");
+        assert_eq!(name_some(&["a".into(), "b".into()], 2), "a, b");
+        assert_eq!(name_some(&["a".into(), "b".into()], 7), "a, b and 5 more");
     }
 }

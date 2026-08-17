@@ -153,6 +153,13 @@ parking_lot = "0.12.5"
 smallvec = "1"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 blake3 = "1.8.6"
+# For the checksum `cargo xtask package --run` prints beside each release artefact. sha256
+# rather than the blake3 above it, because the number is for a release page: it is what
+# `sha256sum -c` and GitHub's own attestations speak, and a checksum a downloader cannot verify
+# with the tool they already have is not a checksum. Already in the graph transitively at this
+# exact version, so naming it costs no new compilation — the same argument as `regex` and
+# `getrandom` above.
+sha2 = "0.10.9"
 rayon = "1.12.0"
 
 # --- process lifecycle ---

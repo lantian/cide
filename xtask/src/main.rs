@@ -17,9 +17,10 @@
 //!   handshake, and that `SUPPORTED_CLI` records the version that did. **Not a CI gate** and
 //!   must never be added to one: it needs the CLI installed and a working login. See
 //!   [`verify_cli`].
-//! * `package`            — preflight the Linux packaging and print the plan; `--write`
+//! * `package`            — preflight the packaging and print the plan; `--write`
 //!   regenerates the Flatpak files and `--check` gates them. It builds nothing unless asked
-//!   with `--run`. See `package.rs` and `docs/adr/0007`.
+//!   with `--run`. `--src` is the cheap one: `git archive` of HEAD into a release-page source
+//!   tarball, no compiler involved. See `package.rs` and `docs/adr/0007`.
 //!
 //! Both gates are line-oriented lints over source text rather than macro reflection or a
 //! linked-in `cide-app`. That is a deliberate trade: `generate_handler!` expands inside a
@@ -54,9 +55,13 @@ Tasks:
   package [targets] [...]  preflight the packaging and print the plan
                              targets: --appimage --deb --flatpak (Linux)
                                       --app --dmg                (macOS)
-                             default: everything this host can build. Nothing here
-                             cross-compiles, so naming a target the host cannot
+                                      --src                      (any host)
+                             default: everything this host is responsible for. Nothing
+                             here cross-compiles, so naming a bundle the host cannot
                              produce fails the preflight rather than printing a plan.
+                             --src is the exception — any host can run `git archive` —
+                             but it is in the Linux default set only, so a release
+                             matrix uploads one source tarball rather than two.
                              --write  regenerate packaging/flatpak/*
                              --check  fail if those files are stale (CI gate)
                              --run    actually build; otherwise nothing is built
@@ -112,27 +117,45 @@ fn main() -> ExitCode {
                 "--flatpak",
                 "--app",
                 "--dmg",
+                "--src",
                 "--write",
                 "--check",
                 "--run",
             ],
         )
         .and_then(|f| {
-            // Naming no target means everything *this host* can build, which is what someone
-            // typing `package` to see the state of things wants. Which those are is decided in
-            // `package.rs`, from `rustc -vV`, because the host is that module's business and it
-            // is also what the preflight has to report against. Naming one means only that one —
-            // including one this machine cannot produce, which is a refusal with a reason rather
-            // than a silently narrowed plan.
-            let named = ["--appimage", "--deb", "--flatpak", "--app", "--dmg"]
-                .iter()
-                .any(|t| f.contains(*t));
+            // Naming no target means everything *this host* is responsible for, which is what
+            // someone typing `package` to see the state of things wants. Which those are is
+            // decided in `package.rs`, from `rustc -vV`, because the host is that module's
+            // business and it is also what the preflight has to report against. Naming one means
+            // only that one — including one this machine cannot produce, which is a refusal with
+            // a reason rather than a silently narrowed plan.
+            //
+            // `--src` is in that list like any other: it is not in the macOS default set (one
+            // source tarball per release, cut on Linux), but asking for it anywhere is a plan and
+            // not a refusal, because `git archive` runs the same everywhere.
+            let named = [
+                "--appimage",
+                "--deb",
+                "--flatpak",
+                "--app",
+                "--dmg",
+                "--src",
+            ]
+            .iter()
+            .any(|t| f.contains(*t));
             let targets = named.then(|| package::Targets {
                 appimage: f.contains("--appimage"),
                 deb: f.contains("--deb"),
                 flatpak: f.contains("--flatpak"),
                 app: f.contains("--app"),
                 dmg: f.contains("--dmg"),
+                src: f.contains("--src"),
+                // Named on the command line, by construction: this whole literal only runs when
+                // `named` is true. The distinction it carries is about the DIRTY-TREE verdict —
+                // a release artifact must match HEAD, while a default run that happens to
+                // include the tarball must not refuse to build the AppImage somebody asked for.
+                src_named: f.contains("--src"),
             });
             let root = workspace_root()?;
             package::package(
@@ -1294,8 +1317,26 @@ mod tests {
     /// source file. Scoped to the process: a fixed name under a shared `/tmp` belongs to
     /// whoever ran the tests first, and every later user gets a permission denial instead
     /// of a test result.
+    /// A directory of this process's own.
+    ///
+    /// Keyed by pid **and a counter**, because the pid alone is not unique enough under the
+    /// runner this repository's CI actually uses. `cargo nextest` gives every test its own
+    /// process, so a pid-keyed path is already private there — but plain `cargo test`, which the
+    /// macOS CI job runs, puts every test in this module in ONE process on parallel threads,
+    /// sharing a single directory. That was an intermittent failure that appeared roughly one run
+    /// in six and named a different test each time, which is the shape that gets written off as
+    /// "the flaky one" rather than diagnosed.
+    ///
+    /// `Relaxed` is enough: the only requirement is that two calls differ, and there is nothing
+    /// else for this counter to be ordered against.
     fn scratch_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("cide-xtask-{}", std::process::id()))
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "cide-xtask-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     fn scratch(name: &str, contents: &str) -> PathBuf {

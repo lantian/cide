@@ -246,6 +246,63 @@ be installed by `tauri-bundler`'s freedesktop path into `hicolor/512x512@2/apps/
 no icon theme searches — the exact trap that script's comments record removing `128x128@2x.png`
 for. The overlay is the right place to put it and nobody has.
 
+### `--src`: the source tarball, and what its checksum is worth
+
+`cargo xtask package --src --run` writes
+`target/release/bundle/src/cide-0.1.0-src.tar.gz` and prints its sha256. It is the artefact a
+GitHub release page attaches beside the AppImage, and its point is that the number under it is
+**reproducible from the tag**: anyone can check out `v0.1.0`, run the same command, and get the
+same bytes. That is why it is `git archive` and not `tar`.
+
+`git archive` is what makes the claim checkable rather than merely plausible. The contents are
+exactly the tracked set at `HEAD`, so `.gitignore` decides what ships and there is one rule
+instead of two that drift — measured here, 889 tracked files and 889 files in the tarball, the
+two lists identical. Every entry is normalised to `root/root`, mode 0644/0755 and the commit's
+date, so a fresh clone produces the same tar. And the stream opens with a `pax_global_header`
+carrying `comment=<sha>`, which `git get-tar-commit-id` reads back — the tarball says which
+commit it is without a synthesised file to say so.
+
+Measured on the reference machine (git 2.54.0): two runs two seconds apart are **byte-identical**,
+`1f 8b 08 00 00 00 00 00` — git's built-in gzip writes `MTIME 0`. That is not luck, it is the
+reason the plan is `--format=tar.gz` in one step: writing `foo.tar` and then running `gzip` on it
+embeds the *file's* mtime and the same commit gets a different sha256 every run, which is a
+checksum nobody can reproduce. The one remaining variable is a configured `tar.tar.gz.command`,
+which swaps in the machine's own compressor — different bytes, same tar inside — and the
+preflight warns when one is set. Across git versions the gzip layer may differ; the tar layer
+cannot, so `gunzip -c | sha256sum` is the comparison that always holds.
+
+**A dirty tree is a preflight failure**, and this is the check worth having. `git archive`
+packages `HEAD`, so uncommitted work produces a valid tarball of something the developer is not
+looking at — a false claim about a commit, discovered much later as a bug report against code
+that was never released. The verdict names the commit and the files. Untracked files are only a
+warning: they are usually scratch, and the narrow bad case (a new source file the committed code
+already imports, so the tarball fails to build while the author's tree builds fine) is worth a
+sentence rather than a refusal. There is no `--allow-dirty`; a flag like that exists to be pasted
+into a script.
+
+**It is in the Linux default set only**, and that is the one place `Targets::for_host` stops
+meaning "what this host can build". A Mac runs `git archive` perfectly well and `--src` there is
+honoured — the cross-compilation refusal never names it. But a release matrix that produced it on
+both hosts would upload two files called `cide-0.1.0-src.tar.gz` whose gzip layers differ, and
+whichever upload lost would leave the published checksum matching neither job. One artefact, one
+producer.
+
+Unpacked, the tarball builds: `cargo metadata --locked --offline` resolves the whole graph,
+`ui/src/ipc/generated.ts` and every `crates/cide-ipc/bindings/*.ts` are tracked so `tsc` needs no
+prior codegen, and `contract-check` runs green inside it. What it correctly does not carry is
+`.git`, `target/`, `ui/node_modules` and `ui/dist`. Running `--src` from *inside* an unpacked
+tarball is therefore a preflight failure with that sentence in it, rather than a confusing error
+out of git.
+
+**What the tarball is still missing is a licence.** `Cargo.toml` declares
+`license = "MIT OR Apache-2.0"` and the generated AppStream metainfo publishes the same string,
+but there is no `LICENSE-MIT`/`LICENSE-APACHE` at the root, so there is none in the archive
+either — and Apache-2.0 §4(a) requires the licence text to accompany redistributed source, which
+a tarball on a public release page unambiguously is. Adding the two files fixes it with no code
+change (they are tracked, so they land in the archive for free). It has not been done because the
+MIT text needs a copyright holder named, and that is not a choice this repository can make for
+itself.
+
 ### Paths stay XDG, deliberately
 
 `$XDG_STATE_HOME/cide/workspace.json` and `$XDG_CONFIG_HOME/cide/keymap.json` work on macOS —
