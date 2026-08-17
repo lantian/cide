@@ -43,6 +43,18 @@
    * between the user's unsaved edits and what is on disk. It was wired to the mechanism and
    * passing `check:rows` the whole time; the number the mechanism gave it was wrong for this
    * pane kind, and `--pane-corner-clear` is the mechanism learning to answer per kind.
+   *
+   * # Why this bar still reserves after the find bar (M16) stopped
+   *
+   * Because its height is not a constant. The cluster can *step over* a strip whose height is
+   * known — that is what `--pane-top-strip` in `layout/PaneTitleBar.module.css` does for the find
+   * bar, which is exactly `--h-findbar` tall by declaration. This bar is not: `.conflictText`
+   * below is `flex: 1; min-width: 0` with no `white-space` or `overflow`, so on a narrow pane the
+   * sentence wraps and the bar grows a line, and a step sized for the unwrapped case would put
+   * the cluster straight through *Keep mine* — the failure written up immediately above, back
+   * again by a different route. A strip that can grow reserves horizontally; a strip that cannot
+   * is stepped over. `EditorPane.tsx` marks this one `data-pane-strip="fluid"`, which is how the
+   * frame's `:has()` rule knows to leave the cluster alone while this bar is up.
    */
   padding: 6px calc(10px + var(--pane-corner-clear, 0px)) 6px 10px;
   border-bottom: 1px solid var(--border);

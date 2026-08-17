@@ -20,13 +20,15 @@
  *   it on a prop change would drop the undo history, the scroll position and the selection
  *   — and, if the buffer were dirty, the user's edits.
  */
-import { useEffect, useMemo, useRef, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 import {
   defaultKeymap,
   history,
   historyKeymap,
   indentWithTab,
+  moveLineDown,
+  moveLineUp,
 } from '@codemirror/commands'
 import {
   bracketMatching,
@@ -57,6 +59,7 @@ import { exceedsBytes } from './byteSize'
 import { pendingReveals, planReveal, registerReveal } from './revealRequest'
 import { planRestore, type FileView } from './position'
 import { viewTracker } from './viewTracker'
+import { navRecorder } from './navRecorder'
 import {
   claimStatusReadout,
   formatReadout,
@@ -209,6 +212,26 @@ export interface EditorSurfaceProps {
    */
   symbols?: readonly OutlineNode[] | undefined
   /**
+   * Whether this editor's **tab is the one in front**. (M16)
+   *
+   * The one fact about a file pane that no part of the editor can observe: `TabContent` hides an
+   * inactive tab with `visibility: hidden` and never unmounts it, so a background editor is
+   * mounted, laid out at full size, still painting, and — before this — indistinguishable from
+   * the one the user is reading. `TabContent` has computed and passed the flag since M4
+   * (`renderTree: (tab, active) => ReactNode`, documented there for exactly this class of
+   * consumer); `App.tsx` wrote `renderTree={(tab) =>` and threw it away.
+   *
+   * Two things read it, both about the status bar's single slot: a mount behind another tab must
+   * not claim it, and a tab coming forward must take it. See `statusReadout.ts`'s header for the
+   * two reports.
+   *
+   * Deliberately **not** the same thing as `tree.focused`. `PaneBody` dispatches on the pane
+   * kind, so a File tab holds exactly one editor pane by construction — being the active tab is
+   * therefore the whole of "is this editor on screen", and routing it through the focused-pane
+   * machinery would tie the bar to a second, slower answer.
+   */
+  onScreen?: boolean | undefined
+  /**
    * This file's problems, already filtered by the host. (M12)
    *
    * Filtered *before* it gets here, deliberately: the panel, the status bar and the rail badge
@@ -286,6 +309,7 @@ export function EditorSurface({
   highlight = 'all',
   at,
   onView,
+  onScreen = true,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -384,6 +408,59 @@ export function EditorSurface({
    */
   const symbolsRef = useRef<readonly OutlineNode[]>(symbols ?? [])
   symbolsRef.current = symbols ?? []
+  /*
+   * And the path segments, in a ref for the mirror-image reason — which was a live bug. (M16)
+   *
+   * `segments` is memoized on `[path, root]` and the build effect is keyed on `[path, reloadKey]`,
+   * so a **root that arrives late** produces new segments without re-running the effect: the
+   * update listener kept the array it closed over at build time. The `[segments]` effect below
+   * repaired the bar once, and then the very next caret move republished the stale absolute trail
+   * over it. Reading through a ref is what makes the listener and the effect agree about what
+   * this file is called.
+   */
+  const segmentsRef = useRef<readonly string[]>(segments)
+  segmentsRef.current = segments
+  /** The trail as last published, so nothing below has to compare arrays it has not built. */
+  const publishedRef = useRef<readonly string[]>(segments)
+  const onScreenRef = useRef(onScreen)
+  onScreenRef.current = onScreen
+
+  /*
+   * `src/main.rs › impl Parser › parse`, published if and only if it moved.
+   *
+   * Takes the caret rather than reading it, because its hot caller — the update listener — has
+   * already paid for `doc.lineAt` and must not pay twice: this runs on every selection change,
+   * which under a held arrow key is thirty times a second, and publishes on almost none of them.
+   * That is what keeps the trail off the same budget as the `Ln 7, Col 48` readout beside it,
+   * which goes straight into a DOM node for exactly this reason.
+   *
+   * A function rather than three copies is not tidiness. There are **three** callers now — the
+   * listener, a root that arrived late, and an outline that arrived late — and the last two are
+   * the ones that were missing: a freshly opened tab showed a path with no symbols until the user
+   * moved the caret, and the late-root repair called `setTrail(segments)` with the path alone,
+   * *truncating* a symbol tail that was already on screen.
+   */
+  const publishTrail = useCallback((line: number, column: number) => {
+    const slot = slotRef.current
+    if (slot === null) return
+    const segs = segmentsRef.current
+    const next = [...segs, ...trailNames(symbolsRef.current, line, column)]
+    if (sameTrail(publishedRef.current, next)) return
+    publishedRef.current = next
+    // The split index travels with the trail: `StatusBar` has to know where the path ends and
+    // the symbols begin, or it draws `parse` as a clickable directory. See `statusReadout.ts`.
+    slot.setTrail(next, segs.length)
+  }, [])
+
+  /** The same, for a caller with no caret in hand — it reads the live view for one. */
+  const rebuildTrail = useCallback(() => {
+    const view = viewRef.current
+    if (view === null) return
+    const head = view.state.selection.main.head
+    const at = view.state.doc.lineAt(head)
+    publishTrail(at.number, head - at.from + 1)
+  }, [publishTrail])
+
   const language = useMemo(() => languageName(path), [path])
   const endings = useMemo(() => captureLineEndings(doc), [doc])
 
@@ -424,9 +501,6 @@ export function EditorSurface({
      */
     let readout: ReadoutSlot | null = null
     let caret: CaretSlot | null = null
-    // The whole trail as last published, so the listener can compare before touching the DOM.
-    // `sameTrail` does the same job one layer down; this avoids even building the array.
-    let publishedTrail: readonly string[] = segments
     const readoutFor = (state: EditorState): string =>
       formatReadout({ language, ending: endings.ending, cursor: cursorLabel(state) })
 
@@ -627,6 +701,22 @@ export function EditorSurface({
         observedRef.current = seen
         viewCb.current?.(seen)
       }),
+      /*
+       * The mouse, on the Back stack. (M16)
+       *
+       * Beside `viewTracker` because it is the same shape — a `ViewPlugin` watching the same
+       * update stream, with every decision in an import-free module a check script runs — and
+       * beside `ctrlLink(project, path)` because it takes the same two arguments for the same
+       * reason. The whole rule is `navHistory.ts::recordsClick`; what this line buys is that a
+       * click more than half a viewport away, or into another file, is a place Back can return
+       * from. Without it the pointer was the one input device that moved the caret and wrote
+       * nothing, so Back was empty for anyone who navigates with a mouse.
+       *
+       * Deliberately **not** folded into the update listener below: it must see the caret slot
+       * before that listener moves it, and it must not pay for a keystroke. `navRecorder.ts`
+       * writes both reasons out.
+       */
+      navRecorder(project, path),
       indentUnit.of('    '),
       EditorState.tabSize.of(4),
       languageSlot.of([]),
@@ -654,6 +744,33 @@ export function EditorSurface({
           },
           preventDefault: true,
         },
+        /*
+         * Move line up / down, re-homed — the compensation `cide-core::keymap` has claimed since
+         * M12 and that nobody had built. (M16)
+         *
+         * `alt+up`/`alt+down` are `navigate.prevMember`/`navigate.nextMember` in the app keymap,
+         * and the key gate is a window **capture** listener, so `defaultKeymap`'s
+         * `Alt-ArrowUp`/`Alt-ArrowDown` never see the event: move-line was simply gone from every
+         * buffer, with no replacement anywhere — not in the palette, not in the Code menu. The
+         * comment beside those two bindings said this file re-homed them to `Mod-Shift-Arrow`,
+         * `grep` found nothing, and that comment is now true.
+         *
+         * # Why the chord is spelled twice
+         *
+         * `Mod-Shift-Arrow` is free on Linux and Windows and is **not** free on macOS, which is
+         * the half the old comment got wrong: `standardKeymap` carries `{ mac: 'Cmd-ArrowUp',
+         * shift: selectDocStart }`, so ⌘⇧↑/⌘⇧↓ are select-to-top-of-file and select-to-bottom
+         * there. This block is added before `defaultKeymap` and therefore claims first, so
+         * spelling it `Mod-` would take those two away silently. `Mod-Alt-Shift-Arrow` is free in
+         * both layers — checked in `check-editor.mjs` by expanding the composed keymap the way
+         * CodeMirror expands it, `shift:` sub-bindings and per-platform `mac:` spellings included,
+         * rather than by reading the documentation.
+         *
+         * IDEA spells this ⌥⇧↑ on both platforms; that is `Shift-Alt-ArrowUp`, which is
+         * `copyLineUp` here — trading one capability for another is not a re-homing, so it loses.
+         */
+        { key: 'Mod-Shift-ArrowUp', mac: 'Mod-Alt-Shift-ArrowUp', run: moveLineUp },
+        { key: 'Mod-Shift-ArrowDown', mac: 'Mod-Alt-Shift-ArrowDown', run: moveLineDown },
         ...closeBracketsKeymap,
         ...defaultKeymap,
         ...historyKeymap,
@@ -665,6 +782,13 @@ export function EditorSurface({
           // mounts in a fresh split takes the readout when it appears, and without this the
           // bar would keep reporting that new pane's `Ln 1, Col 1` while the user carries on
           // typing over here. `focus` costs one array read when the slot is already held.
+          //
+          // `hasFocus` is `root.activeElement == contentDOM`, and **that the read-only branch
+          // below makes `.cm-content` focusable at all is load-bearing here**, not a detail of
+          // that branch. Without the `tabindex` it adds, this test is permanently false in every
+          // library and toolchain buffer, so such an editor claims both slots once on mount and
+          // can never take them back — and Ctrl+G, Ctrl+F12, ⌥F7, Ctrl+B and Back then all act
+          // on whichever *editable* file the user touched last.
           if (update.view.hasFocus) {
             readout?.focus()
             caret?.focus()
@@ -685,19 +809,14 @@ export function EditorSurface({
             // file" note costs nothing on the per-keystroke path.
             caret?.set(at.number, column, update.state.doc.lines)
             /*
-             * `src/main.rs › impl Parser › parse`.
+             * `src/main.rs › impl Parser › parse`, handed the caret this branch already computed.
              *
-             * The path half changes when the user switches file — rare; the symbol half changes
-             * when the caret crosses a member boundary, which is far rarer than a caret move.
-             * So this runs on every selection change and publishes on almost none of them, which
-             * is what keeps it off the same budget as the `Ln 7, Col 48` readout beside it (that
-             * one is written straight into a DOM node for exactly this reason).
+             * The rule itself is `publishTrail` above, and it is up there rather than inline for
+             * a reason this listener demonstrates: the other two things that move the trail — a
+             * root and an outline that arrive late — cannot reach a closure defined inside the
+             * build effect, and while it lived here they simply did not move it.
              */
-            const next = [...segments, ...trailNames(symbolsRef.current, at.number, column)]
-            if (!sameTrail(publishedTrail, next)) {
-              publishedTrail = next
-              readout?.setTrail(next)
-            }
+            publishTrail(at.number, column)
           }
           // Read from `update.state`, not from a captured view: this listener outlives
           // several states and the one that changed is the one to report.
@@ -769,7 +888,73 @@ export function EditorSurface({
       )
     }
     if (readOnly) {
-      shared.push(EditorState.readOnly.of(true), EditorView.editable.of(false))
+      shared.push(
+        EditorState.readOnly.of(true),
+        EditorView.editable.of(false),
+        /*
+         * **The line that makes a read-only buffer answer the keyboard at all.** (M16)
+         *
+         * Reported as "Ctrl+F does nothing in a std-library file"; the find bar was never the
+         * problem. `EditorView.editable.of(false)` gives `.cm-content` `contenteditable="false"`
+         * (`@codemirror/view`, `updateAttrs`), and a `contenteditable="false"` div with no
+         * `tabindex` **is not focusable**. CodeMirror registers every DOM handler — `keydown`
+         * included — on `view.contentDOM` (`InputState.ensureHandlers`), and events bubble *up*,
+         * so a keystroke delivered anywhere else never reaches it. Clicking such a buffer focuses
+         * `.cm-scroller` instead, which is contentDOM's parent and has `tabIndex = -1` of its
+         * own, and `focusPreventScroll(view.contentDOM)` in CodeMirror's `mousedown` — and every
+         * `view.focus()` in this codebase, including `registerReveal`'s below and `ctrlLink`'s —
+         * is a no-op against an unfocusable element.
+         *
+         * So it was not Ctrl+F that was dead. **The entire editor keymap was dead** in every
+         * library and toolchain buffer: `Mod-f`, `F3`/`Shift-F3`, `Mod-d`, `Mod-Shift-l`,
+         * `Escape`, `Alt-Enter` (*send lines to Claude*), and the whole of `defaultKeymap` — the
+         * arrow keys, Home/End, PageUp/PageDown, `Mod-a`. It read as alive because `.cm-scroller`
+         * is the focused overflowing element, so those keys still *scrolled* the pane natively.
+         * What was actually missing was the caret: the base theme hides `.cm-cursor` and unhides
+         * it only under `&.cm-focused`, and `view.hasFocus` is `root.activeElement ==
+         * contentDOM`, so it was permanently false.
+         *
+         * That same permanently-false `hasFocus` is the second, quieter half. The update listener
+         * above re-claims the status readout and `caretTrack`'s slot **only** on
+         * `update.view.hasFocus`, so such a buffer claimed both on mount and could never take
+         * them back. Click an editable file and then click back into a std file, and Ctrl+G,
+         * Ctrl+F12, ⌥F7, Ctrl+B and Back all acted on the *other* file, while the status bar's
+         * trail, language and `Ln x, Col y` went on naming it.
+         *
+         * # Why this and not the two alternatives
+         *
+         * Dropping `editable.of(false)` and keeping only `EditorState.readOnly` also works —
+         * CodeMirror ignores DOM changes under that facet — and it makes `.cm-content` a *root
+         * editable element* again, which is exactly the thing `codeMenu.tsx`'s `restoreFocus`
+         * note relies on read-only buffers not being, and it re-enables IME and a native caret in
+         * a document that cannot change.
+         *
+         * Binding `ctrl+f` in `cide-core::keymap` fights a written rule:
+         * `nothing_binds_the_find_bars_f_keys` keeps the find bar's chords out of the Rust keymap
+         * because the window capture gate would swallow them in the buffer and in the find field
+         * at once. It would also have fixed one chord and left the other twenty dead.
+         *
+         * `contentAttributes` merges over the computed attrs — `updateAttrs` builds the defaults
+         * and then folds this facet in on top — so `contenteditable="false"` survives untouched
+         * and only `tabindex` is added.
+         *
+         * `'0'` rather than `'-1'`, and the reason is *not* that `-1` would fail to work: an
+         * element with `tabindex="-1"` takes focus from a click and from `.focus()` just as well,
+         * so every chord above would come back either way. It is that `-1` would leave the two
+         * halves disagreeing. `@codemirror/view`'s `updateSelection` computes
+         * `!focused && !(editable || dom.tabIndex > -1)` to decide whether to write a *pointer*
+         * selection back into a `.cm-content` it believes can never hold focus — and the DOM
+         * reports `tabIndex === -1` both for `tabindex="-1"` and for no attribute at all. So `-1`
+         * would make the element focusable while leaving the library on the branch it keeps for
+         * unfocusable content: half-fixed, and in the half that is hard to see. `'0'` says the
+         * same thing to both, and it is what the editable case already is — a `contenteditable`
+         * element is a tab stop without being given one.
+         *
+         * `indentWithTab` refuses under `readOnly`, so Tab still falls through to the browser and
+         * moves focus out of the buffer, which is correct.
+         */
+        EditorView.contentAttributes.of({ tabindex: '0' }),
+      )
     }
 
     let view: EditorView
@@ -793,8 +978,23 @@ export function EditorSurface({
     // Claimed after the view is built and released in the cleanup below, so the bar's line
     // and the buffer on screen have exactly the same lifetime. A view that failed to
     // construct returned above and never claims one.
-    readout = claimStatusReadout(segments, readoutFor(view.state))
+    // `path` and not the trail: the trail may be root-relative, and `chrome/StatusBar.tsx` has to
+    // turn a crumb back into an absolute path to reveal it. `onScreenRef` and not `onScreen`,
+    // because this effect is keyed on `[path, reloadKey]` and adding the flag to that list would
+    // rebuild the whole `EditorView` — scrollback, undo history and unsaved edits — on every tab
+    // switch. The flag is only read at this instant; the effect further down handles it moving.
+    readout = claimStatusReadout(
+      path,
+      segments,
+      readoutFor(view.state),
+      onScreenRef.current,
+    )
     slotRef.current = readout
+    // The claim carries the path alone, so a file whose outline has *already* been parsed — a tab
+    // reopened, a second pane over the same buffer — gets its `impl Parser › parse` tail in the
+    // first frame rather than on the user's first caret move.
+    publishedRef.current = segments
+    rebuildTrail()
     // Claimed and released with the readout, and for the same reason: the two answer the same
     // question — *which editor is the user in* — and a caret slot outliving its buffer would
     // send Ctrl+F12 to a file that is no longer on screen.
@@ -991,17 +1191,58 @@ export function EditorSurface({
   }, [path, reloadKey])
 
   /*
-   * The trail against a root that arrived late.
+   * The trail against a root, or an outline, that arrived late.
    *
-   * The claim above is taken once per buffer and carries the trail as it stood then, which
-   * is wrong exactly once: `PaneBody` passes `roots[0]?.path ?? PROJECT_ROOT`, so an editor
-   * restored before its project record lands computes an absolute path and, without this,
-   * would keep showing one until the tab is reopened. Runs after the mount effect on the
-   * first pass and is a no-op there — `setTrail` compares before it publishes.
+   * Two effects and not one, because the two facts change independently and React would
+   * otherwise re-run the work for whichever of them did not move.
+   *
+   * **The root.** The claim above is taken once per buffer and carries the trail as it stood
+   * then, which is wrong exactly once: `PaneBody` passes `roots[0]?.path ?? PROJECT_ROOT`, so an
+   * editor restored before its project record lands computes an absolute path and, without this,
+   * would keep showing one until the tab is reopened.
+   *
+   * `rebuildTrail()` rather than the `setTrail(segments)` this used to be, which was a second
+   * bug hiding inside the fix for the first: it published the **path alone**, so a root arriving
+   * while `impl Parser › parse` was on the bar truncated the tail the user was reading.
    */
   useEffect(() => {
-    slotRef.current?.setTrail(segments)
-  }, [segments])
+    rebuildTrail()
+  }, [segments, rebuildTrail])
+
+  /*
+   * **The outline**, which is not a race but the ordinary case.
+   *
+   * `OutlineFeed` parses on a worker and publishes into `outlineStore` some time after the tab
+   * opens, so a freshly opened file has a path and no symbols for a moment. Nothing recomputed
+   * on that: the symbol half was appended only by the update listener, so the tail stayed missing
+   * until the user happened to move the caret — which reads exactly like the feature being
+   * unfinished, and is why it is listed here rather than left to the next selection change.
+   *
+   * `symbols` and not `symbolsRef`: this is the one place the identity of that prop is wanted.
+   * `EditorPane` reads it through `useSyncExternalStore` over a store that returns a shared
+   * frozen constant for the empty case, so an unchanged outline is an unchanged reference and
+   * this does not run per render.
+   */
+  useEffect(() => {
+    rebuildTrail()
+  }, [symbols, rebuildTrail])
+
+  /*
+   * This tab came forward, so the bar follows it. (M16)
+   *
+   * The missing half of the claim stack. `TabContent` never unmounts an inactive tab and
+   * `file_open` is open-*or-activate*, so switching to an already-open file produces no mount,
+   * no `EditorView`, and no DOM focus — nothing the stack was watching. The bar kept naming the
+   * previous file until the user clicked into the buffer, which is precisely the report.
+   *
+   * `focus()` and not a fresh claim: this editor already holds one, and `focus` is a splice.
+   * There is deliberately **no** `else` demoting it — clicking into a terminal tab leaves the
+   * last buffer's trail standing, which `chrome/StatusBar.tsx` states as intended behaviour and
+   * which a demotion here would quietly change into a blank slot.
+   */
+  useEffect(() => {
+    if (onScreen) slotRef.current?.focus()
+  }, [onScreen])
 
   /*
    * Push the diagnostics, and configure the gutter.

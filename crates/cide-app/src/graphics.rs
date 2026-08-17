@@ -26,6 +26,24 @@
 //! the environment, so a user who already knows what their hardware needs is never
 //! overridden.
 
+/// Whether this platform has a ladder at all.
+///
+/// Every rung is a WebKitGTK variable, and WebKitGTK is the Linux web view. On macOS the web
+/// view is WKWebView and on Windows it is WebView2; neither reads any of these names, so
+/// [`apply`] sets nothing there — correctly, and it is worth being explicit about rather than
+/// leaving as an inline `cfg!`, because two surfaces downstream depend on the answer:
+///
+/// * `cmd::settings::graphics_status`, and through it **Settings → Appearance, which off Linux
+///   offers three switches that persist and do nothing.** That is a known defect rather than a
+///   decision — see `README.md`'s Platforms section. This constant is the seam to gate it on
+///   when someone with a Mac can see the screen.
+/// * `apply_graphics_overrides`, which puts the user's stored choices into the environment; the
+///   same reasoning applies to it and for the same reason it is harmless rather than wrong.
+///
+/// A named constant also means the two places that branch on the platform cannot drift into
+/// disagreeing about what "Linux" meant.
+pub const LADDER_APPLIES: bool = cfg!(target_os = "linux");
+
 /// Apply the graphics workarounds this session needs.
 ///
 /// Must be called before `tauri::Builder` runs. Returns the variables it set, for logging.
@@ -37,7 +55,7 @@ pub fn apply() -> Vec<(&'static str, &'static str)> {
         return applied;
     }
 
-    if cfg!(target_os = "linux") {
+    if LADDER_APPLIES {
         // Rung 1: the DMABUF renderer. This is the one that matters in practice — it is
         // implicated in the Wayland protocol error above, in blank windows on NVIDIA, and
         // in a family of "the app starts but never paints" reports across compositors.

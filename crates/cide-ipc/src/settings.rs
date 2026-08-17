@@ -323,12 +323,17 @@ pub struct GraphicsSettings {
 /// edit was a no-op, and only a test asserting the default caught it. `scroll_speed` would
 /// have failed the same way and louder, since a derived `0` is a value the CLI discards.
 ///
-/// Everything here except [`Self::resume_all_on_launch`] is turned into an environment by
-/// [`cide_core::child_env::claude_env`], which is the only consumer and the only place the
-/// spelling of these variables is decided. Adding a field to this struct without adding a line
-/// there produces a switch that persists, renders, and does nothing — which is what three of
-/// these were until that function existed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+/// Everything here except [`Self::resume_all_on_launch`] and [`Self::cli`] is turned into an
+/// environment by [`cide_core::child_env::claude_env`], which is the only consumer and the only
+/// place the spelling of these variables is decided. Adding a field to this struct without
+/// adding a line there produces a switch that persists, renders, and does nothing — which is
+/// what three of these were until that function existed.
+///
+/// **No longer `Copy`**, as of [`Self::cli`]: a `String` and two `Vec`s cannot be. The one call
+/// site that relied on it by name is `cmd::session.rs`'s settings read, which now clones
+/// alongside the proxy settings it was already cloning. That is one allocation per spawn, on a
+/// path that is about to `fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
 pub struct ClaudeSettings {
@@ -370,6 +375,141 @@ pub struct ClaudeSettings {
     /// worse than leaving it alone. [`crate::settings::ClaudeSettings::SCROLL_SPEED`] is the
     /// range, and `cide_core::child_env::claude_env` is where it is enforced.
     pub scroll_speed: u8,
+
+    /// Which `claude` is launched, and with what beyond cide's own argv and environment.
+    ///
+    /// A sub-struct rather than three more fields here because the three belong together on
+    /// screen and travel together in a patch — and because `cide_core::claude_cli`, which is
+    /// where the rules over them live, wants one thing to take a reference to.
+    pub cli: ClaudeCli,
+}
+
+/// The user's own launch configuration for `claude`: the binary, extra arguments, extra
+/// environment.
+///
+/// # Stored verbatim, filtered on the way out
+///
+/// Nothing here is validated on the way *in*. A refused argument is still stored, still shown
+/// in the field the user typed it into, and struck out in the readout beside a sentence saying
+/// why — the same arrangement [`ProxySettings`] uses for a credentialed URL, and for the same
+/// reason: a value you cannot see is a value you cannot correct, and `ui/src/settings/
+/// useSettings.ts` sends its patch fire-and-forget with `.catch(() => {})`, so a rejected write
+/// is a field that snaps back and says nothing.
+///
+/// Enforcement is therefore at the spawn, in `cide_core::claude_cli`, and it is not a
+/// duplicate of the screen: `workspace.json` is hand-editable and `settings_set` is one
+/// `invoke` away from being bypassed, so a filter that only ran in the UI would let a
+/// hand-edited file cost somebody their `--resume`.
+///
+/// # Why `Debug` is written by hand
+///
+/// [`Self::env`] holds whatever the user typed, which is where a token for their own MCP
+/// server ends up. `Settings` derives `Debug`, so a `tracing::debug!(?settings)` anywhere in
+/// the app would print it, and there is no way to review every future call site — the exact
+/// argument [`ProxySettings`] makes. Names survive, values do not; a log line saying which
+/// variables cide set is most of the value and none of the risk.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ClaudeCli {
+    /// The program a Claude pane, and the headless one-shot lane, actually run.
+    ///
+    /// **A bare name here stays a bare name.** `"claude"` — the default — is passed through as
+    /// a bare string and resolved by the OS at each spawn, which is deliberate and load-bearing:
+    /// the CLI updates itself underneath a running app, and resolving the name once at launch
+    /// would pin whichever version was on `PATH` then. cide resolves it only to *check* it, and
+    /// throws the resolved path away.
+    ///
+    /// An absolute or relative path is passed through as written, so a user can pin a specific
+    /// version or point at a wrapper (`mise`, `asdf`, a shim, a `direnv` exec) — all of which
+    /// are legitimate and none of which answer `--version` in a shape cide can parse. That is
+    /// why the verdict on this field warns far more often than it refuses; see
+    /// `cide_core::claude_cli::resolve`.
+    pub binary: String,
+
+    /// Extra arguments, **one token per entry**, placed before every argument cide adds.
+    ///
+    /// A vector and not a shell string. A single string needs a quoting parser cide would have
+    /// to invent and get wrong at the first `--append-system-prompt "be terse"`; the project's
+    /// own precedent is `cide_claude::headless::argv`, which spells its tokens out for the same
+    /// reason. One row per argument in the UI, plus a readout of the resulting argv.
+    ///
+    /// Several tokens are refused — see `cide_core::claude_cli::REFUSED_ARGS`. They are the
+    /// ones that duplicate an argument cide already passes, and each of them breaks something
+    /// silently rather than loudly.
+    pub args: Vec<String>,
+
+    /// Extra environment variables for `claude` children.
+    ///
+    /// A `Vec` of pairs and not a `BTreeMap`, which is what `InspectionSettings::sources` uses.
+    /// The difference is who types the key: nothing types the keys of that map, and here the
+    /// user does, so a map would rewrite the key on every keystroke and lose the row the moment
+    /// two of them were briefly equal. A vector also matches what `SpawnSpec::env` actually
+    /// implements — later wins — so a shadowed duplicate can be shown as shadowed rather than
+    /// silently dropped.
+    pub env: Vec<ClaudeEnvVar>,
+}
+
+impl Default for ClaudeCli {
+    fn default() -> Self {
+        Self {
+            // The bare name, exactly what the frontend used to hardcode. See the field.
+            binary: "claude".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+}
+
+impl fmt::Debug for ClaudeCli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every field named explicitly, and the same hazard `ProxySettings` carries: a field
+        // added above and forgotten here vanishes from every debug print rather than failing
+        // to compile. `a_claude_cli_debug_print_names_every_field` is the guard, and it reads
+        // the list off the serialized value so it cannot fall behind either.
+        f.debug_struct("ClaudeCli")
+            .field("binary", &self.binary)
+            // Arguments are not secret in the way a value is — they are flags, and the whole
+            // point of a log line here is to say which ones a child got. `--append-system-prompt
+            // <text>` is the closest thing to a leak and it is text the user typed into a field
+            // labelled "arguments"; redacting it would make the line useless for the failure it
+            // exists to explain.
+            .field("args", &self.args)
+            // Values do not survive. See the struct's note.
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+/// One `NAME=value` pair the user asked for.
+///
+/// A named struct rather than a `(String, String)` because it crosses the wire and a tuple
+/// arrives in TypeScript as a positional array — `pair[0]` and `pair[1]` in the component that
+/// draws the two inputs, which is one transposition away from writing the value into the name.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ClaudeEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+impl fmt::Debug for ClaudeEnvVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The name, and the fact that there is a value, and nothing else. `ClaudeCli`'s own
+        // `Debug` delegates to this one for the whole list, so the redaction has to be here or
+        // it is nowhere: `Vec<T>`'s `Debug` prints each element with `T`'s.
+        write!(
+            f,
+            "{}={}",
+            self.name,
+            if self.value.is_empty() {
+                "\"\""
+            } else {
+                "<redacted>"
+            }
+        )
+    }
 }
 
 impl ClaudeSettings {
@@ -395,6 +535,7 @@ impl Default for ClaudeSettings {
             // who never opens Settings sees a change. It is not a measured optimum — see the
             // field's note and `base_env`'s.
             scroll_speed: 3,
+            cli: ClaudeCli::default(),
         }
     }
 }

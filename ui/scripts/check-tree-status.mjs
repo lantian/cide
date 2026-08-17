@@ -325,6 +325,134 @@ try {
   eq(rp.rootOf('/home/u/work/cide/src/main.rs', ROOTS), '/home/u/work/cide',
     'and the root a row resolves to is a path, which is the whole point')
 
+  // --- which segments of the status bar's path trail lead somewhere (M16) -----------------
+  //
+  /*
+   * The user's report was that the trail names a dependency source and none of it is clickable,
+   * and the constraint on the fix was explicit: a segment that cannot be revealed gets **no
+   * notification**. It has to be drawn inert instead. So the classification runs before the
+   * click, and it runs here rather than in `StatusBar` — a rule inside a React component is a
+   * rule nothing in `ui/scripts/` can compile, which is where this project's four most expensive
+   * bugs hid.
+   *
+   * `roots` is `fs_reveal_roots`: the project's roots, plus every path a synthetic group can
+   * hang a row from — a package directory under *External Libraries*, a file in the *Scratches*
+   * drawer. All three populations are driven below, because they fail in three different ways.
+   */
+  const REVEAL = [
+    '/home/u/work/cide',
+    '/home/u/work/cide/ui',
+    // A package directory, which is what `Groups::reveal_roots` answers — NOT the cache above
+    // it. The five segments in between draw no row.
+    '/home/u/.cargo/registry/src/index.crates.io-6f17/serde-1.0.229',
+    // A scratch: the group's top-level children are the files themselves, so the `<blake3>`
+    // directory holding them is not a reveal root and its crumb must be inert.
+    '/home/u/.local/state/cide/scratches/4f2a9c7b/scratch.rs',
+  ]
+
+  // 1. A project file. The trail is drawn relative to the root, so every crumb is under it.
+  eq(
+    // `src › main.rs` — two crumbs, because the trail is drawn relative to the root.
+    rp.crumbTargets('/home/u/work/cide/src/main.rs', 2, 2, REVEAL),
+    ['/home/u/work/cide/src', '/home/u/work/cide/src/main.rs'],
+    'a project file drawn root-relative: every crumb is revealable, and each resolves to the '
+      + 'ABSOLUTE path of what it names — the crumb reads `src` and the reveal gets '
+      + '`/home/u/work/cide/src`, which is the whole reason the trail alone was not enough',
+  )
+
+  // 2. A library source. This is the report: the run from the package directory rightwards is
+  //    live, and everything above it — including two segments literally called `src` — is not.
+  const SERDE = '/home/u/.cargo/registry/src/index.crates.io-6f17/serde-1.0.229/src/de/mod.rs'
+  eq(
+    rp.crumbTargets(SERDE, 10, 10, REVEAL),
+    [
+      null, // home
+      null, // u
+      null, // .cargo
+      null, // registry
+      null, // src        <- a directory called `src` that is NOT the crate's
+      null, // index.crates.io-6f17
+      '/home/u/.cargo/registry/src/index.crates.io-6f17/serde-1.0.229',
+      '/home/u/.cargo/registry/src/index.crates.io-6f17/serde-1.0.229/src',
+      '/home/u/.cargo/registry/src/index.crates.io-6f17/serde-1.0.229/src/de',
+      SERDE,
+    ],
+    'a library source: the package directory and everything under it, and NOTHING above it. A '
+      + 'depth rule guessed from the cache root would light up `registry` and '
+      + '`index.crates.io-…`, and every one of those clicks would fire the "not in this '
+      + "project's file tree\" notice the user ruled out",
+  )
+
+  // 3. A file under nothing at all — opened through the out-of-project confirmation. `fs_reveal`
+  //    is index-only and would answer `None` for every one of these.
+  eq(
+    rp.crumbTargets('/etc/nginx/nginx.conf', 3, 3, REVEAL),
+    [null, null, null],
+    'a file outside every root and every group: the whole trail is inert, so it reads as a '
+      + 'label rather than as three controls that do nothing',
+  )
+
+  // 4. The scratch, which is the sub-case that proves the rule is about ROWS and not about
+  //    directories: the drawer holding it draws no row, so only the file itself is live.
+  const SCRATCH = '/home/u/.local/state/cide/scratches/4f2a9c7b/scratch.rs'
+  eq(
+    rp.crumbTargets(SCRATCH, 8, 8, REVEAL).slice(-2),
+    [null, SCRATCH],
+    'a scratch file is revealable and the `<blake3>` directory above it is not — the tree draws '
+      + 'the files as the group\'s own children and never draws that directory',
+  )
+
+  // 5. The symbol tail, which is the trap this whole feature was blocked on. `StatusBar` used to
+  //    say in as many words that it "does not know where the path ends and the symbols begin…
+  //    no crumb is clickable yet".
+  eq(
+    // `src › lib.rs › impl Parser › parse`, drawn root-relative: two path crumbs, two symbols.
+    rp.crumbTargets('/home/u/work/cide/src/lib.rs', 4, 2, REVEAL),
+    ['/home/u/work/cide/src', '/home/u/work/cide/src/lib.rs', null, null],
+    'crumbs past `pathCount` are SYMBOLS and are never revealable. Without the split, `parse` '
+      + 'is classified as `…/lib.rs/impl Parser/parse` — under the project root, so drawn live — '
+      + 'and the click reports a file that does not exist',
+  )
+  eq(
+    rp.crumbTargets('/home/u/work/cide/src/lib.rs', 3, 0, REVEAL),
+    [null, null, null],
+    'and a trail that is all symbols has nothing to reveal',
+  )
+
+  // 6. The nested root, which `rootOf` already gets right and which this must inherit rather
+  //    than re-decide: a file under the second root is drawn ABSOLUTELY, because the trail is
+  //    relative to `roots[0]` alone.
+  eq(
+    rp.crumbTargets('/home/u/work/cide/ui/src/App.tsx', 7, 7, REVEAL),
+    [
+      null, // home
+      null, // u
+      null, // work            <- above every root: inert, and correctly so
+      '/home/u/work/cide',
+      '/home/u/work/cide/ui',
+      '/home/u/work/cide/ui/src',
+      '/home/u/work/cide/ui/src/App.tsx',
+    ],
+    'a root itself is revealable — with several roots the index draws a row per root, which is '
+      + 'exactly the case this crumb appears in — and the directories above it are not',
+  )
+
+  // 7. Degradations. Both answer "nothing", which is the only honest answer when the two ends
+  //    have come apart, and neither throws inside a render.
+  eq(
+    rp.crumbTargets('/home/u/work/cide/src/main.rs', 2, 99, REVEAL),
+    [null, null],
+    'more path crumbs than the file has components means a trail published against one buffer '
+      + 'and a `file` from another; guessing an alignment would open the wrong row',
+  )
+  eq(rp.crumbTargets('', 0, 0, REVEAL), [], 'and no file at all is no crumbs')
+  eq(
+    rp.crumbTargets('/home/u/work/cide/src/main.rs', 2, 2, []),
+    [null, null],
+    'and before `fs_reveal_roots` has answered, nothing is revealable — the safe direction, '
+      + 'since the alternative is a live-looking crumb for one frame',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

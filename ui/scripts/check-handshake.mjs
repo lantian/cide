@@ -238,12 +238,48 @@ try {
     )
   }
 
-  // The command answers this shape even when it fails, and the degraded value has to carry
-  // the field or every consumer sees `undefined` on a machine where the command is missing.
-  ok(
-    /verifiedRange: 'unknown', warning: null, handshake: null/.test(client),
-    'the degraded cliSupport value carries `handshake`',
-  )
+  /*
+   * The command answers this shape even when it fails, and the degraded value has to carry
+   * **every** field or the consumers of the missing ones see `undefined` on a machine where
+   * the command is not registered — which for `handshake` is drawn as `never`, a perfectly
+   * plausible answer and therefore the worst kind of wrong.
+   *
+   * This used to be a regex over one line of source: `/verifiedRange: 'unknown', warning:
+   * null, handshake: null/`. It pinned the *formatting* rather than the property — M16 added
+   * three fields, Prettier wrapped the object across lines, and the assertion failed while
+   * the value it was checking had grown strictly more correct. Worse, it would have gone
+   * green on a fallback that dropped `version`, which is a field it was never watching.
+   *
+   * So: read the interface's own field list, extract the fallback object, and require each
+   * name to appear in it. Neither side is restated here, which is what makes the assertion
+   * survive the next field.
+   */
+  {
+    const declared = client.match(/export interface ClaudeCliSupport \{([\s\S]*?)\n\}/)
+    ok(declared != null, 'ClaudeCliSupport is still an interface this script can read')
+    // Strip comments first: every field of this interface carries a doc block, and several of
+    // them name *other* fields in prose. A scan over raw source would read those as
+    // declarations and then find them trivially present in the fallback.
+    const body = (declared?.[1] ?? '')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+    const declaredFields = [...body.matchAll(/^\s{2}(\w+)[?]?:/gm)].map((m) => m[1])
+    ok(
+      declaredFields.length >= 4,
+      `read ${declaredFields.length} fields off ClaudeCliSupport — the scan still matches`,
+    )
+
+    const fallback = client.match(/pendingCommand<ClaudeCliSupport>\([\s\S]*?\n {6}\{([\s\S]*?)\n {6}\},/)
+    ok(fallback != null, "the degraded value passed to `pendingCommand` is still readable")
+    const degraded = fallback?.[1] ?? ''
+    eq(
+      declaredFields.filter((name) => !new RegExp(`\\b${name}:`).test(degraded)),
+      [],
+      'the degraded cliSupport value carries every field the interface declares — a field '
+        + 'missing from it reaches the screen as `undefined` on any machine where the command '
+        + 'is not registered, which is exactly the build this fallback exists for',
+    )
+  }
 
   // --- the screen still uses this module ---------------------------------------------------
 

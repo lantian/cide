@@ -96,6 +96,17 @@ pub struct Headless {
     /// `ProxyScope::claude` — a one-shot **is a claude**, and a user who takes `claude` out of
     /// scope means both — and this applies whatever it is given.
     pub proxy: ProxyEnv,
+    /// The user's own environment additions, already filtered. (M16)
+    ///
+    /// Same argument as [`Self::proxy`] one field up, and the same shape: this crate must not
+    /// have an opinion about which of the user's variables are allowed — that rule is
+    /// `cide_core::claude_cli`, which the caller runs — and this applies whatever it is given.
+    ///
+    /// It reaches this lane and not only panes because `ProxyScope::claude` already settled the
+    /// question for its own field: a one-shot **is a claude**, and a user who points `claude` at
+    /// a gateway or a cloud provider means the commit-message generation too. The *arguments*
+    /// deliberately do not travel; see `cide_app::cmd::settings::run_headless`.
+    pub env: Vec<(String, Option<String>)>,
 }
 
 impl Headless {
@@ -110,7 +121,13 @@ impl Headless {
             // field existed — so a caller that forgets to set it is no worse off than before,
             // rather than silently direct.
             proxy: ProxyEnv::default(),
+            env: Vec::new(),
         }
+    }
+
+    pub fn env(mut self, env: Vec<(String, Option<String>)>) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn tools(mut self, tools: ToolAccess) -> Self {
@@ -199,9 +216,22 @@ pub fn run(program: &Path, run: &Headless) -> Result<HeadlessResult, HeadlessErr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_env(&mut command);
-    // After `scrub_env`, so a scrub cannot undo the proxy the user asked for. The two passes
-    // answer different questions and only overlap on nothing: `scrub_env` removes cide's own
-    // interactive variables, and none of them is a proxy name.
+    // After `scrub_env`, so a scrub cannot undo what the user asked for. The passes answer
+    // different questions and barely overlap: `scrub_env` removes cide's own interactive
+    // variables (`CLAUDE_CODE_SSE_PORT`, `CIDE_HOOK_SOCK`, `TERM`, `COLUMNS`, `LINES`), and
+    // every one of those names is refused by `cide_core::claude_cli` — so a list that reaches
+    // here cannot resurrect one of them.
+    //
+    // Before the proxy, matching the pane lane's order in `cmd::session.rs::base_env`: the
+    // proxy screen is the authority on proxy variables and the launch configuration refuses
+    // them by name, so the two cannot collide — but the *order* being the same in both lanes is
+    // what makes that one sentence true of cide rather than of one spawn site.
+    for (name, value) in &run.env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
     run.proxy.apply(&mut command);
     // A one-shot outliving a `SIGKILL`ed cide is a `claude` nobody can see, spending money
     // against a prompt nobody will read the answer to. `arm` requires that the thread doing

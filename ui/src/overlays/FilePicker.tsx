@@ -16,8 +16,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ModalShell, Hint } from './ModalShell'
-import { kindBadge, matchCounter } from './format'
+import { kindBadge, matchCounter, pickerEmptyState, pickerEmptyText } from './format'
 import { isListKey, listAction } from './listKeys'
+import { useOverlays } from './store'
 import { isNoIndex } from '@/store/fileIndex'
 import {
   pendingCommand,
@@ -78,6 +79,43 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
   /** The project exists but its walk has not started yet. Distinct from `failed`. */
   const [awaitingIndex, setAwaitingIndex] = useState(false)
 
+  /*
+   * Whether *External Libraries* are in scope.
+   *
+   * Read from the store rather than held here, because the two writers are outside this
+   * component: the key gate dispatches `picker.libraries` from a window capture listener, and
+   * the command palette can set it for the *next* Ctrl+P. `useState` here would also reset the
+   * scope every time the overlay closed, which is the one thing the store's own note rules out.
+   */
+  const libraries = useOverlays((s) => s.libraries)
+  const toggleLibraries = useOverlays((s) => s.toggleLibraries)
+
+  /*
+   * Start the walk the first time the scope is switched on for this project.
+   *
+   * Here rather than in `dispatch.ts`, and the reason is not tidiness: the walk needs a project
+   * id and this component has one, the dispatcher does not, and a second place that could start
+   * a `cargo metadata` is a second place to get *at most once per project* wrong. The command
+   * itself is a flag flip and nothing more.
+   *
+   * Fire-and-forget, and idempotent on the Rust side: a second press, a second window, or a
+   * re-open of the overlay finds the walk running or finished and starts nothing. The user sees
+   * it happen through the poll below — `running` stays true and the counter climbs, exactly as
+   * it does during the project's own walk.
+   *
+   * `pendingCommand` because a build without the handler must not reject into a render. The
+   * fallback is `undefined`: nothing was started, the query below simply answers from an empty
+   * library matcher, and the picker degrades to project-only rather than breaking.
+   */
+  useEffect(() => {
+    if (!libraries) return
+    void pendingCommand<void | undefined>(
+      'picker_index_libraries',
+      () => pickerApi.indexLibraries(project),
+      undefined,
+    )
+  }, [libraries, project])
+
   const scrollRef = useRef<HTMLDivElement>(null)
 
   /*
@@ -111,7 +149,7 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
         'picker_query',
         async () => {
           try {
-            return await pickerApi.query(project, query)
+            return await pickerApi.query(project, query, undefined, libraries)
           } catch (error) {
             if (isNoIndex(error)) return 'notIndexedYet'
             throw error
@@ -141,7 +179,10 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
       cancelled = true
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [project, query])
+    // `libraries` is in here, and it has to be: flipping the scope changes the answer to the
+    // *same* query, so without it ⌥L would do nothing visible until the user typed another
+    // character — a control that appears not to work, which is worse than no control.
+  }, [project, query, libraries])
 
   const hits: PickerRow[] = useMemo(() => frame?.items ?? [], [frame])
 
@@ -208,6 +249,12 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
           <Hint keys="⏎">open</Hint>
           <Hint keys="⇧⏎">open in split</Hint>
           <Hint keys="⌥⏎">send path to Claude</Hint>
+          {/* One element that documents the chord *and* is the mouse target, which is what
+              stops this being either an undiscoverable keystroke or a button whose keyboard
+              equivalent nobody knows. It sits in the footer rather than beside the counter
+              because that row is prompt + field + counter and is the one place the eye is
+              while typing. */}
+          <ScopeToggle on={libraries} onToggle={toggleLibraries} />
         </>
       }
     >
@@ -216,12 +263,19 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
           File index unavailable — <code>picker_query</code> is not registered in this build.
         </div>
       ) : hits.length === 0 ? (
+        /* Four states, two of which look identical and mean opposite things. The rule is
+           `format.ts`'s and is driven by `check:picker`; this is the `switch` over its answer
+           and holds no decision of its own. */
         <div className={styles.status}>
-          {frame?.running === true || awaitingIndex
-            ? 'Indexing…'
-            : query === ''
-              ? 'Type to search'
-              : 'No matches'}
+          {pickerEmptyText(
+            pickerEmptyState({
+              running: frame?.running === true,
+              awaitingIndex,
+              query,
+              libraries,
+              total: frame?.total ?? null,
+            }),
+          )}
         </div>
       ) : (
         <div className={styles.viewport} style={{ height: `${virtualizer.getTotalSize()}px` }}>
@@ -247,11 +301,50 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
                 <span className={`${styles.badge} ${tone}`}>{badge.label}</span>
                 <span className={styles.name}>{basename(hit.value)}</span>
                 <span className={styles.path}>{hit.text}</span>
+                {/* The provenance chip, right-aligned. Rendered only when there is one — a
+                    project row has nothing to say and an empty chip would be a column of
+                    blank boxes down the left of the user's own files. */}
+                {hit.source != null && <span className={styles.source}>{hit.source}</span>}
               </div>
             )
           })}
         </div>
       )}
     </ModalShell>
+  )
+}
+
+/**
+ * The footer's scope chip: `⌥L Libraries`, lit when the scope is on.
+ *
+ * # Why an `aria-pressed` button and not a checkbox
+ *
+ * Nothing in the overlay language uses a checkbox, and the app's own precedent for a binary
+ * control that is not a form field is `SearchPanel`'s `aria-pressed` buttons. A segmented
+ * control was the other candidate and is too heavy at this width for two states of one binary.
+ *
+ * # `onMouseDown` with `preventDefault`, never `onClick`
+ *
+ * The same trick the rows use, and for the same reason: a click blurs the input between
+ * `mousedown` and `click`, and `ModalShell`'s `selectionchange` listener repaints the caret
+ * when it does — after which typing stops working. Keeping focus in the field is also what
+ * makes the chord and the chip interchangeable rather than two different gestures.
+ */
+function ScopeToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-pressed={on}
+      data-audit="pickerScopeToggle"
+      className={on ? `${styles.scope} ${styles.scopeOn}` : styles.scope}
+      title="Search the source of this project's resolved dependencies as well. Nothing is walked until you ask, and nothing is watched."
+      onMouseDown={(ev) => {
+        ev.preventDefault()
+        onToggle()
+      }}
+    >
+      <span className={styles.footerKey}>⌥L</span>
+      Libraries
+    </button>
   )
 }

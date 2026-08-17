@@ -36,7 +36,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cide_fs::groups::{Expanded, Groups};
+use cide_fs::groups::{Entry, Expanded, Groups};
 use cide_ipc::{TreeRow, TreeRowKind};
 use parking_lot::{Mutex, RwLock};
 
@@ -143,6 +143,24 @@ impl ProjectGroups {
 
     pub fn reveal(&self, path: &Path) -> Option<usize> {
         self.rows.write().reveal(path)
+    }
+
+    /// Every path a group can hang a row from. See [`Groups::reveal_roots`].
+    ///
+    /// A read lock and a `Vec` of clones, and no resolution: this is asked once per attach and
+    /// again on the `cide://fs-status` the resolver emits, and it must stay affordable enough
+    /// that neither of those is a decision.
+    pub fn reveal_roots(&self) -> Vec<PathBuf> {
+        self.rows.read().reveal_roots()
+    }
+
+    /// One group's top-level rows, with their labels. See [`Groups::entries`].
+    ///
+    /// A read lock and a `Vec` of clones, and no resolution. The caller that wants a resolution
+    /// asks for one — [`Self::resolve_now`] — and is the only place that decides it is worth
+    /// blocking for.
+    pub fn entries(&self, id: &str) -> Vec<Entry> {
+        self.rows.read().entries(id)
     }
 
     /// Expand a header or a directory inside one, answering whether a resolution is now owed.

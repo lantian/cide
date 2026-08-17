@@ -17,6 +17,11 @@ pub mod lifecycle;
 pub mod lsp;
 pub mod positions_state;
 pub mod scratches;
+// Comment stripping for this crate's structural source assertions. Test-only: a source
+// assertion is a gate, not a product feature, and shipping the stripper in the binary would
+// invite it to be used for something.
+#[cfg(test)]
+pub mod srcgrep;
 pub mod state;
 pub mod symbols;
 pub mod windows;
@@ -378,12 +383,14 @@ pub fn run() {
             cmd::fs::fs_create_in,
             cmd::fs::fs_scratch_new,
             cmd::fs::fs_writable_roots,
+            cmd::fs::fs_reveal_roots,
             cmd::fs::fs_rename,
             cmd::fs::fs_delete,
             cmd::fs::fs_paste,
             cmd::fs::fs_paste_plan,
             cmd::picker::picker_query,
             cmd::picker::picker_rank,
+            cmd::picker::picker_index_libraries,
             cmd::search::search_query,
             cmd::search::search_cancel,
             cmd::symbols::symbols_outline,
@@ -552,11 +559,29 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build the cide application")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                // This event covers a window close and a quit from the UI. A SIGTERM never
-                // reaches it, which is why `lifecycle` also owns a signal thread; both call
-                // the same function, and it runs once whichever gets there first.
-                lifecycle::shutdown(app);
+            match event {
+                // `ExitRequested` covers a window close and a quit from the UI. A SIGTERM
+                // never reaches it, which is why `lifecycle` also owns a signal thread.
+                //
+                // `Exit` is the *other* way out, and on macOS it is the only one the common
+                // gesture takes. ⌘Q goes `NSApp terminate:` → `applicationWillTerminate` →
+                // `AppState::exit()` → `Event::LoopDestroyed`, which tauri-runtime-wry turns
+                // into `RunEvent::Exit` — `ExitRequested` is never raised and no signal is
+                // sent, so with only the arm above a ⌘Q would skip `shutdown` entirely: the
+                // 500 ms workspace debounce would go unflushed and the SIGHUP→SIGTERM→SIGKILL
+                // ladder would never run, orphaning every `claude` and every language server.
+                // That is the whole of the quit path on a Mac, because cide binds no quit
+                // command of its own and ⌘Q comes from tauri's default macOS menu.
+                //
+                // Costs Linux nothing and is a small correctness win there too: `Exit` also
+                // follows `app.exit(code)` and a runtime-initiated teardown, both of which
+                // reach here without an `ExitRequested`. `shutdown` sets `SHUTTING_DOWN`
+                // first and returns immediately on a second call, so the ordinary Linux
+                // sequence — `ExitRequested` then `Exit` — still runs the ladder exactly once.
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                    lifecycle::shutdown(app);
+                }
+                _ => {}
             }
         });
 }

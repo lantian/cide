@@ -18,6 +18,69 @@
   --pane-cluster-inset: var(--w-minimap);
 }
 
+/*
+ * **The one rule that moves the cluster down a strip.** (M16)
+ *
+ * The find bar is a CodeMirror top panel — `position: sticky; top: 0`, the full width of the
+ * editor — so it lands on exactly the pixels this cluster floats over, and the cluster wins the
+ * paint order (see `.body`'s `z-index: 0` below, which was added deliberately to produce that
+ * order after the reverse shipped and buried all four buttons). Until M16 the *bar* got out of
+ * the way, reserving `--pane-corner-clear` and stopping 221px short. The user rejected that: a
+ * search field is the width of the thing being searched. So the bar keeps its width and the
+ * cluster steps below it.
+ *
+ * # Why `:has()`, and the five alternatives that lost
+ *
+ *  * *A custom property the editor sets on its own root.* **Impossible**, and written down so
+ *    nobody spends an afternoon on it: custom properties inherit **downwards**, and `.cluster`
+ *    is a sibling of `.body`, not a descendant of the editor. `:has()` is the only selector in
+ *    CSS by which a descendant's existence reaches an ancestor's computed style.
+ *  * *`:has()` with a literal `33px`.* The same rule with the arithmetic copied. `--h-findbar`
+ *    is that number's home and `EditorSurface.module.css` gives the panel exactly it, so the two
+ *    ends of the step name one token and cannot drift.
+ *  * *Measure it in JS and write an inline `--pane-top-strip`.* Exact, and it would handle a
+ *    fractional or a future strip — but `ui/scripts/` has no browser, so the gate could only
+ *    assert that the code exists. That is the weak-gate shape `check-rows.mjs` was written to
+ *    reject, and it buys a ResizeObserver plus a MutationObserver per editor pane and one frame
+ *    of lag.
+ *  * *Report the panel's state up through React.* `EditorSurface` would grow an `onPanel…` prop
+ *    and stop being text-in/text-out. This rule needs **zero** changes to that component.
+ *  * *CSS anchor positioning* (`anchor-name` on the panel, `position-anchor` here). Literally
+ *    the feature for this problem, and even the DOM order works. WebKit shipped it in Safari 26;
+ *    on any older WebKitGTK the `anchor()` is invalid and `top` falls back to `0` — which *is*
+ *    the bug. Usable only behind `@supports` **plus** this rule as the fallback, i.e. strictly
+ *    more code than this rule alone.
+ *
+ * # Why the exclusion, and why the conflict bar is not in this branch
+ *
+ * A strip whose height is a constant can be stepped over. A strip whose height depends on its
+ * content cannot: `panes/EditorPane.module.css`'s conflict bar is 6px of padding around a 21.5px
+ * button *and* a `.conflictText` that is `flex: 1; min-width: 0` with no `white-space` — so it
+ * wraps and grows a line on a narrow pane, and a fixed step over it would land the cluster in
+ * the middle of *Keep mine*. That bar keeps reserving **horizontally** instead, which is what it
+ * has always done and what stops the click preserving unsaved edits from closing the pane.
+ *
+ * `[data-pane-strip='fluid']` is that bar declaring itself. It is also what makes the
+ * *both-strips* state right for free: with a conflict bar up, the find bar is no longer the
+ * topmost strip and none of it is under the cluster at all, so the cluster must stay at 0 —
+ * which is exactly what excluding this frame from the rule does.
+ *
+ * An attribute rather than a class, because the declaring end is another CSS module and class
+ * names are hashed per file; and a *kind* rather than a boolean, so a future strip with a
+ * constant height can say so and be stepped over. `.cm-panels-top` is CodeMirror's own class and
+ * the container carrying it exists in the DOM **only while a top panel is open** (`syncDOM`
+ * removes it at zero panels, `@codemirror/view/dist/index.js`), so this is an exact state test
+ * rather than a proxy for one — and the class name is not new vocabulary in this file, which
+ * already reasons about `.cm-panels` below.
+ *
+ * Scoped to `data-kind='editor'` and not widened to every pane: a diff pane draws its own 26px
+ * `.header` above its CodeMirror surface, so a top panel there would already be *below* this
+ * cluster, and a terminal has no panels at all.
+ */
+.frame[data-kind='editor']:has(:global(.cm-panels-top)):not(:has([data-pane-strip='fluid'])) {
+  --pane-top-strip: var(--h-findbar);
+}
+
 .frame {
   display: flex;
   flex-direction: column;
@@ -46,6 +109,23 @@
    * so the editor's inset wins wherever it applies regardless of source order.
    */
   --pane-cluster-inset: 0px;
+
+  /*
+   * How far DOWN this pane pins something above its own content, and therefore how far down the
+   * cluster has to start so that it sits on the content rather than on that. (M16)
+   *
+   * `0px` for every pane kind; the only exception is the one `:has()` rule at the top of this
+   * file. A terminal pins nothing above its transcript, so its content starts at 0 and this is
+   * the same rule answering zero rather than a special case — which matters more than it sounds.
+   * Forcing every kind down by a find bar's height "for symmetry" would park four buttons over
+   * line 2 of every transcript for ever, and the reveal is `.frame:hover`, so two clusters are
+   * essentially never on screen at once and there is no misalignment anybody could observe.
+   *
+   * Stated here rather than left to a `var()` fallback, for the same reason `--pane-cluster-inset`
+   * is above it: a fallback resolves in silence, and a geometry that silently resolves to zero is
+   * this file's entire failure mode.
+   */
+  --pane-top-strip: 0px;
 
   /*
    * How WIDE the floating control cluster is. Not the band it occupies — see
@@ -290,7 +370,28 @@
  */
 .cluster {
   position: absolute;
-  top: 0;
+  /*
+   * On the visible part of the pane's own content, whatever the pane keeps pinned above it.
+   *
+   * `--pane-top-strip` is `0px` on every pane except an editor whose find bar is the topmost
+   * strip, so this is `top: 0` in every state but one; see that property and the `:has()` rule at
+   * the top of this file for which state, and why it is the only one.
+   *
+   * # The clamp, and the pane it is honest about
+   *
+   * `MIN_RATIO` is 0.1 (`crates/cide-ipc/src/workspace.rs`) and splits nest, so a pane under 60px
+   * tall is reachable by dragging. `.frame` has no `overflow: hidden` — only `.body` does — so an
+   * unclamped `top: 33px` on a 40px pane would paint these controls *over the pane below*, which
+   * is a stranger bug than the one being fixed. A percentage on `top` resolves against this
+   * frame's own height, so `100% - var(--h-panetitle)` is "my own bottom edge, one cluster up".
+   *
+   * Below roughly 59px of pane height there is no correct resting place at all, and this does not
+   * pretend otherwise: it chooses *inside my own frame, over my own find bar* rather than
+   * *outside my frame, over somebody else's pane*. When the maximum goes negative the spec's
+   * `max(MIN, min(VAL, MAX))` yields `0px`, which is the right degenerate answer — flush with the
+   * top, exactly where the cluster sits with no strip at all.
+   */
+  top: clamp(0px, var(--pane-top-strip), calc(100% - var(--h-panetitle)));
   /*
    * Clear of whatever the pane keeps down its right edge.
    *

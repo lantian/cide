@@ -68,6 +68,9 @@ import {
  */
 const NO_WRITABLE: readonly string[] = []
 
+/** The same, for the reveal set. Separate constant, separate identity, same argument. */
+const NO_REVEALABLE: readonly string[] = []
+
 /**
  * A tree command, with "the index is not built yet" separated from "there is no such
  * handler".
@@ -134,6 +137,25 @@ interface FileTreeStore {
    * scratch is not, which is the safe direction of being briefly wrong.
    */
   writable: readonly string[]
+  /**
+   * Every path the tree can hang a row from: the roots, **plus** each group's top-level children
+   * — a package directory under *External Libraries*, a file in the *Scratches* drawer. (M16)
+   *
+   * Not the writable set and not derivable from it: a dependency source is revealable and must
+   * never be writable, and the scratch *drawer* is writable while drawing no row of its own. Two
+   * questions, two lists, from the two Rust functions that answer them.
+   *
+   * The reader is `chrome/StatusBar.tsx` through `rowPaths::crumbTargets`, which is why this
+   * lives in the file tree's store rather than beside the readout: it is a fact about the tree,
+   * and the tree is the thing a crumb reveals *into*.
+   *
+   * `[]` until the answer lands, which makes every crumb inert for that frame — the safe
+   * direction, since the alternative is a live-looking crumb that reports itself. It is re-asked
+   * on the self-heal below rather than once, because unlike `writable` this answer genuinely
+   * moves a second time: *External Libraries* resolves on a background thread and emits
+   * `cide://fs-status` when it lands, and that is the burst that turns the library crumbs on.
+   */
+  revealable: readonly string[]
   /**
    * A row index the tree should scroll to, set by `reveal` and cleared by the component
    * once it has scrolled. A number rather than a boolean flag so two reveals in a row are
@@ -422,6 +444,17 @@ const ROW_FIELDS: Readonly<Record<keyof TreeRow, true>> = {
 }
 const ROW_KEYS = Object.keys(ROW_FIELDS) as Array<keyof TreeRow>
 
+/**
+ * Whether two lists of paths are the same list.
+ *
+ * For the reveal set, which is a *prop of the status bar*: writing back a fresh array of equal
+ * strings would re-render the bar and re-run its crumb classification on every watcher burst that
+ * happened to add a file.
+ */
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((path, i) => path === b[i])
+}
+
 /** Whether two windows of rows describe the same thing. Field-wise: `TreeRow` is flat. */
 function sameRows(a: readonly TreeRow[] | undefined, b: readonly TreeRow[]): boolean {
   if (a === undefined || a.length !== b.length) return false
@@ -444,6 +477,7 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
   chunks: new Map(),
   degraded: false,
   writable: NO_WRITABLE,
+  revealable: NO_REVEALABLE,
   revealTo: null,
   selected: null,
   selectedIndex: 0,
@@ -471,6 +505,9 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       // The old project's drawer names nothing in the new one, and leaving it would make a
       // stale path look mutable for as long as the fetch below takes.
       writable: NO_WRITABLE,
+      // Same argument one step over: a crumb of the *previous* project's trail would keep
+      // testing as revealable, and the click would land on a tree that no longer holds it.
+      revealable: NO_REVEALABLE,
     })
     if (project === null) return
 
@@ -491,6 +528,20 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
     const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project), [])
     if (generation !== mine || get().project !== project) return
     set({ writable })
+
+    /*
+     * And the reveal set, on the same terms and for the same reason.
+     *
+     * Sequential rather than `Promise.all`ed with the one above: both are `blocking()` calls onto
+     * the same pool behind the same project lock, so racing them buys nothing, and this one is
+     * strictly less urgent — it decides whether a *status bar* crumb is drawn live.
+     *
+     * `fs_reveal_roots` never resolves *External Libraries*, so on a cold project this answers
+     * with the roots alone. That is why `refresh` asks again; see the self-heal there.
+     */
+    const revealable = await tree('fs_reveal_roots', () => fsApi.revealRoots(project), [])
+    if (generation !== mine || get().project !== project) return
+    set({ revealable })
   },
 
   ensure(from, to) {
@@ -710,6 +761,57 @@ export const useFileTree = create<FileTreeStore>((set, get) => ({
       const writable = await tree('fs_writable_roots', () => fsApi.writableRoots(project), [])
       if (generation !== mine || get().project !== project) return
       if (writable.length > 0) set({ writable })
+    }
+
+    /*
+     * Re-ask the reveal set when the composed row count moved, and the gate is **not** the one
+     * above — the two lists become complete at different moments and for different reasons.
+     *
+     * `writable` is complete the moment it is non-empty, so "is it empty" is the right guard
+     * there. This one is legitimately non-empty and still incomplete: an unresolved *External
+     * Libraries* contributes nothing, so a cold project answers with exactly its roots, and
+     * `fs_reveal_roots` deliberately does not resolve one (a `cargo metadata` inside a status
+     * bar's render is not a trade worth making). Guarding on emptiness would therefore leave
+     * every library crumb inert for the life of the window — the dead-affordance failure one
+     * layer down from the one the crumbs exist to fix.
+     *
+     * A changed count is the exact signal, not a proxy, and the argument is worth writing down
+     * because it is what keeps the ordinary burst at zero calls. **Every path that grows this
+     * list fulfils a group while that group is expanded**: an expand asks for the resolution
+     * (`Expanded::Resolve`), `reveal_path`'s `resolve_now` runs only for a path it is about to
+     * reveal *into* the group (which opens it), and the stale-stamp path answers `Resolve` only
+     * for a group that was expanded. An expanded group's children are visible rows, so the
+     * composed count moves with them. A burst from an ordinary file *write* does not move the
+     * count and costs nothing here; a file being created or deleted does, which is one cheap
+     * call — two locks and a `Vec` clone — on a gesture the user made.
+     *
+     * The answer is compared before it is written: `revealable` is a prop of the status bar, and
+     * a fresh array identity would re-render it for nothing.
+     */
+    /*
+     * ...or while we still have no roots at all, which is the case the count cannot see.
+     *
+     * The row count only moves for an EXPANDED group. The picker's library scope resolves
+     * *External Libraries* through its own path — the toggle forks `cargo metadata` and fills the
+     * group — and it does that whether or not the group is open in the tree. Resolved while
+     * collapsed, the composed count is unchanged, this call never runs, and `revealable` stays
+     * empty: every crumb of a library path is drawn inert, including the package directory,
+     * although Rust now knows exactly where the package roots are.
+     *
+     * Asking again while the list is empty is the cheap half of the question — `fs_reveal_roots`
+     * deliberately does not resolve anything itself (see its note above), so an empty answer
+     * costs two locks and a clone, and it stops costing anything the moment it succeeds once.
+     *
+     * The honest residual: this heals on the NEXT refresh rather than at the moment the picker
+     * finishes. A user who resolves the scope and immediately looks at the status bar without
+     * touching anything still sees inert crumbs until something moves the tree. Closing that
+     * needs the picker's walk to nudge this store, which is a channel neither module has, and
+     * inventing one for a one-frame staleness is the more expensive mistake.
+     */
+    if (count !== get().count || get().revealable.length === 0) {
+      const revealable = await tree('fs_reveal_roots', () => fsApi.revealRoots(project), [])
+      if (generation !== mine || get().project !== project) return
+      if (revealable.length > 0 && !sameList(get().revealable, revealable)) set({ revealable })
     }
 
     const wanted = [...visible].filter((chunk) => chunk * CHUNK_ROWS < count)

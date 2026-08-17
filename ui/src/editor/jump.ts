@@ -15,9 +15,15 @@
  * # What is here and what is deliberately not
  *
  * No decisions. The stack arithmetic — the merge rule, the forward-tail truncation, the cap, the
- * refresh-from-the-live-caret — is all in `navHistory.ts`, which is import-free and is compiled
- * and driven by `ui/scripts/check-editor.mjs`. What is left here is the store, the clock and the
- * IPC: the parts a headless check could not run anyway.
+ * refresh-from-the-live-caret, and since M16 the rule that says which pointer clicks are
+ * navigations — is all in `navHistory.ts`, which is import-free and is compiled and driven by
+ * `ui/scripts/check-editor.mjs`. What is left here is the store, the clock and the IPC: the parts
+ * a headless check could not run anyway.
+ *
+ * Three functions write to the store, and the split is about *when the caret can be read*, not
+ * about taste: [`jumpTo`] for a navigation that is about to happen, [`pendingJump`] for one that
+ * might still be refused, and [`recordClick`] for one that has already happened. Each carries the
+ * ordering its own call site gets wrong.
  *
  * # Across windows: stated, not left to be discovered
  *
@@ -153,6 +159,37 @@ export function jumpTo(project: ProjectId | null, to: JumpTarget, record_ = true
     ...(to.align === undefined ? {} : { align: to.align }),
   }
   requestReveal(to.path, target)
+}
+
+/**
+ * Write the entry for a pointer click that has **already** moved the caret. (M16)
+ *
+ * The third recording door, and the narrow one: no reveal, no open, no flags. [`jumpTo`] exists
+ * because eight gestures had to *ask* for a caret move and then remember to record it;
+ * `navRecorder.ts` is the opposite shape — the caret is already where the user pointed, so
+ * issuing a `requestReveal` here would dispatch a selection into the view that just produced one,
+ * for no change. The whole of the decision is `navHistory.ts::recordsClick`, which the caller has
+ * already run.
+ *
+ * # Why the origin is a parameter and not read here
+ *
+ * The same ordering hazard [`pendingJump`] was written for, arriving from the other side.
+ * `origin` is the caret **before** this click, and the only place that is still knowable is
+ * inside the `ViewPlugin`'s `update()`: CodeMirror runs plugin updates before update listeners,
+ * and `EditorSurface`'s listener is what hands `caretTrack`'s slot to the editor being clicked
+ * into. Read the caret here — one listener later — and the origin *is* the destination, `near`
+ * merges the two into one entry, and the feature is a silent no-op with nothing on screen to say
+ * so. Taking it as an argument means this function cannot get that wrong.
+ */
+export function recordClick(
+  project: ProjectId | null,
+  origin: FilePosition | null,
+  to: FilePosition,
+): void {
+  if (project === null || !isShellRealm()) return
+  pruneHistories()
+  const history = histories.get(project) ?? EMPTY_HISTORY
+  histories.set(project, record(history, origin, to))
 }
 
 /**

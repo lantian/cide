@@ -291,6 +291,33 @@ try {
     'and the enablement comes from the same function the clause and the handler use',
   )
 
+  // --- 5b. and the fifth caller, added in M16: a crumb of the status bar's path trail --------
+  //
+  // `crates › cide-core › src › lib.rs` is clickable now, and each segment goes exactly where
+  // the chord, the palette row, the Explorer button and a Ctrl+click on a directory in terminal
+  // output go. That matters more here than anywhere else, because this is the only one of the
+  // five that fires on a **dependency source**: `dispatch.ts`'s arm brings the sidebar to Files
+  // first, and `fs_reveal` resolves an *External Libraries* group that has never been opened.
+  // A handler wired to `treeStore.reveal` would do neither and would look identical.
+  const bar = read('../src/chrome/StatusBar.tsx').replace(/\/\*[\s\S]*?\*\//g, '')
+  ok(
+    /onRevealSegment\?\.\(target\)/.test(bar) && !/useFileTree/.test(bar),
+    'a crumb calls the handler it was given and reads no store — `chrome/` components are pure '
+      + 'render targets, which is what `chrome/auditFixture.ts` depends on',
+  )
+  ok(
+    /onRevealSegment=\{[\s\S]{0,240}?runCommand\('file\.reveal', \{ path \}\)/.test(app)
+      && !/onRevealSegment=\{[\s\S]{0,240}?useFileTree/.test(app),
+    'and App routes it through the **command**. Rule 5 again, one call site further on: five '
+      + 'gestures, one set of preconditions',
+  )
+  ok(
+    /onRevealSegment=\{[\s\S]{0,200}?boot\?\.role\.kind === 'shell'/.test(app),
+    "…and withholds it where the command would refuse. `dispatch.ts` answers with a notice "
+      + 'outside a shell window, and the whole point of classifying a crumb before the click is '
+      + 'that it never has to explain itself after one',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

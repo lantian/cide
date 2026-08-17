@@ -8,7 +8,10 @@ tiling grid of panes — the project's primary Claude session, additional sessio
 shells, and read-only diffs — alongside the ordinary IDE furniture that serves it: a file
 tree, a tabbed editor, an IDEA-style git commit tool window, `Ctrl+P`, and `Shift+Ctrl+P`.
 
-Rust + Tauri 2. Linux-first (developed on KDE/Wayland), with the code kept portable.
+Rust + Tauri 2. Linux-first (developed on KDE/Wayland), with the code kept portable — *kept*
+portable, not *shown* to be: **Linux is the only platform this has ever run on.** See
+[Platforms](#platforms-m16), which says what macOS would and would not do and what has actually
+been checked.
 
 **Status: M0, M1, M3 and M4 complete; M5 code complete, its audit unrun.** The workspace
 builds and runs, real `claude` processes render in xterm panes, the domain core owns the
@@ -88,6 +91,171 @@ CIDE_AUDIT=1 ./target/debug/cide # re-check the chrome against the design mock
 CIDE_AUDIT_PANES=1 ./target/debug/cide # re-check the pane host registry under churn
 CIDE_AUDIT_WINDOWS=1 ./target/debug/cide # re-check detach/re-dock and window modes
 ```
+
+## Platforms (M16)
+
+**Linux is the only platform cide has ever run on.** Everything below the first paragraph is
+written from source — the workspace's own and its dependencies' — and *none of it has been
+observed*. That distinction is the whole point of this section, so it is made once, plainly:
+
+> **macOS: not done.** The workspace has never been compiled, run or bundled on macOS, and it
+> cannot be from a Linux machine. Cross-compiling to Darwin needs Apple's linker and the macOS
+> SDK, whose licence restricts it to Apple hardware; `rustup target add aarch64-apple-darwin`
+> installs a `std` and nothing that can link Cocoa, AppKit or WebKit. Tauri documents
+> cross-compiling *Windows* from Linux and nothing else. So the next step is a Mac or a
+> `macos-15` runner, and there is no version of this work that does not need one.
+>
+> What exists now: the bundle configuration, an **advisory** CI job that compiles, tests and
+> lints the workspace on `macos-15`, and `cfg` arms that keep the Linux-only pieces out of the
+> graph and say what the platform does instead. What is known to be broken or absent there is
+> the table below.
+
+Windows is not a target and nothing here has been written with it in mind; where a `cfg` arm
+says "not Linux" rather than "macOS", that is honesty about the BSDs and Windows too, not
+coverage.
+
+### What compiles, and what nobody knows yet
+
+`cide-app` is the only crate that links tauri and the only one that would fail to *compile*;
+the crates with a platform problem that compiles anyway are `cide-core` (`child_env`) and
+`cide-fs` (`trash`), and both are in the table below. Every Linux-only API in the workspace is
+already behind a `cfg` with a counterpart that compiles: `gtk` is target-gated to Linux and four
+BSDs in `crates/cide-app/Cargo.toml`, the GTK mouse-button handler has a non-GTK arm, the folder
+picker falls back to `tauri_plugin_dialog` (which parents the dialog itself off Linux, which is
+the only reason the GTK arm exists), the signal handlers are `cfg(unix)` and macOS is a unix,
+and `git2`/tree-sitter build with `cc` everywhere. Reading every arm suggests `cargo build`
+succeeds on a Mac with few or no changes.
+
+**That is an estimate, and it is deliberately not written down as a fact.** Nobody has run the
+compiler. The `macos (advisory)` job in `.github/workflows/ci.yml` exists to convert it into
+one; it is `continue-on-error: true` until it has been green once, because a job that has never
+passed cannot tell a regression from a first attempt. The comment on that job says what to
+delete when it does.
+
+### Where a Linux guarantee has no macOS equivalent
+
+| what | on macOS | where it is written down |
+| --- | --- | --- |
+| **`PR_SET_PDEATHSIG`** — cide's children die with it (ADR 0008) | **No equivalent.** A `SIGKILL`, OOM kill or crash leaves every `claude` and language server running. A clean quit is unaffected. | `cide_core::child_env::set_parent_death_signal`, non-Linux arm |
+| the fork race inside that guarantee | **Still closed.** `getppid()`/`raise()` are POSIX, one shared body, one test on both platforms | same |
+| **`/proc/<pid>/cwd`** — a shell pane's real working directory | **Always `None`.** Relative paths in terminal output stop resolving; absolute ones still work, and nothing errors | `cmd::session::cwd_of_pid`, non-Linux arm |
+| **the eight resize grips** | **Not painted.** `tao`'s `drag_resize_window` is `NotSupported` on macOS and the grip's `preventDefault()` would swallow the gesture AppKit handles itself | `ui/src/chrome/windowControls.ts::drawsOwnResizeGrips` |
+| **the graphics ladder** (ADR 0006) | **Applies nothing**, correctly — every rung is a WebKitGTK variable and macOS runs WKWebView | `cide_app::graphics::LADDER_APPLIES` |
+| **⌘Q** | Reaches `lifecycle::shutdown` through `RunEvent::Exit`, which is now handled | `cide_app::run`, and `both_ways_out_of_the_run_loop_reach_shutdown` |
+| **⌘W, ⌥⌘H** | **Dead.** macOS's default menu bar answers the accelerator before WKWebView is asked | `cide_core::keymap::MACOS_MENU_CHORDS` |
+| the freedesktop trash spec | Writes to `~/.local/share/Trash`, which Finder cannot see or restore from | `cide_fs::trash` — **unchanged, and wrong there** |
+| XDG state and config paths | Work, but are not the platform convention | `cide_core::persist` — a deliberate choice, see below |
+
+**`PDEATHSIG` is the one that matters**, and dropping it silently on a platform is exactly how
+an orphaned `claude` survives a crash — so it is not dropped silently. The non-Linux arm is
+written out, shares one body with the Linux arm for the half that *is* portable, logs a
+`warn` once per process, and `PARENT_DEATH_IS_ENFORCED` is a public `false` there so no caller
+can read the arm as equivalent. The two real replacements are named in that arm's docs and
+**neither is implemented**: a supervising helper process using `kqueue`'s `NOTE_EXIT` (which
+`cide-hook`, already a second binary in the bundle, is the natural home for), and — cheaper,
+weaker, and the one worth doing first — a startup sweep that kills children whose recorded cide
+pid is dead. The sweep needs a pid registry that does not exist yet; `cide_claude::orphans`
+sweeps *files*, not processes.
+
+**Found on the way, and it is a Linux defect, not a macOS one.** `set_parent_death_signal`'s
+doc comment said its caller "that matters" was `cide-pty`. `cide-pty` does not depend on
+`cide-core` at all and has never called it: **no PTY pane — no `claude`, no shell — is armed on
+any platform.** Two things stand in the way, and only the first was the one the comment named:
+`portable-pty`'s `CommandBuilder` exposes no `pre_exec` hook, and `PtySession::spawn` is called
+from a Tauri command worker, which fact 3 of that module makes the *wrong* thread to fork from —
+arming there would kill panes seconds after they opened. What covers a PTY child today is the
+shutdown ladder, the signal thread and `run.sh`'s reap of a previous run's orphans. The comment
+now says all of that instead of naming a call that does not exist.
+
+### What needs a Mac at the keyboard
+
+Everything here is a decision, not a port, and each one has a consequence somebody has to look
+at before choosing:
+
+* **The title bar.** The window is built `decorations(false)` (ADR 0006). The macOS idiom is
+  `TitleBarStyle::Overlay` + `hidden_title(true)`, which restores native edge resize, rounded
+  corners, the window shadow and real traffic lights — at which point `windowControls.ts`'s
+  `MAC` layout becomes dead code and the header has to reserve ~78px of leading inset instead.
+  That is a design decision. Until it is made, the header draws its own buttons on the left and
+  the OS resizes the edges.
+* **The menu bar.** cide calls neither `.menu()` nor `.enable_macos_default_menu(false)`, so
+  tauri installs `Menu::default`, whose accelerators AppKit resolves ahead of the web view.
+  `keymap::MACOS_MENU_CHORDS` lists all twelve and `macos_menu_conflicts()` computes which
+  bindings they kill; a test pins the answer in both directions, so a new dead chord fails the
+  build rather than shipping, and `./target/debug/cide-headless keymap` prints the list under
+  every dump **on every host**, because a chord that cannot fire on a Mac is invisible from the
+  platform this is developed on. Today it is two: **⌘W** closes the window instead of the tab, and
+  **⌥⌘H** hides other applications instead of moving a pane left. Turning the default menu off
+  fixes both and takes the Edit submenu with it — and on macOS those items are a large part of
+  how ⌘C/⌘V reach a text view at all, which is precisely the thing that cannot be checked from
+  here. cide also has no `app.quit` command, so ⌘Q *is* that menu item: the quit path on a Mac
+  is a gesture cide does not own, which is why the run loop now handles `RunEvent::Exit`.
+* **Option in a terminal pane.** `ui/src/terminal/xterm.ts` constructs `new Terminal({…})`
+  without `macOptionIsMeta`, which defaults false, so Option composes a dead-key character
+  instead of sending `ESC`-prefixed bytes. That takes out `⌥F7`, `⌥↑`/`⌥↓`, the `⌥⌘h/j/k/l`
+  family and every readline Meta binding inside a pane. A one-line fix that should be made by
+  somebody who can press the key.
+* **The cwd probe.** `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, …)` is about twenty lines of
+  `libc`. Whether it answers for a same-user child under the hardened runtime is the part that
+  has to be observed rather than read.
+* **Move to trash.** `NSFileManager trashItemAtURL:` or the `trash` crate. `cide_fs::trash`
+  rejected that crate *for Linux*, on reasoning that does not carry to macOS.
+* **Settings → Appearance** offers three graphics switches that persist and do nothing there.
+  `graphics::LADDER_APPLIES` is the seam to gate them on; the screen wants eyes before it grows
+  a fourth state.
+* **`run.sh` does not run on a stock Mac.** It uses `mapfile` (bash 4+; macOS ships 3.2 as
+  `/bin/bash`) and `ps -eo ppid=,pid=,comm=`, whose `comm` prints a full path there.
+* **Case-insensitive filesystems.** APFS folds case by default and `canonicalize` does not
+  normalise it, so `cide_fs::ops::check_within` — textual by design — would refuse a terminal
+  link naming `/Users/x/proj/…` for a project opened as `/Users/x/Proj`. Unquantified.
+* **FSEvents.** `notify` uses it there, not inotify, and the debouncer timings were tuned
+  against inotify. Expected to work; unverified.
+
+### Packaging, and the half that money buys
+
+`cargo xtask package` grew `--app` and `--dmg`, a `crates/cide-app/tauri.macos.conf.json`
+overlay, and a **host check**: naming a target this machine cannot build is a preflight failure
+with the reason in it, in the first second, rather than a plan that dies inside `codesign`
+twenty minutes later. Naming no target means everything the host can build. The `cide-hook`
+sidecar rides along unchanged — `externalBin` copies into `Contents/MacOS/`, which is exactly
+where `current_exe().parent()` looks — and the overlay must never carry that key, because
+`tauri-build` reads the *host's* platform overlay on every `cargo build` and it would break the
+workspace build on macOS and nowhere else. A test asserts it does not.
+
+What no amount of configuration can do:
+
+* **Notarisation needs a paid Apple Developer Program membership** ($99/yr) for a Developer ID
+  Application certificate. A free Apple ID yields a local-run-only certificate that cannot be
+  notarised.
+* **Without notarisation a downloaded `.dmg` is quarantined** and Gatekeeper refuses it as
+  *"damaged and can't be opened"* — which blames the download, not the signature — until the
+  user runs `xattr -dr com.apple.quarantine`. The preflight says so in as many words.
+* **The updater is a third artefact.** `tauri-plugin-updater`'s macOS channel is an
+  `.app.tar.gz`, not the `.dmg`; and no `plugins.updater` is configured on any platform yet.
+
+An unsigned or ad-hoc-signed `.app` and `.dmg` that run locally are entirely buildable, and
+that is the honest first target.
+
+**The icon set is left one raster short, knowingly.** The overlay carries its own `bundle.icon`
+list because the platform merge *replaces* the array rather than extending it, and the macOS
+list drops `48x48.png` — not an ICNS size, so `tauri-bundler` Lanczos-resizes it to 32 and then
+discards it because `32x32.png` is already in the family. What is still missing is a 1024px
+`icon@2x.png` for the ICNS 512@2x slot, which leaves a Retina icon upscaled from 512. It is one
+line in `scripts/gen-icons.sh`; it is not there because an `@2x` name in the *Linux* list would
+be installed by `tauri-bundler`'s freedesktop path into `hicolor/512x512@2/apps/`, a directory
+no icon theme searches — the exact trap that script's comments record removing `128x128@2x.png`
+for. The overlay is the right place to put it and nobody has.
+
+### Paths stay XDG, deliberately
+
+`$XDG_STATE_HOME/cide/workspace.json` and `$XDG_CONFIG_HOME/cide/keymap.json` work on macOS —
+nothing fails — but they are not the platform convention, which is
+`~/Library/Application Support/dev.cide.ide`. They are staying where they are, and this is the
+reason rather than an omission: `keymap.json` is a file people hand-edit and hand around, every
+piece of documentation here names one path, and `app_config_dir()` would fork that into two
+answers for one question. Hook sockets already fall back from `$XDG_RUNTIME_DIR` to
+`std::env::temp_dir()`, which is unset-and-therefore-`$TMPDIR` on every Mac — a per-user 0700
+directory, with an explicit 0600 chmod on the socket besides.
 
 ## Panes, tabs and the reopen stack (M15), and what is not done
 
@@ -222,8 +390,15 @@ way — xterm drops it in `consumeWheelEvent` before any protocol runs, confirme
 | **right-click → Close to the left** | close everything before this tab, asking about unsaved work once |
 | **Back / Forward** (the mouse's thumb buttons) | reopen a closed file *as it was* — split, pane ids and all |
 
-`navigate.back` and `navigate.forward` have **no key binding by default** — the thumb buttons are
-it. `Ctrl+Alt+←`/`→` are not them and must not be written down as if they were: `ctrl+alt+right` is
+`navigate.back` and `navigate.forward` have **no key binding on Linux or Windows** — the thumb
+buttons are it. On **macOS they are ⌘[ and ⌘]**, added to `keymap::platform_layer` rather than to
+`defaults()`, because `ctrl+[` *is* the ESC byte on every terminal and the key gate is a window
+capture listener: the Linux spelling would take Escape-equivalent from every pane in every window.
+The cost on macOS is `defaultKeymap`'s `Mod-[`/`Mod-]`, which are indent and dedent — the
+capability survives on Tab and Shift+Tab (`indentWithTab`), which is what IDEA-on-mac binds anyway,
+and `check:editor` pins that by command identity.
+
+`Ctrl+Alt+←`/`→` are not them and must not be written down as if they were: `ctrl+alt+right` is
 `pane.split.right`, which on any tab but the console splits the pane and spawns a *new* `claude`
 child, so a reader who trusted that line got a running process instead of a navigation. *Language
 support (M12)* below carries the `keymap.json` entries if you want keys as well —
@@ -313,6 +488,380 @@ a second shell window opening the same file in between can produce two tabs over
 the same window `tab_reopen_closed` has always had. And the **bulk close stops at the first
 unanticipated refusal** rather than marching on — a file that turns dirty between the one question
 and the closes parks a dialog about itself, and the tabs after it stay open.
+
+## The find bar spans the file, and the path trail is clickable (M16)
+
+Two reports about the bottom and the top of an editor pane, and both of them are about a control
+that is drawn and does nothing.
+
+### The cluster steps below the find bar, instead of the find bar stopping short of the cluster
+
+The pane's ⊞ ⛶ ⧉ × cluster floats in the top-right corner, and a CodeMirror top panel is
+`position: sticky; top: 0` across the editor's full width — so the find bar lands on exactly those
+pixels, and the cluster wins the paint order (`.body` is a stacking context at `z-index: 0`, which
+was added deliberately after the *reverse* shipped and buried all four buttons). The M15 answer was
+to reserve horizontally: `margin-right: var(--pane-corner-clear)`, 221px on an editor pane. The user
+rejected it — a search field is the width of the thing being searched — and it was also failing on
+its own terms, because `.findBar`'s own controls need about 217px, so under roughly 440px of pane
+the reserve started clipping the buttons it was protecting.
+
+So the bar keeps its width and the **cluster moves down by exactly one bar**. Where it rests:
+
+| state | find bar | cluster `top` |
+| --- | --- | --- |
+| nothing pinned above the buffer | — | `0` |
+| find bar open | full width of the file content | `--h-findbar` (33px) |
+| conflict bar up | — | `0` |
+| both | full width, *below* the conflict bar | `0` |
+
+The cluster moves in exactly one state, and it is the common one. In *both*, the find bar is no
+longer the topmost strip, so none of it is under the cluster and nothing needs to move.
+
+**The conflict bar keeps its reserve, and that is not an inconsistency — it is the rule.** A strip
+whose height is a constant can be stepped over; a strip whose height depends on its content cannot.
+`.conflictText` is `flex: 1; min-width: 0` with no `white-space`, so *This file changed on disk while
+you had unsaved changes* wraps and the bar grows a line on a narrow pane, and a step sized for the
+unwrapped case would land the cluster in the middle of **Keep mine** — which is the exact bug M13
+fixed there, arriving back by a different route. That bar therefore goes on reserving
+`--pane-corner-clear` horizontally, `EditorPane.tsx` marks it `data-pane-strip="fluid"`, and the
+frame's rule stands down while it is up. Both bars are fully clickable in every one of the four
+states above.
+
+**"Full width" means the width of the file content, not of the pane.** The bar stops at
+`var(--w-minimap)`, which is where `.cm-scroller` stops: `.cm-panels` is `z-index: 300` and the
+minimap is a sibling canvas at `right: 0`, so a literal 100% would paint over its top 33px and take
+its clicks. The bar's `border-bottom` now meets the minimap's `border-left`.
+
+**A too-short pane.** `MIN_RATIO` is 0.1 and splits nest, so a pane under 60px tall is reachable by
+dragging, and `.frame` has no `overflow: hidden` — an unclamped 33px would paint the cluster over
+the pane *below*. It is `clamp(0px, var(--pane-top-strip), calc(100% - var(--h-panetitle)))`, and
+the comment there is honest that below ~59px there is no correct resting place at all: the clamp
+only chooses *inside my own frame, over my own find bar* rather than *outside my frame, over
+somebody else's pane*. When the maximum goes negative the spec yields the minimum, which is `0px`.
+
+**Terminals do not move, and that is the same rule returning zero** rather than an exception: the
+cluster sits at the top of the pane's *content*, and a terminal pins nothing above its transcript.
+Forcing every kind down 33px for symmetry would park four buttons over line 2 of every transcript
+for ever, and the reveal is `.frame:hover`, so two clusters are essentially never on screen at once
+and there is no misalignment anybody could observe.
+
+The mechanism is `:has()` on the frame, which is this codebase's first — custom properties inherit
+*downwards*, so nothing the editor declares can reach a box that is its ancestor's sibling, and
+`:has()` is the only selector by which a descendant's existence reaches an ancestor's computed
+style. The five alternatives that lost (including CSS anchor positioning, which is literally the
+feature for this problem and falls back to `top: 0` on any WebKitGTK older than Safari 26 — and
+`top: 0` *is* the bug) are written up in `PaneTitleBar.module.css`. `check:rows` pins the whole
+thing: that the panel does **not** read `--pane-corner-clear` any more, that both ends of the step
+name `--h-findbar`, that the token's value re-derives from the bar's own padding and control
+height, that exactly one rule sets the step and it is scoped and excludes the fluid strip, that the
+conflict bar declares itself, that the `top` stays clamped — and that the find bar is still the
+**only** top panel in `src/editor/`, since a second one would stack inside the same box and leave
+the cluster resting on it.
+
+**Not verified by a gate:** `:has()` invalidation cost with a live terminal in a sibling pane. The
+argument is that `.cm-panels-top` never appears in xterm's mutations so WebKit should not
+invalidate, but nothing in `ui/scripts/` runs a browser; the four states and a deliberately short
+split want `./run.sh --audit-panes` and a pair of eyes.
+
+### Every segment of the status bar's path trail that leads somewhere is clickable
+
+`crates › cide-core › src › lib.rs › impl Parser › parse` is drawn from `editor/statusReadout.ts`.
+Three things were wrong with it and they are separable.
+
+**It only rebuilt when the buffer was focused.** The claim stack was moved by exactly two things —
+mounting and DOM focus — and a tab switch is neither: `TabContent` never unmounts an inactive tab,
+so every open file holds a live claim for as long as the project does, and `file_open` is
+open-*or-activate*. Switching to an already-open file therefore moved nothing until the user clicked
+into the buffer, and on restore every tab mounted at once in `file_read` completion order and **the
+last one to land owned the bar**, whichever tab was in front. This is *not implemented* rather than
+implemented-and-unreachable — but it is a near miss of the usual kind: `TabContent.renderTree`
+has taken `(tab, active)` since M4 and documents that flag for exactly this class of consumer, and
+`App.tsx` wrote `renderTree={(tab) =>` and threw it away. The flag now reaches `EditorSurface`,
+where a mount behind another tab is inserted at the *bottom* of the claim stack and a tab coming
+forward calls `focus()`. Two further rebuilds were missing: the **outline arriving late** (the parse
+is asynchronous, so a freshly opened tab had a path and no symbols until the caret moved) and, worse,
+the late-*root* repair published the path alone and so **truncated** a symbol tail that was already
+on screen. There is now exactly one `setTrail` call in that file, and `check:editor` counts it.
+
+**A third bug, found on the way:** `segments` is memoized on `[path, root]` while the build effect
+is keyed on `[path, reloadKey]`, so a root arriving late gave the update listener a stale array —
+the repair landed and the very next caret move published the absolute path back over it. It reads
+through a ref now.
+
+**Which segments are clickable.** A segment is revealable exactly when its absolute path is at or
+under a *reveal root* — a path the file tree can hang a row from. That is `rootOf`'s longest-match
+containment, the same test `Groups::owner_of` applies in Rust, and the list is `fs_reveal_roots`:
+the project's roots plus **each group's top-level children**. So on a dependency source,
+`serde-1.0.229 › src › de › mod.rs` is live and `home › u › .cargo › registry › src ›
+index.crates.io-…` is not, which is the report. The list has to come from Rust: those are *package*
+directories, not the caches above them, and the SDK row's directory comes out of
+`rustc --print sysroot`, so a depth rule guessed on the frontend would mark
+`lib › rustlib › src › rust › library` clickable and every one of those clicks would fire the notice
+this feature exists to stop showing.
+
+The rule is `sidebar/rowPaths.ts::crumbTargets` — pure, import-free, and driven by
+`check:tree-status` over all three populations (a project file, a library source, a file under
+nothing) plus a scratch, a nested second root, and the degradations. It takes `pathCount`, the
+number of leading crumbs that are path rather than symbol, because without it `parse` classifies as
+`…/lib.rs/impl Parser/parse`, comes out inside the project root, and is drawn live.
+`StatusBar.tsx` used to say so itself: *"deliberately does not know where the path ends and the
+symbols begin… no crumb is clickable yet"*.
+
+**An inert segment gets no notification, because it is not a control.** It is drawn inert instead:
+the revealable run is `--dim` against the trail's `--faint`, so the boundary is legible at rest with
+no badge and no icon, and only the live ones underline under the pointer. The cursor is `default`
+and never `not-allowed` — a forbidden cursor is a refusal, which is the same message the user
+rejected with a different renderer. A live crumb runs `runCommand('file.reveal', { path })`, the
+same command ⌃⇧E, the palette row, the Explorer's ⌖ button and a Ctrl+click on a directory in
+terminal output run; there is no second reveal path. In a window with no sidebar the handler is
+withheld entirely, so the whole trail is inert rather than live-and-refusing.
+
+**Where it is still only a necessary condition.** Containment is all a pure function can know:
+inside a reveal root, whether a *particular* directory has a row also depends on the project's
+ignore rules, so a gitignored file's crumbs are drawn live and report themselves the way ⌃⇧E
+already does for the file itself. That residue is uniform — if the file is ignored, so is every
+ancestor crumb of it — and closing it would mean an IPC round trip per crumb. And a library crumb
+is inert until *External Libraries* has resolved: `fs_reveal_roots` deliberately never triggers a
+resolution (a `cargo metadata` inside a status bar's render is not a trade worth making), so the
+crumbs light up on the `cide://fs-status` the resolver emits. The store re-asks exactly when the
+composed row count moved, which is provably every burst that can grow the list and no ordinary one.
+
+**No tab stops.** `BranchSelector` is the bar's one focusable control and six to ten new focus stops
+for a path trail would cost more than the gap they close; the keyboard route to the same place is
+⌃⇧E and is bound. Crumbs carry `role="link"` and stay inline `<span>`s — `.path` needs
+`text-overflow: ellipsis`, which requires inline content, so a `<button>` would silently coarsen the
+ellipsis to whole-crumb granularity. Clicking the *last* crumb to open File Structure at its
+siblings, which is IDEA's other breadcrumb gesture, is still not done.
+
+## Which `claude` is launched, and with what (M16)
+
+**Settings → Claude sessions now names the binary, extra arguments and extra environment**, and
+every Claude pane, plus the one-shots behind *Generate commit message* and *Explain selection*, is
+spawned from it. Before this the program was the literal `claude` in five places. Nothing was
+un-stranded: grepping for every shape of it (`cli_path|claude_path|binary_path|extra_args|extra_env`)
+across `crates/` and `ui/src/` returned zero hits, so this is **not implemented**, not
+built-and-unreachable.
+
+### The binary is checked at save, and the check is a warning far more often than a refusal
+
+A bare name stays a bare name. `claude` is passed to `execvp` unresolved so the OS resolves it at
+each spawn — the CLI self-updates, and pinning the answer at launch would keep panes on a version
+that no longer exists. cide resolves it only to *check* it and throws the path away.
+
+Only three verdicts are hard, and they are the three the OS cannot `exec`: blank, a bare name on no
+`PATH` directory (`~/.cargo/bin` and `~/go/bin` included, because a desktop-launched cide has a
+different `PATH` from a terminal-launched one), and a path that is not an executable file. Everything
+else warns. `mise`, `asdf`, `direnv` and a plain shell wrapper are all legitimate ways to name a
+`claude` and none of them answers `--version` in a shape worth refusing over — the project already
+paid for the opposite arrangement once, with `~/.cargo/bin/rust-analyzer`, which is a symlink to
+`rustup` and passes any on-PATH-and-executable probe before failing at exec.
+
+The verdict is unlatched and per-binary, which is a change: `version::check_once` describes whichever
+binary was probed first in the process, which was free while `claude` was a constant and became a lie
+the moment it was a setting — a user who fixes a typo would read back the verdict for the binary that
+answered ten minutes ago. `run_headless` still calls the latched one for its one-line-per-process log
+warning, and its comment now says which binary that line is about.
+
+A binary that cannot be run also fails at *spawn*, as `SessionError::NoClaudeBinary`, whose written
+sentence `spawnFailureText` prefers verbatim and `TerminalPane` writes into the failing pane's own
+transcript. It is deliberately outside `isRecoverableSessionError`: retrying cannot help, and a pane
+that retried would spin.
+
+### What is refused, and where the refusal is legible
+
+Seven arguments and seventeen variables. The spellings were read out of `claude --help` on 2.1.233
+and every variable name was checked against the strings in the installed binary, rather than
+remembered.
+
+| refused | why it is not merely discouraged |
+| --- | --- |
+| `--session-id`, `--resume`/`-r`, `--fork-session`, `--continue`/`-c` | the uuid **is** the pane's `SessionId`; a second one makes every hook frame name a session this process never heard of |
+| `--settings` | duplicates cide's inline hook payload; if the user's wins, every hook dies silently |
+| `--bare` | authentication becomes strictly `ANTHROPIC_API_KEY` or `apiKeyHelper` — an auth failure in every pane for a Max subscriber |
+| `--print`/`-p` | turns an interactive pane into a one-shot that exits |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | a key outranks subscription OAuth, so it would silently bill a Console org — and the sentence already on this screen promising cide never sets one would become a lie |
+| `CLAUDE_CODE_SSE_PORT`, `CIDE_HOOK_SOCK` | cide's own; a wrong value binds a pane's `claude` to another editor's lockfile |
+| `TERM`, `COLUMNS`, `LINES`, `TMUX` | cide sets these and this list is folded *after* them, so an accepted value would win |
+| the four `CLAUDE_CODE_*` names above | there is a switch for each; two controls writing one variable is how the one you can see loses |
+| the four proxy names | the proxy screen has three modes and three scopes so "no proxy" and "do not interfere" stay distinguishable, and it is applied *after* this list |
+| `CLAUDE_CONFIG_DIR` | `lifecycle::claude_projects_dir` reads it from **cide's own** environment to find a transcript; set for the child alone, every Resume button vanishes |
+
+`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and `--safe-mode` are
+**warned, not refused** — they work, they mean something serious, and they are the user's decision.
+The line is whether *cide's own* behaviour becomes wrong.
+
+**Nothing is rejected on save.** `useSettings.ts` sends its patch fire-and-forget with
+`.catch(() => {})`, so a `settings_set` that returned `Err` is invisible — the field snaps back and
+says nothing. Everything is therefore stored verbatim and the readout says what the child actually
+gets: a refused token stays in its row, struck through (a strike, not a colour: a dim monospace input
+against a dim placeholder is a distinction nobody makes at a glance and one that vanishes entirely
+for a colour-blind reader), absent from the resolved argv below it. The proxy screen already made
+this argument about a password and answered it the same way.
+
+Enforcement is at the spawn as well, and that is not belt-and-braces: `workspace.json` is
+hand-editable and `settings_set` is one `invoke` away from being bypassed, so a UI-only filter would
+let a hand-edited file cost somebody their `--resume`. `apply_patch` makes the same argument three
+times over for its clamps.
+
+### The two orderings that are load-bearing
+
+**The user's arguments go first.** `--add-dir`, `--mcp-config` and `--tools` are variadic and collect
+every following non-flag token, and every argument cide appends begins with `-` — so a user flag
+placed first can never swallow cide's session id, and one placed last would swallow whatever cide
+wrote. `cide_claude::headless::argv` refuses the same wager for the same reason.
+
+**The hooks decision is made before the binary is substituted.** `program_is_claude` matches on a
+file name, and its own note predicted this exact failure: *"the moment anything passes an absolute
+path as the program — a configurable CLI location in Settings, say — this returns false, no
+`--settings` is attached, and every session runs with no hooks."* It is closed by ordering rather
+than by teaching that function about paths: the decision is made from what the frontend asked for,
+which is still the bare string `claude`, and the substitution happens downstream of it. Teaching it
+about the setting would still answer `false` for `~/.local/share/claude/versions/2.1.233`, which is
+the value a user pins when they want a specific version.
+
+### Two deliberate asymmetries, stated so they are not "fixed" later
+
+* **The extra environment reaches `claude` panes and the one-shot lane, and not shell panes** — where
+  the four `CLAUDE_CODE_*` switches above *do* reach. Those names are inert to `bash`; an arbitrary
+  `NODE_OPTIONS` or `PATH` is not, and a field labelled *the environment claude is spawned with* must
+  not quietly become the user's shell's.
+* **The extra *arguments* do not travel to the one-shot lane at all.** `headless::argv` is cide's own
+  machinery — `-p --output-format json --no-session-persistence --tools` — and a user `--model` or
+  `--tools` folded into it does not customise anything, it breaks the parse of a reply that never
+  arrives. `ProxyScope::claude` covers both lanes because a proxy is one thing to a user; an argument
+  vector is not.
+
+**`ClaudeSettings` lost `Copy`** (a `String` and two `Vec`s cannot be) and `ClaudeCli` implements
+`Debug` by hand, redacting values and keeping names — `Settings` derives `Debug`, so a
+`tracing::debug!(?settings)` anywhere would otherwise print a token the user typed into the env
+editor. Two tests guard it, modelled on `ProxySettings`'s, one of which reads the field list off
+`serde_json` so it cannot fall behind either.
+
+**Fixed while here:** `cide_claude::version::probe` built a bare `Command` and did not scrub, while
+the identical probe in `cmd/app.rs` did and said why. Under the AppImage it ran a Node with
+`PYTHONHOME` pointing inside the bundle — the ADR 0007 environment — so the version cide reported
+came from a process launched in a way no pane is ever launched in.
+
+**Not done.** No end-to-end confirmation: nothing in `ui/scripts/` mounts React against a live
+backend, so "typing a bad path makes every pane print the same sentence" is argued, not observed. The
+refusal list is a list of somebody else's flag names and **will go stale**, exactly as `SUPPORTED_CLI`
+does — it belongs in `version.rs`'s table of what a patch release can retract, and the honest gate is
+an `#[ignore]`d real-CLI test putting these shapes in front of the installed binary, which is not
+written. `CLAUDE_CONFIG_DIR` is refused rather than supported; teaching `claude_projects_dir` to read
+the setting is the better answer and is a change to the resume path, not to this screen. And there is
+no way to spell *remove* in the environment editor, deliberately: a removal control would let a user
+delete the `ANTHROPIC_API_KEY` their own login environment carries, which is the only credential some
+Console customers have.
+
+## Ctrl+P can reach External Libraries (M16)
+
+**⌥L while the picker is open — or the footer's `⌥L Libraries` chip — widens Ctrl+P to the source of
+this project's resolved dependencies.** Off at every launch. This is **not implemented** rather than
+stranded: every supporting piece existed and was reachable, but library files were candidates
+nowhere, because `Index::build`'s sink is the only thing that ever fills the file matcher and it only
+walks project roots.
+
+### It cannot be a filter, and it is not one
+
+The exclusion is a *structural* property, not a rule: `cide_fs::groups`'s header lists the four
+couplings a grafted synthetic root would trip, and line 17 names this exact cost — *"the walk's sink
+is the picker's injector | 593 crates' worth of files in Ctrl+P"*. **That decision is untouched.**
+`Index` is not modified; library candidates go into a *second, opt-in matcher* on `ProjectFs`, so
+`dir_paths()` (the watcher's list), `Filter::build`, `show_roots` and `path_of` are the project's
+alone. "Never watched" stays true because there is still no code that could watch them.
+
+### Measured on this repository
+
+| | |
+| --- | --- |
+| external packages `cargo metadata --frozen` resolves | **593** (0.21 s, 3.1 MB of JSON) |
+| files under them, with cide's exact ignore settings | **31,865** (36,643 entries including directories) |
+| the project's own index | 875 files |
+| walk, 593 roots at `threads: 1`, warm | **130 ms** |
+| the same loop at `BuildOptions::default()` (`threads: 0`) | **1.24 s** |
+| the whole of `~/.cargo/registry/src` | 127,055 files |
+| `~/go/pkg/mod` | 347,777 files |
+
+The last two rows are the point: *index the libraries* and *index everything this machine has ever
+built* differ by two orders of magnitude, and only the first is bounded by the project the user has
+open. The `threads: 0` row is the trap — the cost is not the walking, it is spawning and joining 32
+walker threads 593 times over directories that hold 60 entries each — and it has a source assertion in
+`check:picker`, because nothing else in the suite can see a 20× slowdown.
+
+### Lazily, and visibly
+
+Nothing is walked until the scope is switched on for the first time in a process. `picker_index_
+libraries` claims the walk and returns; the overlay watches it fill through the poll it already runs,
+so `running` stays true and the counter climbs — the same shape `symbols_index` and `symbol_query`
+have had since M12. If nobody has opened *External Libraries*, the walk asks
+`ProjectGroups::resolve_now` for the packages, blocking on `cargo metadata` on a pool thread: the
+same call `fs_reveal` already makes for *Select Opened File*, on the same argument — the gesture
+explicitly asked for this, it happens at most once per project per process, and the alternative is
+not "faster", it is an empty answer.
+
+A `cargo add` or `cargo update` invalidates it. The lockfile stamp already notices (it is a stamp and
+not a watcher subscription because `Cargo.lock` is gitignored in plenty of repositories and no
+`cide://fs-changed` would ever mention it), and that path now calls `forget_libraries` *before*
+spawning the resolver — the stale set is wrong now, and the resolver runs for a quarter of a second
+during which Ctrl+P would otherwise keep offering it. It does not re-walk; the next query does.
+
+### Two matchers and a merge
+
+Forced, for the reason `symbol_matcher` is — `Matcher::query` holds one query per matcher — plus one
+specific to this: **nucleo is append-only**, so a toggle-off could not un-inject 32,000 candidates,
+and post-filtering a 200-row frame would break both the row limit and the `6 of 2,418` counter, which
+come from the snapshot.
+
+Merging is exact and free. `Pattern::indices` **returns the score** and `frame()` was already calling
+it for the highlight offsets and throwing the return value away; `frame_scored` stopped throwing it
+away. The rows are already sorted within each side, so it is a two-finger merge, `matched`/`total` are
+sums, and `running` is the OR. **Ties go to the project**, and that decides the common case rather
+than an edge one: an empty query scores every row identically, and `lib.rs` typed in full matches this
+project's and `serde`'s identically too.
+
+### Telling the rows apart
+
+A library row draws `serde-1.0.229/src/lib.rs` — the package directory prefixed for free by
+`Visitor::item`, so a user can narrow to one crate by typing its name — and a right-aligned dim chip
+carrying `serde 1.0.229`. That is one nullable `PickerRow.source` and not a flag beside a label, so a
+row can never be marked as a library with nothing to show for it. The version is in the chip and not
+in the matched column: it is a label you read to tell two rows apart, not a thing you search for, and
+in the haystack it would make every crate's files match every other crate's version digits. `.source`
+is `flex: none` and `.path` is `flex: 1`, so the path ellipsises first — a path is reconstructible
+from a name and a package, and a package name cut in half is not.
+
+### The chord, and why it is a command
+
+`⌥L` is bound in `cide_core::keymap` under a new `filePickerOpen` context flag, not handled locally
+in the overlay. A local `if (ev.altKey && ev.key === 'l')` would be unrebindable, unlisted and
+undiscoverable — the shape that produces this project's recurring defect. The clause is
+`filePickerOpen` and **not** `overlayOpen`, which is true for any of nine overlays: the gate is a
+window *capture* listener, and ⌥L is `ESC l` to a shell (readline's `downcase-word`), so the wider
+clause would have taken it from every terminal pane in every window whenever a menu happened to be
+up. `ctrl+alt+l` was the obvious alternative and is KDE's Lock Screen on a stock install, so on the
+development platform it never reaches the app.
+
+The footer chip is an `aria-pressed` button (the app's precedent is `SearchPanel`'s; nothing in the
+overlay language uses a checkbox) that commits on `mousedown` with `preventDefault` — a click blurs
+the input between the two events and `ModalShell`'s `selectionchange` listener repaints the caret,
+after which typing stops working. **One element documents the chord and is the mouse target.**
+
+The scope is window-session state in the overlay store: it survives closing and reopening the picker
+within a run, and resets on relaunch, so "disabled by default" stays true in the sense a user checks
+it. Persisting it would make that true exactly once in a user's life and would silently change what
+Ctrl+P costs on every project thereafter.
+
+**Not done.** No end-to-end confirmation on screen — the merge, the chip and the toggle are asserted
+in Rust and in `check:picker`, and nothing in `ui/scripts/` mounts React against a live backend. Go
+projects are **untested at this scale**: `go list -m all` bounds the set the same way, but a Go
+module's directory is the whole module rather than a package, and the numbers above are cargo's alone.
+`.a` and `.so` files and trybuild `.stderr` fixtures are indexed like everything else the walk admits
+(2,829 `.a` files in this dependency set), because a second ignore rule beside `Filter` is a thing
+this codebase resists on principle. The registry is machine-global and immutable, so two open projects
+sharing 500 crates each pay their own 130 ms and ~12 MB; a process-global cache keyed by package
+directory is the obvious later move. And `Matcher::dirty()` is still an orphan — declared,
+implemented, and called by nothing in the workspace, not even a test. That is pre-existing and
+unrelated, and it is recorded here because it was found on the way through.
 
 ## Speed search in both sidebar trees (M15)
 
@@ -980,6 +1529,41 @@ a root in full — sources, `bin/`, `lib/`, everything, since nothing under a ru
 be written by an editor. `$GOROOT` joins it when it is set, which it usually is not; Go's std
 therefore stays writable on most machines, and that is stated rather than hidden.
 
+**And a read-only buffer could not be focused at all, which killed the entire editor keymap in
+it.** (M16) Reported as *"Ctrl+F opens no find bar in a std-library file"*; the find bar was never
+the problem. `findExtensions()` is unconditional in `EditorSurface`'s extension list, and
+right-click **Code ▸ Find…** opened the bar in those buffers the whole time. The cause is one
+missing attribute: `EditorView.editable.of(false)` gives `.cm-content` `contenteditable="false"`,
+such an element with **no `tabindex` is not focusable**, and CodeMirror registers every DOM handler
+— `keydown` included — on `contentDOM`. Events bubble up, so the listener never fired. Clicking the
+buffer focused `.cm-scroller` (contentDOM's *parent*, which carries `tabIndex = -1`) instead, and
+every `view.focus()` in the codebase was a no-op against it.
+
+So it was never one chord. `Mod-f`, `F3`/`Shift-F3`, `Mod-d`, `Mod-Shift-l`, `Escape`, `Alt+Enter`
+(*send lines to Claude*) and **the whole of `defaultKeymap`** — arrows, Home/End, PageUp/PageDown,
+`Mod-a` — were dead in every library and toolchain buffer. It read as alive because `.cm-scroller`
+is the focused overflowing element, so those keys still scrolled the pane; what was actually missing
+was the **caret**, which the base theme hides outside `.cm-focused`. And `view.hasFocus` is
+`activeElement == contentDOM`, so it was permanently false — which is why the update listener's two
+slot re-claims never fired, and why Ctrl+G, Ctrl+F12, ⌥F7, Ctrl+B and Back all acted on whichever
+*editable* file was touched last while the status bar went on naming it.
+
+The fix is `EditorView.contentAttributes.of({ tabindex: '0' })` beside the `editable` facet, which
+merges over the computed attributes and leaves `contenteditable="false"` alone. Dropping
+`editable.of(false)` would also work and loses: it makes `.cm-content` a root editable element
+again, which is exactly what `codeMenu.tsx`'s focus-restore note relies on read-only buffers not
+being, and it puts an IME and a native caret in a document that cannot change. Binding `ctrl+f` in
+`cide-core::keymap` fights `nothing_binds_the_find_bars_f_keys` and would have fixed one chord out
+of twenty. `check:editor` asserts the pairing inside the `if (readOnly)` block, on
+comments-stripped source, because that file now argues about tabindex at length.
+
+**Still unmet:** the same shape exists on the `a` side of `panes/DiffPane.tsx`, where it is
+*deliberate* — "a click does not place a caret in a document that cannot be changed" — so Ctrl+F in
+a split diff still only works after clicking the right-hand side. That is a separate decision and
+was not folded in here. And the end-to-end confirmation (open a toolchain path, click, assert
+`document.activeElement` is `.cm-content` and `.cm-editor` carries `cm-focused`) needs a display and
+belongs in the `CIDE_AUDIT_PANES=1` harness; no check script anywhere constructs an `EditorView`.
+
 **Not done.** *Reveal in File Manager* is disabled for a row outside the project rather than
 relaxing `fs_show_in_manager`'s containment check; the resolver has no timeout (`--frozen` and
 `GOPROXY=off` make the network impossible, so the only unbounded wait left is cargo's own
@@ -1009,6 +1593,28 @@ wrapped. `Ctrl+G` is Go to line, which **takes find-next away from that chord in
 `F3` is find-next now, `Ctrl+Shift+G` is still find-previous, and one line of `keymap.json` —
 `{"key":"ctrl+g","command":"-navigate.line","when":"editorFocused"}` — gives CodeMirror's `Mod-g`
 back. The `when` is not optional in that line and the test named after it says why.
+
+**And what `Alt+Up`/`Alt+Down` cost was a comment, not a compensation.** `keymap.rs` has claimed
+since M12 that "`EditorSurface` re-homes `moveLineUp`/`moveLineDown` to `Mod-Shift-Arrow` — IDEA's
+own chord for the same thing — which is free in both layers, so a capability moves rather than
+disappearing." Both halves were false and it took until M16 to check: `grep moveLineUp ui/src`
+returned nothing, so move-line-up/down had simply been gone from every buffer since the member walk
+claimed Alt+Arrow — with no palette row and no menu item either; and `Mod-Shift-Arrow` is *not* free
+on macOS, where `standardKeymap`'s `{ mac: 'Cmd-ArrowUp', shift: selectDocStart }` claims ⌘⇧↑. The
+binding exists now, spelled `Mod-Shift-Arrow` off macOS and `Mod-Alt-Shift-Arrow` on it, and
+`check:editor` **computes** the freedom of both — expanding the composed CodeMirror keymap the way
+CodeMirror expands it, `shift:` sub-bindings and `mac:` overrides included — rather than trusting
+the documentation, since trusting the documentation is what produced the sentence being replaced.
+`check:keys` holds the other end: the re-homed chord is read out of `EditorSurface.tsx` and asserted
+**unbound in `cide_core::keymap`**, on both layers, because the gate is a window capture listener
+and a `ctrl+shift+up` added there next year would delete the capability a second time in exactly
+the way it was deleted the first — with no conflict visible to either side alone.
+
+**Still chord-only.** Move line up/down has a key and nothing else: no palette row, no *Code* menu
+item. `moveLineUp` is a `@codemirror/commands` function, not a `cide-core::commands` id, and giving
+it one means an id, a `when`, a dispatch arm and a route from `keys/dispatch.ts` into a specific
+pane's `EditorView` — which is the seam `paneHosts.ts` exists to keep closed. Named here rather than
+half-built, since naming a cost and then not paying it is the failure this whole section is about.
 
 **Verified against real servers.** `cargo test -p cide-lsp -- --ignored` drives the real binaries;
 **CI does not run it**, so run it by hand after touching that crate. All seven pass — `gopls`
@@ -1124,11 +1730,46 @@ IDEA's own `Ctrl+Alt+Left/Right` is not free here — `ctrl+alt+right` is `pane.
 KDE both are usually the compositor's virtual-desktop shortcuts — and `alt+left`/`alt+right` are
 readline word-motion the window capture listener would take from every terminal.
 
-**Only an explicit navigation is recorded**, and the list of what deliberately is *not* is in
-`ui/src/editor/navHistory.ts`: typing and arrow keys, scrolling, find-as-you-type, the
-`Alt+Up`/`Alt+Down` member walk (a held key, so ten presses would be ten entries), switching between
-already-open tabs, edits, and a Back/Forward move itself. A history that records caret moves is what
-makes Back useless.
+**Only an explicit navigation is recorded — and, since M16, a far pointer click.** The list of what
+deliberately is *not* is in `ui/src/editor/navHistory.ts`: typing and arrow keys, scrolling,
+find-as-you-type, the `Alt+Up`/`Alt+Down` member walk (a held key, so ten presses would be ten
+entries), switching between already-open tabs, edits, and a Back/Forward move itself. A history that
+records caret moves is what makes Back useless.
+
+The pointer was the **one input device that moved the caret and wrote nothing**, which left Back
+empty for anyone who navigates by pointing and Forward empty for everyone — Forward only fills once
+you have gone Back. `navHistory.ts`'s header had predicted the complaint and written down why the
+entry was missing; the objection was that the rule would have to live inside `EditorSurface`, which
+is documented as pure. It was answered by moving the *rule* rather than the component:
+`recordsClick` is in the import-free module `check:editor` already compiles standalone, and
+`navRecorder.ts` is a `ViewPlugin` that reads four facts off a `ViewUpdate` and asks. A click
+records when it is a **single empty selection**, from a `select.pointer` transaction, with no
+document change, landing **more than 25 lines away or in another file**. So a drag records at most
+the one entry its `mousedown` earns; a double-click, a triple-click, a shift-click and an Alt+click
+multi-caret record nothing; and clicking about inside the function you are reading — by far the most
+common click there is — is not going anywhere. Twenty-five must exceed the merge distance of three,
+or `record` would collapse every entry the rule produced.
+
+Two orderings make it work and both compile backwards. CodeMirror runs plugin updates **before**
+update listeners, which is what lets the recorder read `caretTrack`'s slot before `EditorSurface`'s
+listener hands it to the editor being clicked into — so a click from one pane into another records
+the pane you left. And `jump.ts::recordClick` **takes** the origin rather than reading one: read it
+a listener later and the origin is the destination, `near` merges them, and the feature is a silent
+no-op. The recorder falls back to `update.startState` whenever the live caret is already in this
+file, so if that CodeMirror ordering ever changes the cost is a *missing* entry, never a wrong one.
+
+Two consequences, stated rather than left to be met on screen. **The first click after Ctrl+Tab
+records the tab you came from**, however little it moved the caret: `caretTrack`'s claims are
+released on unmount and an inactive tab is never unmounted, so the slot still names the old file
+until something in the new tab takes focus. The switch alone still records nothing — what records
+is a pointer landing in a document the caret was not in, which is the rule applied exactly, and it
+is what makes Back after a tab switch go somewhere. And **clicking to and fro between two panes of
+a split fills the stack with the alternation**, one entry per crossing, because two different files
+are never `near` each other; `NAV_CAP` is 50 and that is now a number a session can actually reach.
+Both are IDEA's behaviour. The alternative — take the origin from the clicked pane's own previous
+caret instead of the slot — is more consistent with "a tab switch is not a jump" and loses twice:
+it breaks the split case the feature is for, and it makes Back from a click disagree with Back from
+Go to definition about what an origin is.
 
 **Unmet, and written here rather than left to be found.** The navigation history is **per JavaScript
 realm and session-scoped**: a detached-pane window keeps its own (always empty, since such a window

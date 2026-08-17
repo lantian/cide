@@ -53,8 +53,14 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { exitMarkerText, exitMarkerBytes, showsCode, markFor, isRecoverableSessionError } =
-    await import(`file://${join(out, 'exitMarker.js')}`)
+  const {
+    exitMarkerText,
+    exitMarkerBytes,
+    showsCode,
+    markFor,
+    isRecoverableSessionError,
+    spawnFailureText,
+  } = await import(`file://${join(out, 'exitMarker.js')}`)
 
   // --- the distinction the Rust side exists to preserve --------------------------------
   //
@@ -168,6 +174,29 @@ try {
     false,
     'a child that cannot be spawned at all is not fixed by spawning it again',
   )
+  // M16. The configured Claude binary cannot be executed — a typo in Settings, a path that
+  // moved, a `~/.local/bin` that is not on this app's PATH. It kills *every* pane at once, so
+  // it is the one spawn failure a user is most likely to meet, and a pane that retried it would
+  // spin against a value only the user can change.
+  {
+    const problem = {
+      kind: 'noClaudeBinary',
+      message: '“cluade” is not on this app\'s PATH. Settings → Claude sessions → Binary.',
+    }
+    eq(
+      isRecoverableSessionError(problem),
+      false,
+      'a configured binary that cannot be executed is not fixed by trying again — the value is '
+        + 'the user’s to correct, and a retry loop would hide the sentence that says so',
+    )
+    eq(
+      spawnFailureText(problem),
+      problem.message,
+      'and its written sentence reaches the pane verbatim. That is the whole reason the variant '
+        + 'needs no frontend change: `TerminalPane` writes this into the failing pane’s own '
+        + 'transcript, so the user reads it where the failure happened',
+    )
+  }
   for (const other of [null, undefined, 'no such session', new Error('no such session'), 7]) {
     eq(
       isRecoverableSessionError(other),

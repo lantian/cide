@@ -73,6 +73,32 @@ function rustDefaults() {
   return [...two, ...three]
 }
 
+/**
+ * The bindings `platform_layer` **pushes** — the macOS-only additions, not the rewrites.
+ *
+ * A second reader beside `rustDefaults` rather than a wider regex over the whole file, because
+ * the two answer different questions and share none of their shape: `defaults()` is a table of
+ * tuples, and this is a run of `out.push(Binding::new(...))` calls after a rewrite loop. Reading
+ * them together would make a rewritten binding indistinguishable from a pushed one, and the
+ * difference is the whole point of the ⌘[ note in `keymap.rs`.
+ *
+ * Sliced from `fn platform_layer` to the next top-level `fn`, so the `Binding::new` calls in
+ * that file's *tests* — which name several of these same chords — cannot be read as shipping
+ * code. A gate that reads a fixture measures the fixture.
+ */
+function rustPlatformPushes() {
+  const path = fileURLToPath(new URL('../../crates/cide-core/src/keymap.rs', import.meta.url))
+  const source = readFileSync(path, 'utf8')
+  const start = source.indexOf('fn platform_layer(macos: bool) -> Vec<Binding> {')
+  if (start < 0) throw new Error(`could not find platform_layer in ${path}`)
+  const end = source.indexOf('\n}\n', start)
+  const body = source.slice(start, end)
+  return [...body.matchAll(/Binding::new\("([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({
+    key: m[1],
+    command: m[2],
+  }))
+}
+
 const out = mkdtempSync(join(tmpdir(), 'cide-keys-'))
 let failed = 0
 
@@ -230,6 +256,13 @@ try {
     // `KeyG` is in the sweep below, so both entry points are held to agreeing about it — and to
     // *passing it through* in a terminal-focused context, which is the half that matters.
     { key: 'ctrl+g', command: 'navigate.line', when: 'editorFocused' },
+    // M16. The file picker's library scope. `filePickerOpen` and not `overlayOpen`, and the
+    // difference is the whole reason that flag was added: ⌥L is `ESC l` to a shell — readline's
+    // `downcase-word` — so a binding scoped to *any* overlay would have the window capture
+    // listener eat it in a terminal pane whenever a menu or a palette happened to be up. `KeyL`
+    // is in the sweep below, so both entry points are held to agreeing about it, and to leaving
+    // it alone in every context that is not this one.
+    { key: 'alt+l', command: 'picker.libraries', when: 'filePickerOpen' },
     // The mouse's thumb buttons, as pseudo-keys. Unscoped, unlike every other M12 binding: a
     // thumb button is pressed wherever the pointer is, which in this app is most often over a
     // terminal — and unlike ⌃B or ⌃G there is nothing to take away, since no shell reads GDK
@@ -1572,6 +1605,155 @@ try {
      * fails on any gap; this line survives as the smoke test for that script's premise.
      */
     ok(dispatched.has('file.saveAll'), 'file.saveAll is dispatched (palette-only, no binding)')
+  }
+
+  /* ------------------------------------------------------------------------------------
+   * M16: the chords `EditorSurface` re-homes must stay unbound in the app keymap.
+   *
+   * # The conflict neither side can see alone
+   *
+   * `defaultKeymap` binds `Alt-ArrowUp`/`Alt-ArrowDown` to move-line, and this app's keymap
+   * takes `alt+up`/`alt+down` for `navigate.prevMember`/`navigate.nextMember`. The gate is a
+   * window *capture* listener, so it resolves the stroke and swallows it **before** CodeMirror
+   * is offered the event: move-line was simply gone from every buffer, in every window, with a
+   * comment in `keymap.rs` claiming `EditorSurface` compensated for it and `grep moveLineUp
+   * ui/src` returning nothing. That comment had been wrong since M12.
+   *
+   * `EditorSurface` now re-homes both to `Mod-Shift-Arrow` (and `Mod-Alt-Shift-Arrow` on
+   * macOS). The compensation is only worth anything while those chords stay free, and **no
+   * existing gate can see that**: `the_default_keymap_has_no_conflicts` sees one table,
+   * `check-editor.mjs` sees the other, and neither knows the other exists. A `ctrl+shift+up`
+   * added to `defaults()` next year deletes move-line a second time in exactly the way it was
+   * deleted the first.
+   *
+   * Both sides are folded through `normalizeSequence` rather than compared as literals. That is
+   * not defensive: this side builds a stroke in its own modifier order (`alt+shift+meta+up`)
+   * and a Rust author writes `meta+alt+shift+up`, so a literal `includes('Binding::new("…"')`
+   * goes green against the very binding it forbids. It did, in the first draft.
+   * ---------------------------------------------------------------------------------- */
+  {
+    const surfacePath = fileURLToPath(
+      new URL('../src/editor/EditorSurface.tsx', import.meta.url),
+    )
+    // Comments stripped, and load-bearing: the paragraph beside those two bindings names both
+    // chords and both command names at length, so a grep over raw source finds the feature's
+    // *explanation* after the feature has been deleted.
+    const surface = readFileSync(surfacePath, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+
+    /**
+     * CodeMirror's chord spelling as this app's stroke, for a given platform.
+     *
+     * `Mod` is Ctrl off macOS and Cmd on it — which is the entire reason the mac spelling is
+     * different and the entire reason both have to be checked. `normalizeSequence` then orders
+     * the modifiers and folds the key name, so the two sides are compared in one vocabulary.
+     */
+    const asStroke = (chord, mac) =>
+      normalizeSequence(
+        chord
+          .split('-')
+          .map((part) => {
+            if (part === 'Mod') return mac ? 'meta' : 'ctrl'
+            if (part === 'Cmd') return 'meta'
+            if (/^Arrow/.test(part)) return part.slice(5).toLowerCase()
+            return part.toLowerCase()
+          })
+          .join('+'),
+      )
+
+    const rehomed = [
+      ...surface.matchAll(
+        /\{\s*key:\s*'([^']+)'\s*,\s*mac:\s*'([^']+)'\s*,\s*run:\s*(\w+)\s*\}/g,
+      ),
+    ].map((m) => ({ key: m[1], mac: m[2], run: m[3] }))
+
+    ok(
+      rehomed.length > 0,
+      'EditorSurface re-homes at least one command taken by the app keymap. Every assertion ' +
+        'below is vacuous without one, and the state this whole block exists for is exactly ' +
+        'the state where the re-homing has been deleted and its paragraph left behind',
+    )
+
+    const boundIn = (bindings, stroke) => {
+      const hit = bindings.find((b) => normalizeSequence(b.key) === stroke)
+      return hit === undefined ? null : hit.command
+    }
+    const defaults = rustDefaults()
+
+    for (const { key, mac, run } of rehomed) {
+      const linux = asStroke(key, false)
+      eq(
+        boundIn(defaults, linux),
+        null,
+        `${linux} (${run}, re-homed from a chord the app keymap took) is unbound in ` +
+          'cide_core::keymap::defaults() — bind it there and the capture listener eats the ' +
+          'keystroke before CodeMirror is asked, which is how move-line disappeared the first ' +
+          'time',
+      )
+
+      /*
+       * The macOS spelling, and it has two ways of becoming bound rather than one.
+       *
+       * `platform_layer` rewrites **every** `ctrl+…` default to `meta+…` blanket, so a chord
+       * bound off macOS reappears as its meta form on it. Checking only the explicit pushes
+       * would miss that entirely — which is a whole class of collision that exists on exactly
+       * one platform and on nobody's development machine.
+       */
+      const macStroke = asStroke(mac, true)
+      const preimage = macStroke.replace(/\bmeta\b/, 'ctrl')
+      eq(
+        boundIn(defaults, normalizeSequence(preimage)),
+        null,
+        `nor does the macOS layer produce ${macStroke} by rewriting ${normalizeSequence(preimage)} — ` +
+          'that rewrite is blanket, so a ctrl chord bound off macOS reappears as a meta chord on it',
+      )
+      eq(
+        boundIn(rustPlatformPushes(), macStroke),
+        null,
+        `${macStroke} (${run}) is not pushed by platform_layer either`,
+      )
+    }
+  }
+
+  /* ------------------------------------------------------------------------------------
+   * M16: ⌘[ and ⌘] reach the macOS layer.
+   *
+   * Added to the layer rather than produced by it, because the ctrl spelling cannot exist:
+   * Ctrl+[ **is** the ESC byte on every terminal ever made, and this gate is a capture
+   * listener, so `("ctrl+[", "navigate.back")` in `defaults()` would swallow Escape-equivalent
+   * in every terminal pane in every window on Linux. A push is therefore the only shape
+   * available, and a push is the shape a later tidy-up deletes.
+   * ---------------------------------------------------------------------------------- */
+  {
+    const pushes = rustPlatformPushes()
+    for (const [key, command] of [
+      ['meta+bracketleft', 'navigate.back'],
+      ['meta+bracketright', 'navigate.forward'],
+    ]) {
+      const hit = pushes.find((b) => normalizeSequence(b.key) === key)
+      eq(
+        hit?.command ?? null,
+        command,
+        `the macOS platform layer binds ${key} to ${command}`,
+      )
+      /*
+       * A convention rather than a correctness requirement, and labelled as one.
+       *
+       * `keys/keymap.ts` folds every incoming binding through `normalizeSequence`, so a Rust
+       * author who wrote `meta+[` would still be understood — the two sides would *not*
+       * disagree. What a written bracket costs is findability: `grep bracketleft` over the
+       * repository would then answer for one side only, which is how the two spellings drift
+       * into meaning different things to a reader.
+       */
+      eq(
+        normalizeSequence(hit?.key ?? key),
+        hit?.key ?? key,
+        `and spells it in the normalised vocabulary (${key}), so one grep answers for both ` +
+          'sides. Not a correctness requirement — `keys/keymap.ts` folds every binding it is ' +
+          'handed — a findability one',
+      )
+    }
   }
 
   if (failed > 0) {

@@ -42,15 +42,31 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   const { patch, setTheme, setWindowMode } = useSettingsActions()
 
   /**
-   * The CLI-version verdict, fetched once per mount.
+   * The CLI verdict — can the configured binary be run, and is its version one this build's
+   * protocol was checked against.
    *
-   * The probe behind it is latched in Rust for the life of the process, so this costs one IPC
-   * round trip and never a `claude --version` per render — and the log warning it triggers is
-   * written once however many panes or settings tabs exist. `cliSupport` degrades to a
-   * warning-free value rather than throwing, so a build without the command still draws.
+   * # Re-fetched when the configured binary changes, and that is the whole reason for the dep
+   *
+   * The probe used to be latched in Rust for the life of the process, which was free and
+   * correct while `claude` was a bare name nobody could change. It is a *setting* now: a user
+   * who fixes a typo in the Binary field and reads back the verdict for the binary that
+   * answered ten minutes ago has been told their correction did not work. So the Rust side is
+   * unlatched and per-binary, and this effect re-runs on the value it is about.
+   *
+   * The cost is one `claude --version` — a Node boot, hundreds of milliseconds, on Rust's
+   * blocking pool — per *distinct* binary, not per keystroke: the field commits on blur, so
+   * `settings.claude.cli.binary` changes once per edit rather than once per character.
+   *
+   * `cliSupport` degrades to a verdict-free value rather than throwing, so a build without the
+   * command still draws.
    */
+  // `null` until bootstrap resolves. Read as `undefined` rather than defaulted to `'claude'`,
+  // so the first probe waits for the real value instead of firing once for the default and
+  // again for whatever the user actually configured.
+  const configuredBinary = settings?.claude.cli.binary
   const [cliSupport, setCliSupport] = useState<ClaudeCliSupport | null>(null)
   useEffect(() => {
+    if (configuredBinary === undefined) return
     let live = true
     void claudeTasks.cliSupport().then((support) => {
       if (live) setCliSupport(support)
@@ -58,7 +74,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     return () => {
       live = false
     }
-  }, [])
+  }, [configuredBinary])
 
   /**
    * The log directory, resolved by opening it.

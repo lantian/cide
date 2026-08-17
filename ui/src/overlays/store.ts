@@ -64,6 +64,32 @@ interface OverlayStore {
    * switches to the palette rather than closing, which falls out of comparing the kind.
    */
   toggle: (kind: OverlayKind) => void
+
+  /**
+   * Whether Ctrl+P also searches *External Libraries*. (M16)
+   *
+   * # Window-session state, off at every launch, deliberately not persisted
+   *
+   * The three storage classes and why this is the middle one:
+   *
+   * * **`useState` in `FilePicker`** — too aggressive. The user switches it on, opens the wrong
+   *   file, presses Ctrl+P again, and it is off. Surviving a close-and-reopen within the run is
+   *   what makes the toggle usable at all.
+   * * **Here** — survives the overlay closing, resets on relaunch. "Disabled by default" then
+   *   stays true in the sense a user checks it: they launch cide and it is off.
+   * * **`Settings` / `workspace.json`** — makes "disabled by default" true exactly once in a
+   *   user's life, and silently changes what Ctrl+P costs on every project thereafter. If it is
+   *   ever wanted, the honest shape is `picker.includeLibrariesDefault` — a *default* for new
+   *   sessions with this flag still on top — not a persisted live value. Per-project is worse
+   *   again: a DTO field, a migration and a `workspace_changed` round trip per toggle, for a
+   *   preference that changes several times a minute.
+   *
+   * The *index* is cached on `ProjectFs` independently of this, so at most one library walk
+   * happens per project per process however often this flips.
+   */
+  libraries: boolean
+  setLibraries: (on: boolean) => void
+  toggleLibraries: () => void
 }
 
 export const useOverlays = create<OverlayStore>((set) => ({
@@ -71,6 +97,9 @@ export const useOverlays = create<OverlayStore>((set) => ({
   show: (kind) => set({ open: kind }),
   close: () => set({ open: null }),
   toggle: (kind) => set((state) => ({ open: state.open === kind ? null : kind })),
+  libraries: false,
+  setLibraries: (on) => set({ libraries: on }),
+  toggleLibraries: () => set((state) => ({ libraries: !state.libraries })),
 }))
 
 /** True when any overlay is showing. The `overlayOpen` flag `when` clauses test. */
@@ -102,4 +131,17 @@ export function showOverlay(kind: OverlayKind): void {
 /** Close whatever is open, from outside React. The picker's "I accepted a row" path. */
 export function closeOverlay(): void {
   useOverlays.getState().close()
+}
+
+/**
+ * Is the file picker the overlay showing? The `filePickerOpen` flag `when` clauses test.
+ *
+ * A function of its own beside [`overlayOpen`] rather than a comparison written at the call
+ * site, for the reason that whole flag exists: `overlayOpen` is true for any of nine overlays,
+ * and ⌥L scoped to *that* would be swallowed by the window capture gate while the palette, the
+ * symbol picker or the branch popup was up — where it means nothing and where the keystroke
+ * should pass through to whatever wanted it.
+ */
+export function filePickerOpen(): boolean {
+  return useOverlays.getState().open === 'files'
 }

@@ -47,6 +47,20 @@ pub struct Candidate {
     pub text: String,
     /// What picking it means: an absolute path, a command id. Never shown.
     pub value: String,
+    /// Provenance, for a candidate that did not come from the project. (M16)
+    ///
+    /// Carried on the candidate rather than derived from the path at frame time, because the
+    /// answer is not in the path: `…/registry/src/index.crates.io-6f17/serde-1.0.229/src/de/
+    /// mod.rs` yields `serde-1.0.229` by string surgery and never `serde 1.0.229`, and for the
+    /// SDK row it yields nothing recognisable at all. The resolver already knows; this is where
+    /// it says so once, at injection time, for the life of the candidate.
+    ///
+    /// **Deliberately not part of the matched column.** `NucleoMatcher::push` writes only
+    /// `text` into `columns[0]`, so typing `1.0.229` finds nothing — which is right: a version
+    /// number is a label the user reads to tell two rows apart, not a thing they search for, and
+    /// putting it in the haystack would make every crate's files match every other crate's
+    /// version digits.
+    pub source: Option<String>,
 }
 
 impl Candidate {
@@ -54,7 +68,104 @@ impl Candidate {
         Self {
             text: text.into(),
             value: value.into(),
+            source: None,
         }
+    }
+
+    /// The same, from a package whose name and version the row should carry.
+    pub fn from_source(
+        text: impl Into<String>,
+        value: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            value: value.into(),
+            source: Some(source.into()),
+        }
+    }
+}
+
+/// A frame and the score behind each of its rows. See [`NucleoMatcher::frame_scored`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scored {
+    pub frame: PickerFrame,
+    /// Parallel to `frame.items`, and the same length.
+    pub scores: Vec<u32>,
+}
+
+/// Interleave two scored frames into one, highest score first, project rows winning ties.
+///
+/// # Why a merge rather than a second column on one matcher
+///
+/// Two matchers is forced, for the reason `ProjectFs::symbol_matcher` already documents —
+/// `Matcher::query` holds one query per matcher, so sharing would make each keystroke in one
+/// overlay reset the other — plus one more that is specific to this feature: **nucleo is
+/// append-only**. There is no un-inject. A user who turns *Search libraries* off after turning
+/// it on could not have 32,000 candidates taken back out, and post-filtering a 200-row frame
+/// would break both the row limit and the `6 of 2,418` counter, which come from the snapshot.
+///
+/// # The tie-break is toward the project, and it is load-bearing
+///
+/// Scores collide constantly: an empty query gives every row the same score, and `lib.rs`
+/// typed in full matches this project's and `serde`'s identically. Ties therefore decide the
+/// common case rather than an edge one, and the answer that is right in both is *the user's own
+/// files first* — a picker whose first row for an empty query is somebody else's crate is a
+/// picker that has stopped being about this project.
+///
+/// `matched` and `total` are sums: they describe the candidate set the user is now searching,
+/// which is the whole point of having turned libraries on. `running` is the OR — a frame is
+/// still growing if either side is.
+///
+/// The rows are already sorted within each side, so this is a two-finger merge and not a sort.
+pub fn merge(project: Scored, libraries: Scored, limit: usize) -> PickerFrame {
+    let limit = limit.min(MAX_FRAME);
+    let mut items =
+        Vec::with_capacity(limit.min(project.frame.items.len() + libraries.frame.items.len()));
+
+    let mut left = project
+        .frame
+        .items
+        .into_iter()
+        .zip(project.scores)
+        .peekable();
+    let mut right = libraries
+        .frame
+        .items
+        .into_iter()
+        .zip(libraries.scores)
+        .peekable();
+
+    while items.len() < limit {
+        // `>=`, not `>`: the project side takes the row on a tie. See the note above — with an
+        // empty query every score is equal, so this branch *is* the ordering most of the time.
+        let take_left = match (left.peek(), right.peek()) {
+            (Some((_, l)), Some((_, r))) => l >= r,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        let next = if take_left { left.next() } else { right.next() };
+        match next {
+            Some((row, _)) => items.push(row),
+            None => break,
+        }
+    }
+
+    PickerFrame {
+        items,
+        // Saturating rather than wrapping: the counter is a readout and a wrapped `total` is a
+        // number that reads as a bug. Neither side can realistically reach `u32::MAX` — the
+        // whole cargo registry on this machine is 127,055 files — so this is a guard, not a case.
+        matched: project
+            .frame
+            .matched
+            .saturating_add(libraries.frame.matched),
+        total: project.frame.total.saturating_add(libraries.frame.total),
+        running: project.frame.running || libraries.frame.running,
+        // The project's, not a concatenation: both were parsed from the same string, and the
+        // overlay compares this against what the user has typed to drop a stale frame.
+        query: project.frame.query,
     }
 }
 
@@ -151,6 +262,87 @@ impl NucleoMatcher {
             columns[0] = item.text.as_str().into();
         });
     }
+
+    /// [`Matcher::frame`], with the score of every row it returned.
+    ///
+    /// # Why the scores come back out at all
+    ///
+    /// Ctrl+P can now answer from **two** matchers — the project's and, when the user asks for
+    /// it, the resolved libraries' — and nucleo has no notion of a second source. Merging two
+    /// frames means ordering rows that were scored independently, and the only honest key is
+    /// the score itself. Rescoring on this side would mean a third implementation of the
+    /// ranking (`frame`'s, `rank`'s, and a new one) that could disagree with both.
+    ///
+    /// The score is free: `Pattern::indices` computes and returns it in order to produce the
+    /// highlight offsets, and this method is what stopped throwing it away. Nothing about the
+    /// single-matcher path changed — [`Matcher::frame`] is now one line over this.
+    ///
+    /// The vector is parallel to `frame.items` and the same length. A struct rather than a
+    /// tuple because `(PickerFrame, Vec<u32>)` at a call site reads as neither.
+    pub fn frame_scored(&self, limit: usize) -> Scored {
+        let limit = limit.min(MAX_FRAME);
+        // `query` before `inner`, which is the order `query()` takes them in. Taking them the
+        // other way round deadlocks against a concurrent keystroke; see the lock-order note
+        // on the struct. Holding the guard for the whole frame is also what makes the echoed
+        // query honest: it is the query the pattern below was actually parsed from, not one a
+        // keystroke landing mid-frame has already replaced.
+        let query = self.query.lock();
+        let mut nucleo = self.inner.lock();
+        // 10ms: long enough to finish a small query outright, short enough that the IPC
+        // thread is never held for a frame's worth of time.
+        let status = nucleo.tick(10);
+        self.dirty.store(false, Ordering::Release);
+
+        let snapshot = nucleo.snapshot();
+        let matched = snapshot.matched_item_count();
+        let total = snapshot.item_count();
+        let take = (matched as usize).min(limit) as u32;
+
+        let mut matcher = self.highlight.lock();
+        let pattern = snapshot.pattern().column_pattern(0);
+        let mut indices = Vec::new();
+        let mut scores = Vec::with_capacity(take as usize);
+        let items: Vec<PickerRow> = snapshot
+            .matched_items(..take)
+            .map(|item| {
+                indices.clear();
+                // The score `indices` has always returned and this call has always thrown away.
+                // Free — the pattern is scored to produce the offsets either way — and it is
+                // what [`merge`] needs to interleave two matchers' frames without rescoring.
+                //
+                // `None` cannot happen here: these items are the snapshot's *matched* ones, so
+                // the pattern matched them a moment ago. Zero is the honest fallback if nucleo
+                // ever disagrees with itself — it sorts the row last rather than dropping it.
+                let score = pattern
+                    .indices(
+                        item.matcher_columns[0].slice(..),
+                        &mut matcher,
+                        &mut indices,
+                    )
+                    .unwrap_or(0);
+                indices.sort_unstable();
+                indices.dedup();
+                scores.push(score);
+                PickerRow {
+                    text: item.data.text.clone(),
+                    value: item.data.value.clone(),
+                    indices: indices.clone(),
+                    source: item.data.source.clone(),
+                }
+            })
+            .collect();
+
+        Scored {
+            frame: PickerFrame {
+                items,
+                matched,
+                total,
+                running: status.running,
+                query: query.clone(),
+            },
+            scores,
+        }
+    }
 }
 
 impl Matcher for NucleoMatcher {
@@ -187,55 +379,8 @@ impl Matcher for NucleoMatcher {
     }
 
     fn frame(&self, limit: usize) -> PickerFrame {
-        let limit = limit.min(MAX_FRAME);
-        // `query` before `inner`, which is the order `query()` takes them in. Taking them the
-        // other way round deadlocks against a concurrent keystroke; see the lock-order note
-        // on the struct. Holding the guard for the whole frame is also what makes the echoed
-        // query honest: it is the query the pattern below was actually parsed from, not one a
-        // keystroke landing mid-frame has already replaced.
-        let query = self.query.lock();
-        let mut nucleo = self.inner.lock();
-        // 10ms: long enough to finish a small query outright, short enough that the IPC
-        // thread is never held for a frame's worth of time.
-        let status = nucleo.tick(10);
-        self.dirty.store(false, Ordering::Release);
-
-        let snapshot = nucleo.snapshot();
-        let matched = snapshot.matched_item_count();
-        let total = snapshot.item_count();
-        let take = (matched as usize).min(limit) as u32;
-
-        let mut matcher = self.highlight.lock();
-        let pattern = snapshot.pattern().column_pattern(0);
-        let mut indices = Vec::new();
-        let items = snapshot
-            .matched_items(..take)
-            .map(|item| {
-                indices.clear();
-                pattern.indices(
-                    item.matcher_columns[0].slice(..),
-                    &mut matcher,
-                    &mut indices,
-                );
-                indices.sort_unstable();
-                indices.dedup();
-                PickerRow {
-                    text: item.data.text.clone(),
-                    value: item.data.value.clone(),
-                    indices: indices.clone(),
-                }
-            })
-            .collect();
-
-        PickerFrame {
-            items,
-            matched,
-            total,
-            running: status.running,
-            query: query.clone(),
-        }
+        self.frame_scored(limit).frame
     }
-
     fn clear(&self) {
         let mut nucleo = self.inner.lock();
         // `restart(true)` invalidates every outstanding injector, so a fresh one has to be
@@ -289,6 +434,12 @@ pub fn rank(query: &str, items: &[Candidate], limit: usize) -> PickerFrame {
                 text: item.text.clone(),
                 value: item.value.clone(),
                 indices: indices.clone(),
+                // Carried through from the candidate rather than hardcoded `None`, so this path
+                // says the same thing as the streaming one. In practice every caller of `rank`
+                // is the command palette, whose candidates have no provenance — but a `None`
+                // written here would be a silent second rule, and the day something else ranks a
+                // fixed list of library files it would lose the chip with no symptom.
+                source: item.source.clone(),
             }
         })
         .collect();
@@ -507,5 +658,175 @@ mod tests {
         let complete = settle(&matcher, 20);
         assert_eq!(complete.total, 100_000);
         assert_eq!(complete.matched, 100_000);
+    }
+
+    // --- M16: two matchers, one frame ---------------------------------------------------
+
+    /// Settle a matcher and hand back the scored frame the merge is built from.
+    fn scored(matcher: &NucleoMatcher, limit: usize) -> Scored {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let scored = matcher.frame_scored(limit);
+            if !scored.frame.running || Instant::now() > deadline {
+                return scored;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn library(texts: &[&str], source: &str) -> NucleoMatcher {
+        let matcher = NucleoMatcher::new();
+        matcher.extend(
+            &mut texts
+                .iter()
+                .map(|t| Candidate::from_source(*t, format!("/reg/{t}"), source)),
+        );
+        matcher
+    }
+
+    /// The score `Pattern::indices` returns and `frame` used to throw away.
+    ///
+    /// Asserted as a *property* rather than against a number: nucleo's bonus table is its own
+    /// business and pinning a literal here would fail on the next release of a crate this
+    /// project cannot upgrade anyway. What has to be true is that the vector is parallel to the
+    /// rows and ordered the way the rows are, because [`merge`] is a two-finger merge and reads
+    /// it as already-sorted.
+    #[test]
+    fn a_scored_frame_carries_one_ordered_score_per_row() {
+        let matcher = NucleoMatcher::new();
+        matcher
+            .extend(&mut candidates(&["src/main.rs", "src/lib.rs", "docs/readme.md"]).into_iter());
+        matcher.query("srmn");
+        let scored = scored(&matcher, 10);
+        assert_eq!(scored.scores.len(), scored.frame.items.len());
+        assert!(!scored.scores.is_empty());
+        assert!(
+            scored.scores.windows(2).all(|w| w[0] >= w[1]),
+            "nucleo hands back its matches best-first, and `merge` reads them that way: {:?}",
+            scored.scores
+        );
+    }
+
+    #[test]
+    fn a_library_candidate_carries_its_package_and_a_project_one_does_not() {
+        let project = NucleoMatcher::new();
+        project.extend(&mut candidates(&["src/lib.rs"]).into_iter());
+        project.query("lib");
+        let libs = library(&["serde-1.0.229/src/lib.rs"], "serde 1.0.229");
+        libs.query("lib");
+
+        let frame = merge(scored(&project, 10), scored(&libs, 10), 10);
+        let sources: Vec<Option<String>> = frame.items.iter().map(|r| r.source.clone()).collect();
+        assert_eq!(
+            sources,
+            vec![None, Some("serde 1.0.229".to_string())],
+            "one nullable field carries both the flag and the label, so a row can never be \
+             marked as a library with nothing to show for it"
+        );
+    }
+
+    /// The tie-break, which decides the *common* case rather than an edge one.
+    ///
+    /// An empty query scores every candidate identically, and `lib.rs` typed in full matches
+    /// this project's and serde's identically too. A picker whose first row is somebody else's
+    /// crate has stopped being about the project the user has open.
+    #[test]
+    fn the_project_wins_a_tie() {
+        let project = NucleoMatcher::new();
+        project.extend(&mut candidates(&["src/lib.rs"]).into_iter());
+        let libs = library(&["serde-1.0.229/src/lib.rs"], "serde 1.0.229");
+
+        for query in ["", "lib.rs"] {
+            project.query(query);
+            libs.query(query);
+            let frame = merge(scored(&project, 10), scored(&libs, 10), 10);
+            assert_eq!(
+                frame.items.first().map(|r| r.source.clone()),
+                Some(None),
+                "the user's own file comes first for query {query:?}"
+            );
+        }
+    }
+
+    /// Ordering across the seam, when the scores really do differ.
+    #[test]
+    fn a_better_library_match_outranks_a_worse_project_one() {
+        let project = NucleoMatcher::new();
+        project.extend(&mut candidates(&["a/b/c/deserialize_something_else.rs"]).into_iter());
+        let libs = library(&["serde-1.0.229/src/de.rs"], "serde 1.0.229");
+        project.query("de.rs");
+        libs.query("de.rs");
+
+        let frame = merge(scored(&project, 10), scored(&libs, 10), 10);
+        assert_eq!(
+            frame.items[0].text, "serde-1.0.229/src/de.rs",
+            "the merge is by score and not by side; a side-first order would bury an exact \
+             match under every fuzzy one the project happens to have"
+        );
+    }
+
+    #[test]
+    fn the_counts_are_sums_and_running_is_the_or() {
+        let project = NucleoMatcher::new();
+        project.extend(&mut candidates(&["a.rs", "b.rs"]).into_iter());
+        let libs = library(&["serde-1.0.229/src/lib.rs"], "serde 1.0.229");
+        project.query("rs");
+        libs.query("rs");
+
+        let mut left = scored(&project, 10);
+        let right = scored(&libs, 10);
+        assert!(!left.frame.running);
+        assert!(!right.frame.running);
+        let settled = merge(left.clone(), right.clone(), 10);
+        assert_eq!(
+            settled.total, 3,
+            "the user is searching both sets, so both are counted"
+        );
+        assert_eq!(settled.matched, 3);
+        assert!(!settled.running);
+
+        // One side still filling keeps the overlay polling. Believing a `false` here is how the
+        // picker once left a user an empty list over a repository that was mid-walk.
+        left.frame.running = true;
+        assert!(merge(left, right, 10).running);
+    }
+
+    /// The limit is the *merged* limit, not the limit per side.
+    #[test]
+    fn the_merge_truncates_to_one_limit_rather_than_two() {
+        let project = NucleoMatcher::new();
+        project.extend(&mut candidates(&["a1.rs", "a2.rs", "a3.rs"]).into_iter());
+        let libs = library(
+            &["serde-1.0.229/src/a4.rs", "serde-1.0.229/src/a5.rs"],
+            "serde 1.0.229",
+        );
+        project.query("a");
+        libs.query("a");
+
+        let frame = merge(scored(&project, 50), scored(&libs, 50), 4);
+        assert_eq!(frame.items.len(), 4);
+        assert_eq!(
+            frame.matched, 5,
+            "and the counter still names everything that matched, not what fitted"
+        );
+    }
+
+    /// An empty other side is the ordinary case — libraries off, or a project with no
+    /// dependencies — and must not cost a row.
+    #[test]
+    fn merging_with_an_empty_side_changes_nothing_about_the_rows() {
+        let project = NucleoMatcher::new();
+        project.extend(&mut candidates(&["src/main.rs", "src/lib.rs"]).into_iter());
+        project.query("rs");
+        let empty = NucleoMatcher::new();
+        empty.query("rs");
+
+        let alone = scored(&project, 10);
+        let merged = merge(scored(&project, 10), scored(&empty, 10), 10);
+        assert_eq!(
+            merged.items, alone.frame.items,
+            "same rows, same order, whichever way round the feature is switched"
+        );
+        assert_eq!(merged.total, alone.frame.total);
     }
 }

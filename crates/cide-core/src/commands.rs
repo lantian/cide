@@ -112,6 +112,11 @@ pub const CONTEXT_FLAGS: &[&str] = &[
     "shellWindow",
     // Host flags: transient chrome that only the React tree knows about.
     "overlayOpen",
+    // Narrower than `overlayOpen`, which is true for any of nine overlays. A binding scoped to
+    // this one reaches the keyboard only while Ctrl+P's list has it, which is what lets ⌥L be
+    // free everywhere else — including in every terminal pane in every window, where the gate
+    // is a *capture* listener and would otherwise swallow it.
+    "filePickerOpen",
     "contextMenuOpen",
     "sidebarFiles",
     "sidebarGit",
@@ -779,6 +784,30 @@ fn build() -> Vec<Command> {
         .keywords(&["method", "function", "up"]),
         // View.
         Command::new("picker.files", "Go to file", VIEW).when("projectOpen"),
+        /*
+         * The file picker's library scope. (M16)
+         *
+         * # Why this is a command and not an `if (ev.altKey)` in the overlay
+         *
+         * Because a local key handler is unrebindable, unlisted and undiscoverable — the exact
+         * shape that produces this project's most-repeated defect. Going through the registry
+         * costs one entry here, one `when` flag, one default binding and one `case` in
+         * `dispatch.ts`, and buys a palette row, a rebindable chord and a `check:commands` that
+         * fails if any of the four is missing.
+         *
+         * # `projectOpen`, not `filePickerOpen`
+         *
+         * The two clauses do different jobs and this one is the *palette's*. `filePickerOpen`
+         * gates the keyboard — see the binding in `keymap.rs` — because ⌥L must not be taken
+         * from a terminal pane in every window. The palette is a different surface: the picker
+         * and the palette cannot both be open, so a `when("filePickerOpen")` here would make
+         * the row permanently unlistable. From the palette the command sets the scope for the
+         * *next* Ctrl+P, which is a useful thing to be able to do and the reason the row exists
+         * at all.
+         */
+        Command::new("picker.libraries", "Search External Libraries too", VIEW)
+            .when("projectOpen")
+            .keywords(&["dependencies", "crates", "vendor", "registry", "sources"]),
         // `picker.symbols` is the id `crates/cide-core/src/keymap.rs`'s own fixture already
         // reached for before this existed. Ids are API — using the name the codebase had already
         // chosen costs nothing and means one fewer spelling in the world.

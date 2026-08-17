@@ -21,4 +21,24 @@ value: string,
  * characters and diverge for an emoji, so highlight against `Array.from(text)` rather
  * than `text[i]`.
  */
-indices: Array<number>, };
+indices: Array<number>, 
+/**
+ * Where this row came from, when it did not come from the project. (M16)
+ *
+ * `Some("serde 1.0.229")` for a file inside an *External Libraries* package, `None` for a
+ * project file and for every row `picker_rank` produces (the command palette, which has no
+ * provenance to speak of).
+ *
+ * # One nullable field rather than a flag and a label
+ *
+ * The failure this exists for is two rows reading `RS  lib.rs  src/lib.rs`, one of them
+ * this project's and one of them `serde`'s — the request's own words were "open the wrong
+ * `lib.rs`". A boolean `library: bool` would let the frontend draw a row *marked* as a
+ * library with nothing to say about which one, and a separate `package: Option<String>`
+ * beside it would let the two disagree. One field carries both facts and cannot.
+ *
+ * It is the package's *display* string — name and version, exactly as the tree's own row
+ * draws it — and not a path. A path here would be the registry directory, which is what
+ * `value` already carries and what nobody can read at 620px.
+ */
+source?: string, };

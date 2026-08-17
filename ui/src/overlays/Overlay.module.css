@@ -473,3 +473,73 @@
   color: var(--faint);
   font-size: 11.5px;
 }
+
+/* --- M16: the file picker's library scope --- */
+
+/*
+ * The footer's scope chip. Built from `.footerKey`'s vocabulary rather than beside it, so the
+ * chord reads as the same kind of thing as the four hints to its left — it *is* one, with a
+ * mouse target wrapped round it.
+ *
+ * `line-height` and not `height`, so the chip sits on the footer's own baseline whatever the
+ * 30px row does; a fixed height here made it float half a pixel above `⌥⏎ send path to Claude`.
+ */
+.scope {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 0 6px;
+  line-height: 18px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--faint);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.scope:hover {
+  color: var(--dim);
+  border-color: var(--dim);
+}
+
+/*
+ * Lit. Both the border and the text move, deliberately: this control's whole job is to be
+ * readable at a glance from the corner of the eye while the user is typing in the field above,
+ * and a border-only change at 11px is not.
+ */
+.scopeOn,
+.scopeOn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.scopeOn .footerKey {
+  color: var(--accent);
+}
+
+/*
+ * The row's provenance chip — `serde 1.0.229`.
+ *
+ * Right-aligned and dim, after the path. It is the field that tells two rows reading
+ * `RS lib.rs src/lib.rs` apart, which is the failure the whole library scope has to avoid, so
+ * it must not be the thing that ellipsises: `.path` is `flex: 1` and shrinks first, and this is
+ * `flex: none`. A path is reconstructible from the name and the package; a package name that
+ * has been cut in half is not.
+ */
+.source {
+  flex: none;
+  margin-left: auto;
+  padding-left: 10px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.rowSelected .source {
+  color: var(--dim);
+}

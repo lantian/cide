@@ -1238,9 +1238,15 @@ mod tests {
     /// `connect_button_press_event` in order to explain what wry does with it. Without this the
     /// only way to keep the test green would be to stop writing the explanation down.
     ///
-    /// Deliberately small: block comments, line comments, and enough string-literal awareness
-    /// that a `"//"` inside a string does not eat the rest of the line. It is not a Rust lexer
-    /// and does not need to be — it runs over one file in this crate.
+    /// The implementation moved to [`crate::srcgrep`] when `lifecycle.rs` needed the same thing
+    /// for the run loop's exit arms. It is imported rather than copied for the ordinary reason,
+    /// and for one specific to it: a second stripper would be a second set of edge cases, and
+    /// the edge cases are the whole of what makes a source assertion trustworthy.
+    // Gated to match its only consumer. The test below is `cfg`-ed to the platforms that have a
+    // GTK window to attach a button handler to; leaving the import unconditional made
+    // `clippy --all-targets -D warnings` fail on macOS with `unused import` — which is the fourth
+    // step of the new advisory macOS CI job, so the job would have gone red on its first run for a
+    // reason that has nothing to do with the platform support it exists to measure.
     #[cfg(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -1248,63 +1254,7 @@ mod tests {
         target_os = "netbsd",
         target_os = "openbsd"
     ))]
-    fn without_comments(source: &str) -> String {
-        let bytes: Vec<char> = source.chars().collect();
-        let mut out = String::with_capacity(source.len());
-        let mut i = 0;
-        let mut in_string = false;
-        let mut depth = 0usize;
-        while i < bytes.len() {
-            let c = bytes[i];
-            let next = bytes.get(i + 1).copied();
-            if depth > 0 {
-                if c == '*' && next == Some('/') {
-                    depth -= 1;
-                    i += 2;
-                    continue;
-                }
-                if c == '/' && next == Some('*') {
-                    depth += 1;
-                    i += 2;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-            if in_string {
-                if c == '\\' {
-                    i += 2;
-                    continue;
-                }
-                if c == '"' {
-                    in_string = false;
-                }
-                out.push(c);
-                i += 1;
-                continue;
-            }
-            if c == '"' {
-                in_string = true;
-                out.push(c);
-                i += 1;
-                continue;
-            }
-            if c == '/' && next == Some('/') {
-                while i < bytes.len() && bytes[i] != '\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            if c == '/' && next == Some('*') {
-                depth = 1;
-                i += 2;
-                continue;
-            }
-            out.push(c);
-            i += 1;
-        }
-        out
-    }
+    use crate::srcgrep::without_comments;
 
     /// The gate that would have caught the shipped-and-dead mouse buttons.
     ///

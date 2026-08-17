@@ -22,12 +22,20 @@
  * * **Scrolling, the wheel, minimap drags.** An entry is a caret, and a scroll does not move
  *   one. (The *view memory* does follow scrolling. That is the other feature, with the other
  *   store; see `position.ts`.)
- * * **A far pointer click.** IDEA records one and this does not — the honest reason is that
- *   the rule would have to live inside `EditorSurface`'s update listener, and that component is
- *   documented as pure: text in, text out, no IPC, no store, no knowledge of tabs. Teaching it
- *   what a navigation history is to gain a heuristic (*"more than N lines away counts"*) is a
- *   worse trade than the missing entry. It is the one item on this list that might be worth
- *   revisiting, and it is written down rather than left to be rediscovered.
+ * * ~~**A far pointer click.**~~ **Recorded since M16** — [`recordsClick`] is the rule and
+ *   `navRecorder.ts` is the twenty lines that feed it. This entry used to read *"IDEA records one
+ *   and this does not"*, and the reason given was that the rule would have to live inside
+ *   `EditorSurface`'s update listener, which is documented as pure. That objection was answered
+ *   by moving the rule rather than the component: the *decision* is [`recordsClick`] here, in the
+ *   module a check script already compiles standalone, and what sits in the editor is a
+ *   `ViewPlugin` that reads four facts off a `ViewUpdate` and asks. It is the one item on this
+ *   list the header said might be worth revisiting, and this is the revisit.
+ *
+ *   The pointer was the **one input device that moves the caret and writes nothing**: every
+ *   keyboard route into another part of a file (Go to definition, the structure popup, Go to
+ *   line) recorded, and the mouse — which is how most people actually move around a buffer they
+ *   are reading — recorded nothing at all. So Back was empty for the users who use a mouse, and
+ *   Forward was empty for everyone, because Forward only fills once you have gone Back.
  * * **Find, find-as-you-type and Find Next.** One entry per keystroke of a query is precisely
  *   the flood the rule exists to prevent.
  * * **`navigate.nextMember` / `navigate.prevMember`.** Bound to `alt+up`/`alt+down`, which is a
@@ -94,6 +102,24 @@ export const EMPTY_HISTORY: NavHistory = { entries: [], index: -1 }
 export const MERGE_LINES = 3
 
 /**
+ * How far a pointer click has to move the caret before it counts as going somewhere. (M16)
+ *
+ * **It must be strictly greater than [`MERGE_LINES`]**, and that is not a style preference: a
+ * click recorded at a distance the merge rule then collapses is a write that [`record`] silently
+ * discards, and a recorder that writes and then throws the write away is worse than one that
+ * never writes — it burns the per-keystroke budget and produces nothing, and every test of it
+ * passes. Twenty-five is comfortably clear of three.
+ *
+ * Twenty-five lines is roughly half a viewport at the default code font, so the test a reader
+ * would recognise is *"you can no longer see where you came from"*. That is the same question
+ * `topVisibleLine` answers for the view memory, and it is deliberately answered here in **lines**
+ * rather than against the real viewport: a viewport-relative rule needs geometry, geometry needs
+ * a laid-out DOM, and a rule that needs a DOM is a rule `check-editor.mjs` cannot run — which is
+ * the arrangement this whole module exists to avoid.
+ */
+export const SIGNIFICANT_LINES = 25
+
+/**
  * How many entries are kept.
  *
  * Fifty, dropping from the *front*. This is a session's worth of jumping and it is not drawn
@@ -129,6 +155,92 @@ function near(a: FilePosition, b: FilePosition): boolean {
   // "Somewhere in this file" is the same place as any place in this file — see `UNKNOWN_LINE`.
   if (a.line === UNKNOWN_LINE || b.line === UNKNOWN_LINE) return true
   return Math.abs(a.line - b.line) <= MERGE_LINES
+}
+
+/**
+ * One pointer gesture, reduced to the four facts the rule needs.
+ *
+ * A `ViewUpdate` cannot be constructed without a laid-out DOM, so the plugin in
+ * `navRecorder.ts` reads these off one and this module decides. Everything below is a *decision*;
+ * everything there is a field read.
+ */
+export interface ClickGesture {
+  /**
+   * The transaction set carries CodeMirror's own `select.pointer` user event.
+   *
+   * This is the whole of "was this the mouse". `@codemirror/view` stamps it from `mousedown`,
+   * from `touchstart`/`touchmove`, and from a DOM-read selection change within 50 ms of one;
+   * `keydown` stamps `select` instead, and `findNext` stamps `select.search`. So arrow keys,
+   * Home/End, PageUp/PageDown, Find and Find Next are all excluded by this field alone, and none
+   * of them reaches the arithmetic below.
+   */
+  readonly pointer: boolean
+  /**
+   * The resulting selection is a single empty range — a caret, not a highlight.
+   *
+   * This is what keeps a **drag** from flooding the stack: a drag emits a `select.pointer`
+   * transaction per pointer move, and every one after the first leaves a non-empty range. The
+   * one that does get through is the `mousedown` that started the drag, which really did put the
+   * caret where the user pointed, so it is an honest entry rather than an escapee.
+   *
+   * Double-click (a word), triple-click (a line) and shift-click (extend) are non-empty too, and
+   * Alt+click adds a *second* range — `ranges.length > 1` — which is a multi-caret edit gesture
+   * and not a navigation. The plugin folds both tests into this one field.
+   */
+  readonly caret: boolean
+  /** The same update changed the document: an edit, not a navigation. */
+  readonly docChanged: boolean
+  /** Where the caret was, or `null` when no editor held it. */
+  readonly from: FilePosition | null
+  /** Where the caret is now. */
+  readonly to: FilePosition
+}
+
+/**
+ * Whether a pointer gesture is a navigation worth an entry. (M16)
+ *
+ * # In the words of what it deliberately does not record
+ *
+ * * **Anything that is not the pointer.** Typing, arrow keys, Home/End, PageUp/PageDown, Find,
+ *   Find Next, the `Alt+Up`/`Alt+Down` member walk, and the reveal a Back or Forward *lands* —
+ *   none of them stamps `select.pointer`, so all of them fail on the first field. The last is
+ *   load-bearing: a walk that recorded its own arrival could only ever go back one step.
+ * * **A scroll, a wheel gesture or a minimap drag.** They emit no selection transaction at all,
+ *   so nothing here is even asked. An entry is a caret, and a scroll does not move one.
+ * * **A drag, a double-click, a triple-click, a shift-click, an Alt+click.** See [`caret`].
+ * * **A click that lands near where the caret already was.** [`SIGNIFICANT_LINES`], and this is
+ *   the field the whole feature turns on: too small and Back walks a line at a time and is
+ *   useless, too large and it is the complaint this fixes. Clicking about inside the function you
+ *   are reading is not going anywhere, and it is by far the most common click there is.
+ * * **A click with no known origin.** Defensive rather than reachable — a mounted editor has
+ *   claimed `caretTrack`'s slot, so a click inside one always has an origin — but a recorded
+ *   destination with no return address is a Back entry that leads nowhere, which is precisely the
+ *   "wired to nothing" shape this project keeps paying for. Refusing is the conservative half.
+ * * **A click whose origin is [`UNKNOWN_LINE`] *in the file being clicked into*.** Same reasoning
+ *   from the other side: `near` treats "somewhere in this file" as matching *any* place in it, so
+ *   such an origin would be merged into the entry it is measured against — replacing a real line
+ *   with a 0. The qualifier is not a hedge: an `UNKNOWN_LINE` origin in a **different** file is
+ *   recorded, because that is an ordinary Explorer-opened entry and `jump.ts::navigate` already
+ *   knows to reveal nothing for it and let the view memory place the caret. Both halves are
+ *   unreachable from a live caret — `claimCaret` starts at line 1 and `doc.lineAt` never answers
+ *   0 — and are written down because the sentinel exists and the order of the tests below is what
+ *   decides which one applies.
+ *
+ * A different **file** is always significant, however few lines apart the two places are. That is
+ * what serves "I was reading another file and clicked into this one": the distance in lines
+ * between two different documents is not a quantity, and treating a missing comparison as "near"
+ * would drop the one case a user is most likely to want back.
+ */
+export function recordsClick(gesture: ClickGesture): boolean {
+  if (!gesture.pointer) return false
+  if (!gesture.caret) return false
+  if (gesture.docChanged) return false
+
+  const { from, to } = gesture
+  if (from === null) return false
+  if (from.path !== to.path) return true
+  if (from.line === UNKNOWN_LINE || to.line === UNKNOWN_LINE) return false
+  return Math.abs(from.line - to.line) > SIGNIFICANT_LINES
 }
 
 /**

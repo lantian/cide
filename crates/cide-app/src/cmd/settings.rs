@@ -582,7 +582,7 @@ pub async fn claude_headless(
     request: HeadlessRequest,
 ) -> Result<HeadlessResult, HeadlessError> {
     let cwd = project_root(&state, project)?;
-    run_headless(cwd, request, claude_proxy(&state)).await
+    run_headless(cwd, request, claude_proxy(&state), claude_cli(&state)).await
 }
 
 /// The proxy environment a `claude` one-shot is spawned with.
@@ -626,33 +626,62 @@ async fn run_headless(
     cwd: PathBuf,
     request: HeadlessRequest,
     proxy: cide_core::proxy::ProxyEnv,
+    cli: cide_ipc::ClaudeCli,
 ) -> Result<HeadlessResult, HeadlessError> {
     // Latched, so this is a probe on the first one-shot of the process and free afterwards.
     // Worth doing here rather than only at startup: a user whose CLI self-updated mid-session
     // gets the warning next to the run it might explain.
-    cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM));
+    //
+    // **The latch describes whichever binary was probed first**, which since M16 is a binary
+    // the user can change. That is left as it is deliberately: this call exists for one log
+    // line, and re-probing on every one-shot would mean re-warning on every one-shot. The
+    // *screen's* verdict is unlatched and per-binary — see [`cli_support`] — which is the place
+    // the answer has to be current.
+    cide_claude::version::check_once(Path::new(&cli.binary));
 
-    // The bare name, resolved by `PATH` — the same thing every pane spawns. Resolving it
-    // ourselves would pin whichever version was on `PATH` at launch, and the CLI updates
-    // itself underneath a running app.
+    // The program **exactly as configured**, which for the default is the bare name `claude`
+    // resolved by `PATH` — the same thing every pane spawns. Resolving it ourselves would pin
+    // whichever version was on `PATH` at launch, and the CLI updates itself underneath a
+    // running app.
     //
     // The proxy is resolved by the caller, not here, and it is `ProxyScope::claude` that
     // decides it: a one-shot *is a claude*, and a user who takes `claude` out of scope means
     // both lanes. Until this argument existed the one-shot lane read no proxy setting at all
     // — it inherited cide's raw environment — so a corporate user whose panes worked got a
     // commit-message generation that hung.
-    let run = cide_claude::Headless::new(request, cwd).proxy(proxy);
-    tauri::async_runtime::spawn_blocking(move || {
-        cide_claude::headless::run(Path::new(CLAUDE_PROGRAM), &run)
-    })
-    .await
-    .map_err(|e| HeadlessError::NotInstalled {
-        detail: format!("the headless worker did not finish: {e}"),
-    })?
+    //
+    // # The environment travels, the arguments do not
+    //
+    // `ProxyScope::claude` already covers "claude panes **and** the headless one-shot lane…
+    // one field for both because they are one thing to a user", and the launch configuration's
+    // environment follows the same rule for the same reason: a user who points `claude` at a
+    // gateway means both lanes.
+    //
+    // The **arguments** deliberately do not. `cide_claude::headless::argv` is cide's own
+    // machinery — `-p --output-format json --no-session-persistence --tools` — and a user
+    // `--model` or `--tools` folded into it does not customise a pane, it breaks commit-message
+    // generation with a parse error against an envelope that never arrives. The Settings screen
+    // says which of the two travels; see `ClaudeCliSection`.
+    let plan = cide_core::claude_cli::plan_here(&cli);
+    let program = PathBuf::from(cli.binary);
+    let run = cide_claude::Headless::new(request, cwd)
+        .proxy(proxy)
+        .env(plan.env);
+    tauri::async_runtime::spawn_blocking(move || cide_claude::headless::run(&program, &run))
+        .await
+        .map_err(|e| HeadlessError::NotInstalled {
+            detail: format!("the headless worker did not finish: {e}"),
+        })?
 }
 
-/// Resolved by `PATH`, never by us. See [`run_headless`].
-const CLAUDE_PROGRAM: &str = "claude";
+/// The user's launch configuration, or the default when there is no workspace.
+///
+/// One reader rather than four copies of `state.with(|ws| ws.settings.claude.cli.clone())`: the
+/// hazard is a call site that forgets and silently keeps spawning the bare `claude`, which is
+/// indistinguishable from working right up until somebody configures a binary.
+fn claude_cli(state: &WorkspaceState) -> cide_ipc::ClaudeCli {
+    state.with(|ws| ws.settings.claude.cli.clone())
+}
 
 // --- the two named uses of the headless lane ----------------------------------------------
 
@@ -747,7 +776,7 @@ pub async fn claude_commit_message(
     }
 
     let request = cide_claude::prompt::commit_message(&diff, branch.as_deref());
-    Ok(run_headless(root, request, claude_proxy(&state)).await?)
+    Ok(run_headless(root, request, claude_proxy(&state), claude_cli(&state)).await?)
 }
 
 /// The patch text a commit would record, and the branch it would land on.
@@ -816,10 +845,32 @@ pub async fn claude_explain_selection(
         end_line,
         &text,
     );
-    run_headless(cwd, request, claude_proxy(&state)).await
+    run_headless(cwd, request, claude_proxy(&state), claude_cli(&state)).await
 }
 
 // --- the CLI version check ----------------------------------------------------------------
+
+/// One refusal or warning sentence, and the flag or variable it belongs to.
+///
+/// # Why the prose crosses the wire instead of living in TypeScript
+///
+/// `cide_core::claude_cli` writes each sentence beside the rule it explains, and
+/// `RefusedArg::reason`'s own doc says it is "printed beside the struck-out token. Prose, because
+/// the screen prints it." It was not printed: `Verdict::note()` had exactly one caller, a
+/// `tracing` line, so a user who typed `CLAUDE_CODE_USE_BEDROCK=1` got a yellow border and no
+/// sentence — while the words "Bills an AWS account rather than your subscription" existed, were
+/// asserted non-empty by a test, and reached nobody.
+///
+/// `ui/src/settings/claudeCli.ts` deliberately carries only the *names*, because a sentence
+/// written twice is a sentence that will say two things. So the names are matched there for
+/// instant feedback with no round trip, and the prose is shipped once, from here, and looked up.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliReason {
+    /// The long-form flag or the variable name, as the table spells it.
+    pub name: String,
+    pub reason: String,
+}
 
 /// What `claude --version` says, against what the IDE protocol was verified with.
 ///
@@ -857,43 +908,112 @@ pub struct ClaudeCliSupport {
     /// IDE integration has never worked, which are different situations the screen words
     /// differently. See `cide_core::handshake`.
     pub handshake: Option<cide_core::handshake::Handshake>,
+
+    // --- M16: which binary all of the above is about ---------------------------------------
+    /// The configured binary, echoed back.
+    ///
+    /// Echoed rather than assumed by the screen, because the three fields above describe *this*
+    /// value and a screen drawing them beside a field the user has since edited would be
+    /// captioning one binary's version with another's name.
+    pub binary: String,
+    /// Where it resolves to — the absolute path the OS would `exec`.
+    ///
+    /// Shown, and never spawned. What a pane runs is [`Self::binary`] exactly as stored, so a
+    /// bare `claude` is resolved afresh at every spawn; the CLI updates itself underneath a
+    /// running app and pinning this answer would keep panes on a version that no longer exists.
+    /// The path is here because "which one is that, actually" is the question a wrapper, a shim
+    /// or a `~/.local/bin` ordering makes unanswerable from the field alone.
+    pub resolved: Option<String>,
+    /// Why it cannot be run at all, in one sentence. `None` when it can.
+    ///
+    /// The **only** hard verdict on this screen. Everything else about a binary — a wrapper
+    /// script, a `--version` that prints something unparseable, a version outside the verified
+    /// range — is a warning, because `mise`, `asdf`, `direnv` and a plain shell wrapper are all
+    /// legitimate ways to name a `claude` and none of them answers `--version` in a shape worth
+    /// refusing over. The project already paid for the opposite arrangement:
+    /// `~/.cargo/bin/rust-analyzer` is a symlink to `rustup`, which passes any
+    /// on-PATH-and-executable probe and then fails at exec.
+    pub problem: Option<String>,
+    /// Every argument sentence, keyed by long-form flag. See [`CliReason`].
+    pub arg_reasons: Vec<CliReason>,
+    /// Every environment sentence, keyed by variable name.
+    pub env_reasons: Vec<CliReason>,
 }
 
-/// Whether the installed CLI is one this build's IDE protocol was ever checked against.
+/// Whether the configured CLI can be run, and whether this build's IDE protocol was ever
+/// checked against its version.
 ///
-/// The probe behind this is latched for the life of the process, so the Settings screen
-/// re-reading it costs nothing and the warning reaches the log exactly once however many
-/// panes are open — which is the requirement: a per-pane warning is a warning that has been
-/// trained out of the reader by the time it means something.
+/// # It stopped being latched in M16, and that is the point
+///
+/// The probe used to be `version::check_once`, whose `OnceLock` describes whichever binary was
+/// probed first in this process. With `claude` a bare name that is the same binary every time
+/// and the latch is free. With a **configurable** binary it is a lie the moment the user edits
+/// the field: they would type a path, press nothing, and read back the version of the `claude`
+/// that answered ten minutes ago — which is the exact failure this screen exists to prevent.
+///
+/// So the screen's answer is unlatched and per-binary, and the latch stays where it belongs:
+/// `run_headless` still calls `check_once` for its one-line-per-process log warning, and its
+/// own comment now says which binary that line describes.
+///
+/// The cost is one `claude --version` per Settings tab mount and per edit of the binary field —
+/// a Node boot, so hundreds of milliseconds — on the blocking pool. `SettingsTab` keys its
+/// effect on the configured binary so it is one probe per distinct value, not one per keystroke.
 ///
 /// `async`, with the probe on the blocking pool, and it has to be. A Tauri command that is not
-/// `async` runs on the main thread, which here is the GTK loop; the *first* call is the one
-/// that misses the latch and actually runs `claude --version`, and `claude` is a Node.js
-/// program whose startup is measured in hundreds of milliseconds. Sync, that is every window
-/// in the application frozen for the length of a Node boot at the exact moment the user opened
+/// `async` runs on the main thread, which here is the GTK loop, and `claude` is a Node.js
+/// program whose startup is measured in hundreds of milliseconds. Sync, that is every window in
+/// the application frozen for the length of a Node boot at the exact moment the user opened
 /// Settings — the same defect `session_spawn` and `session_scrollback` were moved off the main
-/// thread for, and one that would never reproduce for whoever had already opened Settings once
-/// in that session.
+/// thread for.
+/// `AppHandle` rather than `State<'_, WorkspaceState>`, which is the shape every other reader
+/// on this screen uses. A `State` borrow cannot cross an `await`, so an async command taking one
+/// is forced to return a `Result` whose error variant nothing can produce — a rejected promise
+/// the frontend would have to handle and never see. `session_spawn` reaches the workspace the
+/// same way and for the same reason.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn claude_cli_support() -> ClaudeCliSupport {
+pub async fn claude_cli_support(app: AppHandle) -> ClaudeCliSupport {
+    // Read on this thread and cloned out: the workspace lock is `parking_lot` and must not be
+    // held across an await, let alone across a `fork`.
+    let binary = app
+        .try_state::<WorkspaceState>()
+        .map(|state| claude_cli(&state).binary)
+        .unwrap_or_else(|| cide_ipc::ClaudeCli::default().binary);
     // A join failure means the pool is going away, which is a shutting-down application. The
     // no-CLI answer is the honest one to draw with and this screen must still render.
-    tauri::async_runtime::spawn_blocking(cli_support)
+    tauri::async_runtime::spawn_blocking(move || cli_support(&binary))
         .await
         .unwrap_or_else(|_| ClaudeCliSupport {
             version: None,
             verified_range: cide_claude::version::verified_range(),
             warning: None,
             handshake: None,
+            binary: String::new(),
+            resolved: None,
+            problem: None,
+            arg_reasons: arg_reasons(),
+            env_reasons: env_reasons(),
         })
 }
 
 /// The verdict, computed synchronously. Separate from the command so a test can call it
 /// without an async runtime, and so the command body is only the threading decision.
-fn cli_support() -> ClaudeCliSupport {
-    let support = cide_claude::version::check_once(Path::new(CLAUDE_PROGRAM));
+///
+/// **Blocking, and it forks.** `resolve` is a `stat` per `PATH` entry; `probe` is a whole Node
+/// boot. Neither is `arm`ed, deliberately: `arm` hands the kernel a pid to kill when the
+/// *forking thread* exits, and a `--version` that outlives this function by a millisecond has
+/// nothing to leak — it is not a session, it holds no subscription slot and it exits on its
+/// own. Arming it would only add a `pre_exec` to a process that is already gone.
+fn cli_support(binary: &str) -> ClaudeCliSupport {
+    let resolved = cide_core::claude_cli::resolve(binary);
+    // Only probed when there is something to probe. Forking a binary already known to be
+    // missing would spend a Node boot to learn what `resolve` just said, and would produce a
+    // second, worse sentence for the same problem.
+    let support = match &resolved {
+        Ok(path) => cide_claude::version::support_of(cide_claude::version::probe(path).as_deref()),
+        Err(_) => cide_claude::version::Support::Missing,
+    };
     let handshake = cide_core::handshake::load(&cide_core::handshake::handshake_path());
-    verdict(support, handshake)
+    verdict(&support, handshake, binary, resolved)
 }
 
 /// Build the answer from a verdict and a record, without touching `PATH` or the disk.
@@ -909,10 +1029,14 @@ fn cli_support() -> ClaudeCliSupport {
 ///
 /// With the inputs handed in, every branch is drivable: a `Support::Newer` really does produce
 /// a warning, a `Support::Verified` really does produce none, and a record from an older build
-/// really does keep its own range rather than being relabelled with this one's.
+/// really does keep its own range rather than being relabelled with this one's. The binary
+/// verdict is handed in for the same reason — a test can drive a missing binary on a machine
+/// where `claude` is installed, which is every machine this is developed on.
 fn verdict(
     support: &cide_claude::version::Support,
     handshake: Option<cide_core::handshake::Handshake>,
+    binary: &str,
+    resolved: Result<PathBuf, cide_core::claude_cli::BinaryProblem>,
 ) -> ClaudeCliSupport {
     ClaudeCliSupport {
         version: support.version().map(str::to_string),
@@ -922,7 +1046,44 @@ fn verdict(
         // this build's would erase the one signal that says the record is from a different
         // build — which is the case the screen has its own sentence for.
         handshake,
+        binary: binary.to_string(),
+        resolved: resolved
+            .as_ref()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        problem: resolved.err().map(|problem| problem.message()),
+        arg_reasons: arg_reasons(),
+        env_reasons: env_reasons(),
     }
+}
+
+/// Every argument sentence, refused and warned alike, keyed by long-form flag.
+///
+/// Both tables in one list because the *screen* does not need them separated — the row already
+/// knows its own verdict from matching the name locally; what it lacks is the prose.
+fn arg_reasons() -> Vec<CliReason> {
+    use cide_core::claude_cli::{REFUSED_ARGS, WARNED_ARGS};
+    REFUSED_ARGS
+        .iter()
+        .chain(WARNED_ARGS.iter())
+        .map(|entry| CliReason {
+            name: entry.flag.to_string(),
+            reason: entry.reason.to_string(),
+        })
+        .collect()
+}
+
+/// The same for environment variables.
+fn env_reasons() -> Vec<CliReason> {
+    use cide_core::claude_cli::{REFUSED_ENV, WARNED_ENV};
+    REFUSED_ENV
+        .iter()
+        .chain(WARNED_ENV.iter())
+        .map(|(name, reason)| CliReason {
+            name: (*name).to_string(),
+            reason: (*reason).to_string(),
+        })
+        .collect()
 }
 
 // --- the log directory --------------------------------------------------------------------
@@ -1332,7 +1493,7 @@ mod tests {
         let newer = Support::Newer {
             version: "9.9.9".into(),
         };
-        let answer = verdict(&newer, None);
+        let answer = verdict(&newer, None, "claude", Ok(PathBuf::from("/usr/bin/claude")));
         assert_eq!(answer.version.as_deref(), Some("9.9.9"));
         let warning = answer.warning.expect("a CLI past the range is news");
         assert!(warning.contains("9.9.9"), "{warning}");
@@ -1346,16 +1507,50 @@ mod tests {
         let verified = Support::Verified {
             version: "2.1.226".into(),
         };
-        assert_eq!(verdict(&verified, None).warning, None);
+        assert_eq!(
+            verdict(
+                &verified,
+                None,
+                "claude",
+                Ok(PathBuf::from("/usr/bin/claude"))
+            )
+            .warning,
+            None
+        );
 
         // Missing: also no *protocol* warning. "claude is not installed" is a different
         // message and the screen's own heading already says it.
-        assert_eq!(verdict(&Support::Missing, None).warning, None);
-        assert_eq!(verdict(&Support::Missing, None).version, None);
+        let missing = || {
+            verdict(
+                &Support::Missing,
+                None,
+                "claude",
+                Err(cide_core::claude_cli::BinaryProblem::NotOnPath {
+                    name: "claude".into(),
+                }),
+            )
+        };
+        assert_eq!(missing().warning, None);
+        assert_eq!(missing().version, None);
+        assert!(
+            missing().problem.is_some(),
+            "the *binary* verdict is where a missing claude is reported, and it is the only \
+             hard refusal on this screen"
+        );
+        assert_eq!(missing().resolved, None);
 
         // The range is always populated, whatever the verdict.
         for support in [&newer, &verified, &Support::Missing] {
-            assert!(!verdict(support, None).verified_range.is_empty());
+            assert!(
+                !verdict(
+                    support,
+                    None,
+                    "claude",
+                    Ok(PathBuf::from("/usr/bin/claude"))
+                )
+                .verified_range
+                .is_empty()
+            );
         }
     }
 
@@ -1376,6 +1571,8 @@ mod tests {
                 version: "2.1.227".into(),
             },
             Some(stored.clone()),
+            "claude",
+            Ok(PathBuf::from("/usr/bin/claude")),
         );
 
         let carried = answer.handshake.expect("the record is carried through");
@@ -1393,7 +1590,7 @@ mod tests {
     /// either way.
     #[test]
     fn the_real_verdict_assembles_with_a_range_whatever_is_installed() {
-        let support = cli_support();
+        let support = cli_support("claude");
         assert!(!support.verified_range.is_empty());
         assert_eq!(
             support.warning.is_some(),

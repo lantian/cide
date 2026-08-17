@@ -1140,6 +1140,23 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         useOverlays.getState().toggle('files')
         return
 
+      case 'picker.libraries':
+        /*
+         * Widen — or narrow — the file picker's scope.
+         *
+         * It flips a flag and nothing else. Starting the walk is `FilePicker`'s, on an effect
+         * keyed to the flag, and deliberately: the walk needs a project id and the overlay has
+         * one, this does not, and a second place that could start a `cargo metadata` is a second
+         * place to get "at most once per project" wrong.
+         *
+         * Reachable two ways, which is the point of it being a command at all. From the keyboard
+         * it is ⌥L while the picker has focus (`filePickerOpen`), and from the palette it sets
+         * the scope for the *next* Ctrl+P — the two overlays cannot be open at once, so from
+         * there it can only ever be a preparation, and that is a useful thing to be able to do.
+         */
+        useOverlays.getState().toggleLibraries()
+        return
+
       case 'palette.commands':
         useOverlays.getState().toggle('commands')
         return

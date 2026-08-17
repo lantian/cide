@@ -19,6 +19,7 @@
 import { useSyncExternalStore } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { currentUserAgent, drawsOwnResizeGrips } from './windowControls'
 import styles from './WindowFrame.module.css'
 
 /*
@@ -306,8 +307,16 @@ export function WindowFrame({ children }: WindowFrameProps) {
    * Grips are removed, not merely disabled, while maximized. Dragging the border of a
    * maximized window on KDE leaves it in a half-maximized state that reports maximized but
    * no longer fills the output, and nothing in the app can put it back.
+   *
+   * They are removed on macOS for the whole life of the window, for the reason
+   * `drawsOwnResizeGrips` states at length: `startResizeDragging` is unimplemented there and
+   * an undecorated NSWindow keeps its own edge resize, so drawing them takes a working gesture
+   * away and gives nothing back. Read from the user agent rather than from a command, matching
+   * the button layout beside it — the alternative costs an async round trip before the frame
+   * can render, and a frame of grips that eat the pointer is exactly what is being removed.
    */
-  const grips = isMaximized ? [] : [...EDGES, ...CORNERS]
+  const platformResizes = !drawsOwnResizeGrips(currentUserAgent())
+  const grips = isMaximized || platformResizes ? [] : [...EDGES, ...CORNERS]
 
   return (
     <div className={cls('frame')}>

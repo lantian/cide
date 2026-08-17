@@ -178,6 +178,10 @@ export function spawnFailureBytes(message: string): string {
  *
  * Deliberately narrow. `alreadyOpen` is a refusal the user must see (a conversation cannot be
  * resumed twice), and `pty` is a real failure to start a process; retrying either would loop.
+ * `noClaudeBinary` (M16) is the same: the configured program cannot be executed, so a retry
+ * cannot help and a pane that retried would spin. Its `message` is a written sentence naming
+ * the value and where to correct it, which `spawnFailureText` below prefers verbatim — so the
+ * only thing this predicate has to do about it is stay silent.
  */
 export function isRecoverableSessionError(reason: unknown): boolean {
   if (reason === null || typeof reason !== 'object') return false

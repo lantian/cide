@@ -59,6 +59,43 @@ export function windowControlLayout(userAgent: string): WindowControlLayout {
 }
 
 /**
+ * Whether the frame paints its own eight resize grips, or leaves the edges to the OS.
+ *
+ * `WindowFrame.tsx` covers the window's perimeter with invisible grips and hands each
+ * pointer-down to `startResizeDragging`, because on Wayland an undecorated window forfeits the
+ * resize borders the compositor was providing. That is right on Linux and **wrong on macOS**,
+ * for two separate reasons that happen to point the same way:
+ *
+ *  1. `startResizeDragging` does not exist there. `tao`'s macOS `drag_resize_window` is
+ *     `Err(ExternalError::NotSupported)` unconditionally (tao-0.35.3
+ *     `src/platform_impl/macos/window.rs`), and `WindowFrame` `void`s the rejected promise —
+ *     so the grip resizes nothing and reports nothing.
+ *  2. There is nothing to hand back in the first place. An undecorated window on macOS is
+ *     `NSWindowStyleMask::Borderless | Resizable`, and AppKit keeps the edge resize for a
+ *     borderless resizable window. The service Wayland takes away is one macOS never took.
+ *
+ * Painting them anyway is worse than useless rather than merely useless: the handler calls
+ * `preventDefault()` before the doomed call, so the grip **swallows** a pointer-down that AppKit
+ * would otherwise have turned into a resize. Eight invisible strips around the window that stop
+ * the window being resized is the exact shape of a bug nobody would think to look for.
+ *
+ * # Why this is a function here and not a condition in the component
+ *
+ * Because a rule inside a React component is a rule no check script can compile. This module is
+ * import-free and DOM-free precisely so `scripts/check-window-controls.mjs` can run it, and this
+ * project has paid for the other arrangement repeatedly. The component reads the answer; it does
+ * not contain it.
+ *
+ * Windows is deliberately not special-cased. WebView2 windows built `decorations(false)` are in
+ * the same position as Linux's — `drag_resize_window` is implemented there — so the fallback
+ * branch is right for both, and is also right for the non-browser runtimes (`''`) a check script
+ * and an SSR bundle produce.
+ */
+export function drawsOwnResizeGrips(userAgent: string): boolean {
+  return !isMacUserAgent(userAgent)
+}
+
+/**
  * The running webview's user agent, or `''` where there is no navigator.
  *
  * Guarded because the header is imported outside a browser: an SSR bundle, or a check script.

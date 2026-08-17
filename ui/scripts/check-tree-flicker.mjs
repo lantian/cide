@@ -81,6 +81,13 @@ try {
   // --- the tree is primed: 30 rows on screen -------------------------------------------------
 
   eq(d.primed.rows, 30, 'the viewport is showing its 30 rows before anything is asked of it')
+  eq(
+    d.revealAtAttach,
+    ['/p'],
+    'and `attach` has already asked what the tree can hang a row from. The self-heal below only '
+      + 'fires on a burst that moved the count, so without this fetch the status bar would draw '
+      + 'every crumb of every path inert until somebody happened to create a file',
+  )
 
   // --- a burst that moved nothing ------------------------------------------------------------
 
@@ -105,8 +112,17 @@ try {
   eq(d.changed.rowFive, 'new.rs', 'and row 5 is the new file, not the one it displaced')
   eq(
     d.changed.calls,
-    { fs_tree_count: 1, fs_tree_rows: 1 },
-    'still one count and one visible chunk: a burst costs the viewport, not CHUNK_CAP',
+    { fs_tree_count: 1, fs_reveal_roots: 1, fs_tree_rows: 1 },
+    'still one count and one visible chunk: a burst costs the viewport, not CHUNK_CAP — plus, '
+      + 'because the composed count MOVED, one `fs_reveal_roots`. That is the burst a group '
+      + 'finishing its resolution arrives on, and the status bar\'s path trail has no other way '
+      + 'to learn that a dependency source now has a row',
+  )
+  eq(
+    d.changed.revealable,
+    ['/p', '/dep/serde-1.0.229'],
+    'and the answer is kept, so a library crumb that was inert becomes clickable in the same '
+      + 'burst rather than at the next project switch',
   )
 
   // --- a burst that only moved rows off screen -----------------------------------------------
@@ -115,7 +131,35 @@ try {
   eq(
     d.offscreen.calls,
     { fs_tree_count: 1, fs_tree_rows: 1 },
-    'the off-screen chunk is marked stale rather than re-read on the burst',
+    'the off-screen chunk is marked stale rather than re-read on the burst — and there is no '
+      + '`fs_reveal_roots` here, because a rename moves no row COUNT. That asymmetry against the '
+      + 'insertion above is the whole gate: without it the reveal set would be re-fetched on '
+      + 'every watcher burst, which on a resolved cargo project is a few hundred paths of JSON '
+      + 'per `git status` in a terminal pane',
+  )
+  eq(
+    d.offscreen.revealable,
+    ['/p', '/dep/serde-1.0.229'],
+    'so the third answer the fixture was holding was never asked for — proving the gate is a '
+      + 'gate and not a comment claiming to be one',
+  )
+
+  // --- and an unchanged answer is dropped rather than written back --------------------------
+
+  eq(
+    d.revealIdentityHeld,
+    true,
+    'a burst that moved the count and got back the SAME reveal set keeps the array it already '
+      + 'had. `revealable` is a prop of the status bar, so a fresh array of equal strings would '
+      + 're-render the bar and re-classify every crumb on every file anyone creates',
+  )
+  eq(
+    d.revealClearedOnSwitch,
+    [],
+    'and switching project drops it before the first await. A path from the project being left '
+      + 'names nothing in the one being entered, so a crumb still drawn live from it would '
+      + 'reveal into a tree that does not hold it — the notice this whole feature exists to '
+      + 'stop showing',
   )
   // `a-249` and not `a-250`: the insertion above shifted every row below it down one.
   eq(d.offscreen.staleName, 'a-249', 'its cached row is still readable — it was not evicted')

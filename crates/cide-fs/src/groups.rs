@@ -503,6 +503,76 @@ impl Groups {
         self.groups.is_empty()
     }
 
+    /// Every path these groups can hang a row from: each group's **top-level** children.
+    ///
+    /// The same list [`Groups::owner_of`] scans, published so the frontend can ask the question
+    /// `owner_of` answers — *is this path somewhere the tree could show it?* — without asking
+    /// Rust once per path. `ui/src/chrome/StatusBar.tsx` draws the open file's trail and makes a
+    /// segment clickable exactly when it is at or under one of these, which is why the answer has
+    /// to be the **package directories** and not the caches they sit in:
+    /// `…/registry/src/index.crates.io-<hash>/serde-1.0.229` is a row, and every one of
+    /// `home`, `.cargo`, `registry`, `src`, `index.crates.io-<hash>` is not. Marking those
+    /// clickable would put the "not in this project's file tree" notice behind five segments of
+    /// every library path, which is precisely the dead control this milestone is about.
+    ///
+    /// Deriving the same list on the frontend from `cide_core::toolchain::dependency_roots()`
+    /// would be wrong twice over: those are *cache* roots rather than package roots, and the SDK
+    /// row's directory comes from `rustc --print sysroot` (see `cide_deps::sdk`), which cannot be
+    /// reconstructed without forking a process. A depth rule guessed from the cache root would
+    /// mark `lib › rustlib › src › rust › library` clickable and every one of those clicks would
+    /// land on the notice.
+    ///
+    /// I/O-free and deliberately non-resolving: an unresolved group has no children and
+    /// contributes nothing, so a Go-to-definition tab into `~/.cargo/registry` simply has no
+    /// clickable crumbs until *External Libraries* resolves. That is a degradation rather than a
+    /// lie, and it heals itself — the resolver emits `cide://fs-status` when it finishes, which
+    /// is what the store re-asks on.
+    ///
+    /// A note row (`path: None` — "rust-src is not installed") contributes nothing, which is
+    /// right: there is no directory to reveal into.
+    pub fn reveal_roots(&self) -> Vec<PathBuf> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.children.iter())
+            .filter_map(|node| node.path.clone())
+            .collect()
+    }
+
+    /// One group's **top-level** children, as the entries it was fulfilled with. (M16)
+    ///
+    /// [`Self::reveal_roots`] one screen up answers the same shape for *every* group at once and
+    /// keeps only the paths, because the status bar's question is "could any tree row hold
+    /// this". This one is per-group and keeps the labels, because the picker's question is
+    /// narrower and its answer has to carry two more things: the package **name**, which becomes
+    /// the `serde-1.0.229/src/de/mod.rs` prefix a user narrows by typing, and the **detail**,
+    /// which is the `1.0.229` chip that tells two `lib.rs` rows apart.
+    ///
+    /// Note rows — *"Standard library sources are not installed"*, or a Go module the cache does
+    /// not hold — come back with `path: None` and `dir: false`. They are kept rather than
+    /// filtered because a caller deciding what a missing directory means is a caller that can
+    /// say so; dropping them here would make "resolved, and three of its packages have no
+    /// source on disk" indistinguishable from "resolved, and there were only the other 590".
+    ///
+    /// I/O-free, non-resolving, and a clone per row: an unresolved group answers with the empty
+    /// vector rather than starting a `cargo metadata`, exactly as `reveal_roots` does. Whether
+    /// to resolve is the *caller's* decision, and `cide_app::libraries::ProjectGroups::
+    /// resolve_now` is where that decision has its own guard against being made twice.
+    pub fn entries(&self, id: &str) -> Vec<Entry> {
+        let Some(group) = self.groups.iter().find(|g| g.id == id) else {
+            return Vec::new();
+        };
+        group
+            .children
+            .iter()
+            .map(|node| Entry {
+                name: node.name.clone(),
+                detail: node.detail.clone(),
+                dir: node.dir,
+                path: node.path.clone(),
+            })
+            .collect()
+    }
+
     // --- addressing -------------------------------------------------------------------
 
     fn row_of_group(&self, id: &str) -> Option<usize> {
@@ -940,6 +1010,118 @@ mod tests {
         assert_eq!(
             groups.reveal(Path::new("/home/u/work/cide/src/lib.rs")),
             None
+        );
+    }
+
+    /// `reveal_roots` is the list the status bar decides a crumb's fate from, so what matters is
+    /// the pair of properties: every package directory is in it, and nothing *above* one is.
+    ///
+    /// The second half is the whole point. A rule guessed on the frontend — "a dependency cache
+    /// root plus two levels" — would put `registry` and `index.crates.io-<hash>` in this list,
+    /// and every click on those crumbs would land on the "not in this project's file tree" notice
+    /// this feature exists to stop showing.
+    #[test]
+    fn reveal_roots_are_the_package_directories_and_not_the_caches_above_them() {
+        let dir = scratch("groups-reveal-roots");
+        let serde = dir.join("registry/src/index.crates.io-6f17/serde-1.0.229");
+        let syn = dir.join("registry/src/index.crates.io-6f17/syn-2.0.87");
+        std::fs::create_dir_all(serde.join("src")).unwrap();
+        std::fs::create_dir_all(&syn).unwrap();
+        std::fs::write(serde.join("src/lib.rs"), "").unwrap();
+
+        let mut groups = shown();
+        assert_eq!(
+            groups.reveal_roots(),
+            Vec::<PathBuf>::new(),
+            "an unresolved group contributes nothing rather than guessing — the crumbs stay \
+             inert until the resolver lands, which is a degradation and not a lie"
+        );
+
+        groups.fulfil(
+            ID,
+            vec![
+                Entry::directory("serde", &serde),
+                Entry::directory("syn", &syn),
+                // The `rust-src is not installed` case: a row with no path at all.
+                Entry::note("Standard library sources are not installed."),
+            ],
+            None,
+        );
+        assert_eq!(groups.reveal_roots(), vec![serde.clone(), syn.clone()]);
+        assert!(
+            !groups
+                .reveal_roots()
+                .iter()
+                .any(|p| serde.starts_with(p) && *p != serde),
+            "nothing above a package directory is a reveal root: `registry`, `src` and \
+             `index.crates.io-<hash>` draw no row, and a crumb offering to select one of them \
+             would report that a file the user is looking at is not in the tree"
+        );
+
+        // And the list is exactly what `reveal` will accept, which is the property the frontend
+        // is really relying on when it decides whether to make a crumb clickable.
+        assert!(groups.reveal(&serde.join("src/lib.rs")).is_some());
+        assert!(
+            groups
+                .reveal(&dir.join("registry/src/index.crates.io-6f17"))
+                .is_none()
+        );
+    }
+
+    /// `entries` is what the picker's library scope is built from, so what matters is the pair
+    /// of properties: a resolved package contributes its **name, version and directory**, and a
+    /// note row contributes a row with no directory rather than being silently dropped.
+    ///
+    /// The second half is not tidiness. A caller that filtered notes out here could not tell
+    /// "resolved, and three packages have no source on disk" from "resolved, and there were only
+    /// the other 590" — which is exactly the difference between a degraded answer and a wrong
+    /// count on the picker's `6 of 2,418`.
+    #[test]
+    fn entries_carry_the_package_label_and_note_rows_carry_no_directory() {
+        let dir = scratch("groups-entries");
+        let serde = dir.join("serde-1.0.229");
+        std::fs::create_dir_all(&serde).unwrap();
+
+        let mut groups = shown();
+        assert!(
+            groups.entries(ID).is_empty(),
+            "an unresolved group contributes nothing rather than guessing, exactly as \
+             `reveal_roots` does — the picker's scope is empty until the resolver lands"
+        );
+
+        groups.fulfil(
+            ID,
+            vec![
+                Entry {
+                    name: "serde".into(),
+                    detail: Some("1.0.229".into()),
+                    dir: true,
+                    path: Some(serde.clone()),
+                },
+                Entry::note("Standard library sources are not installed."),
+            ],
+            None,
+        );
+
+        let entries = groups.entries(ID);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "serde");
+        assert_eq!(
+            entries[0].detail.as_deref(),
+            Some("1.0.229"),
+            "the version is what tells two `lib.rs` rows apart in the picker; without it the \
+             chip says `serde` beside `serde` and the feature's whole failure mode is back"
+        );
+        assert_eq!(entries[0].path.as_deref(), Some(serde.as_path()));
+        assert_eq!(
+            entries[1].path, None,
+            "a note has no directory to walk, and a caller has to be able to see that it is a \
+             note rather than being handed 590 rows where there were 591"
+        );
+
+        assert!(
+            groups.entries("noSuchGroup").is_empty(),
+            "a group nobody has shown answers with nothing rather than panicking"
         );
     }
 

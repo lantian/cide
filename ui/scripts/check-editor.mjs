@@ -2233,20 +2233,38 @@ try {
 
     // --- the slot --------------------------------------------------------------------------
     const RS = ['crates', 'cide-core', 'src', 'lib.rs']
+    const RS_FILE = `${ROOT}/crates/cide-core/src/lib.rs`
     const TOML = ['Cargo.toml']
-    const line = (trail, detail) => ({ trail, detail })
+    const TOML_FILE = `${ROOT}/Cargo.toml`
+    // Field order matters: `eq` compares JSON, and the module builds its lines in this order.
+    const line = (file, trail, pathCount, detail) => ({ trail, pathCount, file, detail })
 
-    eq(readout.statusReadout(), line([], ''), 'no editor open means an empty slot the bar hides')
+    eq(
+      readout.statusReadout(),
+      line('', [], 0, ''),
+      'no editor open means an empty slot the bar hides',
+    )
 
     const seen = []
     const stop = readout.subscribeStatusReadout((l) => seen.push(l))
-    eq(seen, [line([], '')], 'a subscriber is told the current line at once, not on the next change')
+    eq(
+      seen,
+      [line('', [], 0, '')],
+      'a subscriber is told the current line at once, not on the next change',
+    )
 
-    const first = readout.claimStatusReadout(RS, 'Rust · UTF-8 · LF · Ln 1, Col 1')
+    const first = readout.claimStatusReadout(RS_FILE, RS, 'Rust · UTF-8 · LF · Ln 1, Col 1')
     eq(
       readout.statusReadout(),
-      line(RS, 'Rust · UTF-8 · LF · Ln 1, Col 1'),
+      line(RS_FILE, RS, 4, 'Rust · UTF-8 · LF · Ln 1, Col 1'),
       'a mounted editor claims the slot, trail and all',
+    )
+    eq(
+      readout.statusReadout().pathCount,
+      RS.length,
+      'and a buffer nobody has looked at yet is all path and no symbols, so the split index is '
+        + 'the whole trail — which is what makes every crumb of it classifiable from the first '
+        + 'frame rather than after the first caret move',
     )
 
     first.set('Rust · UTF-8 · LF · Ln 9, Col 3')
@@ -2257,21 +2275,66 @@ try {
 
     // The boot race: the project record lands after the editor did, and the trail it was
     // claimed with was drawn against the fallback root.
-    first.setTrail(['cide', 'crates', 'cide-core', 'src', 'lib.rs'])
+    first.setTrail(['cide', 'crates', 'cide-core', 'src', 'lib.rs'], 5)
     eq(
       readout.statusReadout().trail,
       ['cide', 'crates', 'cide-core', 'src', 'lib.rs'],
       'a root that arrives late redraws the trail rather than leaving an absolute path',
     )
     const beforeSameTrail = seen.length
-    first.setTrail(['cide', 'crates', 'cide-core', 'src', 'lib.rs'])
+    first.setTrail(['cide', 'crates', 'cide-core', 'src', 'lib.rs'], 5)
     eq(seen.length, beforeSameTrail, 'and an unchanged trail notifies nobody')
-    first.setTrail(RS)
+    first.setTrail(RS, 4)
+
+    // The symbol tail, which is the other thing `setTrail` carries — and the reason the split
+    // index travels with it rather than being remembered from the claim.
+    first.setTrail([...RS, 'impl Parser', 'parse'], RS.length)
+    eq(
+      [readout.statusReadout().trail.length, readout.statusReadout().pathCount],
+      [6, 4],
+      'a symbol tail lengthens the trail and NOT the path count. Without the split, `parse` is '
+        + 'classified as `…/lib.rs/impl Parser/parse` — under the project root, so drawn live — '
+        + 'and every click on it reports a file that does not exist',
+    )
+    const beforeSplitOnly = seen.length
+    first.setTrail([...RS, 'impl Parser', 'parse'], 6)
+    eq(
+      seen.length,
+      beforeSplitOnly + 1,
+      'and the count alone moving is a change: the same segments split differently are a '
+        + 'different set of clickable crumbs, so an equality that only compared the strings '
+        + 'would leave the bar drawing the old ones',
+    )
+    first.setTrail(RS, 4)
+
+    // Two buffers whose trails are **identical** — `src › lib.rs` under two roots of this very
+    // repository — with the same caret, so every field but the file agrees. The bar has to be
+    // told, because the crumbs it draws from that trail reveal into two different places.
+    const twinA = readout.claimStatusReadout('/a/src/lib.rs', ['src', 'lib.rs'], 'Rust · x')
+    const beforeTwin = seen.length
+    const twinB = readout.claimStatusReadout('/b/src/lib.rs', ['src', 'lib.rs'], 'Rust · x')
+    eq(
+      [seen.length - beforeTwin, seen.at(-1).file],
+      [1, '/b/src/lib.rs'],
+      'a second buffer with the same segments and the same caret still notifies, because the '
+        + 'FILE moved. An equality that compared only the visible text would leave the bar '
+        + 'drawing the same crumbs against the previous path — every one of them revealing a row '
+        + 'in the wrong tree, with no wrong pixel anywhere on screen',
+    )
+    twinB.release()
+    twinA.release()
 
     // A split: the second pane mounts and takes the bar, which is right — it is the file the
     // user just opened.
-    const second = readout.claimStatusReadout(TOML, 'TOML · UTF-8 · LF · Ln 1, Col 1')
+    const second = readout.claimStatusReadout(TOML_FILE, TOML, 'TOML · UTF-8 · LF · Ln 1, Col 1')
     eq(readout.statusReadout().trail, TOML, 'the newest editor holds it')
+    eq(
+      readout.statusReadout().file,
+      TOML_FILE,
+      'and the ABSOLUTE path travels with it. Two buffers routinely produce the same segments — '
+        + '`src › lib.rs` under two roots of this repository — so a bar that kept the previous '
+        + "file would reveal every crumb in the wrong tree, silently and with no wrong pixel",
+    )
 
     // …and typing in the first pane takes it back. Without this the bar reports the other
     // pane's `Ln 1, Col 1` while the user types, which is a wrong answer rather than a
@@ -2285,7 +2348,7 @@ try {
     first.focus()
     eq(
       readout.statusReadout(),
-      line(RS, 'Rust · UTF-8 · LF · Ln 10, Col 1'),
+      line(RS_FILE, RS, 4, 'Rust · UTF-8 · LF · Ln 10, Col 1'),
       'focusing it does, and brings the position it had been keeping',
     )
     eq(readout.readoutClaims().length, 2, 'focus reorders the claims rather than adding one')
@@ -2295,7 +2358,7 @@ try {
     first.release()
     eq(readout.statusReadout().trail, TOML, 'releasing hands the slot down the stack')
     first.set('Rust · UTF-8 · LF · Ln 99, Col 1')
-    first.setTrail(['gone.rs'])
+    first.setTrail(['gone.rs'], 1)
     first.focus()
     eq(
       readout.statusReadout().trail,
@@ -2304,21 +2367,66 @@ try {
     )
 
     second.release()
-    eq(readout.statusReadout(), line([], ''), 'the last editor closing empties the slot')
+    eq(readout.statusReadout(), line('', [], 0, ''), 'the last editor closing empties the slot')
     eq(readout.readoutClaims(), [], 'and leaves no claim behind')
-    eq(seen.at(-1), line([], ''), 'the subscriber was told, so both boxes empty and the CSS hides them')
+    eq(
+      seen.at(-1),
+      line('', [], 0, ''),
+      'the subscriber was told, so both boxes empty and the CSS hides them',
+    )
+
+    // --- which TAB is in front, which is the input this stack did not have (M16) -------------
+    //
+    // `TabContent` never unmounts an inactive tab, so every open file holds a live claim for as
+    // long as the project does, and the stack was moved by exactly two things — mounting and DOM
+    // focus. A tab switch is neither. Two reports came out of that and both are driven here.
+
+    // 1. Restore. Five tabs mount at once in `file_read` completion order; one of them is the
+    //    tab the user is looking at, and it is not the last to land.
+    const bg1 = readout.claimStatusReadout('/p/a.rs', ['a.rs'], 'a', false)
+    const front = readout.claimStatusReadout('/p/b.rs', ['b.rs'], 'b', true)
+    const bg2 = readout.claimStatusReadout('/p/c.rs', ['c.rs'], 'c', false)
+    eq(
+      readout.statusReadout().file,
+      '/p/b.rs',
+      'a mount BEHIND another tab does not take the bar. Before this, reopening a workspace left '
+        + 'the status bar naming whichever restored file resolved last — a different file on '
+        + 'every launch, and never reliably the one on screen',
+    )
+
+    // 2. Ctrl+Tab, a tab-strip click, `file.open` on a file that is already open. None of them
+    //    mounts anything and none of them moves DOM focus, so `focus()` on the flag turning true
+    //    is the whole of what makes them work.
+    bg2.focus()
+    eq(readout.statusReadout().file, '/p/c.rs', 'and a tab coming forward takes it')
+    front.focus()
+    eq(readout.statusReadout().file, '/p/b.rs', 'and back again')
+    eq(readout.readoutClaims().length, 3, 'all of it by reordering — no claim was added or lost')
+
+    // Closing the visible one hands the bar to a background claim rather than blanking it, which
+    // is why an off-screen mount is inserted at the bottom of the stack rather than skipped.
+    front.release()
+    ok(
+      readout.statusReadout().file !== '',
+      'closing the front tab leaves a file on the bar rather than an empty slot',
+    )
+    bg1.release()
+    bg2.release()
+    eq(readout.readoutClaims(), [], 'and the three unwind cleanly')
 
     // The claim copies what it is handed: a caller mutating its own array afterwards — a
     // `useMemo` result it still owns — must not silently redraw the bar.
     const owned = ['src', 'main.rs']
-    const third = readout.claimStatusReadout(owned)
+    const third = readout.claimStatusReadout('/p/src/main.rs', owned)
     owned.push('nope')
     eq(readout.statusReadout().trail, ['src', 'main.rs'], 'the claim holds its own copy')
     third.release()
 
     stop()
     const quiet = seen.length
-    readout.claimStatusReadout(RS, 'Python · UTF-8 · LF · Ln 1, Col 1').release()
+    readout
+      .claimStatusReadout(RS_FILE, RS, 'Python · UTF-8 · LF · Ln 1, Col 1')
+      .release()
     eq(seen.length, quiet, 'an unsubscribed listener stops being called')
 
     // `StatusBar` guards its `setTrail` with this, so it has to answer the way React needs.
@@ -2333,10 +2441,65 @@ try {
       'EditorSurface claims the slot and releases it — a claim without the release leaves a ' +
         'closed file’s caret on the bar',
     )
+
+    // --- the wiring, comment-stripped -------------------------------------------------------
+    //
+    // Every assertion below is about a CALL that has to exist, and this file's own header says
+    // why that is the shape: the bugs here are absences, and an absence is exactly what a test
+    // of the surrounding code passes over. Stripped of comments first, because the prose that
+    // explains each of these calls names the very identifiers being matched — an assertion that
+    // a comment can satisfy is an assertion that stays green while the feature is deleted.
+    const strip = (text) =>
+      text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/[^\n]*$/gm, '')
+    const surface = strip(surfaceSrc)
+
     ok(
-      /setTrail\(segments\)/.test(surfaceSrc),
-      'and redraws the trail when the root arrives, which is the one thing the claim cannot ' +
-        'carry from mount',
+      /claimStatusReadout\(\s*path,\s*segments,/.test(surface),
+      'the claim carries the absolute PATH as well as the trail. The trail may be root-relative '
+        + '— that is the whole point of it — so a bar handed only the segments cannot turn a '
+        + 'crumb back into something `file.reveal` accepts',
+    )
+    ok(
+      /claimStatusReadout\([\s\S]{0,120}?onScreenRef\.current,?\s*\)/.test(surface),
+      'and whether this editor is the tab in front, read through a REF. As a dependency of the '
+        + 'build effect it would rebuild the whole `EditorView` — scrollback, undo history, '
+        + 'unsaved edits — on every tab switch',
+    )
+    ok(
+      /useEffect\(\(\) => \{\s*if \(onScreen\) slotRef\.current\?\.focus\(\)\s*\}, \[onScreen\]\)/
+        .test(surface),
+      'and a tab coming forward takes the slot. Ctrl+Tab, a tab-strip click and `file.open` on '
+        + 'an already-open file produce no mount and no DOM focus, so without this effect the '
+        + 'bar keeps naming the previous file until the user clicks into the buffer — which is '
+        + 'the report',
+    )
+    for (const [dep, why] of [
+      ['segments', 'a root that arrives late'],
+      ['symbols', 'an outline that arrives late — the ordinary case, not a race: the parse is '
+        + 'asynchronous, so before this the symbol half of the trail was missing until the user '
+        + 'happened to move the caret'],
+    ]) {
+      ok(
+        new RegExp(`useEffect\\(\\(\\) => \\{\\s*rebuildTrail\\(\\)\\s*\\}, \\[${dep}, rebuildTrail\\]\\)`)
+          .test(surface),
+        `the trail is rebuilt for ${why}`,
+      )
+    }
+    eq(
+      (surface.match(/\.setTrail\(/g) ?? []).length,
+      1,
+      'and there is exactly ONE `setTrail` call in this file. The late-root repair used to be a '
+        + 'second one written `setTrail(segments)` — the path alone — so a root arriving while '
+        + '`impl Parser › parse` was on the bar TRUNCATED the tail the user was reading. One '
+        + 'call site is what makes that unrepresentable rather than remembered',
+    )
+    ok(
+      /const next = \[\.\.\.segs, \.\.\.trailNames\(symbolsRef\.current/.test(surface)
+        && /const segs = segmentsRef\.current/.test(surface),
+      'and it reads the segments through a REF rather than the closure. `segments` is memoized '
+        + 'on `[path, root]` and the build effect is keyed on `[path, reloadKey]`, so a root '
+        + 'arriving late gave the update listener a stale array — the repair landed and the very '
+        + 'next caret move published the absolute path back over it',
     )
     ok(
       !/styles\.breadcrumbs/.test(surfaceSrc),
@@ -2356,9 +2519,18 @@ try {
       'and renders the readout span childless, so a re-render cannot overwrite the live text',
     )
     ok(
-      /sameTrail\(prev, line\.trail\) \? prev : line\.trail/.test(barSrc),
-      'while the trail goes through state guarded by `sameTrail` — an unguarded setter would ' +
+      /sameCrumbs\(prev, line\) \? prev : line/.test(barSrc),
+      'while the crumbs go through state guarded by an equality — an unguarded setter would ' +
         're-render the bar on every keystroke, which is what the DOM write above avoids',
+    )
+    ok(
+      /a\.file === b\.file/.test(barSrc)
+        && /a\.pathCount === b\.pathCount/.test(barSrc)
+        && /sameTrail\(a\.trail, b\.trail\)/.test(barSrc),
+      'and that equality covers ALL THREE fields the crumbs are drawn from. `sameTrail` alone '
+        + 'is not enough and the gap is silent: `src › lib.rs` under two different roots of this '
+        + 'repository is the same trail, so switching between them would keep the previous '
+        + '`file` and reveal every crumb in the wrong tree',
     )
 
     const barCss = readFileSync('src/chrome/StatusBar.module.css', 'utf8')
@@ -2379,6 +2551,107 @@ try {
       'and stays a block box: `text-overflow: ellipsis` needs inline content, and a flex ' +
         'container drops the ellipsis silently',
     )
+
+    // --- and a crumb that leads somewhere says so, at rest (M16) ----------------------------
+    //
+    // The user asked for the path trail to be clickable and ruled out, by name, a notice
+    // explaining why a click did nothing. So the difference between a crumb that reveals and one
+    // that cannot has to be in the paint. This is the block that keeps it there.
+    const bar = strip(barSrc)
+    ok(
+      /crumbTargets\(\s*crumbs\.file,\s*crumbs\.trail\.length,\s*crumbs\.pathCount,/.test(bar),
+      'the bar asks `rowPaths::crumbTargets` which segments lead somewhere, and hands it the '
+        + 'file and the split index. The rule is a pure module a check script compiles and '
+        + 'drives; the four bugs this project has paid most for were all rules written inside a '
+        + 'hook or an event handler, where nothing can reach them',
+    )
+    ok(
+      /onRevealSegment\?\.\(target\)/.test(bar),
+      'and a live crumb calls the handler with the resolved PATH, not with its own label',
+    )
+    ok(
+      /onRevealSegment === undefined \? null : \(targets\[i\] \?\? null\)/.test(bar),
+      'and a window with no file tree draws every crumb INERT rather than live-and-refusing. '
+        + '`dispatch.ts` answers `file.reveal` with a notice when the role is not `shell`, and a '
+        + 'crumb that explains itself after the click is the control this feature exists to stop '
+        + 'drawing',
+    )
+    ok(
+      /target === null \? \(\s*segment\s*\) : \(/.test(bar),
+      'an inert crumb renders as bare text — no wrapper, no handler, no role. "Inert" is the '
+        + 'absence of a control rather than a control that returns early, so there is nothing '
+        + 'for a later edit to accidentally re-enable',
+    )
+    ok(
+      /if \(isSelecting\(\)\) return/.test(bar),
+      'and a drag that ended on a crumb is a selection, not a click — the trail became '
+        + 'selectable text in M15 and copying a path out of the bar is a thing people do',
+    )
+    ok(
+      /\.crumbLive \{[^}]*color:\s*var\(--dim\)/.test(barCss)
+        && /\.path \{[^}]*color:\s*var\(--faint\)/.test(barCss),
+      'the two tones are the boundary, AT REST: the revealable run is `--dim` against the '
+        + "trail's `--faint`, so on a dependency source `home › u › .cargo › registry › …` reads "
+        + 'as context and `serde-1.0.229 › src › de › mod.rs` reads as live, with no badge and '
+        + 'no icon and nothing to hover first',
+    )
+    ok(
+      /\.crumbLive:hover \{[^}]*text-decoration:\s*underline/.test(barCss),
+      'and the underline the user asked for is on hover, and only on the live ones',
+    )
+    ok(
+      !/not-allowed/.test(barCss.replace(/\/\*[\s\S]*?\*\//g, '')),
+      'while an inert crumb gets `default` and never `not-allowed`. A forbidden cursor is a '
+        + 'refusal — the same message as the notice, rendered as a pointer — and the refusal is '
+        + 'exactly what was ruled out',
+    )
+    ok(
+      !/\.crumbLive \{[^}]*display:\s*(inline-block|flex|block)/.test(barCss),
+      'and the live crumb stays an INLINE box. `.path` needs `text-overflow: ellipsis`, which '
+        + 'requires inline content: an `inline-block` — or a `<button>`, which is one by '
+        + 'default — coarsens the ellipsis to whole-crumb granularity and brings UA padding and '
+        + 'a focus ring into an 11px row',
+    )
+
+    // --- the reveal set reaches the bar, and only in a window that has a file tree ------------
+    const appSrc = strip(readFileSync('src/App.tsx', 'utf8'))
+    ok(
+      /revealRoots=\{revealRoots\}/.test(appSrc)
+        && /useFileTree\(\(s\) => s\.revealable\)/.test(appSrc),
+      'App subscribes to the tree store for the reveal set and passes it down, rather than the '
+        + 'bar reading a store — every component in `chrome/` is a pure render target, which is '
+        + 'what `chrome/auditFixture.ts` depends on',
+    )
+    ok(
+      /onRevealSegment=\{[\s\S]{0,200}?boot\?\.role\.kind === 'shell'[\s\S]{0,200}?runCommand\('file\.reveal', \{ path \}\)/
+        .test(appSrc),
+      'and the click runs the COMMAND — the same one ⌃⇧E, the palette row, the Explorer button '
+        + 'and a Ctrl+click on a directory in terminal output run. A second reveal path would '
+        + 'have to know about External Libraries, the sidebar switch and the no-row sentence all '
+        + 'over again',
+    )
+    ok(
+      !/onRevealSegment=\{\(path\) => runCommand/.test(appSrc),
+      "…and it is withheld in a window with no sidebar rather than passed unconditionally: "
+        + '`dispatch.ts` refuses `file.reveal` outside a shell window, so an unguarded handler '
+        + 'is a whole trail of live-looking crumbs that answer with a notice',
+    )
+
+    // --- and the flag that says which tab is in front reaches the editor ---------------------
+    ok(
+      /renderTree=\{\(tab, active\) =>/.test(appSrc) && /onScreen=\{active\}/.test(appSrc),
+      '`TabContent` has computed and offered "is this tab in front" since M4; `App.tsx` wrote '
+        + '`renderTree={(tab) =>` and discarded it. Without the flag a background tab is '
+        + 'indistinguishable from the visible one — hidden tabs are `visibility: hidden`, never '
+        + 'unmounted — and the status bar was claimed by whichever restored file resolved last',
+    )
+    for (const file of ['src/panes/PaneBody.tsx', 'src/panes/EditorPane.tsx']) {
+      ok(
+        /onScreen=\{onScreen\}/.test(strip(readFileSync(file, 'utf8'))),
+        `${file} passes it on — a prop that stops one component short is this project's most `
+          + 'repeated defect with a shorter fuse',
+      )
+    }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -2922,6 +3195,11 @@ try {
      */
     const findSrc = readFileSync('src/editor/find.ts', 'utf8')
     const findCode = strip(findSrc)
+    // Comments stripped, and that is the load-bearing half of every assertion below that reads
+    // this file: `EditorSurface.tsx` argues at length about read-only, about tabindex, and about
+    // which chords the app keymap takes — so a pin written against raw source would certify the
+    // argument rather than the code.
+    const surface12 = strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
     const memberBlock = (src, name) => {
       const start = src.indexOf(name)
       if (start === -1) return ''
@@ -2977,6 +3255,60 @@ try {
     )
 
     /*
+     * ------------------------------------------------ Ctrl+F in a read-only buffer (M16)
+     *
+     * Reported as "the find bar does not open in a std-library file", and every assertion above
+     * passes on the broken build — because the find module was *right*. `findExtensions()` is
+     * unconditional in `EditorSurface`'s shared extension list, and the right-click **Code ▸
+     * Find…** item opens the bar in those buffers today. What was dead was the chord, and with it
+     * every other chord: `EditorView.editable.of(false)` gives `.cm-content`
+     * `contenteditable="false"`, a `contenteditable="false"` element with no `tabindex` cannot be
+     * focused, and CodeMirror registers `keydown` on `contentDOM`. Events bubble up, not down, so
+     * the listener never fired.
+     *
+     * Scoped to the `if (readOnly)` block and to comments-stripped source, for the reason this
+     * section keeps relearning: `EditorSurface.tsx` now *discusses* read-only, tabindex and
+     * contentAttributes at length, and a whole-file grep would certify the prose. `memberBlock`
+     * above exists for the same hazard.
+     */
+    {
+      const surface = surface12
+      const start = surface.indexOf('if (readOnly) {')
+      ok(start !== -1, 'EditorSurface still has a read-only branch')
+      // To the closing brace of that `if`, by depth rather than by a regex: the block contains
+      // braces of its own the moment anything is added to it.
+      let depth = 0
+      let end = start
+      for (let i = surface.indexOf('{', start); i < surface.length; i++) {
+        if (surface[i] === '{') depth += 1
+        else if (surface[i] === '}') {
+          depth -= 1
+          if (depth === 0) {
+            end = i + 1
+            break
+          }
+        }
+      }
+      const readOnlyBlock = surface.slice(start, end)
+      ok(readOnlyBlock.length > 0 && end > start, 'and the block is bounded')
+      ok(
+        /EditorView\.editable\.of\(false\)/.test(readOnlyBlock),
+        'it still makes the content non-editable — `EditorState.readOnly` alone would leave ' +
+          '.cm-content a root editable element, with an IME and a native caret in a document ' +
+          'that cannot change',
+      )
+      ok(
+        /EditorView\.contentAttributes\.of\(\{ tabindex: '[-0-9]+' \}\)/.test(readOnlyBlock),
+        'and it gives that non-editable content a TABINDEX. Without one the element cannot take ' +
+          'focus, so CodeMirror\'s keydown listener — which is registered on contentDOM — never ' +
+          'fires, and the WHOLE editor keymap is dead in every library and toolchain buffer: ' +
+          'Ctrl+F, F3, Mod-d, Escape, Alt+Enter and all of defaultKeymap. It reads as alive ' +
+          'because .cm-scroller still scrolls natively, and `view.hasFocus` stays false for ever ' +
+          '— which is what left Ctrl+G, Ctrl+F12 and Back acting on the last EDITABLE file',
+      )
+    }
+
+    /*
      * Undo, which was reachable by key and by nothing else, and absent entirely from the one
      * editable surface whose Accept writes a file.
      *
@@ -3011,6 +3343,158 @@ try {
       'and Ctrl+Y is redo off macOS — the `mac:` property overrides `key:` only there, so the ' +
         'chord the report asked for is already bound and needs nothing added',
     )
+
+    /*
+     * ------------------------------------------ what the app keymap takes, and where it goes
+     *
+     * Two capabilities `cide-core::keymap` claims in prose to have re-homed. One of them had
+     * not been, and the comment saying so had been read past for four milestones — the same
+     * shape as the `FileStamp` comment that was confidently wrong about its own arithmetic.
+     *
+     * The chord freedom is *computed* rather than asserted from the documentation, because
+     * reading the documentation is exactly what produced the wrong sentence: the old comment
+     * said `Mod-Shift-Arrow` was "free in both layers", and on macOS `standardKeymap` binds
+     * `{ mac: 'Cmd-ArrowUp', shift: selectDocStart }`, which claims ⌘⇧↑. The expansion below
+     * mirrors `@codemirror/view`'s `normalizeKeyName` and its `shift:` sub-binding rule, so a
+     * future upstream binding on either chord fails here rather than on somebody's Mac.
+     */
+    {
+      const normalizeChord = (name, platform) => {
+        const parts = name.split(/-(?!$)/)
+        let result = parts[parts.length - 1]
+        if (result === 'Space') result = ' '
+        let alt = false, ctrl = false, shift = false, meta = false
+        for (let i = 0; i < parts.length - 1; i++) {
+          const mod = parts[i]
+          if (/^(cmd|meta|m)$/i.test(mod)) meta = true
+          else if (/^a(lt)?$/i.test(mod)) alt = true
+          else if (/^(c|ctrl|control)$/i.test(mod)) ctrl = true
+          else if (/^s(hift)?$/i.test(mod)) shift = true
+          else if (/^mod$/i.test(mod)) { if (platform === 'mac') meta = true; else ctrl = true }
+          else throw new Error(`unrecognised modifier ${mod} in ${name}`)
+        }
+        if (alt) result = `Alt-${result}`
+        if (ctrl) result = `Ctrl-${result}`
+        if (meta) result = `Meta-${result}`
+        if (shift) result = `Shift-${result}`
+        return result
+      }
+      const claimedOn = (platform) => {
+        const claimed = new Map()
+        for (const b of composed) {
+          const spelling = b[platform] ?? b.key
+          if (spelling === undefined) continue
+          if (b.run) claimed.set(normalizeChord(spelling, platform), b.run)
+          if (b.shift) claimed.set(normalizeChord(`Shift-${spelling}`, platform), b.shift)
+        }
+        return claimed
+      }
+      const mac = claimedOn('mac')
+      const linux = claimedOn('linux')
+      // The expansion is only worth anything if it reproduces bindings we know are there.
+      eq(linux.get('Ctrl-f')?.name, 'openSearchPanel', 'the expansion finds Mod-f on Linux')
+      eq(mac.get('Meta-f')?.name, 'openSearchPanel', 'and ⌘F on macOS')
+      eq(
+        mac.get('Shift-Meta-ArrowUp')?.name,
+        'selectDocStart',
+        'and it reaches a `shift:` sub-binding of a `mac:`-only entry — which is the one the ' +
+          'old keymap.rs comment did not know about',
+      )
+
+      /* Move line up/down: taken by alt+up/alt+down in the app keymap, re-homed here. */
+      ok(
+        /run: moveLineUp/.test(surface12) && /run: moveLineDown/.test(surface12),
+        'EditorSurface re-homes moveLineUp/moveLineDown. `cide-core::keymap` binds alt+up and ' +
+          'alt+down to the member walk and the key gate is a window CAPTURE listener, so ' +
+          'CodeMirror never sees Alt+Arrow — and the comment beside those bindings claimed this ' +
+          'compensation existed while `grep moveLineUp src/` returned nothing at all',
+      )
+      /*
+       * The chords are read out of the source rather than restated here, so this checks the
+       * binding that ships instead of a copy of it that agrees with it today.
+       */
+      const homed = [
+        ...surface12.matchAll(/\{ key: '([^']+)', mac: '([^']+)', run: (moveLine(?:Up|Down)) \}/g),
+      ]
+      eq(homed.length, 2, 'both directions are re-homed, and both name a mac spelling of their own')
+      /*
+       * `ok`, never `eq`, for "nothing claims this chord". The map holds *functions*, and `eq`
+       * compares through `JSON.stringify`, which answers `undefined` for a function — so
+       * `eq(claimed, undefined)` is true for every chord in the table as well as every chord
+       * outside it. That version of this assertion passed a deliberate mutation to a colliding
+       * macOS chord, which is how it was found: a check that cannot fail is worse than no check,
+       * because it is counted.
+       */
+      const freeOn = (map, chord, platform) => {
+        const claim = map.get(normalizeChord(chord, platform))
+        return claim === undefined ? null : (claim.name || 'an anonymous command')
+      }
+      for (const [, key, macKey, run] of homed) {
+        eq(freeOn(linux, key, 'linux'), null, `${key} (${run}) is free off macOS`)
+        eq(freeOn(mac, macKey, 'mac'), null, `${macKey} (${run}) is free on macOS`)
+        ok(
+          freeOn(mac, key, 'mac') !== null,
+          `${key} is NOT free on macOS, which is the whole reason ${run} carries a mac spelling ` +
+            'of its own — if upstream ever drops that binding, this fails and the exception goes',
+        )
+      }
+
+      /*
+       * ⌘[ / ⌘] become Back and Forward on macOS (`keymap::platform_layer`), so
+       * `defaultKeymap`'s indentLess/indentMore lose their chord there. The capability must not
+       * go with them, and Tab/Shift+Tab is where it survives — pinned by command identity, not
+       * by key string, so an upstream re-spelling of the chord cannot fake it.
+       */
+      const { indentLess, indentMore } = require('@codemirror/commands')
+      eq(mac.get('Meta-[')?.name, 'indentLess', 'upstream still binds Mod-[ to indentLess')
+      eq(mac.get('Meta-]')?.name, 'indentMore', 'and Mod-] to indentMore')
+      ok(
+        indentWithTab.run === indentMore && indentWithTab.shift === indentLess,
+        'so Tab and Shift+Tab are what indent and dedent survive on when ⌘[ and ⌘] become Back ' +
+          'and Forward — which is what IDEA-on-mac binds them to as well',
+      )
+      /*
+       * Installed in the *keymap*, and scoped to it.
+       *
+       * `/indentWithTab,/.test(surface12)` was the first version of this, and it was a check that
+       * could not fail: `indentWithTab` is also on the import line from `@codemirror/commands`,
+       * comma and all, so deleting it from the keymap left this green. Found by deleting it and
+       * watching nothing go red — which is the only way this class of assertion is ever found,
+       * and the reason the `freeOn` note above says a check that cannot fail is worse than none.
+       *
+       * The array is bracket-matched rather than regexed to its end: it contains array literals
+       * of its own (`...defaultKeymap` is spread, but the `Alt-Enter` entry and the two re-homed
+       * move-line entries are object literals with nested calls), so `indexOf('])')` finds the
+       * wrong close as soon as anything is added.
+       */
+      const keymapAt = surface12.indexOf('keymap.of([')
+      ok(keymapAt !== -1, 'EditorSurface still builds its own keymap')
+      let square = 0
+      let keymapEnd = keymapAt
+      for (let i = surface12.indexOf('[', keymapAt); i < surface12.length; i++) {
+        if (surface12[i] === '[') square += 1
+        else if (surface12[i] === ']') {
+          square -= 1
+          if (square === 0) {
+            keymapEnd = i + 1
+            break
+          }
+        }
+      }
+      const editorKeymap = surface12.slice(keymapAt, keymapEnd)
+      ok(
+        /\bindentWithTab\b/.test(editorKeymap),
+        'and EditorSurface actually installs indentWithTab IN ITS KEYMAP — the survival path for ' +
+          'indent and dedent on macOS has to be a binding, not merely an import',
+      )
+      for (const [, key, macKey, run] of homed) {
+        ok(
+          editorKeymap.includes(key) && editorKeymap.includes(macKey),
+          `and ${run}'s re-homed chords are in that keymap rather than somewhere the view never ` +
+            'reads — an extension built and not mounted is this project\'s most-repeated defect',
+        )
+      }
+    }
 
     const diffSrc = strip(readFileSync('src/panes/DiffPane.tsx', 'utf8'))
     const sharedAt = diffSrc.indexOf('const shared =')
@@ -3335,6 +3819,122 @@ try {
       const kept = nav.record(nav.record(nav.EMPTY_HISTORY, A1, B1), B1, at('/b.rs', 200))
       eq(kept.entries.length, 3, 'and a real move inside the same file is still an entry')
       eq(nav.MERGE_LINES, 3, 'the merge distance is what the comment says it is')
+    }
+
+    /* ------------------------------------------------ the pointer, which used to record nothing
+     *
+     * **The recording rule is the whole feature**, in both directions: record too much and Back
+     * moves a line at a time and is useless; record nothing and the mouse — the one input device
+     * that moves the caret and never wrote an entry — leaves Back empty for anyone who navigates
+     * by pointing, and Forward empty for everyone, since Forward only fills once you have gone
+     * Back.
+     *
+     * `recordsClick` is the whole of it, and it is here rather than inside the `ViewPlugin` for
+     * the reason this file's header gives: a rule that lives in an event handler is a rule no
+     * check can compile, and that is where this project's most expensive bugs have hidden.
+     */
+    {
+      const click = (from, to) => ({ pointer: true, caret: true, docChanged: false, from, to })
+
+      /* The threshold, and the constraint that makes it a threshold rather than a number. */
+      eq(nav.SIGNIFICANT_LINES, 25, 'the significance distance is what the comment says it is')
+      ok(
+        nav.SIGNIFICANT_LINES > nav.MERGE_LINES,
+        'and it is strictly greater than MERGE_LINES — a click recorded at a distance the merge ' +
+          'rule then collapses is a write `record` throws away, which is worse than not writing: ' +
+          'it costs the per-keystroke budget, produces nothing, and passes every test of itself',
+      )
+
+      const here = at('/a.rs', 100)
+      ok(!nav.recordsClick(click(here, at('/a.rs', 100))), 'a click that moves nothing is nothing')
+      ok(
+        !nav.recordsClick(click(here, at('/a.rs', 125))),
+        'and exactly SIGNIFICANT_LINES away is still the same neighbourhood — clicking about ' +
+          'inside the function you are reading is the most common click there is, and it is not ' +
+          'going anywhere',
+      )
+      ok(
+        nav.recordsClick(click(here, at('/a.rs', 126))),
+        'one line past it is: half a viewport away, you can no longer see where you came from',
+      )
+      ok(nav.recordsClick(click(here, at('/a.rs', 74))), 'and the distance is unsigned')
+      ok(
+        nav.recordsClick(click(here, at('/b.rs', 101))),
+        'a different FILE is always significant, however close the line numbers happen to be — ' +
+          'the distance between two documents is not a quantity, and treating a missing ' +
+          'comparison as "near" would drop the case a user most wants back',
+      )
+
+      /* What it deliberately does not record, one field at a time. */
+      const far = at('/a.rs', 400)
+      ok(
+        !nav.recordsClick({ ...click(here, far), pointer: false }),
+        'a keyboard selection is not a click: arrow keys, Home/End, PageUp/PageDown, Find, Find ' +
+          'Next and the alt+up member walk all stamp something other than `select.pointer`, and ' +
+          'so does the reveal a Back LANDS — a walk that recorded its own arrival could only ' +
+          'ever go back one step',
+      )
+      ok(
+        !nav.recordsClick({ ...click(here, far), caret: false }),
+        'a non-empty selection is not a caret move: this is what keeps a DRAG from flooding the ' +
+          'stack, and it takes the double-click, the triple-click, the shift-click and the ' +
+          'alt+click multi-caret gesture with it',
+      )
+      ok(
+        !nav.recordsClick({ ...click(here, far), docChanged: true }),
+        'and an edit is not a navigation, however far the caret ended up',
+      )
+      ok(
+        !nav.recordsClick(click(null, far)),
+        'a click with no known origin records nothing — a destination with no return address is ' +
+          'a Back entry that leads nowhere',
+      )
+      ok(
+        !nav.recordsClick(click({ path: '/a.rs', line: nav.UNKNOWN_LINE, column: 1 }, far)),
+        'nor does one whose origin is "somewhere in this file": `near` matches that against any ' +
+          'place in the file, so recording it would overwrite a real line with the 0 sentinel',
+      )
+
+      /*
+       * A realistic session, driven through `recordsClick` AND `record` together, because the
+       * two are only correct as a pair — a rule that says yes to something the merge rule then
+       * eats is indistinguishable, from inside either function, from one that works.
+       *
+       * A scroll and a wheel gesture appear as gaps rather than as rows: they produce no
+       * selection transaction at all, so the plugin is never asked. That is the honest shape and
+       * it is why they cannot be represented here as a `false`.
+       */
+      {
+        let history = nav.EMPTY_HISTORY
+        let caret = at('/a.rs', 40)
+        const gestures = [
+          ['click two lines down', click(caret, at('/a.rs', 42)), false],
+          ['type a word', { ...click(at('/a.rs', 42), at('/a.rs', 42)), docChanged: true }, false],
+          ['press ArrowDown', { ...click(at('/a.rs', 42), at('/a.rs', 43)), pointer: false }, false],
+          /* …scroll six hundred lines: no transaction, nothing asked… */
+          ['click at the bottom of the file', click(at('/a.rs', 43), at('/a.rs', 640)), true],
+          ['drag out a selection', { ...click(at('/a.rs', 640), at('/a.rs', 200)), caret: false }, false],
+          ['click into the other pane', click(at('/a.rs', 640), at('/b.rs', 12)), true],
+          ['click three lines further', click(at('/b.rs', 12), at('/b.rs', 15)), false],
+        ]
+        for (const [what, gesture, expected] of gestures) {
+          eq(nav.recordsClick(gesture), expected, `${what}: ${expected ? 'recorded' : 'ignored'}`)
+          if (nav.recordsClick(gesture)) history = nav.record(history, gesture.from, gesture.to)
+          caret = gesture.to
+        }
+        eq(
+          history.entries.map((e) => `${e.path}:${e.line}`),
+          ['/a.rs:43', '/a.rs:640', '/b.rs:12'],
+          'so a session of ordinary editing leaves three entries and not thirty — the origin of ' +
+            'the first far click, where it landed, and the file clicked into afterwards',
+        )
+        ok(nav.isCoherent(history), 'and the result is walkable')
+        eq(
+          nav.walk(history, 'back', caret).to.path,
+          '/a.rs',
+          'Back from the second file returns to the first, which is the report this fixes',
+        )
+      }
     }
 
     /* The forward tail, discarded exactly as a browser discards it. */
@@ -3740,6 +4340,109 @@ try {
       /topVisibleLine\(/.test(stripJs(readFileSync('src/editor/viewTracker.ts', 'utf8'))),
       'and the tracker applies the correction rather than reporting the raw hit test',
     )
+
+    /* ---------------------------------------- the recorder: mounted, cheap, and in the right order
+     *
+     * `navRecorder.ts` needs a `ViewUpdate`, which needs a laid-out DOM, so it is source-asserted
+     * rather than run — the same weaker gate `viewTracker.ts` gets two lines above, and chosen
+     * for the same reason. What is pinned here is exactly the set of things that are *absences*:
+     * an extension nobody mounts, a rule reimplemented instead of called, and an ordering that
+     * compiles perfectly backwards.
+     */
+    {
+      ok(
+        /navRecorder\(project, path\),/.test(surfaceSrc),
+        'EditorSurface mounts the click recorder — this project\'s most-repeated defect is a ' +
+          'feature built complete and reachable from nothing, and an unmounted extension is ' +
+          'exactly that: every assertion about `recordsClick` above still passes',
+      )
+
+      const recorderSrc = stripJs(readFileSync('src/editor/navRecorder.ts', 'utf8'))
+      ok(
+        /ViewPlugin\.define\(/.test(recorderSrc) && !/updateListener/.test(recorderSrc),
+        'it is a ViewPlugin and NOT an update listener. Two reasons, and neither is style: a ' +
+          'plugin runs BEFORE the listeners, which is what lets it read caretTrack\'s slot ' +
+          'before EditorSurface\'s listener moves it onto the editor being clicked into; and it ' +
+          'keeps the navigation history out of the component whose header promises no ' +
+          'knowledge of tabs',
+      )
+      ok(
+        /recordsClick\(/.test(recorderSrc) &&
+          !/SIGNIFICANT_LINES/.test(recorderSrc) &&
+          !/Math\.abs/.test(recorderSrc),
+        'and it ASKS the rule rather than carrying a copy of it — a second distance test here ' +
+          'would be a decision in the one place no check script can compile',
+      )
+      /*
+       * The cost gate, scoped to `update()` itself.
+       *
+       * The first version of this assertion compared the file-wide index of the `select.pointer`
+       * test against the index of `doc.lineAt` — and `doc.lineAt` lives in a helper *below* the
+       * class, so it passed no matter which order `update()` did its work in. That is the
+       * "pins today's layout rather than the property" failure this file has already paid for
+       * once, caught by mutating the source and watching nothing go red. The property is about
+       * the order of statements inside one method, so the assertion has to be too.
+       */
+      const updateAt = recorderSrc.indexOf('update(update: ViewUpdate): void {')
+      ok(updateAt !== -1, 'the recorder still has an update()')
+      let depth = 0
+      let updateEnd = updateAt
+      for (let i = recorderSrc.indexOf('{', updateAt); i < recorderSrc.length; i++) {
+        if (recorderSrc[i] === '{') depth += 1
+        else if (recorderSrc[i] === '}') {
+          depth -= 1
+          if (depth === 0) {
+            updateEnd = i + 1
+            break
+          }
+        }
+      }
+      const updateBody = recorderSrc.slice(updateAt, updateEnd)
+      const gateAt = updateBody.indexOf("isUserEvent('select.pointer')")
+      const bailAt = updateBody.indexOf('if (!pointer) return')
+      ok(gateAt > 0 && bailAt > gateAt, 'update() tests `select.pointer` and leaves on a miss')
+      for (const read of ['positionIn(', 'originOf(', 'recordsClick(']) {
+        const readAt = updateBody.indexOf(read)
+        ok(
+          readAt > bailAt,
+          `\`${read}\` runs only after that early return: this method is called on every ` +
+            'selection change, which under a held arrow key is thirty times a second on the ' +
+            'path EditorSurface writes its readout straight into a DOM node to stay off, so a ' +
+            'keystroke must cost one Array.some and nothing else',
+        )
+      }
+      ok(
+        /focusedCaret\(\)/.test(recorderSrc) && /update\.startState/.test(recorderSrc),
+        'the origin comes from caretTrack when the caret is in another file and from ' +
+          '`update.startState` otherwise — the second is the fallback that makes a reordering ' +
+          'of CodeMirror\'s own update phases cost a MISSING entry rather than a wrong one',
+      )
+
+      /*
+       * The ordering, pinned on the `jump.ts` side too, because it is the half that compiles
+       * backwards. `recordClick` must take the origin as an argument; reading it there — one
+       * listener later — would make the origin the destination, `near` would merge the two into
+       * one entry, and the whole feature would be a silent no-op. This is the same hazard
+       * `pendingJump` carries above, arriving from the other direction.
+       */
+      const clickBlock = jumpSrc.slice(jumpSrc.indexOf('export function recordClick'))
+      ok(clickBlock.length > 0, 'jump.ts exports recordClick')
+      const clickBody = clickBlock.slice(0, clickBlock.indexOf('\n}\n') + 1)
+      ok(
+        /origin: FilePosition \| null,/.test(clickBody),
+        'and it TAKES the origin rather than reading it',
+      )
+      ok(
+        !/livePosition\(\)/.test(clickBody) && !/focusedCaret\(/.test(clickBody),
+        'and reads no live caret of its own: by the time this runs the editor being clicked ' +
+          'into may already hold the slot, so the origin it found would be the destination',
+      )
+      ok(
+        /record\(history, origin, to\)/.test(clickBody) && !/requestReveal/.test(clickBody),
+        'it records and reveals NOTHING — the caret is already where the user pointed, so a ' +
+          'reveal here would dispatch a selection into the view that just produced one',
+      )
+    }
 
     const paneSrc = stripJs(readFileSync('src/panes/EditorPane.tsx', 'utf8'))
     ok(

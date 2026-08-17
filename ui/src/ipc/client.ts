@@ -591,6 +591,27 @@ export const fs = {
     invoke<string[]>('fs_writable_roots', { project: projectId }),
 
   /**
+   * Every path the file tree can hang a row from: the project's roots **plus** each synthetic
+   * group's top-level children — the package directories under *External Libraries*, and each
+   * file in the *Scratches* drawer. (M16)
+   *
+   * The containment question, not the writability one above, and the two lists disagree in both
+   * directions: a dependency source is revealable and never writable, the scratch *drawer* is
+   * writable and draws no row. What asks is `sidebar/rowPaths.ts::crumbTargets`, which decides
+   * before the click whether a segment of the status bar's path trail leads anywhere — an
+   * affordance that looks the same and does nothing being the defect this project keeps
+   * producing.
+   *
+   * Asked once per attach and re-asked whenever the tree self-heals, because the answer moves
+   * twice: when a project's roots move, and when *External Libraries* finishes resolving. It is
+   * deliberately I/O-free on the Rust side and never triggers a resolution, so an unresolved
+   * group answers with the roots alone and the library crumbs light up on the `cide://fs-status`
+   * the resolver emits.
+   */
+  revealRoots: (projectId: ProjectId) =>
+    invoke<string[]>('fs_reveal_roots', { project: projectId }),
+
+  /**
    * The same speed-search rule over a list the caller supplies — the git panel's changes tree.
    *
    * The `picker.rank` shape, and the same argument: two sidebar trees that answer one query
@@ -611,9 +632,36 @@ export const fs = {
  * `total` are the two numbers in the `6 of 2,418` counter, and they climb during a walk.
  */
 export const picker = {
-  /** Query a project's file index. Usable before `fs.index` has finished. */
-  query: (projectId: ProjectId, query: string, limit?: number) =>
-    invoke<PickerFrame>('picker_query', { project: projectId, query, limit: limit ?? null }),
+  /**
+   * Query a project's file index. Usable before `fs.index` has finished.
+   *
+   * `libraries` widens the answer to the project's resolved dependency packages — never to a
+   * dependency *cache*. See `ProjectFs::index_libraries`. Off by default and off costs nothing:
+   * with it false Rust takes one frame from one matcher, exactly as it did before the parameter
+   * existed.
+   *
+   * Passed explicitly rather than defaulted in Rust: `picker_query`'s parameter is
+   * `Option<bool>` because Tauri rejects a missing key for a plain `bool`, and a default living
+   * only here is one the next caller forgets. Both sides answer `false`.
+   */
+  query: (projectId: ProjectId, query: string, limit?: number, libraries = false) =>
+    invoke<PickerFrame>('picker_query', {
+      project: projectId,
+      query,
+      limit: limit ?? null,
+      libraries,
+    }),
+
+  /**
+   * Start the dependency walk behind `query`'s `libraries` scope, if one has not run.
+   *
+   * Returns as soon as the walk is claimed; the overlay watches it fill through `query`'s
+   * `running` flag and its climbing counter, the same way it watches the project walk. Calling
+   * it twice is free — the second finds the walk running or finished and starts nothing — which
+   * is what lets the caller be "the toggle went on" rather than a piece of bookkeeping.
+   */
+  indexLibraries: (projectId: ProjectId) =>
+    invoke<void>('picker_index_libraries', { project: projectId }),
 
   /**
    * Rank a list supplied here — the command palette.
@@ -1572,6 +1620,34 @@ export interface ClaudeCliSupport {
     /** The verified range as it stood when this was recorded, so a stale record reads stale. */
     verifiedRange: string
   } | null
+  /**
+   * The configured binary this whole verdict is about, echoed back. (M16)
+   *
+   * Echoed rather than assumed, because `version` and `warning` describe *this* value: a screen
+   * that captioned them with whatever is currently in the input would label one binary's
+   * version with another's name for as long as a probe was in flight.
+   */
+  binary: string
+  /** The absolute path it resolves to, or null when it cannot be run. Shown, never spawned. */
+  resolved: string | null
+  /**
+   * Why it cannot be run at all — the only hard verdict on this screen. Null when it can.
+   *
+   * A wrapper script, a `--version` that prints nothing parseable, a version past the verified
+   * range: all warnings, none of them this. `mise`, `asdf` and `direnv` are legitimate ways to
+   * name a `claude` and none of them answers `--version` in a shape worth refusing over.
+   */
+  problem: string | null
+  /**
+   * Every refusal and warning sentence, keyed by the flag or variable it belongs to.
+   *
+   * The names are matched in `settings/claudeCli.ts` for instant feedback with no round trip;
+   * only the PROSE comes from Rust, because a sentence written twice is a sentence that will say
+   * two things. Before this existed the screen struck a token out and never said why —
+   * `Verdict::note()` had one caller and it was a `tracing` line.
+   */
+  argReasons: { name: string; reason: string }[]
+  envReasons: { name: string; reason: string }[]
 }
 
 /**
@@ -1622,7 +1698,24 @@ export const claudeTasks = {
     pendingCommand<ClaudeCliSupport>(
       'claude_cli_support',
       () => invoke<ClaudeCliSupport>('claude_cli_support'),
-      { version: null, verifiedRange: 'unknown', warning: null, handshake: null },
+      {
+        version: null,
+        verifiedRange: 'unknown',
+        warning: null,
+        handshake: null,
+        // Empty rather than absent: the screen looks a sentence up by name and an empty table
+        // simply finds none, which is the same degraded-but-drawable shape every other field
+        // here takes. A missing key would be a crash in the one path that exists so the section
+        // still renders when the command is unavailable.
+        argReasons: [],
+        envReasons: [],
+        // Not `null` and not the default `'claude'`: an empty string is what the screen reads
+        // as "no answer yet", and inventing a binary name here would caption the fallback with
+        // a claim about a program nothing probed.
+        binary: '',
+        resolved: null,
+        problem: null,
+      },
     ),
 }
 

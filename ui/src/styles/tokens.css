@@ -312,6 +312,24 @@
   --h-status: 24px;
   --h-panetitle: 26px;
   /*
+   * The find bar's height, and the one number two stylesheets have to agree on. (M16)
+   *
+   * `editor/EditorSurface.module.css` gives `.cm-panels-top` exactly this height, and
+   * `layout/PaneTitleBar.module.css` steps the floating ⊞ ⛶ ⧉ × cluster down by exactly this
+   * much while a find bar is open, so those four controls sit *below* the bar instead of on top
+   * of its right-hand end. Two ends of one step: an offset derived in one file and applied in
+   * another is an offset that can silently desynchronise, and this project has already shipped a
+   * reserve that was right in one file and 96px wrong in another (`--pane-corner` vs
+   * `--pane-corner-clear`, see `PaneTitleBar.module.css`).
+   *
+   * 33px is `.findBar`'s own parts, and nothing else: `padding: 5px` twice, a 22px
+   * `.findInput`/`.findButton` (`border-box`, so 22 is the whole control), and the panel's own
+   * `border-bottom: 1px`. `check:rows` re-derives that sum out of those very rules rather than
+   * trusting this comment — the number has to stay big enough to hold the bar, because the
+   * panel's `height` is explicit and a bar that outgrew it would be clipped.
+   */
+  --h-findbar: 33px;
+  /*
    * The two sidebar widths are the mock's, and they are now *defaults* rather than fixed
    * values: `chrome/SidebarSplitter.tsx` re-declares both on `<html>` from the saved
    * settings before the first render, and again on every drag. These literals are what a

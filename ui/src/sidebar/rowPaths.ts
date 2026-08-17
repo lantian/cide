@@ -39,6 +39,103 @@ export function rootOf(path: string, roots: readonly string[]): string | null {
 }
 
 /**
+ * Where each segment of the status bar's path trail would take you, or `null`. (M16)
+ *
+ * `crates › cide-core › src › lib.rs › impl Parser › parse` is drawn by `chrome/StatusBar.tsx`
+ * as a flat list of crumbs, and the user asked for the ones that name a real place to be
+ * clickable. The half that is not obvious is which ones those are, and the answer has to be
+ * given **before** the click: a crumb that looks live and then reports *"not in this project's
+ * file tree"* is the dead control this project has now shipped nineteen times, and the user
+ * ruled that notice out by name. So an inert crumb is drawn inert, and this is the function that
+ * decides which.
+ *
+ * # The rule
+ *
+ * A segment is revealable exactly when its absolute path is at or under a **reveal root** — a
+ * path the file tree can hang a row from. That is [`rootOf`]'s longest-match containment, the
+ * same test `cide_fs::groups::Groups::owner_of` applies on the Rust side and says so in as many
+ * words. `roots` comes from `fs_reveal_roots`: the project's roots, plus each synthetic group's
+ * top-level children. Three populations fall out of it, and all three are what the tree draws:
+ *
+ * * **A project file.** The trail is drawn relative to the root (`statusReadout::pathTrail`), so
+ *   every segment is under it and every one is revealable.
+ * * **A library source.** The reveal roots are the *package* directories —
+ *   `…/registry/src/index.crates.io-<hash>/serde-1.0.229`, `…/pkg/mod/github.com/foo/bar@v1.2.3`,
+ *   `<sysroot>/lib/rustlib/src/rust/library`. So `serde-1.0.229 › src › de › mod.rs` is live and
+ *   `home`, `.cargo`, `registry`, `src`, `index.crates.io-…` are not, which is the report this
+ *   came from. **This cannot be derived here from a depth rule over the dependency caches** —
+ *   the SDK's directory comes out of `rustc --print sysroot` — which is why the list is asked for
+ *   rather than computed.
+ * * **A file under nothing** — opened through the out-of-project confirmation, or gitignored.
+ *   Nothing is revealable, because `fs_reveal` is index-only and would answer `None`.
+ *
+ * # What this is, precisely: a necessary condition, not a sufficient one
+ *
+ * Containment is the whole of what a pure function can know. Inside a reveal root, whether a
+ * *particular* directory has a row also depends on the project's ignore rules — `target/debug`
+ * is under the root and has no row — so a click on a crumb of a gitignored path still reports
+ * itself the way ⌃⇧E already does for the file. That residue is uniform rather than misleading:
+ * if the file is ignored, so is every ancestor crumb of it, and the trail reads as one live run
+ * or none. What this closes is the case that is *structurally* unreachable and was being offered
+ * anyway.
+ *
+ * # Arguments, and why they are these
+ *
+ * `file` is the buffer's absolute path; `pathCount` is how many leading entries of the trail are
+ * path segments. The trail alone is not enough for either job: it may be root-relative (so the
+ * crumbs cannot be joined into a path), and its tail is `mod › impl › fn` (so a symbol named
+ * `src` would be tested as a directory). `StatusBar` carries both on the readout claim for
+ * exactly this call — before it did, the comment in that file said plainly that it "does not know
+ * where the path ends and the symbols begin… no crumb is clickable yet".
+ *
+ * Crumbs at or past `pathCount` are symbols and answer `null` unconditionally. Going somewhere is
+ * a thing a *symbol* crumb could plausibly do — IDEA opens File Structure at its siblings — and
+ * that is a different gesture with a different target, deliberately not smuggled in here.
+ */
+export function crumbTargets(
+  file: string,
+  trailLength: number,
+  pathCount: number,
+  roots: readonly string[],
+): (string | null)[] {
+  const out: (string | null)[] = new Array<string | null>(trailLength).fill(null)
+  // Where each component of `file` ends, so a crumb's path is a *slice of the original string*.
+  // Rejoining split components would have to invent a separator and would lose a leading `/` or
+  // a drive letter; slicing cannot, whatever the path looked like going in.
+  const ends: number[] = []
+  for (let i = 1; i < file.length; i += 1) {
+    const prev = file[i - 1]
+    if ((file[i] === '/' || file[i] === '\\') && prev !== '/' && prev !== '\\') ends.push(i)
+  }
+  const last = file[file.length - 1]
+  if (file.length > 0 && last !== '/' && last !== '\\') ends.push(file.length)
+
+  // More path crumbs than the file has components means the two ends have come apart — a trail
+  // published against one buffer and a `file` from another. Answering "nothing is revealable" is
+  // the honest degradation; guessing an alignment would produce a crumb that opens the wrong row.
+  if (pathCount > ends.length) return out
+  /*
+   * How many leading components of `file` the trail does not draw, because it is root-relative.
+   *
+   * **This is where the symbol exclusion actually lives**, and it is worth saying so rather than
+   * letting the loop bound below take the credit: `pathCount` is what anchors crumb 0 to a
+   * component of the path, so crumb *i* can only ever address `ends[skipped + i]`, and for
+   * `i >= pathCount` that index is past the end. Bound the loop by `trailLength` instead and
+   * nothing changes; compute this from `trailLength` — which is what you get if nobody threads
+   * the split index through — and the whole trail shifts left, so `parse` resolves to `lib.rs`
+   * and reveals it. `check-tree-status.mjs` drives that mutation, not the bound.
+   */
+  const skipped = ends.length - pathCount
+  for (let i = 0; i < Math.min(pathCount, trailLength); i += 1) {
+    const at = ends[skipped + i]
+    if (at === undefined) continue
+    const path = file.slice(0, at)
+    out[i] = rootOf(path, roots) === null ? null : path
+  }
+  return out
+}
+
+/**
  * What *Copy Relative Path* copies.
  *
  * The **absolute** path when no root claims the row, and when the row is a root itself. That

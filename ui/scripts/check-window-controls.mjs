@@ -1,6 +1,7 @@
 /**
- * Checks `src/chrome/windowControls.ts` — which side the window buttons go on, and in what
- * order, for the platform the webview reports.
+ * Checks `src/chrome/windowControls.ts` — the two things about a window frame that differ by
+ * platform: which side the buttons go on and in what order, and whether the frame paints its
+ * own resize grips or leaves the edges to the OS.
  *
  * Worth a check because the failure is silent and remote: it is invisible to `tsc`, invisible
  * on the developing machine (Linux, which is the fallback branch — so a detection that never
@@ -10,7 +11,11 @@
  * strings directly.
  *
  * Same shape as `check-menu-model.mjs`: a bare `tsc` over one import-free file, then import
- * the output and assert.
+ * the output and assert. The tail additionally reads `WindowFrame.tsx` as *source*, because a
+ * rule the component does not consult is a rule that does not exist — this project's signature
+ * defect — and no check here can mount React. Those assertions run over comment-stripped text:
+ * `WindowFrame.tsx` explains `startResizeDragging` and the macOS suppression by name in prose,
+ * so a grep over raw source would match the explanation of code that had been deleted.
  *
  * What this does NOT cover:
  *   - that the header renders the cluster at that end. That is JSX and CSS; the layout audit
@@ -18,16 +23,32 @@
  *     `trafficLight` rules — width, height, sibling gap — depends on which side they are on.
  *   - that the buttons act. `WindowFrame.tsx` binds `data-window-button`, and the capability
  *     files are what let the calls through; a missing permission fails at runtime only.
+ *   - that AppKit really does resize a borderless window by its edges. That is the claim the
+ *     macOS branch rests on and it needs a Mac; see README's Platforms section.
  *
  * Run: `pnpm --dir ui run check:window-controls`
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-window-controls-'))
 let failed = 0
+
+/**
+ * Remove comments before grepping `WindowFrame.tsx`.
+ *
+ * Not optional here: that file's own prose names `drawsOwnResizeGrips`, `startResizeDragging`
+ * and `isMaximized` while explaining them, so a grep over raw source would be satisfied by the
+ * paragraph describing code somebody had just deleted. String literals are kept — they are the
+ * feature, not commentary — for the reason `check-tab-drag.mjs` sets out at length.
+ *
+ * Deliberately naive, and safe on this one file: it contains no regex literal holding `//` or
+ * `/*`. The `[^:]` guard keeps a `https://` inside a string from eating its line.
+ */
+const strip = (src) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
 
 const eq = (actual, expected, what) => {
   const a = JSON.stringify(actual)
@@ -76,9 +97,8 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { isMacUserAgent, windowControlLayout, currentUserAgent } = await import(
-    `file://${join(out, 'chrome/windowControls.js')}`
-  )
+  const { isMacUserAgent, windowControlLayout, currentUserAgent, drawsOwnResizeGrips } =
+    await import(`file://${join(out, 'chrome/windowControls.js')}`)
 
   // =====================================================================================
   // 1. Detection
@@ -147,6 +167,68 @@ try {
     windowControlLayout(LINUX_WEBKIT),
     'a non-browser runtime gets the non-mac layout, which is what this project develops on',
   )
+
+  // =====================================================================================
+  // 4. Who resizes the window's edges
+  // =====================================================================================
+
+  ok(
+    drawsOwnResizeGrips(LINUX_WEBKIT),
+    'Linux paints its own resize grips: an undecorated Wayland surface has no resize border, ' +
+      'so `startResizeDragging` is the whole of the gesture',
+  )
+  ok(
+    !drawsOwnResizeGrips(MAC_WEBKIT),
+    'macOS must NOT paint resize grips. `tao`’s macOS `drag_resize_window` returns ' +
+      'NotSupported unconditionally, and the grip calls `preventDefault()` before it — so a ' +
+      'painted grip takes the pointer-down that AppKit would have turned into a resize ' +
+      '(a borderless NSWindow keeps `NSWindowStyleMask::Resizable`) and resizes nothing. ' +
+      'Drawing them is worse than not having them',
+  )
+  ok(
+    drawsOwnResizeGrips(WINDOWS_EDGE) && drawsOwnResizeGrips(''),
+    'Windows and a non-browser runtime follow the Linux branch: `drag_resize_window` is ' +
+      'implemented on Windows, and the fallback must be the platform this project develops on',
+  )
+
+  // =====================================================================================
+  // 5. …and the frame actually asks
+  // =====================================================================================
+  //
+  // The rule above is a pure function, so it is trivially green whether or not anything calls
+  // it. `WindowFrame.tsx` is where it has to be consulted, and it is JSX inside a component —
+  // exactly the place no check in this repository can execute.
+
+  const frame = strip(readFileSync('src/chrome/WindowFrame.tsx', 'utf8'))
+
+  ok(
+    /import\s*\{[^}]*\bdrawsOwnResizeGrips\b[^}]*\}\s*from\s*'\.\/windowControls'/.test(frame),
+    'WindowFrame.tsx imports drawsOwnResizeGrips from ./windowControls. Without the import the ' +
+      'rule is a module nothing loads, and the grips are painted on every platform',
+  )
+  ok(
+    /drawsOwnResizeGrips\(\s*currentUserAgent\(\)\s*\)/.test(frame),
+    'WindowFrame.tsx calls drawsOwnResizeGrips(currentUserAgent()). Reading the agent through ' +
+      'the same helper as the button layout is what keeps the two platform decisions answering ' +
+      'from one place — and an async command instead would cost a frame of live grips',
+  )
+  // The list is what the JSX maps over, so an empty list is the only thing that actually stops
+  // a grip being painted. Both suppressions have to survive together: the macOS one is new, and
+  // the maximized one is load-bearing on KDE (see the component's own comment).
+  const gripList = frame.match(/const grips\s*=\s*([^\n]*)/)
+  ok(gripList !== null, 'WindowFrame.tsx still derives the painted grips into `const grips`')
+  if (gripList) {
+    ok(
+      /isMaximized/.test(gripList[1]),
+      'the grips are still suppressed while maximized — dragging a maximized window’s ' +
+        `border on KDE half-maximizes it with no way back. Got: ${gripList[1].trim()}`,
+    )
+    ok(
+      /platformResizes|drawsOwnResizeGrips/.test(gripList[1]),
+      'the painted-grip list does not consult the platform, so macOS gets eight invisible ' +
+        `strips that swallow the pointer and resize nothing. Got: ${gripList[1].trim()}`,
+    )
+  }
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

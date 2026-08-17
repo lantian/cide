@@ -209,6 +209,33 @@ fn keymap() {
         }
     };
     emit(&render_keymap(&cide_core::keymap::resolve(&user)));
+    emit(&render_macos_menu_conflicts());
+}
+
+/// The chords that resolve cleanly and can never fire on macOS, appended to every keymap dump.
+///
+/// Printed on **every** host, not only on a Mac, and that is the point. This is a fact about the
+/// keymap that is invisible from the platform it is developed on: `cide_core::keymap` produces a
+/// binding, Settings → Keymap lists it, `check:keys` proves it resolves — and AppKit answers the
+/// accelerator from `Menu::default` before the web view is ever asked, so the command never runs
+/// there. A tool whose whole job is *"inspect the keymap without a window"* should say so.
+///
+/// It is also what stops `macos_menu_conflicts` being a function only its own test calls, which
+/// is this project's signature defect wearing a different hat. Two lines on a Linux dump is a
+/// price worth paying for that.
+fn render_macos_menu_conflicts() -> String {
+    let conflicts = cide_core::keymap::macos_menu_conflicts();
+    if conflicts.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nunreachable on macOS (the system menu bar answers first):\n");
+    for c in conflicts {
+        out.push_str(&format!(
+            "  {:<14} {:<24} taken by {}\n",
+            c.key, c.command, c.menu_item
+        ));
+    }
+    out
 }
 
 // ----------------------------------------------------------------------- columns

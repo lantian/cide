@@ -271,9 +271,18 @@ pub fn defaults() -> Vec<Binding> {
     // # What this costs, named rather than hidden
     //
     // `@codemirror/commands` binds `Alt-ArrowUp`/`Alt-ArrowDown` to `moveLineUp`/`moveLineDown`,
-    // so inside a buffer those stop moving lines. `EditorSurface` re-homes them to
-    // `Mod-Shift-Arrow` — IDEA's own chord for the same thing — which is free in both layers, so
-    // a capability moves rather than disappearing.
+    // so inside a buffer those stop moving lines. `EditorSurface` re-homes them, so a capability
+    // moves rather than disappearing.
+    //
+    // This paragraph used to say the re-homing was to `Mod-Shift-Arrow`, "IDEA's own chord …
+    // free in both layers". Both halves were wrong and it took until M16 to notice: `grep` found
+    // no `moveLineUp` anywhere in `ui/src`, so the compensation had never been built and
+    // move-line was simply gone; and `Mod-Shift-Arrow` is *not* free on macOS, where
+    // `standardKeymap`'s `{ mac: "Cmd-ArrowUp", shift: selectDocStart }` makes ⌘⇧↑/⌘⇧↓
+    // select-to-top and select-to-bottom. The binding that exists now is `Mod-Shift-Arrow` on
+    // Linux and Windows and `Mod-Alt-Shift-Arrow` on macOS, which is free in both — checked by
+    // expanding the composed CodeMirror keymap in `check-editor.mjs` rather than by reading its
+    // documentation, because reading it is what produced the sentence this paragraph replaces.
     //
     // The alternative was `ctrl+alt+up`/`ctrl+alt+down`, and it costs strictly more: `ctrl+alt+down`
     // is already `pane.split.down` above, *and* CodeMirror binds `Mod-Alt-Arrow` to
@@ -348,6 +357,34 @@ pub fn defaults() -> Vec<Binding> {
             // platform exception here would need a matching one in `keeps_ctrl_on_macos` and
             // would be the only entry in that list not justified by the OS eating the chord.
             ("ctrl+g", "navigate.line", "editorFocused"),
+            /*
+             * ⌥L — widen Ctrl+P to *External Libraries*, while Ctrl+P has the keyboard. (M16)
+             *
+             * # What it costs, checked in every layer rather than assumed
+             *
+             * * **In `defaults()`**: no binding uses Alt with a letter except `alt+shift+s`, and
+             *   the only other Alt entries are `alt+up`, `alt+down` and `alt+f7`. Free.
+             * * **Against typing**: strokes come from `KeyboardEvent.code`, so this is
+             *   layout-independent, and the gate resolves before the focused input is offered
+             *   the event — the picker's field never sees a character.
+             * * **Against the overlay's own keys**: `listAction` claims the arrows, the Page
+             *   keys, Home/End, Enter and Escape, and nothing else. Free.
+             * * **In terminals and in CodeMirror**: nothing at all, because of the clause. ⌥L is
+             *   `ESC l` to a shell — readline's `downcase-word` — and taking that from every
+             *   terminal pane in every window for a command that only means something while a
+             *   modal is up would be the `ctrl+b` mistake with a smaller excuse.
+             *
+             * `ctrl+alt+l` was the obvious alternative and is rejected: it is KDE's Lock Screen
+             * on a stock install, so on the development platform it never reaches the app at all.
+             *
+             * The clause names `filePickerOpen` rather than `overlayOpen`, which is true for any
+             * of nine overlays. Scoped to the one that has a library scope, ⌥L in the palette,
+             * the symbol picker or the branch popup stays unbound and passes through.
+             *
+             * `platform_layer` leaves Alt alone, so this stays ⌥L on macOS, where ⌥ is also
+             * where an IDEA user's hand already is.
+             */
+            ("alt+l", "picker.libraries", "filePickerOpen"),
             /*
              * M14. Ctrl+Tab is the **tab** switcher, and this is a move rather than an addition:
              * `project.switcher.next` / `.prev` were bound here and are not any more.
@@ -507,7 +544,139 @@ fn platform_layer(macos: bool) -> Vec<Binding> {
             args: binding.args,
         });
     }
+
+    /*
+     * ⌘[ and ⌘] — Back and Forward, added to the layer rather than produced by it. (M16)
+     *
+     * The mac chord for this in Xcode, in VS Code, in IDEA-on-mac and in every browser. On
+     * Linux the thumb buttons are the whole of it (`mouseback`/`mouseforward` above), and those
+     * carry no `ctrl`, so `ctrl_to_meta` returns `None` and the rewrite loop leaves them alone
+     * on macOS too — `the_macos_layer_leaves_the_thumb_buttons_alone` asserts exactly that. So
+     * this is an addition and cannot collide with a rewritten form of them.
+     *
+     * # Why not `("ctrl+[", …)` in `defaults()`, and let the loop above produce ⌘[ for free
+     *
+     * Because Ctrl+[ **is** the ESC character, 0x1b, on every terminal ever made, and the key
+     * gate is a window *capture* listener: the binding would swallow Escape-equivalent in every
+     * terminal pane in every window on Linux, which is the failure `ctrl+b`'s `editorFocused`
+     * clause exists to prevent, without the clause. Ctrl+] is telnet's escape and vim's
+     * jump-to-tag. Neither is free, so neither is written down.
+     *
+     * # Spelling
+     *
+     * `bracketleft`, not `[`. `normalize_key` deliberately renames no keys — the trap
+     * `keeps_ctrl_on_macos` documents for backquote — so the Rust side would keep whichever was
+     * written. The frontend folds them together either way (`chords.ts`'s `ALIASES` maps `[` to
+     * `bracketleft` on the *binding string* as well as on the event, and `CODE_NAMES` maps the
+     * `BracketLeft` code to the same name), and `chords.ts` renders it back as `[` for the
+     * palette's chip. So the choice is about which spelling makes the two sides look identical
+     * to somebody grepping, and that is this one.
+     *
+     * No `when`, matching `mouseback`/`mouseforward`: the one precondition that matters —
+     * somewhere to go back to — cannot be a context flag and is re-checked in `keys/dispatch.ts`,
+     * which reports the refusal as a sentence. What it costs a *terminal* is the point of the
+     * paragraph above and is why the Linux spelling is not the same chord.
+     *
+     * # What it takes from CodeMirror, named rather than discovered
+     *
+     * `@codemirror/commands` binds `Mod-[`/`Mod-]` to `indentLess`/`indentMore`, and `Mod` is ⌘
+     * on macOS — so those two chords go dead inside a buffer there. **The capability does not
+     * go with them**: `indentWithTab` is in `EditorSurface`'s keymap, so Tab and Shift+Tab indent
+     * and dedent the selection, which is what IDEA-on-mac binds them to as well.
+     * `check-editor.mjs` pins that survival path by command identity rather than by key string.
+     */
+    out.push(Binding::new("meta+bracketleft", "navigate.back"));
+    out.push(Binding::new("meta+bracketright", "navigate.forward"));
+
     out
+}
+
+/// The chords macOS's own menu bar takes before the web view is ever asked.
+///
+/// cide never calls `.menu()` and never calls `.enable_macos_default_menu(false)`, so on macOS
+/// tauri installs `Menu::default` for it (`tauri-2.11.5` `src/app.rs`, in `build()`). AppKit
+/// resolves a menu item's key equivalent in `performKeyEquivalent:` **before** the key reaches
+/// WKWebView, so `ui/src/keys/gate.ts` — a window capture listener inside the document — never
+/// sees these at all. A binding whose macOS spelling lands here is not merely shadowed; it is
+/// unreachable, and it is still listed in Settings → Keymap looking perfectly healthy.
+///
+/// The list is the accelerators `muda-0.19.2`'s `PredefinedMenuItemType::accelerator` gives the
+/// items `Menu::default` puts in, **as this module spells a chord** — modifiers in
+/// `ctrl alt shift meta` order. `maximize` is in that menu and is deliberately absent here: it
+/// is the one predefined item with no accelerator.
+///
+/// Two entries are worth knowing about even though nothing collides with them:
+///
+/// * **`meta+q`.** cide has no `app.quit` command at all — on Linux the window manager's close
+///   button and `RunEvent::ExitRequested` are the whole of it — so ⌘Q *is* this menu item, and
+///   the quit path on a Mac is a gesture cide does not own. `cide_app::lib`'s run loop now
+///   handles `RunEvent::Exit` for exactly that reason.
+/// * **`meta+c` / `meta+v` / `meta+x` / `meta+a` / `meta+z`.** These are the Edit submenu, and
+///   they are the argument *against* the obvious fix of turning the default menu off: on macOS
+///   a menu item's `copy:`/`paste:` is a large part of how clipboard keys reach a text view at
+///   all, and finding out whether WKWebView still handles them unaided needs a Mac.
+pub const MACOS_MENU_CHORDS: [(&str, &str); 12] = [
+    ("meta+c", "Edit → Copy"),
+    ("meta+x", "Edit → Cut"),
+    ("meta+v", "Edit → Paste"),
+    ("meta+z", "Edit → Undo"),
+    ("shift+meta+z", "Edit → Redo"),
+    ("meta+a", "Edit → Select All"),
+    ("meta+m", "Window → Minimize"),
+    ("meta+w", "File → Close Window"),
+    ("meta+q", "cide → Quit"),
+    ("meta+h", "cide → Hide"),
+    ("alt+meta+h", "cide → Hide Others"),
+    ("ctrl+meta+f", "View → Toggle Full Screen"),
+];
+
+/// A default binding whose macOS spelling is claimed by [`MACOS_MENU_CHORDS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacMenuConflict {
+    /// The chord, as the macOS layer resolves it.
+    pub key: String,
+    /// The command that will never run for it there.
+    pub command: String,
+    /// The menu item that takes it instead.
+    pub menu_item: &'static str,
+}
+
+/// Every default binding that macOS's menu bar makes unreachable.
+///
+/// Computed rather than listed, over the *rebinds* the platform layer produces — an unbind
+/// (`-command`) is not a conflict, it is the layer removing a chord on purpose.
+///
+/// This is a fact about the product, not a lint, so it has a surface as well as a gate:
+/// `cide-headless keymap` prints it under every dump on every host — the tool exists to inspect
+/// the keymap without a window, and *"this binding cannot fire on a Mac"* is exactly the kind of
+/// thing a window would never show you. `every_macos_menu_conflict_is_one_somebody_decided_to_keep`
+/// fails when the set changes in either direction; growing it silently is how a keymap entry
+/// becomes decoration.
+pub fn macos_menu_conflicts() -> Vec<MacMenuConflict> {
+    conflicts_in(platform_layer(true))
+}
+
+/// [`macos_menu_conflicts`] over a layer handed in, so the unbind rule below has a test.
+///
+/// The unbind filter is not decoration. A default already spelled with **both** modifiers —
+/// `ctrl+meta+f` is the shape, and it is in the claimed list because ⌃⌘F is Full Screen — would
+/// have that exact key on its `-command` line, and reporting a removal as a dead binding would
+/// put a permanent false entry in the list this module exists to keep true.
+fn conflicts_in(layer: Vec<Binding>) -> Vec<MacMenuConflict> {
+    layer
+        .into_iter()
+        .filter(|binding| !binding.command.starts_with('-'))
+        .filter_map(|binding| {
+            MACOS_MENU_CHORDS
+                .iter()
+                .find(|(chord, _)| *chord == binding.key)
+                .map(|(_, menu_item)| MacMenuConflict {
+                    key: binding.key,
+                    command: binding.command,
+                    menu_item,
+                })
+        })
+        .collect()
 }
 
 /// Chords that stay on `ctrl` even on macOS.
@@ -1432,6 +1601,65 @@ mod tests {
         }
     }
 
+    /// Every clause on a **binding** names a flag the vocabulary knows. (M16)
+    ///
+    /// # This was a hole, and it was found by mutation
+    ///
+    /// `check-commands.mjs` has always asserted this for a `Command`'s `when` — the clause that
+    /// gates the *palette* — and nothing asserted it for a `Binding`'s, which gates the
+    /// *keyboard*. The split between those two is spelled out at the head of this module; what
+    /// it did not have was a check on the second half.
+    ///
+    /// The failure is silent and total, and it is this project's signature defect wearing a
+    /// typo. `KeyContext` is a map and evaluation reads a missing key as `false`, so a clause
+    /// naming `pickerIsOpen` where the vocabulary says `filePickerOpen` is **permanently
+    /// false**: the binding is in the table, `conflicts` reports nothing about it, Settings →
+    /// Keymap lists it, and the chord does nothing for ever. Changing this file and
+    /// `check-key-gate.mjs`'s mirror together — which is exactly what somebody renaming a flag
+    /// would do — left the entire suite green.
+    ///
+    /// Here rather than in the TypeScript, because this side owns both tables and the failure
+    /// should arrive where it was caused. `check-commands.mjs` keeps the other half, over a
+    /// `CONTEXT_FLAGS` it reads out of this crate's source.
+    ///
+    /// Compound clauses are split into identifiers, so `a && !b` is checked as two names rather
+    /// than as one string that matches nothing.
+    #[test]
+    fn every_default_binding_scopes_itself_with_a_flag_that_exists() {
+        let mut checked = 0usize;
+        // Both platform layers, because a clause added to the macOS-only pushes would never be
+        // built on this machine and would ship without anybody having run it.
+        let layers: Vec<Binding> = defaults()
+            .into_iter()
+            .chain(platform_layer(false))
+            .chain(platform_layer(true))
+            .collect();
+        for binding in &layers {
+            let Some(clause) = binding.when.as_deref() else {
+                continue;
+            };
+            for flag in clause
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|part| !part.is_empty())
+            {
+                assert!(
+                    crate::commands::CONTEXT_FLAGS.contains(&flag),
+                    "the binding `{}` → `{}` is scoped to `{flag}`, which is not in \
+                     CONTEXT_FLAGS. A key context is a map and a missing key reads as false, so \
+                     this chord is dead in every context — listed in Settings → Keymap, \
+                     reported by nothing, and doing nothing for ever.",
+                    binding.key,
+                    binding.command
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 8,
+            "only {checked} clause identifiers were checked — the scan stopped seeing them"
+        );
+    }
+
     #[test]
     fn the_default_keymap_has_no_conflicts() {
         assert_eq!(conflicts(&resolve(&[])), Vec::new());
@@ -1965,6 +2193,140 @@ mod tests {
         );
         let resolved = resolve_layers(&mac, &[]);
         assert_eq!(command_for(&resolved, "mouseback"), ["navigate.back"]);
+    }
+
+    /// The chords a Mac user will press and nothing will happen, pinned in both directions.
+    ///
+    /// Not a lint and not a wish: it is an allowlist of conflicts somebody looked at and decided
+    /// to live with, and it fails when the set **grows** (a new binding is dead on macOS and
+    /// nobody noticed) *and* when it **shrinks** (an entry here has gone stale and is now
+    /// misleading prose in `README.md`). Set equality is the only assertion that catches both.
+    ///
+    /// It cannot be a behavioural test, because the thing that eats the keystroke is AppKit
+    /// resolving a menu accelerator in a process this repository has never run.
+    #[test]
+    fn every_macos_menu_conflict_is_one_somebody_decided_to_keep() {
+        let acknowledged = [
+            // ⌘W. The Mac-correct binding for closing a *tab* — it is what Safari, Chrome and
+            // VS Code do — so the binding is right and the obstacle is the menu, not the
+            // keymap. Kept rather than moved back to ctrl+w, which would be wrong on the
+            // platform's own terms; the fix is `.enable_macos_default_menu(false)` plus an
+            // explicit menu whose accelerators match `commands.rs`, and that is a decision
+            // that needs somebody looking at a Mac. Until then ⌘W closes the window.
+            ("meta+w", "tab.close", "File → Close Window"),
+            // ⌥⌘H. Hide Others, which is a strong system convention and not worth fighting.
+            // The other three of the family (⌥⌘J/K/L) are unclaimed, so pane navigation works
+            // in three directions out of four there — which is worse than it sounds, and is
+            // the reason this is written down rather than shrugged at.
+            ("alt+meta+h", "pane.navigate.left", "cide → Hide Others"),
+        ];
+
+        let found: Vec<(String, String, &str)> = macos_menu_conflicts()
+            .into_iter()
+            .map(|c| (c.key, c.command, c.menu_item))
+            .collect();
+        let expected: Vec<(String, String, &str)> = acknowledged
+            .iter()
+            .map(|(k, c, m)| ((*k).to_string(), (*c).to_string(), *m))
+            .collect();
+
+        assert_eq!(
+            found, expected,
+            "the set of default bindings macOS's menu bar makes unreachable has changed. A new \
+             entry means a chord that is listed in Settings → Keymap, resolves cleanly, and can \
+             never fire on a Mac — AppKit answers the accelerator before WKWebView is asked. \
+             Either move the binding, or add it here with the reason it is acceptable, and keep \
+             README.md's Platforms section in step"
+        );
+    }
+
+    /// A chord the layer *removes* is not a chord that stopped working.
+    ///
+    /// Reachable, not hypothetical: a default written `ctrl+meta+f` produces an unbind on that
+    /// exact key, and ⌃⌘F is Full Screen, so without the filter the list above would carry a
+    /// permanent entry describing a binding that no longer exists. There is no such default
+    /// today, which is precisely why this is a direct test rather than a mutation of `defaults`.
+    #[test]
+    fn an_unbind_on_a_claimed_chord_is_not_reported_as_a_dead_binding() {
+        let removed = Binding {
+            key: "ctrl+meta+f".into(),
+            command: "-view.fullscreen".into(),
+            when: None,
+            args: None,
+        };
+        let kept = Binding::new("ctrl+meta+f", "view.fullscreen");
+
+        assert!(conflicts_in(vec![removed.clone()]).is_empty());
+        assert_eq!(
+            conflicts_in(vec![removed, kept])
+                .into_iter()
+                .map(|c| c.command)
+                .collect::<Vec<_>>(),
+            ["view.fullscreen"],
+            "the rebind on a claimed chord is still a conflict; only the removal is not"
+        );
+    }
+
+    /// The claimed-chord table is only as good as its spelling.
+    ///
+    /// Every entry has to parse and re-render to itself, or it can never match a resolved
+    /// binding and the whole check above quietly finds nothing — the vacuous-green failure this
+    /// project has paid for more than once.
+    #[test]
+    fn every_chord_the_mac_menu_bar_claims_is_spelled_the_way_this_module_spells_one() {
+        for (chord, item) in MACOS_MENU_CHORDS {
+            let parsed = parse_chord(chord).unwrap_or_else(|e| panic!("{item}: {chord}: {e:?}"));
+            assert_eq!(
+                render(&parsed),
+                chord,
+                "{item}: `{chord}` is not this module's canonical spelling (modifiers go \
+                 ctrl, alt, shift, meta), so it can never match a resolved binding"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_gets_cmd_bracket_for_back_and_forward() {
+        let mac = resolve_layers(&platform_layer(true), &[]);
+        assert_eq!(command_for(&mac, "meta+bracketleft"), ["navigate.back"]);
+        assert_eq!(
+            command_for(&mac, "meta+bracketright"),
+            ["navigate.forward"],
+            "⌘] is Forward on macOS — the chord Xcode, VS Code and every browser use"
+        );
+
+        // The literal spelling has to resolve to the same stroke, because that is what a user
+        // writes in `keymap.json` and what `chords.ts` folds an event onto.
+        assert_eq!(normalize_key("Meta+["), "meta+[");
+        assert_eq!(normalize_key("meta+bracketleft"), "meta+bracketleft");
+
+        // Linux and Windows get nothing: `ctrl+[` IS the ESC byte and `ctrl+]` is telnet's
+        // escape, and the gate is a window capture listener, so binding either would take them
+        // from every terminal pane in every window.
+        let linux = resolve_layers(&platform_layer(false), &[]);
+        for key in ["meta+bracketleft", "meta+bracketright", "ctrl+[", "ctrl+]"] {
+            assert!(
+                command_for(&linux, key).is_empty(),
+                "{key} must be unbound off macOS"
+            );
+        }
+        for binding in defaults() {
+            let key = normalize_key(&binding.key);
+            assert!(
+                !key.contains('[') && !key.contains(']') && !key.contains("bracket"),
+                "{key} is bound to {} — a bracket chord in `defaults()` reaches Linux, where \
+                 ctrl+[ is the ESC character every terminal application reads",
+                binding.command
+            );
+        }
+
+        // Rebindable and unbindable like any other key, which is the whole reason these live in
+        // the keymap rather than in a mac-only branch of the gate.
+        let unbound = resolve_layers(
+            &platform_layer(true),
+            &[Binding::new("meta+bracketleft", "-navigate.back")],
+        );
+        assert!(command_for(&unbound, "meta+bracketleft").is_empty());
     }
 
     #[test]

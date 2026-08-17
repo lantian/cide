@@ -482,6 +482,18 @@ export function App() {
   )
 
   /*
+   * Every path the file tree can hang a row from, for the status bar's clickable path trail.
+   * (M16)
+   *
+   * Subscribed here rather than inside `StatusBar` because every component in `chrome/` is a
+   * pure render target that reads nothing from a store — the property `chrome/auditFixture.ts`
+   * depends on. It moves twice in a session (the project's roots, and *External Libraries*
+   * resolving), so a subscription rather than a one-off read; the store re-asks Rust on the
+   * `cide://fs-status` the resolver emits, and this re-renders the bar when the answer grows.
+   */
+  const revealRoots = useFileTree((s) => s.revealable)
+
+  /*
    * Diagnostics: one snapshot, filtered once, read by three surfaces. (M12)
    *
    * The filter is applied *here* and not in the store, and not in any of the three consumers.
@@ -594,6 +606,12 @@ export function App() {
   const keyContext = {
     projectOpen: activeProjectId !== null,
     overlayOpen: overlay !== null,
+    // Narrower than `overlayOpen`, and that is the whole reason it exists: ⌥L is scoped to the
+    // one overlay that has a library scope, so it stays unbound — and therefore passes through —
+    // in the palette, the symbol picker, the branch popup and every terminal pane in every
+    // window. The gate is a *capture* listener, so an `overlayOpen` clause would have taken
+    // readline's `downcase-word` from a shell any time a modal happened to be up.
+    filePickerOpen: overlay === 'files',
     // `gate.ts` listens on window capture, so it sees a keystroke before an open menu does.
     // Nothing collides today — every default binding is a modified chord — but this is what
     // stops a user who rebinds a bare key from having it swallowed while a menu is up.
@@ -1033,7 +1051,7 @@ export function App() {
               <TabContent
                 tabs={activeProject.tabs}
                 activeTab={activeProject.activeTab}
-                renderTree={(tab) =>
+                renderTree={(tab, active) =>
                   // A settings tab has a pane tree — every tab does, which is the invariant
                   // that makes "promote pane to tab" one code path — but nothing to render
                   // into it. The screen replaces the tree rather than living inside a pane.
@@ -1122,6 +1140,19 @@ export function App() {
                           onSessionBound={(session) =>
                             void bindSession(activeProject.id, tab.id, paneNode.id, session)
                           }
+                          /*
+                           * Which tab is in front, which `TabContent` computes and has offered
+                           * through this callback's second argument since M4 — and which this
+                           * call site wrote `(tab) =>` and discarded.
+                           *
+                           * The editor is the only pane kind that needs it, and needs it because
+                           * the hiding here is pure CSS: a background tab's panes are mounted,
+                           * laid out at full size and painting, so nothing below can tell them
+                           * from the visible one. Without it the status bar's file readout was
+                           * claimed by whichever restored tab's `file_read` resolved last, and a
+                           * Ctrl+Tab moved nothing. See `editor/statusReadout.ts`.
+                           */
+                          onScreen={active}
                         />
                         )}
                       </PaneFrame>
@@ -1353,6 +1384,26 @@ export function App() {
           /* The *filtered* snapshot, so the bar and the panel cannot disagree — and `null`
              whenever nothing has looked, which is what makes it print `✗ — ⚠ —`. */
           diagnostics={statusBarCounts(diagnostics.snapshot)}
+          revealRoots={revealRoots}
+          /*
+           * A crumb of the open file's path trail, straight to `file.reveal` and to nothing
+           * else. Identical routing to `Explorer`'s ⌖ button above and to a Ctrl+click on a
+           * directory in terminal output, and for the identical reason: that arm brings the
+           * sidebar to Files first, resolves an *External Libraries* group that has never been
+           * opened, and reports a path with no row in a sentence — none of which is worth a
+           * second copy here, and all of which a second reveal path would have to keep in step.
+           *
+           * **Withheld in a window with no sidebar**, which draws every crumb inert rather than
+           * live-and-refusing. `dispatch.ts` answers `file.reveal` with a notice when
+           * `role.kind !== 'shell'`, and a detached *tab* window reaches this line — the
+           * detached-*pane* branch returns long before it. Same rule and same shape as
+           * `onRevealPath` on the terminal above.
+           */
+          onRevealSegment={
+            boot?.role.kind === 'shell'
+              ? (path) => runCommand('file.reveal', { path })
+              : undefined
+          }
         />
 
         {/*

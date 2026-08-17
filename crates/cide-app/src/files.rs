@@ -284,6 +284,29 @@ pub struct ProjectFs {
     /// frame, and what stops a watcher burst from parsing files for a project whose symbol index
     /// nobody has ever asked for.
     symbols_started: AtomicBool,
+
+    // --- M16: the library scope of the file picker ---------------------------------------
+    //
+    // A **third** matcher, for the reason the symbol one is a second, plus one that is specific
+    // to this: nucleo is append-only. A user who turns *Search libraries* off cannot have 32,000
+    // candidates taken back out, so a single matcher would mean the toggle only ever went one
+    // way. Two matchers and `cide_search::merge` is what makes it a toggle at all.
+    //
+    // The four couplings `cide_fs::groups` lists are all still intact, and that is the point:
+    // this touches `Index` nowhere. `dir_paths()` — the watcher's watch list — `Filter::build`,
+    // `show_roots` and `path_of` are the project's alone. "Library sources are never watched"
+    // stays true because there is still no code that could watch them.
+    /// Candidates from the resolved dependency packages. Empty until somebody asks.
+    library_matcher: Arc<NucleoMatcher>,
+    libraries_indexing: AtomicBool,
+    /// A library walk has run to completion for this project.
+    ///
+    /// What makes [`Self::index_libraries`] idempotent, and what lets the picker tell "nobody
+    /// asked yet" from "asked, and this project has no dependencies" — which are the same empty
+    /// matcher and need different words on screen.
+    libraries_walked: AtomicBool,
+    /// How many packages the walk covered, for the empty-answer sentence.
+    library_packages: AtomicU32,
 }
 
 impl ProjectFs {
@@ -312,6 +335,10 @@ impl ProjectFs {
             symbols_stale: AtomicU32::new(0),
             symbols_indexing: AtomicBool::new(false),
             symbols_started: AtomicBool::new(false),
+            library_matcher: Arc::new(NucleoMatcher::new()),
+            libraries_indexing: AtomicBool::new(false),
+            libraries_walked: AtomicBool::new(false),
+            library_packages: AtomicU32::new(0),
         }
     }
 
@@ -394,6 +421,213 @@ impl ProjectFs {
 
         self.symbols_started.store(true, Ordering::Release);
         self.symbol_status()
+    }
+
+    // --- M16: the library scope of the file picker ------------------------------------------
+
+    pub fn library_matcher(&self) -> &NucleoMatcher {
+        &self.library_matcher
+    }
+
+    pub fn is_indexing_libraries(&self) -> bool {
+        self.libraries_indexing.load(Ordering::Acquire)
+    }
+
+    /// Has a library walk finished for this project?
+    ///
+    /// What separates "nobody asked" from "asked, and this project depends on nothing" — the
+    /// same empty matcher, and two different sentences on screen.
+    pub fn libraries_walked(&self) -> bool {
+        self.libraries_walked.load(Ordering::Acquire)
+    }
+
+    /// How many packages the last walk covered. Zero before one has run.
+    pub fn library_packages(&self) -> u32 {
+        self.library_packages.load(Ordering::Acquire)
+    }
+
+    /// Walk this project's resolved dependency packages into the library matcher.
+    ///
+    /// **Blocking, and idempotent.** Call it from `spawn_blocking`; `cmd::picker` is the only
+    /// caller in the app and does.
+    ///
+    /// # What is indexed, and what deliberately is not
+    ///
+    /// Only the packages *this project resolves* — `cargo metadata --frozen`'s dependency graph
+    /// plus the SDK row — and never a dependency cache. Measured on this repository: **593
+    /// packages, 31,865 files**, walked in ~130 ms warm. The whole of `~/.cargo/registry/src` on
+    /// the same machine is 127,055 files and `~/go/pkg/mod` is 347,777, neither of which is
+    /// bounded by anything about the project the user has open. That distinction is the feature:
+    /// "index the libraries" and "index everything this machine has ever built" differ by two
+    /// orders of magnitude, and only the first is a picker.
+    ///
+    /// **No watcher, and no `Filter` rebuild.** Library sources are read-only and immutable —
+    /// a registry crate at a version does not change — so there is nothing to watch, and adding
+    /// 6,586 directories to inotify to learn that would cost more than the walk. The staleness
+    /// that does happen is `cargo add`/`cargo update`, which the lockfile stamp already notices
+    /// (`libraries::stale`) and which invalidates the group; [`Self::forget_libraries`] is what
+    /// that path calls.
+    ///
+    /// # Why it can block on `cargo metadata`, and why that is affordable
+    ///
+    /// A user who has never opened *External Libraries* has no resolved packages, so this asks
+    /// `ProjectGroups::resolve_now` for them — the same blocking resolution `fs_reveal` already
+    /// performs for *Select Opened File*, on the same argument: the gesture explicitly asked for
+    /// this, it happens at most once per project per process, and the alternative is not
+    /// "faster", it is an empty answer.
+    ///
+    /// The user sees it happen. `picker_index_libraries` returns immediately after claiming the
+    /// walk and the overlay polls with `running: true` while the counter climbs — the same shape
+    /// `symbols_index` and `symbol_query` have shipped with since M12.
+    pub fn index_libraries(&self) -> bool {
+        /*
+         * `libraries_walked` is checked BEFORE the claim, and that order is the whole
+         * correctness of this pair.
+         *
+         * It read `swap(true, …) || libraries_walked()`. `swap` STORES unconditionally and
+         * returns the old value, so once a walk had finished the second operand took the branch
+         * — after the first had already set the flag, and before the clearing guard below was
+         * constructed. Every later call therefore latched `libraries_indexing` to true and left
+         * it there for the life of the process, and the picker's overlay polls that flag: the
+         * scope reported *indexing* for ever, on a project whose libraries were already indexed.
+         * `FilePicker` re-issues this on every mount while the scope is on, so reopening Ctrl+P
+         * once was enough.
+         *
+         * Asking the cheap, idempotent question first also makes the claim mean what it says:
+         * whoever wins the swap is the one doing a walk, and is holding the guard.
+         */
+        if self.libraries_walked() {
+            return false;
+        }
+        if self.libraries_indexing.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        // Cleared by a guard, so a panic in the walk cannot leave the flag set for ever — which
+        // would make every later call take the branch above and report a half-filled matcher as
+        // final. The same shape as `IndexingGuard` and `index_symbols`'s, and for the same
+        // reason: the consequence of getting it wrong is silent and permanent.
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _guard = Guard(&self.libraries_indexing);
+
+        // Resolve if nobody has. `resolve_now` claims, fills and answers false when somebody
+        // else is already resolving — in which case the entries below are whatever is there,
+        // and the walk simply covers fewer packages than it might have. A `Resolving` group is
+        // a group somebody is about to fulfil, and `libraries_walked` stays false, so the next
+        // press of the toggle picks up the rest.
+        let roots = self.root_paths();
+        if self.groups.entries(crate::libraries::GROUP_ID).is_empty() {
+            self.groups.resolve_now(&roots);
+        }
+
+        // A note row — *"Standard library sources are not installed"*, or a Go module the cache
+        // does not hold — has no directory and contributes nothing. `dir` is what says the path
+        // is real; `Entry::note` sets neither.
+        let packages: Vec<(String, PathBuf)> = self
+            .groups
+            .entries(crate::libraries::GROUP_ID)
+            .into_iter()
+            .filter_map(|entry| {
+                let path = entry.path?;
+                // The name *and* the version, which is `detail` — `serde 1.0.229`. Without the
+                // version two rows from two builds of the same crate are indistinguishable,
+                // which is the failure the chip exists for. `detail` is also where a per-row
+                // note lands (`v1.1.1 · not downloaded`), and that reads correctly in a chip.
+                let label = match entry.detail {
+                    Some(detail) if !detail.is_empty() => format!("{} {detail}", entry.name),
+                    _ => entry.name.clone(),
+                };
+                Some((label, path))
+            })
+            .collect();
+
+        // The package's *directory name* as the walk's label, not the display label: it is what
+        // becomes the `rel` prefix, so a row reads `serde-1.0.229/src/de/mod.rs` and a user can
+        // narrow to one crate by typing its name. The display label goes on the candidate's
+        // `source` instead, where it is drawn and not matched.
+        let roots: Vec<Root> = packages
+            .iter()
+            .map(|(_, path)| Root::new(path.clone()))
+            .collect();
+        let sources: Vec<String> = packages.iter().map(|(label, _)| label.clone()).collect();
+
+        self.library_packages
+            .store(roots.len() as u32, Ordering::Release);
+
+        let matcher = Arc::clone(&self.library_matcher);
+        Index::walk_roots(
+            &roots,
+            // `threads: 1`, and the default is the trap. See `Index::walk_roots`: 593 roots at
+            // the default `threads: 0` costs 1.24 s against 130 ms here, all of it in spawning
+            // and joining 32 walker threads per package directory.
+            BuildOptions {
+                threads: 1,
+                ..BuildOptions::default()
+            },
+            true,
+            &move |batch: &[WalkItem]| {
+                for item in batch.iter().filter(|i| !i.is_dir) {
+                    // `item.root` is the index into `roots`, which is parallel to `sources` by
+                    // construction. A miss is impossible and is treated as "no chip" rather than
+                    // as a panic: a row with no provenance is a degraded row, and a panic here
+                    // would poison the guard above and disable the feature for the process.
+                    let source = sources.get(item.root as usize).cloned();
+                    let value = item.path.to_string_lossy().into_owned();
+                    matcher.push(match source {
+                        Some(source) => Candidate::from_source(item.rel.clone(), value, source),
+                        None => Candidate::new(item.rel.clone(), value),
+                    });
+                }
+            },
+        );
+
+        /*
+         * Last, and only on this path — the same rule `Indexing::run` states about `walked`. It
+         * means "this project's libraries have been walked", and setting it earlier would make a
+         * walk that panicked permanently unrepeatable with no way to ask again.
+         *
+         * **And only when there was something to walk.** The comment above says a `Resolving`
+         * group leaves `libraries_walked` false so the next press picks up the rest — that was
+         * the intent and not the behaviour: the store ran unconditionally. So a user who expanded
+         * *External Libraries* in the tree (which forks `cargo metadata` on its own thread) and
+         * pressed the picker's toggle inside that window got zero packages, `resolve_now`
+         * refusing because somebody else held the claim, and the flag latched anyway — the
+         * library scope was then permanently empty for that project, with no gesture that could
+         * ask again. Which is the exact opposite of what the paragraph above promises.
+         *
+         * Zero packages is not always transient: a Go-only project, or a Rust one whose
+         * `rust-src` component is absent, legitimately resolves to nothing. Those cases are not
+         * distinguished here on purpose — a repeated walk of an empty set costs one `entries()`
+         * call, while a wrongly-latched flag costs the feature.
+         */
+        if !roots.is_empty() {
+            self.libraries_walked.store(true, Ordering::Release);
+        }
+        true
+    }
+
+    /// Drop the library candidates and allow a fresh walk.
+    ///
+    /// Called when the lockfile stamp says the resolution is stale — `cargo add`, `cargo
+    /// update` — because the packages the matcher holds are then a set that no longer describes
+    /// this project. `NucleoMatcher::clear` replaces the injector under its own lock, so a walk
+    /// still pushing into the old one is filling a queue nobody reads rather than corrupting the
+    /// new one.
+    ///
+    /// It does **not** re-walk. The user asked for libraries once; whether they still want them
+    /// is answered by the toggle being on, and the next query re-walks through the ordinary lazy
+    /// path. Re-walking here would put a 130 ms walk on the tail of a `cargo build` in a
+    /// terminal pane.
+    pub fn forget_libraries(&self) {
+        if !self.libraries_walked.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.library_matcher.clear();
+        self.library_packages.store(0, Ordering::Release);
     }
 
     /// Re-parse a handful of files a watcher burst touched.
@@ -536,6 +770,25 @@ impl ProjectFs {
     pub fn writable_paths(&self) -> Vec<PathBuf> {
         let mut paths = self.root_paths();
         paths.extend(self.groups.writable_dirs());
+        paths
+    }
+
+    /// Every path the file tree can hang a row from: the roots, plus each group's top-level
+    /// children.
+    ///
+    /// The **containment** question, not the writability one, and the two lists are genuinely
+    /// different in both directions. A dependency source is revealable and not writable (that is
+    /// the whole of `writable_dirs`' comment); a scratch is both; a project root is both. So this
+    /// is a third list rather than a widening of either, for the same reason `writable_paths` is
+    /// not a widened [`Self::root_paths`] — one list meaning two things is how a menu comes to
+    /// offer a verb the handler refuses.
+    ///
+    /// What asks: the status bar's path trail, which makes a segment clickable exactly when some
+    /// entry here contains it. See [`cide_fs::groups::Groups::reveal_roots`] for why the
+    /// frontend cannot derive the group half itself.
+    pub fn reveal_paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.root_paths();
+        paths.extend(self.groups.reveal_roots());
         paths
     }
 

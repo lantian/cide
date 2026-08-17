@@ -31,6 +31,28 @@
  * buffer somebody is typing in from stealing the readout out from under them. Releasing
  * hands the slot to the editor under it rather than blanking the bar, so closing one half of
  * a split leaves the other half's file on screen instead of nothing.
+ *
+ * # The input that was missing: which tab is in front (M16)
+ *
+ * That is the right ordering for a split and it was the wrong ordering for **tabs**, because the
+ * stack was moved by exactly two things — mounting and DOM focus — and a tab switch is neither.
+ * `TabContent` never unmounts an inactive tab (it says why, at length), so every open file holds
+ * a live claim for as long as the project does. Two reports came out of that, and they are the
+ * same bug seen from both ends:
+ *
+ * * switching to an already-open file left the previous file on the bar until the user clicked
+ *   into the buffer — `file_open` is open-*or-activate*, so there is no mount and no focus;
+ * * on restore, every tab mounted at once in `file_read` completion order and the **last one to
+ *   land** owned the bar, whichever tab was actually in front.
+ *
+ * So the claim carries `onScreen`: a mount behind another tab goes to the *bottom* of the stack
+ * instead of the top, and `EditorSurface` calls [`ReadoutSlot.focus`] when its tab comes forward.
+ * Mount, activation and DOM focus then all move the slot, and the three gestures that produce no
+ * mount — Ctrl+Tab, a tab-strip click, `file.open` on an open file — work like the two that do.
+ *
+ * Nothing *demotes*: clicking into a terminal leaves the last buffer's trail standing, which is
+ * `chrome/StatusBar.tsx`'s stated behaviour and unchanged, because a terminal tab holds no
+ * editor and so claims nothing.
  */
 
 /** The four facts, each owned by a different part of the editor. */
@@ -81,12 +103,40 @@ export function pathTrail(path: string, root?: string): string[] {
 export interface ReadoutLine {
   /** The trail. Empty when no editor holds the slot. */
   readonly trail: readonly string[]
+  /**
+   * How many leading entries of [`trail`] are **path** segments; the rest are the caret's
+   * `mod › impl › fn` chain. (M16)
+   *
+   * The bar draws one flat list and used to say so in its own comment — *"deliberately does not
+   * know where the path ends and the symbols begin… no crumb is clickable yet"*. That sentence
+   * was the feature's whole blocker, and this field is it: without the split,
+   * `crates › cide-core › src › lib.rs › impl Parser › parse` classifies `parse` against
+   * `…/lib.rs/impl Parser/parse`, which is under the project root, so the symbol would be drawn
+   * as a live crumb and every click on it would report a file that does not exist.
+   *
+   * Carried on the claim rather than recomputed, because it cannot be recovered from the trail:
+   * a symbol legitimately called `src` is indistinguishable from a directory called `src`.
+   */
+  readonly pathCount: number
+  /**
+   * The buffer's **absolute** path, of which the trail is a possibly root-relative rendering.
+   *
+   * The trail alone cannot be turned back into paths — `crates › cide-core` may be missing
+   * `/home/u/work/cide` in front of it, and rejoining segments would have to invent a separator.
+   * `rowPaths::crumbTargets` slices this string instead.
+   */
+  readonly file: string
   /** `Rust · UTF-8 · LF · Ln 7, Col 48`, or `''` for the same reason. */
   readonly detail: string
 }
 
 /** No editor open. Frozen and shared, so "nothing here" is one object and one comparison. */
-const NOTHING: ReadoutLine = Object.freeze({ trail: Object.freeze([]), detail: '' })
+const NOTHING: ReadoutLine = Object.freeze({
+  trail: Object.freeze([]),
+  pathCount: 0,
+  file: '',
+  detail: '',
+})
 
 /** Receives the owning editor's line, and `NOTHING` when no editor holds the slot. */
 export type ReadoutListener = (line: ReadoutLine) => void
@@ -96,14 +146,22 @@ export interface ReadoutSlot {
   /** Replace the moving half. Reaches the bar only while this slot is on top. */
   set(detail: string): void
   /**
-   * Replace the trail, for a file whose *root* moved under it.
+   * Replace the trail. Three things move it, and none of them is opening another file — that
+   * takes a fresh claim, and the `file` this slot was claimed with never changes.
    *
-   * Not the same thing as opening another file, which takes a fresh claim. This is the boot
-   * race: `PaneBody` passes `roots[0]?.path ?? PROJECT_ROOT`, so an editor restored before
-   * its project record arrives computes its trail against the fallback and would otherwise
-   * show an absolute path for the rest of the session.
+   * 1. The caret crossing a member boundary, which is what appends `impl Parser › parse`.
+   * 2. The **root arriving late**: `PaneBody` passes `roots[0]?.path ?? PROJECT_ROOT`, so an
+   *    editor restored before its project record lands computes its trail against the fallback
+   *    and would otherwise show an absolute path for the rest of the session.
+   * 3. The **outline arriving late**, which is the ordinary case rather than a race — the parse
+   *    is asynchronous, so a freshly opened tab has a path and no symbols for a moment. Before
+   *    M16 nothing recomputed on that, and the symbol half stayed missing until the user moved
+   *    the caret.
+   *
+   * `pathCount` travels with the trail because (1) and (3) change it and the other does not, and
+   * a bar that took the length from a stale field would draw a symbol as a clickable directory.
    */
-  setTrail(trail: readonly string[]): void
+  setTrail(trail: readonly string[], pathCount: number): void
   /** Take the slot — the user is in this editor now. A no-op when it is already held. */
   focus(): void
   /** Give it up on unmount. The editor under this one gets it back. */
@@ -112,6 +170,8 @@ export interface ReadoutSlot {
 
 interface Claim {
   trail: readonly string[]
+  pathCount: number
+  file: string
   detail: string
 }
 
@@ -147,7 +207,12 @@ export function sameTrail(a: readonly string[], b: readonly string[]): boolean {
 }
 
 function same(a: ReadoutLine, b: ReadoutLine): boolean {
-  return a.detail === b.detail && sameTrail(a.trail, b.trail)
+  return (
+    a.detail === b.detail
+    && a.file === b.file
+    && a.pathCount === b.pathCount
+    && sameTrail(a.trail, b.trail)
+  )
 }
 
 function publish(): void {
@@ -155,7 +220,12 @@ function publish(): void {
   if (same(line, published)) return
   // A snapshot, not the claim: the claim is mutable and a listener holding it would watch
   // `detail` change under it without ever being told.
-  published = { trail: line.trail, detail: line.detail }
+  published = {
+    trail: line.trail,
+    pathCount: line.pathCount,
+    file: line.file,
+    detail: line.detail,
+  }
   // Copied before the walk: a listener is free to unsubscribe itself, and mutating the set
   // under its own iterator is how the next listener silently stops being told.
   for (const listen of [...listeners]) listen(published)
@@ -168,16 +238,32 @@ function publish(): void {
  * unique: two panes can show one file, and the one being closed would disconnect the one
  * that stays. Same reasoning as `registerReveal`'s disposer.
  *
- * The trail is handed over once and changes only through `setTrail`. `EditorSurface` rebuilds
- * its view — and so takes a fresh claim — whenever the *path* changes, so the only thing that
- * can move it afterwards is the root it is drawn relative to.
+ * The trail is handed over as the file's **path segments** and changes only through `setTrail`;
+ * `pathCount` therefore starts as its length, because a buffer nobody has looked at yet has no
+ * symbol tail. `EditorSurface` rebuilds its view — and so takes a fresh claim — whenever the
+ * *path* changes, which is why `file` is fixed for the life of a claim and never has a setter.
+ *
+ * `onScreen` is whether this editor's tab is the one in front. See the header for the two
+ * reports that came of the stack not having that input.
  *
  * The handle is inert after `release`, so a listener still firing out of a torn-down
  * CodeMirror update cannot write into a bar that has moved on to another buffer.
  */
-export function claimStatusReadout(trail: readonly string[], detail = ''): ReadoutSlot {
-  const claim: Claim = { trail: [...trail], detail }
-  claims.push(claim)
+export function claimStatusReadout(
+  file: string,
+  trail: readonly string[],
+  detail = '',
+  onScreen = true,
+): ReadoutSlot {
+  const claim: Claim = { trail: [...trail], pathCount: trail.length, file, detail }
+  // An editor that mounts **behind another tab does not take the slot**, and that one word is
+  // the whole of the restore bug. `TabContent` never unmounts an inactive tab, so reopening a
+  // workspace mounts every restored file at once, in the order `file_read` happens to resolve —
+  // and with an unconditional push the bar ended up naming whichever of them landed last,
+  // regardless of which tab the user is looking at. Inserted at the bottom rather than skipped,
+  // so closing the visible editor still hands the bar down to something rather than blanking it.
+  if (onScreen) claims.push(claim)
+  else claims.unshift(claim)
   publish()
   let live = true
 
@@ -189,9 +275,10 @@ export function claimStatusReadout(trail: readonly string[], detail = ''): Reado
       claim.detail = next
       if (top()) publish()
     },
-    setTrail(next: readonly string[]): void {
-      if (!live || sameTrail(claim.trail, next)) return
+    setTrail(next: readonly string[], pathCount: number): void {
+      if (!live || (claim.pathCount === pathCount && sameTrail(claim.trail, next))) return
       claim.trail = [...next]
+      claim.pathCount = pathCount
       if (top()) publish()
     },
     focus(): void {
@@ -229,5 +316,5 @@ export function subscribeStatusReadout(listen: ReadoutListener): () => void {
 
 /** Every live claim, oldest first. For tests and diagnostics. */
 export function readoutClaims(): ReadoutLine[] {
-  return claims.map(({ trail, detail }) => ({ trail, detail }))
+  return claims.map(({ trail, pathCount, file, detail }) => ({ trail, pathCount, file, detail }))
 }

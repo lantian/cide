@@ -1837,6 +1837,68 @@ mod tests {
             "another session's id must not match"
         );
     }
+
+    // --- the run loop reaches shutdown by both routes ---------------------------------------
+
+    /// Which run events reach [`shutdown`], asserted structurally because nothing can call it.
+    ///
+    /// The dispatch is a closure passed to `App::run`, which needs a real event loop, a real
+    /// window and a display; there is no way to hand it a `RunEvent` from a test, and
+    /// `RunEvent` is `#[non_exhaustive]` besides. So the gate is over the source, in the same
+    /// shape as `windows.rs`'s focus-routing assertion and for the same reason: the defect is a
+    /// missing *arm*, and a missing arm is invisible to every other kind of check.
+    ///
+    /// # The bug this exists to keep out
+    ///
+    /// Only `ExitRequested` was matched. On Linux that is enough — a window close and a UI quit
+    /// both raise it, and a signal is caught by the signal thread. On macOS the common gesture
+    /// raises neither: ⌘Q from tauri's default menu is `NSApp terminate:`, which tao turns into
+    /// `Event::LoopDestroyed` and tauri-runtime-wry into the *other* variant, with no signal
+    /// raised anywhere. The consequence is not a crash but a silence: the debounced workspace
+    /// write never flushes and the child ladder never runs, so a Mac user's last layout change
+    /// is lost and every `claude` and language server is orphaned.
+    ///
+    /// Deliberately not asserted here: that only these two variants are matched. `RunEvent` is
+    /// non-exhaustive and gains variants across tauri releases; pinning the whole match would
+    /// turn a dependency bump into a red build with nothing wrong.
+    #[test]
+    fn both_ways_out_of_the_run_loop_reach_shutdown() {
+        let lib = crate::srcgrep::without_comments(include_str!("lib.rs"));
+
+        // The window of source that matters: the `.run(...)` closure, not the whole file. Both
+        // names appear elsewhere in `lib.rs` as ordinary prose otherwise, and matching the file
+        // whole would go green on a mention rather than on an arm.
+        let run = lib
+            .split_once(".run(|app, event|")
+            .map(|(_, rest)| rest)
+            .expect("lib.rs still ends with a `.run(|app, event| …)` closure");
+
+        assert!(
+            run.contains("RunEvent::ExitRequested"),
+            "the run-loop closure does not handle `tauri::RunEvent::ExitRequested`, which is \
+             what a window close and a quit from the UI raise"
+        );
+        // The bare variant, and it has to be told apart from the longer name that starts with
+        // it: `ExitRequested` contains `Exit`, so a plain `contains` would call this satisfied
+        // by the arm above alone — which is exactly the state being forbidden. Both spellings
+        // rustfmt can produce for the bare variant are accepted, so a reformat of the match
+        // is not a red build.
+        assert!(
+            run.contains("RunEvent::Exit =>") || run.contains("RunEvent::Exit |"),
+            "the run-loop closure does not handle `tauri::RunEvent::Exit`, only the requested \
+             form. That is the other way out, and on macOS it is the one the ordinary gesture \
+             takes: ⌘Q raises no ExitRequested and no signal, so `lifecycle::shutdown` would \
+             not run at all — the debounced workspace write is lost and every `claude` and \
+             language server is orphaned, with nothing reported anywhere. `app.exit()` reaches \
+             here the same way on every platform"
+        );
+        assert!(
+            run.contains("lifecycle::shutdown(app)"),
+            "the run-loop closure matches the exit events but never calls \
+             `lifecycle::shutdown`, which is the only thing on that path that flushes state \
+             and brings the children down"
+        );
+    }
 }
 
 #[cfg(test)]

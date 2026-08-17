@@ -376,21 +376,18 @@ try {
     '`--pane-corner-clear` is the SUM of the inset and the width — the band the cluster '
       + 'actually occupies, which is what a pane\'s own content has to keep clear',
   )
+  //
+  //    The find bar used to be a fourth entry here and is deliberately not one any more; the
+  //    block below this loop pins the mechanism that replaced it, and pins that this rule has
+  //    not quietly come back.
   for (const [file, selector] of [
     ['src/panes/DiffPane.module.css', '.header'],
     ['src/panes/GitDiffPane.module.css', '.header'],
     ['src/panes/EditorPane.module.css', '.conflict'],
-    // The find bar. A CodeMirror top panel is `position: sticky; top: 0` across the editor's
-    // full width, so it is the same 33 rows of pixels as the cluster — `Match case` under `×`,
-    // `3 of 12` under `⧉`. It cannot be raised out of the way: `.body`'s `z-index: 0` was added
-    // deliberately to put the cluster on top (the block further down pins that against the real
-    // literals in `node_modules`), because before it the bar covered all four buttons. So the
-    // panel reserves the band like every other surface that lands in that corner.
-    ['src/editor/EditorSurface.module.css', '.body :global(.cm-panels.cm-panels-top)'],
   ]) {
     // The selector is matched literally rather than built into a character-escaped pattern:
-    // `:global(.cm-panels...)` has parentheses and dots in it, and the `"\\" + selector` trick
-    // the first three entries were written with escapes only the leading character.
+    // the `"\\" + selector` trick these were originally written with escapes only the leading
+    // character, and a selector carrying a `.` or a `(` would then match far too much.
     const body = css(file)
     const at = body.indexOf(`${selector} {`)
     const rule = at < 0 ? '' : body.slice(at, body.indexOf('}', at) + 1)
@@ -401,6 +398,175 @@ try {
         + 'under the pane cluster otherwise, drawn but unclickable',
     )
   }
+
+  // --- the find bar keeps its width, and the CLUSTER moves instead (M16) ------------------
+  //
+  // The reserve above is the right answer for a strip whose height can change with its content
+  // — the conflict bar wraps on a narrow pane — and it was the wrong answer for the find bar,
+  // which is a fixed 33px and is a *search field*: the user rejected a search box that is 221px
+  // narrower than the file it is searching. So the bar spans the content and the cluster steps
+  // below it, and this block is what makes that step provable rather than asserted twice.
+  //
+  // Four separate ways it could go wrong, each pinned here:
+  //
+  //   * the reserve creeps back onto the panel (a well-meaning revert) — the negative below;
+  //   * the offset and the bar's height stop being the same number — both ends must name
+  //     `--h-findbar`, and the token's value is re-derived from the bar's own parts;
+  //   * the step fires for a strip it cannot size — the `:has()` rule must stay scoped to an
+  //     editor pane and must keep excluding `[data-pane-strip='fluid']`;
+  //   * the cluster slides off a short pane — the `top` must stay inside a `clamp()`.
+  const surfaceCss = css('src/editor/EditorSurface.module.css')
+  const panelAt = surfaceCss.indexOf('.body :global(.cm-panels.cm-panels-top) {')
+  const panelRule =
+    panelAt < 0 ? '' : surfaceCss.slice(panelAt, surfaceCss.indexOf('}', panelAt) + 1)
+  ok(panelRule !== '', 'the find bar panel still has a rule of its own to check')
+  ok(
+    !/--pane-corner/.test(panelRule),
+    'the find bar does NOT reserve the pane cluster any more. It is a search field, and one '
+      + 'that stops 221px short of the file it is searching is what the reserve cost here; the '
+      + 'cluster steps below it instead. Reintroducing `--pane-corner-clear` here would put the '
+      + 'narrow bar back in silence, which is why this is a negative and not an omission',
+  )
+  ok(
+    /margin-right:\s*var\(--w-minimap\)/.test(panelRule),
+    'and it ends where the file content ends — `.cm-scroller` has the same `margin-right`, so '
+      + 'the bar stops at the minimap instead of painting over its top 33px and taking its '
+      + 'clicks (`.cm-panels` is z-index 300 and would win)',
+  )
+  ok(
+    /height:\s*var\(--h-findbar\)/.test(panelRule),
+    'and it is exactly `--h-findbar` tall — the same token the frame steps the cluster down by, '
+      + 'so the offset and the thing being stepped over cannot desynchronise',
+  )
+
+  // Both setters of the step, with their selectors, out of the comment-stripped stylesheet.
+  const stripSetters = [
+    ...paneCss.matchAll(/([^{}]+)\{([^{}]*?--pane-top-strip:\s*([^;]+);[^{}]*)\}/g),
+  ].map((m) => ({ selector: m[1].trim().replace(/\s+/g, ' '), value: m[3].trim() }))
+  eq(
+    stripSetters.length,
+    2,
+    'exactly two rules set `--pane-top-strip`: `.frame`, which states the 0 every pane kind '
+      + 'has, and the single `:has()` rule that steps over a find bar. A third would be a '
+      + 'second answer to "how far down does this pane\'s content start"',
+  )
+  const base = stripSetters.find((s) => s.selector === '.frame')
+  const step = stripSetters.find((s) => s.selector !== '.frame')
+  ok(
+    base !== undefined && base.value === '0px',
+    '`.frame` states the default strip explicitly rather than leaving the `top` below to ride a '
+      + '`var()` fallback — the same rule `--pane-cluster-inset` follows, for the same reason: a '
+      + 'fallback resolves in silence',
+  )
+  ok(
+    step !== undefined && step.value === 'var(--h-findbar)',
+    'and the step names `--h-findbar` rather than restating 33px, so it is the same number the '
+      + 'panel above declares as its height',
+  )
+  if (step) {
+    ok(
+      /\[data-kind='editor'\]/.test(step.selector),
+      'the step is scoped to an EDITOR pane. A diff draws its own 26px header above its '
+        + 'CodeMirror surface, so a panel there is already below the cluster, and a terminal has '
+        + `no panels at all — the rule reads: ${step.selector}`,
+    )
+    ok(
+      /:has\(\s*:global\(\.cm-panels-top\)\s*\)/.test(step.selector),
+      'and it tests for the panel CONTAINER, which `@codemirror/view` removes from the DOM at '
+        + 'zero panels — an exact state test rather than a proxy for one',
+    )
+    ok(
+      /:not\(\s*:has\(\[data-pane-strip='fluid'\]\)\s*\)/.test(step.selector),
+      'and it stands down while a fluid-height strip is pinned above the panel. The conflict '
+        + "bar's `.conflictText` is `flex: 1; min-width: 0` with no `white-space`, so it wraps "
+        + 'and grows on a narrow pane: a fixed step over it would land the cluster in the middle '
+        + 'of `Keep mine`. It also settles the both-strips case, where the find bar is no longer '
+        + 'the topmost strip and nothing of it is under the cluster',
+    )
+  }
+
+  // The declaring end of that exclusion. Without it the `:not()` above names an attribute
+  // nobody sets, which is false for ever — the cluster would step down over a conflict bar and
+  // through the button that preserves the user's unsaved edits.
+  const editorPaneTsx = readFileSync('src/panes/EditorPane.tsx', 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+  ok(
+    /className=\{styles\.conflict\}[\s\S]{0,400}?data-pane-strip="fluid"/.test(editorPaneTsx),
+    'and the conflict bar actually declares `data-pane-strip="fluid"`. The `:not()` above is '
+      + 'the only reader of it, so an attribute nobody sets makes that clause false for ever '
+      + 'and steps the cluster down through `Keep mine`',
+  )
+
+  // The cluster's resting place, and the pane it cannot slide out of.
+  ok(
+    /top:\s*clamp\(\s*0px\s*,\s*var\(--pane-top-strip\)\s*,\s*calc\(100% - var\(--h-panetitle\)\)\s*\)/
+      .test(clusterRule),
+    'the cluster rests at `--pane-top-strip`, clamped into its own frame. `MIN_RATIO` is 0.1 '
+      + 'and splits nest, so a pane under 60px is reachable by dragging, and `.frame` has no '
+      + '`overflow: hidden` — an unclamped 33px there paints these controls over the pane BELOW. '
+      + 'A bare `top: 0` would be the bug this whole block is about',
+  )
+
+  // --- `--h-findbar` is the bar's own parts, not a number somebody typed -------------------
+  //
+  // The panel's height is explicit, so this token being too small does not spill the bar — it
+  // CLIPS it, silently, at whichever end the flex row gives way. Derived here from the four
+  // declarations that actually make the height, so a taller input or a fatter padding fails on
+  // this line instead of eating the close button.
+  const tokensCss = css('src/styles/tokens.css')
+  const findBarPad = /\.findBar \{[\s\S]*?padding:\s*(\d+)px/.exec(surfaceCss)
+  const findInputH = /\.findInput \{[\s\S]*?height:\s*(\d+)px/.exec(surfaceCss)
+  const findButtonH = /\.findButton \{[\s\S]*?height:\s*(\d+)px/.exec(surfaceCss)
+  const panelBorder = /border-bottom:\s*(\d+)px/.exec(panelRule)
+  const findbarToken = /--h-findbar:\s*(\d+)px/.exec(tokensCss)
+  ok(
+    findBarPad !== null && findInputH !== null && findButtonH !== null && panelBorder !== null
+      && findbarToken !== null,
+    'the find bar still declares a padding, an input height, a button height and a bottom '
+      + 'border, and `tokens.css` still declares `--h-findbar`',
+  )
+  if (findBarPad && findInputH && findButtonH && panelBorder && findbarToken) {
+    const tallest = Math.max(Number(findInputH[1]), Number(findButtonH[1]))
+    const want = Number(findBarPad[1]) * 2 + tallest + Number(panelBorder[1])
+    eq(
+      Number(findbarToken[1]),
+      want,
+      '`--h-findbar` is the bar it is measuring: 5px of padding twice, the 22px control that '
+        + 'sets the row height (`box-sizing: border-box`, so 22 is the whole control), and the '
+        + "panel's own 1px border-bottom",
+    )
+    eq(
+      Number(findbarToken[1]),
+      33,
+      'and that sum is 33px. Spelled out as well as derived, because `--pane-corner` agreed '
+        + 'with a wrong derivation for a whole milestone: two ways of being wrong have to '
+        + 'disagree before either is worth trusting',
+    )
+  }
+
+  // --- and the step is only exact while there is exactly ONE top panel ---------------------
+  //
+  // `--h-findbar` is one bar's height. A second `Panel` with `top = true` would stack inside the
+  // same `.cm-panels-top` container, which would then be taller than the step and the cluster
+  // would come to rest on top of the second bar. `GoToLine.tsx` says why the stock `gotoLine`
+  // dialog — a *bottom* panel — was not reused; this is the assertion that keeps the top group
+  // a group of one.
+  const editorFiles = readdirSync('src/editor', { withFileTypes: true })
+    .filter((e) => e.isFile() && /\.tsx?$/.test(e.name))
+    .map((e) => `src/editor/${e.name}`)
+  const topPanelFiles = editorFiles.filter((f) =>
+    /\btop\s*[=:]\s*true\b/.test(
+      readFileSync(f, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, ''),
+    ),
+  )
+  eq(
+    topPanelFiles,
+    ['src/editor/find.ts'],
+    'the find bar is still the only TOP panel in the editor. A second one stacks inside the '
+      + 'same `.cm-panels-top` box, which would then be taller than `--h-findbar` and leave the '
+      + 'cluster resting on it — the exact collision the step exists to end',
+  )
 
   // And nobody outside the publishing file reads the bare width any more. This is the
   // assertion that would have caught the conflict bar: it *was* wired to `--pane-corner`, and

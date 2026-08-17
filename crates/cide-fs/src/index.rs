@@ -349,6 +349,54 @@ impl Index {
         index
     }
 
+    /// Walk roots and stream them to `sink`, building **no tree at all**. (M16)
+    ///
+    /// # Why this is not `Index::build` with the result thrown away
+    ///
+    /// `build` grafts every entry into an arena, sorts each touched directory's children and
+    /// recomputes the visible-row counts. That is what a *file tree* needs and the picker needs
+    /// none of it: it wants candidate strings. For the 593 external packages this repository
+    /// depends on, the arena is ~32,000 nodes and their `PathBuf` keys — several times the
+    /// memory of the candidates themselves — for a tree nothing draws, nothing expands and
+    /// nothing reveals into. `cide_fs::groups` draws the *External Libraries* rows, from the
+    /// resolver's answer, and has since M13.
+    ///
+    /// Everything else is deliberately identical: the same `WalkBuilder`, the same gitignore
+    /// rules, the same `rel` construction — so a path the picker offers is a path the tree would
+    /// have shown, had anybody asked it to walk there.
+    ///
+    /// # Threads, and the 20× trap
+    ///
+    /// `BuildOptions::default()` is `threads: 0`, which lets `ignore` spin one walker per core.
+    /// That is right for a handful of project roots and catastrophic for hundreds of tiny ones:
+    /// measured on this repository's own dependency set — 593 package directories, 36,643
+    /// entries of which 31,865 are files, warm cache, 32 cores — a loop of `threads: 0` walks
+    /// costs **1.24 s**, against **130 ms** for the same loop at `threads: 1`. The cost is not
+    /// the walking, it is spawning and joining 32 threads 593 times over directories that hold
+    /// 60 entries each.
+    ///
+    /// So the caller passes `threads: 1` and this function does not decide for it — but the
+    /// number is written down here because the *default* is the trap, and a caller reaching for
+    /// `BuildOptions::default()` gets it.
+    ///
+    /// `multi` is `true` for these callers, which is what makes `rel` come back as
+    /// `serde-1.0.229/src/de/mod.rs` — the package name prefixed for free by `Visitor::item`,
+    /// and exactly the string the picker should match and draw.
+    pub fn walk_roots(
+        roots: &[Root],
+        opts: BuildOptions,
+        multi: bool,
+        sink: &(dyn Fn(&[WalkItem]) + Sync),
+    ) {
+        for (i, root) in roots.iter().enumerate() {
+            // `u16`, so a project with more than 65,535 dependency packages would alias root
+            // indices. Truncating is the right failure: the index is only used to attribute a
+            // `WalkItem` to a root, no caller of this function reads it, and refusing to walk
+            // would be a worse answer than an unread field being wrong.
+            walk_root(root, i as u16, multi, opts, |batch| sink(batch));
+        }
+    }
+
     /// Insert walked entries into the arena.
     ///
     /// Sorting by path is what makes a second pass unnecessary: a parent path is a
@@ -1286,6 +1334,125 @@ mod tests {
         assert_eq!(rows[1].depth, 1);
         assert_eq!(rows[2].root, 1);
         assert_eq!(index.reveal(&dir.join("beta/b.rs")), Some(3));
+        assert_eq!(
+            index.reveal(&dir.join("beta")),
+            Some(2),
+            "a ROOT has a row of its own once there are several, which is what lets the status \
+             bar's path trail make that segment clickable: a file under the second root is drawn \
+             absolutely (the trail is relative to `roots[0]` alone), so `beta` is a crumb"
+        );
+    }
+
+    /// The picker's library walk: candidates, no tree, and the package name on every path.
+    ///
+    /// Three properties, and every one of them is a thing a later edit could take away without
+    /// any other test noticing:
+    ///
+    ///   * **`rel` is prefixed with the package's directory name.** That is what makes a picker
+    ///     row read `serde-1.0.229/src/lib.rs` and what lets a user narrow to one crate by
+    ///     typing its name. It falls out of `multi: true` and is the whole reason the caller
+    ///     passes it.
+    ///   * **The same ignore rules as the project walk.** A picker that offered `target/` from a
+    ///     dependency and the tree that does not would be two answers to one question.
+    ///   * **No `Index` is produced at all.** The arena for 593 packages is ~36,000 nodes and
+    ///     their `PathBuf` keys, for a tree nothing draws — `Groups` draws the library rows.
+    ///     This is asserted by the signature (there is no `Index` to return) and by the fact
+    ///     that this test drives it with nothing but a sink.
+    #[test]
+    fn walk_roots_streams_candidates_with_a_package_prefix_and_builds_no_tree() {
+        let dir = scratch("index-walk-roots");
+        let alpha = dir.join("alpha-1.0.0");
+        let beta = dir.join("beta-2.0.0");
+        tree(&alpha);
+        tree(&beta);
+
+        let found = std::sync::Mutex::new(Vec::<String>::new());
+        Index::walk_roots(
+            &[Root::new(&alpha), Root::new(&beta)],
+            BuildOptions {
+                threads: 1,
+                ..BuildOptions::default()
+            },
+            true,
+            &|batch| {
+                let mut found = found.lock().unwrap();
+                for item in batch.iter().filter(|i| !i.is_dir) {
+                    found.push(item.rel.clone());
+                }
+            },
+        );
+
+        let mut rows = found.into_inner().unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                "alpha-1.0.0/Cargo.toml",
+                "alpha-1.0.0/src/deep/mod.rs",
+                "alpha-1.0.0/src/lib.rs",
+                "alpha-1.0.0/src/main.rs",
+                "beta-2.0.0/Cargo.toml",
+                "beta-2.0.0/src/deep/mod.rs",
+                "beta-2.0.0/src/lib.rs",
+                "beta-2.0.0/src/main.rs",
+            ],
+            "every path carries its package, and `target/debug/binary` is gitignored on both \
+             sides exactly as it is for the project's own walk"
+        );
+    }
+
+    /// `root` attributes a walked item to the root it came from, which is what the library walk
+    /// turns into the `serde 1.0.229` chip. An index that did not track it would give every row
+    /// the first package's name — 31,864 rows labelled `serde`.
+    #[test]
+    fn walk_roots_attributes_every_item_to_its_own_root() {
+        let dir = scratch("index-walk-roots-attribution");
+        let alpha = dir.join("alpha");
+        let beta = dir.join("beta");
+        tree(&alpha);
+        tree(&beta);
+
+        let seen = std::sync::Mutex::new(Vec::<(u16, String)>::new());
+        Index::walk_roots(
+            &[Root::new(&alpha), Root::new(&beta)],
+            BuildOptions {
+                threads: 1,
+                ..BuildOptions::default()
+            },
+            true,
+            &|batch| {
+                let mut seen = seen.lock().unwrap();
+                for item in batch.iter().filter(|i| !i.is_dir) {
+                    seen.push((item.root, item.rel.clone()));
+                }
+            },
+        );
+
+        for (root, rel) in seen.into_inner().unwrap() {
+            let expected = if rel.starts_with("alpha/") { 0 } else { 1 };
+            assert_eq!(root, expected, "{rel} was attributed to root {root}");
+        }
+    }
+
+    /// The mirror image, and the reason the crumb rule above is safe rather than lucky.
+    ///
+    /// With one root the root itself is not drawn — its children are the top-level rows — so
+    /// `reveal` on it answers `None` and a crumb offering to select it would report that the
+    /// project is not in its own file tree. It never becomes a crumb: `statusReadout::pathTrail`
+    /// draws a file inside the root *relative* to it, so the first segment is already one level
+    /// down, and a file outside the root has no ancestor equal to it. Pinned here because that
+    /// is an argument, and an argument is exactly what stops being true quietly.
+    #[test]
+    fn a_lone_root_has_no_row_to_reveal() {
+        let dir = scratch("index-lone-root");
+        tree(&dir);
+        let mut index = build(&dir);
+        assert_eq!(index.reveal(&dir), None);
+        assert_eq!(
+            index.rows(0, 1)[0].name,
+            "src",
+            "its children are the top rows"
+        );
     }
 
     #[test]

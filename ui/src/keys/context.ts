@@ -73,7 +73,13 @@ export type { KeyContext }
  * Listed as data rather than left implicit so `check-commands.mjs` can tell "supplied
  * elsewhere" apart from "supplied by nobody", which is the failure mode above.
  */
-export const HOST_FLAGS = ['overlayOpen', 'contextMenuOpen', 'sidebarFiles', 'sidebarGit'] as const
+export const HOST_FLAGS = [
+  'overlayOpen',
+  'filePickerOpen',
+  'contextMenuOpen',
+  'sidebarFiles',
+  'sidebarGit',
+] as const
 
 /** Flags [`deriveContext`] computes. Every one is a fact about the workspace mirror. */
 export const DERIVED_FLAGS = [

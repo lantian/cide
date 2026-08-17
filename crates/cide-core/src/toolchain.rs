@@ -57,7 +57,13 @@ pub fn which(binary: &str) -> Option<PathBuf> {
     None
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Is this an executable *file*?
+///
+/// `pub` since M16 for [`crate::claude_cli::resolve`], which has to answer the same question
+/// about a path the user typed rather than one this module found. Answering `false` for a
+/// directory is the half that matters there: a settings field is exactly where somebody pastes
+/// `~/.local/bin` when they meant `~/.local/bin/claude`.
+pub fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

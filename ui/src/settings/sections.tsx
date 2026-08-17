@@ -32,6 +32,7 @@ import {
   ToggleRow,
 } from './controls'
 import { badge, handshakeNote, sentence } from './cliHandshake'
+import { ClaudeCliSection } from './ClaudeCliSection'
 import { GraphicsLadder } from './GraphicsLadder'
 import { KeymapSection } from './KeymapSection'
 import { ProxySection } from './ProxySection'
@@ -58,7 +59,7 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
   {
     id: 'claudeSessions',
     title: 'Claude sessions',
-    description: 'The environment every claude pane is spawned with.',
+    description: 'Which claude is launched, and the arguments and environment it is given.',
   },
   { id: 'editor', title: 'Editor', description: 'The code buffer.' },
   {
@@ -293,6 +294,22 @@ function ClaudeSessionsSection({ settings, patch, claudeVersion, cliSupport }: S
         These reach a pane's child process when it starts. A pane already running keeps the
         environment it was spawned with until it is restarted.
       </Note>
+
+      {/* The launch configuration: which `claude`, and what beyond cide's own argv and
+          environment. A component of its own rather than more rows here, for the same reason
+          `ProxySection` is one — it has repeatable rows, a readout and a hard verdict, none of
+          which is this file's `Row`/`Note` vocabulary.
+
+          It also has to stay out of *this* file. `check-claude-env.mjs` asserts set-equality
+          between the `CLAUDE_CODE_*` names in `child_env.rs` and the ones named here, so that a
+          switch wired to nothing fails a gate; the refusal list names four of those variables
+          for the opposite reason, and spelling them in this file would break that check with a
+          message about a defect that is not there. */}
+      <ClaudeCliSection
+        cli={claude.cli}
+        onChange={(cli) => set({ cli })}
+        support={cliSupport}
+      />
     </>
   )
 }

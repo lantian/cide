@@ -59,7 +59,9 @@ pub fn app_get_bootstrap(window: Window, state: State<'_, WorkspaceState>) -> Bo
         workspace,
         keymap: keymap::resolve(&user_keymap()),
         commands: commands::registry().to_vec(),
-        capabilities: capabilities(),
+        // Read from the workspace this window already holds, so the version in the header is
+        // the version of the binary this workspace's panes will actually spawn.
+        capabilities: capabilities(&state.with(|ws| ws.settings.claude.cli.binary.clone())),
     }
 }
 
@@ -127,10 +129,14 @@ pub fn window_set_viewport(
 }
 
 /// What this build can actually do, so the frontend never offers a dead control.
-fn capabilities() -> Capabilities {
+///
+/// `binary` is the user's configured `claude`, which is why this takes an argument at all: the
+/// header's version string has to be about the binary panes will actually run, or a user who
+/// pinned an old CLI reads the version of one they are not using.
+fn capabilities(binary: &str) -> Capabilities {
     Capabilities {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        claude_version: claude_version(),
+        claude_version: claude_version(binary),
         // **This flag's meaning changed in M12, and the change matters.**
         //
         // It used to mean "a language server ships", which was a *runtime* claim wearing a
@@ -155,8 +161,13 @@ fn capabilities() -> Capabilities {
 /// Recorded because the IDE-integration protocol is unversioned and the CLI self-updates:
 /// knowing which version a session was spawned against is the only way to tell a protocol
 /// change from a bug in this code.
-fn claude_version() -> Option<String> {
-    let mut command = std::process::Command::new("claude");
+fn claude_version(binary: &str) -> Option<String> {
+    // Not spawned at all when the configured binary cannot be run. This is on the bootstrap
+    // path — every window pays for it — and forking something already known to be missing spends
+    // a `fork`/`exec` to learn what `resolve` answered from a `stat`. The screen has the
+    // sentence; this field is only the string.
+    cide_core::claude_cli::resolve(binary).ok()?;
+    let mut command = std::process::Command::new(binary);
     // The CLI is node, and a bundled launch would otherwise hand it this AppImage's
     // `LD_LIBRARY_PATH`. See `cide_core::child_env`.
     cide_core::child_env::scrub_command(&mut command);

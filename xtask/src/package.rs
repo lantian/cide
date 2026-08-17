@@ -1,4 +1,33 @@
-//! Linux packaging: AppImage, .deb, and a Flatpak manifest.
+//! Packaging: AppImage, .deb and a Flatpak manifest on Linux; `.app` and `.dmg` on macOS.
+//!
+//! # Nothing here cross-compiles, and the task says so rather than printing a plan that cannot run
+//!
+//! A bundle is built by and for the host. Linking `cide-app` for `*-apple-darwin` needs Apple's
+//! linker and the macOS SDK, whose licence restricts it to Apple hardware, and the bundlers
+//! themselves shell out to host tools — `linuxdeploy` and `dpkg-deb` on one side, `codesign`,
+//! `hdiutil` and `sips` on the other. Tauri documents cross-compiling Windows from Linux
+//! (`cargo-xwin`) and nothing else. So `--dmg` on a Linux host is a `Verdict::Fail` with the
+//! reason in it, not a plan that fails twenty minutes later inside a tool nobody has: naming a
+//! target the host cannot produce is a mistake worth catching in the first second.
+//!
+//! Naming no target at all means *everything this host can build*, which is why
+//! [`Targets::for_host`] takes a triple. On Linux that is the three below, unchanged.
+//!
+//! # The macOS half is configuration, not experience
+//!
+//! **cide has never been compiled, run or bundled on macOS.** What exists is
+//! `crates/cide-app/tauri.macos.conf.json`, the plan, and the preflight verdicts — all of which
+//! were written by reading `tauri-utils`' config schema and `tauri-bundler`'s macOS bundler
+//! rather than by watching one succeed. `README.md`'s Platforms section is the honest record;
+//! keep the two in step.
+//!
+//! That overlay file is safe in a way `tauri.linux.conf.json` is not, and the asymmetry is the
+//! whole reason one exists and the other is refused a few lines below. `tauri-build` reads the
+//! platform overlay for the **host** on every cargo invocation, so a Linux overlay carrying a
+//! bundling-only key breaks `cargo build --workspace` on the only platform this repository is
+//! developed on. A macOS overlay is never read here at all — and on a Mac it would be read by
+//! every `cargo build` too, which is why it must carry no `externalBin` (`the_macos_overlay…`
+//! test, and a preflight verdict, both say so).
 //!
 //! # Why AppImage is the primary channel and not one of three equals
 //!
@@ -131,24 +160,82 @@ const TAURI_CLI_MAJOR: u64 = 2;
 /// can check honestly.
 const GNOME_RUNTIME: &str = "49";
 
+/// The macOS-only overlay, read by `tauri-build` and `cargo tauri build` when the host is a Mac
+/// and by nothing at all here. See the module docs for why this one is safe and
+/// `tauri.linux.conf.json` is not.
+const TAURI_MACOS_CONF: &str = "crates/cide-app/tauri.macos.conf.json";
+
 /// Which artefacts to produce.
+///
+/// Five flags rather than a `Vec<String>` so that the host check below can ask "did you name
+/// anything this machine cannot build" as a compile-checked question rather than by matching
+/// strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Targets {
     pub appimage: bool,
     pub deb: bool,
     pub flatpak: bool,
+    /// macOS: the `.app` bundle. The `.dmg` is built from it, so asking for a dmg alone still
+    /// produces one — `cargo tauri build --bundles dmg` runs the app bundler first.
+    pub app: bool,
+    /// macOS: the disk image, which is what a person downloads.
+    pub dmg: bool,
 }
 
 impl Targets {
-    /// Everything, which is what naming no target means.
-    pub const ALL: Self = Self {
+    /// Everything Linux can produce.
+    pub const LINUX: Self = Self {
         appimage: true,
         deb: true,
         flatpak: true,
+        app: false,
+        dmg: false,
     };
 
-    /// The `--bundles` value for `cargo tauri build`, or `None` when neither Tauri target
-    /// was asked for.
+    /// Everything macOS can produce.
+    pub const MACOS: Self = Self {
+        appimage: false,
+        deb: false,
+        flatpak: false,
+        app: true,
+        dmg: true,
+    };
+
+    /// Everything the host named by `triple` can build, which is what naming no target means.
+    ///
+    /// Taking a triple rather than reading `cfg!(target_os)` is what makes both branches
+    /// testable from one machine — the same reason `cide_core::keymap::platform_layer` takes a
+    /// bool. It is also the honest question: the artefacts are decided by the machine running
+    /// the bundler, and `rustc -vV` is where that machine names itself.
+    pub fn for_host(triple: &str) -> Self {
+        if is_macos_triple(triple) {
+            Self::MACOS
+        } else {
+            Self::LINUX
+        }
+    }
+
+    /// The targets named here that `triple` cannot build.
+    ///
+    /// Returned as names rather than as a bool so the failure can say which ones, which is the
+    /// difference between a verdict a reader can act on and one they have to guess at.
+    fn impossible_on(self, triple: &str) -> Vec<&'static str> {
+        let macos_host = is_macos_triple(triple);
+        [
+            (self.appimage, "appimage", false),
+            (self.deb, "deb", false),
+            (self.flatpak, "flatpak", false),
+            (self.app, "app", true),
+            (self.dmg, "dmg", true),
+        ]
+        .into_iter()
+        .filter(|(wanted, _, needs_macos)| *wanted && *needs_macos != macos_host)
+        .map(|(_, name, _)| name)
+        .collect()
+    }
+
+    /// The `--bundles` value for `cargo tauri build`, or `None` when no Tauri target was
+    /// asked for. (Flatpak is not one: it is built by `flatpak-builder` from a manifest.)
     fn bundles(self) -> Option<String> {
         let mut names = Vec::new();
         if self.appimage {
@@ -157,14 +244,31 @@ impl Targets {
         if self.deb {
             names.push("deb");
         }
+        if self.app {
+            names.push("app");
+        }
+        if self.dmg {
+            names.push("dmg");
+        }
         (!names.is_empty()).then(|| names.join(","))
     }
+}
+
+/// Whether a target triple names macOS.
+///
+/// `-apple-darwin` and not `apple` alone: `aarch64-apple-ios` is a real triple and is not a host
+/// this task can build for either.
+fn is_macos_triple(triple: &str) -> bool {
+    triple.contains("-apple-darwin")
 }
 
 /// What the task was asked to do.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    pub targets: Targets,
+    /// `None` means "everything this host can build" — see [`Targets::for_host`]. Kept as an
+    /// option rather than resolved in `main.rs` because the host is learned from `rustc -vV`,
+    /// which is this module's business and not the CLI parser's.
+    pub targets: Option<Targets>,
     /// Rewrite the checked-in Flatpak manifest.
     pub write: bool,
     /// Fail if the checked-in Flatpak manifest is stale. A CI gate.
@@ -217,6 +321,20 @@ pub struct AppInfo {
     /// AppImage-only on purpose. A `.deb` depends on the distribution's own `webkit2gtk`
     /// package and must not carry a second copy of its helper processes.
     pub appimage_files: Vec<(String, String)>,
+    /// `bundle.targets` from `TAURI_MACOS_CONF`, the macOS platform overlay.
+    ///
+    /// Separate from `bundle_targets` because the overlay *replaces* the base array rather than
+    /// extending it (the merge is RFC 7386, in which an array is a scalar) — so on a Mac the
+    /// base config's `["appimage", "deb"]` is not what the bundler sees, and a preflight that
+    /// checked the base array would pass while producing nothing.
+    pub macos_bundle_targets: Vec<String>,
+    /// `bundle.icon` from `TAURI_MACOS_CONF`, for the same reason.
+    pub macos_icons: Vec<String>,
+    /// `bundle.externalBin` from `TAURI_MACOS_CONF`. Must stay empty, exactly like
+    /// `base_external_bin`: on a Mac, `tauri-build` reads this overlay on every cargo
+    /// invocation, so a sidecar key here would break `cargo build --workspace` there while
+    /// leaving Linux green — a red build on the one platform nobody here can reproduce.
+    pub macos_external_bin: Vec<String>,
 }
 
 impl AppInfo {
@@ -231,6 +349,24 @@ impl AppInfo {
     }
 }
 
+/// Every icon file the requested targets could need, each with the config that names it.
+///
+/// Free function rather than a method because it is about a *request*, not about the repository.
+fn icon_list(info: &AppInfo, targets: Targets) -> Vec<(&str, &'static str)> {
+    let mut out: Vec<(&str, &'static str)> = Vec::new();
+    if targets.appimage || targets.deb || targets.flatpak {
+        out.extend(info.icons.iter().map(|i| (i.as_str(), TAURI_CONF)));
+    }
+    if targets.app || targets.dmg {
+        for icon in &info.macos_icons {
+            if !out.iter().any(|(seen, _)| *seen == icon.as_str()) {
+                out.push((icon.as_str(), TAURI_MACOS_CONF));
+            }
+        }
+    }
+    out
+}
+
 pub fn package(root: &Path, opts: Options) -> Result<()> {
     let info = read_app_info(root)?;
 
@@ -242,8 +378,12 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
     }
 
     let triple = host_triple()?;
-    let checks = preflight(root, &info, opts.targets);
-    println!("preflight for {} {}", info.product_name, info.version);
+    let targets = opts.targets.unwrap_or_else(|| Targets::for_host(&triple));
+    let checks = preflight(root, &info, targets, &triple);
+    println!(
+        "preflight for {} {} on {triple}",
+        info.product_name, info.version
+    );
     for check in &checks {
         println!("  [{}] {}", check.marker(), check.detail());
     }
@@ -252,7 +392,7 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
         .filter(|c| matches!(c, Verdict::Fail(_)))
         .collect();
 
-    let steps = plan(root, &info, opts.targets, &triple);
+    let steps = plan(root, &info, targets, &triple);
     println!("\nplan:");
     for step in &steps {
         println!("  $ {}", step.display());
@@ -291,7 +431,11 @@ pub fn package(root: &Path, opts: Options) -> Result<()> {
 fn artefacts(root: &Path) -> Vec<(String, u64)> {
     let mut found = Vec::new();
     let bundle = root.join("target/release/bundle");
-    for sub in ["appimage", "deb"] {
+    // `macos` is where tauri-bundler puts the `.app`, `dmg` where it puts the disk image. The
+    // `.app` is a *directory*, so its `metadata().len()` is the directory entry's size and not
+    // the bundle's — it is listed anyway, because "the .app exists" is the fact worth printing
+    // and the `.dmg` beside it carries the number that means something.
+    for sub in ["appimage", "deb", "macos", "dmg"] {
         let Ok(entries) = fs::read_dir(bundle.join(sub)) else {
             continue;
         };
@@ -299,7 +443,7 @@ fn artefacts(root: &Path) -> Vec<(String, u64)> {
             let path = entry.path();
             let is_artefact = path
                 .extension()
-                .is_some_and(|e| e == "AppImage" || e == "deb");
+                .is_some_and(|e| e == "AppImage" || e == "deb" || e == "app" || e == "dmg");
             if is_artefact && let Ok(meta) = entry.metadata() {
                 found.push((
                     format!(
@@ -565,36 +709,87 @@ fn manifest_path(info: &AppInfo) -> String {
 }
 
 /// Everything that can be checked without building.
-pub fn preflight(root: &Path, info: &AppInfo, targets: Targets) -> Vec<Verdict> {
+///
+/// `triple` is the host's, from `rustc -vV`. It is a parameter and not a `cfg!` so that both
+/// hosts' verdicts can be exercised from one machine — which for the macOS half is the *only*
+/// way they can be exercised at all.
+pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<Verdict> {
     let mut out = Vec::new();
 
-    for (wanted, name) in [(targets.appimage, "appimage"), (targets.deb, "deb")] {
+    // First, before anything that would be wasted effort. A target the host cannot produce is
+    // not a configuration problem to be reported alongside twelve others; it is the answer.
+    let impossible = targets.impossible_on(triple);
+    if !impossible.is_empty() {
+        let (needed, why) = if is_macos_triple(triple) {
+            (
+                "Linux",
+                "`linuxdeploy` and `dpkg-deb` are Linux tools and the AppImage carries a Linux \
+                 WebKitGTK",
+            )
+        } else {
+            (
+                "macOS",
+                "linking Cocoa/WebKit needs Apple's linker and SDK, which are licensed to Apple \
+                 hardware, and `codesign`/`hdiutil` exist nowhere else",
+            )
+        };
+        out.push(Verdict::Fail(format!(
+            "this host is {triple}; {} can only be built on {needed}. Cross-compilation is not \
+             possible — {why}. Use a {needed} machine or a CI runner",
+            impossible.join(", "),
+        )));
+    }
+
+    // Which file has to declare a target is decided by the **target's** platform, not by the
+    // host's. The macOS overlay *replaces* `bundle.targets` (the merge is RFC 7386, in which an
+    // array is a scalar), so `dmg` is never going to appear in the base config and asking the
+    // base config about it would produce a second, misleading failure beside the honest one
+    // above — which is what the first version of this did.
+    for (wanted, name, macos_only) in [
+        (targets.appimage, "appimage", false),
+        (targets.deb, "deb", false),
+        (targets.app, "app", true),
+        (targets.dmg, "dmg", true),
+    ] {
         if !wanted {
             continue;
         }
-        if info.bundle_targets.iter().any(|t| t == name) {
-            out.push(Verdict::Ok(format!("{TAURI_CONF} bundles `{name}`")));
+        let (declares, declared_in) = if macos_only {
+            (&info.macos_bundle_targets, TAURI_MACOS_CONF)
+        } else {
+            (&info.bundle_targets, TAURI_CONF)
+        };
+        if declares.iter().any(|t| t == name) {
+            out.push(Verdict::Ok(format!("{declared_in} bundles `{name}`")));
         } else {
             out.push(Verdict::Fail(format!(
-                "{TAURI_CONF} does not list `{name}` in bundle.targets, so \
+                "{declared_in} does not list `{name}` in bundle.targets, so \
                  `cargo tauri build` will not produce one"
             )));
         }
     }
 
-    for icon in &info.icons {
+    // The union of the icon lists that could be in force, deduplicated. A union rather than a
+    // choice because the question here is only "does this file exist", and the two lists name
+    // the same directory: reporting one icon twice would be noise, and reporting neither list
+    // when the *other* platform's was asked for would leave a missing raster undetected.
+    for (icon, declared_in) in icon_list(info, targets) {
         let path = root.join(APP_CRATE).join(icon);
         if path.exists() {
             out.push(Verdict::Ok(format!("icon {icon}")));
         } else {
             out.push(Verdict::Fail(format!(
-                "icon {icon} is named in {TAURI_CONF} but missing at {}",
+                "icon {icon} is named in {declared_in} but missing at {}",
                 path.display()
             )));
         }
     }
 
-    if targets.appimage || targets.deb {
+    if targets.app || targets.dmg {
+        out.extend(macos_checks(info));
+    }
+
+    if targets.appimage || targets.deb || targets.app || targets.dmg {
         out.push(tauri_cli_check());
         out.push(if info.bundles_the_hook() {
             Verdict::Ok(format!(
@@ -674,6 +869,116 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets) -> Vec<Verdict> 
         }
     }
 
+    out
+}
+
+/// The environment variables `tauri-bundler` reads before it signs and notarises a macOS bundle.
+///
+/// Named here rather than looked up in three places, and checked *by name* so the preflight can
+/// tell "you have not set this up" from "you set it up wrong": the bundler's own failure for a
+/// missing `APPLE_ID` arrives after the `.app` has been built, minutes in.
+const MACOS_SIGNING_VARS: [&str; 2] = ["APPLE_SIGNING_IDENTITY", "APPLE_CERTIFICATE"];
+const MACOS_NOTARY_VARS: [&str; 3] = ["APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID"];
+
+/// The macOS-only preflight: the overlay, the sidecar rule that applies there, and signing.
+///
+/// **Every verdict here was written from `tauri-utils`' schema and `tauri-bundler`'s macOS
+/// bundler, not from a build.** Nobody has run this. It is still worth having, because the two
+/// things it catches are both silent: a `.app` built with no code signature at all, which
+/// downloads with a quarantine bit and refuses to open with *"cide is damaged and can't be
+/// opened"* — a message that blames the download rather than the missing signature — and an
+/// overlay key that would break `cargo build` on a Mac while leaving Linux green.
+fn macos_checks(info: &AppInfo) -> Vec<Verdict> {
+    let mut out = Vec::new();
+
+    out.push(if info.macos_bundle_targets.is_empty() {
+        Verdict::Fail(format!(
+            "{TAURI_MACOS_CONF} has no bundle.targets. The base config asks for `appimage` and \
+             `deb`, which a Mac cannot build, so `cargo tauri build` would produce nothing and \
+             say so only at the end"
+        ))
+    } else {
+        Verdict::Ok(format!(
+            "{TAURI_MACOS_CONF} overrides bundle.targets with {:?}",
+            info.macos_bundle_targets
+        ))
+    });
+
+    // The same trap as `base_external_bin`, one platform over and invisible from here.
+    // `tauri-build` reads the *host's* platform overlay on every cargo invocation, so this key
+    // in this file would fail `cargo build --workspace` on a Mac with a missing-resource error,
+    // while every gate on this machine stayed green.
+    if !info.macos_external_bin.is_empty() {
+        out.push(Verdict::Fail(format!(
+            "{TAURI_MACOS_CONF} carries bundle.externalBin ({:?}). `tauri-build` reads the host's \
+             platform overlay on every `cargo build`, so this breaks the whole workspace build on \
+             macOS — and only there. The sidecar belongs in {TAURI_BUNDLE_CONF}, which nothing \
+             reads unless the bundler step asks for it",
+            info.macos_external_bin
+        )));
+    }
+
+    out.extend(signing_verdicts(
+        &MACOS_SIGNING_VARS
+            .into_iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .collect::<Vec<_>>(),
+        &MACOS_NOTARY_VARS
+            .into_iter()
+            .filter(|v| std::env::var_os(v).is_none())
+            .collect::<Vec<_>>(),
+    ));
+
+    // The updater's macOS channel is a different artefact from the `.dmg`. Worth one line
+    // because the Linux warning below names AppImage and would otherwise read as "sorted".
+    if !info.has_updater {
+        out.push(Verdict::Warn(
+            "no `plugins.updater` in the config. On macOS the updater's artefact is an \
+             `app.tar.gz`, which is a third bundle target rather than a property of the .dmg — \
+             so self-updating is not something the .dmg gains by being configured"
+                .into(),
+        ));
+    }
+
+    out
+}
+
+/// The signing and notarisation verdicts, over the environment rather than reading it.
+///
+/// Pure so the assertions about it are deterministic: reading the process environment inside a
+/// verdict makes the test that checks the wording pass or fail depending on whose machine it
+/// runs on, and a signing certificate on a developer's Mac is exactly the case where a wrong
+/// message costs the most.
+fn signing_verdicts(configured: &[&str], notary_unset: &[&str]) -> Vec<Verdict> {
+    let mut out = Vec::new();
+    out.push(if configured.is_empty() {
+        // A warning and not a failure, deliberately. An unsigned local build is a legitimate
+        // thing to want and is the only thing available without a paid Apple Developer Program
+        // membership; refusing it would make this task unusable for the first Mac build, which
+        // is the one that matters most.
+        Verdict::Warn(format!(
+            "none of {MACOS_SIGNING_VARS:?} is set, so the bundle will be unsigned. It runs \
+             locally, but a downloaded copy is quarantined and Gatekeeper reports it as damaged \
+             rather than as unidentified; a user has to `xattr -dr com.apple.quarantine` it. A \
+             Developer ID certificate needs a paid Apple Developer Program membership"
+        ))
+    } else {
+        Verdict::Ok(format!(
+            "code signing configured via {}",
+            configured.join(", ")
+        ))
+    });
+
+    // Only worth saying once there is a signature to notarise. Said unconditionally it is noise
+    // on every unsigned build, and a preflight people learn to skip is worse than one that says
+    // less.
+    if !notary_unset.is_empty() && !configured.is_empty() {
+        out.push(Verdict::Warn(format!(
+            "signing is configured but {notary_unset:?} {} unset, so the bundle will not be \
+             notarised and Gatekeeper will still warn on a downloaded copy",
+            if notary_unset.len() == 1 { "is" } else { "are" }
+        )));
+    }
     out
 }
 
@@ -1162,6 +1467,13 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or(serde_json::Value::Null);
 
+    // Same tolerance, same reason: a missing macOS overlay is a preflight verdict, not a hard
+    // error out of a function that `--check` and `--write` also call.
+    let macos: serde_json::Value = fs::read_to_string(root.join(TAURI_MACOS_CONF))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+
     Ok(AppInfo {
         identifier: string(conf.get("identifier"), "identifier")?,
         version: string(conf.get("version"), "version")?,
@@ -1180,6 +1492,9 @@ pub fn read_app_info(root: &Path) -> Result<AppInfo> {
             })
             .unwrap_or_default(),
         base_external_bin: list(conf.pointer("/bundle/externalBin")),
+        macos_bundle_targets: list(macos.pointer("/bundle/targets")),
+        macos_icons: list(macos.pointer("/bundle/icon")),
+        macos_external_bin: list(macos.pointer("/bundle/externalBin")),
     })
 }
 
@@ -1198,8 +1513,19 @@ mod tests {
             has_updater: false,
             external_bin: vec!["../../target/release/cide-hook".into()],
             base_external_bin: Vec::new(),
+            macos_bundle_targets: vec!["app".into(), "dmg".into()],
+            macos_icons: vec!["icons/32x32.png".into()],
+            macos_external_bin: Vec::new(),
         }
     }
+
+    /// The two hosts, spelled as `rustc -vV` spells them.
+    ///
+    /// Real triples rather than invented ones: `is_macos_triple` is a substring test, and a
+    /// fixture that only *resembles* a triple would let a wrong substring through. Linux is what
+    /// every gate in this repository runs on, so it is the default in the helpers below.
+    const LINUX: &str = "x86_64-unknown-linux-gnu";
+    const MACOS: &str = "aarch64-apple-darwin";
 
     /// Resolve `..` and `.` textually, the way `Path::join` does not.
     ///
@@ -1296,7 +1622,7 @@ mod tests {
     fn a_sidecar_in_the_base_config_is_a_preflight_failure() {
         let mut info = info();
         info.base_external_bin = vec!["../../target/release/cide-hook".into()];
-        let checks = preflight(Path::new("/nonexistent"), &info, Targets::ALL);
+        let checks = preflight(Path::new("/nonexistent"), &info, Targets::LINUX, LINUX);
         assert!(
             checks
                 .iter()
@@ -1313,7 +1639,7 @@ mod tests {
         let steps = plan(
             Path::new("/nonexistent"),
             &info(),
-            Targets::ALL,
+            Targets::LINUX,
             "x86_64-unknown-linux-gnu",
         );
         let bundle = steps
@@ -1343,7 +1669,7 @@ mod tests {
     fn a_missing_sidecar_entry_is_a_failure_not_a_warning() {
         let mut info = info();
         info.external_bin.clear();
-        let checks = preflight(Path::new("/nonexistent"), &info, Targets::ALL);
+        let checks = preflight(Path::new("/nonexistent"), &info, Targets::LINUX, LINUX);
         assert!(
             checks
                 .iter()
@@ -1369,7 +1695,7 @@ mod tests {
         let steps = plan(
             Path::new("/nonexistent"),
             &info(),
-            Targets::ALL,
+            Targets::LINUX,
             "x86_64-unknown-linux-gnu",
         );
         let build = steps
@@ -1401,6 +1727,8 @@ mod tests {
             appimage: false,
             deb: false,
             flatpak: true,
+            app: false,
+            dmg: false,
         };
         let steps = plan(
             Path::new("/nonexistent"),
@@ -1418,7 +1746,7 @@ mod tests {
         let steps = plan(
             Path::new("/nonexistent"),
             &info(),
-            Targets::ALL,
+            Targets::LINUX,
             "x86_64-unknown-linux-gnu",
         );
         let fetch = steps
@@ -1454,7 +1782,7 @@ mod tests {
         fs::create_dir_all(runtime.parent().unwrap()).unwrap();
         fs::write(&runtime, b"not really a runtime").unwrap();
 
-        let steps = plan(&dir, &info(), Targets::ALL, "x86_64-unknown-linux-gnu");
+        let steps = plan(&dir, &info(), Targets::LINUX, "x86_64-unknown-linux-gnu");
         assert!(steps.iter().all(|s| s.program != "curl"), "{steps:?}");
         // …but it is still handed over, or the bundler downloads its own.
         assert!(
@@ -1472,6 +1800,8 @@ mod tests {
             appimage: false,
             deb: true,
             flatpak: false,
+            app: false,
+            dmg: false,
         };
         let steps = plan(
             Path::new("/nonexistent"),
@@ -1651,7 +1981,7 @@ mod tests {
         let steps = plan(
             Path::new("/nonexistent"),
             &info(),
-            Targets::ALL,
+            Targets::LINUX,
             "x86_64-unknown-linux-gnu",
         );
         let tauri: Vec<&Step> = steps
@@ -1669,6 +1999,8 @@ mod tests {
             appimage: false,
             deb: false,
             flatpak: true,
+            app: false,
+            dmg: false,
         };
         assert_eq!(targets.bundles(), None);
         let steps = plan(
@@ -1725,7 +2057,7 @@ mod tests {
     fn a_missing_bundle_target_is_a_failure_not_a_warning() {
         let mut info = info();
         info.bundle_targets = vec!["deb".into()];
-        let checks = preflight(Path::new("/nonexistent"), &info, Targets::ALL);
+        let checks = preflight(Path::new("/nonexistent"), &info, Targets::LINUX, LINUX);
         assert!(
             checks
                 .iter()
@@ -1737,7 +2069,7 @@ mod tests {
     #[test]
     fn a_missing_updater_is_a_warning_not_a_failure() {
         // An AppImage with no update endpoint is still a working AppImage.
-        let checks = preflight(Path::new("/nonexistent"), &info(), Targets::ALL);
+        let checks = preflight(Path::new("/nonexistent"), &info(), Targets::LINUX, LINUX);
         assert!(
             checks
                 .iter()
@@ -1756,5 +2088,206 @@ mod tests {
             optional: false,
         };
         assert_eq!(step.display(), "cd crates/cide-app && cargo tauri build");
+    }
+
+    // --- macOS -------------------------------------------------------------------------------
+    //
+    // Nothing below has ever been observed. It is a set of assertions about *configuration*,
+    // written from `tauri-utils`' schema and `tauri-bundler`'s macOS bundler, and its whole job
+    // is to make the first real Mac build fail for reasons that are about the Mac rather than
+    // about a config nobody could check from here. Both branches are reachable on this machine
+    // only because the host is a parameter; see `Targets::for_host`.
+
+    #[test]
+    fn a_target_the_host_cannot_build_is_refused_with_the_reason_in_it() {
+        // The point of this verdict is that it arrives in the first second rather than twenty
+        // minutes later inside `codesign`, and that it says why rather than "unsupported".
+        let checks = preflight(Path::new("/nonexistent"), &info(), Targets::MACOS, LINUX);
+        let refusal = checks
+            .iter()
+            .find(|c| matches!(c, Verdict::Fail(d) if d.contains("Cross-compilation")))
+            .unwrap_or_else(|| panic!("no cross-compilation refusal in {checks:?}"));
+        let detail = refusal.detail();
+        assert!(
+            detail.contains("app, dmg") && detail.contains(LINUX),
+            "the refusal must name both the targets and the host: {detail}"
+        );
+        assert!(
+            detail.contains("SDK") || detail.contains("licensed"),
+            "and why it cannot simply be cross-compiled, or a reader tries `--target`: {detail}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_runs_the_other_way_too() {
+        // Symmetric on purpose. A Mac cannot produce an AppImage either, and a macOS CI runner
+        // that ran the default `cargo xtask package` would otherwise get a plan it cannot run.
+        let checks = preflight(Path::new("/nonexistent"), &info(), Targets::LINUX, MACOS);
+        assert!(
+            checks
+                .iter()
+                .any(|c| matches!(c, Verdict::Fail(d) if d.contains("can only be built on Linux"))),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn naming_no_target_means_what_this_host_can_build() {
+        assert_eq!(Targets::for_host(LINUX), Targets::LINUX);
+        assert_eq!(Targets::for_host(MACOS), Targets::MACOS);
+        // …and the two do not overlap, so the default can never trip the refusal above.
+        assert!(Targets::for_host(LINUX).impossible_on(LINUX).is_empty());
+        assert!(Targets::for_host(MACOS).impossible_on(MACOS).is_empty());
+    }
+
+    #[test]
+    fn an_ios_triple_is_not_a_mac() {
+        // `is_macos_triple` is a substring test, and `apple` alone would match a target that is
+        // neither a host nor anything this task can build for.
+        assert!(is_macos_triple("aarch64-apple-darwin"));
+        assert!(is_macos_triple("x86_64-apple-darwin"));
+        assert!(!is_macos_triple("aarch64-apple-ios"));
+        assert!(!is_macos_triple(LINUX));
+    }
+
+    #[test]
+    fn the_dmg_is_asked_for_from_the_overlay_and_not_from_the_base_config() {
+        // The overlay *replaces* `bundle.targets` rather than extending it, so the base config
+        // is never going to mention `dmg` and asking it would produce a second, misleading
+        // failure beside the honest cross-compilation one.
+        let checks = preflight(Path::new("/nonexistent"), &info(), Targets::MACOS, MACOS);
+        assert!(
+            checks.iter().any(
+                |c| matches!(c, Verdict::Ok(d) if d.contains(TAURI_MACOS_CONF)
+                                                    && d.contains("bundles `dmg`"))
+            ),
+            "{checks:?}"
+        );
+        assert!(
+            !checks.iter().any(|c| matches!(c, Verdict::Fail(d)
+                if d.contains(TAURI_CONF) && d.contains("dmg"))),
+            "the base config must not be blamed for a target only the overlay can declare: \
+             {checks:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_mac_build_is_a_warning_and_says_what_a_user_will_see() {
+        // Not a failure: an unsigned local build is the only thing available without a paid
+        // Apple Developer Program membership, and it is exactly what a first Mac build wants.
+        // The wording matters as much as the level — Gatekeeper's message for a quarantined
+        // unsigned bundle blames the *download* ("is damaged"), so a reader who has not been
+        // told will go looking for a corrupt file.
+        let unsigned = signing_verdicts(&[], &MACOS_NOTARY_VARS);
+        let warning = unsigned
+            .iter()
+            .find(|c| matches!(c, Verdict::Warn(d) if d.contains("unsigned")))
+            .unwrap_or_else(|| panic!("no unsigned-bundle warning in {unsigned:?}"));
+        assert!(
+            warning.detail().contains("damaged") && warning.detail().contains("quarantine"),
+            "the warning has to name what the user sees: {}",
+            warning.detail()
+        );
+        // …and nothing about notarisation, which is noise on a build that has no signature to
+        // notarise in the first place.
+        assert_eq!(unsigned.len(), 1, "{unsigned:?}");
+
+        // With a certificate but no notary credentials, the second warning is the useful one.
+        let signed = signing_verdicts(&["APPLE_SIGNING_IDENTITY"], &["APPLE_ID"]);
+        assert!(
+            matches!(signed.first(), Some(Verdict::Ok(_))),
+            "a configured signing identity is not a warning: {signed:?}"
+        );
+        assert!(
+            signed
+                .iter()
+                .any(|c| matches!(c, Verdict::Warn(d) if d.contains("not be notarised"))),
+            "{signed:?}"
+        );
+
+        // Fully configured: no warnings at all, or the preflight cries wolf on the one setup
+        // that is actually correct.
+        let full = signing_verdicts(&["APPLE_SIGNING_IDENTITY"], &[]);
+        assert!(full.iter().all(|c| matches!(c, Verdict::Ok(_))), "{full:?}");
+    }
+
+    #[test]
+    fn the_macos_overlay_must_not_carry_the_sidecar() {
+        // The mirror of `a_sidecar_in_the_base_config_is_a_preflight_failure`, one platform
+        // over and invisible from here: `tauri-build` reads the *host's* platform overlay on
+        // every cargo invocation, so this key in that file breaks `cargo build --workspace` on
+        // a Mac and nowhere else. Asserted against the checked-in file as well as against a
+        // fixture, because the checked-in file is the one that can break somebody's build.
+        let root = crate::workspace_root().expect("a workspace root");
+        let live = read_app_info(&root).expect("tauri.macos.conf.json parses");
+        assert!(
+            live.macos_external_bin.is_empty(),
+            "{TAURI_MACOS_CONF} carries bundle.externalBin ({:?}); that breaks `cargo build \
+             --workspace` on macOS and on no other platform",
+            live.macos_external_bin
+        );
+
+        let mut info = info();
+        info.macos_external_bin = vec!["../../target/release/cide-hook".into()];
+        let checks = preflight(Path::new("/nonexistent"), &info, Targets::MACOS, MACOS);
+        assert!(
+            checks.iter().any(|c| matches!(c, Verdict::Fail(d)
+                if d.contains(TAURI_MACOS_CONF) && d.contains("externalBin"))),
+            "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn the_checked_in_overlay_declares_what_a_mac_can_actually_build() {
+        // Against the real file. Without this the overlay could be deleted or emptied and every
+        // gate here would stay green while a Mac build produced an `appimage` request and then
+        // no artefacts at all.
+        let root = crate::workspace_root().expect("a workspace root");
+        let live = read_app_info(&root).expect("tauri.macos.conf.json parses");
+        assert_eq!(
+            live.macos_bundle_targets,
+            vec!["app".to_string(), "dmg".to_string()],
+            "{TAURI_MACOS_CONF} must override bundle.targets: the base config asks for appimage \
+             and deb, which a Mac cannot build, and the merge replaces the array rather than \
+             extending it"
+        );
+        assert!(
+            !live.macos_icons.is_empty(),
+            "{TAURI_MACOS_CONF} must carry its own bundle.icon, or the replaced-array merge \
+             leaves the Mac build with the base list — including 48x48, which is not an ICNS \
+             size and is resized to 32 for nothing"
+        );
+        for icon in &live.macos_icons {
+            assert!(
+                root.join(APP_CRATE).join(icon).exists(),
+                "{icon} is named in {TAURI_MACOS_CONF} but is not on disk"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mac_plan_builds_the_sidecar_and_fetches_no_appimage_runtime() {
+        // The `.app` must carry `cide-hook` for the same reason the AppImage must — a bundle
+        // without it launches and every session in it runs with no hooks — and on macOS the
+        // sidecar lands in `Contents/MacOS/`, which is exactly where `current_exe().parent()`
+        // looks. The AppImage runtime fetch is a 3 MB download that would be pure waste here.
+        let steps = plan(Path::new("/nonexistent"), &info(), Targets::MACOS, MACOS);
+        let printed: Vec<String> = steps.iter().map(Step::display).collect();
+        assert!(
+            printed.iter().any(|s| s.contains("-p cide-hook")),
+            "the mac plan does not build the hook sidecar: {printed:?}"
+        );
+        assert!(
+            printed.iter().any(|s| s.contains("--bundles app,dmg")),
+            "{printed:?}"
+        );
+        assert!(
+            !printed.iter().any(|s| s.contains("appimage-runtime")),
+            "the mac plan fetches the AppImage runtime: {printed:?}"
+        );
+        assert!(
+            !printed.iter().any(|s| s.contains("flatpak-builder")),
+            "the mac plan runs flatpak-builder: {printed:?}"
+        );
     }
 }

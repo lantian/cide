@@ -18,6 +18,24 @@ pub enum SessionError {
     /// A plain resume naming a conversation this app already has open. See `session_spawn`.
     #[error("session {0} is already open in this window; a conversation cannot be resumed twice")]
     AlreadyOpen(SessionId),
+    /// The configured Claude binary cannot be executed. (M16)
+    ///
+    /// # Why a variant, when portable-pty would have failed anyway
+    ///
+    /// It fails as `SessionError::Pty("No such file or directory (os error 2)")`, which names
+    /// neither the program nor the setting that chose it. A configurable binary makes that the
+    /// *ordinary* failure rather than an exotic one — a typo in Settings kills every pane at
+    /// once — so it gets a sentence that names the value and where to correct it.
+    ///
+    /// It needs no frontend change to be seen. `ui/src/panes/exitMarker.ts::spawnFailureText`
+    /// prefers a tagged `message` verbatim and `TerminalPane` writes it into the pane's own
+    /// transcript, so the sentence composed in `cide_core::claude_cli::BinaryProblem::message`
+    /// is what the user reads, in the pane that failed.
+    ///
+    /// Deliberately **not** in `isRecoverableSessionError`: retrying cannot help, and a pane
+    /// that retries a missing binary spins.
+    #[error("{message}")]
+    NoClaudeBinary { program: String, message: String },
     #[error("{0}")]
     Pty(String),
 }
@@ -28,6 +46,7 @@ impl serde::Serialize for SessionError {
         let (kind, message) = match self {
             Self::NoSuchSession => ("noSuchSession", self.to_string()),
             Self::AlreadyOpen(_) => ("alreadyOpen", self.to_string()),
+            Self::NoClaudeBinary { .. } => ("noClaudeBinary", self.to_string()),
             Self::Pty(_) => ("pty", self.to_string()),
         };
         use serde::ser::SerializeStruct;
@@ -92,7 +111,28 @@ impl serde::Serialize for SessionError {
 /// what the literal did before. These variables mean nothing to `bash`, and a user who types
 /// `claude` at a shell pane's prompt should get the settings they configured rather than the
 /// defaults of a program cide did not notice starting.
-fn base_env(spec: SpawnSpec, claude: &cide_ipc::ClaudeSettings) -> SpawnSpec {
+///
+/// # The user's own variables, and why *those* stop at a shell pane (M16)
+///
+/// [`cide_core::claude_cli::user_env`] is folded last of the three, and only when `is_claude`.
+/// The inconsistency with the paragraph above is deliberate and is written down here so it is
+/// not "fixed" later: the four `CLAUDE_CODE_*` names are inert to `bash` — a shell that
+/// inherits them is a shell that ignores them — while an arbitrary `NODE_OPTIONS`,
+/// `GIT_SSH_COMMAND` or `PATH` from that list is not inert to anything. A field labelled
+/// *the environment claude panes are spawned with* must not quietly become the environment the
+/// user's own shell is spawned with too.
+///
+/// Last of the three so that a variable the user set beats a constant this function assumed —
+/// which is why `TERM`, `COLUMNS`, `LINES` and `TMUX` are on the refusal list rather than left
+/// to be shadowed. Everything applied *after* this function — the proxy pass,
+/// `CLAUDE_CODE_SSE_PORT`, `CIDE_HOOK_SOCK` — is out of the user's reach by construction, which
+/// is the other half of why those names are refused rather than merely discouraged: a value
+/// this list carried for one of them would be overwritten with nothing on screen saying so.
+fn base_env(
+    spec: SpawnSpec,
+    claude: &cide_ipc::ClaudeSettings,
+    user_env: Vec<cide_core::child_env::EnvChange>,
+) -> SpawnSpec {
     let spec = apply_env_changes(spec, cide_core::child_env::bundle_scrub())
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
@@ -105,7 +145,8 @@ fn base_env(spec: SpawnSpec, claude: &cide_ipc::ClaudeSettings) -> SpawnSpec {
         .env_remove("COLUMNS")
         .env_remove("LINES")
         .env_remove("CI");
-    apply_env_changes(spec, cide_core::child_env::claude_env(claude))
+    let spec = apply_env_changes(spec, cide_core::child_env::claude_env(claude));
+    apply_env_changes(spec, user_env)
 }
 
 /// Fold a list of [`cide_core::child_env::EnvChange`]s into a spec.
@@ -177,13 +218,28 @@ fn proxy_log_line(kind: &str, target: cide_ipc::ProxyTarget, env: &ProxyEnv) -> 
 /// `claude` and lets `PATH` resolve it.
 ///
 /// **The limitation is worth stating, because breaking it is silent.** `claude` on this
-/// machine resolves to `~/.local/share/claude/versions/2.1.226`, whose file name is a version
-/// number and matches nothing here. That is harmless today — the resolution happens in the
-/// OS, after this decision — but the moment anything passes an absolute path as the program
-/// (a configurable CLI location in Settings, say), this returns false, no `--settings` is
-/// attached, and every session runs with no hooks: no token figures, no fast buffer reload,
-/// and a close confirm that cannot tell busy from idle. Nothing fails; the features simply
-/// are not there. A change to what is passed as `program` needs a change here too.
+/// machine resolves to `~/.local/share/claude/versions/2.1.233`, whose file name is a version
+/// number and matches nothing here. That is harmless because the resolution happens in the OS,
+/// after this decision.
+///
+/// # The configurable binary, and why this function did not have to change (M16)
+///
+/// The paragraph above used to end by predicting its own failure: *"the moment anything passes
+/// an absolute path as the program — a configurable CLI location in Settings, say — this
+/// returns false, no `--settings` is attached, and every session runs with no hooks"*. Settings
+/// now has exactly that field, and the prediction is closed by **ordering** rather than by
+/// teaching this function about paths.
+///
+/// `session_spawn` calls this on the program the *frontend* asked for, which is still the bare
+/// string `claude` for every Claude pane, and only then substitutes `ClaudeCli::binary` into
+/// the spec. So the decision is made from the one value that is reliably a name, and the
+/// substitution happens downstream of it.
+///
+/// Teaching this to recognise a configured path was the alternative and it loses twice: it
+/// would have to compare against a setting this function cannot see without a lock it must not
+/// take, and it would still answer `false` for `~/.local/share/claude/versions/2.1.233` — the
+/// value a user pins when they want a specific version, which is the whole reason the field
+/// exists. A change to what is passed as `program` still needs a reader of this note.
 fn program_is_claude(program: &str) -> bool {
     std::path::Path::new(program)
         .file_name()
@@ -305,6 +361,13 @@ pub async fn session_spawn(
     // pass below now needs it too — `ProxyScope` answers separately for `claude` and for the
     // user's shell — and a scope decided after the environment had already been built would
     // have been a scope that could not reach it.
+    //
+    // **And it is computed from what the frontend asked for, before the configured binary is
+    // substituted below.** That ordering is the whole of the bug `program_is_claude`'s note
+    // predicted: decide after substituting, and an absolute path from Settings answers `false`,
+    // no `--settings` is attached, and every session runs with no hooks — no token figures, no
+    // fast buffer reload, and a close confirm that cannot tell busy from idle. Nothing fails;
+    // the features simply are not there.
     let is_claude = program_is_claude(&spec.program);
 
     // Read once, here, rather than inside the proxy pass: this is the only place that knows
@@ -314,14 +377,72 @@ pub async fn session_spawn(
     // touch nothing — is the right answer anyway.
     // The Claude environment toggles come out of the same read, for the same reason and at the
     // same cost: one lock acquisition on this thread rather than two, and none at all inside
-    // the spawn. `Copy`, so unlike the proxy settings it needs no clone.
+    // the spawn. Cloned, both of them: `ClaudeSettings` stopped being `Copy` when it grew the
+    // launch configuration, which is a `String` and two `Vec`s. One allocation on a path that
+    // is about to `fork`.
     let (proxy, claude_settings) = app
         .try_state::<crate::workspace_state::WorkspaceState>()
-        .map(|state| state.with(|ws| (ws.settings.proxy.clone(), ws.settings.claude)))
+        .map(|state| state.with(|ws| (ws.settings.proxy.clone(), ws.settings.claude.clone())))
         .unwrap_or_default();
+
+    // The user's launch configuration, filtered. Enforced *here* as well as on the Settings
+    // screen and not instead of it: `workspace.json` is hand-editable and `settings_set` is one
+    // `invoke` away from being bypassed, so a filter that only ran in the UI would let a
+    // hand-edited file cost somebody their `--resume`. See `cide_core::claude_cli`.
+    //
+    // A shell pane gets neither half — see `base_env`'s note on why the env stops here, and
+    // note that the arguments have nowhere sensible to go either: `--model opus` handed to
+    // `bash` is a login shell that fails to start.
+    let plan = if is_claude {
+        cide_core::claude_cli::plan_here(&claude_settings.cli)
+    } else {
+        cide_core::claude_cli::Plan::default()
+    };
+    // One line, once, naming what was dropped. A hand-edited `workspace.json` is the case this
+    // exists for: there is no screen involved in that path, so the log is the only place the
+    // refusal can be seen at all.
+    for refused in plan.refusals() {
+        tracing::warn!(
+            token = %refused.text,
+            "refusing a claude launch argument or variable: {}",
+            refused.verdict.note().unwrap_or_default()
+        );
+    }
+
+    // The configured binary, substituted after the decision above and never before it.
+    //
+    // Passed through **exactly as stored**, so a bare `claude` is still resolved by the OS at
+    // this spawn rather than pinned to whatever `which` answered at launch — the CLI updates
+    // itself underneath a running app. `resolve` below is a *check*; its answer is thrown away.
+    if is_claude {
+        let configured = claude_settings.cli.binary.trim();
+        // Checked before the fork so the failure is a sentence in the pane's own transcript
+        // rather than portable-pty's `ENOENT`, which names a file the user never typed. The
+        // cost is a `stat` per `PATH` entry, on the caller's thread, once per Claude spawn.
+        if let Err(problem) = cide_core::claude_cli::resolve(configured) {
+            return Err(SessionError::NoClaudeBinary {
+                program: configured.to_string(),
+                message: problem.message(),
+            });
+        }
+        spec.program = configured.to_string();
+    }
+
+    // The user's arguments go **first**, before every token cide adds.
+    //
+    // Not last, and the reason is a variadic flag. `--add-dir`, `--mcp-config`, `--allowedTools`
+    // and `--tools` all collect every following token that does not begin with `-`, and every
+    // argument cide appends below does begin with one (`--session-id`, `--resume`,
+    // `--fork-session`, `--settings`). So a user flag placed here can never swallow a uuid,
+    // whereas the same flag placed last would swallow whatever cide had already written.
+    // `cide_claude::headless::argv` refuses the same wager for the same reason and says so.
+    for a in plan.args {
+        spec = spec.arg(a);
+    }
+
     let target = pane_proxy_target(&proxy.scope, is_claude);
     let proxy_env = ProxyEnv::for_target(&proxy, target);
-    let mut spec = apply_proxy(base_env(spec, &claude_settings), &proxy_env);
+    let mut spec = apply_proxy(base_env(spec, &claude_settings, plan.env), &proxy_env);
     // Redacted, and at debug level: one line per spawn is worth it when a pane cannot reach
     // the network, but it is not worth it on every launch of a machine with no proxy at all.
     tracing::debug!(
@@ -674,7 +795,11 @@ pub async fn session_scrollback(
 /// * It is the cwd **now**, not the cwd the line was printed from. The frontend never lets a
 ///   cwd out-rank a root for that reason: a path that resolves under both comes back ambiguous
 ///   and opens nothing rather than opening the wrong file.
-/// * It is Linux-only. So is this app.
+/// * **It is Linux-only, and off Linux the feature degrades rather than failing.** See
+///   [`cwd_of_pid`]: there is no `/proc` on macOS, so this answers `None` for every pane and
+///   relative paths in terminal output stop resolving. Nothing errors and nothing is logged per
+///   click — the links simply only work for absolute paths, which is the quietest kind of
+///   missing feature and is why the arm is written out rather than left to a failing syscall.
 ///
 /// # Why a cwd outside the project is `None` rather than the truth
 ///
@@ -712,7 +837,7 @@ pub fn session_cwd(
 /// and refusing a cwd outside the project — are exercised against a real process in the test at
 /// the foot of this file, rather than only against a running `claude`.
 fn contained_cwd(pid: u32, roots: &[PathBuf]) -> Option<PathBuf> {
-    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let cwd = cwd_of_pid(pid)?;
     // A deleted working directory reads back as `/path (deleted)`, which is neither a directory
     // nor a path anybody has — `is_dir` refuses that and a cwd that has since been removed with
     // one syscall.
@@ -723,6 +848,43 @@ fn contained_cwd(pid: u32, roots: &[PathBuf]) -> Option<PathBuf> {
         return None;
     }
     Some(cwd)
+}
+
+/// A process's current working directory, on a platform that can be asked.
+///
+/// Split from [`contained_cwd`] so that the platform question and the containment question are
+/// separable: the containment rule is the security-relevant half and is the same everywhere, so
+/// it stays platform-independent and keeps its tests on every host. Only the *reading* is
+/// per-platform.
+#[cfg(target_os = "linux")]
+fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Off Linux there is nothing to read, and this returns `None` deliberately rather than by
+/// accident.
+///
+/// **The accident is what was here before.** The `/proc` `read_link` above compiled everywhere
+/// and simply failed on macOS, where there is no `/proc` at all — so the whole feature switched
+/// itself off with no arm, no comment and no log line. What the user would see is not an error
+/// but a *narrower* set of working terminal links: `src/main.rs` printed by a build running in a
+/// subdirectory stops opening anything, while `/home/you/p/src/main.rs` still does. Diagnosing
+/// that from the outside means knowing this function exists.
+///
+/// **What macOS needs.** `libproc`'s `proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size)`,
+/// whose `pvi_cdir.vip_path` is the answer — about twenty lines of `libc` plus a `#[repr(C)]`
+/// struct, or the `libproc` crate. Two things stop it being written here: it cannot be compiled,
+/// let alone run, on this machine, and it is the *permission* model that decides whether it is
+/// worth having — `PROC_PIDVNODEPATHINFO` on another user's process needs root, and whether it
+/// answers for a same-user child under macOS's hardened runtime is exactly the sort of thing
+/// that has to be observed rather than read. Written down in `README.md` under Platforms.
+///
+/// The BSDs want a third answer again (`sysctl KERN_PROC_CWD`), which is why this is
+/// `not(target_os = "linux")` rather than a macOS arm: everything that is not Linux is honestly
+/// unimplemented here, not merely untested.
+#[cfg(not(target_os = "linux"))]
+fn cwd_of_pid(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1094,6 +1256,7 @@ mod tests {
                 scroll_speed: 12,
                 ..Default::default()
             },
+            Vec::new(),
         );
         assert_eq!(
             value_of(&spec, "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
@@ -1119,6 +1282,7 @@ mod tests {
         let spec = base_env(
             SpawnSpec::new("claude", std::env::temp_dir()),
             &cide_ipc::ClaudeSettings::default(),
+            Vec::new(),
         );
         for var in [
             "CLAUDE_CODE_DISABLE_MOUSE",
@@ -1151,6 +1315,7 @@ mod tests {
                 scroll_speed: 9,
                 ..Default::default()
             },
+            Vec::new(),
         );
         // `SpawnSpec::env` is applied in order, so the *last* entry for a name is the one the
         // child gets; asserting on the last is asserting on what the child sees.
@@ -1176,8 +1341,103 @@ mod tests {
                 disable_mouse: true,
                 ..Default::default()
             },
+            Vec::new(),
         );
         assert_eq!(value_of(&spec, "CLAUDE_CODE_DISABLE_MOUSE"), Some("1"));
+    }
+
+    // --- M16: the user's own variables ------------------------------------------------------
+
+    /// The launch configuration's environment reaches the spec, and reaches it **last**.
+    ///
+    /// Last is the whole point: `TERM` and the `CLAUDE_CODE_*` names are refused precisely
+    /// *because* a user's value would win here, so the two rules only compose if this fold runs
+    /// after both of the ones above it. A fold placed first would silently invert the refusal
+    /// list's justification while every test of the list itself kept passing.
+    #[test]
+    fn the_launch_configurations_variables_are_folded_after_everything_cide_assumed() {
+        let plan = cide_core::claude_cli::plan(
+            &cide_ipc::ClaudeCli {
+                env: vec![
+                    cide_ipc::ClaudeEnvVar {
+                        name: "MY_MCP_TOKEN".into(),
+                        value: "hunter2".into(),
+                    },
+                    // Refused, so it must not appear at all — and the refusal has to bite here
+                    // rather than only on the screen, because `workspace.json` is hand-editable.
+                    cide_ipc::ClaudeEnvVar {
+                        name: "ANTHROPIC_API_KEY".into(),
+                        value: "sk-ant-nope".into(),
+                    },
+                    cide_ipc::ClaudeEnvVar {
+                        name: "TERM".into(),
+                        value: "xterm".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            None,
+        );
+        let spec = base_env(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &cide_ipc::ClaudeSettings::default(),
+            plan.env,
+        );
+        assert_eq!(value_of(&spec, "MY_MCP_TOKEN"), Some("hunter2"));
+        assert_eq!(
+            value_of(&spec, "ANTHROPIC_API_KEY"),
+            None,
+            "a key outranks subscription OAuth and would bill a Console org for a Max user"
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .rfind(|(k, _)| k == "TERM")
+                .map(|(_, v)| v.as_str()),
+            Some("xterm-256color"),
+            "cide's TERM survives, which it only does because the name is refused — this fold \
+             is last, so an accepted TERM would have overwritten it"
+        );
+    }
+
+    /// The pass is fed an empty list for a shell pane, and this is the assertion that says the
+    /// gate is *at the call site* rather than inside the fold.
+    ///
+    /// `base_env` itself is unconditional and must stay so: it is folded for every pane, and a
+    /// `if is_claude` buried in here would be a second place the decision lives. What
+    /// `session_spawn` does is hand it `Plan::default()`, whose `env` is empty.
+    #[test]
+    fn base_env_folds_whatever_it_is_handed_and_decides_nothing() {
+        let spec = base_env(
+            SpawnSpec::new("/bin/bash", std::env::temp_dir()),
+            &cide_ipc::ClaudeSettings::default(),
+            cide_core::claude_cli::Plan::default().env,
+        );
+        assert_eq!(
+            value_of(&spec, "MY_MCP_TOKEN"),
+            None,
+            "an empty plan adds nothing, which is what a shell pane is given"
+        );
+    }
+
+    /// The pane's own transcript is where a bad binary is read, and `spawnFailureText` prefers
+    /// a tagged `message` verbatim — so the message has to survive serialization intact.
+    #[test]
+    fn a_missing_binary_serializes_as_its_own_kind_with_a_sentence() {
+        let error = SessionError::NoClaudeBinary {
+            program: "cluade".into(),
+            message: cide_core::claude_cli::BinaryProblem::NotOnPath {
+                name: "cluade".into(),
+            }
+            .message(),
+        };
+        let json = serde_json::to_value(&error).expect("serializes");
+        assert_eq!(json["kind"], "noClaudeBinary");
+        let message = json["message"].as_str().expect("a message");
+        assert!(
+            message.contains("cluade") && message.contains("Settings"),
+            "the sentence has to name the value and where to correct it: {message}"
+        );
     }
 
     fn manual(http: &str, https: &str, all: &str, no_proxy: &str) -> ProxySettings {

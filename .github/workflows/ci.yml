@@ -275,3 +275,83 @@ jobs:
 
       - name: pnpm build
         run: pnpm --dir ui build
+
+  # ---------------------------------------------------------------------------------
+  # macOS: does the workspace still compile, pass its tests and lint clean on a Mac?
+  #
+  # ## Advisory, on purpose, and the one thing to read before changing that
+  #
+  # `continue-on-error: true`. **cide has never been compiled, run or bundled on macOS** —
+  # not once, by anybody — and it cannot be from the machine it is developed on: linking
+  # `cide-app` for `*-apple-darwin` needs Apple's linker and the macOS SDK, which are
+  # licensed to Apple hardware, and Tauri documents cross-compiling Windows from Linux and
+  # nothing else. So the first run of this job is the first time the compiler has ever seen
+  # this code for that target, and a red X on it is *information*, not a broken branch.
+  #
+  # Making it blocking is the right move the moment it has been green once. Do that by
+  # deleting the `continue-on-error` line and saying so in README.md's Platforms section,
+  # which is where the honest state of macOS support is recorded. Leaving it advisory after
+  # it goes green is how a gate becomes decoration.
+  #
+  # ## What it deliberately does not do
+  #
+  # No `contract-check`, no `codegen --check`, no packaging. The first two are host
+  # independent — they parse Rust source and diff JSON — so running them twice buys nothing
+  # and costs a second place for them to disagree. Packaging is a twenty-minute job that
+  # needs `cargo-tauri`, and `cargo xtask package --dmg` refuses on a non-Mac host anyway;
+  # when someone wants a `.dmg`, that is a release workflow and not this one.
+  #
+  # The `ui` and `no-tauri-outside-app` jobs are not duplicated either: `check:*` scripts are
+  # node compiling TypeScript, and `cargo tree` resolves a lockfile. Neither has a platform.
+  #
+  # ## The rule that this job exists to protect
+  #
+  # **The `#[tauri::command]` surface must stay identical across platforms.** `contract-check`
+  # parses `generate_handler!` in `crates/cide-app/src/lib.rs` textually, so a
+  # `#[cfg(target_os = "linux")]` on a *registration* would drift `contract/commands.json`
+  # green on one host and red on the other, and the frontend's `client.ts` would call a
+  # command that does not exist there. Platform differences belong inside handler bodies —
+  # `cmd::session::cwd_of_pid` is the shape to copy — never in the registration list.
+  #
+  # ## Cost
+  #
+  # `macos-15` runners are arm64 and free for public repositories; on a private one they bill
+  # at ten times the Linux per-minute rate, which is the number most likely to decide whether
+  # this job stays. No system dependencies to install — WebKit *is* the OS there, so the whole
+  # `libwebkit2gtk-4.1-dev` block above has no analogue. Expect 10–15 minutes cold, dominated
+  # by git2's vendored libgit2/openssl and the tree-sitter grammars.
+  # ---------------------------------------------------------------------------------
+  macos:
+    name: macos (advisory)
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: macos
+
+      # Formatting is host independent and the rust job already gates it, but it costs
+      # seconds here and a `cfg`-gated block that only this job compiles is exactly the kind
+      # of code that gets committed unformatted.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo build --locked --workspace
+        run: cargo build --locked --workspace
+
+      # `--ignored` is deliberately not passed, for the reasons the rust job spells out.
+      #
+      # Expect failures here that are about the *test*, not about the product: several assert
+      # against `/bin/sh` behaviour, `/proc`, or a Linux path layout. Each one is a decision to
+      # make — gate the test on the platform, or fix what it found — and neither should be
+      # made by deleting the assertion.
+      - name: cargo test --locked --workspace
+        run: cargo test --locked --workspace
+
+      # The step most likely to find something real. Every `#[cfg(not(target_os = "linux"))]`
+      # arm in this workspace is compiled for the first time here, and an unused import or an
+      # unreachable branch inside one is invisible on Linux.
+      - name: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings

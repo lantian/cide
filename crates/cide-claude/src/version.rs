@@ -112,11 +112,17 @@ pub fn check_once(program: &Path) -> &'static Support {
 ///
 /// Separate from [`support_of`] so that the comparison — the part with rules in it — is a pure
 /// function that tests can drive without a CLI on `PATH`.
+///
+/// **Scrubbed, since M16.** This built a bare `Command` and did not, which was a real hole
+/// rather than an omission of principle: the identical probe in `cide_app::cmd::app` *does*
+/// scrub and says why. Under the AppImage this one ran a Node with the bundle's
+/// `LD_LIBRARY_PATH` and `PYTHONHOME` — the ADR 0007 environment — so the version cide reported
+/// came from a process launched in a way no pane is ever launched in, and on a bad day from a
+/// process that failed to start at all and was reported as *not installed*.
 pub fn probe(program: &Path) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(program);
+    cide_core::child_env::scrub_command(&mut command);
+    let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }

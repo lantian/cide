@@ -51,8 +51,12 @@ Tasks:
                              NO-GO. Needs a display. The debug profile also needs the Vite
                              dev server on :1420 (`pnpm --dir ui dev`); --release builds
                              ui/dist and embeds it instead. See BENCH.md.
-  package [targets] [...]  preflight the Linux packaging and print the plan
-                             targets: --appimage --deb --flatpak (default: all)
+  package [targets] [...]  preflight the packaging and print the plan
+                             targets: --appimage --deb --flatpak (Linux)
+                                      --app --dmg                (macOS)
+                             default: everything this host can build. Nothing here
+                             cross-compiles, so naming a target the host cannot
+                             produce fails the preflight rather than printing a plan.
                              --write  regenerate packaging/flatpak/*
                              --check  fail if those files are stale (CI gate)
                              --run    actually build; otherwise nothing is built
@@ -106,24 +110,30 @@ fn main() -> ExitCode {
                 "--appimage",
                 "--deb",
                 "--flatpak",
+                "--app",
+                "--dmg",
                 "--write",
                 "--check",
                 "--run",
             ],
         )
         .and_then(|f| {
-            // Naming no target means all of them, which is what someone typing `package`
-            // to see the state of things wants. Naming one means only that one.
-            let named = f.contains("--appimage") || f.contains("--deb") || f.contains("--flatpak");
-            let targets = if named {
-                package::Targets {
-                    appimage: f.contains("--appimage"),
-                    deb: f.contains("--deb"),
-                    flatpak: f.contains("--flatpak"),
-                }
-            } else {
-                package::Targets::ALL
-            };
+            // Naming no target means everything *this host* can build, which is what someone
+            // typing `package` to see the state of things wants. Which those are is decided in
+            // `package.rs`, from `rustc -vV`, because the host is that module's business and it
+            // is also what the preflight has to report against. Naming one means only that one —
+            // including one this machine cannot produce, which is a refusal with a reason rather
+            // than a silently narrowed plan.
+            let named = ["--appimage", "--deb", "--flatpak", "--app", "--dmg"]
+                .iter()
+                .any(|t| f.contains(*t));
+            let targets = named.then(|| package::Targets {
+                appimage: f.contains("--appimage"),
+                deb: f.contains("--deb"),
+                flatpak: f.contains("--flatpak"),
+                app: f.contains("--app"),
+                dmg: f.contains("--dmg"),
+            });
             let root = workspace_root()?;
             package::package(
                 &root,

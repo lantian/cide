@@ -29,8 +29,16 @@
 //! `cide-core` must not depend on the MCP server. See `docs/adr/0008`.
 //!
 //! The re-exports are not deprecated and not a shim: `arm` beside `sweep_hook_sockets` is how
-//! this module reads as one answer to "what does a hard kill leave behind", and every call site
-//! in `cide-claude` and `cide-pty` already spells it `orphans::arm`.
+//! this module reads as one answer to "what does a hard kill leave behind", and this crate's own
+//! spawn site (`headless`) already spells it `orphans::arm`.
+//!
+//! **`cide-pty` is not one of them**, and an earlier version of this paragraph said it was. It
+//! does not depend on `cide-core` at all, `portable-pty`'s `CommandBuilder` has no `pre_exec`
+//! seam, and `PtySession::spawn` is called from a Tauri command worker — which fact 3 in
+//! [`cide_core::child_env`] makes the *wrong* thread to fork from. So the first bullet above is
+//! the standing state of things rather than a description of a fixed bug: a hard kill leaves
+//! every PTY child running, and what recovers it is the sweep here plus `run.sh`'s reap, not
+//! `PDEATHSIG`. See `set_parent_death_signal`'s docs for what arming them would cost.
 
 use std::ffi::OsStr;
 use std::fs;

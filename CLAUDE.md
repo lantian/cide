@@ -68,7 +68,8 @@ pnpm --dir ui build
   entry through Vite) and asserts on the output. Adding a `check:foo` script to
   `ui/package.json` is enough — CI enumerates them rather than listing them. Several modules
   are import-free *so that* their check can compile them standalone; keep them that way.
-- Icon drift: `scripts/gen-icons.sh --check`. Packaging: `cargo xtask package [--appimage|--deb|--flatpak] [--check|--write|--run]` — without `--run` it only prints a plan.
+- Icon drift: `scripts/gen-icons.sh --check`. Packaging: `cargo xtask package [--appimage|--deb|--flatpak|--app|--dmg] [--check|--write|--run]` — without `--run` it only prints a plan. Naming no target means everything *this host* can build; naming one the host cannot (`--dmg` on Linux) is a preflight failure, because nothing here cross-compiles.
+- **Linux is the only platform cide has ever run on.** `README.md`'s Platforms section is the record: what a `cfg` arm does on macOS instead, which guarantees have no equivalent there (`PR_SET_PDEATHSIG` above all), and what still needs a Mac. The `macos` CI job is advisory until it has passed once.
 
 Which check covers what you touched:
 

@@ -57,6 +57,18 @@ export interface PaneBodyProps {
   onOpenPath?: ((path: string, at: { line: number; column: number } | null) => void) | undefined
   /** Ctrl+click on a directory. Absent in a window with no file tree — see `TerminalPane`. */
   onRevealPath?: ((path: string) => void) | undefined
+  /**
+   * Whether this pane's **tab** is the one in front. (M16)
+   *
+   * Only the editor branch reads it, and only for the status bar's single slot — a hidden tab is
+   * `visibility: hidden` rather than unmounted, so its panes are mounted, measured and painting,
+   * and nothing below this can tell them from the visible ones. `TabContent` has passed the flag
+   * to its `renderTree` since M4 for exactly this class of consumer; `App.tsx` discarded it.
+   *
+   * A terminal pane ignores it: the WebGL pool answers the same question its own way, through
+   * `paneHosts`, and a second route to it would be a second answer.
+   */
+  onScreen?: boolean | undefined
   onSessionBound?: ((session: string) => void) | undefined
 }
 
@@ -72,6 +84,7 @@ export function PaneBody({
   onOpenPath,
   onRevealPath,
   onSessionBound,
+  onScreen,
 }: PaneBodyProps): ReactNode {
   // Every hook first, unconditionally, before the dispatch below returns for anything.
   //
@@ -129,7 +142,15 @@ export function PaneBody({
   // unsaved text. Keying on the pane means a File tab has exactly one editor, which is what
   // makes one dirty flag per tab the right shape rather than a race.
   if (editor && pane.kind === 'editor') {
-    return <EditorPane path={editor.path} root={cwd} project={project} tab={editor.tab} />
+    return (
+      <EditorPane
+        path={editor.path}
+        root={cwd}
+        project={project}
+        tab={editor.tab}
+        onScreen={onScreen}
+      />
+    )
   }
 
   // A diff is a document, not a process: it never spawns and has no session to adopt. The

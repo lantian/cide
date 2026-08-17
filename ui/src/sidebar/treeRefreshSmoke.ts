@@ -26,6 +26,11 @@ interface Backend {
   rows: TreeRow[]
   /** Command name → how many times it was invoked. */
   calls: Map<string, number>
+  /**
+   * What `fs_reveal_roots` currently answers. Mutable, because *External Libraries* resolving
+   * mid-session is the whole reason the store re-asks at all. (M16)
+   */
+  revealRoots: string[]
 }
 
 function row(path: string, depth = 0): TreeRow {
@@ -44,7 +49,7 @@ function row(path: string, depth = 0): TreeRow {
   }
 }
 
-const backend: Backend = { rows: [], calls: new Map() }
+const backend: Backend = { rows: [], calls: new Map(), revealRoots: ['/p'] }
 
 function install(): void {
   const invoke = (cmd: string, args: Record<string, unknown>): Promise<unknown> => {
@@ -64,6 +69,14 @@ function install(): void {
         // never asks this again — a `fs_writable_roots` per watcher burst would be an IPC round
         // trip per burst for an answer that only moves when a project's roots do.
         return Promise.resolve(['/p'])
+      case 'fs_reveal_roots':
+        // M16. The status bar's clickable path trail asks what the tree can hang a row from:
+        // the roots, plus every package under *External Libraries* and every file in the
+        // scratch drawer. Mutable in this fixture because the property under test is that the
+        // store re-asks **exactly when the composed count moved** — a group resolving always
+        // grows the count, and an ordinary rename never does, so a burst that renames a row
+        // must not pay for this and a burst that inserts one must.
+        return Promise.resolve([...backend.revealRoots])
       case 'git_tree_status':
         // Deliberately a *fresh object with equal contents* on every call, which is what
         // `gitStatusStore` installs after every refresh. It is the case `FileTree`'s
@@ -189,6 +202,10 @@ async function main(): Promise<void> {
 
   await useFileTree.getState().attach('p1')
   await useGitStatus.getState().attach('p1')
+  // What the status bar's crumbs have to go on before any burst has happened, which is most of
+  // a session: `attach` asks once, and a store that only self-healed would leave every crumb
+  // inert until somebody created a file.
+  const revealAtAttach = [...useFileTree.getState().revealable]
   const view = new View()
   view.look(0, 30)
   await settle(5)
@@ -213,11 +230,20 @@ async function main(): Promise<void> {
   // rows at all before the new ones land.
   mark = new Map(backend.calls)
   backend.rows.splice(5, 0, row('/p/new.rs'))
+  // …and, in the same burst, *External Libraries* finishing its resolution. That is not two
+  // unrelated events: fulfilling a group happens while the group is expanded, so its packages
+  // become visible rows and the composed count moves with them. This is the burst the status
+  // bar's crumbs have to learn from.
+  backend.revealRoots = ['/p', '/dep/serde-1.0.229']
   await useFileTree.getState().refresh()
   await settle(5)
   const changed = view.take()
   const changedCalls = callsSince(mark)
   const rowFive = useFileTree.getState().rowAt(5)?.name ?? null
+  const revealedAfterChange = [...useFileTree.getState().revealable]
+  // Read here rather than at the end: a later burst appends a row of its own, and a count read
+  // out of the final state would be describing that instead of this insertion.
+  const changedCount = useFileTree.getState().count
 
   // --- a burst that only touches rows the user cannot see -------------------------------------
   //
@@ -230,10 +256,15 @@ async function main(): Promise<void> {
   view.take()
   mark = new Map(backend.calls)
   backend.rows[250] = row('/p/renamed.rs')
+  // A third answer nobody should ever see. A rename moves no row *count*, so this burst must not
+  // ask — which is what makes the gate above a gate rather than "ask on every burst" with a
+  // comment claiming otherwise.
+  backend.revealRoots = ['/p', '/dep/serde-1.0.229', '/dep/syn-2.0.87']
   await useFileTree.getState().refresh()
   await settle(5)
   const offscreen = view.take()
   const offscreenCalls = callsSince(mark)
+  const revealedAfterOffscreen = [...useFileTree.getState().revealable]
 
   // Scrolling back to it revalidates. The old row is still readable the whole time — the tree
   // never blanks it — and the new one is there once the chunk lands.
@@ -242,6 +273,32 @@ async function main(): Promise<void> {
   const duringRevalidate = useFileTree.getState().rowAt(250)?.name ?? null
   await settle(5)
   const revalidatedName = useFileTree.getState().rowAt(250)?.name ?? null
+
+  // --- a burst that moves the count while the reveal set stays exactly the same --------------
+  //
+  // The ordinary case for the rest of a session: a file is created, so the count moves and the
+  // list is re-asked, and the answer is the one the store already holds. It must be dropped
+  // rather than written back — `revealable` is a *prop of the status bar*, and a fresh array of
+  // equal strings re-renders it and re-runs its crumb classification for nothing.
+  //
+  // Appended rather than inserted, so no row above shifts and this cannot disturb the four
+  // assertions above it.
+  backend.revealRoots = ['/p', '/dep/serde-1.0.229']
+  const revealBefore = useFileTree.getState().revealable
+  backend.rows.push(row('/p/another.rs'))
+  await useFileTree.getState().refresh()
+  await settle(5)
+  view.take()
+  const revealIdentityHeld = useFileTree.getState().revealable === revealBefore
+
+  // --- and a project switch drops it, synchronously ------------------------------------------
+  //
+  // Read without awaiting, deliberately: `attach` clears its state before its first `await`, and
+  // the window this is about is exactly that — the frames between switching project and the new
+  // answer landing. A reveal set left standing there classifies the new project's trail against
+  // the old project's roots, and the click reveals a path that is not in this tree.
+  void useFileTree.getState().attach('p2')
+  const revealClearedOnSwitch = [...useFileTree.getState().revealable]
 
   view.stop()
   console.log(
@@ -252,18 +309,23 @@ async function main(): Promise<void> {
         renders: changed.renders,
         drawn: changed.drawn,
         rows: changed.rows,
-        count: useFileTree.getState().count,
+        count: changedCount,
         rowFive,
         calls: changedCalls,
+        revealable: revealedAfterChange,
       },
       offscreen: {
         renders: offscreen.renders,
         drawn: offscreen.drawn,
         calls: offscreenCalls,
+        revealable: revealedAfterOffscreen,
         staleName,
         duringRevalidate,
         revalidatedName,
       },
+      revealAtAttach,
+      revealIdentityHeld,
+      revealClearedOnSwitch,
     }),
   )
 }

@@ -304,6 +304,28 @@ use std::sync::mpsc::{Sender, channel};
 #[cfg(unix)]
 pub const DEATH_SIGNAL: libc::c_int = libc::SIGTERM;
 
+/// Whether this platform can actually enforce what [`arm`] promises.
+///
+/// `true` only on Linux, where `PR_SET_PDEATHSIG` exists. It is a public constant rather than a
+/// private `cfg!` so that the gap is a *value* other code can read, report and test against,
+/// instead of a silence — see [`set_parent_death_signal`]'s non-Linux arm for what is and is not
+/// still true off Linux, and `README.md`'s Platforms section for the consequence.
+///
+/// Nothing branches on this to change behaviour; [`arm`] is called unconditionally at every
+/// spawn site and the platform decides how much of it takes effect. It exists so that "cide's
+/// children die with it" can be *stated* per platform rather than assumed everywhere.
+pub const PARENT_DEATH_IS_ENFORCED: bool = cfg!(target_os = "linux");
+
+/// Said once per process, on a platform that cannot enforce the guarantee.
+///
+/// Once, not once per spawn: a Claude pane, a shell pane, two language servers and a
+/// `cargo metadata` on every project open would make this the loudest line in the log and the
+/// least informative. It is a `warn` and not a `debug` because it changes what a crash costs the
+/// user — orphaned `claude` processes holding subscription slots — and that belongs in the log
+/// a user is asked to send back.
+#[cfg(unix)]
+static DEATH_SIGNAL_UNSUPPORTED_WARNED: std::sync::Once = std::sync::Once::new();
+
 /// Arrange for `command`'s child to be signalled when this process dies.
 ///
 /// Installs a `pre_exec` hook, so the `prctl` happens in the forked child where it counts and
@@ -317,9 +339,22 @@ pub const DEATH_SIGNAL: libc::c_int = libc::SIGTERM;
 /// workers, so the thread that forked can retire while the child is healthy, and the kernel
 /// then delivers `SIGTERM` to a working language server on a work-stealing schedule nobody can
 /// reproduce. Spawn from a thread you own and keep.
+///
+/// **Off Linux this arms almost nothing**, and it says so in the log rather than pretending.
+/// See [`PARENT_DEATH_IS_ENFORCED`] and [`set_parent_death_signal`].
 #[cfg(unix)]
 pub fn arm(command: &mut Command) {
     use std::os::unix::process::CommandExt;
+
+    if !PARENT_DEATH_IS_ENFORCED {
+        DEATH_SIGNAL_UNSUPPORTED_WARNED.call_once(|| {
+            tracing::warn!(
+                "this platform has no PR_SET_PDEATHSIG, so a SIGKILL or crash of cide will \
+                 leave its children — claude sessions, language servers — running. A clean \
+                 quit still stops them; see cide_core::child_env::set_parent_death_signal"
+            );
+        });
+    }
 
     // Read *here*, in the parent, before the fork. Inside `pre_exec` this is exactly what
     // `getppid()` should return, and comparing the two is how the child detects a parent that
@@ -346,9 +381,36 @@ pub fn arm(_command: &mut Command) {}
 /// Called from inside a `pre_exec` hook, which is why it takes the parent's pid rather than
 /// reading it: `getppid()` here is the pid to *compare against*, not the value to trust.
 ///
-/// Public so that a spawner this crate does not own can use the same implementation. The one
-/// that matters is `cide-pty`: `portable-pty`'s `CommandBuilder` exposes no `pre_exec` hook of
-/// its own, so PTY panes cannot be armed from outside that crate.
+/// Public so that a spawner this crate does not own can use the same implementation — a
+/// `pre_exec` hook installed anywhere in the workspace should call this rather than write its
+/// own `prctl`.
+///
+/// # PTY panes are not armed, and this is where that is written down
+///
+/// An earlier version of this comment said the caller that mattered was `cide-pty`. **It is
+/// not a caller at all**, and never was: `crates/cide-pty/Cargo.toml` does not depend on
+/// `cide-core`, and a grep for this function across the workspace finds the definition, the
+/// `cide-claude::orphans` re-export and a type-check test. The armed children are the ones
+/// spawned through `std::process::Command` — the language servers (`cide_lsp::server`), the
+/// `claude` one-shots (`cide_claude::headless`) and dependency resolution (`cide-deps`).
+///
+/// Two things stand in the way of arming a PTY pane, and only the first is the one the old
+/// comment named:
+///
+///  1. `portable-pty`'s `CommandBuilder` exposes no `pre_exec` hook. Its own hook already runs
+///     `setsid`, and there is no seam to add to it from outside the crate.
+///  2. **`PtySession::spawn` is called from a Tauri command worker** (`cmd::session`), and fact
+///     3 above says the signal fires when the *forking thread* exits. Arming there would hand
+///     the kernel a pid to kill the moment a pooled worker retired — a `claude` dying seconds
+///     after the pane opened, with nothing anywhere to say why. Arming PTY panes therefore
+///     means routing their spawn through [`on_spawn_thread`] first; it is not a one-line change
+///     and it is not free (that thread is process-global and serialises every spawn).
+///
+/// What covers a PTY child today: a clean quit runs `lifecycle::shutdown`'s
+/// SIGHUP→SIGTERM→SIGKILL ladder over the whole process group, a caught signal reaches the same
+/// function through `lifecycle`'s signal thread, and `run.sh` reaps `claude` processes orphaned
+/// by a previous hard kill before it starts the next one. The uncovered case is a `SIGKILL` or
+/// OOM kill of a cide that was **not** launched from `run.sh`.
 ///
 /// Returns nothing. There is no useful recovery in a forked child, and the caller's only
 /// alternative to ignoring the error is to fail the spawn, which is worse.
@@ -361,22 +423,68 @@ pub fn set_parent_death_signal(expected_parent: u32, signal: libc::c_int) {
         return;
     }
 
-    // The race the man page does not spell out: if the parent exited between the `fork` and
-    // the line above, the death it was armed for has already happened and nothing will ever
-    // deliver the signal. Re-parenting is the observable evidence — `getppid()` becomes 1, or
-    // the nearest subreaper — so a mismatch here means "already orphaned", and the child does
-    // to itself what the kernel now never will.
-    //
-    // SAFETY: both calls are bare syscalls with no arguments to get wrong.
+    signal_self_if_already_orphaned(expected_parent, signal);
+}
+
+/// The half of the arrangement that needs no kernel support, shared by both platform arms.
+///
+/// The race the `prctl(2)` man page does not spell out: if the parent exited between the `fork`
+/// and the arming, the death it was armed for has already happened and nothing will ever deliver
+/// the signal. Re-parenting is the observable evidence — `getppid()` becomes 1, or the nearest
+/// subreaper — so a mismatch here means "already orphaned", and the child does to itself what
+/// the kernel now never will.
+///
+/// **One body, called from both `cfg` arms, on purpose.** The non-Linux arm is the whole of what
+/// that platform can do, and an arm written out separately is an arm that can quietly become
+/// empty again — which is how a guarantee gets dropped on a platform without anybody saying so.
+/// Sharing the body makes "macOS still closes the fork race" true by construction rather than by
+/// a second copy nobody runs, and lets the test below cover both platforms with one assertion.
+#[cfg(unix)]
+fn signal_self_if_already_orphaned(expected_parent: u32, signal: libc::c_int) {
+    // SAFETY: both calls are bare syscalls with no arguments to get wrong, and both are
+    // async-signal-safe, which is what a `pre_exec` hook requires.
     if unsafe { libc::getppid() } as u32 != expected_parent {
         unsafe { libc::raise(signal) };
     }
 }
 
-/// Other unixes have no `PR_SET_PDEATHSIG`. macOS and the BSDs would need `kqueue`'s
-/// `NOTE_EXIT` and a supervising thread, which is a different design; cide targets Linux.
+/// macOS and the BSDs: the fork race is still closed, the standing guarantee is **not**.
+///
+/// This arm is deliberately not empty, and the difference between what it does and what the
+/// Linux arm does is the whole macOS story for ADR 0008. Read it before assuming a Mac build
+/// behaves like this one.
+///
+/// **What still holds.** The half that needs no kernel support is the fourth trap above: if the
+/// parent died between the `fork` and this call, the child is already orphaned and nothing will
+/// ever come for it, so it does to itself what the kernel would have. `getppid()` and `raise()`
+/// are POSIX and async-signal-safe everywhere, so that check is portable and is performed.
+///
+/// **What does not.** There is no `PR_SET_PDEATHSIG` outside Linux, so the standing arrangement
+/// — *signal me whenever my parent goes* — simply does not exist. A `SIGKILL`, an OOM kill or a
+/// crash of cide on macOS leaves every child it spawned running: each `claude` holding a
+/// subscription slot, each `rust-analyzer` holding 1–4 GB. A clean quit is unaffected;
+/// `lifecycle::shutdown`'s ladder is what stops children there and it is platform-independent.
+///
+/// **Why there is no equivalent, rather than one nobody wrote.** The BSD answer is `kqueue`'s
+/// `EVFILT_PROC`/`NOTE_EXIT` on the parent's pid, and it cannot be used from here: this function
+/// runs between `fork` and `exec`, and `exec` destroys every thread and every file descriptor
+/// that was not marked to survive it. A kqueue registered here is gone microseconds later.
+/// Delivering it properly means a *supervising process* — a shim that spawns the real child,
+/// waits on both, and kills the group when cide's pid exits — which is a design, not a syscall,
+/// and would want the existing second binary (`cide-hook`) to grow a `reap` mode.
+///
+/// **The cheaper first pass, also not done.** A startup sweep: record the pids cide spawns, and
+/// on the next launch kill any whose recording cide is dead. `cide_claude::orphans` already has
+/// exactly this shape for hook sockets — same liveness rule, same bias towards leaving things
+/// alone — but it sweeps *files*, and nothing in the workspace records a child pid, so this is
+/// new state rather than an extension. It also recovers at the next launch instead of
+/// immediately, which is strictly weaker than `PDEATHSIG`. Both are written up in `README.md`
+/// under Platforms; neither is implemented, and [`PARENT_DEATH_IS_ENFORCED`] is `false` here so
+/// that no caller can read this arm as equivalent.
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn set_parent_death_signal(_expected_parent: u32, _signal: libc::c_int) {}
+pub fn set_parent_death_signal(expected_parent: u32, signal: libc::c_int) {
+    signal_self_if_already_orphaned(expected_parent, signal);
+}
 
 /// Run `f` on the one thread that spawns children, and return what it returned.
 ///
@@ -647,7 +755,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn an_already_orphaned_child_signals_itself_rather_than_waiting_for_a_death_that_happened() {
         // The `getppid` race guard, which is the one branch of `set_parent_death_signal` a
@@ -656,6 +764,12 @@ mod tests {
         // cide dies is armed against a corpse, the kernel has already run the death
         // notification, and the child runs for ever. Being right in the common case and
         // wrong in the race is exactly how an orphan survives a SIGKILL.
+        //
+        // `cfg(unix)` and not `cfg(target_os = "linux")`, which is what it used to say. On
+        // macOS and the BSDs this branch is not one of two things the function does — it is
+        // the *whole* of what the function can do, so it is the platform where dropping it
+        // costs the most and the platform where nothing else would notice. Both arms call one
+        // shared body, so this assertion covers both wherever it runs.
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         use std::time::Instant;

@@ -189,6 +189,17 @@ fn prepare(fs: &Arc<crate::files::ProjectFs>, resolve: Option<(&Arc<dyn FsEvents
         return;
     };
     if fs.groups().stale() == Some(cide_fs::groups::Expanded::Resolve) {
+        // The picker's library candidates were walked from the packages this resolution is
+        // about to replace, so they describe a dependency set that no longer exists — a
+        // `cargo update` moves versions, a `cargo remove` deletes a directory the matcher still
+        // offers. Forgetting them here rather than after the resolver lands is deliberate: the
+        // stale set is wrong *now*, and the resolver runs on its own thread for a quarter of a
+        // second during which Ctrl+P would otherwise keep offering it. (M16)
+        //
+        // It does not trigger a re-walk. The next query does, through the ordinary lazy path,
+        // and only if the user still has the scope switched on — re-walking here would put a
+        // 130 ms walk on the tail of every `cargo build` in a terminal pane.
+        fs.forget_libraries();
         crate::libraries::spawn_resolve(Arc::clone(fs), Arc::clone(events), project);
     }
 }
@@ -910,6 +921,46 @@ pub async fn fs_writable_roots(
     .await
 }
 
+/// Every path the file tree can hang a row from: the project's roots, plus each group's
+/// top-level children. (M16)
+///
+/// The same shape as [`fs_writable_roots`] immediately above, and for the same reason stated
+/// there: the frontend needs the list Rust would check against, because it is deciding *before*
+/// the click whether a control does anything. Here the control is a segment of the status bar's
+/// path trail — `crates › cide-core › src › lib.rs`, or, for a dependency source,
+/// `home › u › .cargo › registry › src › index.crates.io-… › serde-1.0.229 › src › de › mod.rs`.
+/// Only the run from the package directory rightwards can be revealed; the five segments before
+/// it name caches the tree draws no row for. Marking them clickable would fire
+/// `dispatch.ts`'s *"not in this project's file tree"* notice on a path the user is looking at,
+/// which is the report this milestone came out of.
+///
+/// **It must not resolve.** [`crate::groups::ProjectGroups::reveal_roots`] takes a read lock and
+/// clones a `Vec`; running `cargo metadata` from here would put a cold build inside a status
+/// bar's render. An unresolved *External Libraries* therefore answers with the project roots
+/// alone, and the crumbs light up when the resolver finishes — it emits `cide://fs-status`, and
+/// the store re-asks on that.
+///
+/// A command rather than a field on `FsStatus`: this answer moves when a project's roots move or
+/// when a group resolves, not on every watcher burst.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_reveal_roots(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<Vec<PathBuf>, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_reveal_roots", move || {
+        // Through `prepare` for the reason `fs_writable_roots` is: a freshly attached tree asks
+        // this before anything has shown the groups, and without it the answer would be the roots
+        // alone for that window — every crumb of a library path inert until something else
+        // happened to read the tree.
+        if fs.groups().needs_prepare() {
+            fs.groups().prepare(&fs.root_paths());
+        }
+        fs.reveal_paths()
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_rename(
     app: tauri::AppHandle,
@@ -1284,7 +1335,7 @@ mod tests {
     async fn settled_matches(registry: &FsRegistry, project: ProjectId, expected: u32) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let frame = query_project(registry, project, NEEDLE.to_string(), Some(50))
+            let frame = query_project(registry, project, NEEDLE.to_string(), Some(50), false)
                 .await
                 .expect("the picker answers for an indexed project");
             if frame.matched >= expected || Instant::now() >= deadline {
@@ -1362,7 +1413,7 @@ mod tests {
                 return (mid_walk_frames, None);
             }
 
-            let frame = query_project(registry, project, NEEDLE.to_string(), Some(50))
+            let frame = query_project(registry, project, NEEDLE.to_string(), Some(50), false)
                 .await
                 .expect("picker_query is answerable the whole time the walk runs");
             let at = started.elapsed();
@@ -1618,7 +1669,7 @@ mod tests {
         );
         // The observable the user would have lost. `matched`, not a status field, because the
         // matcher being cleared is what empties Ctrl+P.
-        let after = query_project(&registry, project, NEEDLE.to_string(), Some(50))
+        let after = query_project(&registry, project, NEEDLE.to_string(), Some(50), false)
             .await
             .expect("the picker still answers");
         assert_eq!(
@@ -1711,7 +1762,7 @@ mod tests {
             .claim(project, vec![dir.path().to_path_buf()])
             .expect("a project nobody has indexed claims");
 
-        let frame = query_project(&registry, project, NEEDLE.to_string(), Some(50))
+        let frame = query_project(&registry, project, NEEDLE.to_string(), Some(50), false)
             .await
             .expect("the picker is answerable from the instant the project is claimed");
         assert_eq!(frame.matched, 0, "nothing has been walked yet");
@@ -1725,7 +1776,7 @@ mod tests {
         // Dropping the claim without running it clears the flag, which is the same guard that
         // covers a walk that panicked — and the picker must then stop asking.
         drop(claimed);
-        let settled = query_project(&registry, project, NEEDLE.to_string(), Some(50))
+        let settled = query_project(&registry, project, NEEDLE.to_string(), Some(50), false)
             .await
             .expect("still answerable");
         assert!(
@@ -1838,7 +1889,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut matched = 0;
         while matched == 0 && Instant::now() < deadline {
-            matched = query_project(&registry, project, "mainrs".to_string(), Some(50))
+            matched = query_project(&registry, project, "mainrs".to_string(), Some(50), false)
                 .await
                 .expect("the picker answers for an indexed project")
                 .matched;
@@ -2684,6 +2735,50 @@ mod scratch_tests {
             None,
             "a path in neither is honestly nothing, which is what the caller reports"
         );
+
+        cleanup(&root);
+    }
+
+    /// What `fs_reveal_roots` answers, and why it is a third list rather than either of the two
+    /// that already exist. (M16)
+    ///
+    /// The status bar's path trail makes a segment clickable exactly when it is at or under one
+    /// of these, so the property that matters is the pair: everything the tree can hang a row
+    /// from is here, and the *containers* of those things are not. A scratch drawer proves both
+    /// halves at once — the files in it are rows, and the `<blake3>` directory holding them is
+    /// not — and it is the one group a test can build without forking `cargo`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reveal_roots_are_the_roots_plus_every_row_a_group_can_hang() {
+        let (_registry, _id, fs, root) = project("reveal-roots").await;
+        prepare(&fs, None);
+
+        assert_eq!(
+            fs.reveal_paths(),
+            vec![root.clone()],
+            "before anything is shown, the project's roots and nothing else"
+        );
+
+        let scratch = fs.groups().new_scratch(&root, "rs").expect("a scratch");
+        let drawer = scratch.parent().expect("the drawer").to_path_buf();
+        let paths = fs.reveal_paths();
+        assert!(paths.contains(&root), "the project root is still there");
+        assert!(
+            paths.contains(&scratch),
+            "and the scratch file is, because the tree draws a row for it: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&drawer),
+            "but NOT the `<blake3>` directory holding it — the tree draws no row for that, so a \
+             crumb offering to select it would report that a file the user is looking at is not \
+             in the file tree"
+        );
+
+        // The two lists this is deliberately not. Writability and revealability disagree in both
+        // directions once *External Libraries* is resolved (a dependency source is revealable and
+        // never writable), and merging them is how a menu comes to offer a verb the handler
+        // refuses — the failure `writable_paths` was itself split out to prevent.
+        assert!(fs.writable_paths().contains(&drawer));
+        assert!(!fs.writable_paths().contains(&scratch));
 
         cleanup(&root);
     }

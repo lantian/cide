@@ -19,12 +19,32 @@
  */
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const out = mkdtempSync(join(tmpdir(), 'cide-picker-'))
 let failed = 0
+
+const ok = (cond, what) => {
+  if (!cond) {
+    failed += 1
+    console.error(`FAIL ${what}`)
+  }
+}
+
+const uiFile = (rel) => readFileSync(fileURLToPath(new URL(`../${rel}`, import.meta.url)), 'utf8')
+
+/**
+ * Remove comments before grepping.
+ *
+ * Load-bearing: `FilePicker.tsx` and `store.ts` explain the library scope by name at length,
+ * so a grep over raw source matches the *explanation* of a feature that has been deleted —
+ * which is precisely how a gate stays green over a dead control. See `check-claude-env.mjs`,
+ * which makes the same argument and paid for it.
+ */
+const strip = (src) => src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
 
 const eq = (actual, expected, what) => {
   const a = JSON.stringify(actual)
@@ -67,9 +87,8 @@ try {
 
   const require = createRequire(import.meta.url)
   const { searchCommands } = require(join(out, 'overlays/score.js'))
-  const { groupDigits, matchCounter, basename, dirname, kindBadge } = require(
-    join(out, 'overlays/format.js'),
-  )
+  const { groupDigits, matchCounter, basename, dirname, kindBadge, pickerEmptyState, pickerEmptyText } =
+    require(join(out, 'overlays/format.js'))
   const { listAction, PAGE_ROWS } = require(join(out, 'overlays/listKeys.js'))
   const { canGo, gotoNote, parseGoto } = require(join(out, 'overlays/gotoLine.js'))
   const usages = require(join(out, 'overlays/usagesModel.js'))
@@ -537,6 +556,208 @@ try {
   ok(
     usages.noUsagesSentence(null).includes('the symbol'),
     'and both survive not knowing the identifier’s name',
+  )
+
+  /* ------------------------------------------------- M16: the picker's library scope */
+
+  /*
+   * Four empty states, two of which look identical and mean opposite things.
+   *
+   * The rule came out of a ternary in `FilePicker.tsx`'s JSX when the library scope made it
+   * four-way. Two of the four are empty answers — "still filling, wait" and "finished, and
+   * there is nothing" — and a third is an empty answer with a cause the user can act on. That
+   * is the shape this project ships inverted, and it is unreachable by any check while it
+   * lives inside a render.
+   */
+  const empty = (over) =>
+    pickerEmptyState({
+      running: false,
+      awaitingIndex: false,
+      query: 'lib',
+      libraries: false,
+      total: 12,
+      ...over,
+    })
+
+  eq(empty({ running: true }), 'indexing', 'a filling matcher says so before anything else')
+  eq(
+    empty({ awaitingIndex: true }),
+    'indexing',
+    'and so does a project whose walk has not started — the two are different facts and the ' +
+      'same answer, because what the user needs to know is "wait", not which index it is',
+  )
+  eq(
+    empty({ running: true, query: '' }),
+    'indexing',
+    'a walk outranks the empty query: `Type to search` over a repository that is mid-walk ' +
+      'tells the user to do the thing they already did',
+  )
+  eq(empty({ query: '' }), 'typeToSearch', 'and a settled empty query invites one')
+  eq(empty({}), 'noMatches', 'a query that found nothing found nothing')
+  eq(
+    empty({ libraries: true, total: 0 }),
+    'noLibraries',
+    'but with the scope ON and a candidate set of zero, the cause is that nothing resolved — ' +
+      '"No matches" there blames the query for an empty index, which is the answer ' +
+      '`libraries.rs` refuses to give about its own group',
+  )
+  eq(
+    empty({ libraries: false, total: 0 }),
+    'noMatches',
+    'and with the scope OFF a zero total is an unindexed project, not a library problem — ' +
+      'saying otherwise would put a sentence about dependencies in front of somebody who ' +
+      'never asked about them',
+  )
+  eq(
+    empty({ libraries: true, total: 0, query: '' }),
+    'typeToSearch',
+    'an empty query has not searched for anything yet and has no business reporting on the ' +
+      'library scope',
+  )
+  eq(
+    empty({ libraries: true, total: 800 }),
+    'noMatches',
+    'a project with files of its own and no dependencies gets "No matches", which is true: ' +
+      'nothing-resolved is only worth saying when there is nothing else to say',
+  )
+
+  // Every state has words, and they are all different. A `switch` that fell through would
+  // return `undefined` and render an empty box, which reads as a picker that has hung.
+  const STATES = ['indexing', 'typeToSearch', 'noLibraries', 'noMatches']
+  const sentences = STATES.map((s) => pickerEmptyText(s))
+  eq(
+    sentences.filter((t) => typeof t === 'string' && t.length > 0).length,
+    STATES.length,
+    'every empty state has a sentence',
+  )
+  eq(new Set(sentences).size, STATES.length, 'and no two of them are the same words')
+
+  /* ------------------------------------------------------------- the wiring, in source */
+  //
+  // Everything above is satisfied by a rule nothing calls and a scope nothing can reach.
+  // These read comment-stripped source, because both files explain the feature by name at
+  // length and a grep over raw source would match the explanation of a deleted one.
+
+  const picker = strip(uiFile('src/overlays/FilePicker.tsx'))
+
+  ok(
+    /pickerEmptyState\(/.test(picker) && /pickerEmptyText\(/.test(picker),
+    'FilePicker asks the checked rule rather than re-deciding in its JSX',
+  )
+  ok(
+    /pickerApi\.query\([^)]*libraries/.test(picker),
+    'and it passes the scope to `picker.query`. Without this the toggle is a flag nothing ' +
+      'reads: it lights up, and the answer never changes',
+  )
+  ok(
+    /pickerApi\.indexLibraries\(/.test(picker),
+    'and it starts the walk when the scope goes on. Rust answers from an empty library ' +
+      'matcher otherwise — a scope that is switched on and returns nothing, for ever',
+  )
+  {
+    // The dep array. Flipping the scope changes the answer to the *same* query, so without
+    // `libraries` in it ⌥L does nothing visible until the user types another character — a
+    // control that appears not to work, which is worse than no control at all.
+    const poll = picker.slice(picker.indexOf('const poll = ('))
+    const deps = poll.match(/\}, \[([^\]]*)\]\)/)
+    ok(deps != null, "the poll effect's dependency array is readable")
+    ok(
+      /\blibraries\b/.test(deps?.[1] ?? ''),
+      'and it names `libraries`, so flipping the scope re-asks the current query rather than ' +
+        'waiting for the next keystroke',
+    )
+  }
+  ok(
+    /aria-pressed/.test(picker),
+    'the mouse affordance is an `aria-pressed` button, matching `SearchPanel`’s precedent — ' +
+      'nothing in the overlay language uses a checkbox',
+  )
+  ok(
+    /onMouseDown/.test(picker) && !/<button[\s\S]{0,400}?onClick=\{\(\) => onToggle/.test(picker),
+    'and it commits on `mousedown` with `preventDefault`, not on `click`: a click blurs the ' +
+      'input between the two events and ModalShell’s selectionchange listener repaints the ' +
+      'caret, after which typing stops working',
+  )
+  ok(
+    /⌥L/.test(picker),
+    'and the same element prints the chord, so one control is both the documentation and the ' +
+      'mouse target',
+  )
+  ok(
+    /hit\.source/.test(picker),
+    'a library row draws its provenance. Two rows reading `RS lib.rs src/lib.rs` is the ' +
+      'failure the whole scope has to avoid, and the package name is the only thing that ' +
+      'separates them',
+  )
+
+  const overlayCss = uiFile('src/overlays/Overlay.module.css')
+  ok(
+    /\.source \{[^}]*flex: none/.test(overlayCss),
+    'and the provenance chip does not shrink. `.path` is `flex: 1` and ellipsises first, ' +
+      'deliberately: a path is reconstructible from a name and a package, and a package name ' +
+      'cut in half is not',
+  )
+
+  /*
+   * Two Rust decisions with no behavioural gate, asserted at source level because the
+   * alternatives cost more than they are worth — one is a wall-clock measurement over the
+   * user's own cargo registry, the other is a watcher-burst path with no test harness. Both
+   * were found by mutation: the code compiled, every test passed, and the feature was 20×
+   * slower / silently stale.
+   */
+  const repoFile = (rel) =>
+    readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), 'utf8')
+  const stripRust = (src) => strip(src.split(/#\[cfg\(test\)\]/)[0])
+
+  {
+    const files = stripRust(repoFile('crates/cide-app/src/files.rs'))
+    const walk = files.slice(files.indexOf('Index::walk_roots('))
+    ok(
+      /threads:\s*1/.test(walk.slice(0, 400)),
+      'the library walk asks for ONE thread per package. `BuildOptions::default()` is ' +
+        '`threads: 0`, which lets `ignore` spin one walker per core — right for a handful of ' +
+        'project roots and measured at 1.24 s against 130 ms for 593 package directories on ' +
+        'this machine, all of it in spawning and joining 32 threads per directory. Nothing ' +
+        'else in the suite can see a 20× slowdown',
+    )
+    ok(
+      /libraries_walked/.test(files) && /forget_libraries/.test(files),
+      'and the walk is guarded and reversible — the flags behind "at most once per project" ' +
+        'and "the lockfile moved"',
+    )
+  }
+
+  ok(
+    /fs\.forget_libraries\(\)/.test(stripRust(repoFile('crates/cide-app/src/cmd/fs.rs'))),
+    'a stale lockfile drops the library candidates. `cargo update` moves versions and ' +
+      '`cargo remove` deletes a directory the matcher still offers, so without this Ctrl+P ' +
+      'keeps opening files that no longer exist until the app is relaunched. Its only caller ' +
+      'is the watcher-burst path, which has no test harness',
+  )
+
+  const store = strip(uiFile('src/overlays/store.ts'))
+  ok(
+    /libraries: false/.test(store),
+    'the scope is OFF at every launch — the request’s own words. A `true` here would make ' +
+      '"disabled by default" false for everybody after the first flip',
+  )
+  ok(
+    /export function filePickerOpen/.test(store),
+    'and `filePickerOpen` is derived here rather than as a comparison at the call site: ' +
+      '`overlayOpen` is true for any of nine overlays, and ⌥L scoped to that would be ' +
+      'swallowed in a terminal pane whenever a menu happened to be up',
+  )
+
+  const dispatch = strip(uiFile('src/keys/dispatch.ts'))
+  ok(
+    /case 'picker\.libraries':/.test(dispatch),
+    "the command is dispatched. `check:commands` requires every id to be handled here or to " +
+      'carry an `unavailable` reason — listed-and-silently-inert is the state that check ' +
+      'makes unrepresentable',
+  )
+  ok(
+    /toggleLibraries\(\)/.test(dispatch),
+    'and it flips the flag rather than opening something',
   )
 
   if (failed > 0) {

@@ -1,0 +1,210 @@
+/*
+ * The launch-configuration section: repeatable rows, and the resolved-argv readout.
+ *
+ * Every colour is a token from `styles/tokens.css`, so both themes follow with no media query
+ * — the same rule `ProxySection.module.css` states at its top. The field vocabulary
+ * (`.field`, `.fieldLabel`, `.input`, `.fieldHint`) is deliberately identical to that file's:
+ * these two sections sit one above the other on the same screen, and a second, subtly
+ * different text input is the kind of drift a reader notices and cannot name.
+ */
+
+/* --- a stacked text field, matching ProxySection --- */
+
+.field {
+  display: block;
+  padding: 11px 0;
+}
+
+.fieldLabel {
+  display: block;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.fieldHint {
+  display: block;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 5px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  /* A program name, a flag and a variable are all machine strings: mono, like every path and
+     counter in this app. */
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+/*
+ * A refused entry: struck through, dimmed, and *still legible*.
+ *
+ * Not `disabled`, and not removed. The user has to be able to read what they typed in order
+ * to correct it — the same argument the proxy screen makes about not redacting a password in
+ * the field it was typed into — and a disabled input cannot be selected, corrected or even
+ * focused with the keyboard.
+ *
+ * The strike-through is what carries the meaning; the colour alone would not, because a dim
+ * monospace input against a dim placeholder is a distinction nobody makes at a glance and one
+ * that disappears entirely for a red-green colour-blind reader.
+ */
+.refused {
+  color: var(--dim);
+  text-decoration: line-through;
+  border-color: var(--border-soft);
+}
+
+/*
+ * Warned: it reaches the child, so it keeps a value's weight and gets a rule, not a strike.
+ *
+ * `--yellow` is the app's caution colour — the same token the diagnostics badges and the git
+ * status use — rather than `--accent`, which everywhere else in this app means "this is
+ * selected". A warned row is not selected.
+ */
+.warned {
+  border-color: var(--yellow);
+}
+
+/* --- repeatable rows --- */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 0;
+}
+
+.listRow {
+  display: flex;
+  /* `wrap`, so the sentence below can take a whole line of its own rather than competing with
+     the inputs for the row's width. Without it a long refusal squeezes the field it explains. */
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+/*
+ * The sentence beside a struck-out or flagged row.
+ *
+ * `flex-basis: 100%` puts it on its own line under the inputs — it is prose about the row above
+ * it, and prose crammed into a flex slot beside a text field is unreadable at this width.
+ *
+ * `--dim` rather than `--red` or `--yellow`: the row's own input already carries the colour of
+ * its verdict, and repeating that here would say the same thing twice in the louder of the two
+ * places. This is the explanation, not the alarm.
+ */
+.why {
+  flex-basis: 100%;
+  margin: 0;
+  padding-left: 2px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--dim);
+}
+
+/* The name column is fixed so a column of NAMEs lines up and a long value takes the slack. */
+.name {
+  flex: none;
+  width: 38%;
+}
+
+.listRow .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.add {
+  align-self: flex-start;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.add:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.remove {
+  flex: none;
+  width: 24px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--faint);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.remove:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* --- the resolved argv --- */
+
+.argv {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text);
+  -webkit-user-select: text;
+  user-select: text;
+  /* A long argument scrolls inside the box rather than widening the settings pane. */
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+/* One space between tokens, drawn rather than typed, so a token can carry its own colour. */
+.argv span + span::before {
+  content: ' ';
+}
+
+/* cide's own tokens, so the two halves of the line are distinguishable at a glance. */
+.argvOurs {
+  color: var(--faint);
+}
+
+.foot {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.foot code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+}

@@ -161,7 +161,47 @@
   color: var(--border);
 }
 
-/* The last segment is the file itself, and it is the segment the row is really about. */
-.crumb:last-child {
+/*
+ * A segment that leads somewhere. (M16)
+ *
+ * The bar already carried two tones, so the split costs no new chrome: `.path` above is
+ * `--faint`, and this promotes the run that can actually be revealed to `--dim`. On a dependency
+ * source that draws the boundary **at rest**, with no badge and no icon —
+ * `home › u › .cargo › registry › src › index.crates.io-…` reads as context and
+ * `serde-1.0.229 › src › de › mod.rs` reads as live. That is the whole ask: the user rejected a
+ * notice explaining why a click did nothing, and the answer to a dead-looking control is to stop
+ * drawing it live, not to apologise for it afterwards.
+ *
+ * `cursor: pointer` here and **`default` — never `not-allowed`** on the rest. `not-allowed` is a
+ * refusal, which is the same message as the notice with a different renderer; `text` would
+ * promise that selecting is the affordance. `default` says "this is a label", which is what an
+ * inert crumb is. It is also why there is no rule for the inert case at all: they inherit the
+ * bar's own cursor and colour, so "inert" is the absence of a decision rather than a second one.
+ *
+ * # `.crumb:last-child` is gone, deliberately
+ *
+ * It used to paint the final segment `--dim` — "the file itself, the segment the row is really
+ * about". With the trail now split into a live run and an inert prefix, a third rule that
+ * brightens the last crumb regardless makes the tone ambiguous exactly where it matters: the
+ * final crumb is the innermost *symbol* whenever there is a symbol tail, and a symbol is never
+ * revealable. Nothing is lost in the case that rule was written for — in a project file the
+ * whole path is revealable, so the file name is `--dim` here and the rest of the trail is
+ * brighter than it used to be, not dimmer. What is lost is a file under no root at all, whose
+ * trail is now uniformly faint; that is the honest rendering, because nothing on it leads
+ * anywhere.
+ *
+ * An inline box, and `check:editor` pins that: `.path` needs `text-overflow: ellipsis`, which
+ * requires a block container with **inline** content, so an `inline-block` (or a `<button>`,
+ * which is one by default) would silently coarsen the ellipsis to whole-crumb granularity and
+ * bring UA padding and a focus ring into an 11px row.
+ */
+.crumbLive {
   color: var(--dim);
+  cursor: pointer;
+}
+
+.crumbLive:hover {
+  color: var(--text-hi);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }

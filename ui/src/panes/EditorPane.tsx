@@ -61,6 +61,12 @@ export interface EditorPaneProps {
   project?: string | undefined
   /** The file tab that owns this pane, for the same reason. */
   tab?: string | undefined
+  /**
+   * Whether this pane's tab is the one in front. Passed straight through to `EditorSurface`,
+   * which says what reads it and why an inactive tab is otherwise indistinguishable from the
+   * active one. (M16)
+   */
+  onScreen?: boolean | undefined
 }
 
 /**
@@ -104,7 +110,13 @@ type Load =
  */
 const POSITION_DEBOUNCE_MS = 500
 
-export function EditorPane({ path, root, project, tab }: EditorPaneProps): ReactNode {
+export function EditorPane({
+  path,
+  root,
+  project,
+  tab,
+  onScreen,
+}: EditorPaneProps): ReactNode {
   /*
    * This file's structure, for the status bar's symbol trail.
    *
@@ -553,7 +565,30 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
   return (
     <div className={styles.pane}>
       {conflict && (
-        <div className={styles.conflict} role="alert">
+        <div
+          className={styles.conflict}
+          role="alert"
+          /*
+           * "I am pinned above this pane's content, and my height depends on what is in me."
+           *
+           * Read by exactly one selector — the `:has()` rule in `layout/PaneTitleBar.module.css`
+           * that steps the floating ⊞ ⛶ ⧉ × cluster down past the find bar (M16). This bar's
+           * height is *not* a constant: `.conflictText` is `flex: 1; min-width: 0` with no
+           * `white-space`, so on a narrow pane the sentence wraps and the bar grows a line. A
+           * fixed step over it would put the cluster through the middle of *Keep mine* — the very
+           * button whose unclickability `EditorPane.module.css` writes up at length — so this bar
+           * keeps reserving horizontally and the cluster stays where it is.
+           *
+           * It also settles the both-strips case: with this bar up, the find bar is the *second*
+           * strip and none of it is under the cluster, so the cluster must not move — which is
+           * what excluding this frame from that rule says.
+           *
+           * An attribute rather than a class because the reader is another CSS module and class
+           * names are hashed per file. A *kind*, not a boolean: a future strip with a constant
+           * height would say so and be stepped over instead.
+           */
+          data-pane-strip="fluid"
+        >
           <span className={styles.conflictText}>
             This file changed on disk while you had unsaved changes.
           </span>
@@ -593,6 +628,7 @@ export function EditorPane({ path, root, project, tab }: EditorPaneProps): React
           path={path}
           root={root}
           project={project}
+          onScreen={onScreen}
           doc={load.text}
           reloadKey={reloadKey}
           readOnly={!load.writable}

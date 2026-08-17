@@ -160,3 +160,69 @@ export function symbolBadge(kind: string): KindBadge {
       return { label: '·', tone: 'faint' }
   }
 }
+
+/**
+ * What the file picker says when it has no rows to draw. (M16)
+ *
+ * # Why this is a function and not a ternary in the JSX it came out of
+ *
+ * It was a ternary, with three arms, and the library scope makes it four — at which point it
+ * is a *rule*: two of the four are empty answers that look identical and mean opposite things
+ * ("still filling, wait" versus "finished, and there is nothing"), and a third is an empty
+ * answer with a cause the user can act on. That is precisely the shape this project has
+ * shipped inverted before, and a rule inside JSX is a rule no check script can compile.
+ *
+ * The four states, and the input that decides each:
+ *
+ * | state | when |
+ * | --- | --- |
+ * | `indexing` | a walk is filling either matcher, or the project has not started one |
+ * | `typeToSearch` | the query is empty and nothing is running |
+ * | `noLibraries` | libraries are in scope, nothing is running, and **nothing was resolved** |
+ * | `noMatches` | everything else |
+ *
+ * `noLibraries` is checked before `noMatches` and after `typeToSearch`, and both orderings
+ * matter. Before, because "No matches" over a project whose dependencies were never resolved
+ * blames the query for an empty candidate set — the failure `libraries.rs` already refuses to
+ * ship ("an empty group is indistinguishable from a broken one"). After, because an empty
+ * query has not searched for anything yet and has no business reporting on the library scope.
+ *
+ * `total === 0` and not `total === projectFiles`: the merged `total` counts both sides, so a
+ * project with files of its own can never reach zero here — which is right. Nothing resolved
+ * is only worth saying when there is nothing at all to say anything else about, and a project
+ * with 800 files of its own and no dependencies gets "No matches", which is true.
+ */
+export type PickerEmptyState = 'indexing' | 'typeToSearch' | 'noLibraries' | 'noMatches'
+
+export function pickerEmptyState(input: {
+  /** Either matcher is still filling. */
+  running: boolean
+  /** The project's walk has not started; distinct from a walk that is running. */
+  awaitingIndex: boolean
+  query: string
+  /** Is the library scope switched on? */
+  libraries: boolean
+  /** The merged candidate count, or `null` before any frame has arrived. */
+  total: number | null
+}): PickerEmptyState {
+  if (input.running || input.awaitingIndex) return 'indexing'
+  if (input.query === '') return 'typeToSearch'
+  if (input.libraries && input.total === 0) return 'noLibraries'
+  return 'noMatches'
+}
+
+/** The sentence for each state. Separated so the rule above can be driven without the words. */
+export function pickerEmptyText(state: PickerEmptyState): string {
+  switch (state) {
+    // One word for two walks, deliberately. Which of the two indexes is still filling is
+    // cide's bookkeeping; the counter beside it is already climbing.
+    case 'indexing':
+      return 'Indexing…'
+    case 'typeToSearch':
+      return 'Type to search'
+    case 'noLibraries':
+      return 'No external libraries resolved for this project'
+    case 'noMatches':
+      return 'No matches'
+  }
+}
