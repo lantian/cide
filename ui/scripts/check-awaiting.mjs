@@ -437,7 +437,27 @@ try {
   // --- what the marker actually says ----------------------------------------------------------
   eq(awaitingBadge(0), '', 'nothing waiting draws an empty box, never a zero')
   eq(awaitingBadge(1), '1', 'a count, not a dot: how many decides whether the user goes now')
-  eq(awaitingBadge(9), '9', 'nine still fits the 13px box')
+  eq(awaitingBadge(9), '9', 'nine still fits the reserved box')
+  // The reserve and the chip are one number, and that is what stops the marker moving a tab.
+  //
+  // `.awaiting` sets `width: var(--awaiting-w)`; `.labelPinned` reaches over the same variable
+  // in a negative margin and a matching padding. Written as two literals they would drift, and
+  // the drift is invisible until a marker appears and shoves every tab after it sideways under
+  // the pointer. Asserted on the stylesheet because there is no DOM here.
+  {
+    const css = readFileSync(new URL('../src/chrome/TabStrip.module.css', import.meta.url), 'utf8')
+    eq(
+      /width:\s*var\(--awaiting-w\)/.test(css),
+      true,
+      'the chip takes its width from --awaiting-w rather than a literal',
+    )
+    eq(
+      (css.match(/var\(--awaiting-w\)/g) ?? []).length,
+      3,
+      'and so do both halves of `.labelPinned`\'s reach-over — three readers, one number',
+    )
+  }
+
   eq(
     awaitingBadge(10),
     '9+',

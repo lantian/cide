@@ -35,7 +35,7 @@
   /* The awaiting marker's reserved box. Named here rather than in `.awaiting` because
      `.labelPinned` has to reach over it too, and two literals that must agree is one too
      many. */
-  --awaiting-w: 13px;
+  --awaiting-w: 16px;
   display: flex;
   align-items: center;
   gap: var(--tab-gap);
@@ -203,17 +203,35 @@
 .awaiting {
   flex: none;
   width: var(--awaiting-w);
-  height: 13px;
+  /*
+   * 16x15, not 13x13, and a pill rather than a rounded square.
+   *
+   * At 13px square with a 9.5px digit the ink filled the box corner to corner: reported as
+   * "missing padding", which is exactly what it was — there is no padding property to add,
+   * because the box is a fixed reserve and the glyph is centred in whatever is left. So the
+   * fix is to leave more, and the number to change is the reserve.
+   *
+   * `--awaiting-w` is what makes that safe. It is read here AND by `.labelPinned`'s
+   * margin/padding pair, so the space the label reaches over grows with the chip and the tab
+   * does not shift when the marker appears — which is the one thing this marker may not do.
+   * The height is not shared and is set beside it; they are a visual pair, not a layout one.
+   *
+   * Still comfortably inside the 30px strip, and still narrower than two mono digits at 10px
+   * (~12px), so `9+` fits without the clip below ever engaging.
+   */
+  height: 15px;
   /* Clip rather than `min-width`. If a fallback font ever makes `9+` wider than the box, a
      clipped `+` is a cosmetic loss; `min-width` would let the box grow, which moves the tab
      and every tab after it — the one thing this marker may not do. */
   overflow: hidden;
-  border-radius: 3px;
+  /* A pill: half the height, so the shape says "badge" rather than "small filled square",
+     which is what 3px on a 13px box read as. */
+  border-radius: 8px;
   pointer-events: none;
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 10px;
   font-variant-numeric: tabular-nums;
-  line-height: 13px;
+  line-height: 15px;
   text-align: center;
   letter-spacing: 0;
 }
