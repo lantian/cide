@@ -202,6 +202,7 @@ mod tests {
             kind: PaneKind::Editor,
             role: PaneRole::Auxiliary,
             session: None,
+            conversation: None,
             title: "x".into(),
         })
     }

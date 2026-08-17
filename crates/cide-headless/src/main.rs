@@ -624,6 +624,7 @@ mod tests {
             kind,
             role,
             session: session.then(SessionId::new),
+            conversation: None,
             title: title.into(),
         }
     }

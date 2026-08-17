@@ -10,6 +10,23 @@ export type Pane = { id: PaneId, kind: PaneKind, role: PaneRole,
  */
 session: SessionId | null, 
 /**
+ * The conversation the CLI is actually on, when that is no longer [`Self::session`].
+ *
+ * `session` is cide's handle: it keys the registry, it is what the webview addresses a
+ * pane by, and it is stable for the pane's whole life. The CLI's conversation id is not
+ * stable — `--resume <parent>` runs under a fresh one rather than the parent's, and
+ * `/clear` starts another mid-session — and it is the one `~/.claude/projects/*.jsonl`
+ * is named after. Keeping both is what lets a restart resume the conversation the user
+ * was last looking at instead of the one the pane opened with, which is the whole of the
+ * "it always restarts with almost the first session that was in this panel" report: the
+ * parent's transcript is still on disk, so `cide-app`'s `restore_for` kept finding it
+ * and resuming a conversation two or three `/clear`s stale.
+ *
+ * Learned from hook frames, which carry both ids — see `HookFrame::spawned_as`.
+ * `#[serde(default)]` so a `workspace.json` written before this field loads unchanged.
+ */
+conversation: SessionId | null, 
+/**
  * e.g. `cide : claude`, `cide : bash`, `cide : claude — diff`.
  */
 title: string, };

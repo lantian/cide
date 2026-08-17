@@ -853,6 +853,7 @@ mod tests {
             kind: PaneKind::Claude,
             role: PaneRole::Primary,
             session: Some(primary_session),
+            conversation: None,
             title: format!("{name} : claude"),
         };
         let mut tree = PaneTree {
@@ -867,6 +868,7 @@ mod tests {
                 kind: PaneKind::Shell,
                 role: PaneRole::Auxiliary,
                 session: Some(SessionId::new()),
+                conversation: None,
                 title: format!("{name} : bash"),
             };
             tree.root = LayoutNode::Split {
@@ -890,6 +892,7 @@ mod tests {
             kind: PaneKind::Editor,
             role: PaneRole::Auxiliary,
             session: None,
+            conversation: None,
             title: "settings".into(),
         };
         let settings = Tab {
@@ -1555,6 +1558,7 @@ mod tests {
             kind: PaneKind::Diff,
             role: PaneRole::Auxiliary,
             session: None,
+            conversation: None,
             title: "main.rs — diff".into(),
         };
         let project = workspace.projects.values_mut().next().expect("a project");
@@ -1608,6 +1612,7 @@ mod tests {
             kind: PaneKind::Editor,
             role: PaneRole::Auxiliary,
             session: None,
+            conversation: None,
             title: "main.rs".into(),
         };
         project.tabs.push(Tab {

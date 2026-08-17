@@ -210,6 +210,7 @@ pub fn tab_open_settings(
                 // what makes "promote pane to tab" and "split editor" one code path — and
                 // the settings screen simply renders over it.
                 session: None,
+                conversation: None,
                 title: "settings".into(),
             },
         )?;

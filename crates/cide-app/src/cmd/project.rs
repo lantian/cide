@@ -573,6 +573,7 @@ pub fn tab_new_claude(
                 // tab. Only the pinned console has a pane that cannot go.
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title: format!("{name} : claude"),
             },
         )
@@ -938,6 +939,7 @@ mod tests {
                 kind: PaneKind::Editor,
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title: "f".into(),
             },
         )
@@ -1001,6 +1003,7 @@ mod tests {
                         kind: PaneKind::Editor,
                         role: PaneRole::Auxiliary,
                         session: None,
+                        conversation: None,
                         title: "f".into(),
                     },
                 )
@@ -1166,6 +1169,7 @@ mod tests {
                 kind: PaneKind::Editor,
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title: "lib.rs".into(),
             }),
         };
@@ -1186,6 +1190,7 @@ mod tests {
                 kind: PaneKind::Editor,
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title: "lib.rs".into(),
             },
         )
@@ -1223,6 +1228,7 @@ mod tests {
                 kind: PaneKind::Editor,
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title: "a.rs".into(),
             }),
         };

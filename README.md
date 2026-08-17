@@ -2270,6 +2270,37 @@ On relaunch, `app_restore_plan` marks each pane `Resumable` or `Fresh`, and exac
 per project `eager` — its primary session. Every other Claude pane shows a resume splash and
 spawns when asked, so reopening a six-pane project does not silently start six agents.
 
+### The pane's id and the CLI's conversation are two different things (M17)
+
+`SessionId` is cide's handle for a pane's child: it keys the registry, the webview addresses
+panes by it, and it is stable for the pane's whole life. It is **not** reliably the id the CLI
+is running under. On 2.1.224, `claude --resume <parent>` runs under a *fresh* conversation id
+rather than announcing the parent's, and `/clear` mints another mid-session. The code assumed
+otherwise in two places, and both assumptions were load-bearing:
+
+* Hook frames were routed by the payload's `session_id`, so every frame from a resumed pane
+  named a uuid no pane held and its effects were emitted to nobody. Measured on a live
+  workspace: 2 session ids arriving from hooks, 12 held by panes, **zero overlap**. That is
+  the whole of "the finished-turn notification never fires" — it worked in a freshly opened
+  pane, where the two ids agree, and nowhere else. Four attempts read the chain and found every
+  link correct, because the defect was in which id the links were keyed by.
+* Resume named the pane's own id, whose transcript is still on disk after a `/clear`. So a
+  restart kept resuming the conversation the user had cleared — "it always restarts with almost
+  the first session that was in this panel".
+
+The fix stops inferring identity and carries it. A Claude child is spawned with
+`CIDE_SESSION=<the id cide filed it under>`; `cide-hook` reads that from its own environment
+and puts it in every frame as `spawned_as`; `HookFrame::owner()` is what effects are keyed by.
+The CLI's id is not discarded — it is recorded on the pane as `Pane.conversation` and is what
+`restore_for` resumes, so a restart picks up the conversation the user was last looking at.
+`Pane.conversation` stays `None` for a pane whose CLI never diverged.
+
+Two consequences worth keeping in mind. `run.sh` builds `cide-hook` as well as `cide-app`,
+because the app resolves the hook binary as `current_exe().parent()/cide-hook` and a stale one
+reports in an old frame shape **silently** — no error, no log line, just chrome that never
+updates. And the hook log now prints `session` and `cli` separately; when they differ, only
+`session` addresses a pane.
+
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the

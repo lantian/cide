@@ -50,7 +50,7 @@ use std::thread;
 use cide_claude::{HookEvent, HookFrame};
 use cide_ipc::{SessionId, SessionState};
 use dashmap::DashMap;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 /// The socket, and every session's last known state.
 pub struct HookServer {
@@ -58,6 +58,10 @@ pub struct HookServer {
     /// Last known state per session. The state machine needs a "current" to transition from,
     /// and a session with no entry yet is treated as `Spawning`.
     states: Arc<DashMap<SessionId, SessionState>>,
+    /// The conversation each session's CLI is currently on, when it is not the session's own
+    /// id. Deduped here rather than against `workspace.json` because every frame of a busy
+    /// turn repeats it, and each write there bumps `rev` and schedules a disk write.
+    conversations: Arc<DashMap<SessionId, SessionId>>,
 }
 
 impl HookServer {
@@ -85,6 +89,8 @@ impl HookServer {
 
         let states: Arc<DashMap<SessionId, SessionState>> = Arc::new(DashMap::new());
         let apply_states = Arc::clone(&states);
+        let conversations: Arc<DashMap<SessionId, SessionId>> = Arc::new(DashMap::new());
+        let apply_conversations = Arc::clone(&conversations);
 
         // The serialising channel. Unbounded, and deliberately: a hook process is blocked on
         // its own `write` until this side reads the line, so back-pressure here would be
@@ -99,7 +105,7 @@ impl HookServer {
                 // Ends when every sender has gone, which is when the accept loop below has
                 // ended and no connection thread is left holding a clone.
                 for frame in inbox {
-                    apply(&frame, &app, &apply_states);
+                    apply(&frame, &app, &apply_states, &apply_conversations);
                 }
             })?;
 
@@ -120,7 +126,11 @@ impl HookServer {
             })?;
 
         tracing::info!(path = %path.display(), "hook socket listening");
-        Ok(Self { path, states })
+        Ok(Self {
+            path,
+            states,
+            conversations,
+        })
     }
 
     /// The value for a child's `CIDE_HOOK_SOCK`.
@@ -147,6 +157,9 @@ impl HookServer {
     /// Forget a session that has gone.
     pub fn forget(&self, session: SessionId) {
         forget_in(&self.states, session);
+        // Or a pane reusing this id after a restart would inherit the last run's
+        // conversation and never record its own.
+        self.conversations.remove(&session);
     }
 }
 
@@ -233,17 +246,45 @@ enum Effect {
         session: String,
         state: SessionState,
     },
+    /// The CLI is on a different conversation than the one this pane opened with.
+    ///
+    /// Recorded so the *next* launch resumes what the user was last looking at. Without it a
+    /// restart re-resumes the id the pane spawned under, whose transcript is still on disk —
+    /// which is why `/clear` looked like it did nothing across a restart.
+    Conversation {
+        session: SessionId,
+        conversation: SessionId,
+    },
 }
 
 /// Route one frame: update state, emit what the frontend needs.
-fn apply(frame: &HookFrame, app: &AppHandle, states: &DashMap<SessionId, SessionState>) {
-    for effect in decide(frame, states) {
+fn apply(
+    frame: &HookFrame,
+    app: &AppHandle,
+    states: &DashMap<SessionId, SessionState>,
+    conversations: &DashMap<SessionId, SessionId>,
+) {
+    for effect in decide(frame, states, conversations) {
         match effect {
             Effect::Status { session, payload } => {
                 crate::emit::session_status(app, &session, payload)
             }
             Effect::Tool { session, paths } => crate::emit::session_tool(app, &session, paths),
             Effect::State { session, state } => crate::emit::session_state(app, &session, state),
+            Effect::Conversation {
+                session,
+                conversation,
+            } => {
+                // Best effort by design. Missing it costs the next launch a stale resume,
+                // which is what already happened; it must never cost the running turn, so a
+                // torn-down app or a closed pane is not an error here.
+                if let Some(state) = app.try_state::<crate::workspace_state::WorkspaceState>() {
+                    let _ = state.update(|ws| {
+                        cide_core::workspace::note_conversation(ws, session, conversation);
+                        Ok(())
+                    });
+                }
+            }
         }
     }
 }
@@ -253,11 +294,15 @@ fn apply(frame: &HookFrame, app: &AppHandle, states: &DashMap<SessionId, Session
 /// Pure but for that one write, which is the point: everything a hook can be — an unknown
 /// event, an unknown session, a statusline, a tool call, a permission prompt — is decided
 /// here where a test can see it.
-fn decide(frame: &HookFrame, states: &DashMap<SessionId, SessionState>) -> Vec<Effect> {
+fn decide(
+    frame: &HookFrame,
+    states: &DashMap<SessionId, SessionState>,
+    conversations: &DashMap<SessionId, SessionId>,
+) -> Vec<Effect> {
     // The statusline is not a hook event and carries no `session_id` in the same shape; it is
     // handled first so it does not fall through the state machine.
     if frame.event == "statusline" {
-        return match frame.session_id() {
+        return match frame.owner() {
             Some(session) => vec![Effect::Status {
                 session: session.to_owned(),
                 payload: frame.payload.clone(),
@@ -271,17 +316,38 @@ fn decide(frame: &HookFrame, states: &DashMap<SessionId, SessionState>) -> Vec<E
         return Vec::new();
     };
 
-    let Some(raw) = frame.session_id() else {
+    // The pane's id, not the CLI's. See `HookFrame::owner` for why those differ and what it
+    // cost when this routed on the payload alone.
+    let Some(raw) = frame.owner() else {
         return Vec::new();
     };
     let Ok(session) = raw.parse::<SessionId>() else {
-        // A session uuid we did not mint. Reachable when a user runs `claude` by hand inside
-        // a cide shell: it inherits `CIDE_HOOK_SOCK` and reports here, but no pane owns it.
-        tracing::debug!(session = raw, "hook from a session this app does not own");
+        // Not a uuid at all. Note this is *not* the "a session we did not mint" guard it once
+        // claimed to be — every uuid parses, so an id from a conversation no pane holds used
+        // to sail through here and have its effects emitted into the void.
+        tracing::debug!(session = raw, "hook frame whose session id is not a uuid");
         return Vec::new();
     };
 
     let mut effects = Vec::new();
+
+    // Which conversation the CLI is on, when it has told us and it is not the one this pane
+    // opened with. Recorded before anything else because it is what the *next* launch reads:
+    // a turn that ends with the app being quit must still have filed it.
+    if let Some(cli) = frame.session_id().and_then(|s| s.parse::<SessionId>().ok())
+        && cli != session
+        && conversations.insert(session, cli) != Some(cli)
+    {
+        tracing::info!(
+            %session,
+            %cli,
+            "hook: the CLI moved this pane onto another conversation"
+        );
+        effects.push(Effect::Conversation {
+            session,
+            conversation: cli,
+        });
+    }
 
     // Files first, so a reload is not held up behind a state transition that may not happen.
     if matches!(event, HookEvent::PostToolUse | HookEvent::PostToolBatch) {
@@ -318,7 +384,15 @@ fn decide(frame: &HookFrame, states: &DashMap<SessionId, SessionState>) -> Vec<E
         // no line here means the hooks are not arriving; a line here with none from
         // `window_set_awaiting` means the webview is not hearing the event or not reporting it;
         // both, with a zero count in `retitle`, means the window-to-session mapping is wrong.
-        tracing::info!(session = raw, ?next, "hook: session state changed");
+        // `cli` is logged separately from `session` because the two diverging is the failure
+        // this whole path was rebuilt around: when they differ, the CLI has moved to another
+        // conversation (a resume, or `/clear`) and only `session` addresses a pane.
+        tracing::info!(
+            session = raw,
+            cli = frame.session_id().unwrap_or("-"),
+            ?next,
+            "hook: session state changed"
+        );
         effects.push(Effect::State {
             session: raw.to_owned(),
             state: next,
@@ -342,6 +416,93 @@ mod tests {
 
     fn state_of(states: &States, session: SessionId) -> Option<SessionState> {
         states.get(&session).map(|s| *s)
+    }
+
+    /// Shadows [`super::decide`] for the tests that predate conversation tracking, giving
+    /// each call a private empty map. They assert on states and effects, and a frame whose
+    /// ids agree produces no conversation effect anyway.
+    fn decide(frame: &HookFrame, states: &States) -> Vec<Effect> {
+        super::decide(frame, states, &DashMap::new())
+    }
+
+    /// A resumed session: the CLI announces an id cide never minted, and `cide-hook` reports
+    /// the pane's id alongside it.
+    ///
+    /// This is the regression test for four rounds of "the finished-turn notification does
+    /// nothing". Routing on the payload's `session_id` sent every effect to a uuid no pane
+    /// held, so the chrome had nothing to react to and the log looked healthy throughout.
+    #[test]
+    fn effects_address_the_pane_not_the_conversation_the_cli_moved_to() {
+        let pane = SessionId::new();
+        let cli = SessionId::new();
+        assert_ne!(pane, cli);
+
+        let states = States::new();
+        let conversations = DashMap::new();
+        let mut f = frame("Stop", &cli.to_string());
+        f.spawned_as = Some(pane.to_string());
+
+        // Busy first, because `Stop` only means "finished, awaiting you" out of `Busy`.
+        states.insert(pane, SessionState::Busy);
+
+        let effects = super::decide(&f, &states, &conversations);
+
+        match effects.as_slice() {
+            [
+                Effect::Conversation {
+                    session,
+                    conversation,
+                },
+                Effect::State { session: s2, state },
+            ] => {
+                assert_eq!(*session, pane);
+                assert_eq!(*conversation, cli, "the id a later `--resume` must name");
+                assert_eq!(
+                    s2,
+                    &pane.to_string(),
+                    "the effect must name the id the webview keys panes by"
+                );
+                assert_eq!(*state, SessionState::AwaitingInput);
+            }
+            other => panic!("expected a Conversation then a State effect, got {other:?}"),
+        }
+
+        assert_eq!(
+            state_of(&states, pane),
+            Some(SessionState::AwaitingInput),
+            "dedupe must track the pane, or the next turn's transition is swallowed"
+        );
+        assert_eq!(
+            state_of(&states, cli),
+            None,
+            "nothing may be filed under the CLI's id — no pane would ever read it"
+        );
+
+        // A second frame on the same conversation must not re-file it: `apply` turns each one
+        // into a `rev` bump and a `workspace.json` write, and a busy turn sends many.
+        let again = super::decide(&f, &states, &conversations);
+        assert!(
+            !again
+                .iter()
+                .any(|e| matches!(e, Effect::Conversation { .. })),
+            "an unchanged conversation must be deduped, got {again:?}"
+        );
+    }
+
+    /// A `claude` the user started by hand in a cide shell: no `CIDE_SESSION` in its
+    /// environment, so the payload's id is all there is and must still work.
+    #[test]
+    fn a_frame_without_a_spawned_id_still_routes_on_the_payload() {
+        let session = SessionId::new();
+        let states = States::new();
+        states.insert(session, SessionState::Busy);
+
+        let effects = decide(&frame("Stop", &session.to_string()), &states);
+
+        assert!(
+            matches!(effects.as_slice(), [Effect::State { session: s, .. }] if s == &session.to_string()),
+            "the fallback path is what a hand-started `claude` depends on",
+        );
     }
 
     #[test]

@@ -107,6 +107,23 @@ pub struct HookFrame {
     /// and is not versioned; forwarding it whole means a CLI release that adds a field
     /// reaches the app instead of being dropped by a deserialiser that had not heard of it.
     pub payload: serde_json::Value,
+
+    /// The `SessionId` cide spawned this child as, read from `CIDE_SESSION` in the child's
+    /// own environment by `cide-hook`.
+    ///
+    /// This exists because the CLI's session id and cide's diverge, and the payload alone
+    /// cannot say which pane a frame belongs to. Two ways they diverge, both reported:
+    /// `claude --resume <parent>` runs under a *fresh* id rather than announcing the parent,
+    /// and `/clear` starts a new conversation mid-session. Either way the payload names an
+    /// id no pane holds, every effect is emitted under it, and the webview — which keys panes
+    /// by the id cide minted — hears nothing. That is the whole of the "finished-turn
+    /// notification never fires for a resumed session" report.
+    ///
+    /// `Option` because a `claude` the user started by hand in a cide shell inherits
+    /// `CIDE_HOOK_SOCK` but not `CIDE_SESSION`, and because a frame written by an older
+    /// `cide-hook` binary still on PATH has no such field.
+    #[serde(default)]
+    pub spawned_as: Option<String>,
 }
 
 impl HookFrame {
@@ -114,7 +131,17 @@ impl HookFrame {
         Self {
             event: event.into(),
             payload,
+            spawned_as: None,
         }
+    }
+
+    /// The id every effect from this frame must be keyed by: the pane's, not the CLI's.
+    ///
+    /// Prefers `spawned_as` precisely because it is the id the webview knows. Falls back to
+    /// the payload's `session_id` so a hand-started `claude` still drives its own pane when
+    /// the two happen to agree, which is the case cide minted the id for.
+    pub fn owner(&self) -> Option<&str> {
+        self.spawned_as.as_deref().or_else(|| self.session_id())
     }
 
     pub fn kind(&self) -> Option<HookEvent> {

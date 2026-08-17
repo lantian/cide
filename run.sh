@@ -152,7 +152,13 @@ fi
 #
 # So: ask cargo, which is the only thing that knows. When the binary is current this costs
 # ~0.2s; when it is not, rebuilding is precisely what the old guard was asking for anyway.
-build=(cargo build -p cide-app)
+# `cide-hook` is built alongside, and it is not optional. The app resolves the hook binary as
+# `current_exe().parent()/cide-hook`, so a run.sh that builds only `cide-app` launches a new
+# IDE against whatever `cide-hook` happened to be in `target/debug` from some earlier build.
+# Every hook then reports in an old frame shape and the failure is silent — no error, no log
+# line, just chrome that never updates. That is how the finished-turn notification survived
+# four rounds of fixes: the code read correctly and the binary answering was stale.
+build=(cargo build -p cide-app -p cide-hook)
 if [ "$release" = 1 ]; then
   build+=(--release)
 fi

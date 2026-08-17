@@ -465,6 +465,15 @@ pub async fn session_spawn(
     // answers with the id the child will report, and everything below — the exit watcher,
     // the registry key, the value returned to the frontend and therefore
     // `pane_bind_session`'s `workspace.json` entry — uses that instead of the minted one.
+    //
+    // **That last paragraph is a claim about the CLI, and on 2.1.224 it is false.** A
+    // `claude --resume <parent>` reports a *fresh* id in its hook frames, not the parent's,
+    // and `/clear` mints another one mid-session. So the id chosen here is right for the
+    // command line and wrong as a routing key the moment either happens. Rather than chase
+    // the CLI's id, the child is told the id cide is filing it under (`CIDE_SESSION` below)
+    // and `cide-hook` echoes it back, so routing no longer depends on the two agreeing.
+    // Measured before the fix: 2 session ids arrived from hooks, 12 were held by panes, and
+    // the two sets did not intersect at all.
     let minted = SessionId::new();
     let mut id = minted;
     if is_claude {
@@ -514,6 +523,11 @@ pub async fn session_spawn(
         );
 
         if is_claude {
+            // The routing key for every frame this child's hooks send. Set only for Claude
+            // panes: a shell pane has no conversation, and a `claude` the user starts by hand
+            // inside one must not drive that pane's busy/idle chrome.
+            spec = spec.env("CIDE_SESSION", id.to_string());
+
             match hook_settings(theme) {
                 Some(json) => spec = spec.arg("--settings").arg(json),
                 // Without an absolute path to `cide-hook` the child cannot run it: its cwd is

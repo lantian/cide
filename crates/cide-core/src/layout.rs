@@ -1413,6 +1413,7 @@ mod tests {
             kind: PaneKind::Claude,
             role: PaneRole::Primary,
             session: Some(SessionId::new()),
+            conversation: None,
             title: "cide : claude".into(),
         }
     }
@@ -1423,6 +1424,7 @@ mod tests {
             kind: PaneKind::Shell,
             role: PaneRole::Auxiliary,
             session: Some(SessionId::new()),
+            conversation: None,
             title: "cide : bash".into(),
         }
     }
@@ -2299,6 +2301,7 @@ mod tests {
             kind: PaneKind::Editor,
             role: PaneRole::Auxiliary,
             session: None,
+            conversation: None,
             title: "workspace.rs".into(),
         };
         let e = editor.id;

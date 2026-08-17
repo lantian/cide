@@ -70,6 +70,10 @@ fn pane_for(intent: &SplitIntent, project_name: &str) -> Pane {
             SplitIntent::Mirror { session } => Some(*session),
             _ => None,
         },
+        // A mirror shows the same child as its source, so the CLI's conversation for it is
+        // whatever the source already recorded; this pane learns its own from the next hook
+        // frame rather than copying a value that may be a turn out of date.
+        conversation: None,
         title: format!("{project_name} : {suffix}"),
     }
 }
@@ -313,6 +317,7 @@ mod tests {
             kind: PaneKind::Claude,
             role: PaneRole::Primary,
             session: None,
+            conversation: None,
             title: "cide : claude".into(),
         };
         let mut tree = new_tree(first);

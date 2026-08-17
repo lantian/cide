@@ -104,7 +104,17 @@ fn forward(event: &str, payload: &str) {
     let parsed: serde_json::Value =
         serde_json::from_str(payload).unwrap_or_else(|_| serde_json::Value::String(payload.into()));
 
-    let frame = serde_json::json!({ "event": event, "payload": parsed });
+    // Read from our own environment rather than the payload: we are a direct child of the
+    // `claude` cide spawned, so we inherit the id cide minted for it. The payload's
+    // `session_id` is whatever conversation the CLI is currently running, which is a
+    // different thing the moment the user resumes or types `/clear`.
+    let spawned_as = std::env::var("CIDE_SESSION").ok();
+
+    let frame = serde_json::json!({
+        "event": event,
+        "payload": parsed,
+        "spawned_as": spawned_as,
+    });
     let Ok(mut line) = serde_json::to_vec(&frame) else {
         return;
     };

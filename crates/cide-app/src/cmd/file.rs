@@ -70,6 +70,7 @@ fn open_file_tab(state: &WorkspaceState, project: ProjectId, path: PathBuf) -> R
                 // last one closes the tab.
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title,
             },
         )
@@ -619,6 +620,7 @@ fn diff_pane(title: String) -> Pane {
         role: PaneRole::Auxiliary,
         // No process, ever. A diff is a document.
         session: None,
+        conversation: None,
         title,
     }
 }
@@ -1720,6 +1722,7 @@ mod tests {
             kind: PaneKind::Claude,
             role: PaneRole::Auxiliary,
             session: Some(cide_ipc::SessionId::new()),
+            conversation: None,
             title: title.into(),
         }
     }
@@ -1730,6 +1733,7 @@ mod tests {
             kind: PaneKind::Shell,
             role: PaneRole::Auxiliary,
             session: Some(cide_ipc::SessionId::new()),
+            conversation: None,
             title: title.into(),
         }
     }
@@ -1948,6 +1952,7 @@ mod tests {
                 kind: PaneKind::Editor,
                 role: PaneRole::Auxiliary,
                 session: None,
+                conversation: None,
                 title: "main.rs".into(),
             },
         )

@@ -126,6 +126,7 @@ pub fn open_project(
             kind: PaneKind::Claude,
             role: PaneRole::Primary,
             session: Some(primary_session),
+            conversation: None,
             title: format!("{name} : claude"),
         }),
     };
@@ -976,6 +977,43 @@ pub fn console_tab(ws: &Workspace, project: ProjectId) -> Result<TabId> {
 /// `set_diff_spec` above documents the same fact about the same map. Two functions needing the
 /// same correction is the argument for making the fallback explicit here rather than leaving
 /// each caller to remember it.
+/// Record which conversation the CLI moved a pane's session onto.
+///
+/// Keyed by `session` — cide's own handle — because that is the only id a hook frame and a
+/// pane are guaranteed to agree on. Searches every project, every tab and the detached map,
+/// since a hook says nothing about where its pane currently lives and the pane may have been
+/// detached into another window since it spawned.
+///
+/// Returns whether anything changed, so the caller can skip a `rev` bump and the
+/// `workspace.json` write behind it. That matters more here than elsewhere: a busy turn
+/// sends hook frames continuously and all but the first carry a conversation id the pane has
+/// already recorded.
+pub fn note_conversation(ws: &mut Workspace, session: SessionId, conversation: SessionId) -> bool {
+    for project in ws.projects.values_mut() {
+        let panes = project
+            .tabs
+            .iter_mut()
+            .flat_map(|t| t.tree.panes.values_mut())
+            .chain(project.detached.values_mut());
+
+        for pane in panes {
+            if pane.session != Some(session) {
+                continue;
+            }
+            // `Some(conversation) == pane.conversation` is the common case on a busy turn.
+            // Also skip when the CLI is simply using our id, so the field stays `None` for
+            // the ordinary pane and `workspace.json` does not grow a redundant uuid per pane.
+            let next = (conversation != session).then_some(conversation);
+            if pane.conversation == next {
+                return false;
+            }
+            pane.conversation = next;
+            return true;
+        }
+    }
+    false
+}
+
 pub fn bind_session(
     ws: &mut Workspace,
     project: ProjectId,
@@ -1619,6 +1657,7 @@ fn demo_pane(kind: PaneKind, title: &str, attached: bool) -> Pane {
         kind,
         role: PaneRole::Auxiliary,
         session: attached.then(SessionId::new),
+        conversation: None,
         title: title.to_string(),
     }
 }
@@ -1744,6 +1783,53 @@ mod tests {
             "the fixture only means anything if it moved"
         );
         validate(&ws).expect("still valid");
+    }
+
+    /// A pane records the conversation its CLI moved onto, and stops recording it once it has.
+    ///
+    /// The dedupe is the load-bearing half: `note_conversation` is reached from a hook frame,
+    /// every frame of a busy turn repeats the same id, and each `true` here costs a `rev` bump
+    /// and a `workspace.json` write.
+    #[test]
+    fn a_pane_records_the_conversation_its_cli_moved_onto_exactly_once() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let pane = project(&ws, id).expect("exists").tabs[0].tree.focused;
+        let session = project(&ws, id).expect("exists").primary_session;
+
+        let cleared = SessionId::new();
+        assert!(
+            note_conversation(&mut ws, session, cleared),
+            "the first frame after a `/clear` has something to say"
+        );
+        assert_eq!(
+            project(&ws, id).expect("exists").tabs[0].tree.panes[&pane].conversation,
+            Some(cleared)
+        );
+        assert!(
+            !note_conversation(&mut ws, session, cleared),
+            "every later frame of the same turn repeats it and must cost nothing"
+        );
+
+        // A pane whose CLI is simply using our id stays `None`, so `workspace.json` does not
+        // grow a redundant uuid per pane and `restore_for`'s fallback stays the common path.
+        let mut plain = Workspace::default();
+        let id = open(&mut plain, "/home/dev/work/cide");
+        let session = project(&plain, id).expect("exists").primary_session;
+        let pane = project(&plain, id).expect("exists").tabs[0].tree.focused;
+        assert!(!note_conversation(&mut plain, session, session));
+        assert_eq!(
+            project(&plain, id).expect("exists").tabs[0].tree.panes[&pane].conversation,
+            None
+        );
+
+        // And a session no pane holds is not an error: a hook can outlive its pane.
+        assert!(!note_conversation(
+            &mut plain,
+            SessionId::new(),
+            SessionId::new()
+        ));
+        validate(&plain).expect("still valid");
     }
 
     /// And every other pane binds only itself.

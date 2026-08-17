@@ -784,6 +784,7 @@ mod tests {
             kind: cide_ipc::PaneKind::Claude,
             role: cide_ipc::PaneRole::Auxiliary,
             session: Some(session),
+            conversation: None,
             title: "atlas : claude — mirror".into(),
         };
         let mirror_id = mirror.id;
@@ -840,6 +841,7 @@ mod tests {
             kind: cide_ipc::PaneKind::Claude,
             role: cide_ipc::PaneRole::Auxiliary,
             session: Some(leaves),
+            conversation: None,
             title: "atlas : claude".into(),
         };
         let second_id = second.id;
@@ -887,6 +889,7 @@ mod tests {
             kind: cide_ipc::PaneKind::Claude,
             role: cide_ipc::PaneRole::Auxiliary,
             session: Some(cide_ipc::SessionId::new()),
+            conversation: None,
             title: "atlas : claude".into(),
         };
         let second_id = second.id;

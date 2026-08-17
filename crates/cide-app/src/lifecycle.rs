@@ -613,6 +613,11 @@ fn restore_for(pane: &Pane, cwd: &Path, projects_dir: Option<&Path>) -> SessionR
     let Some(session) = pane.session else {
         return SessionRestore::Fresh;
     };
+    // The conversation the CLI last reported, falling back to the pane's own id for a pane
+    // that never diverged. Preferring `session` here is what made `/clear` look inert across
+    // a restart: the pre-`/clear` transcript is still on disk under the pane's id, so this
+    // found it, resumed it, and handed back the conversation the user had just cleared.
+    let session = pane.conversation.unwrap_or(session);
     match projects_dir {
         Some(dir) if transcript_exists(dir, cwd, session) => SessionRestore::Resumable { session },
         _ => SessionRestore::Fresh,
@@ -1345,6 +1350,7 @@ mod tests {
                 kind: PaneKind::Claude,
                 role: PaneRole::Auxiliary,
                 session: Some(SessionId::new()),
+                conversation: None,
                 title: "secondary : claude".into(),
             },
         )
@@ -1359,6 +1365,7 @@ mod tests {
                 kind: PaneKind::Shell,
                 role: PaneRole::Auxiliary,
                 session: Some(SessionId::new()),
+                conversation: None,
                 title: "fixture : bash".into(),
             },
         )
@@ -1533,6 +1540,94 @@ mod tests {
             .find(|e| e.kind == PaneKind::Claude && !e.eager)
             .expect("the secondary claude pane is planned");
         assert_eq!(secondary.restore, SessionRestore::Fresh);
+    }
+
+    /// After `/clear`, the pane must come back on the conversation the user last had — not
+    /// the one it opened with, whose transcript is still sitting on disk beside it.
+    ///
+    /// This is the "it always restarts with almost the first session that was in this panel"
+    /// report. Both transcripts exist here, which is the whole difficulty: the old check
+    /// found the pane's own id first and never looked further.
+    #[test]
+    fn a_cleared_pane_resumes_the_conversation_the_cli_moved_to() {
+        let root = temp_dir("cleared");
+        let projects_dir = temp_dir("projects-cleared");
+        let mut ws = fixture(&root);
+        let primary = ws
+            .projects
+            .values()
+            .next()
+            .expect("fixture project")
+            .primary_session;
+
+        // The conversation `/clear` started, and the one the pane opened with. Both on disk.
+        let after_clear = SessionId::new();
+        write_transcript(&projects_dir, &root, primary);
+        write_transcript(&projects_dir, &root, after_clear);
+
+        for project in ws.projects.values_mut() {
+            for tab in project.tabs.iter_mut() {
+                for pane in tab.tree.panes.values_mut() {
+                    if pane.session == Some(primary) {
+                        pane.conversation = Some(after_clear);
+                    }
+                }
+            }
+        }
+
+        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let entry = plan
+            .iter()
+            .find(|e| e.eager)
+            .expect("the primary pane is planned");
+        assert_eq!(
+            entry.restore,
+            SessionRestore::Resumable {
+                session: after_clear
+            },
+            "resume must name the conversation the CLI last reported"
+        );
+    }
+
+    /// A pane whose CLI never moved keeps resuming its own id, and a recorded conversation
+    /// with no transcript is not resumable — `/clear` immediately before a quit leaves the
+    /// new conversation with nothing written yet.
+    #[test]
+    fn a_recorded_conversation_still_has_to_exist_on_disk() {
+        let root = temp_dir("unwritten");
+        let projects_dir = temp_dir("projects-unwritten");
+        let mut ws = fixture(&root);
+        let primary = ws
+            .projects
+            .values()
+            .next()
+            .expect("fixture project")
+            .primary_session;
+        write_transcript(&projects_dir, &root, primary);
+
+        let mut target = None;
+        for project in ws.projects.values_mut() {
+            for tab in project.tabs.iter_mut() {
+                for pane in tab.tree.panes.values_mut() {
+                    if pane.session == Some(primary) {
+                        pane.conversation = Some(SessionId::new());
+                        target = Some(pane.id);
+                    }
+                }
+            }
+        }
+        let target = target.expect("the primary pane");
+
+        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        let entry = plan
+            .iter()
+            .find(|e| e.pane == target)
+            .expect("the primary pane is planned");
+        assert_eq!(
+            entry.restore,
+            SessionRestore::Fresh,
+            "an unwritten conversation must start clean rather than resume the stale one"
+        );
     }
 
     #[test]
