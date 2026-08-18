@@ -710,6 +710,23 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
                 steps.push(fetch_appimage_runtime(triple));
             }
             env.push((LDAI_RUNTIME_FILE.to_string(), runtime.display().to_string()));
+
+            // The 32-bit-GTK trap. See `gtk_immodules_shim` for the whole chain; the short
+            // version is that without this the bundle dies inside a downloaded shell script
+            // and the only message that reaches the user is `failed to run linuxdeploy`.
+            if let Some((target, link)) = gtk_immodules_shim(Path::new("/usr/bin")) {
+                steps.push(link_gtk_immodules_shim(&target, &link));
+                // Prepended, not appended: the whole point is to be found before the 32-bit
+                // binary that `command -v` would otherwise return. Absolute, because the
+                // process that reads it is several layers below this one — same reason the
+                // runtime path above is absolute.
+                let shim_dir = root.join(GTK_SHIM_DIR);
+                let inherited = std::env::var("PATH").unwrap_or_default();
+                env.push((
+                    "PATH".to_string(),
+                    format!("{}:{inherited}", shim_dir.display()),
+                ));
+            }
         }
 
         // Run from the app crate: `cargo tauri build` finds `tauri.conf.json` by walking up
@@ -864,6 +881,62 @@ fn sidecar_path(triple: &str) -> String {
 /// The environment variable `linuxdeploy-plugin-appimage` turns into `--runtime-file`.
 const LDAI_RUNTIME_FILE: &str = "LDAI_RUNTIME_FILE";
 
+/// Where a 64-bit `gtk-query-immodules-3.0` is put when the host's unsuffixed one is 32-bit.
+const GTK_SHIM_DIR: &str = "target/appimage-gtk-shim";
+
+/// The tool `linuxdeploy-plugin-gtk` runs to build the AppDir's `immodules.cache`.
+const GTK_IMMODULES_TOOL: &str = "gtk-query-immodules-3.0";
+
+/// Is this file an ELF64 image?
+///
+/// Byte 4 of an ELF header is `EI_CLASS`: 1 is 32-bit, 2 is 64-bit. Read rather than shelled
+/// out to `file(1)`, which is not guaranteed present and whose output is prose.
+fn is_elf64(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.len() > 4 && bytes[..4] == [0x7f, b'E', b'L', b'F'] && bytes[4] == 2
+}
+
+/// The multilib trap that makes an AppImage build fail with nothing but `failed to run
+/// linuxdeploy`, and the shim that gets around it.
+///
+/// On a distribution that ships 32-bit GTK alongside 64-bit — openSUSE's `gtk3-tools-32bit` is
+/// the case this was found on — the **32-bit** package owns the unsuffixed
+/// `/usr/bin/gtk-query-immodules-3.0` and the 64-bit tool is renamed to `…-3.0-64`.
+/// `linuxdeploy-plugin-gtk`'s `search_tool` tries `command -v` *first* and returns on the first
+/// hit, so it finds the 32-bit binary and never reaches the `/usr/bin/$tool-64` entry that is
+/// already in its own fallback list. It then runs that binary over the AppDir's 64-bit
+/// immodules, every load fails with `wrong ELF class: ELFCLASS64`, the tool exits 1, and the
+/// plugin — which is `set -e` — dies. linuxdeploy reports `Failed to run plugin: gtk`, and
+/// tauri-bundler discards linuxdeploy's stderr at its default log level, so all the user is
+/// told is `failed to bundle project: failed to run linuxdeploy`.
+///
+/// Nothing about this is cide's, and it is not fixable in cide's source: the decision is made
+/// inside a downloaded shell script. What *is* available is `PATH`, which that `command -v`
+/// honours. So a directory holding one symlink named `gtk-query-immodules-3.0` and pointing at
+/// the 64-bit tool goes on the front of the step's `PATH`, and `search_tool` finds the right
+/// binary by the same rule it was already using.
+///
+/// `None` when the host is not in this state — the common case, where the unsuffixed tool is
+/// already 64-bit or absent. A shim is never installed speculatively: putting a directory in
+/// front of `PATH` for every build would be a durable hazard in exchange for nothing.
+fn gtk_immodules_shim(bin_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let unsuffixed = bin_dir.join(GTK_IMMODULES_TOOL);
+    let suffixed = bin_dir.join(format!("{GTK_IMMODULES_TOOL}-64"));
+
+    // Only when the unsuffixed one exists *and* is the wrong class. If it is missing entirely
+    // the plugin's own fallback list reaches `-64` unaided, and if it is already 64-bit there
+    // is nothing to fix.
+    if !unsuffixed.exists() || is_elf64(&unsuffixed) || !is_elf64(&suffixed) {
+        return None;
+    }
+    Some((
+        suffixed,
+        PathBuf::from(GTK_SHIM_DIR).join(GTK_IMMODULES_TOOL),
+    ))
+}
+
 /// Where the prefetched AppImage type-2 runtime is kept, relative to the workspace root.
 const APPIMAGE_RUNTIME_DIR: &str = "target/appimage-runtime";
 
@@ -890,6 +963,45 @@ fn runtime_arch(triple: &str) -> &str {
 /// Fetching it here with `curl --retry`, which does fail rather than hang, and handing it over
 /// as `LDAI_RUNTIME_FILE`, takes the network out of the innermost layer. It also makes a
 /// second build offline-capable, which the layer below is not.
+/// Put the 64-bit `gtk-query-immodules-3.0` where a `PATH` lookup will find it first.
+///
+/// `ln -sfn` rather than a copy: the tool is part of the host's GTK installation and must track
+/// it, and `-f` makes a second build over an existing link a no-op rather than an error.
+/// `mkdir -p` first, in one `sh -c`, because `ln` will not create the directory and a plan of
+/// two steps for one symlink reads like two things going on.
+fn link_gtk_immodules_shim(target: &Path, link: &Path) -> Step {
+    Step {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "mkdir -p {} && ln -sfn {} {}",
+                shell_quote(
+                    &link
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .display()
+                        .to_string()
+                ),
+                shell_quote(&target.display().to_string()),
+                shell_quote(&link.display().to_string()),
+            ),
+        ],
+        cwd: ".".into(),
+        env: Vec::new(),
+        optional: false,
+    }
+}
+
+/// Single-quote one argument for `sh -c`.
+///
+/// These paths are `/usr/bin/...` and a path under `target/` today, but this builds a shell
+/// command line and a quoting rule that is only correct for the paths it happens to see is the
+/// kind that stops being correct silently.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn fetch_appimage_runtime(triple: &str) -> Step {
     let arch = runtime_arch(triple);
     Step {
@@ -2208,6 +2320,69 @@ fn read_before_build(value: Option<&serde_json::Value>) -> Option<BeforeBuild> {
 
 #[cfg(test)]
 mod tests {
+    /// The 32-bit-GTK trap, which cost a whole packaging run and reported only `failed to run
+    /// linuxdeploy`. The shim must appear when — and only when — the host is in that state.
+    #[test]
+    fn a_gtk_shim_is_installed_only_when_the_unsuffixed_tool_is_the_wrong_class() {
+        use super::{gtk_immodules_shim, is_elf64};
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("cide-gtk-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let write = |name: &str, class: u8| {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).expect("create");
+            // Just the identification bytes: `is_elf64` reads byte 4 and nothing else.
+            f.write_all(&[0x7f, b'E', b'L', b'F', class, 0, 0, 0])
+                .expect("write");
+            path
+        };
+
+        // Nothing there at all: the plugin's own fallback list reaches `-64` unaided.
+        assert!(
+            gtk_immodules_shim(&dir).is_none(),
+            "an absent tool needs no shim"
+        );
+
+        // The healthy host: unsuffixed is already 64-bit.
+        write("gtk-query-immodules-3.0", 2);
+        write("gtk-query-immodules-3.0-64", 2);
+        assert!(
+            gtk_immodules_shim(&dir).is_none(),
+            "a 64-bit tool must not put a directory on the front of PATH for nothing"
+        );
+
+        // The openSUSE multilib host this was found on.
+        let wrong = write("gtk-query-immodules-3.0", 1);
+        assert!(!is_elf64(&wrong), "the fixture is the 32-bit case");
+        let (target, link) = gtk_immodules_shim(&dir).expect("this host needs the shim");
+        assert_eq!(target, dir.join("gtk-query-immodules-3.0-64"));
+        assert_eq!(
+            link.file_name().and_then(|n| n.to_str()),
+            Some("gtk-query-immodules-3.0"),
+            "the link has to carry the name `command -v` looks up, or it is never found"
+        );
+
+        // And a host with no 64-bit tool to point at gets no dangling symlink.
+        std::fs::remove_file(dir.join("gtk-query-immodules-3.0-64")).expect("remove");
+        assert!(
+            gtk_immodules_shim(&dir).is_none(),
+            "a shim pointing at nothing would fail later and more confusingly"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path with a quote in it must not end the shell string it is embedded in.
+    #[test]
+    fn shell_quoting_survives_a_quote() {
+        use super::shell_quote;
+        assert_eq!(shell_quote("/usr/bin/x"), "'/usr/bin/x'");
+        assert_eq!(shell_quote("a'b"), r#"'a'\''b'"#);
+    }
+
     use super::*;
 
     fn info() -> AppInfo {
@@ -2468,12 +2643,30 @@ mod tests {
             steps[fetch]
         );
         let handed = &steps[bundle].env;
-        assert_eq!(handed.len(), 1);
-        assert_eq!(handed[0].0, LDAI_RUNTIME_FILE);
+        // By key, not by position, and the set is checked rather than the length. A second
+        // variable appears here on a host that needs the `gtk-query-immodules-3.0` shim, and
+        // whether this machine is one of those is not something the test can decide — so the
+        // assertion has to tolerate that entry by name while still failing on any other.
+        let runtime = handed
+            .iter()
+            .find(|(k, _)| k == LDAI_RUNTIME_FILE)
+            .unwrap_or_else(|| panic!("the runtime must reach the bundler: {handed:?}"));
         assert!(
-            handed[0].1.starts_with('/'),
+            runtime.1.starts_with('/'),
             "appimagetool runs with its own cwd, so this has to be absolute: {handed:?}"
         );
+        for (key, value) in handed {
+            assert!(
+                key == LDAI_RUNTIME_FILE || key == "PATH",
+                "unexpected variable handed to the bundler: {key}={value}"
+            );
+        }
+        if let Some((_, path)) = handed.iter().find(|(k, _)| k == "PATH") {
+            assert!(
+                path.starts_with('/') && path.contains(GTK_SHIM_DIR),
+                "the only PATH cide sets here is the shim, prepended and absolute: {path}"
+            );
+        }
     }
 
     #[test]

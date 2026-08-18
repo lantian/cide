@@ -582,6 +582,25 @@ where `current_exe().parent()` looks — and the overlay must never carry that k
 `tauri-build` reads the *host's* platform overlay on every `cargo build` and it would break the
 workspace build on macOS and nowhere else. A test asserts it does not.
 
+**A multilib host can break the AppImage with a message that names nothing.** On a distribution
+that ships 32-bit GTK beside 64-bit — openSUSE's `gtk3-tools-32bit` is the case this was found on
+— the *32-bit* package owns the unsuffixed `/usr/bin/gtk-query-immodules-3.0` and the 64-bit tool
+is renamed `…-3.0-64`. `linuxdeploy-plugin-gtk`'s `search_tool` tries `command -v` **first** and
+returns on the first hit, so it takes the 32-bit binary and never reaches the `/usr/bin/$tool-64`
+entry already in its own fallback list. That binary then reads the AppDir's 64-bit immodules,
+fails every load with `wrong ELF class: ELFCLASS64`, and exits 1; the plugin is `set -e`, so
+linuxdeploy reports `Failed to run plugin: gtk`, and tauri-bundler discards linuxdeploy's stderr
+at its default log level. What reaches the user is `failed to bundle project: failed to run
+linuxdeploy` — four layers above the fact, naming none of it.
+
+None of that is fixable in cide's source, because the decision is made inside a downloaded shell
+script. What is available is `PATH`, which that `command -v` honours, so `xtask package` puts one
+symlink named `gtk-query-immodules-3.0` in `target/appimage-gtk-shim`, points it at the 64-bit
+tool, and prepends that directory for the bundler step only. `gtk_immodules_shim` installs it
+**only** when the unsuffixed tool exists and is genuinely the wrong ELF class: putting a directory
+on the front of `PATH` for every build would be a durable hazard bought for nothing. The plan
+prints the step like any other, so a host in this state says so before it builds.
+
 **The first Mac packaging run got as far as the frontend and stopped there**, and the fault was
 the preflight's rather than the Mac's: `./build.sh` preflighted fourteen things, built
 `cide-hook` in release, and only then handed over to `cargo tauri build`, whose *first* action is
