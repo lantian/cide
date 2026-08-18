@@ -412,7 +412,7 @@ function Files({ settings, patch }: SectionProps) {
       />
       <ToggleRow
         label="Show ignored files"
-        hint="Everything .gitignore covers — target/, node_modules/, dist/ — drawn in a muted olive, the way IDEA draws them. Off by default because it is expensive: on a Rust project it is hundreds of thousands of extra rows to walk, hold and offer to Ctrl+P. One ignore decision serves every surface, so this widens Find in Files and the symbol index with the tree — a find-in-files over a built project will read your object files. They are shown but not watched, so changes inside an ignored directory appear when the project is indexed again rather than as they happen."
+        hint="Everything .gitignore covers — target/, node_modules/, dist/ — drawn in a muted olive, the way IDEA draws them. On by default, the way IDEA shows them. It is the expensive setting: on a Rust project it is hundreds of thousands of extra rows to walk, hold and offer to Ctrl+P, so turn it off if indexing a large project feels slow. One ignore decision serves every surface, so this widens Find in Files and the symbol index with the tree — a find-in-files over a built project will read your object files. They are shown but not watched, so changes inside an ignored directory appear when the project is indexed again rather than as they happen."
         checked={explorer.showIgnoredFiles}
         onChange={(v) => set({ showIgnoredFiles: v })}
       />

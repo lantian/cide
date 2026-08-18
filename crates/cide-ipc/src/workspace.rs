@@ -79,7 +79,27 @@ impl Workspace {
     ///
     /// This is the same argument 1 → 2 makes about the proxy scope, applied to a setting whose
     /// blast radius is the contents of files rather than an environment variable.
-    pub const CURRENT_SCHEMA: u32 = 3;
+    /// # 3 → 4: ignored files become visible by default
+    ///
+    /// The odd one out, and worth reading before adding a fifth: this is the only rung that
+    /// **overwrites a value already on disk**. Every other one uses `or_insert_with`, and
+    /// [`crate::settings::ExplorerSettings`] carries `#[serde(default)]`, so a document that
+    /// predates the field would take the new default with no migration at all.
+    ///
+    /// The problem is the documents that do *not* predate it. `show_ignored_files` shipped as
+    /// `false` and every workspace written by that build has the word `false` in it — not
+    /// because anyone chose it, but because a constant in that build said so. Leaving those
+    /// alone would mean the people who already have the feature are exactly the people it stays
+    /// switched off for, including the person who asked for it.
+    ///
+    /// Overwriting a user's answer is the thing this ladder exists to prevent, so the exception
+    /// is bounded rather than general: it rewrites `false` and only `false`, on a field that
+    /// existed for a matter of hours before this correction, in a build that never presented it
+    /// with any other default. A `true` is left alone because it agrees, and a user who wants
+    /// the cheap walk back now turns it off against a default that is finally the one the
+    /// feature was asked for — a statement on their disk, which is what rungs 1 → 2 and 2 → 3
+    /// are both about.
+    pub const CURRENT_SCHEMA: u32 = 4;
 }
 
 impl Default for Workspace {

@@ -2538,12 +2538,23 @@ The walk was `hidden(true).git_ignore(true).ignore(true)`, so a dot-prefixed ent
 `.gitignore` covered were simply absent — including `.claude`, which is a directory a user of this
 particular IDE has every reason to want to open.
 
-Both are now settings, and they are settings rather than an unconditional change because the cost
-is not symmetric with the benefit. Showing dotfiles adds tens of entries; showing ignored files
-adds `target/` and `node_modules/`, which on a real repository is a very large number of rows to
-walk, hold, offer to Ctrl+P and *watch* — one `Filter` serves the tree, the picker, content search
-and symbol indexing alike, so the cost lands on all of them at once. `.git` itself stays hidden
-either way. Ignored rows are drawn in a muted tone from the token palette rather than a literal
+Both are now settings, **and both default to on.** The cost of showing ignored files is real and
+asymmetric — dotfiles add tens of entries, while `target/` and `node_modules/` add a very large
+number of rows to walk, hold, offer to Ctrl+P and *watch*, and one `Filter` serves the tree, the
+picker, content search and symbol indexing alike, so it lands on all four at once. That cost is
+why the setting shipped `false`, and shipping it `false` was the wrong call: the feature exists to
+answer "cide doesn't show gitignored files - but should", IDEA shows them with nothing configured,
+and a feature that stays off until the person who asked finds a switch has not been delivered. The
+expensive behaviour is the one that was asked for; the cheap one is a toggle away. `.git` itself
+stays hidden either way.
+
+Correcting it needed a schema rung, which is the interesting part. `ExplorerSettings` carries
+`#[serde(default)]`, so documents written *before* the field take the new default for free — but
+those are exactly the users who do not have the feature yet. Every workspace written by the build
+that shipped it contains `"showIgnoredFiles": false`, put there by a constant rather than by a
+person. So `persist::v3_to_v4` overwrites `false`, and only `false`: a `true` already agrees, an
+absent key is serde's to answer. It is the only rung in the ladder that overwrites anything, and
+the exception is bounded to a value that can be shown never to have been a choice. Ignored rows are drawn in a muted tone from the token palette rather than a literal
 colour copied from IDEA, so they read as present-but-excluded in both themes.
 
 Two things worth knowing, neither of them hidden in the code: the walk and the *watcher* share the

@@ -133,10 +133,23 @@ pub struct ExplorerSettings {
 }
 
 impl Default for ExplorerSettings {
+    /// Both on.
+    ///
+    /// `show_ignored_files` shipped `false`, on a cost argument that is entirely true — one
+    /// ignore verdict serves the tree, the picker, Find in Files and the symbol index alike, so
+    /// turning it on widens all four at once, and on a built Rust project that is a very large
+    /// number of extra rows. It was still the wrong default, because the feature exists to
+    /// answer "cide doesn't show gitignored files - but should with special highlight like in
+    /// idea", and IDEA shows them in its project view with nothing to configure. A feature that
+    /// is off until the person who asked for it finds a switch has not been delivered.
+    ///
+    /// The cost is now a thing a user turns *off* having seen it, which is the direction that
+    /// keeps the default honest: the expensive behaviour is the one that was asked for, and the
+    /// cheap one is available to anyone who finds it too slow.
     fn default() -> Self {
         Self {
             show_hidden_files: true,
-            show_ignored_files: false,
+            show_ignored_files: true,
         }
     }
 }
@@ -1119,15 +1132,20 @@ mod tests {
 
     /// The two defaults, pinned, because they are the whole shape of the feature.
     ///
-    /// A fresh workspace shows `.claude` and does not show `target/`. Both halves are a
-    /// decision rather than an accident — see [`ExplorerSettings`] — and both are invisible in
-    /// any other test: a wrong default here is not a failure anywhere, it is a file tree that
-    /// is quietly missing a directory, or a project that takes thirty seconds to open.
+    /// A fresh workspace shows `.claude` **and** `target/`. Both halves are a decision rather
+    /// than an accident — see [`ExplorerSettings`] — and both are invisible in any other test:
+    /// a wrong default here is not a failure anywhere, it is a file tree quietly missing a
+    /// directory the user asked to see.
+    ///
+    /// `show_ignored_files` shipped `false` and was corrected to `true` one report later. It is
+    /// pinned here, and `persist::v3_to_v4` carries the correction onto disks that already hold
+    /// the old value, so the two must move together: changing this constant without a rung
+    /// leaves every existing user on whatever their file happens to say.
     #[test]
-    fn a_fresh_workspace_shows_dotfiles_and_not_ignored_files() {
+    fn a_fresh_workspace_shows_dotfiles_and_ignored_files() {
         let settings = Settings::default();
         assert!(settings.explorer.show_hidden_files);
-        assert!(!settings.explorer.show_ignored_files);
+        assert!(settings.explorer.show_ignored_files);
         assert_eq!(settings.explorer, ExplorerSettings::default());
     }
 

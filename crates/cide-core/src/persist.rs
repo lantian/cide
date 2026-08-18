@@ -194,6 +194,7 @@ pub fn migrate(value: Value) -> Result<Workspace> {
         CURRENT => Ok(serde_json::from_value(value)?),
         1 => migrate(v1_to_v2(value)),
         2 => migrate(v2_to_v3(value)),
+        3 => migrate(v3_to_v4(value)),
         v if v > CURRENT => Err(CoreError::Serde(format!(
             "workspace schema {v} is newer than this build's {CURRENT}; refusing to downgrade it"
         ))),
@@ -306,6 +307,54 @@ fn v2_to_v3(mut value: Value) -> Value {
                     .entry("autosave")
                     .or_insert_with(|| Value::from(default_on));
             }
+        }
+    }
+    value
+}
+
+/// Schema 3 → 4: make gitignored files visible in workspaces that already said otherwise.
+///
+/// # The one rung that overwrites
+///
+/// [`v1_to_v2`] and [`v2_to_v3`] both use `or_insert_with` and both explain at length that
+/// overwriting a value a user typed is what this ladder exists to avoid. This one overwrites,
+/// and the justification is narrow enough to state exactly.
+///
+/// `ExplorerSettings::show_ignored_files` shipped as `false`. Every workspace written by that
+/// build therefore contains `"showIgnoredFiles": false` — a constant from that build, not an
+/// answer from a person, because the feature and its default arrived together and no build ever
+/// offered a different one. `#[serde(default)]` would give the new default only to documents
+/// written *before* the field existed, which is precisely the set of users who do not have the
+/// feature yet. The users who do have it would be the ones it stays off for.
+///
+/// So: rewrite `false`, leave everything else alone. A `true` already agrees. A missing key is
+/// left missing and takes the new default through serde. A non-boolean is left for `from_value`
+/// to reject with serde's own message, which is the refusal both older rungs make and for the
+/// same reason — "your settings block is corrupt" and "your explorer settings silently became
+/// the default" are different answers and only one is honest.
+///
+/// This does not license a fifth rung that rewrites answers. It licenses rewriting a value that
+/// can be shown never to have been an answer.
+fn v3_to_v4(mut value: Value) -> Value {
+    if let Some(root) = value.as_object_mut() {
+        root.insert("schemaVersion".into(), Value::from(4u32));
+
+        let Some(settings) = root.get_mut("settings").and_then(Value::as_object_mut) else {
+            // No settings block, or one that is not an object. Nothing to correct here, and
+            // `from_value` is the right place for the complaint if it is malformed.
+            return value;
+        };
+        let Some(explorer) = settings.get_mut("explorer").and_then(Value::as_object_mut) else {
+            // Predates the field: serde's default now supplies `true`, which is the point.
+            return value;
+        };
+
+        // Serialized from the type rather than written as a literal, for the reason `v1_to_v2`
+        // gives about its own: the default is the type's to state, and a literal here is a
+        // second copy that the first edit to `ExplorerSettings::default()` silently invalidates.
+        let default_on = cide_ipc::ExplorerSettings::default().show_ignored_files;
+        if explorer.get("showIgnoredFiles") == Some(&Value::Bool(false)) {
+            explorer.insert("showIgnoredFiles".into(), Value::from(default_on));
         }
     }
     value
@@ -1232,10 +1281,10 @@ mod tests {
 
         let ws = load(&path);
 
-        assert_eq!(Workspace::CURRENT_SCHEMA, 3);
+        assert_eq!(Workspace::CURRENT_SCHEMA, 4);
         assert_eq!(
-            ws.schema_version, 3,
-            "the ladder ran every rung — 1 → 2 → 3 — and stopped at current"
+            ws.schema_version, 4,
+            "the ladder ran every rung — 1 → 2 → 3 → 4 — and stopped at current"
         );
         assert_eq!(
             dir.entries(),
@@ -2008,6 +2057,69 @@ mod tests {
             migrated["settings"]["editor"]["fontSize"],
             serde_json::json!(13.0)
         );
+    }
+
+    /// The 3 → 4 rung rewrites the `false` a build wrote, and nothing else.
+    ///
+    /// The three cases together are the whole justification for the only rung that overwrites:
+    /// a `false` cannot be an answer (no build ever offered another default), a `true` is left
+    /// alone because it already agrees, and an absent key is left absent so serde's default
+    /// supplies it. If a later change makes `false` reachable as a real choice, this rung is
+    /// what has to be revisited.
+    #[test]
+    fn the_3_to_4_rung_rewrites_only_the_false_that_no_one_chose() {
+        let doc = |explorer: serde_json::Value| {
+            serde_json::json!({
+                "schemaVersion": 3,
+                "rev": 4,
+                "settings": { "explorer": explorer, "editor": { "fontSize": 13.0 } },
+                "projects": {},
+                "windows": {},
+            })
+        };
+
+        let off = v3_to_v4(doc(
+            serde_json::json!({ "showHiddenFiles": true, "showIgnoredFiles": false }),
+        ));
+        assert_eq!(off["schemaVersion"], serde_json::json!(4));
+        assert_eq!(
+            off["settings"]["explorer"]["showIgnoredFiles"],
+            serde_json::json!(true),
+            "the value a build wrote is corrected"
+        );
+        assert_eq!(
+            off["settings"]["explorer"]["showHiddenFiles"],
+            serde_json::json!(true),
+            "its neighbour is untouched"
+        );
+        assert_eq!(
+            off["settings"]["editor"]["fontSize"],
+            serde_json::json!(13.0),
+            "and so is the rest of the document"
+        );
+
+        // Someone who turned it on keeps it on — the rung must be idempotent, since `load`
+        // re-enters `migrate` and a second pass must find nothing to do.
+        let on = v3_to_v4(doc(serde_json::json!({ "showIgnoredFiles": true })));
+        assert_eq!(
+            on["settings"]["explorer"]["showIgnoredFiles"],
+            serde_json::json!(true)
+        );
+
+        // Absent: left absent. `#[serde(default)]` is what answers, and it now says `true`.
+        let missing = v3_to_v4(doc(serde_json::json!({ "showHiddenFiles": false })));
+        assert!(
+            missing["settings"]["explorer"]
+                .get("showIgnoredFiles")
+                .is_none(),
+            "an absent key is serde's to answer, not this rung's"
+        );
+
+        // A document with no explorer block, and one with no settings block, both survive.
+        let bare = v3_to_v4(serde_json::json!({
+            "schemaVersion": 3, "rev": 0, "projects": {}, "windows": {},
+        }));
+        assert_eq!(bare["schemaVersion"], serde_json::json!(4));
     }
 
     /// A schema-2 document with no `settings` block at all — the majority, since every field of
