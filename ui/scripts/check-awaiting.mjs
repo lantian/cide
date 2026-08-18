@@ -456,6 +456,49 @@ try {
       3,
       'and so do both halves of `.labelPinned`\'s reach-over — three readers, one number',
     )
+
+    /*
+     * The box is big enough for the glyphs it has to hold.
+     *
+     * This is the assertion the reported bug needed and did not have. The chip was 13px square
+     * with a 9.5px digit; the ink filled it corner to corner and it was reported as "missing
+     * padding" — which it was, except that a fixed reserve has no padding property to add, so
+     * the number to change is the reserve itself. Every other assertion here passed throughout,
+     * because they check that the three declarations *agree*, not that the number is usable.
+     *
+     * `9+` is the widest label `awaitingBadge` can produce (asserted just below), and the mono
+     * family advances 0.6em per character. So the smallest box that fits the label is
+     * `2 * 0.6 * fontSize`, and anything at or under that is the corner-to-corner state again.
+     * The 3px floor is what makes it read as a badge rather than as a filled rectangle: it is
+     * the gap the reporter could see was missing.
+     */
+    const px = (name, pattern) => {
+      const hit = pattern.exec(css)
+      if (hit === null) throw new Error(`check:awaiting could not read ${name} from the stylesheet`)
+      return Number(hit[1])
+    }
+    const reserve = px('--awaiting-w', /--awaiting-w:\s*([\d.]+)px/)
+    const fontSize = px('.awaiting font-size', /\.awaiting\b[^}]*?font-size:\s*([\d.]+)px/s)
+    const height = px('.awaiting height', /\.awaiting\b[^}]*?height:\s*([\d.]+)px/s)
+    const label = 2 * 0.6 * fontSize
+
+    eq(
+      reserve - label >= 3,
+      true,
+      `the chip must leave room around its widest label: ${reserve}px box, ` +
+        `${label.toFixed(1)}px of glyph at ${fontSize}px mono — under 3px of total slack is ` +
+        'the corner-to-corner state that was reported as missing padding',
+    )
+    eq(
+      height - fontSize >= 3,
+      true,
+      `and vertically too: ${height}px box against a ${fontSize}px glyph`,
+    )
+    eq(
+      /\.awaiting\b[^}]*?line-height:\s*([\d.]+)px/s.exec(css)?.[1],
+      String(height),
+      'line-height matches the height, or the digit is not centred in the box it was given',
+    )
   }
 
   eq(

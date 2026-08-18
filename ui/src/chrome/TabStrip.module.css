@@ -216,8 +216,11 @@
    * does not shift when the marker appears — which is the one thing this marker may not do.
    * The height is not shared and is set beside it; they are a visual pair, not a layout one.
    *
-   * Still comfortably inside the 30px strip, and still narrower than two mono digits at 10px
-   * (~12px), so `9+` fits without the clip below ever engaging.
+   * Still comfortably inside the 30px strip, and **wider** than the two mono digits `9+` needs
+   * — JetBrains Mono advances 0.6em, so 12px at this size against a 16px box — which is what
+   * stops the clip below ever engaging. `check:awaiting` computes that from these declarations
+   * rather than trusting this sentence, because the sentence was written backwards once and
+   * still read as an argument.
    */
   height: 15px;
   /* Clip rather than `min-width`. If a fallback font ever makes `9+` wider than the box, a
