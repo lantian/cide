@@ -50,12 +50,34 @@ export function goToDefinition(
   path: string,
   line: number,
   column: number,
+  onInterfaceMethod?: () => void,
 ): void {
   void diagnosticsApi
     .definition(project, path, line, column)
     .then((answer) => {
       switch (answer.kind) {
         case 'found':
+          /*
+           * The one case where the protocol's correct answer is not the useful one. (M18)
+           *
+           * gopls resolves a call through an interface to the interface's method, because that
+           * is where the callee is declared — and the report was that this is not what "go to
+           * definition" is for in Go. `interfaceMethod` is decided in Rust by parsing the file
+           * this answer points *at*: only a method inside `interface { … }` sets it, so an
+           * interface type name and every Rust position are untouched. `cide_lang`'s
+           * `interface_method_at` carries the argument for why the target and not the caret.
+           *
+           * The redirect is **injected by the caller** rather than called from here, for two
+           * reasons that both bite. `goToImplementation` lives in `codeIntel.ts`, which imports
+           * this module, so reaching for it here is a cycle. And its own empty-answer fallback
+           * is this function — so an interface nobody implements would bounce between the two
+           * for ever. A caller that passes nothing gets the plain declaration, which is exactly
+           * what that fallback needs.
+           */
+          if (answer.interfaceMethod && onInterfaceMethod !== undefined) {
+            onInterfaceMethod()
+            return
+          }
           /*
            * `jumpTo` **before** `file.open`, which is the design and not a preference.
            *

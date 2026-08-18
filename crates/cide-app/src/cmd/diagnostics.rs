@@ -165,12 +165,80 @@ pub async fn diagnostics_definition(
         });
     };
     Ok(tauri::async_runtime::spawn_blocking(move || {
-        diagnostics.definition(&path, line, column, DEFINITION_TIMEOUT)
+        let answer = diagnostics.definition(&path, line, column, DEFINITION_TIMEOUT);
+        mark_interface_method(answer)
     })
     .await
     .unwrap_or(cide_ipc::DefinitionAnswer::Unavailable {
         reason: "The lookup did not finish.".to_string(),
     }))
+}
+
+/// Fill in [`cide_ipc::DefinitionAnswer::Found::interface_method`] by parsing the file the answer
+/// points at.
+///
+/// # Why the target file and not the caret's
+///
+/// The question is "did this land on an interface method", and only the target can answer it. A
+/// call site says nothing: `x.Read(p)` looks identical whether `x` is an interface or a concrete
+/// type, which is precisely why the protocol has two requests instead of one.
+///
+/// # Why here
+///
+/// `lsp.rs` is a language-server client and has no business parsing Go; `cide_lang` parses Go and
+/// has no business knowing what a definition is. This is the seam that already holds both, and it
+/// is on the blocking pool, where reading and parsing one file is allowed to cost what it costs.
+///
+/// Best-effort in every direction. A file that cannot be read — a definition inside `$GOMODCACHE`
+/// on a mount that went away, a target the server named but the disk does not have — leaves the
+/// flag `false`, and Go to definition does what it did before. The cost is one read and one parse
+/// of a file the user is about to open anyway, and only when a definition was actually found.
+fn mark_interface_method(answer: cide_ipc::DefinitionAnswer) -> cide_ipc::DefinitionAnswer {
+    let cide_ipc::DefinitionAnswer::Found {
+        path,
+        line,
+        column,
+        interface_method: _,
+    } = answer
+    else {
+        return answer;
+    };
+
+    let interface_method = interface_method_at(&path, line);
+    cide_ipc::DefinitionAnswer::Found {
+        path,
+        line,
+        column,
+        interface_method,
+    }
+}
+
+/// Does the declaration at `path:line` belong to an interface?
+///
+/// The extension gate is a cost decision and not a correctness one:
+/// `cide_lang::interface_method_at` already answers `false` for Rust by construction, and its own
+/// docs explain why. But this is reached from the **probe**, which the Ctrl-hover underline calls
+/// as the pointer moves, and making every hover in a Rust file read and parse the file it points
+/// at to be told "no interfaces here" is a cost with a known answer. A Go file pays one read and
+/// one tree-sitter parse per distinct target, behind `resolveWord`'s cache.
+fn interface_method_at(path: &str, line: u32) -> bool {
+    if std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        != Some("go")
+    {
+        return false;
+    }
+    std::fs::read_to_string(path).is_ok_and(|text| {
+        cide_lang::interface_method_at(
+            &cide_lang::outline(
+                std::path::Path::new(path),
+                &text,
+                cide_lang::Limits::default(),
+            ),
+            line,
+        )
+    })
 }
 
 /// The shortest a caller may ask this to wait, and the longest.
@@ -214,7 +282,27 @@ pub async fn diagnostics_probe(
         .unwrap_or(DEFINITION_TIMEOUT)
         .clamp(PROBE_TIMEOUT_FLOOR, DEFINITION_TIMEOUT);
     Ok(tauri::async_runtime::spawn_blocking(move || {
-        diagnostics.probe(&path, line, column, timeout)
+        // Enriched here and not in `lsp.rs` for the same reason the definition is, and it has to
+        // be enriched at all so that Ctrl+click and Ctrl+B do the same thing to the same word.
+        // A discriminator the click consults and the keystroke does not is how the two gestures
+        // drift apart.
+        match diagnostics.probe(&path, line, column, timeout) {
+            cide_ipc::ProbeAnswer::Definition {
+                path,
+                line,
+                column,
+                interface_method: _,
+            } => {
+                let interface_method = interface_method_at(&path, line);
+                cide_ipc::ProbeAnswer::Definition {
+                    path,
+                    line,
+                    column,
+                    interface_method,
+                }
+            }
+            other => other,
+        }
     })
     .await
     .unwrap_or(cide_ipc::ProbeAnswer::Unavailable {

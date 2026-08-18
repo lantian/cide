@@ -2532,6 +2532,32 @@ opens it at line 1. The lookup gives up after five seconds and says the server i
 which, for the first minute of a session on a large workspace, is the truthful answer.
 
 
+### And the one position where Go to definition asks the other question
+
+The above shipped as a second binding, and the report came back unchanged: *"goto for golang works
+not as i expected - it goes to interface declaration, but should go to implementation."* A feature
+on a chord the person who asked has not been told about is the same non-delivery as a feature
+behind a default they never saw.
+
+So Ctrl+B and Ctrl+click now redirect — from **one** position, decided by parsing the file the
+answer points at rather than by looking at the language. `cide_lang::interface_method_at` asks
+whether the definition landed on a method inside an `interface { … }` block. Only that answers
+yes, which is exactly the case the report is about and exactly the case where the declaration is
+useless. Everything else is untouched, and the two obvious regressions are both unreachable by
+construction:
+
+* a Rust struct or trait name lands on its own declaration, never inside an interface body, so
+  Ctrl+B never turns into a jump to an `impl` block;
+* a Go interface **type** name — `io.Reader` — lands on the type spec, which is *outside* the
+  brace block holding the methods, so the declaration still wins.
+
+`navigate.implementation` keeps Ctrl+Alt+B, because "what implements the thing I am standing on"
+is a question worth asking from the positions the redirect deliberately never fires on. The two
+gestures share `interfaceMethod` on the wire so Ctrl+click and Ctrl+B cannot drift apart, and the
+redirect is *injected by the caller* rather than called from inside `goToDefinition`: that
+function is `goToImplementation`'s own empty-answer fallback, so wiring it the other way round
+would make an interface nobody implements bounce between the two for ever.
+
 ## Hidden and ignored files in the trees (M18)
 
 The walk was `hidden(true).git_ignore(true).ignore(true)`, so a dot-prefixed entry and anything a

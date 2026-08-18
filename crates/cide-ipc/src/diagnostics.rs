@@ -399,6 +399,15 @@ pub enum DefinitionAnswer {
         path: String,
         line: u32,
         column: u32,
+        /// The target is a method declared inside an interface, so asking
+        /// `textDocument/implementation` would name something concrete.
+        ///
+        /// Computed from the *target* file's outline rather than from the language or the
+        /// caret — `cide_lang::interface_method_at` carries the whole argument, including why
+        /// an interface *type name* deliberately answers `false`. The frontend uses it to
+        /// redirect Go to definition exactly once, in the one case where the protocol's correct
+        /// answer is not the useful one.
+        interface_method: bool,
     },
     /// The server answered, and its answer was "no declaration here".
     ///
@@ -446,6 +455,11 @@ pub enum ProbeAnswer {
         path: String,
         line: u32,
         column: u32,
+        /// Same flag, same meaning and same producer as
+        /// [`DefinitionAnswer::Found::interface_method`], so Ctrl+click and Ctrl+B agree about
+        /// what they are about to do. The hover reads this value too and ignores it: the
+        /// underline promises "this jumps somewhere", which stays true either way.
+        interface_method: bool,
     },
     /// The caret is on the **declaration itself**. The click shows usages.
     ///

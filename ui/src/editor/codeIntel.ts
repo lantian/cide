@@ -195,7 +195,12 @@ export function resolveWord(
         kind: answer.kind as ProbeKind,
         target:
           answer.kind === 'definition'
-            ? { path: answer.path, line: answer.line, column: answer.column }
+            ? {
+                path: answer.path,
+                line: answer.line,
+                column: answer.column,
+                interfaceMethod: answer.interfaceMethod,
+              }
             : undefined,
         reason: answer.kind === 'unavailable' ? answer.reason : undefined,
         askedMs: wantMs,
@@ -272,6 +277,22 @@ export function ctrlActivate(project: ProjectId, path: string, word: WordTarget)
          * "reference" about something the user considered a declaration — `fn fmt` in an
          * `impl Display` resolves to the trait's — and Back is what makes that recoverable.
          */
+        /*
+         * The Go interface case, kept identical to Ctrl+B's. (M18)
+         *
+         * `interfaceMethod` says the declaration this click would open is a method inside an
+         * `interface { … }`, which is the one position where the protocol's correct answer is
+         * not the one the user meant. `goToImplementation` handles 0 / 1 / many itself and falls
+         * back to the declaration when nothing implements it, so nothing is lost — this is a
+         * better first guess, not a different feature.
+         *
+         * Deliberately *after* the `target === undefined` guard and before the jump, so the Back
+         * stack records the same thing either way.
+         */
+        if (target.interfaceMethod) {
+          goToImplementation(project, path, word.line, word.column, word.text)
+          return
+        }
         jumpTo(project, { path: target.path, line: target.line, column: target.column })
         // Deliberately uncaught: `Failures` reports it. A `.catch(() => {})` here is precisely
         // what would turn a definition that resolved and then failed to open into silence.
@@ -358,11 +379,17 @@ export function findUsages(
  * because that is where the callee is declared. "Take me to the concrete one" is
  * `textDocument/implementation`, a different request that cide asked nowhere.
  *
- * Making Ctrl+B try implementation first and fall back would fix Go by breaking Rust —
+ * Making Ctrl+B try implementation first *unconditionally* would fix Go by breaking Rust —
  * rust-analyzer answers `implementation` on a struct name with its `impl` blocks and on a trait
  * with its implementors, so Ctrl+click on an ordinary type name would stop opening the
  * declaration. A separate id is what `navigate.usages` already established as this codebase's
  * answer to a gesture that has to guess.
+ *
+ * Ctrl+B and Ctrl+click *do* now redirect here, from exactly one position: a definition that
+ * landed on a method inside an interface. That is decided in Rust by parsing the target file
+ * (`cide_lang::interface_method_at`), not by looking at the language, which is what keeps every
+ * type name in both languages on the declaration. This command stays because it answers the
+ * question from positions the redirect deliberately never fires on.
  *
  * # The same 0 / 1 / ≥2 rule, with one difference
  *

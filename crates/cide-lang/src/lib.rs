@@ -137,3 +137,154 @@ mod tests {
         }
     }
 }
+
+/// Is the declaration at `line` a method belonging to an **interface** rather than to a concrete
+/// type?
+///
+/// The discriminator behind Go to definition's one language-specific behaviour, and the reason it
+/// can be language-specific without a `match` on the language: only Go's outline produces
+/// [`SymbolKind::Interface`] with method children, so a Rust file answers `false` by construction
+/// rather than by exemption.
+///
+/// # Why this question, and not "is the file Go"
+///
+/// The report was that Go to definition on a Go method call lands on the interface. gopls is
+/// right — `textDocument/definition` resolves to where the callee is *declared* — but it is not
+/// what the user wanted, and `textDocument/implementation` is the question that is. The obvious
+/// fix, "in Go, ask for implementations first", is wrong in both languages at once: in Rust it
+/// turns Ctrl+B on a struct name into a jump to an `impl` block, and in Go it turns Ctrl+B on an
+/// interface *type name* — `io.Reader` — into a jump to some implementor, when the declaration is
+/// exactly what a reader of that line wants.
+///
+/// Both of those are type names; the case the user is complaining about is a *method*. So the
+/// test is neither the language nor the caret, but where the answer landed: a definition that
+/// arrived inside an interface's method set is the one, and only, case where a concrete
+/// implementation is the better answer. A type name lands on the type spec — which is *outside*
+/// the brace block that holds the methods — and is left alone.
+///
+/// `line` is 1-based, matching [`cide_ipc::SymbolSpan`] and every position on this wire.
+pub fn interface_method_at(outline: &cide_ipc::FileOutline, line: u32) -> bool {
+    let cide_ipc::FileOutline::Ready { symbols, .. } = outline else {
+        return false;
+    };
+    symbols.iter().any(|symbol| holds_method_at(symbol, line))
+}
+
+/// Depth-first: does `symbol` — or anything inside it — hold a method at `line`?
+///
+/// Recursive rather than a scan of the flat index, because "whose child is this" is the entire
+/// question and the flat list is precisely where that is thrown away.
+fn holds_method_at(symbol: &cide_ipc::Symbol, line: u32) -> bool {
+    if !spans(&symbol.range, line) {
+        return false;
+    }
+    if symbol.kind == cide_ipc::SymbolKind::Interface
+        && symbol
+            .children
+            .iter()
+            .any(|child| spans(&child.selection, line))
+    {
+        return true;
+    }
+    symbol.children.iter().any(|c| holds_method_at(c, line))
+}
+
+fn spans(span: &cide_ipc::SymbolSpan, line: u32) -> bool {
+    span.start_line <= line && line <= span.end_line
+}
+
+#[cfg(test)]
+mod interface_method_tests {
+    use super::*;
+
+    /// Real Go, because the whole predicate is a claim about what tree-sitter-go produces and a
+    /// hand-built `Symbol` tree would only test the walk.
+    const GO: &str = r#"package p
+
+type Reader interface {
+	Read(p []byte) (int, error)
+	Close() error
+}
+
+type File struct{ name string }
+
+func (f *File) Read(p []byte) (int, error) { return 0, nil }
+
+func (f *File) Close() error { return nil }
+"#;
+
+    fn outline_of(src: &str) -> cide_ipc::FileOutline {
+        outline(std::path::Path::new("p.go"), src, Limits::default())
+    }
+
+    fn line_of(src: &str, needle: &str) -> u32 {
+        src.lines()
+            .position(|l| l.contains(needle))
+            .map(|i| i as u32 + 1)
+            .unwrap_or_else(|| panic!("no line containing {needle:?}"))
+    }
+
+    /// The case the report is about: the definition landed on a method inside `interface { … }`,
+    /// so a concrete implementation is the better answer and Go to definition asks for one.
+    #[test]
+    fn a_method_inside_an_interface_is_the_case_that_wants_an_implementation() {
+        let outline = outline_of(GO);
+        for method in ["Read(p []byte)", "Close() error\n"] {
+            let line = line_of(GO, method.trim_end_matches('\n'));
+            assert!(
+                interface_method_at(&outline, line),
+                "line {line} ({method:?}) is an interface method"
+            );
+        }
+    }
+
+    /// The case that must NOT trigger, and the reason this is not simply "is the file Go".
+    ///
+    /// `type Reader interface {` is where Ctrl+B on `io.Reader` lands. Redirecting it to an
+    /// implementor would take the declaration away from the gesture whose whole name is "go to
+    /// definition" — the Go-side twin of the Rust regression this predicate exists to avoid.
+    #[test]
+    fn an_interface_type_name_is_left_alone() {
+        let outline = outline_of(GO);
+        assert!(
+            !interface_method_at(&outline, line_of(GO, "type Reader interface")),
+            "the type spec is outside the brace block that holds the methods"
+        );
+    }
+
+    /// A concrete method with the same name as an interface one. Nothing to redirect to: the
+    /// definition already *is* the implementation.
+    #[test]
+    fn a_concrete_method_is_not_an_interface_method() {
+        let outline = outline_of(GO);
+        for concrete in [
+            "func (f *File) Read",
+            "func (f *File) Close",
+            "type File struct",
+        ] {
+            let line = line_of(GO, concrete);
+            assert!(
+                !interface_method_at(&outline, line),
+                "line {line} ({concrete:?}) is concrete"
+            );
+        }
+    }
+
+    /// Rust answers `false` by construction rather than by an exemption, which is what lets the
+    /// caller skip a language check entirely.
+    #[test]
+    fn rust_has_no_interface_methods_to_find() {
+        let src = "trait Reader { fn read(&self) -> usize; }\nstruct F;\nimpl Reader for F { fn read(&self) -> usize { 0 } }\n";
+        let outline = outline(std::path::Path::new("p.rs"), src, Limits::default());
+        for line in 1..=3 {
+            assert!(!interface_method_at(&outline, line), "line {line}");
+        }
+    }
+
+    /// A file with no parser, or one that failed to parse, is not an interface method.
+    #[test]
+    fn an_outline_that_is_not_ready_answers_no() {
+        let outline = outline(std::path::Path::new("p.toml"), "x = 1\n", Limits::default());
+        assert!(!interface_method_at(&outline, 1));
+    }
+}

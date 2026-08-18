@@ -1076,7 +1076,15 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (project === null) return unmet(command, 'no open project')
         // Fire-and-forget: every outcome — found, not found, still indexing — reports itself
         // through `Failures`. See `editor/goToDefinition.ts`.
-        goToDefinition(project.id, caret.path, caret.line, caret.column)
+        //
+        // The redirect is passed in rather than living inside `goToDefinition`, and it is spent
+        // only when the answer landed on a method inside an interface — the Go case where the
+        // declaration is not what anyone meant. `goToImplementation` falls back to the plain
+        // declaration when nothing implements it, which is both the right answer and what stops
+        // the two functions calling each other for ever.
+        goToDefinition(project.id, caret.path, caret.line, caret.column, () =>
+          goToImplementation(project.id, caret.path, caret.line, caret.column, focusedWord()),
+        )
         return
       }
 
@@ -1115,11 +1123,12 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * terminal pane has to be refused with a sentence rather than run against a caret that
          * does not exist.
          *
-         * Ctrl+B is untouched and still means "definition". The user's report was that goto in Go
-         * lands on the interface — which is `textDocument/definition` behaving correctly — so the
-         * fix is a second question, not a different answer to the first. Folding them together
-         * would regress Rust, where `implementation` on a struct name answers with its `impl`
-         * blocks; the id's own comment in `cide_core::commands` has the whole argument.
+         * Ctrl+B still means "definition" everywhere except one position: a definition that
+         * landed on a method inside an interface now redirects here, because that is the case
+         * the report was about and the declaration is not what anyone meant by it. The test is
+         * the *target*, parsed — never the language — so `implementation` is not folded into
+         * `definition` for a struct or a trait or an interface type name, which is where doing
+         * so would regress Rust. `cide_core::commands` has the whole argument.
          *
          * An empty answer falls back to Go to definition inside `goToImplementation`, so this
          * command always does something wherever a caret is.

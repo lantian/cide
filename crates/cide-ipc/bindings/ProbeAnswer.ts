@@ -23,4 +23,11 @@
  * up: "still indexing" and "there is nothing here" are different answers and a rejection carries
  * neither.
  */
-export type ProbeAnswer = { "kind": "definition", path: string, line: number, column: number, } | { "kind": "declaration" } | { "kind": "notFound" } | { "kind": "unavailable", reason: string, };
+export type ProbeAnswer = { "kind": "definition", path: string, line: number, column: number, 
+/**
+ * Same flag, same meaning and same producer as
+ * [`DefinitionAnswer::Found::interface_method`], so Ctrl+click and Ctrl+B agree about
+ * what they are about to do. The hover reads this value too and ignores it: the
+ * underline promises "this jumps somewhere", which stays true either way.
+ */
+interfaceMethod: boolean, } | { "kind": "declaration" } | { "kind": "notFound" } | { "kind": "unavailable", reason: string, };

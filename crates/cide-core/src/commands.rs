@@ -837,13 +837,18 @@ fn build() -> Vec<Command> {
          * method, because that is where the callee is declared. "Take me to the concrete one" is
          * `textDocument/implementation`, a different protocol request, and cide asked it nowhere.
          *
-         * Teaching Ctrl+B to try implementation first and fall back was the obvious fix and it
-         * **regresses Rust**: rust-analyzer answers `implementation` on a struct name with its
-         * `impl` blocks and on a trait with its implementors, so Ctrl+click on an ordinary type
-         * name would stop opening the declaration. Changing the most-used gesture in one language
-         * to fix a complaint in another is the trade this codebase already refused once — see
-         * `navigate.usages` directly above, which exists for exactly the same reason: a gesture
-         * that guesses needs a sibling that does not.
+         * Teaching Ctrl+B to try implementation first and fall back **regresses Rust**:
+         * rust-analyzer answers `implementation` on a struct name with its `impl` blocks and on a
+         * trait with its implementors, so Ctrl+click on an ordinary type name would stop opening
+         * the declaration. That is why this id exists at all.
+         *
+         * **Since the follow-up report, Ctrl+B does redirect — but only from one position.** Not
+         * "in Go": from a definition that landed on a method inside `interface { … }`, which
+         * `cide_lang::interface_method_at` decides by parsing the *target* file. A struct name, a
+         * trait name and an interface *type* name all land outside that brace block and are
+         * untouched, so neither regression above is reachable. This id keeps its own binding
+         * because the redirect answers only the case where the declaration was useless, and
+         * asking for implementors of a type you are standing on is a question a user still has.
          *
          * ≥2 answers is the *common* case (an interface with many implementors), so this reuses
          * the Find usages popup: 0 falls back to Go to definition so the command always does

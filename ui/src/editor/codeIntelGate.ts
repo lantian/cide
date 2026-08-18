@@ -261,6 +261,15 @@ export interface Target {
   readonly path: string
   readonly line: number
   readonly column: number
+  /**
+   * The declaration this names is a method inside an interface, so Ctrl+click asks for an
+   * implementation instead of opening it.
+   *
+   * Cached alongside the position rather than asked again at click time, which is the same
+   * guarantee the rest of this record exists for: the hover and the click read one answer, so
+   * the underline can never promise something the click will not do.
+   */
+  readonly interfaceMethod: boolean
 }
 
 /** One remembered answer. */

@@ -361,6 +361,12 @@ impl ProjectDiagnostics {
                     path: target.to_string_lossy().to_string(),
                     line,
                     column,
+                    // Not decided here. This layer holds a language-server client and knows
+                    // nothing about Go's grammar; the answer comes from parsing the *target*
+                    // file, which is `cmd::diagnostics`'s job because that is where the outline
+                    // is reachable. `false` is the honest default for a caller that does not
+                    // enrich it — Go to definition behaving exactly as it always has.
+                    interface_method: false,
                 },
                 // `null`, `[]`, or a `rust-analyzer://` URI with no file behind it. All three mean
                 // "nothing to open", and none of them is a malfunction worth alarming anyone with.
@@ -449,6 +455,10 @@ impl ProjectDiagnostics {
                             path: target.path.to_string_lossy().to_string(),
                             line: target.line,
                             column: target.column,
+                            // Filled in by `cmd::diagnostics`, for the reason the twin in
+                            // `DefinitionAnswer::Found` above states: parsing Go is not this
+                            // layer's job.
+                            interface_method: false,
                         }
                     }
                 }
