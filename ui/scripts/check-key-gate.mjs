@@ -251,6 +251,11 @@ try {
     // unconditional binding would take a key `mc` puts a menu on, in every terminal pane in every
     // window. `F7` is in the sweep below, so both entry points are held to agreeing about it.
     { key: 'alt+f7', command: 'navigate.usages', when: 'editorFocused' },
+    // M18. Go to implementation, on IDEA's chord. Scoped for the same reason ⌃B is, and it is not
+    // theoretical: Ctrl+Alt+B is `ESC ^B` to a terminal that maps Alt to an Escape prefix, which
+    // is readline's `backward-word`. `KeyB` is in the sweep below, so the two entry points are
+    // held to agreeing about it — including that a terminal-focused window passes it through.
+    { key: 'ctrl+alt+b', command: 'navigate.implementation', when: 'editorFocused' },
     // Go to line. Scoped for the same reason ⌃B is, and one sharper: `^G` is readline's abort,
     // so an unconditional binding would take the cancel key of every shell in every pane.
     // `KeyG` is in the sweep below, so both entry points are held to agreeing about it — and to
@@ -1283,7 +1288,17 @@ try {
    * comment on that binding names what it costs (find-next moves to F3, which is why F3 is here).
    */
   {
-    for (const key of ['ctrl+c', 'ctrl+v', 'ctrl+z', 'ctrl+y', 'ctrl+shift+z', 'ctrl+u', 'alt+u', 'f3', 'shift+f3']) {
+    /*
+     * `ctrl+f` joined this list in M19. It is the terminal's find bar, resolved in
+     * `src/terminal/keys.ts` from xterm's own handler for exactly the reason ⌃C and ⌃V are —
+     * and it is the one entry here that CodeMirror *also* wants (`Mod-f` opens the editor's
+     * find bar, and reaches it only because no default claims the key). A `when: "terminalFocused"`
+     * default would have been swallowed by the window capture entry in every rename field and
+     * every text input in a window whose focused pane is a terminal;
+     * `keymap::ctrl_f_is_not_bound_here_because_two_panes_mean_two_things_by_it` is the Rust end
+     * of the same claim, and the sweep below is the half that measures it.
+     */
+    for (const key of ['ctrl+c', 'ctrl+v', 'ctrl+f', 'ctrl+z', 'ctrl+y', 'ctrl+shift+z', 'ctrl+u', 'alt+u', 'f3', 'shift+f3']) {
       ok(
         !rustDefaults().some((b) => b.key === key),
         `${key} is bound by no default — the terminal or CodeMirror owns it, focus-scoped`,
@@ -1293,6 +1308,7 @@ try {
       for (const spec of [
         { code: 'KeyC', key: 'c', ctrl: true },
         { code: 'KeyV', key: 'v', ctrl: true },
+        { code: 'KeyF', key: 'f', ctrl: true },
         { code: 'KeyZ', key: 'z', ctrl: true },
         { code: 'KeyY', key: 'y', ctrl: true },
         { code: 'KeyZ', key: 'z', ctrl: true, shift: true },

@@ -7,7 +7,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use cide_fs::testing::scratch;
-use cide_fs::{BuildOptions, Filter, Index, Root, WalkItem, WatchConfig, WatchEvent, Watcher};
+use cide_fs::{
+    BuildOptions, Filter, Index, Root, Visibility, WalkItem, WatchConfig, WatchEvent, Watcher,
+};
 
 /// Long enough that a loaded machine does not split a burst, short enough that a failing
 /// test finishes.
@@ -35,6 +37,7 @@ fn start_with(
     let filter = std::sync::Arc::new(Filter::build(
         &[dir.to_path_buf()],
         dirs.iter().map(|p| p.as_path()),
+        Visibility::CONSERVATIVE,
     ));
     let mut config = WatchConfig {
         roots: vec![dir.to_path_buf()],
@@ -116,6 +119,74 @@ fn writes_under_an_ignored_directory_are_never_reported() {
     assert_eq!(change.paths, vec![dir.join("src/main.rs")]);
 }
 
+/// The same storm, with the tree *showing* `target/`. Still silent. (M18)
+///
+/// This is the property the whole *Show ignored files* design rests on, and it is the one that
+/// cannot be established by reading: the walk, the watch list and the event loop each have to
+/// treat "shown" and "watched" as different questions, and getting any one of them wrong turns a
+/// `cargo build` into a repaint every two seconds. So the tree is built with the setting on, the
+/// rows are asserted to be there, and then 200 object files are written into them.
+#[test]
+fn a_shown_target_directory_is_still_never_watched() {
+    let dir = scratch("watch-ignored-shown");
+    std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(dir.join("src/main.rs"), "").unwrap();
+
+    let shown = Visibility {
+        hidden: true,
+        ignored: true,
+    };
+    let index = Index::build(
+        vec![Root::new(dir.path())],
+        BuildOptions {
+            visibility: shown,
+            ..BuildOptions::default()
+        },
+        &|_: &[WalkItem]| {},
+    );
+    let filter = std::sync::Arc::new(Filter::build(
+        &[dir.to_path_buf()],
+        index.dir_paths().iter().map(|p| p.as_path()),
+        shown,
+    ));
+    let rows: Vec<String> = index.rows(0, 64).into_iter().map(|r| r.name).collect();
+    assert!(
+        rows.contains(&"target".to_string()),
+        "the setting is meant to be on for this test: {rows:?}"
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let config = WatchConfig {
+        roots: vec![dir.to_path_buf()],
+        // Exactly what `Indexing::run` hands the watcher.
+        dirs: index.watch_dirs(&filter),
+        debounce: Duration::from_millis(100),
+        quiet: QUIET,
+        max_wait: Duration::from_secs(30),
+        ..WatchConfig::default()
+    };
+    let watcher = Watcher::start(config, filter, move |event| {
+        let _ = tx.send(event);
+    });
+
+    for i in 0..200 {
+        std::fs::write(dir.join(format!("target/debug/o{i}.o")), "x").unwrap();
+    }
+    assert!(
+        next_change(&rx, QUIET * 4).is_none(),
+        "a build storm under a *shown* target/ reached the UI — the rows are the walk's \
+         snapshot on purpose, and watching them costs a descriptor per directory plus one \
+         event per object file"
+    );
+
+    std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+    let change = next_change(&rx, Duration::from_secs(10)).expect("a real edit should arrive");
+    assert_eq!(change.paths, vec![dir.join("src/main.rs")]);
+    drop(watcher);
+}
+
 #[test]
 fn a_git_head_change_is_flagged_as_git() {
     let dir = scratch("watch-git");
@@ -181,6 +252,7 @@ fn a_new_file_reaches_the_index_and_a_deleted_one_leaves_it() {
     let filter = Filter::build(
         &[dir.to_path_buf()],
         index.dir_paths().iter().map(|p| p.as_path()),
+        Visibility::CONSERVATIVE,
     );
     index.expand(&dir.join("src")).unwrap();
     assert_eq!(index.count(), 2);
@@ -240,7 +312,11 @@ fn a_git_index_write_is_reported_but_moves_no_row() {
         &|_: &[WalkItem]| {},
     );
     let dirs = index.dir_paths();
-    let filter = Filter::build(&[dir.to_path_buf()], dirs.iter().map(|p| p.as_path()));
+    let filter = Filter::build(
+        &[dir.to_path_buf()],
+        dirs.iter().map(|p| p.as_path()),
+        Visibility::CONSERVATIVE,
+    );
     index.expand(&dir.join("src")).unwrap();
     let before = index.rows(0, 100);
     assert_eq!(before.len(), 2, "src/ and src/a.rs; .git is not a row");

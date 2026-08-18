@@ -407,6 +407,8 @@ pub fn run() {
             cmd::diagnostics::diagnostics_probe,
             cmd::diagnostics::diagnostics_usages,
             cmd::diagnostics::diagnostics_usages_cancel,
+            cmd::diagnostics::diagnostics_implementations,
+            cmd::diagnostics::diagnostics_refresh,
             cmd::diagnostics::diagnostics_restart,
         ])
         .on_window_event(|window, event| {

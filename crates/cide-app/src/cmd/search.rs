@@ -461,8 +461,12 @@ mod tests {
         // An entry in the registry is what "open" means here; the walk itself is beside the
         // point, so the claim is dropped un-run rather than walked.
         drop(
-            fs.claim(project, vec![dir.to_path_buf()])
-                .expect("a project nobody has indexed claims"),
+            fs.claim(
+                project,
+                vec![dir.to_path_buf()],
+                cide_fs::Visibility::CONSERVATIVE,
+            )
+            .expect("a project nobody has indexed claims"),
         );
 
         let searches = SearchRegistry::default();
@@ -573,6 +577,7 @@ mod tests {
         let filter = Arc::new(Filter::build(
             &[dir.to_path_buf()],
             dirs.iter().map(|p| p.as_path()),
+            cide_fs::Visibility::CONSERVATIVE,
         ));
         job.walk(
             roots,

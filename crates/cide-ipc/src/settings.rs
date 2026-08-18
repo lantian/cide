@@ -62,6 +62,7 @@ pub struct Settings {
     pub claude: ClaudeSettings,
     pub proxy: ProxySettings,
     pub sidebar: SidebarSettings,
+    pub explorer: ExplorerSettings,
     pub inspections: InspectionSettings,
 }
 
@@ -80,7 +81,62 @@ impl Default for Settings {
             claude: ClaudeSettings::default(),
             proxy: ProxySettings::default(),
             sidebar: SidebarSettings::default(),
+            explorer: ExplorerSettings::default(),
             inspections: InspectionSettings::default(),
+        }
+    }
+}
+
+/// What the file tree walks, and therefore what it draws. (M18)
+///
+/// # Why these are settings and not simply "show everything"
+///
+/// The reported bug was that cide shows neither dotfiles nor ignored files, and the two halves
+/// of it cost three orders of magnitude apart. That difference is the whole reason this is a
+/// pair of booleans with different defaults rather than one:
+///
+/// * Dotfiles are tens of entries in a repository — `.claude`, `.github`, `.gitignore` itself
+///   — and every one of them is a project file a user edits. Hiding them is the surprise, so
+///   [`Self::show_hidden_files`] defaults **on**.
+/// * Ignored files are `target/`, `node_modules/`, `dist/`. On this repository that is roughly
+///   200,000 entries against 1,500 tracked ones, and each becomes an arena node in
+///   `cide_fs::Index`, a `Ctrl+P` candidate in the picker, and a row the scrollbar spans. A
+///   default that made opening a Rust project cost a full `target/` walk would be a default
+///   that made cide feel broken, so [`Self::show_ignored_files`] defaults **off**.
+///
+/// `.git` is not a third field. It is excluded structurally by `cide_fs::filter::Visibility`,
+/// which explains why at length; the short version is that it is a database of one loose object
+/// per version of every file ever committed, and nothing in a file tree can usefully act on one.
+///
+/// # Changing either one re-walks the project
+///
+/// There is no way to patch an existing index into the other answer — the entries were never
+/// walked — so `cmd::settings::settings_set` re-indexes every open project when one of these
+/// moves. That is a visible cost (a fresh walk, an empty picker for its duration) and it is why
+/// these live here, in stored settings, rather than being a per-panel toggle that could be
+/// flipped by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ExplorerSettings {
+    /// Draw dot-prefixed entries — `.claude`, `.github`, `.env`.
+    pub show_hidden_files: bool,
+    /// Draw entries the ignore rules cover, tinted the way IDEA tints them.
+    ///
+    /// The tint is not decoration: with this on, `target/` is in the tree, in the picker and in
+    /// the scrollbar's range, and a row that looked like any other would make the tree read as
+    /// though the project contained 200,000 source files. `ui/src/sidebar/treeStatus.ts` resolves
+    /// it, and it arrives on the same `git_tree_status` map the M/A/D letters do — an ignored
+    /// *directory* travels as one entry and its contents inherit it, which is what keeps this
+    /// affordable on the wire.
+    pub show_ignored_files: bool,
+}
+
+impl Default for ExplorerSettings {
+    fn default() -> Self {
+        Self {
+            show_hidden_files: true,
+            show_ignored_files: false,
         }
     }
 }
@@ -1060,6 +1116,37 @@ impl InspectionSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two defaults, pinned, because they are the whole shape of the feature.
+    ///
+    /// A fresh workspace shows `.claude` and does not show `target/`. Both halves are a
+    /// decision rather than an accident — see [`ExplorerSettings`] — and both are invisible in
+    /// any other test: a wrong default here is not a failure anywhere, it is a file tree that
+    /// is quietly missing a directory, or a project that takes thirty seconds to open.
+    #[test]
+    fn a_fresh_workspace_shows_dotfiles_and_not_ignored_files() {
+        let settings = Settings::default();
+        assert!(settings.explorer.show_hidden_files);
+        assert!(!settings.explorer.show_ignored_files);
+        assert_eq!(settings.explorer, ExplorerSettings::default());
+    }
+
+    /// A settings file written before these fields existed still loads, with the defaults.
+    ///
+    /// `#[serde(default)]` on the struct is what does it, and it is the difference between a
+    /// user's first launch after an update showing their workspace and showing an error.
+    #[test]
+    fn settings_written_before_the_explorer_group_existed_still_deserialize() {
+        let settings: Settings = serde_json::from_str("{}").expect("an empty object is a default");
+        assert_eq!(settings.explorer, ExplorerSettings::default());
+        let partial: ExplorerSettings =
+            serde_json::from_str(r#"{"showIgnoredFiles":true}"#).expect("a partial group");
+        assert!(
+            partial.show_hidden_files,
+            "a field the file does not mention keeps its default rather than becoming false"
+        );
+        assert!(partial.show_ignored_files);
+    }
 
     /// The password must not survive `{:?}`, however the settings are printed.
     ///

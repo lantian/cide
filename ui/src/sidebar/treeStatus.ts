@@ -17,7 +17,12 @@
  * that has one. Which ancestor statuses a row inherits is the whole content of this file:
  *
  *   * `untracked` and `ignored` are *container* statuses. Everything under such a directory
- *     shares its fate — git has never heard of any of it either.
+ *     shares its fate — git has never heard of any of it either. `ignored` is the one that
+ *     earns its keep now that the tree can be told to *show* ignored files
+ *     (`ExplorerSettings.showIgnoredFiles`): `target/` arrives as a single entry and the
+ *     200,000 rows inside it take their olive tint from this inheritance and from nothing
+ *     else. Enumerating them on the wire is not an option, so this is where that colour
+ *     comes from.
  *   * `modified` is a *rollup* mark, put on every ancestor of every change so that a folder
  *     shows as dirty when something under it is (IDEA's behaviour, and requirement 3). It
  *     must never be inherited downwards, or one edited file would paint every one of its
@@ -99,9 +104,15 @@ export function statusAt(
  * "this file", rather than filling a deep tree with `M`s that only ever say "something under
  * here". The mock draws letters on file rows only.
  *
- * **`untracked` and `ignored` have no letter either.** The mock draws neither status, so the
- * quietest treatment that is still distinguishable (dim, and faint) is transcription; a `?`
- * the mock does not have would be a design decision made in a lookup table.
+ * **`untracked` and `ignored` have no letter either**, and for `ignored` that is now a load-
+ * bearing decision rather than a transcription of the mock. The tag column answers one
+ * question — *what will git do with this file when you commit* — and M, A and D are its three
+ * answers. The answer for an ignored file is "nothing", which is the absence of a letter, not a
+ * fourth one; inventing an `I` or a `?` would put a glyph on every row of a shown `target/` and
+ * make three meanings compete in a 9px column. So `ignored` is carried entirely by colour —
+ * `--ignored`, this palette's muted olive-brown, IDEA's treatment — and by the `aria-label` the
+ * tag span keeps whether or not it draws a glyph. The two signals cannot collide, either:
+ * `git_tree_status` classifies ignored first, so a path is never both ignored and modified.
  */
 export function letterFor(status: TreeStatus, isDir: boolean): string {
   if (isDir) return ''

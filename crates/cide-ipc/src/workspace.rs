@@ -540,6 +540,14 @@ pub enum SettingsSection {
     Keymap,
     ClaudeSessions,
     Editor,
+    /// What the file tree shows: dotfiles, ignored files. (M18)
+    ///
+    /// Its own section rather than a group under `Editor` ("the code buffer") or
+    /// `ProjectsAndWindows` (how projects are spread across OS windows), because it is neither:
+    /// it is the explorer's content, it changes what an index costs, and both toggles re-walk
+    /// every open project when they move. A setting with that consequence should be found under
+    /// a heading that names it rather than at the foot of a list about something else.
+    Files,
     /// Which analysers run, and which of their findings are shown. (M12)
     ///
     /// Its own section rather than a group inside `Editor`, which is described as "the code

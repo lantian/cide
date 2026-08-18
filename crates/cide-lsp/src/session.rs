@@ -30,6 +30,8 @@ use std::collections::BTreeSet;
 use cide_ipc::SourceStatus;
 use serde_json::{Value, json};
 
+use crate::discover::Server;
+
 /// What the session wants done as a result of a message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -83,11 +85,11 @@ impl Session {
     /// A session that has just sent `initialize`.
     ///
     /// Returns the request to write, so the caller never has to know the handshake's shape.
-    pub fn new(roots: &[std::path::PathBuf], server_name: &str) -> (Self, Vec<Effect>) {
+    pub fn new(roots: &[std::path::PathBuf], server: Server) -> (Self, Vec<Effect>) {
         let mut session = Self {
             phase: Phase::Initializing,
             progress: BTreeSet::new(),
-            detail: format!("starting {server_name}"),
+            detail: format!("starting {}", server.binary()),
             initialize_id: 1,
             next_id: 2,
             last_status: None,
@@ -97,7 +99,7 @@ impl Session {
             "jsonrpc": "2.0",
             "id": session.initialize_id,
             "method": "initialize",
-            "params": initialize_params(roots),
+            "params": initialize_params(roots, server),
         });
         let effects = vec![
             Effect::Send(request),
@@ -165,8 +167,25 @@ impl Session {
                 self.push_status(&mut effects);
             }
             ("client/registerCapability", Some(id)) | ("client/unregisterCapability", Some(id)) => {
-                // Accepted and ignored. We register no dynamic capabilities, but refusing makes
-                // gopls log an error on every start, and refusing *by silence* would hang it.
+                /*
+                 * Accepted and ignored, and since M18 the *ignored* half is load-bearing enough
+                 * to spell out.
+                 *
+                 * gopls is told `workspace.didChangeWatchedFiles.dynamicRegistration: true` (see
+                 * `declares_watched_files`), so it registers watch globs through this request. We
+                 * answer `null` and keep no record of what it asked for: the notifications cide
+                 * sends are chosen by `cide_app::lsp::owner_of` — every `.go`, `go.mod`, `go.sum`
+                 * and `go.work` the file watcher reports under the project's roots — rather than
+                 * by matching the server's patterns. That is deliberate. Honouring the globs would
+                 * mean a second path-matching implementation whose only proof of correctness is
+                 * that a server did not complain, and the set cide sends is already narrower than
+                 * anything gopls registers, so honouring them could only ever *drop* an event.
+                 * `gopls_re_diagnoses_a_file_it_was_told_changed_on_disk` is the standing proof
+                 * that an unregistered-but-sent notification is acted on.
+                 *
+                 * Answering at all is not optional: refusing makes gopls log an error on every
+                 * start, and refusing *by silence* would hang it — a request is never dropped.
+                 */
                 effects.push(Effect::Send(response(id.clone(), Value::Null)));
             }
             (_, Some(id)) => {
@@ -278,6 +297,23 @@ impl Session {
         }
     }
 
+    /// Does this server answer `textDocument/implementation`?
+    ///
+    /// The same `boolean | Options` reading as [`Self::supports_references`], and for the same
+    /// reason — `implementationProvider` is `boolean | ImplementationOptions |
+    /// ImplementationRegistrationOptions` in the spec, and reading only the boolean would report
+    /// "gopls cannot do this" about the server whose answer is the entire point of the feature.
+    ///
+    /// `false` before the handshake completes is "nothing has said yet", not a refusal. See
+    /// `LspHandle::supports_implementation`, which is where that distinction is kept.
+    pub fn supports_implementation(&self) -> bool {
+        match self.capabilities.get("implementationProvider") {
+            Some(Value::Bool(yes)) => *yes,
+            Some(Value::Object(_)) => true,
+            _ => false,
+        }
+    }
+
     fn status(&self) -> SourceStatus {
         // Ready needs *both*: the handshake done, and nothing in flight. See the module docs for
         // why "a diagnostic has arrived" is not part of it.
@@ -334,6 +370,63 @@ impl Session {
         }))
     }
 
+    /// `workspace/didChangeWatchedFiles` — files changed on disk, by somebody other than us. (M18)
+    ///
+    /// # Why this exists at all
+    ///
+    /// cide's whole premise is that an agent edits the tree while the user watches. Those writes
+    /// arrive through `notify`, land in `cide_app::files::on_watch_event`, and until M18 stopped
+    /// there: the language servers were told about a file **only** through `didOpen`/`didChange`
+    /// for a buffer the user had open. So a file Claude fixed and the user never opened kept its
+    /// diagnostics, with their original line numbers, for the rest of the session — which is the
+    /// report this notification answers.
+    ///
+    /// `changes` is `(uri, kind)` where kind is LSP's `FileChangeType`: `1` created, `2` changed,
+    /// `3` deleted. Numbers rather than an enum because they cross straight to JSON and this crate
+    /// deliberately re-exports nothing from `lsp-types`.
+    ///
+    /// A notification, so a server that does not implement it drops it in silence — which is the
+    /// property that makes sending it unconditionally safe.
+    pub fn did_change_watched_files(&self, changes: Vec<(String, u8)>) -> Effect {
+        let changes: Vec<Value> = changes
+            .into_iter()
+            .map(|(uri, kind)| json!({ "uri": uri, "type": kind }))
+            .collect();
+        Effect::Send(json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": { "changes": changes },
+        }))
+    }
+
+    /// `rust-analyzer/runFlycheck` — re-run `cargo check`. (M18)
+    ///
+    /// # Why a vendor extension is the right answer here and `didSave` is not
+    ///
+    /// rust-analyzer's semantic analysis follows the disk on its own (it runs its own `notify`
+    /// watcher whenever the client does not claim `didChangeWatchedFiles`), but **flycheck** —
+    /// the `cargo check` that produces every `E0308`, every `unused_variables`, and essentially
+    /// everything a user calls "the errors" — runs only on a save. `crates/cide-lsp/tests/
+    /// real_servers.rs::an_on_disk_edit_alone_never_refreshes_diagnostics` is the standing proof:
+    /// it repairs a broken file on disk, waits two minutes and asserts the diagnostic is *still
+    /// there*.
+    ///
+    /// The alternative was to synthesise a `textDocument/didSave` for a document nobody has open.
+    /// It is a lie about the client's state, rust-analyzer logs an orphan save when the document
+    /// is not in its `mem_docs`, and it fights the refcounting `ui/src/editor/docSync.ts` keeps.
+    /// Asking the server to do the thing we want, by its own name for it, costs one notification.
+    ///
+    /// `textDocument: null` means "the whole workspace", which is what a watcher burst means.
+    /// A notification, and an extension — so any server that has never heard of it, including a
+    /// future replacement for rust-analyzer, drops it silently rather than erroring.
+    pub fn run_flycheck(&self) -> Effect {
+        Effect::Send(json!({
+            "jsonrpc": "2.0",
+            "method": "rust-analyzer/runFlycheck",
+            "params": { "textDocument": null },
+        }))
+    }
+
     /// The orderly half of the shutdown ladder: `shutdown` (a request), then `exit`.
     ///
     /// Both, in this order, before any signal. gopls writes its cache on `exit`, and a `SIGTERM`
@@ -384,7 +477,13 @@ fn publish(params: &Value) -> Option<Effect> {
 ///   the panel has nothing to show for the two minutes it indexes.
 /// * `workspace.configuration: true` — we answer that request, so we may as well say so.
 /// * `publishDiagnostics.*Support` — asking for the fields `convert` reads.
-fn initialize_params(roots: &[std::path::PathBuf]) -> Value {
+///
+/// # Why this takes the `Server` and not a name (M18)
+///
+/// Because exactly one capability must differ between them, and getting that one wrong trades a
+/// stale-diagnostics bug for a wrong-answer bug, which is worse. See
+/// [`declares_watched_files`].
+fn initialize_params(roots: &[std::path::PathBuf], server: Server) -> Value {
     let folders: Vec<Value> = roots
         .iter()
         .map(|root| {
@@ -402,10 +501,7 @@ fn initialize_params(roots: &[std::path::PathBuf]) -> Value {
         "capabilities": {
             "general": { "positionEncodings": ["utf-16"] },
             "window": { "workDoneProgress": true },
-            "workspace": {
-                "workspaceFolders": true,
-                "configuration": true,
-            },
+            "workspace": workspace_capabilities(server),
             "textDocument": {
                 "synchronization": {
                     "didSave": true,
@@ -442,9 +538,74 @@ fn initialize_params(roots: &[std::path::PathBuf]) -> Value {
                  * this list.
                  */
                 "references": { "dynamicRegistration": false },
+                /*
+                 * Go to implementation. (M18)
+                 *
+                 * The user's report was Go-shaped — *"goto for golang goes to the interface
+                 * declaration, but should go to the implementation"* — and gopls is behaving
+                 * correctly there: `textDocument/definition` on a call through an interface
+                 * resolves to the interface's method, because that *is* where the thing being
+                 * called is declared. The question the user is asking is a different protocol
+                 * request, and cide never asked it.
+                 *
+                 * `linkSupport: false` for exactly the reason spelled out over `definition`
+                 * above, and it matters more here rather than less: `textDocument/implementation`
+                 * has the same `Location | Location[] | LocationLink[] | null` result shape, and
+                 * `convert::locations` reads `range` — so a `LocationLink[]` reply would parse
+                 * into rows that all point at line 1. Declared false, pinned by the handshake
+                 * test, so turning it on has to be a deliberate edit in two places.
+                 *
+                 * `dynamicRegistration: false` stated rather than omitted, for the reason the
+                 * `references` block gives.
+                 */
+                "implementation": { "dynamicRegistration": false, "linkSupport": false },
             },
         },
     })
+}
+
+/// The `capabilities.workspace` object, which is the one part that differs per server.
+///
+/// Built rather than written as a literal so `didChangeWatchedFiles` can be **absent** and not
+/// `null`. Both deserialize to `None` in every server this app ships, but "we did not say" and
+/// "we said no" are different sentences on a wire, and the whole reason this function exists is
+/// that a server reads this key as a statement about who is responsible for watching the disk.
+fn workspace_capabilities(server: Server) -> Value {
+    let mut workspace = json!({
+        "workspaceFolders": true,
+        "configuration": true,
+    });
+    if declares_watched_files(server) {
+        workspace["didChangeWatchedFiles"] = json!({ "dynamicRegistration": true });
+    }
+    workspace
+}
+
+/// Does this server get told that **cide** watches the files? (M18)
+///
+/// `true` for gopls, `false` for rust-analyzer, and the asymmetry is the whole point.
+///
+/// `workspace.didChangeWatchedFiles` is not a request for a feature — it is a **transfer of
+/// responsibility**. A server that sees it stops watching the disk itself and waits for the
+/// client to tell it what changed.
+///
+/// * **gopls has no watcher of its own.** It registers watch patterns through
+///   `client/registerCapability` and relies entirely on `workspace/didChangeWatchedFiles` for
+///   everything the editor did not tell it about. Without the capability declared it is never
+///   told about an out-of-editor write at all — which is the Go half of the stale-diagnostics
+///   report.
+/// * **rust-analyzer has one, and it sees more than cide's does.** Declaring this for it would
+///   make cide solely responsible for file notifications, and cide's watcher is gitignore-filtered
+///   and confined to the project's own roots (`cide_fs::watch`). rust-analyzer additionally
+///   watches path dependencies and `~/.cargo/registry` sources; handing it a narrower feed would
+///   quietly break analysis of exactly the code a user cannot see to suspect. Its stale-diagnostic
+///   problem is a *flycheck* problem, not a file-notification one, and [`Session::run_flycheck`]
+///   is the answer to that.
+fn declares_watched_files(server: Server) -> bool {
+    match server {
+        Server::Gopls => true,
+        Server::RustAnalyzer => false,
+    }
 }
 
 #[cfg(test)]
@@ -452,7 +613,7 @@ mod tests {
     use super::*;
 
     fn started() -> Session {
-        let (session, _) = Session::new(&[std::path::PathBuf::from("/repo")], "rust-analyzer");
+        let (session, _) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RustAnalyzer);
         session
     }
 
@@ -482,7 +643,7 @@ mod tests {
 
     #[test]
     fn the_handshake_declares_what_the_client_actually_does() {
-        let (_, effects) = Session::new(&[std::path::PathBuf::from("/repo")], "rust-analyzer");
+        let (_, effects) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RustAnalyzer);
         let request = &sent(&effects)[0];
         let caps = &request["params"]["capabilities"];
         // Without this rust-analyzer never sends `$/progress`, and the panel shows an
@@ -505,6 +666,12 @@ mod tests {
             caps["textDocument"]["references"]["dynamicRegistration"],
             json!(false)
         );
+        // Go to implementation, with the same `linkSupport: false` refusal as `definition` — a
+        // `LocationLink[]` reply would parse into rows that all point at line 1.
+        assert_eq!(
+            caps["textDocument"]["implementation"]["linkSupport"],
+            json!(false)
+        );
         // We answer `workspace/configuration`, so we must say we can.
         assert_eq!(caps["workspace"]["configuration"], json!(true));
         assert_eq!(
@@ -514,12 +681,103 @@ mod tests {
     }
 
     #[test]
+    fn only_gopls_is_told_that_cide_watches_the_files() {
+        // The one capability that differs per server, pinned in both directions because getting
+        // it wrong is worse than the bug it fixes.
+        //
+        // Declaring `didChangeWatchedFiles` *transfers responsibility*: the server stops watching
+        // the disk and waits to be told. gopls has no watcher of its own, so it needs this or it
+        // never hears about an agent's write. rust-analyzer does have one, and it watches path
+        // dependencies and registry sources that cide's gitignore-filtered, per-root watcher does
+        // not — so declaring it there would narrow what that server sees, silently, in exactly
+        // the code a user cannot see to suspect.
+        let (_, gopls) = Session::new(&[std::path::PathBuf::from("/repo")], Server::Gopls);
+        let gopls = &sent(&gopls)[0]["params"]["capabilities"]["workspace"];
+        assert_eq!(
+            gopls["didChangeWatchedFiles"]["dynamicRegistration"],
+            json!(true)
+        );
+
+        let (_, ra) = Session::new(&[std::path::PathBuf::from("/repo")], Server::RustAnalyzer);
+        let ra = &sent(&ra)[0]["params"]["capabilities"]["workspace"];
+        assert!(
+            ra.get("didChangeWatchedFiles").is_none(),
+            "rust-analyzer was told cide watches the files: {ra}"
+        );
+    }
+
+    #[test]
+    fn the_servers_own_implementation_capability_survives_the_handshake() {
+        // Same three-state reading as `referencesProvider`, and for the same reason: a
+        // `MethodNotFound` that never arrives is a twenty-second wait ending in "probably still
+        // indexing" about a feature that was never going to appear.
+        let mut session = started();
+        session.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "implementationProvider": true } },
+        }));
+        assert!(session.supports_implementation());
+
+        // `boolean | ImplementationOptions`: the object form is what a server sends when it wants
+        // work-done progress on the method, and reading only the boolean would report "gopls
+        // cannot do this" about the server the whole feature exists for.
+        let mut options = started();
+        options.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "implementationProvider": { "workDoneProgress": true } } },
+        }));
+        assert!(options.supports_implementation());
+
+        // And a server that offers nothing says so rather than being assumed able.
+        let mut none = started();
+        none.on_message(&json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "capabilities": { "definitionProvider": true } },
+        }));
+        assert!(!none.supports_implementation());
+        assert!(!started().supports_implementation());
+    }
+
+    #[test]
+    fn a_watched_file_change_carries_lsps_own_change_kinds() {
+        // 1 created, 2 changed, 3 deleted. A wrong number here is not an error anywhere — the
+        // server simply acts on the wrong event, and a "deleted" for a file that was written is
+        // how a whole package's diagnostics disappear.
+        let session = running();
+        let Effect::Send(sent) = session.did_change_watched_files(vec![
+            ("file:///repo/a.go".into(), 2),
+            ("file:///repo/b.go".into(), 3),
+        ]) else {
+            panic!()
+        };
+        assert_eq!(sent["method"], "workspace/didChangeWatchedFiles");
+        assert!(sent.get("id").is_none(), "a notification, never a request");
+        assert_eq!(sent["params"]["changes"][0]["uri"], "file:///repo/a.go");
+        assert_eq!(sent["params"]["changes"][0]["type"], 2);
+        assert_eq!(sent["params"]["changes"][1]["type"], 3);
+    }
+
+    #[test]
+    fn a_flycheck_kick_names_the_whole_workspace_and_expects_no_reply() {
+        // `textDocument: null` is rust-analyzer's own spelling of "everything", which is what a
+        // watcher burst means. A *request* here would block a caller on a server that has never
+        // heard of the method; as a notification it is silently dropped by anything that has not.
+        let session = running();
+        let Effect::Send(sent) = session.run_flycheck() else {
+            panic!()
+        };
+        assert_eq!(sent["method"], "rust-analyzer/runFlycheck");
+        assert!(sent.get("id").is_none(), "a notification, never a request");
+        assert_eq!(sent["params"]["textDocument"], Value::Null);
+    }
+
+    #[test]
     fn a_multi_root_project_advertises_all_of_its_roots() {
         let roots = [
             std::path::PathBuf::from("/repo/a"),
             std::path::PathBuf::from("/repo/b"),
         ];
-        let (_, effects) = Session::new(&roots, "gopls");
+        let (_, effects) = Session::new(&roots, Server::Gopls);
         let folders = sent(&effects)[0]["params"]["workspaceFolders"]
             .as_array()
             .expect("array")

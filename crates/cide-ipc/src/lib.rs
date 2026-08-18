@@ -24,11 +24,11 @@ pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
 pub use positions::ViewPosition;
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
-    DEFAULT_CODE_FONT_SIZE, EditorSettings, GraphicsSettings, HighlightLevel, InspectionSettings,
-    MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, ProxyMode,
-    ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings,
-    SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size,
-    normalize_proxy_url, redact_proxy_url,
+    DEFAULT_CODE_FONT_SIZE, EditorSettings, ExplorerSettings, GraphicsSettings, HighlightLevel,
+    InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MIN_CODE_FONT_SIZE,
+    MIN_PUSH_DEBOUNCE_MS, ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH, Settings, SeverityFilter, SidebarSettings, TerminalRenderer,
+    TerminalSettings, clamp_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,

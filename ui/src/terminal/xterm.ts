@@ -20,8 +20,16 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes'
 import { notify } from '@/chrome/notices'
 import { terminalKeyGate } from '@/keys/gate'
-import { terminalClipboardAction, terminalKeyBytes, type TerminalPaneKind } from './keys'
+import {
+  terminalClipboardAction,
+  terminalKeyBytes,
+  terminalOpensFind,
+  type TerminalPaneKind,
+} from './keys'
 import { copyTerminalSelection, pasteIntoTerminal } from './clipboard'
+import { openTerminalFind } from './findStore'
+import { FIND_HIGHLIGHT_LIMIT } from './findModel'
+import { SearchAddon, type ISearchOptions } from '@xterm/addon-search'
 import { imeFiltered, InputGuard } from './inputRouting'
 import {
   paletteSignature,
@@ -118,8 +126,16 @@ function oneLine(text: string): string {
  * terminal that could have swallowed a `^V` the Claude CLI was waiting for. A pane's kind never
  * changes — `PaneKind` is domain state and a Claude pane does not become a shell — so there is
  * nothing to update later.
+ *
+ * `paneId` is here for the same reason and it is a *parameter* rather than something the caller
+ * sets on the handle afterwards, deliberately: the composed key handler below needs it to open
+ * this pane's find bar, and a handle that spent one frame not knowing its pane is a terminal
+ * whose first Ctrl+F silently did nothing. Making it an argument is what stops that being
+ * possible — the compiler asks for it at the one call site (`layout/paneHosts.ts`), where the
+ * id is already in hand. A terminal is built for exactly one pane and never moves between
+ * panes; hosts are keyed by pane id and outlive every mount.
  */
-export function createTerminal(kind: TerminalPaneKind): TerminalHandle {
+export function createTerminal(kind: TerminalPaneKind, paneId: string): TerminalHandle {
   const style = getComputedStyle(document.documentElement)
   const theme = readTheme(style)
 
@@ -335,10 +351,31 @@ export function createTerminal(kind: TerminalPaneKind): TerminalHandle {
     if (action !== null) {
       ev.preventDefault()
       const done =
-        action.kind === 'copy' ? copyTerminalSelection(term) : pasteIntoTerminal(term)
+        action.kind === 'copy' ? copyTerminalSelection(term) : pasteIntoTerminal(term, kind)
       void done.catch((error: unknown) => {
         notify(`The clipboard could not be reached: ${String(error)}`, { kind: 'error' })
       })
+      return false
+    }
+
+    /*
+     * Ctrl+F — this pane's find bar, decided by `terminalOpensFind` and by nothing else.
+     *
+     * Here for exactly the reason the two clipboard chords are, and `keys.ts` carries the whole
+     * argument: this handler is the app's only *focus-scoped* keyboard entry point, so a rule
+     * written here cannot reach a rename field, the commit box or CodeMirror's own Ctrl+F,
+     * whereas a `keymap.json` default with `when: "terminalFocused"` would have reached all
+     * three (that flag follows `tab.tree.focused`, not the caret).
+     *
+     * Below the gate, like everything else in this handler: a user who binds `ctrl+f` in
+     * `keymap.json` still wins, and both entry points of the gate still agree about every chord.
+     *
+     * The pane id is the constructor's, not a lookup: see [`createTerminal`]'s own note for why
+     * a terminal knows its pane from the first frame rather than being told later.
+     */
+    if (terminalOpensFind(ev)) {
+      ev.preventDefault()
+      openTerminalFind(paneId)
       return false
     }
 
@@ -490,6 +527,119 @@ export function promoteWebgl(handle: TerminalHandle): void {
   } catch {
     // DOM renderer. Slower, but correct, and on some WebKitGTK/driver combinations it is
     // the only thing that paints at all.
+  }
+}
+
+/**
+ * The search addons in this window, keyed by the terminal they were loaded into.
+ *
+ * A `WeakMap` for the reason `webglAddons` above is one: a disposed terminal takes its entry
+ * with it, and `TerminalHandle` is not a stable key across an eviction. Nothing here disposes
+ * the addon explicitly — xterm's `AddonManager.dispose()` disposes every loaded addon when the
+ * terminal goes, which is what `TerminalHandle.dispose` reaches.
+ */
+const searchAddons = new WeakMap<Terminal, SearchAddon>()
+
+/**
+ * This terminal's search addon, loaded on first use.
+ *
+ * **Lazily, and that is a decision rather than an optimisation.** `SearchAddon.activate`
+ * registers an `onWriteParsed` listener that re-runs the last query 200 ms after every write
+ * batch, so that the count and the highlights stay true while a child keeps printing. That is
+ * exactly right for a pane somebody is searching and it is pure overhead for the other eleven
+ * hosts the registry may be holding, most of which will never be searched at all. Loading on
+ * demand means a window full of idle Claude panes pays nothing.
+ *
+ * (The listener is cheap even once loaded — it returns immediately unless a query is cached
+ * *and* decorations are on — so the addon is never unloaded again. xterm's `AddonManager` has no
+ * "unload and reload" that keeps the terminal's state, and a bar that is closed leaves no cached
+ * query behind because `clearDecorations` drops it.)
+ */
+export function ensureSearch(handle: TerminalHandle): SearchAddon {
+  const existing = searchAddons.get(handle.term)
+  if (existing) return existing
+
+  const addon = new SearchAddon({ highlightLimit: FIND_HIGHLIGHT_LIMIT })
+  handle.term.loadAddon(addon)
+  searchAddons.set(handle.term, addon)
+  return addon
+}
+
+/**
+ * A CSS token as a `#RRGGBB` literal, or `null` when it is not one.
+ *
+ * xterm's decoration options accept **only** that form — `ISearchDecorationOptions` says so and
+ * its colour parser is not CSS's — so a token that resolves to `rgb(…)`, to a shorthand `#abc`,
+ * or (in a harness that never loaded `tokens.css`) to the empty string has to be rejected here
+ * rather than handed over. The tokens this reads are 6-digit hex in both themes today; the guard
+ * is for the edit that changes one, which would otherwise show up as a search that highlights
+ * nothing and reports no count, with nothing anywhere saying why.
+ */
+function hexToken(style: CSSStyleDeclaration, name: string, fallback: string): string {
+  const value = style.getPropertyValue(name).trim()
+  return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback
+}
+
+/**
+ * What a search should paint, resolved against the theme that is on screen right now.
+ *
+ * Read per search rather than cached: a theme switch repaints every terminal
+ * (`retheme` below) and the decorations would otherwise keep the colours of whichever theme was
+ * up when the bar opened. The cost is two `getPropertyValue` calls per keystroke in a find
+ * field, which is nothing beside the search itself.
+ *
+ * **`decorations` is not optional and is not cosmetic.** `SearchAddon` fires
+ * `onDidChangeResults` only when the search it just ran carried a `decorations` block
+ * (`ResultTracker.fireResultsChanged` returns immediately otherwise), so switching highlighting
+ * off does not buy a cheaper count — it removes the count entirely, and the bar's `3 of 12`
+ * with it.
+ *
+ * The two `…OverviewRuler` fields are required by the type and are inert here: an overview ruler
+ * is drawn only for a terminal constructed with `overviewRulerWidth`, and none is. They are
+ * given the ring's and the fill's colours so that switching one on later needs no second
+ * decision.
+ *
+ * # Why the current hit is a ring and not a loud fill, and why `--sel` is not the wash
+ *
+ * Both halves of this were got wrong once, in this function, and both are failures the rest of
+ * the repository had already written down:
+ *
+ *  * **`--sel` is not a neutral wash here — it is literally this terminal's selection colour.**
+ *    `settings/theme.ts::TERMINAL_SLOTS` maps `selectionBackground → --sel`, so painting matches
+ *    with it makes a highlight indistinguishable from selected text; and the addon *selects* the
+ *    match it moves to (`SearchAddon._selectResult` calls `terminal.select`), so the one hit that
+ *    most needs to stand out was the one wearing the selection's own colour twice over.
+ *    `--accent-dim` instead, which is what `EditorSurface.module.css` uses for `.cm-searchMatch`
+ *    and for the same stated reason: *a hit is the app's own emphasis, not a warning* — and here,
+ *    not a selection either.
+ *  * **A solid `--accent` for the active match was tried in the editor and is unusable.** That
+ *    file's comment carries the measurement: this decoration cannot choose the ink drawn on top
+ *    of it, so a loud fill ends up carrying whatever colour the text already had at about 1.1:1.
+ *    In a terminal that is *worse*, not better — the ink is an arbitrary ANSI palette a child
+ *    program chose, and xterm applies a decoration's `backgroundColor` as the **cell background**
+ *    with the glyph's own foreground over it (`CellColorResolver`, both renderers), not as an
+ *    overlay it could tint. So the same answer the editor reached: the current hit is the same
+ *    fill plus a 1px `--accent` ring. `SearchAddon` renders `activeMatchBorder` as exactly that
+ *    (`_applyStyles` sets `outline: 1px solid …` on the decoration element), which is the idiom
+ *    `.cm-searchMatch-selected` already uses.
+ *
+ * `activeMatchBackground` is still handed the fill rather than left out. Omitting it would make
+ * the active decoration contribute no background at all, and the two renderers disagree about
+ * whether the highlight decoration underneath then survives — a hit that flickers between two
+ * colours as you walk it is a worse bug than the one this replaced.
+ */
+export function searchOptions(): ISearchOptions {
+  const style = getComputedStyle(document.documentElement)
+  const fill = hexToken(style, '--accent-dim', '#7a4432')
+  const ring = hexToken(style, '--accent', '#d97757')
+  return {
+    decorations: {
+      matchBackground: fill,
+      matchOverviewRuler: fill,
+      activeMatchBackground: fill,
+      activeMatchBorder: ring,
+      activeMatchColorOverviewRuler: ring,
+    },
   }
 }
 

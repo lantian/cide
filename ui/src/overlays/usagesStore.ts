@@ -23,12 +23,22 @@
  */
 import { create } from 'zustand'
 import { diagnostics as diagnosticsApi, type ProjectId, type Usage } from '@/ipc/client'
+import type { UsagesKind } from './usagesModel'
 
 interface UsagesStore {
   /** The project the search belongs to, and what a cancel is aimed at. */
   project: ProjectId | null
   /** The identifier, when the caller knew it. Heads the popup and the empty-result notice. */
   name: string | null
+  /**
+   * Which question this list answers: Find usages, or Go to implementation. (M18)
+   *
+   * On the store rather than passed as a prop because the popup is opened from
+   * `editor/codeIntel.ts` and `keys/dispatch.ts`, both outside the component tree — the same
+   * predicament that put `name` here. It heads the dialog and picks every sentence; see
+   * `UsagesKind` for why sharing the prose would be a lie in one direction.
+   */
+  kind: UsagesKind
   /** True between the request going out and the answer landing. */
   searching: boolean
   rows: readonly Usage[]
@@ -46,6 +56,7 @@ interface UsagesStore {
 export const useUsages = create<UsagesStore>(() => ({
   project: null,
   name: null,
+  kind: 'usages',
   searching: false,
   rows: [],
   truncated: false,
@@ -59,11 +70,16 @@ export const useUsages = create<UsagesStore>(() => ({
  * Clears the rows, deliberately. Leaving the previous search's list up while a new one runs looks
  * like an answer and is not, and the user has just told us it was the wrong question.
  */
-export function beginUsages(project: ProjectId, name: string | null): number {
+export function beginUsages(
+  project: ProjectId,
+  name: string | null,
+  kind: UsagesKind = 'usages',
+): number {
   const generation = useUsages.getState().generation + 1
   useUsages.setState({
     project,
     name,
+    kind,
     searching: true,
     rows: [],
     truncated: false,

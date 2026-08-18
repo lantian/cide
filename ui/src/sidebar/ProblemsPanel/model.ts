@@ -94,6 +94,20 @@ export interface Diagnostic {
   source?: string | undefined
   /** The producer's own code, e.g. `E0308`. Rendered dimmed after the message. */
   code?: string | undefined
+  /**
+   * The file changed on disk after this was published, so `line` may name a different line. (M18)
+   *
+   * Set in Rust, by `cide_core::diagnostics::DiagnosticStore::snapshot`, from the paths the file
+   * watcher marked since the source last spoke about them. The panel neither derives nor clears
+   * it — the analyser is the only thing that can answer staleness, and it answers by republishing.
+   *
+   * Optional because every fixture written before M18 omits it, and because `false` and absent
+   * mean the same thing here: nothing has said this row is out of date.
+   *
+   * The row stays **clickable**. A jump that may be a few lines off is worth more than a dead
+   * row, as long as it says which it is — the same trade the whole three-state snapshot makes.
+   */
+  stale?: boolean | undefined
 }
 
 /**
@@ -279,6 +293,15 @@ export interface FileGroup {
   path: string
   items: Diagnostic[]
   counts: SeverityCounts
+  /**
+   * Any row in this group is marked out of date. (M18)
+   *
+   * Derived here rather than re-scanned in the component, so the heading's warning and the rows'
+   * own marks are one decision. `some` and not `every`: a file whose findings come from two
+   * sources may have one of them current and the other pending a re-check, and the heading has to
+   * warn about the group it heads.
+   */
+  stale: boolean
 }
 
 /**
@@ -309,7 +332,12 @@ export function groupByFile(items: readonly Diagnostic[]): FileGroup[] {
         a.column - b.column ||
         (a.message < b.message ? -1 : a.message > b.message ? 1 : 0),
     )
-    groups.push({ path, items: bucket, counts: countBySeverity(bucket) })
+    groups.push({
+      path,
+      items: bucket,
+      counts: countBySeverity(bucket),
+      stale: bucket.some((item) => item.stale === true),
+    })
   }
   groups.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
   return groups
@@ -426,6 +454,94 @@ export function metaFigure(snapshot: DiagnosticsSnapshot): string {
   // The *true* total, not the number of rows on screen. A cap that reports its prefix as the
   // whole is the same class of quiet lie as an unchecked zero.
   return String(snapshot.items.length + (snapshot.truncated ?? 0))
+}
+
+/* ------------------------------------------------------------------- staleness (M18) */
+
+/**
+ * What a group whose file has moved since it was checked says about itself.
+ *
+ * Kept here, beside `headline`, because the wording *is* the feature — the same argument that put
+ * `headline` in this module. The reported bug was not that a stale row existed; it was that the
+ * row looked exactly like a current one, so clicking it landed the user in a comment with nothing
+ * on screen to explain why.
+ *
+ * Deliberately short. It sits under a group heading in a 252px panel, and a sentence that wraps to
+ * three lines above every group would be read once and then ignored for ever.
+ */
+export const STALE_NOTE = 'Changed since it was checked — positions may be out of date.'
+
+/* -------------------------------------------------------------- the source list (M18) */
+
+/**
+ * One row in the panel's footer: an analyser, what it is doing, and whether it can be restarted.
+ *
+ * # Why this exists at all
+ *
+ * `SourceReport[]` has been on the wire since M12 and `adapt.ts` has been handing it to the panel
+ * that whole time, and the panel drew **none of it**. So `rust-analyzer is not installed` — the
+ * one thing that explains an empty list — was carried across the IPC boundary and dropped, and
+ * `diagnostics.restart` (which is real, tested Rust, registered in the contract, and wrapped in
+ * `client.ts`) had no caller anywhere in the app. That is this repository's named recurring
+ * defect: a mechanism designed, documented, and never connected at the last inch.
+ *
+ * # Why `restartable` is a field and not "always true"
+ *
+ * `ProjectDiagnostics::restart` returns immediately for anything that is not a process, and
+ * tree-sitter and Claude are not processes. A Restart button on those rows would be a control
+ * that does nothing when pressed — the exact bug this panel's own header describes as "the bug
+ * this whole task is about".
+ */
+export interface SourceRow {
+  /** `rustAnalyzer` | `gopls` | `treeSitter` | `claude`. What `restart` is called with. */
+  id: string
+  /** What the user sees: `rust-analyzer`. Carried on the wire; never rebuilt here. */
+  label: string
+  /** One line under the label: the progress detail, the reason, or a count. */
+  detail: string
+  status: SourceStatus['kind']
+  /** Only the two that are separate processes. See above. */
+  restartable: boolean
+}
+
+/** The ids that name a language-server process, and therefore the only ones worth restarting. */
+const RESTARTABLE: readonly string[] = ['rustAnalyzer', 'gopls']
+
+/**
+ * The footer rows, from whichever snapshot arm is in hand.
+ *
+ * `sources` is optional on every arm — it was added in M12 and every pre-M12 fixture omits it —
+ * so a snapshot without it yields no rows and the footer simply is not drawn. That is the right
+ * degradation: an empty list of analysers is not a claim, where an invented row would be.
+ */
+export function sourceRows(snapshot: DiagnosticsSnapshot): SourceRow[] {
+  const reports = snapshot.sources ?? []
+  return reports.map((report) => ({
+    id: report.id,
+    label: report.label,
+    detail: sourceDetail(report),
+    status: report.status.kind,
+    restartable: RESTARTABLE.includes(report.id),
+  }))
+}
+
+/**
+ * The line under one analyser's name.
+ *
+ * The `unavailable` reason first and whole, because it is the only actionable sentence the panel
+ * ever has — *"rust-analyzer is not on PATH. Install it with `rustup component add
+ * rust-analyzer`"* — and truncating it here would be hiding the answer inside the surface that
+ * exists to give it.
+ */
+function sourceDetail(report: SourceReport): string {
+  if (report.status.kind === 'unavailable') return report.status.reason
+  if (report.status.kind === 'scanning') {
+    // The server's own progress line when it has one. `Starting…` rather than an empty string,
+    // because a blank line under a name reads as "this row failed to load".
+    return report.status.detail === '' ? 'Starting…' : report.status.detail
+  }
+  if (report.items === 0) return 'Ready — nothing found.'
+  return report.items === 1 ? 'Ready — 1 finding.' : `Ready — ${report.items} findings.`
 }
 
 /* --------------------------------------------------------------------- the display filter */

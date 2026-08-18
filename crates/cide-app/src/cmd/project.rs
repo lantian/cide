@@ -24,6 +24,11 @@ pub struct Mutated {
     pub rev: u64,
 }
 
+/// Open a project over one or more roots, or activate the one already over them.
+///
+/// **Synchronous, and that is load-bearing** — see [`open_project_here`], which is the whole of
+/// what this does. Anything that wants an open from an `async` command has to go through
+/// [`open_project_on_main_thread`]; there is a test below that says so.
 #[tauri::command(rename_all = "camelCase")]
 pub fn project_open(
     app: tauri::AppHandle,
@@ -32,6 +37,42 @@ pub fn project_open(
     name: Option<String>,
 ) -> Result<ProjectId, CoreError> {
     let roots: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    open_project_here(&app, &state, roots, name)
+}
+
+/// Everything an open does, on the caller's thread — **and the caller must be the main one**.
+///
+/// # The crash this shape exists to prevent
+///
+/// This was the body of [`project_open`] and `project_open_recent` called that command function
+/// directly. `project_open` is synchronous, so Tauri runs it on the main thread — the GTK one, on
+/// Linux — and the body below was written against that fact. `project_open_recent` is `async`, so
+/// Tauri runs it as a task on the shared async runtime, on a tokio worker. The same code, two
+/// threading contracts, and only one of them true.
+///
+/// The one that bit is [`crate::ide::IdeServers::ensure`]: it owns a *second* tokio runtime (the
+/// `cide-ide` one) and drives the port bind with `rt.block_on`. `Runtime::block_on` panics —
+/// "Cannot start a runtime from within a runtime" — when the calling thread is already inside a
+/// runtime, which is exactly what a tokio worker is. In a release build `panic = "abort"`, so that
+/// panic is not a failed command, it is the process going away: opening a project from the recents
+/// dropdown killed the app. (In a debug build it is quieter and worse to diagnose — the task
+/// unwinds, the workspace has already been mutated and broadcast, so the project *appears*, and
+/// the promise the webview is awaiting simply never settles.)
+///
+/// `DiagnosticsRegistry::ensure` is the second reason and would have been a slower failure:
+/// it forks language servers, and `cide_core::child_env::arm` requires the forking thread to
+/// outlive the child. It routes through `on_spawn_thread`, so the fork itself is safe wherever
+/// this runs — but that only holds while every spawn site keeps doing so, and a command worker is
+/// the thread the whole `on_spawn_thread` mechanism exists because of.
+///
+/// So there is one open path, it runs where a synchronous command runs, and the two ways in are
+/// [`project_open`] (already there) and [`open_project_on_main_thread`] (which hops).
+fn open_project_here(
+    app: &tauri::AppHandle,
+    state: &WorkspaceState,
+    roots: Vec<PathBuf>,
+    name: Option<String>,
+) -> Result<ProjectId, CoreError> {
     let id = state.update(|ws| workspace::open_project(ws, roots, name))?;
 
     // Started here rather than lazily at first spawn, because the lockfile has to exist
@@ -43,7 +84,7 @@ pub fn project_open(
                 .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
                 .unwrap_or_default()
         });
-        servers.ensure(&app, id, roots);
+        servers.ensure(app, id, roots);
     }
 
     // The language servers, on the same trigger and idempotent for the same reason. Started here
@@ -56,10 +97,10 @@ pub fn project_open(
                 .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
                 .unwrap_or_default()
         });
-        diagnostics.ensure(&app, id, roots);
+        diagnostics.ensure(app, id, roots);
         // The IDE server started above cannot have found this project's store — it did not exist
         // yet — so the link is completed from this side. See `ide::link_diagnostics`.
-        crate::ide::link_diagnostics(&app, id);
+        crate::ide::link_diagnostics(app, id);
     }
 
     // Recorded here rather than in `cide_core::workspace::open_project`, because the domain
@@ -77,12 +118,13 @@ pub fn project_open(
             .and_then(|p| p.roots.first().map(|r| (r.path.clone(), p.name.clone())))
     });
     if let Some((root, name)) = named {
-        // Off this thread, and not awaited. `project_open` is a *synchronous* command, so Tauri
-        // runs it on the main thread — the GTK one, on Linux — and `remember` is two `fsync`s
-        // and a `rename` behind a lock that `project_recent` can be holding while it stats an
-        // unmounted share. Doing it inline would freeze every window in the process for as long
-        // as that takes, which is the one thing this list is not worth. It is best-effort by
-        // design (see `remember`), so there is no answer to wait for and nothing to report.
+        // Off this thread, and not awaited. This function runs on the main thread — the GTK
+        // one, on Linux; see the note above about what enforces that — and `remember` is two
+        // `fsync`s and a `rename` behind a lock that `project_recent` can be holding while it
+        // stats an unmounted share. Doing it inline would freeze every window in the process for
+        // as long as that takes, which is the one thing this list is not worth. It is
+        // best-effort by design (see `remember`), so there is no answer to wait for and nothing
+        // to report.
         drop(tauri::async_runtime::spawn_blocking(move || {
             remember(&root, &name)
         }));
@@ -203,6 +245,10 @@ pub async fn project_forget_recent(path: Option<String>) -> Result<Vec<RecentEnt
 /// several steps away from the cause. Checked here rather than in `project_open` because that
 /// command is also how a test and a restore open a project, and neither should have to have a
 /// directory on disk.
+///
+/// It is `async` **for the stat and for nothing else**. That is what forces the hop back through
+/// [`open_project_on_main_thread`] at the end: this task runs on a tokio worker, and an open run
+/// there aborted the process. [`open_project_here`] has the mechanism.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn project_open_recent(
     app: tauri::AppHandle,
@@ -223,10 +269,47 @@ pub async fn project_open_recent(
         )));
     }
 
-    // Through the command rather than the domain function, so the IDE server and the recents
-    // entry are handled exactly once, here.
-    let state = app.state::<WorkspaceState>();
-    project_open(app.clone(), state, vec![path], None)
+    // Through the one open path rather than the domain function, so the IDE server, the language
+    // servers and the recents entry are handled exactly once — and **on the main thread**, which
+    // this task is not on. See [`open_project_here`] for the crash that came of assuming it was.
+    open_project_on_main_thread(app, vec![root], None).await
+}
+
+/// Run an open on the thread a synchronous command would have run it on, and wait for the answer.
+///
+/// The bridge every `async` command has to cross to reach [`open_project_here`]. It exists
+/// because the two halves of "open a project from the recents list" have opposite requirements:
+/// the `is_dir` above must **not** run on the main thread (an unmounted share turns it into an
+/// NFS timeout that freezes every window, which is the same reason [`project_recent`] stats off
+/// it), and the open must **only** run there.
+///
+/// `run_on_main_thread` returns as soon as the closure is queued, so the answer comes back over a
+/// channel. `spawn_blocking` for the `recv` rather than blocking this task: the closure runs when
+/// the GTK main loop next turns, and holding an async worker on a blocking `recv` in the meantime
+/// is how a runtime with N workers ends up with N-1.
+///
+/// A `RecvError` means the closure was dropped without answering — the main loop is gone, i.e. the
+/// app is on its way out. Reported rather than swallowed, because "the project did not open" with
+/// no message is precisely the failure this file keeps finding.
+async fn open_project_on_main_thread(
+    app: tauri::AppHandle,
+    roots: Vec<PathBuf>,
+    name: Option<String>,
+) -> Result<ProjectId, CoreError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<ProjectId, CoreError>>();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let state = handle.state::<WorkspaceState>();
+        // The receiver is gone only if this task was cancelled, in which case nobody is waiting
+        // for the id — but the project is open either way, which is what the user asked for.
+        let _ = tx.send(open_project_here(&handle, &state, roots, name));
+    })
+    .map_err(|e| CoreError::Io(format!("could not open the project: {e}")))?;
+
+    tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| CoreError::Io(format!("could not open the project: {e}")))?
+        .map_err(|_| CoreError::Io("the application is shutting down".into()))?
 }
 
 /// Show a project's primary root in the desktop's file manager.
@@ -922,6 +1005,153 @@ mod tests {
     use super::*;
     use cide_ipc::{DiffOrigin, DiffSpec, RepoId, SettingsSection, Workspace, git::DiffSide};
 
+    /// This file's own source, for the two structural tests below.
+    ///
+    /// A structural test and not a behavioural one because the thing being pinned is *which
+    /// thread a command runs on*, and Tauri decides that from the `async` keyword at
+    /// compile time. There is no value to assert on at runtime: by the time a test could
+    /// observe the wrong thread, the process it was observing has aborted.
+    const SOURCE: &str = include_str!("project.rs");
+
+    /// Every `async fn` in [`SOURCE`], as (name, body).
+    ///
+    /// Bodies are cut at the first line that is exactly `}` — rustfmt puts a closing brace at
+    /// column 0 only at the end of a top-level item, and `cargo fmt --all --check` is the first
+    /// step of this project's gate, so that boundary is enforced rather than hoped for.
+    fn async_fns(src: &str) -> Vec<(&str, &str)> {
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices("async fn ") {
+            // `pub async fn` matches at the same place through its own `async fn`; only take
+            // the ones that begin a line (possibly after `pub `), so a mention inside a comment
+            // — of which this module has several — is not read as a definition.
+            let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            if !matches!(&src[line_start..at], "" | "pub ") {
+                continue;
+            }
+            let rest = &src[at + "async fn ".len()..];
+            let name = &rest[..rest.find('(').unwrap_or(0)];
+            let body = match rest.find("\n}\n") {
+                Some(end) => &rest[..end],
+                None => rest,
+            };
+            out.push((name, body));
+        }
+        out
+    }
+
+    /// Every way into the open path, as the substring a call to it leaves in the source.
+    ///
+    /// **`project_open(` is in this list because it is the one the regression actually used.**
+    /// `project_open_recent` did not call the private helper — that helper did not exist; it
+    /// called the *command function*, which is `pub fn` and therefore callable from anywhere in
+    /// the crate. A rule naming only [`open_project_here`] would pass while the exact original
+    /// bug was written back in one line above it.
+    const OPEN_CALLS: [&str; 2] = ["open_project_here(", "project_open("];
+
+    /// **No `async` command may run an open on its own task.** The crash this batch fixed.
+    ///
+    /// `project_open_recent` called the `project_open` command function directly. That function
+    /// is synchronous, so Tauri runs it on the main thread and its body is written for the main
+    /// thread; `project_open_recent` is `async`, so Tauri runs it on a tokio worker — where
+    /// `IdeServers::ensure`'s `rt.block_on` panics with "Cannot start a runtime from within a
+    /// runtime" and, under the release profile's `panic = "abort"`, takes the whole app with it.
+    ///
+    /// So: an `async fn` here may reach the open path only after `run_on_main_thread`.
+    /// The count is asserted as well as the rule, because a rule that stops matching anything
+    /// passes for ever while the mechanism it guards is quietly deleted.
+    ///
+    /// [`OPEN_CALLS`] holds literals that also appear in this test's own text, which would be a
+    /// trap if [`SOURCE`] were searched directly — it is this file, tests included. It is not
+    /// one here: the needles are only ever looked for inside the *body of an `async fn`*, and
+    /// every function in this module is synchronous.
+    #[test]
+    fn no_async_command_opens_a_project_on_its_own_task() {
+        let mut hops = 0;
+        for (name, body) in async_fns(SOURCE) {
+            for call in OPEN_CALLS {
+                let Some(at) = body.find(call) else {
+                    continue;
+                };
+                assert!(
+                    body[..at].contains("run_on_main_thread("),
+                    "`{name}` is async, so Tauri runs it on a tokio worker — it must hop to the \
+                     main thread before calling `{call})`, or `IdeServers::ensure` aborts the \
+                     process"
+                );
+                hops += 1;
+            }
+        }
+        assert_eq!(
+            hops, 1,
+            "exactly one async function should bridge to the open path \
+             (`open_project_on_main_thread`); finding none means the bridge was removed and this \
+             test now guards nothing"
+        );
+    }
+
+    /// And the other half: the ordinary open stays synchronous.
+    ///
+    /// Making `project_open` `async` would move *every* open — the picker's, the palette's, a
+    /// drag onto the window — onto a worker, which is the same abort with a wider blast radius
+    /// and no recents entry involved.
+    ///
+    /// The negative half asks [`async_fns`] rather than `SOURCE.contains`, and that is not
+    /// style: [`SOURCE`] is this file *including this test*, so a needle written as a literal
+    /// here would find itself and the assertion would hold no matter what the code did. The
+    /// escaped `\"camelCase\"` in the positive half is what keeps that one honest — the literal
+    /// as it appears in the file is not the string it searches for.
+    #[test]
+    fn project_open_is_a_synchronous_command() {
+        assert!(
+            SOURCE.contains("#[tauri::command(rename_all = \"camelCase\")]\npub fn project_open("),
+            "project_open must stay a synchronous #[tauri::command]"
+        );
+        assert!(
+            !async_fns(SOURCE)
+                .iter()
+                .any(|(name, _)| *name == "project_open"),
+            "project_open must not become async — see `open_project_here`"
+        );
+    }
+
+    /// The panic itself, so the reasoning above is a fact rather than folklore.
+    ///
+    /// `IdeServers` owns a second tokio runtime and binds its port with `rt.block_on`. This is
+    /// that call, made from a task on another runtime, which is exactly the position a `#[tauri::
+    /// command] async fn` puts it in. If tokio ever stops panicking here the fix above is merely
+    /// unnecessary rather than wrong — but the comment claiming a crash would have gone stale,
+    /// and this is what notices.
+    ///
+    /// The inner runtime is held through an `Arc` whose last reference stays *outside* the task:
+    /// dropping a `Runtime` from inside a runtime panics too, and a second panic during the first
+    /// one's unwind is an abort, which would take the test binary rather than fail a test.
+    #[test]
+    fn a_second_runtime_cannot_be_driven_from_a_task_on_the_first() {
+        let workers = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let ide = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("a second runtime"),
+        );
+
+        let joined = workers.block_on({
+            let ide = std::sync::Arc::clone(&ide);
+            async move { tokio::spawn(async move { ide.block_on(async {}) }).await }
+        });
+
+        let error = joined.expect_err("block_on from inside a runtime does not return");
+        assert!(
+            error.is_panic(),
+            "a command worker driving the IDE runtime panics; with panic=abort that is the crash"
+        );
+    }
+
     /// A workspace with one project and one file tab, and the ids for both.
     fn with_file(path: &str) -> (Workspace, ProjectId, TabId) {
         let mut ws = Workspace::default();
@@ -983,33 +1213,39 @@ mod tests {
     }
 
     /// Open `n` extra file tabs beside the console, and hand back every tab id in strip order.
+    ///
+    /// The ids are **read back off the strip** rather than collected as the tabs are made.
+    /// `workspace::open_tab` inserts each new tab at index 1 — the newest file tab is the
+    /// leftmost one — so creation order is the reverse of strip order, and every test below is
+    /// about positions in the strip. Collecting them in creation order would silently shift
+    /// every index in the reorder arithmetic these tests exist to pin.
     fn strip(n: usize) -> (Workspace, ProjectId, Vec<TabId>) {
-        let (mut ws, project, first) = with_file("/w/f0.rs");
-        let mut ids = vec![
-            workspace::project(&ws, project).expect("a project").tabs[0].id,
-            first,
-        ];
+        let (mut ws, project, _) = with_file("/w/f0.rs");
         for i in 1..n {
-            ids.push(
-                workspace::open_tab(
-                    &mut ws,
-                    project,
-                    TabKind::File {
-                        path: PathBuf::from(format!("/w/f{i}.rs")),
-                        dirty: false,
-                    },
-                    Pane {
-                        id: PaneId::new(),
-                        kind: PaneKind::Editor,
-                        role: PaneRole::Auxiliary,
-                        session: None,
-                        conversation: None,
-                        title: "f".into(),
-                    },
-                )
-                .expect("a tab opens"),
-            );
+            workspace::open_tab(
+                &mut ws,
+                project,
+                TabKind::File {
+                    path: PathBuf::from(format!("/w/f{i}.rs")),
+                    dirty: false,
+                },
+                Pane {
+                    id: PaneId::new(),
+                    kind: PaneKind::Editor,
+                    role: PaneRole::Auxiliary,
+                    session: None,
+                    conversation: None,
+                    title: "f".into(),
+                },
+            )
+            .expect("a tab opens");
         }
+        let ids = workspace::project(&ws, project)
+            .expect("a project")
+            .tabs
+            .iter()
+            .map(|t| t.id)
+            .collect();
         (ws, project, ids)
     }
 

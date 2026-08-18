@@ -52,6 +52,24 @@ export interface ProblemsDigest {
    * `undefined`. This is how the missing `.group` rule was caught.
    */
   unclassed: number
+  /** Group headings the panel marked out of date, by path. (M18) */
+  staleGroups: string[]
+  /** Rows the panel marked out of date, as `<severity>|<message>`. (M18) */
+  staleRows: string[]
+  /** Whether the *"changed since it was checked"* note was drawn at all. (M18) */
+  staleNote: boolean
+  /**
+   * The footer's analyser rows: `<id> :: <detail>`. (M18)
+   *
+   * Empty until M18 for every story, because the component read `snapshot.sources` nowhere —
+   * `adapt.ts` converted the array and the panel dropped it. That is the state this field exists
+   * to keep from coming back.
+   */
+  sources: string[]
+  /** Whether the *Re-run* control was rendered. (M18) */
+  refresh: boolean
+  /** Source ids that offered a Restart button. (M18) */
+  restarts: string[]
 }
 
 const PROJECT = 'smoke-project' as unknown as ProjectId
@@ -71,6 +89,43 @@ const REAL: readonly Diagnostic[] = [
 ]
 
 const READY: DiagnosticsSnapshot = { kind: 'ready', source: 'rust-analyzer', items: REAL }
+
+/*
+ * The M18 story: one file has changed since the analyser looked at it, and the other has not.
+ *
+ * Two files on purpose. A fixture where everything is stale would pass a component that marked
+ * every group unconditionally, which is the "warning nobody reads" failure — the mark has to
+ * distinguish, or it says nothing.
+ */
+const STALE: DiagnosticsSnapshot = {
+  kind: 'ready',
+  source: 'rust-analyzer',
+  items: REAL.map((item) => (item.path === 'src/a.rs' ? { ...item, stale: true } : item)),
+}
+
+/*
+ * The footer's fixture: one analyser answering, one that never started, and two that are not
+ * processes.
+ *
+ * `treeSitter` and `claude` are here specifically to pin that they get **no** Restart button:
+ * `ProjectDiagnostics::restart` returns immediately for anything that is not a process, so a
+ * button on those rows would do nothing when pressed.
+ */
+const SOURCED: DiagnosticsSnapshot = {
+  kind: 'unavailable',
+  reason: 'No language server is running for this project.',
+  sources: [
+    {
+      id: 'rustAnalyzer',
+      label: 'rust-analyzer',
+      status: { kind: 'unavailable', reason: 'rust-analyzer is not on PATH.' },
+      items: 0,
+    },
+    { id: 'gopls', label: 'gopls', status: { kind: 'scanning', detail: 'Loading packages' }, items: 0 },
+    { id: 'treeSitter', label: 'tree-sitter', status: { kind: 'ready' }, items: 2 },
+    { id: 'claude', label: 'claude', status: { kind: 'ready' }, items: 0 },
+  ],
+}
 
 /*
  * A severity no version of this code knows. Cast, not written as `Severity`, because that is
@@ -118,6 +173,26 @@ const STORIES: Array<[string, () => string]> = [
       ),
   ],
   ['rogue', () => renderToStaticMarkup(<ProblemsPanel project={PROJECT} snapshot={ROGUE} />)],
+  [
+    'stale',
+    () =>
+      renderToStaticMarkup(
+        <ProblemsPanel project={PROJECT} snapshot={STALE} onOpenLocation={() => {}} />,
+      ),
+  ],
+  ['sources', () => renderToStaticMarkup(<ProblemsPanel project={PROJECT} snapshot={SOURCED} />)],
+  [
+    'sources-wired',
+    () =>
+      renderToStaticMarkup(
+        <ProblemsPanel
+          project={PROJECT}
+          snapshot={SOURCED}
+          onRefresh={() => {}}
+          onRestartSource={() => {}}
+        />,
+      ),
+  ],
 ]
 
 const digests = STORIES.map(([story, render]) => digest(story, render()))
@@ -144,6 +219,30 @@ function digest(story: string, html: string): ProblemsDigest {
     glyphs: [...html.matchAll(/class="[^"]*glyph[^"]*"[^>]*>([^<]*)</g)].map((m) => m[1] ?? ''),
     rowTag: rowTag(html),
     unclassed: unclassed(html),
+    staleGroups: [
+      ...html.matchAll(
+        /data-audit="problemsGroup" data-stale="true"[\s\S]*?groupPath[^"]*"[^>]*>([^<]*)</g,
+      ),
+    ].map((m) => m[1] ?? ''),
+    staleRows: [
+      ...html.matchAll(
+        /data-audit="problemsRow" data-severity="([^"]*)" data-stale="true"[^>]*>(.*?)<\/(?:div|button)>/g,
+      ),
+    ].map((m) => `${m[1]}|${message(m[2] ?? '')}`),
+    staleNote: html.includes('data-audit="problemsStale"'),
+    sources: [
+      ...html.matchAll(
+        /data-audit="problemsSource" data-source="([^"]*)"[\s\S]*?sourceDetail[^"]*"[^>]*>([^<]*)</g,
+      ),
+    ].map((m) => `${m[1]} :: ${m[2]}`),
+    refresh: html.includes('data-audit="problemsRefresh"'),
+    // Walk back from each Restart button to the `data-source` of the row it sits in. A regex over
+    // the whole document would happily pair a button with a *later* row's id.
+    restarts: [...html.matchAll(/data-audit="problemsRestart"/g)].map((m) => {
+      const before = html.slice(0, m.index)
+      const at = before.lastIndexOf('data-source="')
+      return at === -1 ? '?' : (/data-source="([^"]*)"/.exec(before.slice(at))?.[1] ?? '?')
+    }),
   }
 }
 

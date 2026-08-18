@@ -26,7 +26,7 @@ use std::sync::mpsc;
 use cide_ipc::{FsChange, TreeMatch, TreeRow, TreeRowKind};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
-use crate::filter::Filter;
+use crate::filter::{Filter, Visibility};
 
 pub type NodeId = u32;
 
@@ -69,13 +69,26 @@ pub struct BuildOptions {
     /// that the picker fills visibly during a long walk, large enough that the channel is
     /// not the bottleneck.
     pub batch: usize,
+    /// Which of the two dropped populations this walk keeps — dotfiles, ignored files.
+    ///
+    /// The walk and [`crate::Filter`] must be given the *same* value: the walk decides which
+    /// rows exist and the filter decides which of them survive a watcher rescan, so a walk
+    /// that shows `.claude` under a filter that hides it draws the directory once and deletes
+    /// it again on the first burst. [`Index::visibility`] carries the walk's answer so that the
+    /// incremental walks — a directory that appeared while the app was running — cannot pick a
+    /// different one.
+    pub visibility: Visibility,
 }
 
 impl Default for BuildOptions {
+    /// [`Visibility::CONSERVATIVE`], which is deliberately not the app's default. See the
+    /// constant: the app always passes the user's setting, and this exists for the walks that
+    /// are nobody's file tree.
     fn default() -> Self {
         Self {
             threads: 0,
             batch: 512,
+            visibility: Visibility::CONSERVATIVE,
         }
     }
 }
@@ -111,6 +124,13 @@ pub struct Index {
     show_roots: bool,
     files: u32,
     dirs: u32,
+    /// What the walk that filled this arena was told to show.
+    ///
+    /// Stored rather than passed in per call because the incremental walks are the ones that
+    /// would get it wrong: [`Index::graft_subtree`] runs a fresh `WalkBuilder` over a directory
+    /// that appeared while the app was running, and a walk there with different visibility
+    /// would put rows in the tree that the next rescan of the same directory takes back out.
+    visibility: Visibility,
 }
 
 impl Index {
@@ -118,7 +138,7 @@ impl Index {
     ///
     /// The app registers this before starting the walk so that a picker query arriving in
     /// the first millisecond has something to answer from.
-    pub fn empty(roots: Vec<Root>) -> Self {
+    pub fn empty(roots: Vec<Root>, visibility: Visibility) -> Self {
         let mut index = Self {
             nodes: Vec::new(),
             free: Vec::new(),
@@ -128,6 +148,7 @@ impl Index {
             root_nodes: Vec::new(),
             files: 0,
             dirs: 0,
+            visibility,
         };
         let specs: Vec<(PathBuf, u16)> = index
             .roots
@@ -160,6 +181,20 @@ impl Index {
         &self.roots
     }
 
+    /// What the walk behind these rows was told to show.
+    ///
+    /// **The app does not read this.** The comparison that decides whether an `fs.index` is a
+    /// no-op or a re-walk is made against `cide_app::files::ProjectFs::visibility` — the value
+    /// the registry entry was built with — because that is the object `claim` has in its hand
+    /// before any index exists to ask. This accessor is the assertion seam: it is what lets a
+    /// test say that the arena it is holding was walked with the visibility it asked for, which
+    /// is otherwise invisible from outside the crate. Said plainly rather than left as an
+    /// accessor that looks like the app's — a reader who wired a second comparison to it would
+    /// be comparing the same field twice and proving nothing.
+    pub fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+
     pub fn files(&self) -> u32 {
         self.files
     }
@@ -168,12 +203,33 @@ impl Index {
         self.dirs
     }
 
-    /// Every directory in the tree — the watcher's watch list.
+    /// Every directory in the tree.
+    ///
+    /// This used to be described as the watcher's watch list, and with *show ignored files* it
+    /// stopped being one: a shown `target/` is thousands of directories the watcher must not
+    /// take a descriptor on. It is still what [`crate::Filter::build`] wants — every visited
+    /// directory, so every `.gitignore` is found — and [`Index::watch_dirs`] is the watch list.
     pub fn dir_paths(&self) -> Vec<PathBuf> {
         self.by_path
             .iter()
             .filter(|&(_, &id)| matches!(self.nodes[id as usize].kind, TreeRowKind::Dir))
             .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    /// The directories the watcher takes a descriptor on: [`Index::dir_paths`] minus the ones
+    /// the filter refuses to watch.
+    ///
+    /// A method here rather than a `filter()` at the call site so that the difference between
+    /// the two lists is stated once, in the crate that owns both halves. With
+    /// [`Visibility::ignored`] off the two lists are identical, which is why this could be
+    /// overlooked until now.
+    pub fn watch_dirs(&self, filter: &Filter) -> Vec<PathBuf> {
+        self.by_path
+            .iter()
+            .filter(|&(_, &id)| matches!(self.nodes[id as usize].kind, TreeRowKind::Dir))
+            .map(|(p, _)| p.clone())
+            .filter(|p| filter.watchable(p, true))
             .collect()
     }
 
@@ -328,7 +384,7 @@ impl Index {
         opts: BuildOptions,
         sink: &(dyn Fn(&[WalkItem]) + Sync),
     ) -> Self {
-        let mut index = Self::empty(roots);
+        let mut index = Self::empty(roots, opts.visibility);
         let multi = index.roots.len() > 1;
         let mut entries: Vec<WalkItem> = Vec::new();
 
@@ -687,10 +743,26 @@ impl Index {
     /// every entry is put through `Filter`, which does consult the ancestor matchers, before
     /// it is grafted. Without this the index and the watcher disagree: `watch_tree` already
     /// asks `Filter`, so those rows would appear in the tree and never be watched.
+    ///
+    /// # The one expensive case, with *Show ignored files* on
+    ///
+    /// A `target/` that appears while the app is running is grafted here in full, on the
+    /// watcher thread — a walk of however much of it exists at that moment. It is bounded and
+    /// it happens **once per directory**, because [`Filter::watchable`] refuses the new
+    /// directory a watch, so nothing under it produces another event to rescan on. The
+    /// alternative — refusing to graft what the walk would have shown — makes the tree depend
+    /// on whether a directory existed at index time, which is a difference no user could
+    /// explain.
     fn graft_subtree(&mut self, path: &Path, root_index: u16, filter: &Filter) -> Vec<WalkItem> {
         let root = Root::new(path);
         let mut entries = Vec::new();
-        walk_root(&root, root_index, false, BuildOptions::default(), |batch| {
+        // The *index's* visibility, not the default: a project showing dotfiles that has just
+        // had `.github/` created in it must graft what the original walk would have grafted.
+        let opts = BuildOptions {
+            visibility: self.visibility,
+            ..BuildOptions::default()
+        };
+        walk_root(&root, root_index, false, opts, |batch| {
             entries.extend_from_slice(batch);
         });
         entries.retain(|item| filter.admits(&item.path, item.is_dir));
@@ -924,15 +996,21 @@ fn walk_root(
     mut on_batch: impl FnMut(&[WalkItem]),
 ) {
     let mut builder = WalkBuilder::new(&root.path);
+    let visibility = opts.visibility;
     builder
         // `hidden` and the git rules are `WalkBuilder`'s defaults; they are spelled out
         // because `Filter` reimplements exactly this set for the watcher and the two have to
-        // be read together.
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .ignore(true)
+        // be read together. Both are now *settings* — see `crate::filter::Visibility`, and
+        // note the inversion: `hidden(true)` means "hide them".
+        .hidden(!visibility.hidden)
+        // All four together, never separately: `.gitignore`, the global ignore file,
+        // `.git/info/exclude` and `.ignore` are four sources for one question, and a tree that
+        // showed the paths one of them covers while hiding another's would be inexplicable
+        // from the outside. `Filter::is_ignored` consults the same four.
+        .git_ignore(!visibility.ignored)
+        .git_global(!visibility.ignored)
+        .git_exclude(!visibility.ignored)
+        .ignore(!visibility.ignored)
         // See `Filter`: ignore files above the project root are not consulted, so that the
         // watcher can make the same decision without an unbounded ancestor walk.
         .parents(false)
@@ -944,6 +1022,15 @@ fn walk_root(
         // is how a walk finds a cycle, and how one project's tree ends up containing another.
         .follow_links(false)
         .threads(opts.threads);
+
+    // `.git` is pruned here rather than left to `hidden(true)`, because with dotfiles shown
+    // `hidden(false)` would descend into it: 60,000 loose objects in this repository, every one
+    // of them an arena node and a `Ctrl+P` candidate. `Filter::admits` refuses the same paths,
+    // so the walk and the watcher agree; this is the half that stops the *descent*, which is
+    // the expensive part. Depth 0 is exempt so that a root a user has literally opened at a
+    // `.git` directory still walks — refusing to walk a path the user named is a worse answer
+    // than showing it.
+    builder.filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git");
 
     let (tx, rx) = mpsc::channel::<Vec<WalkItem>>();
     let root_path = root.path.clone();
@@ -1090,6 +1177,118 @@ mod tests {
             BuildOptions::default(),
             &|_: &[WalkItem]| {},
         )
+    }
+
+    /// The two settings, against the same tree, plus the row `.git` must never produce.
+    ///
+    /// One test rather than three because the *comparison* is the content: the same directory
+    /// walked three ways, and what appears is exactly what the setting names.
+    #[test]
+    fn the_walk_shows_dotfiles_and_ignored_entries_only_when_asked_and_never_shows_git() {
+        let dir = scratch("index-visibility");
+        tree(&dir);
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), "{}").unwrap();
+        // A real `.git` would be found by `Filter`, but the walk never consults one: this is
+        // the arm that proves `filter_entry` prunes the descent, not just the rows.
+        std::fs::create_dir_all(dir.join(".git/objects/ab")).unwrap();
+        std::fs::write(dir.join(".git/objects/ab/cd"), "").unwrap();
+
+        let walked = |visibility: Visibility| -> Vec<String> {
+            let mut index = Index::build(
+                vec![Root::new(dir.path())],
+                BuildOptions {
+                    visibility,
+                    ..BuildOptions::default()
+                },
+                &|_: &[WalkItem]| {},
+            );
+            // Everything, so the assertion is about the walk rather than about what happens to
+            // be expanded.
+            let dirs = index.dir_paths();
+            for d in dirs {
+                index.expand(&d);
+            }
+            index
+                .rows(0, index.count())
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+
+        let neither = walked(Visibility::CONSERVATIVE);
+        assert!(neither.contains(&"main.rs".to_string()));
+        assert!(!neither.contains(&".claude".to_string()));
+        assert!(!neither.contains(&".gitignore".to_string()));
+        assert!(!neither.contains(&"target".to_string()));
+
+        let hidden = walked(Visibility {
+            hidden: true,
+            ignored: false,
+        });
+        assert!(hidden.contains(&".claude".to_string()), "{hidden:?}");
+        assert!(
+            hidden.contains(&"settings.json".to_string()),
+            "the contents of a dot directory, not only the directory: {hidden:?}"
+        );
+        assert!(
+            hidden.contains(&".gitignore".to_string()),
+            "and the dotfiles the ignore rules themselves live in"
+        );
+        assert!(
+            !hidden.contains(&"target".to_string()),
+            "hidden and ignored are separate settings: {hidden:?}"
+        );
+        assert!(
+            !hidden.contains(&".git".to_string()) && !hidden.contains(&"objects".to_string()),
+            "`.git` is pruned whatever `hidden` says — 60k loose objects: {hidden:?}"
+        );
+
+        let both = walked(Visibility {
+            hidden: true,
+            ignored: true,
+        });
+        assert!(both.contains(&"target".to_string()), "{both:?}");
+        assert!(both.contains(&"binary".to_string()), "{both:?}");
+        assert!(
+            !both.contains(&".git".to_string()),
+            "still not `.git`: {both:?}"
+        );
+    }
+
+    /// The watch list is not the row list once ignored entries are shown.
+    #[test]
+    fn the_watch_list_excludes_the_ignored_directories_the_tree_now_draws() {
+        let dir = scratch("index-watch-dirs");
+        tree(&dir);
+        let visibility = Visibility {
+            hidden: true,
+            ignored: true,
+        };
+        let index = Index::build(
+            vec![Root::new(dir.path())],
+            BuildOptions {
+                visibility,
+                ..BuildOptions::default()
+            },
+            &|_: &[WalkItem]| {},
+        );
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            index.dir_paths().iter().map(|p| p.as_path()),
+            visibility,
+        );
+
+        let all = index.dir_paths();
+        let watched = index.watch_dirs(&filter);
+        assert!(all.contains(&dir.join("target/debug")));
+        assert!(
+            !watched.contains(&dir.join("target")) && !watched.contains(&dir.join("target/debug")),
+            "a shown `target/` must cost no inotify descriptors: {watched:?}"
+        );
+        assert!(watched.contains(&dir.join("src")));
+        assert!(watched.contains(&dir.join("src/deep")));
+        assert_eq!(index.visibility(), visibility);
     }
 
     /// Speed search's walk, against the walk that draws the rows.
@@ -1482,6 +1681,7 @@ mod tests {
         let filter = Filter::build(
             &[dir.to_path_buf()],
             index.dir_paths().iter().map(|p| p.as_path()),
+            Visibility::CONSERVATIVE,
         );
 
         // `target/` is ignored by the root `.gitignore`, which is above this walk's root.

@@ -35,6 +35,7 @@ import {
   diagnostics as diagnosticsApi,
   file as fileApi,
   type ProjectId,
+  type UsagesAnswer,
 } from '@/ipc/client'
 import { notify } from '@/chrome/notices'
 import { closeOverlay, showOverlay, useOverlays } from '@/overlays/store'
@@ -45,7 +46,8 @@ import {
   isCurrentUsages,
   showUsages,
 } from '@/overlays/usagesStore'
-import { noSymbolSentence, noUsagesSentence } from '@/overlays/usagesModel'
+import { noSymbolSentence, noUsagesSentence, type UsagesKind } from '@/overlays/usagesModel'
+import { goToDefinition } from './goToDefinition'
 import { jumpTo } from './jump'
 import {
   CLICK_TIMEOUT_MS,
@@ -331,7 +333,97 @@ export function findUsages(
   column: number,
   name: string | null,
 ): void {
-  const generation = beginUsages(project, name)
+  locationQuery({
+    project,
+    path,
+    line,
+    column,
+    name,
+    kind: 'usages',
+    ask: () => diagnosticsApi.usages(project, path, line, column),
+    // A caret on a keyword, a comment, punctuation. There is no symbol, so there is nothing to
+    // fall back to and the honest answer is a sentence.
+    onNoSymbol: () => notify(noSymbolSentence(), { kind: 'info' }),
+    failureLead: 'Find usages',
+  })
+}
+
+/**
+ * Go to implementation: Ctrl+Alt+B, and the palette's `navigate.implementation`. (M18)
+ *
+ * # Why this is not a mode of Go to definition
+ *
+ * The report was that Go to definition in Go lands on the interface. It does, and gopls is right:
+ * `textDocument/definition` on a call through an interface resolves to the interface's method,
+ * because that is where the callee is declared. "Take me to the concrete one" is
+ * `textDocument/implementation`, a different request that cide asked nowhere.
+ *
+ * Making Ctrl+B try implementation first and fall back would fix Go by breaking Rust —
+ * rust-analyzer answers `implementation` on a struct name with its `impl` blocks and on a trait
+ * with its implementors, so Ctrl+click on an ordinary type name would stop opening the
+ * declaration. A separate id is what `navigate.usages` already established as this codebase's
+ * answer to a gesture that has to guess.
+ *
+ * # The same 0 / 1 / ≥2 rule, with one difference
+ *
+ * **0 falls through to Go to definition** rather than reporting nothing. An interface with no
+ * implementors, a caret on a plain function, a language where the distinction does not arise —
+ * all of them answer empty, and in every one of them the thing the user wanted next is the
+ * declaration. Without the fallback the command would be silent for the majority of positions it
+ * is pressed on, which is indistinguishable from unwired.
+ *
+ * ≥2 is the *common* case here, unlike for definition: an interface with many implementors is the
+ * normal shape, which is why this reuses the Find usages popup rather than picking one arbitrarily.
+ */
+export function goToImplementation(
+  project: ProjectId,
+  path: string,
+  line: number,
+  column: number,
+  name: string | null,
+): void {
+  locationQuery({
+    project,
+    path,
+    line,
+    column,
+    name,
+    kind: 'implementations',
+    ask: () => diagnosticsApi.implementations(project, path, line, column),
+    // `notFound` is "there is no symbol at this position at all", and `[]` is "nothing implements
+    // it". Both mean the same thing to a user who pressed this key: ask the other question.
+    onNoSymbol: () => goToDefinition(project, path, line, column),
+    onEmpty: () => goToDefinition(project, path, line, column),
+    failureLead: 'Go to implementation',
+  })
+}
+
+/**
+ * The shared body of the two gestures above: ask, apply the 0/1/≥2 rule, report every outcome.
+ *
+ * One function and not two copies, because the parts that must not drift are the ones that are
+ * invisible in review — the generation check that makes a late answer inert, the grace timer that
+ * stops an empty popup flashing, and the *ordering* of `jumpTo` before `file.open` that
+ * `goToDefinition.ts` spends a paragraph on. The parts that legitimately differ are the request,
+ * the wording, and what an empty answer means, and those are the parameters.
+ */
+function locationQuery(spec: {
+  project: ProjectId
+  path: string
+  line: number
+  column: number
+  name: string | null
+  kind: UsagesKind
+  ask: () => Promise<UsagesAnswer>
+  /** The server resolved no symbol at this position. */
+  onNoSymbol: () => void
+  /** The server resolved a symbol and it has no matches. Defaults to a notice. */
+  onEmpty?: (() => void) | undefined
+  /** Leads the sentence for a transport failure: `Find usages failed: …`. */
+  failureLead: string
+}): void {
+  const { project, name, kind } = spec
+  const generation = beginUsages(project, name, kind)
 
   const grace = setTimeout(() => {
     // Only if it is still the search we started, and still running. Otherwise this is a popup
@@ -339,8 +431,8 @@ export function findUsages(
     if (isCurrentUsages(generation)) showOverlay('usages')
   }, GRACE_MS)
 
-  void diagnosticsApi
-    .usages(project, path, line, column)
+  void spec
+    .ask()
     .then((answer) => {
       clearTimeout(grace)
       /*
@@ -368,14 +460,15 @@ export function findUsages(
 
       if (answer.kind === 'notFound') {
         dismiss()
-        notify(noSymbolSentence(), { kind: 'info' })
+        spec.onNoSymbol()
         return
       }
 
       const rows = answer.rows
       if (rows.length === 0) {
         dismiss()
-        notify(noUsagesSentence(name), { kind: 'info' })
+        if (spec.onEmpty === undefined) notify(noUsagesSentence(name, kind), { kind: 'info' })
+        else spec.onEmpty()
         return
       }
       const only = rows[0]
@@ -403,7 +496,7 @@ export function findUsages(
       clearTimeout(grace)
       if (!isCurrentUsages(generation)) return
       dismiss()
-      report(`Find usages failed: ${String(error)}`)
+      report(`${spec.failureLead} failed: ${String(error)}`)
     })
 }
 

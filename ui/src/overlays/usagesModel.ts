@@ -68,9 +68,32 @@ export function subject(name: string | null): string {
   return name === null || name.trim() === '' ? 'the symbol' : `‘${name}’`
 }
 
-/** The dialog's accessible name and its heading: `Usages of ‘parse’`. */
-export function usagesLabel(name: string | null): string {
-  return `Usages of ${subject(name)}`
+/**
+ * Which question produced this list. (M18)
+ *
+ * One popup, two questions. `textDocument/references` and `textDocument/implementation` return the
+ * same shape and want the same 0/1/≥2 handling and the same filter box, so building a second
+ * overlay would have been two copies of the virtualizer, the keyboard model and the grouping — and
+ * two places for them to drift.
+ *
+ * What must **not** be shared is the prose. A user who pressed Ctrl+Alt+B and reads *"No usages of
+ * ‘Reader’ outside its declaration"* has been told their interface is unused, which is a
+ * different and alarming claim from *"nothing implements it"*. Every sentence below therefore
+ * branches on this, and it is a parameter rather than a second set of functions so that adding a
+ * third question means adding a case rather than a file.
+ */
+export type UsagesKind = 'usages' | 'implementations'
+
+/**
+ * The dialog's accessible name and its heading: `Usages of ‘parse’`.
+ *
+ * `kind` defaults to `'usages'`, which keeps every pre-M18 call site and fixture reading exactly
+ * as it did.
+ */
+export function usagesLabel(name: string | null, kind: UsagesKind = 'usages'): string {
+  return kind === 'implementations'
+    ? `Implementations of ${subject(name)}`
+    : `Usages of ${subject(name)}`
 }
 
 /**
@@ -98,7 +121,11 @@ export function usagesStatus(state: {
   readonly truncated: boolean
   readonly name: string | null
   readonly query: string
+  /** Which question this list answers. Defaults to `'usages'`. (M18) */
+  readonly kind?: UsagesKind | undefined
 }): string | null {
+  const kind = state.kind ?? 'usages'
+  const verb = kind === 'implementations' ? 'implementations' : 'usages'
   if (state.failed !== null && state.failed !== undefined && state.failed !== '') {
     return state.failed
   }
@@ -108,11 +135,16 @@ export function usagesStatus(state: {
     // loses what the user actually asked for.
     const detail = state.detail ?? ''
     return detail === ''
-      ? `Finding usages of ${subject(state.name)}…`
-      : `Finding usages of ${subject(state.name)}… — ${detail}`
+      ? `Finding ${verb} of ${subject(state.name)}…`
+      : `Finding ${verb} of ${subject(state.name)}… — ${detail}`
   }
   if (state.total === 0) {
-    return `No usages of ${subject(state.name)} outside its declaration.`
+    // Two different claims, and conflating them is the reason `kind` exists at all: "no usages
+    // outside its declaration" tells a user their interface is unused, which is not what "nothing
+    // implements it" says and is not what they asked.
+    return kind === 'implementations'
+      ? `Nothing implements ${subject(state.name)}.`
+      : `No usages of ${subject(state.name)} outside its declaration.`
   }
   if (state.shown === 0) {
     // Not "No usages": there are usages, and the user's own filter is hiding them. Saying the
@@ -120,7 +152,7 @@ export function usagesStatus(state: {
     return `No usage matches ‘${state.query.trim()}’.`
   }
   if (state.truncated) {
-    return `Showing the first ${state.total} usages — the search stopped at its cap.`
+    return `Showing the first ${state.total} ${verb} — the search stopped at its cap.`
   }
   return null
 }
@@ -138,6 +170,8 @@ export function noSymbolSentence(): string {
 }
 
 /** And the one for a search that came back empty — the notice, not the popup. */
-export function noUsagesSentence(name: string | null): string {
-  return `No usages of ${subject(name)} outside its declaration.`
+export function noUsagesSentence(name: string | null, kind: UsagesKind = 'usages'): string {
+  return kind === 'implementations'
+    ? `Nothing implements ${subject(name)}.`
+    : `No usages of ${subject(name)} outside its declaration.`
 }

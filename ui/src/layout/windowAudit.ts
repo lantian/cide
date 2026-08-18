@@ -165,6 +165,10 @@ export interface WindowAuditDriver {
    * The milestone names alt-screen state because it is the part of a transcript that lives
    * in the parser rather than in the bytes: a detach that rebuilt the vt100 mirror would
    * come back on the primary screen with the pager the user was reading gone.
+   *
+   * Used for two claims, and the second is the one that caught a real bug: that the *session*
+   * comes back on the buffer it left, and that the re-docked pane's own terminal is on the
+   * same buffer as its session. The pair is the point — the session's half always passed.
    */
   inAlternateScreen?(session: string): Promise<boolean>
   /** Resolve once React has committed and the browser has laid out against it. */
@@ -704,6 +708,37 @@ export async function runWindowAudit(
           backWhere,
           `session ${short(session)} came back on the ${altAfter ? 'alternate' : 'primary'} screen having been on the ${altBefore ? 'alternate' : 'primary'} one`,
         )
+      }
+
+      /*
+       * The other half of the alt-screen claim, and the half that was never checked.
+       *
+       * The assertion above is session-to-session: it proves the *mirror* kept the alternate
+       * screen across the round trip, which it always did. What broke was the pane — the
+       * terminal that re-docked came back on whatever buffer it happened to be on, because
+       * the reattach snapshot did not say which buffer it was a picture of and nothing else
+       * did either. Measuring only the session's side of that pair is why a permanently
+       * desynced pane could ship: the pane lost its scrollbar, xterm turned the wheel into
+       * cursor keys aimed at the agent's prompt, and the agent's repaints landed in rows that
+       * had scrolled away — all with this audit green.
+       *
+       * Waited for, not sampled: a re-docked pane re-attaches asynchronously (a spawn check,
+       * an attach, a snapshot), and `hydrated` going true is the moment the snapshot has been
+       * written. A pane that never gets there is not judged — it may be an evicted host, or a
+       * pane belonging to a project this window is not showing.
+       */
+      if (session !== null && altAfter !== null && hadHost) {
+        const rehydrated = await settled(() => peekHost(pane)?.hydrated === true)
+        const terminal = peekHost(pane)?.terminal
+        if (rehydrated && terminal !== undefined) {
+          const onAlt = terminal.term.buffer.active.type === 'alternate'
+          if (onAlt !== altAfter) {
+            fail(
+              backWhere,
+              `the pane's terminal came back on the ${onAlt ? 'alternate' : 'primary'} buffer while session ${short(session)} is on the ${altAfter ? 'alternate' : 'primary'} one`,
+            )
+          }
+        }
       }
 
       checkHostFaults(backWhere)

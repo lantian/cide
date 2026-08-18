@@ -1,6 +1,7 @@
 /**
  * Chords a terminal must resolve itself: the ones xterm.js would otherwise encode wrongly,
- * and the two clipboard chords that are the terminal's own rather than the key gate's.
+ * and the three that are the terminal's own rather than the key gate's — Ctrl+C, Ctrl+V and
+ * Ctrl+F.
  *
  * # Shift+Enter
  *
@@ -23,9 +24,9 @@
  * setup command produces is worth more here than being theoretically tidier: this is a
  * hand-shake with one specific program, not a general terminal feature.
  *
- * # Ctrl+C and Ctrl+V, and why they are decided here and not in the keymap
+ * # Ctrl+C, Ctrl+V and Ctrl+F, and why they are decided here and not in the keymap
  *
- * Neither chord is in `cide_core::keymap::defaults()`, and a Rust test now keeps it that way.
+ * None of the three is in `cide_core::keymap::defaults()`, and a Rust test keeps it that way.
  * The obvious design — bind them with `when: "terminalFocused"` — is wrong, and the reason is
  * already written down in `sidebar/FileTree.tsx`: **these chords are focus-scoped, not
  * context-scoped.** `terminalFocused` is derived from `tab.tree.focused`, a value Rust owns,
@@ -48,14 +49,49 @@
  *   empty-selection branch is the one that must never change. A copy writes nothing to the pty,
  *   so `onUserInput` does not fire and the selection would survive; the caller clears it, which
  *   is what makes "select, copy, interrupt" work without reaching for the mouse.
- * * **Ctrl+V pastes in a shell pane and is left alone in a Claude pane.** This is the reported
- *   asymmetry, and its cause is entirely on the child's side. `bash` binds `\x16` to readline's
+ * * **Ctrl+V pastes, in both pane kinds.** This rule used to return `null` for a Claude pane —
+ *   leaving `^V` to the CLI, which binds it and reads the *system* clipboard out of a
+ *   subprocess (`xclip -selection clipboard -t image/png -o … || wl-paste …`) — because that
+ *   is the only path an **image** has into a prompt and cide cannot reimplement it. The premise
+ *   was right and the conclusion was wrong, and the bug report is what showed the gap: the CLI
+ *   installs that handler at its *main prompt* only. At a numbered-choice prompt ("1. Yes, and
+ *   use auto mode / 2. … / 3. Tell Claude what to change"), or at any of its other questions,
+ *   nothing is listening for the chord — so the byte was swallowed three processes down and the
+ *   keystroke did nothing at all. The context menu's Paste worked the whole time, because it
+ *   calls `pasteIntoTerminal` directly and never came through here.
+ *
+ *   Both survive now, and the trade is made in `terminal/clipboard.ts` rather than here,
+ *   because it needs an answer this function cannot wait for: the clipboard is read, text is
+ *   pasted with `term.paste`, and when there is no text the `^V` byte is written at the child
+ *   after the fact so the CLI's own image paste runs exactly as before. That module's header
+ *   carries the whole argument, including why probing `read_image` was the wrong shape.
+ *
+ *   In a shell pane the paste is the same fix it always was: `bash` binds `\x16` to readline's
  *   `quoted-insert`, which swallows it and takes the next keystroke literally — "nothing
- *   happens". Claude Code binds ctrl+v itself and reads the *system* clipboard out of a
- *   subprocess (`xclip -selection clipboard -t image/png -o … || wl-paste …`, with a
- *   `text/plain` fallback), which is how an image reaches a prompt at all. Claiming the chord
- *   there would stop `^V` reaching the CLI and take image paste away — the one thing cide
- *   cannot reimplement, since the Tauri clipboard plugin only reads text.
+ *   happens".
+ * * * **Ctrl+F opens this pane's find bar**, in both kinds. Asked for as *"Need to add CTRL+F
+ *   (search bar) for claude and bash panels to be able to search text"*.
+ *
+ *   What it costs a child is real and is the reason it is written down rather than discovered:
+ *   xterm encodes plain Ctrl+F as `^F` (0x06), which is readline's `forward-char` and vim's
+ *   page-forward. Those go, in a terminal pane, on purpose.
+ *
+ *   **It is not a `keymap.json` default, and a `when: "terminalFocused"` one would have been a
+ *   bug.** That is the same argument the Ctrl+C/Ctrl+V section above makes, and here it is
+ *   sharper because Ctrl+F is a chord text surfaces actually use: `terminalFocused` is derived
+ *   from `tab.tree.focused`, so it stays true while the caret is in a rename field, the commit
+ *   message box or the Explorer's search input — and the gate's window *capture* listener would
+ *   take the keystroke from all of them, in every window whose focused pane happens to be a
+ *   terminal (which, in an IDE with a pinned Claude console, is most of the time). It would also
+ *   have had to fight `ui/src/editor/EditorSurface.tsx`, whose comment says in as many words
+ *   that binding `ctrl+f` in `cide-core::keymap` fights a written rule: CodeMirror's `Mod-f`
+ *   opens the *editor's* find bar and is reached only because this table stays silent.
+ *
+ *   The command is still real and still first-class — `terminal.find` is in
+ *   `cide_core::commands` with a `terminalFocused` clause, so it has a palette row and a
+ *   `keymap.json` line is all it takes to put it on ⌘F for a Mac. It simply ships with no
+ *   default chord, exactly as `terminal.clear` and `terminal.paste` do, and the chord that does
+ *   ship is focus-scoped here where it can only ever reach a terminal that has the keystroke.
  *
  * ## Why this matches on `key` where the key gate matches on `code`
  *
@@ -98,10 +134,12 @@ export interface TerminalKeyEvent {
 /**
  * Which of the two programs a terminal pane is hosting.
  *
- * The only thing the clipboard rule needs to know about a pane, and it is a real distinction
- * rather than a convenience: `claude` handles Ctrl+V itself and `bash` does not. Anything that
- * is not the Claude CLI is `'shell'` — a pane running some other program is a pane where the
- * chord is unclaimed, which is the same situation `bash` is in.
+ * A real distinction rather than a convenience: when the clipboard holds no text, `claude` is
+ * the one program that can still do something useful with a `^V` — it shells out to
+ * `xclip`/`wl-paste` and pastes an image — and `bash` turns the same byte into readline's
+ * `quoted-insert`, which eats the *next* keystroke. Anything that is not the Claude CLI is
+ * `'shell'`: a pane running some other program is a pane where the chord is unclaimed, which is
+ * the same situation `bash` is in.
  */
 export type TerminalPaneKind = 'claude' | 'shell'
 
@@ -116,8 +154,8 @@ export interface ClipboardFacts {
  * What this keystroke means for the clipboard, or `null` for "not ours".
  *
  * `null` is the load-bearing value: it means the caller returns `true` and *xterm* handles the
- * key, which for Ctrl+C is the interrupt and for Ctrl+V in a Claude pane is `^V` reaching the
- * CLI's own paste. Every branch that is not a copy or a paste has to reach it.
+ * key, which for Ctrl+C with nothing selected is the interrupt. Every branch that is not a copy
+ * or a paste has to reach it.
  */
 export type ClipboardAction = { kind: 'copy'; text: string } | { kind: 'paste' } | null
 
@@ -207,10 +245,43 @@ export function terminalClipboardAction(
   }
 
   if (letter(ev, 'v')) {
-    // Claude's own, deliberately. See the header: taking `^V` here would take image paste
-    // with it, and a text-only paste is a strictly worse version of what already works.
-    return facts.kind === 'claude' ? null : { kind: 'paste' }
+    /*
+     * Both kinds, and `facts.kind` no longer decides it here.
+     *
+     * It used to: a Claude pane returned `null` so `^V` reached the CLI's own paste, image
+     * included. That left every Claude prompt *other than* the main one — the numbered-choice
+     * questions, the permission prompts — with a Ctrl+V that did nothing, because nothing down
+     * there was listening for the byte. See the header.
+     *
+     * The kind still decides the *fallback*, but that decision is `pasteIntoTerminal`'s: it
+     * needs to know whether the clipboard holds text, and that is an `await`. This function is
+     * called from xterm's custom key handler, which is synchronous and whose return value is
+     * the only thing that stops `^V` reaching the pty — so the decision to intercept has to be
+     * made before the answer exists. Intercept always, re-emit `^V` when there was no text: the
+     * image path costs one round trip of latency and nothing else.
+     */
+    return { kind: 'paste' }
   }
 
   return null
+}
+
+/**
+ * Whether this keystroke should open the pane's find bar instead of reaching the child.
+ *
+ * Separate from [`terminalClipboardAction`] rather than a third `ClipboardAction` variant: that
+ * type is about the system clipboard and its two branches both end in `terminal/clipboard.ts`,
+ * whereas this one ends in a piece of pane chrome. Folding them would make one function's name
+ * a lie and force every caller of either to know about both.
+ *
+ * Same shape as everything else here — plain Ctrl only, `key` rather than `code`, keydown only —
+ * and for the same three reasons, which the module header states once.
+ *
+ * `true` means the caller must return `false` to xterm. `^F` is a byte a child wants (readline's
+ * `forward-char`), so nothing else stops it.
+ */
+export function terminalOpensFind(ev: TerminalKeyEvent): boolean {
+  if (ev.type !== 'keydown') return false
+  if (!plainCtrl(ev)) return false
+  return letter(ev, 'f')
 }

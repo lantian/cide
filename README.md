@@ -2194,11 +2194,15 @@ pane's `EditorView` — which is the seam `paneHosts.ts` exists to keep closed. 
 half-built, since naming a cost and then not paying it is the failure this whole section is about.
 
 **Verified against real servers.** `cargo test -p cide-lsp -- --ignored` drives the real binaries;
-**CI does not run it**, so run it by hand after touching that crate. All seven pass — `gopls`
+**CI does not run it**, so run it by hand after touching that crate. All eleven pass — `gopls`
 reporting on a module, rust-analyzer indexing this workspace and reporting an introduced type
 error, the shutdown ladder actually stopping a server, the on-disk-edit test below, a real
-`textDocument/definition` resolving a reference to its declaration, and (M14) a real
-`textDocument/references` listing the call site of a declaration and *not* the declaration itself.
+`textDocument/definition` resolving a reference to its declaration, (M14) a real
+`textDocument/references` listing the call site of a declaration and *not* the declaration itself,
+and (M18) the four that back the section after next: the flycheck kick clearing a diagnostic an
+on-disk edit alone would not, gopls re-diagnosing a file it was only *told* had changed, and
+definition-versus-implementation giving two different answers at one caret in Go and the concrete
+`impl` in Rust. Run against rust-analyzer 1.92.0 and gopls v0.21.0.
 
 Verified in the app, too, once: with a type error planted in `cide-core` *after* the build, a
 launched binary logged `published … child_env.rs n=2 "mismatched types: expected u32, found &str"`
@@ -2246,6 +2250,92 @@ wait. The panel froze at the state the project opened in while the user edited u
 is worse than showing nothing. `ui/src/editor/docSync.ts` now sends all four, refcounted by path so
 a split is one open document, and flushes the pending change *before* `didSave` so the server never
 checks text from 300 ms ago.
+
+## Diagnostics that follow the disk, and a button to re-run them (M18)
+
+Reported as *"rust-analyzer doesn't catch every change — after Claude fixes some hints I still see
+them, and clicking one goes to some comments rather than the line, and I have no manual button to
+re-run it in the Problems panel."* Three separate defects wearing one sentence.
+
+**Nothing carried an out-of-editor write to a language server.** Document sync (above) covers the
+buffer the *user* is typing in. It says nothing about the file an agent just rewrote in a tab
+nobody opened — which, in an editor whose centre of gravity is a Claude session, is most of the
+writes. The watcher's events reached the file tree, the picker and `cide-lang`'s symbol index and
+stopped there. `FsEvents` now has a third method, `files_changed`, and `ProjectDiagnostics::
+files_changed` decides what each server needs:
+
+- **gopls gets `workspace/didChangeWatchedFiles`, at once.** It has no watcher of its own — it
+  registers watch patterns through `client/registerCapability` and then waits — so this
+  notification is how it learns anything the editor did not tell it. That also means the client
+  capability has to be declared, and it now is, **for gopls only**.
+- **rust-analyzer gets `rust-analyzer/runFlycheck`, debounced.** Deliberately *not* the
+  `didChangeWatchedFiles` capability: declaring it transfers responsibility for file notifications
+  to the client, and cide's watcher is gitignore-filtered and confined to the project's roots,
+  where rust-analyzer's own watcher additionally sees path dependencies and `~/.cargo/registry`
+  sources. Narrowing what it sees would trade a stale-diagnostics bug for a wrong-answer bug. Its
+  problem was never file notification anyway — semantic analysis already followed the disk; it is
+  *flycheck*, the `cargo check` behind every `E0308`, that only ran on a save. The kick is
+  coalesced (500 ms trailing, 5 s ceiling) because a `cargo fmt` over four hundred files must
+  produce one `cargo check` and not four hundred.
+
+`an_on_disk_edit_alone_never_refreshes_diagnostics` is unchanged and still asserts the negative —
+it sends nothing, so it stays true. `a_flycheck_kick_refreshes_diagnostics_an_on_disk_edit_alone_
+would_not` is its exact inverse and is the only gate on the extension still existing: a
+notification produces no reply, so a server that stopped implementing it would drop the kick in
+silence.
+
+**A stale row kept its old line number, and said nothing about it.** That is the "clicking it goes
+to comments" half, and it is true for a window even with the above fixed. `Diagnostic` now carries
+`stale`, set in `DiagnosticStore::snapshot` from a `(source, path)` dirty set the watcher marks and
+a publish clears. Keyed by source and not by path alone, because tree-sitter re-parses the open
+buffer on every keystroke while rust-analyzer's flycheck may be twenty seconds away, and a
+path-keyed set would let the first un-mark the second's rows — under-reporting, which is the defect
+itself. The row stays clickable and says *"changed since it was checked"*: a jump that may be a few
+lines off beats a dead row, as long as it is labelled.
+
+**The panel had no controls, and one of them already existed.** `diagnostics.restart` shipped in
+M12 fully implemented, unit-tested, registered in `contract/commands.json` and wrapped in
+`client.ts` — with **no caller anywhere in the app**. So did `snapshot.sources`: on the wire since
+M12, converted by `adapt.ts` on every emit, rendered nowhere, which meant *"rust-analyzer is not on
+PATH"* — the one sentence that explains an empty list — crossed the IPC boundary and was thrown
+away. The panel now has a footer listing every analyser with its status, a **Restart** button on
+the two that are processes (tree-sitter and Claude get none, because `restart` returns immediately
+for them and a button that does nothing is the failure this panel exists to avoid), and a
+**Re-run** button beside it. Re-run is the cheap one — seconds, no re-index — and is also
+`problems.refresh` in the palette. **No default binding**: IDEA and VS Code ship none for their
+equivalents, and a chord is taken from every terminal pane in every window.
+
+## Go to implementation, which is a different question from Go to definition (M18)
+
+Reported as *"goto for golang goes to the interface declaration, but should go to the
+implementation."* gopls is answering correctly: `textDocument/definition` on a call through an
+interface resolves to the interface's method, because that is where the callee is declared. cide
+simply never asked the other question.
+
+**Ctrl+Alt+B**, IDEA's own chord, on a new id `navigate.implementation`, scoped `editorFocused` for
+the reason every other member of that group is — the key gate is a window *capture* listener, and
+Ctrl+Alt+B is `ESC ^B` to a shell. Ctrl+B and Ctrl+click are untouched and still mean "definition".
+
+Teaching Ctrl+B to try implementation first and fall back was the obvious fix and it regresses
+Rust: rust-analyzer answers `textDocument/implementation` on a struct name with its `impl` blocks
+and on a trait with its implementors, so Ctrl+click on an ordinary type name would stop opening the
+declaration. Changing the most-used gesture in one language to fix a complaint in another is the
+trade `navigate.usages` already refused once, for the same reason.
+
+It reuses the Find usages popup wholesale — same 0/1/≥2 rule, and ≥2 is the *common* case here
+because an interface with many implementors is the normal shape — with one difference and one
+correction. The difference: **0 falls through to Go to definition**, so the command always does
+something wherever a caret is. The correction: the popup's prose branches on which question was
+asked, because telling a user who pressed Ctrl+Alt+B *"no usages of ‘Reader’ outside its
+declaration"* claims their interface is unused, which is not what they asked and not true.
+
+`gopls_goes_to_the_implementation_rather_than_the_interface` asserts **both** halves at one caret —
+definition landing on the interface's method, implementation landing on the concrete one — because
+a test that only asked the second would pass on a build where the separate command had become
+pointless. It also caught something worth knowing: gopls answers `textDocument/implementation` on a
+position that is not a type with a JSON-RPC **error** (*"s is a var, not a type"*) rather than with
+`null`, so `RequestError::Failed` is folded into `NotFound` — the server's words go to the log, and
+the user gets the definition they were reaching for instead of a sentence that reads like a fault.
 
 **On screen and fed.** The Problems panel renders a live snapshot, the status bar's counts and the
 ⚑ rail badge are derived from that *same* snapshot (so the three cannot disagree about whether the
@@ -2441,6 +2531,56 @@ a detached pane does not cross into the shell window, so a cross-window jump int
 opens it at line 1. The lookup gives up after five seconds and says the server is still indexing —
 which, for the first minute of a session on a large workspace, is the truthful answer.
 
+
+## Hidden and ignored files in the trees (M18)
+
+The walk was `hidden(true).git_ignore(true).ignore(true)`, so a dot-prefixed entry and anything a
+`.gitignore` covered were simply absent — including `.claude`, which is a directory a user of this
+particular IDE has every reason to want to open.
+
+Both are now settings, and they are settings rather than an unconditional change because the cost
+is not symmetric with the benefit. Showing dotfiles adds tens of entries; showing ignored files
+adds `target/` and `node_modules/`, which on a real repository is a very large number of rows to
+walk, hold, offer to Ctrl+P and *watch* — one `Filter` serves the tree, the picker, content search
+and symbol indexing alike, so the cost lands on all of them at once. `.git` itself stays hidden
+either way. Ignored rows are drawn in a muted tone from the token palette rather than a literal
+colour copied from IDEA, so they read as present-but-excluded in both themes.
+
+Two things worth knowing, neither of them hidden in the code: the walk and the *watcher* share the
+same matchers, so both halves move together or the tree and its events disagree; and flipping
+either toggle rebuilds the `Index`, which is where folder expansion state lives, so the tree comes
+back collapsed.
+
+## A find bar in terminal panes, and what Ctrl+V now means (M18)
+
+Ctrl+F opens a find bar over a Claude or shell pane, driven by `@xterm/addon-search`, which was
+already a dependency and previously unused.
+
+The scope is the honest half. A full-screen TUI runs on the **alternate** buffer, which *is* the
+visible screen — there is no scrollback under it, and `cide_pty`'s vt100 mirror holds the same
+alternate screen, so the transcript a user remembers reading is genuinely not being kept by anyone
+while Claude owns the display. Search there still works, it simply cannot see one line further
+than the user can, and the bar says so (`visible screen only — this program is drawing a
+full-screen view`) rather than quietly returning nothing for a word that is plainly ten lines up.
+Writing `\x1b[?1049l` to reach the scrollback was rejected: taking the child's screen away in
+order to look at it is the `layout/paneHosts.ts` class of bug one layer down.
+
+The cost is deliberate and named in `terminal/keys.ts`: plain `^F` (0x06) no longer reaches the
+child, so readline's `forward-char` and vim's page-forward are gone in a terminal pane, on the
+same argument that already applies to Ctrl+C and Ctrl+V.
+
+Ctrl+V changed meaning in a Claude pane. It used to pass `^V` straight through so that Claude's own
+paste — including **image** paste, which cide cannot do — handled it. That works at Claude's main
+prompt and nowhere else: a numbered-choice prompt has no paste handler, so the keystroke vanished
+and the only way in was the context menu.
+
+The ordering is what makes the fix non-obvious. xterm's custom key handler is **synchronous**, and
+its return value is the only thing that can stop `^V` reaching the pty — but "does the clipboard
+hold text?" is an `await`, so the decision to intercept has to be made before the answer exists.
+So the keystroke is now *always* intercepted, and re-emitted as `\x16` to the CLI when the
+clipboard turns out to hold no text. Text pastes through cide; an image still reaches Claude's own
+handler, one round trip later. Both live in the single implementation in `terminal/clipboard.ts`
+that the keystroke and the context menu share.
 
 ## Verifying the Claude Code CLI
 

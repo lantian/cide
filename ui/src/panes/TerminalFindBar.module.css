@@ -1,0 +1,148 @@
+/*
+ * The terminal pane's find bar.
+ *
+ * # Why it is at the BOTTOM, when the editor's is at the top
+ *
+ * The pane's control cluster (⊞⛶⧉×) floats in the top-right corner of every pane frame at
+ * `z-index: 2` and is revealed on hover, and it is the surface a search field must not fight.
+ * The editor found that out the hard way: its bar reserved `--pane-corner-clear` and stopped
+ * 221px short of the right edge to stay clear of the buttons, and the user rejected it — *a
+ * search field is the width of the thing being searched* — so `PaneTitleBar.module.css` grew a
+ * `:has()` rule that steps the **cluster** down by `--h-findbar` instead. See that file; the
+ * whole argument, and the five alternatives that lost, are written out there.
+ *
+ * That rule is scoped to `[data-kind='editor']` and stays that way. Widening it would put this
+ * bar under the same mechanism, and it would cost the thing the mechanism was invented to
+ * protect: a terminal pins nothing above its transcript, so `--pane-top-strip` is `0px` for
+ * every terminal and the cluster sits flush on line 1. Making the cluster step down whenever a
+ * find bar is open means the four buttons *move* the moment Ctrl+F is pressed, in a pane whose
+ * top-left corner is where a TUI draws its own header.
+ *
+ * The bottom has none of that. `panes/TerminalPane.tsx` already parks the restart bar there for
+ * exactly this reason ("*Under the pane frame's floating control cluster … so this cannot cover
+ * the close button, and the cluster cannot cover these two, because they sit at the other end of
+ * the pane*"), and the two share one stack so they can never cover each other either.
+ *
+ * What it costs, named rather than discovered: the bar covers the last two rows of the
+ * transcript, which in a live Claude pane is the prompt. It is up only while a search is being
+ * typed, Escape gets those rows back, and `findNext` scrolls a match into the viewport — so the
+ * rows it hides are the ones a search is least likely to be looking at. Covering the *first* two
+ * rows instead would hide a TUI's header for the same duration and would move the cluster.
+ */
+
+/*
+ * The stack both bottom bars live in, so the pane never has two things claiming `bottom: 0`.
+ *
+ * Absolutely positioned rather than in flow, for the reason `TerminalPane`'s own comment gives
+ * about the restart bar: `PaneSlot` claims `height: 100%`, so a sibling above the terminal in
+ * flow pushes the terminal its own height past the bottom of the pane frame and it paints over
+ * the row below. A column so that a pane whose child has exited *and* whose find bar is open
+ * shows both, in that order — the restart bar keeps the bottom edge it has always had, and the
+ * find bar sits on top of it.
+ *
+ * `pointer-events: none` on the container with `auto` on the bars themselves: the container
+ * spans the full width even when a bar inside is narrower, and a transparent strip that
+ * swallows clicks meant for the terminal is the failure `.cluster` documents at length.
+ */
+.stack {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+  /*
+   * Under the cluster's `z-index: 2`, which is scoped to the pane frame by its `isolation:
+   * isolate`. The two never meet — they are at opposite ends of the pane — but the order is
+   * stated so that a pane shorter than both resolves in favour of the buttons rather than
+   * burying the close control.
+   */
+  z-index: 1;
+}
+
+.stack > * {
+  pointer-events: auto;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 19px;
+  color: var(--dim);
+}
+
+.field {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+}
+
+.field:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/*
+ * The counter, which must not resize the bar as the number changes.
+ *
+ * `tabular-nums` and a floor on the width: without them, `1 of 12` → `10 of 12` shifts every
+ * control to its left by a character, on every press of the next button. `flex: none` so it
+ * never steals width from the field.
+ */
+.count {
+  flex: none;
+  min-width: 68px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/*
+ * "You are searching the visible screen only." Drawn, not hidden behind a tooltip.
+ *
+ * `min-width: 0` with an ellipsis rather than a wrap: the bar is one line high and a note that
+ * wrapped would change the bar's height under the terminal, refitting the child. The full
+ * sentence is on the `title`, so a narrow pane truncates the explanation rather than losing it.
+ */
+.scope {
+  flex: 2;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--yellow);
+}
+
+.button {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+  color: var(--text-hi);
+  border-color: var(--accent);
+}
+
+.button:disabled {
+  color: var(--dim);
+  cursor: default;
+  opacity: 0.5;
+}

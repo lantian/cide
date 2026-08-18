@@ -45,6 +45,7 @@ export { ProblemsPanel, type ProblemsPanelProps } from './ProblemsPanel'
 export {
   NO_DIAGNOSTICS_SOURCE,
   NO_SOURCE,
+  STALE_NOTE,
   checked,
   countBySeverity,
   groupByFile,
@@ -52,6 +53,7 @@ export {
   isSeverity,
   metaFigure,
   severityRank,
+  sourceRows,
   statusBarCounts,
   summaryLine,
   type Diagnostic,
@@ -61,4 +63,5 @@ export {
   type HeadlineTone,
   type Severity,
   type SeverityCounts,
+  type SourceRow,
 } from './model'

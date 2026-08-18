@@ -34,11 +34,12 @@ Rust *also* keeps a `vt100::Parser` per session, fed **always**, attached or not
 lines of scrollback. It is never used to paint the live terminal. It exists for three things
 that A alone cannot do:
 
-- **Attach.** `session.attach` sends `vt.screen().state_formatted()` as the first frame —
-  contents, alt-screen flag, bracketed paste, mouse protocol, cursor — so a window that has
-  just opened shows the session as it is rather than as it will be from the next byte on.
+- **Attach.** `session.attach` sends `PtySession::reattach_state()` as the first frame —
+  contents, bracketed paste, mouse protocol, cursor, **and which of the two buffers that
+  picture is of** — so a window that has just opened shows the session as it is rather than
+  as it will be from the next byte on.
 - **Catch-up.** When a sink falls more than 500 ms behind, the raw stream is dropped and one
-  `state_formatted()` frame is pushed instead.
+  `reattach_state()` frame is pushed instead.
 - **Host eviction.** Live terminal hosts are capped; an evicted idle pane rehydrates from the
   mirror.
 
@@ -68,7 +69,19 @@ fullscreen TUI repaints from its own model — covering everything `vt100` does 
   frame shears.
 - Two representations of one screen exist and can in principle disagree. They are reconciled
   in one direction only — the mirror seeds a new attachment, never corrects a live one — so a
-  divergence costs one stale first frame, not a permanently wrong terminal.
+  divergence costs one stale first frame, not a permanently wrong terminal. **That held only
+  once the seed said which buffer it was a picture of, and for a long time this document
+  claimed it did when it did not.** `vt100::Screen::state_formatted` dumps whichever grid is
+  active and emits no `?1049` at all, so a sink that missed the child's own `?1049h`/`?1049l`
+  — which a *choked* sink is designed to do, since its raw frames are skipped and this
+  snapshot is substituted — sat on the other buffer from the child for the rest of the
+  session, with nothing able to bring the two back. The reported symptoms were a pane with no
+  scrollbar whose wheel xterm turned into cursor keys aimed at the agent's prompt, and an
+  agent's question that was drawn into rows the viewport no longer had, so it appeared only
+  when a resize forced a full repaint. `cide_pty::reattach_bytes` prepends the buffer, which
+  is what makes the seed self-sufficient; `PtySession::screen_state` is kept, unprefixed, for
+  the one consumer that must *not* follow the buffer — replaying a dead child's last screen
+  into a fresh shell (`SpawnSpec::preload`).
 - Credit flow control has a deadlock shape: a webview that stops acking (crash, GPU hang,
   occluded-window throttle, WebGL context loss) would pin a session above the high-water mark
   forever, looking frozen with no error anywhere. Mitigated by a 5 s watchdog force-reset, by

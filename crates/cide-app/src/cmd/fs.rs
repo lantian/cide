@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cide_fs::{FsError, ops};
+use cide_fs::{FsError, Visibility, ops};
 use cide_ipc::{FsStatus, ProjectId, TreeRow};
 use tauri::{Manager, State};
 
@@ -79,12 +79,16 @@ pub async fn fs_index(
     registry: State<'_, FsRegistry>,
     project: ProjectId,
 ) -> Result<FsStatus, FsError> {
-    let roots: Vec<PathBuf> = state.with(|ws| {
-        cide_core::workspace::project(ws, project)
+    // Both out of one `with`: the roots and the visibility have to describe the same instant,
+    // and two reads with a settings write between them would walk one answer and filter by the
+    // other.
+    let (roots, visibility) = state.with(|ws| {
+        let roots = cide_core::workspace::project(ws, project)
             .map(|p| p.roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (roots, crate::files::visibility_of(&ws.settings))
     });
-    index_project(Arc::new(app), &registry, project, roots).await
+    index_project(Arc::new(app), &registry, project, roots, visibility).await
 }
 
 /// [`fs_index`] with its two Tauri-injected arguments already resolved to values.
@@ -98,11 +102,12 @@ pub(crate) async fn index_project(
     registry: &FsRegistry,
     project: ProjectId,
     roots: Vec<PathBuf>,
+    visibility: Visibility,
 ) -> Result<FsStatus, FsError> {
     if roots.is_empty() {
         return Err(FsError::NoIndex);
     }
-    match registry.claim(project, roots) {
+    match registry.claim(project, roots, visibility) {
         Ok(walk) => blocking("fs_index", move || walk.run(events, project)).await,
         Err(already_running) => Ok(already_running),
     }
@@ -1519,7 +1524,9 @@ mod tests {
                 let registry = Arc::clone(&registry);
                 let events: Arc<dyn FsEvents> = counter.clone();
                 let roots = vec![corpus.path().to_path_buf()];
-                tokio::spawn(async move { index_project(events, &registry, project, roots).await })
+                tokio::spawn(async move {
+                    index_project(events, &registry, project, roots, Visibility::CONSERVATIVE).await
+                })
             };
 
             let (frames, found) = watch_one_walk(&registry, project, started).await;
@@ -1599,7 +1606,9 @@ mod tests {
             let registry = Arc::clone(&registry);
             let events: Arc<dyn FsEvents> = counter.clone();
             let roots = roots.clone();
-            tokio::spawn(async move { index_project(events, &registry, project, roots).await })
+            tokio::spawn(async move {
+                index_project(events, &registry, project, roots, Visibility::CONSERVATIVE).await
+            })
         };
 
         // Wait for the walk to be genuinely in flight before asking again. Issuing the second
@@ -1625,9 +1634,15 @@ mod tests {
         // would have awaited that walk and answered `indexing: false` with the corpus
         // injected twice.
         let events: Arc<dyn FsEvents> = counter.clone();
-        let second = index_project(events, &registry, project, roots.clone())
-            .await
-            .expect("a second fs_index is not an error");
+        let second = index_project(
+            events,
+            &registry,
+            project,
+            roots.clone(),
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("a second fs_index is not an error");
         assert!(
             second.indexing,
             "a second fs.index during a walk answered as if it had done a walk of its own"
@@ -1685,9 +1700,15 @@ mod tests {
         let roots = vec![dir.path().to_path_buf()];
 
         let events: Arc<dyn FsEvents> = counter.clone();
-        let first = index_project(events, &registry, project, roots.clone())
-            .await
-            .expect("the first index");
+        let first = index_project(
+            events,
+            &registry,
+            project,
+            roots.clone(),
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the first index");
         assert_eq!(first.files, FILES, "the walk did not see the corpus");
         assert_eq!(
             counter.walks_started.load(Ordering::Relaxed),
@@ -1701,7 +1722,7 @@ mod tests {
         );
 
         let events: Arc<dyn FsEvents> = counter.clone();
-        let second = index_project(events, &registry, project, roots)
+        let second = index_project(events, &registry, project, roots, Visibility::CONSERVATIVE)
             .await
             .expect("a second fs.index is not an error");
 
@@ -1759,6 +1780,7 @@ mod tests {
             &registry,
             project,
             vec![first_root.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
         )
         .await
         .expect("the first index");
@@ -1773,6 +1795,7 @@ mod tests {
                 first_root.path().to_path_buf(),
                 second_root.path().to_path_buf(),
             ],
+            Visibility::CONSERVATIVE,
         )
         .await
         .expect("the re-index");
@@ -1813,7 +1836,11 @@ mod tests {
         let project = ProjectId::new();
 
         let claimed = registry
-            .claim(project, vec![dir.path().to_path_buf()])
+            .claim(
+                project,
+                vec![dir.path().to_path_buf()],
+                Visibility::CONSERVATIVE,
+            )
             .expect("a project nobody has indexed claims");
 
         let frame = query_project(&registry, project, NEEDLE.to_string(), Some(50), false)
@@ -1867,7 +1894,11 @@ mod tests {
         let generated = dir.path().join("src/generated.rs");
 
         let claimed = registry
-            .claim(project, vec![dir.path().to_path_buf()])
+            .claim(
+                project,
+                vec![dir.path().to_path_buf()],
+                Visibility::CONSERVATIVE,
+            )
             .expect("a project nobody has indexed claims");
         let fs = registry
             .get(project)
@@ -1885,6 +1916,96 @@ mod tests {
             !fs.filter().admits(&generated, false),
             "the accessor still returns the filter from before the walk, so a content search \
              using it would report hits inside directories the tree does not show"
+        );
+
+        drop(registry.remove(project));
+    }
+
+    /// A changed visibility setting is a re-walk, and the rows it asked for actually arrive.
+    ///
+    /// The half of *Show hidden files* / *Show ignored files* that lives in this crate. What is
+    /// pinned is the decision `FsRegistry::claim` makes: an index built under one answer is
+    /// **not** reusable under the other, because the entries the new answer wants were never
+    /// walked. Get that wrong and the toggle is inert — the settings screen saves, the walk is
+    /// declined as "already indexed", and `.claude` stays invisible with nothing in any log.
+    ///
+    /// The trigger — `settings_set` calling `reindex_open_projects` — cannot be driven from a
+    /// `#[test]`: it needs a Tauri `State`, which is the same split every test in this module
+    /// lives with (see the module note). What is covered here is everything below that call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changing_the_visibility_setting_re_walks_the_project_and_the_new_rows_appear() {
+        let dir = scratch("cmd-visibility");
+        std::fs::create_dir_all(dir.path().join(".claude")).expect("a dot directory");
+        std::fs::create_dir_all(dir.path().join("target/debug")).expect("a build directory");
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").expect("an ignore file");
+        std::fs::write(dir.path().join(".claude/settings.json"), b"{}").expect("a dot file");
+        std::fs::write(dir.path().join("target/debug/binary"), []).expect("build output");
+        std::fs::write(dir.path().join("main.rs"), []).expect("a source file");
+
+        let registry = FsRegistry::default();
+        let project = ProjectId::new();
+        let counter = Arc::new(Counting::default());
+
+        // `names` re-reads the *top-level* rows, which is all these assertions need: a hidden
+        // or ignored directory that is in the tree at all is a top-level row of this project.
+        let names = |registry: &FsRegistry| -> Vec<String> {
+            let fs = registry.get(project).expect("an indexed project");
+            fs.with_index(|index| index.rows(0, 64))
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        let index = |visibility| {
+            let events: Arc<dyn FsEvents> = counter.clone();
+            index_project(
+                events,
+                &registry,
+                project,
+                vec![dir.path().to_path_buf()],
+                visibility,
+            )
+        };
+
+        index(Visibility::CONSERVATIVE).await.expect("the walk");
+        let before = names(&registry);
+        assert!(before.contains(&"main.rs".to_string()));
+        assert!(!before.contains(&".claude".to_string()), "{before:?}");
+        assert!(!before.contains(&"target".to_string()), "{before:?}");
+
+        // The same request again: still one walk. This is the property the visibility
+        // comparison must not break — two windows both calling `fs.index` is the ordinary case.
+        index(Visibility::CONSERVATIVE).await.expect("the no-op");
+        assert_eq!(counter.walks_started.load(Ordering::Relaxed), 1);
+
+        let shown = Visibility {
+            hidden: true,
+            ignored: true,
+        };
+        index(shown).await.expect("the re-walk");
+        assert_eq!(
+            counter.walks_started.load(Ordering::Relaxed),
+            2,
+            "a project whose visibility setting moved was not walked again, so the toggle the \
+             user just flipped changed nothing at all"
+        );
+        let after = names(&registry);
+        assert!(after.contains(&".claude".to_string()), "{after:?}");
+        assert!(after.contains(&"target".to_string()), "{after:?}");
+        assert!(
+            !after.contains(&".git".to_string()),
+            "never `.git`, whatever the setting says: {after:?}"
+        );
+
+        // And the watch list is not the row list: `target/` is drawn and unwatched. Asserted
+        // through the filter the project actually holds, which is the object the watcher was
+        // handed by `Indexing::run`.
+        let fs = registry.get(project).expect("an indexed project");
+        let filter = fs.filter();
+        assert!(filter.admits(&dir.path().join("target"), true));
+        assert!(
+            !filter.watchable(&dir.path().join("target"), true),
+            "a shown `target/` must still cost no inotify descriptors, or a cargo build is a \
+             storm of tree updates"
         );
 
         drop(registry.remove(project));
@@ -1910,9 +2031,15 @@ mod tests {
         let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
         let project = ProjectId::new();
 
-        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![dir.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(project).expect("an indexed project");
         // Expanded first, exactly as the panel does before it shows its draft row: a new file
         // inside a collapsed folder is in the index and contributes no *visible* row, and
@@ -1994,9 +2121,15 @@ mod tests {
         let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
         let project = ProjectId::new();
 
-        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![dir.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(project).expect("an indexed project");
         // Both folders expanded, exactly as a user pasting between two visible directories
         // would have them: a row inside a collapsed folder is in the index and contributes no
@@ -2063,9 +2196,15 @@ mod tests {
         let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
         let project = ProjectId::new();
 
-        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![dir.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(project).expect("an indexed project");
         fs.with_index_mut(|index| index.expand(&dir.path().join("src")));
         fs.with_index_mut(|index| index.expand(&dir.path().join("dest")));
@@ -2113,9 +2252,15 @@ mod tests {
         let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
         let project = ProjectId::new();
 
-        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![dir.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(project).expect("an indexed project");
 
         assert!(matches!(
@@ -2148,9 +2293,15 @@ mod tests {
         let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
         let project = ProjectId::new();
 
-        index_project(events, &registry, project, vec![dir.path().to_path_buf()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![dir.path().to_path_buf()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(project).expect("an indexed project");
         let rows = fs.with_index(|index| index.count());
 
@@ -2220,9 +2371,15 @@ mod tests {
         // does not know answers with an empty list. Indexing that would register an entry
         // whose picker is permanently empty and whose tree is permanently zero rows, which
         // reads to every caller as "this repository has no files".
-        let error = index_project(events, &registry, project, Vec::new())
-            .await
-            .expect_err("a rootless project cannot be indexed");
+        let error = index_project(
+            events,
+            &registry,
+            project,
+            Vec::new(),
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect_err("a rootless project cannot be indexed");
         assert_eq!(error, FsError::NoIndex);
         assert!(status_of(&registry, project).await.is_err());
     }
@@ -2533,9 +2690,15 @@ mod scratch_tests {
         let registry = FsRegistry::default();
         let events: Arc<dyn FsEvents> = Arc::new(Silent);
         let id = ProjectId::new();
-        index_project(events, &registry, id, vec![root.clone()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            id,
+            vec![root.clone()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(id).expect("an indexed project");
         (registry, id, fs, root)
     }
@@ -2935,9 +3098,15 @@ mod external_libraries_tests {
         let registry = FsRegistry::default();
         let events: Arc<dyn FsEvents> = Arc::new(Counting::default());
         let project = ProjectId::new();
-        index_project(events, &registry, project, vec![root])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            project,
+            vec![root],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(project).expect("an indexed project");
         (registry, project, fs)
     }
@@ -3148,9 +3317,15 @@ mod notes_tests {
         let registry = FsRegistry::default();
         let events: Arc<dyn FsEvents> = Arc::new(Silent);
         let id = ProjectId::new();
-        index_project(events, &registry, id, vec![root.clone()])
-            .await
-            .expect("the walk");
+        index_project(
+            events,
+            &registry,
+            id,
+            vec![root.clone()],
+            Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the walk");
         let fs = registry.get(id).expect("an indexed project");
         (registry, id, fs, root)
     }

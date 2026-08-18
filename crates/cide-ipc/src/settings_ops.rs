@@ -14,8 +14,8 @@ use ts_rs::TS;
 
 use crate::Theme;
 use crate::settings::{
-    ClaudeSettings, EditorSettings, GraphicsSettings, InspectionSettings, ProxySettings,
-    SidebarSettings, TerminalSettings,
+    ClaudeSettings, EditorSettings, ExplorerSettings, GraphicsSettings, InspectionSettings,
+    ProxySettings, SidebarSettings, TerminalSettings,
 };
 
 /// A partial update to [`crate::Settings`]. `None` means "leave this alone".
@@ -74,6 +74,14 @@ pub struct SettingsPatch {
     /// a stale local copy.
     #[ts(optional)]
     pub sidebar: Option<SidebarSettings>,
+    /// What the file tree walks. (M18)
+    ///
+    /// The one patch field whose arrival is not just a stored value: `settings_set` compares it
+    /// against what the open projects were indexed with and re-walks the ones that no longer
+    /// match. See [`crate::settings::ExplorerSettings`] — there is no way to patch an index into
+    /// showing entries it never walked.
+    #[ts(optional)]
+    pub explorer: Option<ExplorerSettings>,
     /// The Inspections screen, sent whole like every other group.
     ///
     /// `push_debounce_ms` is clamped where this lands (`cmd::settings::apply_patch`) rather

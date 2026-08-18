@@ -1,11 +1,19 @@
 /**
  * Jump to where the thing under the caret is declared.
  *
- * # One function, three callers
+ * # One function, several callers
  *
- * The code pane's context menu, `Ctrl+B` through the command registry, and `Ctrl+Click` in the
- * buffer all land here. Three copies of "ask, then reveal, then open" would be three chances to
+ * `Ctrl+B` through the command registry, `Ctrl+Click` in the buffer (via `codeIntel.ts`'s
+ * `ctrlActivate`, whose jump branch inlines the same order rather than calling this), and — since
+ * M18 — the empty-answer fallback of Go to implementation, which is the majority of the positions
+ * that command is pressed at. Copies of "ask, then reveal, then open" would each be a chance to
  * get the *order* wrong, and the order is the whole correctness of it — see below.
+ *
+ * This header used to claim "the code pane's context menu" as a third caller. There is no such
+ * entry: `grep -rn definition ui/src/menus/` finds nothing, and there never was one. Left recorded
+ * rather than quietly deleted, because a comment that names a caller which does not exist is how
+ * the next reader concludes a surface is wired when it is not — the exact class of defect the
+ * `navigate.*` family keeps being audited for.
  *
  * # What this is not
  *

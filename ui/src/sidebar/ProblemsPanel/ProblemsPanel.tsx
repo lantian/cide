@@ -24,20 +24,41 @@
  * Nothing here reaches into the store, matching every other chrome/sidebar surface: the host
  * passes a snapshot, or passes none and gets the v1 truth. See `index.ts` for the App.tsx
  * block.
+ *
+ * ## What M12 and M18 changed, and what did not
+ *
+ * The paragraphs above are the record of why this surface was written before there was anything
+ * to put in it, and they stay: the *shape* they argue for is what let a real `DiagnosticsSnapshot`
+ * be dropped in without a rewrite. What is no longer true is the first sentence — cide has had a
+ * language-server client since M12 (`crates/cide-lsp`), and `App.tsx` passes a live snapshot.
+ *
+ * M18 added the two things that were still missing at the last inch:
+ *
+ * * **The footer.** `snapshot.sources` has been on the wire since M12 and `adapt.ts` has been
+ *   converting it that whole time, and this component rendered none of it — so *"rust-analyzer is
+ *   not installed"*, the one sentence that explains an empty list, arrived and was discarded. With
+ *   it comes the first caller in the entire app of `diagnostics.restart`, which had been real,
+ *   tested and contract-registered with nothing invoking it.
+ * * **Staleness.** A diagnostic carries the line it had when it was published, and out-of-editor
+ *   writes (an agent's edit, a `git checkout`) move the file underneath it. The row now says so
+ *   rather than silently sending the user to whatever is at that line now.
  */
 import { useMemo } from 'react'
 import type { ProjectId } from '@/ipc/client'
 import {
   NO_SOURCE,
+  STALE_NOTE,
   checked,
   groupByFile,
   headline,
   isSeverity,
   metaFigure,
+  sourceRows,
   summaryLine,
   type DiagnosticsSnapshot,
   type HeadlineTone,
   type Severity,
+  type SourceRow,
 } from './model'
 import styles from './ProblemsPanel.module.css'
 
@@ -109,6 +130,26 @@ export interface ProblemsPanelProps {
    * site, and every fixture, keeps its behaviour exactly.
    */
   hidden?: number | undefined
+  /**
+   * Re-run every analyser for this project. (M18)
+   *
+   * The button the user asked for in as many words. Optional for the same reason
+   * [`onOpenLocation`] is: the panel owns no IPC client, and without a handler the control is not
+   * rendered at all rather than rendered dead — a button that does nothing when pressed is the
+   * bug this whole surface keeps being rewritten to avoid.
+   */
+  onRefresh?: (() => void) | undefined
+  /**
+   * Restart one analyser. (M18)
+   *
+   * `id` is the wire's `DiagnosticSourceId` — `rustAnalyzer`, `gopls`. Only the rows
+   * `sourceRows` marks `restartable` offer it, because `ProjectDiagnostics::restart` returns
+   * immediately for anything that is not a process.
+   *
+   * Separate from [`onRefresh`] and labelled separately, because they cost two different things:
+   * a re-run is seconds, a restart is minutes of re-indexing on a large workspace.
+   */
+  onRestartSource?: ((id: string) => void) | undefined
 }
 
 export function ProblemsPanel({
@@ -117,11 +158,23 @@ export function ProblemsPanel({
   snapshot = NO_SOURCE,
   onOpenLocation,
   hidden = 0,
+  onRefresh,
+  onRestartSource,
 }: ProblemsPanelProps) {
   const groups = useMemo(
     () => (snapshot.kind === 'ready' ? groupByFile(snapshot.items) : []),
     [snapshot],
   )
+  /*
+   * The footer's rows. (M18)
+   *
+   * `sources` has been on the wire since M12 and `adapt.ts` has been handing it over that whole
+   * time, and this component drew none of it — so "rust-analyzer is not installed", the one
+   * sentence that explains an empty list, crossed the IPC boundary and was dropped on the floor.
+   * Drawn on **every** snapshot kind, not only `ready`: the states that most need explaining are
+   * `unavailable` and `scanning`.
+   */
+  const sources = useMemo(() => sourceRows(snapshot), [snapshot])
   const head = headline(snapshot, hidden)
   const scanned = checked(snapshot)
 
@@ -186,15 +239,40 @@ export function ProblemsPanel({
           {groups.length > 0 && (
             <div className={styles.groups} data-audit="problemsGroups">
               {groups.map((group) => (
-                <div key={group.path} className={styles.group} data-audit="problemsGroup">
+                <div
+                  key={group.path}
+                  className={`${styles.group} ${group.stale ? styles.groupStale : ''}`}
+                  data-audit="problemsGroup"
+                  data-stale={group.stale ? 'true' : undefined}
+                >
                   <div className={styles.groupHead} title={group.path}>
                     <span className={styles.groupPath}>{group.path}</span>
                     <span className={styles.groupCount}>{summaryLine(group.counts)}</span>
                   </div>
+                  {/*
+                    * The qualification, and the whole of the M18 fix on this surface.
+                    *
+                    * Without it a row whose file has moved underneath it is indistinguishable
+                    * from a current one — which is precisely the report: the user clicks a hint
+                    * Claude has already fixed and lands in a comment, because the row still
+                    * carries the line number it was published with. The rows stay clickable; a
+                    * jump that may be a few lines off beats a dead row, as long as it says so.
+                    */}
+                  {group.stale && (
+                    <p className={styles.staleNote} data-audit="problemsStale">
+                      {STALE_NOTE}
+                    </p>
+                  )}
                   {group.items.map((item, i) => {
                     const where = `${item.line}:${item.column}`
-                    const label = `${item.severity} at ${group.path} ${where}: ${item.message}`
+                    const label =
+                      `${item.severity} at ${group.path} ${where}: ${item.message}` +
+                      // Appended to the row's own `title` as well as shown once per group,
+                      // because the group note scrolls out of view long before a twenty-row file
+                      // does and the tooltip is what a user checks when a jump lands oddly.
+                      (item.stale === true ? ` — ${STALE_NOTE}` : '')
                     const look = severityLook(item.severity)
+                    const staleClass = item.stale === true ? ` ${styles.rowStale}` : ''
                     const body = (
                       <>
                         <span className={`${styles.glyph} ${look.className}`} aria-hidden="true">
@@ -212,9 +290,10 @@ export function ProblemsPanel({
                       // looks clickable and is not is the bug this whole task is about.
                       <div
                         key={`${where}-${i}`}
-                        className={styles.row}
+                        className={`${styles.row}${staleClass}`}
                         data-audit="problemsRow"
                         data-severity={item.severity}
+                        data-stale={item.stale === true ? 'true' : undefined}
                         title={label}
                       >
                         {body}
@@ -223,9 +302,10 @@ export function ProblemsPanel({
                       <button
                         key={`${where}-${i}`}
                         type="button"
-                        className={`${styles.row} ${styles.rowButton}`}
+                        className={`${styles.row} ${styles.rowButton}${staleClass}`}
                         data-audit="problemsRow"
                         data-severity={item.severity}
+                        data-stale={item.stale === true ? 'true' : undefined}
                         title={label}
                         onClick={() =>
                           // The *absolute* path when the producer sent one: `group.path` is
@@ -243,9 +323,101 @@ export function ProblemsPanel({
               ))}
             </div>
           )}
+
+          {/*
+            * The footer: who is analysing, and the two ways to make them do it again. (M18)
+            *
+            * Rendered whenever there is anything to say — which is *not* only the `ready` state.
+            * A source list under an `unavailable` headline is the whole explanation of why the
+            * list is empty, and it was being thrown away.
+            */}
+          {sources.length > 0 && (
+            <div className={styles.footer} data-audit="problemsSources">
+              <div className={styles.footerHead}>
+                <span className={styles.footerTitle}>Analysers</span>
+                {/*
+                  * Absent, not disabled, when the host passed no handler. A disabled control is a
+                  * promise that it would work under some condition the user could reach; there is
+                  * no such condition here, and this panel's own rules forbid dressing a dead
+                  * thing as a live one.
+                  */}
+                {onRefresh !== undefined && (
+                  <button
+                    type="button"
+                    className={styles.action}
+                    data-audit="problemsRefresh"
+                    onClick={onRefresh}
+                    title="Ask every running analyser to check this project again. Takes seconds; it does not re-index."
+                  >
+                    Re-run
+                  </button>
+                )}
+              </div>
+              {sources.map((source) => (
+                <SourceLine
+                  key={source.id}
+                  source={source}
+                  onRestart={onRestartSource}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </aside>
+  )
+}
+
+/** The status dot's colour class. Dim for `unavailable` — not running is not broken. */
+const STATUS_CLASS: Record<SourceRow['status'], string | undefined> = {
+  ready: styles.sourceReady,
+  scanning: styles.sourceScanning,
+  unavailable: undefined,
+}
+
+function SourceLine({
+  source,
+  onRestart,
+}: {
+  source: SourceRow
+  onRestart?: ((id: string) => void) | undefined
+}) {
+  // Same membership-before-lookup discipline as `severityLook`: `status` is a string that came
+  // from another process, and a prototype key would hand back a function that `className`
+  // stringifies into garbage.
+  const dotClass = Object.hasOwn(STATUS_CLASS, source.status)
+    ? STATUS_CLASS[source.status]
+    : undefined
+  return (
+    <div className={styles.source} data-audit="problemsSource" data-source={source.id}>
+      <span className={`${styles.sourceDot} ${dotClass ?? ''}`} aria-hidden="true">
+        ●
+      </span>
+      <span className={styles.sourceText}>
+        <span className={styles.sourceLabel}>{source.label}</span>
+        <p className={styles.sourceDetail}>{source.detail}</p>
+      </span>
+      {/*
+        * Restart, only for the sources that are processes.
+        *
+        * `diagnostics.restart` has existed, been tested, been registered in the contract and been
+        * wrapped in `client.ts` since M12 with **no caller anywhere in the app** — the mechanism
+        * this codebase keeps building and never connecting. This is its first one. tree-sitter
+        * and Claude get no button because `ProjectDiagnostics::restart` returns immediately for
+        * them, and a control that does nothing when pressed is worse than no control.
+        */}
+      {source.restartable && onRestart !== undefined && (
+        <button
+          type="button"
+          className={styles.action}
+          data-audit="problemsRestart"
+          onClick={() => onRestart(source.id)}
+          title={`Stop ${source.label} and start it again. Slower than Re-run — it re-indexes the workspace from scratch.`}
+        >
+          Restart
+        </button>
+      )}
+    </div>
   )
 }
 

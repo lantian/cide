@@ -19,8 +19,15 @@
 //! `.git/objects` along with everything else — tens of thousands of inotify descriptors for
 //! directories the user cannot see, which is the fastest route to `ENOSPC`. So every
 //! non-ignored directory the walk found gets its own non-recursive watch, plus the handful
-//! of git paths in [`crate::filter::Filter::git_paths`] that the dotfile rule would
+//! of git paths in [`crate::filter::Filter::git_paths`] that the `.git` rule would
 //! otherwise exclude.
+//!
+//! **"Non-ignored" stayed literal when the file tree learned to show ignored files.** The
+//! watch list is [`crate::Index::watch_dirs`] and every event is tested with
+//! [`crate::Filter::watchable`], neither of which softens for the setting — so turning
+//! *Show ignored files* on adds rows and adds not one descriptor, and a `cargo build` produces
+//! exactly the events it produced before. `crate::filter`'s module note has the trade this
+//! buys and what it costs.
 //!
 //! The exception is scale: past [`WatchConfig::max_dir_watches`] the setup cost of
 //! individual watches (`notify-debouncer-full` keeps its watch roots in a `Vec` and scans it
@@ -162,7 +169,12 @@ fn run(
                 for event in events {
                     for path in &event.paths {
                         let is_dir = path.is_dir();
-                        if !filter.admits(path, is_dir) {
+                        // `watchable`, not `admits`: with *show ignored files* on, the tree
+                        // contains `target/` and this loop still must not. See the note at the
+                        // top of `crate::filter` — one event per object file a build writes is
+                        // exactly the storm the two layers of coalescing below exist to
+                        // prevent, and the cheapest place to stop it is before it is queued.
+                        if !filter.watchable(path, is_dir) {
                             continue;
                         }
                         // A directory that has just appeared needs its own watch, and so do
@@ -391,7 +403,9 @@ impl Backend {
             };
             for entry in read.flatten() {
                 let child = entry.path();
-                if entry.file_type().is_ok_and(|t| t.is_dir()) && filter.admits(&child, true) {
+                // `watchable` for the same reason as the event loop: a `git clone` that lands
+                // a directory the ignore rules cover is drawn, and not descended into here.
+                if entry.file_type().is_ok_and(|t| t.is_dir()) && filter.watchable(&child, true) {
                     stack.push(child);
                 }
             }

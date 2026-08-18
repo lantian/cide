@@ -55,9 +55,9 @@ pub fn settings_set(
     app: AppHandle,
     patch: SettingsPatch,
 ) -> Result<Settings, CoreError> {
-    // Read before the patch, so the comparison below is against what the windows are
+    // Read before the patch, so the comparisons below are against what the windows are
     // actually wearing rather than against the value we just wrote.
-    let was = state.with(|ws| ws.settings.theme);
+    let (was_theme, was_explorer) = state.with(|ws| (ws.settings.theme, ws.settings.explorer));
     state.update(|ws| {
         apply_patch(&mut ws.settings, patch);
         // Settings are not part of any structural invariant, but they are part of the tree,
@@ -72,10 +72,56 @@ pub fn settings_set(
     // does not, and it is what shows through while a window is being dragged or resized.
     // Outside the `update` closure deliberately: `windows::apply_theme` walks the window
     // list, and the workspace lock is `parking_lot` and not reentrant.
-    if settings.theme != was {
+    if settings.theme != was_theme {
         windows::apply_theme(&app, settings.theme);
     }
+    // The file tree's two visibility toggles are the only settings whose value is not enough:
+    // the rows they ask for were never walked, so the index has to be built again. See
+    // `reindex_open_projects`.
+    if settings.explorer != was_explorer {
+        reindex_open_projects(&app, crate::files::visibility_of(&settings));
+    }
     Ok(settings)
+}
+
+/// Walk every open project again, because *Show hidden files* or *Show ignored files* moved.
+///
+/// # Why this is here rather than in the webview
+///
+/// The obvious alternative is for the settings screen to call `fs.index` after saving. It is
+/// wrong in three ways, and each one is a bug that would only appear on somebody else's
+/// machine: the screen knows about *its* project and a workspace has several open at once; a
+/// second window would keep its stale tree until something else happened to it; and a user who
+/// edits `workspace.json` by hand — the file is documented as editable — would get no re-walk
+/// at all. The setting lives in Rust, the indexes live in Rust, so the reaction lives in Rust.
+///
+/// Fire-and-forget, deliberately. A walk of a large repository is seconds, and `settings_set`
+/// answers a form: blocking the toggle on the walk would freeze the Settings tab and, with
+/// several projects open, freeze it for the sum of them. The tree is not left guessing in the
+/// meantime — `Indexing::run` emits `cide://fs-status` at the start of the walk and again at
+/// the end, which is exactly what `Explorer` already re-reads its rows on.
+fn reindex_open_projects(app: &AppHandle, visibility: cide_fs::Visibility) {
+    let open = app.state::<crate::files::FsRegistry>().indexed();
+    for (project, roots) in open {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let registry = app.state::<crate::files::FsRegistry>();
+            let events: std::sync::Arc<dyn crate::files::FsEvents> =
+                std::sync::Arc::new(app.clone());
+            match crate::cmd::fs::index_project(events, &registry, project, roots, visibility).await
+            {
+                Ok(status) => tracing::debug!(
+                    ?project,
+                    files = status.files,
+                    "re-indexed a project for a visibility change"
+                ),
+                // `NoIndex` (a project with no roots) is the only error this can produce, and
+                // a project with no roots had nothing to re-walk. Logged rather than surfaced:
+                // the toggle itself succeeded and is already saved.
+                Err(error) => tracing::warn!(?project, %error, "could not re-index a project"),
+            }
+        });
+    }
 }
 
 /// Fold a patch into stored settings. `None` leaves a field alone.
@@ -95,6 +141,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         claude,
         proxy,
         sidebar,
+        explorer,
         inspections,
     } = patch;
 
@@ -152,6 +199,11 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // where it lands, so `workspace.json` cannot hold a width no window can honour.
     if let Some(v) = sidebar {
         settings.sidebar = v.clamped();
+    }
+    // Nothing to clamp — two booleans — but the *consequence* is the largest of any field on
+    // this type: see `settings_set`, which re-walks every open project when this one moves.
+    if let Some(v) = explorer {
+        settings.explorer = v;
     }
     // Clamped for the same reason, and the failure is louder than a bad width. `pushToClaude`
     // writes a line into a live Claude pane's PTY; with a debounce of zero, one `cargo check`

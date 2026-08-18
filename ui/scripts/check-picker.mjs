@@ -558,6 +558,43 @@ try {
     'and both survive not knowing the identifier’s name',
   )
 
+  /*
+   * One popup, two questions. (M18)
+   *
+   * Ctrl+Alt+B reuses this overlay because `textDocument/implementation` returns the same shape
+   * and wants the same 0/1/≥2 rule — but it must not reuse the *prose*. A user who asked "what
+   * implements this" and reads "No usages of ‘Reader’ outside its declaration" has been told
+   * their interface is unused, which is a different and alarming claim.
+   */
+  eq(
+    usages.usagesLabel('Reader', 'implementations'),
+    'Implementations of ‘Reader’',
+    'the dialog is headed by the question that was asked',
+  )
+  eq(
+    usages.usagesLabel('parse'),
+    'Usages of ‘parse’',
+    'and the default keeps every pre-M18 call site reading exactly as it did',
+  )
+  eq(
+    status({ total: 0, shown: 0, kind: 'implementations' }),
+    'Nothing implements ‘parse’.',
+    'an empty implementation search says nothing implements it, not that it is unused',
+  )
+  ok(
+    say({ searching: true, kind: 'implementations' }).startsWith('Finding implementations'),
+    'and the running line names the right search',
+  )
+  ok(
+    say({ truncated: true, kind: 'implementations' }).includes('implementations'),
+    'as does the cap line',
+  )
+  eq(
+    usages.noUsagesSentence('Reader', 'implementations'),
+    'Nothing implements ‘Reader’.',
+    'and so does the notice, which is the one the user sees most often',
+  )
+
   /* ------------------------------------------------- M16: the picker's library scope */
 
   /*

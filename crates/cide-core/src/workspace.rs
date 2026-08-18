@@ -70,7 +70,7 @@ pub fn bump(ws: &mut Workspace) -> u64 {
 /// [`activate_tab`]), each of which bumps once for the whole of what it did.
 ///
 /// The tab is not checked for membership in `p.tabs`. Every caller has already resolved it —
-/// `open_tab` just pushed it, the other two looked it up — and a second lookup here would be a
+/// `open_tab` just inserted it, the other two looked it up — and a second lookup here would be a
 /// second answer to a question already asked, which is how [`close_tab`] and the close dialog
 /// once came to disagree about "unsaved".
 fn set_active(p: &mut Project, tab: TabId) {
@@ -273,6 +273,27 @@ pub fn remove_root(ws: &mut Workspace, project: ProjectId, path: &Path) -> Resul
 /// [`TabKind::ClaudeHome`] is refused with [`CoreError::TabPinned`]: a second console
 /// would report itself unclosable through [`TabKind::closable`] while sitting outside the
 /// index-0 guard, leaving a tab that nothing could ever remove.
+///
+/// # A new tab lands immediately right of the pinned console, not at the end
+///
+/// It used to `push`. The strip therefore grew rightwards for ever, and on a real session the
+/// tab a user had *just* opened was the one furthest from the eye, off the end of a strip that
+/// had already started eliding titles — so the answer to "where did the file I just opened go"
+/// was "scroll". Opening at index 1 puts the newest thing next to the console, which is where
+/// the user is already looking, and makes the strip read newest-first from a fixed anchor.
+///
+/// The rule is deliberately **every** kind, not just [`TabKind::File`]. A per-kind rule would
+/// mean a file opened from the tree and a diff opened from the git panel land in different
+/// places from the same user's point of view — the strip's order would stop being a fact about
+/// when things were opened and become a fact about which gesture opened them, which nobody can
+/// read off the screen. [`reinsert_tab`] already clamps into `1..=len` for the same reason: 0 is
+/// the console's, and the console's alone.
+///
+/// The index is `min`'d against the length rather than written as a literal `1`. `Vec::insert`
+/// **panics** past the end, `validate` is what guarantees a console at 0, and this crate is
+/// linked into a binary built with `panic = "abort"` — so a workspace that had somehow lost its
+/// console would take the process down here rather than be refused by the validator one line
+/// later.
 pub fn open_tab(
     ws: &mut Workspace,
     project: ProjectId,
@@ -297,11 +318,15 @@ pub fn open_tab(
     }
 
     let id = TabId::new();
-    p.tabs.push(Tab {
-        id,
-        kind,
-        tree: layout::new_tree(first_pane),
-    });
+    let at = 1.min(p.tabs.len());
+    p.tabs.insert(
+        at,
+        Tab {
+            id,
+            kind,
+            tree: layout::new_tree(first_pane),
+        },
+    );
     set_active(p, id);
     bump(ws);
     Ok(id)
@@ -311,8 +336,13 @@ pub fn open_tab(
 ///
 /// [`open_tab`]'s counterpart for Ctrl+Shift+T. It is a separate function rather than an
 /// `Option<PaneTree>` parameter on `open_tab` because the two differ in every interesting way:
-/// `open_tab` mints one pane and appends, this one accepts a tree it did not build and inserts
-/// at a position — and the *checks* it therefore has to run are the whole of its body.
+/// `open_tab` mints one pane and puts the tab at the head of the strip, this one accepts a tree
+/// it did not build and restores the position the tab *had* — and the *checks* it therefore has
+/// to run are the whole of its body.
+///
+/// The two clamp the same way and for the same reason (`1..=len`; 0 is the pinned console's),
+/// which is the one thing they do share; see [`open_tab`] for why a `Vec::insert` past the end
+/// would be an abort rather than a refusal.
 ///
 /// # The pane ids are the ones the tab had, and that is on purpose
 ///
@@ -2064,9 +2094,13 @@ mod tests {
         let Err(CoreError::UnsavedChanges { tabs }) = close_project(&mut ws, id, false) else {
             panic!("a project holding unsaved work must not close without force");
         };
+        // Strip order, which `open_tab` makes newest-first: b.rs was opened last, so it sits
+        // nearest the console and is named first. The order matters because this list is what
+        // the close dialog reads out, and a list that did not match the strip would ask about
+        // the tabs in an order the user cannot see.
         assert_eq!(
             tabs.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
-            vec!["a.rs", "b.rs"],
+            vec!["b.rs", "a.rs"],
             "every dirty tab, and only the dirty ones"
         );
         assert!(ws.projects.contains_key(&id), "the project is still open");
@@ -2257,6 +2291,86 @@ mod tests {
         );
     }
 
+    /// Every new tab lands at index 1, so the strip reads newest-first from a fixed anchor.
+    ///
+    /// The user-facing rule is "the file I just opened is the leftmost file tab". The console
+    /// is not a file tab and never moves, which is why "leftmost" means index 1 rather than 0 —
+    /// and why this asserts the console is still at 0 after every open rather than only at the
+    /// end: a rule expressed as `insert(1, ..)` is one typo away from displacing the pinned tab,
+    /// and `validate` is the only thing that would have caught it.
+    ///
+    /// Mixed kinds on purpose. The placement is a property of opening a tab, not of the tab's
+    /// kind: a file, a diff and a Claude tab opened in that order must interleave by *when*,
+    /// because that is the only thing a user can read off the strip.
+    #[test]
+    fn a_new_tab_opens_immediately_right_of_the_pinned_console() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        let console = project(&ws, id).expect("exists").tabs[0].id;
+
+        let first = open_file(&mut ws, id, "/home/dev/work/cide/a.rs", false);
+        let second = full_tab(&mut ws, id, "two");
+        let third = open_file(&mut ws, id, "/home/dev/work/cide/b.rs", false);
+
+        let tabs: Vec<TabId> = project(&ws, id)
+            .expect("exists")
+            .tabs
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            tabs,
+            vec![console, third, second, first],
+            "newest first, immediately right of the console"
+        );
+        assert!(
+            matches!(
+                project(&ws, id).expect("exists").tabs[0].kind,
+                TabKind::ClaudeHome
+            ),
+            "and the pinned console is still the tab nothing may displace"
+        );
+        assert_eq!(
+            project(&ws, id).expect("exists").active_tab,
+            third,
+            "opening a tab still activates it"
+        );
+        validate(&ws).expect("still valid");
+    }
+
+    /// A project that has somehow lost its console does not take the process down.
+    ///
+    /// `Vec::insert` panics past the end and this crate is linked into a binary built with
+    /// `panic = "abort"`, so the difference between `insert(1, ..)` and a clamped index is the
+    /// difference between a refused mutation and a dead app. The workspace below is illegal —
+    /// `validate` rejects it, and `WorkspaceState::update` would roll the whole thing back — but
+    /// it has to *reach* the validator to be rejected.
+    #[test]
+    fn opening_a_tab_in_a_project_with_no_console_does_not_panic() {
+        let mut ws = Workspace::default();
+        let id = open(&mut ws, "/home/dev/work/cide");
+        project_mut(&mut ws, id).expect("exists").tabs.clear();
+
+        let tab = open_tab(
+            &mut ws,
+            id,
+            TabKind::ClaudeFull {
+                title: "one".into(),
+            },
+            aux_pane(),
+        )
+        .expect("the insert does not panic");
+        assert_eq!(
+            project(&ws, id).expect("exists").tabs[0].id,
+            tab,
+            "it lands at 0 because there was nothing to sit behind"
+        );
+        assert!(
+            validate(&ws).is_err(),
+            "and the validator is what refuses the state, as it always was"
+        );
+    }
+
     #[test]
     fn opening_a_second_console_tab_is_refused() {
         let mut ws = Workspace::default();
@@ -2334,11 +2448,16 @@ mod tests {
         let first = full_tab(&mut ws, id, "one");
         let second = full_tab(&mut ws, id, "two");
 
-        project_mut(&mut ws, id).expect("exists").tab_mru = vec![second];
+        // The strip is `[console, second, first]` — `open_tab` inserts at 1 — so `first` is the
+        // one whose left neighbour is another *closable* tab. Closing the tab next to the
+        // console would fall back to the console and pass under any rule, which is the shape
+        // this test exists to avoid.
+        activate_tab(&mut ws, id, first).expect("exists");
+        project_mut(&mut ws, id).expect("exists").tab_mru = vec![first];
         validate(&ws).expect("a one-entry order is a legal one");
 
-        close_tab(&mut ws, id, second, false).expect("a full tab closes");
-        assert_eq!(project(&ws, id).expect("exists").active_tab, first);
+        close_tab(&mut ws, id, first, false).expect("a full tab closes");
+        assert_eq!(project(&ws, id).expect("exists").active_tab, second);
         validate(&ws).expect("still valid");
     }
 
@@ -3103,9 +3222,20 @@ mod tests {
         )
         .expect("opens");
 
+        // `open_tab` inserts at 1, so the strip starts as `[console, b, a]`; moving index 2 to
+        // index 1 swaps them back.
+        assert_eq!(
+            {
+                let tabs = &project(&ws, id).expect("exists").tabs;
+                (tabs[1].id, tabs[2].id)
+            },
+            (b, a),
+            "newest first, before anything is dragged"
+        );
+
         reorder_tab(&mut ws, id, 2, 1).expect("a full tab moves");
         let tabs = &project(&ws, id).expect("exists").tabs;
-        assert_eq!((tabs[1].id, tabs[2].id), (b, a));
+        assert_eq!((tabs[1].id, tabs[2].id), (a, b));
         validate(&ws).expect("still valid");
     }
 

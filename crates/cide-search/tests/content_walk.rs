@@ -181,7 +181,11 @@ fn the_shared_filter_is_what_decides_what_is_searched() {
     let roots = [SearchRoot::new(dir.path())];
     let root_paths = vec![dir.to_path_buf()];
     let dirs = [dir.path(), &dir.join("src")];
-    let filter = cide_fs::Filter::build(&root_paths, dirs.iter().copied());
+    let filter = cide_fs::Filter::build(
+        &root_paths,
+        dirs.iter().copied(),
+        cide_fs::Visibility::CONSERVATIVE,
+    );
 
     let regex = compile(&literal(NEEDLE)).unwrap();
     let cancel = AtomicBool::new(false);

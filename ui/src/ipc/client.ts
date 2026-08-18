@@ -826,6 +826,41 @@ export const diagnostics = {
   usagesCancel: (projectId: ProjectId) =>
     invoke<void>('diagnostics_usages_cancel', { project: projectId }),
 
+  /**
+   * Every place the symbol at this position is *implemented*. (M18)
+   *
+   * The answer to "goto in Go lands on the interface". `textDocument/definition` resolving a call
+   * through an interface to the interface's method is gopls being correct; the concrete one is a
+   * different protocol request, and this is it.
+   *
+   * Same shape, same twenty-second budget and the same [`usagesCancel`] as [`usages`], because it
+   * shares the popup with it — one list on screen means one outstanding request, and the webview
+   * never has to name which.
+   *
+   * `notFound` here means "no symbol at this position", and the caller falls back to
+   * [`definition`] on it rather than saying nothing.
+   */
+  implementations: (projectId: ProjectId, path: string, line: number, column: number) =>
+    invoke<UsagesAnswer>('diagnostics_implementations', {
+      project: projectId,
+      path,
+      line,
+      column,
+    }),
+
+  /**
+   * Re-run every analyser for this project. (M18)
+   *
+   * The Problems panel's *Re-run analysis* button and the `problems.refresh` command. Resolves
+   * with the sentence to show — a control whose whole effect happens in another process over the
+   * next few seconds is otherwise indistinguishable from one that is wired to nothing.
+   *
+   * Cheap on purpose, and distinct from [`restart`]: this re-runs the checks (`cargo check`
+   * again, gopls re-reads the files it has findings for) and takes seconds, where a restart
+   * replaces the process and costs minutes of re-indexing on a large workspace.
+   */
+  refresh: (projectId: ProjectId) => invoke<string>('diagnostics_refresh', { project: projectId }),
+
   /** Restart one analyser after it gave up. The panel's only recovery gesture. */
   restart: (projectId: ProjectId, source: DiagnosticSourceId) =>
     invoke<void>('diagnostics_restart', { project: projectId, source }),

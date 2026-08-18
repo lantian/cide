@@ -50,6 +50,7 @@
     "check:switcher": "node scripts/check-switcher.mjs",
     "check:tab-drag": "node scripts/check-tab-drag.mjs",
     "check:tab-overflow": "node scripts/check-tab-overflow.mjs",
+    "check:terminal-find": "node scripts/check-terminal-find.mjs",
     "check:terminal-keys": "node scripts/check-terminal-keys.mjs",
     "check:theme": "node scripts/check-theme.mjs",
     "check:tree-drag": "node scripts/check-tree-drag.mjs",

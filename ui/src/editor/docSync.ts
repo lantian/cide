@@ -5,8 +5,9 @@
  *
  * Without it the feature looks built and is nearly inert, which is this repository's named worst
  * failure mode. Measured, not assumed — `cide-lsp`'s
- * `diagnostics_refresh_from_disk_without_any_document_sync` starts a real rust-analyzer over a
- * broken crate, waits for the error, repairs the file **on disk**, and waits two minutes:
+ * `an_on_disk_edit_alone_never_refreshes_diagnostics` (the test was renamed; this reference named
+ * a function that no longer existed) starts a real rust-analyzer over a broken crate, waits for
+ * the error, repairs the file **on disk**, and waits two minutes:
  *
  * * the initial error **does** arrive — flycheck runs once when the workspace finishes loading, so
  *   a project opens with a correct list and the panel looks like it works;
@@ -19,6 +20,21 @@
  *
  * `did_save` is what re-triggers flycheck, and `did_change` is what buys the thing an editor is
  * supposed to have over a terminal running `cargo check` — errors on *unsaved* text.
+ *
+ * # What M18 added, and what it deliberately did not add here
+ *
+ * Everything above is about the buffer the **user** has open. It says nothing about the file
+ * Claude just rewrote in a tab nobody opened, which is most of what happens in this editor — and
+ * that half was reaching no server at all. It now goes through Rust instead:
+ * `cide_app::files::on_watch_event` → `FsEvents::files_changed` →
+ * `ProjectDiagnostics::files_changed`, which sends `workspace/didChangeWatchedFiles` to gopls and
+ * a debounced `rust-analyzer/runFlycheck` to rust-analyzer. Both are proven against the real
+ * binaries by `crates/cide-lsp/tests/real_servers.rs`.
+ *
+ * Note what that means for this module: **do not add a `didSave` to `resetDoc`.** An agent's write
+ * reaches the watcher whether or not a pane happened to have the file open, so a save synthesised
+ * here would be a *second* signal for the same edit — a duplicate flycheck for every agent write
+ * to an open file. The one place a save is sent stays `savedDoc`, from a real `file.write`.
  *
  * # Keyed by path, refcounted
  *

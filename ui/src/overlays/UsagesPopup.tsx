@@ -54,6 +54,9 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
   const name = useUsages((s) => s.name)
+  // Which question this list answers. Everything the popup *says* branches on it; nothing it
+  // *does* — the rows, the filter, the keyboard model — differs at all. See `UsagesKind`.
+  const kind = useUsages((s) => s.kind)
   const searching = useUsages((s) => s.searching)
   const rows = useUsages((s) => s.rows)
   const truncated = useUsages((s) => s.truncated)
@@ -161,11 +164,12 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
     truncated,
     name,
     query,
+    kind,
   })
 
   return (
     <ModalShell
-      label={usagesLabel(name)}
+      label={usagesLabel(name, kind)}
       prompt="⌕"
       value={query}
       placeholder="Filter by file or line"

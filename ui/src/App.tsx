@@ -44,6 +44,11 @@ import { GitPanel } from '@/sidebar/GitPanel'
 import { SearchPanel } from '@/sidebar/SearchPanel'
 import { ProblemsPanel } from '@/sidebar/ProblemsPanel'
 import { ALL_VISIBLE, applyFilters, statusBarCounts } from '@/sidebar/ProblemsPanel/model'
+import {
+  isDiagnosticSourceId,
+  refreshDiagnostics,
+  restartDiagnosticSource,
+} from '@/sidebar/ProblemsPanel/actions'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { OverlayHost } from '@/overlays/OverlayHost'
 import { closeOverlay, useOverlayOpen } from '@/overlays/store'
@@ -1004,6 +1009,24 @@ export function App() {
               project={activeProjectId}
               snapshot={diagnostics.snapshot}
               hidden={diagnostics.hidden}
+              // The two controls the M18 report asked for. Both go through
+              // `sidebar/ProblemsPanel/actions.ts`, which `keys/dispatch.ts` also calls for
+              // `problems.refresh` — one implementation, so the button and the palette row cannot
+              // drift into doing different things.
+              onRefresh={
+                activeProjectId === null
+                  ? undefined
+                  : () => refreshDiagnostics(activeProjectId)
+              }
+              onRestartSource={
+                activeProjectId === null
+                  ? undefined
+                  : (id) => {
+                      // Narrowed rather than cast: `SourceRow.id` is a plain string because
+                      // `model.ts` imports nothing, so this is where the wire enum is re-asserted.
+                      if (isDiagnosticSourceId(id)) restartDiagnosticSource(activeProjectId, id)
+                    }
+              }
               onOpenLocation={(path, line, column) => {
                 if (!activeProjectId) return
                 // Requested BEFORE the open — the editor for this path usually does not exist

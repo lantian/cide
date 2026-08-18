@@ -46,6 +46,10 @@ function item(from: WireDiagnostic): Diagnostic {
     source: from.source,
     // `null` on the wire, absent in the panel. See the header.
     code: from.code ?? undefined,
+    // Required on the wire and optional in the panel, which is the same `exactOptionalPropertyTypes`
+    // mismatch `code` has one line up and not laziness: every fixture written before M18 omits it,
+    // and absent has to keep meaning "nothing has said this row is out of date".
+    stale: from.stale,
   }
 }
 

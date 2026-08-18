@@ -585,6 +585,47 @@ fn build() -> Vec<Command> {
         Command::new("terminal.splitBelow", "Split terminal below", TERMINAL).when("paneFocused"),
         Command::new("terminal.clear", "Clear terminal", TERMINAL).when("terminalFocused"),
         Command::new("terminal.paste", "Paste into terminal", TERMINAL).when("terminalFocused"),
+        /*
+         * Search this pane's transcript. Asked for as *"Need to add CTRL+F (search bar) for
+         * claude and bash panels to be able to search text"*.
+         *
+         * # It ships with no default binding, and that is the decision, not an omission
+         *
+         * The chord is Ctrl+F and it is resolved in `ui/src/terminal/keys.ts`, from xterm's own
+         * custom key handler, exactly where Ctrl+C and Ctrl+V are resolved and for the same
+         * reason. A `("ctrl+f", "terminal.find", "terminalFocused")` line in
+         * [`crate::keymap::defaults`] was the obvious alternative and it is the one this
+         * codebase has already written down three separate times as wrong:
+         *
+         * * `keymap::the_terminal_clipboard_chords_are_not_bound_here` states it in full — the
+         *   key gate's second entry point is a window **capture** listener, so a binding is
+         *   consumed before the event reaches its target, and `terminalFocused` is derived from
+         *   `tab.tree.focused` rather than from the caret. It stays true while the user is typing
+         *   in a rename field, the commit message box or the Explorer's search input, so the
+         *   binding would take Ctrl+F from all of them in any window whose focused pane happens
+         *   to be a terminal — which, in an app with a pinned Claude console, is most windows
+         *   most of the time.
+         * * `ui/src/editor/EditorSurface.tsx` says it about this exact chord: binding `ctrl+f`
+         *   here "fights a written rule", because CodeMirror's `Mod-f` opens the *editor's* find
+         *   bar and reaches it only because this keymap stays silent about the key.
+         * * `keymap::nothing_binds_the_find_bars_f_keys` keeps F3/Shift+F3 out for the third
+         *   version of the same argument.
+         *
+         * So the command is here — a palette row, and one line of `keymap.json` away from ⌘F on
+         * a Mac or from any chord a user prefers — while the *shipped* chord is focus-scoped in
+         * the terminal, where it can only ever reach a terminal that has the keystroke. That is
+         * the same shape `terminal.clear` and `terminal.paste` already have: registered, gated,
+         * dispatched, and bound by nobody.
+         *
+         * `terminalFocused` because the bar belongs to a pane and there has to be one. There is
+         * deliberately no *find next* / *find previous* command beside it: those live on Enter
+         * and Shift+Enter inside the bar itself, and giving them ids would mean giving them
+         * chords, and the only conventional ones are F3 and Shift+F3, which the rule above
+         * forbids.
+         */
+        Command::new("terminal.find", "Find in terminal", TERMINAL)
+            .when("terminalFocused")
+            .keywords(&["search", "find", "grep", "scrollback", "transcript"]),
         // File.
         Command::new("file.save", "Save file", FILE).when("editorFocused"),
         Command::new("file.saveAll", "Save all files", FILE).when("editorOpen"),
@@ -784,6 +825,45 @@ fn build() -> Vec<Command> {
          *
          * `editorFocused` and nothing weaker, like every other member of this group.
          */
+        /*
+         * Go to implementation — IDEA's Ctrl+Alt+B. (M18)
+         *
+         * A **separate id**, not a mode of `navigate.definition`, and the separation is the whole
+         * design rather than a filing decision.
+         *
+         * The report was Go-shaped: *"goto for golang goes to the interface declaration, but
+         * should go to the implementation"*. gopls is answering correctly —
+         * `textDocument/definition` on a call through an interface resolves to the interface's
+         * method, because that is where the callee is declared. "Take me to the concrete one" is
+         * `textDocument/implementation`, a different protocol request, and cide asked it nowhere.
+         *
+         * Teaching Ctrl+B to try implementation first and fall back was the obvious fix and it
+         * **regresses Rust**: rust-analyzer answers `implementation` on a struct name with its
+         * `impl` blocks and on a trait with its implementors, so Ctrl+click on an ordinary type
+         * name would stop opening the declaration. Changing the most-used gesture in one language
+         * to fix a complaint in another is the trade this codebase already refused once — see
+         * `navigate.usages` directly above, which exists for exactly the same reason: a gesture
+         * that guesses needs a sibling that does not.
+         *
+         * ≥2 answers is the *common* case (an interface with many implementors), so this reuses
+         * the Find usages popup: 0 falls back to Go to definition so the command always does
+         * something, 1 jumps, ≥2 shows the picker.
+         *
+         * `editorFocused` and nothing weaker, like every other member of this group.
+         */
+        Command::new("navigate.implementation", "Go to implementation", NAVIGATE)
+            .when("editorFocused")
+            // "implementors" and "concrete" are what a person types; "interface", "impl",
+            // "override" and "subclass" are what they call the thing they are standing on. None
+            // of the five title/id scoring tiers reaches this row from any of them.
+            .keywords(&[
+                "implementors",
+                "impl",
+                "concrete",
+                "interface",
+                "override",
+                "subclass",
+            ]),
         Command::new("navigate.usages", "Find usages", NAVIGATE)
             .when("editorFocused")
             // "references" is what the protocol calls it, "callers" and "uses" are what a person
@@ -950,6 +1030,39 @@ fn build() -> Vec<Command> {
         Command::new("sidebar.problems", "Show problems sidebar", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["diagnostics", "errors", "warnings", "inspections"]),
+        /*
+         * Re-run the analysers. (M18)
+         *
+         * The user asked for this in as many words — *"i have not manual button to rerun it in
+         * left side bar inside problems panel"* — and the Problems panel now has the button. It is
+         * a command as well as a button because that is this project's rule: a gesture with no id
+         * cannot be bound, cannot be found in the palette, and cannot be reached without a mouse,
+         * which is the gap `sidebar.search` and `sidebar.problems` were both added to close.
+         *
+         * `projectOpen` and nothing narrower. A `sidebarProblems` flag would scope it to the
+         * panel and would have to be *supplied* by the webview or it is false for ever — this
+         * repository lost all four git commands to exactly that mistake (see the module docs on
+         * `repoOpen`), and the true precondition is anyway "there is a project to analyse" rather
+         * than "the panel happens to be showing".
+         *
+         * **No default binding.** IDEA and VS Code both ship none for their equivalents, nothing
+         * here requires one, and the id is rebindable regardless — a chord spent on a control most
+         * users press once a week is a chord taken from every terminal pane in every window.
+         */
+        Command::new("problems.refresh", "Re-run code analysis", VIEW)
+            .when("projectOpen")
+            // "rerun" and "refresh" are what a user types; "stale" is what they are looking at
+            // when they go looking for it.
+            .keywords(&[
+                "rerun",
+                "refresh",
+                "rescan",
+                "diagnostics",
+                "problems",
+                "lsp",
+                "stale",
+                "analyse",
+            ]),
     ]
 }
 

@@ -21,6 +21,29 @@
 //! handler runs on a pooled worker that can retire at any moment, so a server spawned from one
 //! would be `SIGTERM`ed a few seconds later for no reason anybody could diagnose. `on_spawn_thread`
 //! is the long-lived thread that exists for this.
+//!
+//! # How a write nobody typed reaches a language server (M18)
+//!
+//! cide's premise is that an agent edits the tree while the user watches, so the interesting file
+//! change is the one the editor never saw. Until M18 nothing carried it to a server:
+//! `files::on_watch_event` updated the index, the picker and `cide-lang`, and stopped. The result
+//! was the user's report — Claude fixes a hint, the row stays, and clicking it lands in a comment,
+//! because the row still holds the line number it had when it was published.
+//!
+//! The path now is:
+//!
+//! ```text
+//! notify → cide_fs::watch → files::on_watch_event → FsEvents::files_changed
+//!        → ProjectDiagnostics::files_changed
+//!            ├─ DiagnosticStore::mark_dirty   → the panel says "may be out of date"
+//!            ├─ workspace/didChangeWatchedFiles → gopls, at once
+//!            └─ rust-analyzer/runFlycheck       → debounced, see `KICK_*`
+//! ```
+//!
+//! The two servers need different things and the difference is not cosmetic:
+//! `cide_lsp::session::declares_watched_files` carries that argument. The debounce on the flycheck
+//! kick is a correctness requirement rather than tuning, exactly as the emit coalescer below is: a
+//! `cargo fmt` over four hundred files must produce **one** `cargo check`, not four hundred.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -40,6 +63,21 @@ const COALESCE: Duration = Duration::from_millis(250);
 const COALESCE_CEILING: Duration = Duration::from_secs(1);
 /// How often the pump wakes when nothing is happening.
 const TICK: Duration = Duration::from_millis(100);
+
+/// Trailing debounce on the *flycheck kick* — the `cargo check` re-run an on-disk write asks for.
+///
+/// Longer than [`COALESCE`], and the difference is what each one costs. Coalescing an emit that
+/// fired too early costs a redundant serialization; kicking flycheck too early costs a whole
+/// `cargo check` of the workspace, and a `cargo fmt`, a `git checkout` or a branch switch is
+/// hundreds of watcher events inside a second. The same argument the coalescer's own comment
+/// makes, one order of magnitude up.
+const KICK_DEBOUNCE: Duration = Duration::from_millis(500);
+/// And the ceiling, so a build that writes continuously still gets re-checked rather than never.
+///
+/// Without it, `cargo watch` in a terminal pane — or any tool that touches a file every few
+/// hundred milliseconds — would reset the trailing debounce for ever and the kick would never
+/// fire, which is the failure mode a bare trailing debounce always has.
+const KICK_CEILING: Duration = Duration::from_secs(5);
 
 /// Every project's diagnostics.
 #[derive(Default)]
@@ -81,13 +119,85 @@ impl DiagnosticsRegistry {
     }
 }
 
-/// The Find usages request that is in flight for this project, if any.
+/// The Find usages *or* Go to implementation request in flight for this project, if any. (M18)
 ///
-/// **One per project, so no id has to cross the IPC boundary.** A second Find usages supersedes the
+/// **One per project, so no id has to cross the IPC boundary.** A second search supersedes the
 /// first — the popup only shows one list — and Escape cancels whatever is outstanding, so the
 /// webview never needs to name a request. Handing an id to the frontend would mean the frontend
 /// holding a number whose only valid use is passing it straight back.
+///
+/// Shared between the two gestures rather than given one slot each, and that follows from the same
+/// fact: they share the popup. Two slots would mean an Escape that cancelled one kind of search
+/// and left the other running, with the user looking at a dismissed popup and rust-analyzer still
+/// working — the exact half-cancellation `cancel_usages` was written to prevent.
 type Outstanding = Mutex<Option<(cide_lsp::Requester, i64)>>;
+
+/// What the pump still owes the servers and the panel after a disk change. (M18)
+///
+/// # Why the work is parked here rather than done where it is discovered
+///
+/// [`ProjectDiagnostics::files_changed`] runs on the **watcher thread**, which also carries every
+/// file-tree update for the project. Two things must not happen there: a `cargo check` must not be
+/// started per watcher event (a `cargo fmt` over four hundred files is four hundred events inside
+/// a second), and an emit must not be pushed per event either. So the discovery side records
+/// *that* something is owed and the pump — which already wakes every [`TICK`] and already owns the
+/// only coalescer in this file — decides when to pay it.
+///
+/// A `Mutex` and not atomics: `first` and `last` have to move together or the ceiling and the
+/// trailing debounce disagree about the same burst.
+#[derive(Default)]
+struct Kick {
+    state: Mutex<KickState>,
+}
+
+#[derive(Default)]
+struct KickState {
+    /// When the first un-serviced change of this burst arrived. Drives [`KICK_CEILING`].
+    first: Option<Instant>,
+    /// And the most recent. Drives [`KICK_DEBOUNCE`].
+    last: Option<Instant>,
+    /// The store's staleness marks moved, so the snapshot has changed even though no server spoke.
+    ///
+    /// Separate from the flycheck timers because it is due *immediately* — the whole point of the
+    /// stale flag is that the user sees it while the re-check is still pending — and it rides the
+    /// emit coalescer rather than the kick debounce.
+    marked: bool,
+}
+
+impl Kick {
+    /// Record that a disk change arrived, and whether it moved the panel's staleness marks.
+    fn schedule(&self, marked: bool) {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        state.first.get_or_insert(now);
+        state.last = Some(now);
+        state.marked |= marked;
+    }
+
+    /// Has the panel got something new to say? Consumes the flag.
+    fn take_marked(&self) -> bool {
+        std::mem::take(&mut self.state.lock().marked)
+    }
+
+    /// Is the burst over (or has it run long enough)? Consumes the timers when it is.
+    fn take_due(&self) -> bool {
+        let mut state = self.state.lock();
+        let (Some(first), Some(last)) = (state.first, state.last) else {
+            return false;
+        };
+        if last.elapsed() < KICK_DEBOUNCE && first.elapsed() < KICK_CEILING {
+            return false;
+        }
+        state.first = None;
+        state.last = None;
+        true
+    }
+
+    /// Forget whatever was owed — a manual re-run has just paid it in full.
+    fn clear(&self) {
+        *self.state.lock() = KickState::default();
+    }
+}
 
 /// One project's servers and store.
 pub struct ProjectDiagnostics {
@@ -98,6 +208,8 @@ pub struct ProjectDiagnostics {
     stop: Arc<AtomicBool>,
     pump: Mutex<Option<std::thread::JoinHandle<()>>>,
     usages_in_flight: Outstanding,
+    /// What the pump owes after a disk change. See [`Kick`].
+    kick: Arc<Kick>,
 }
 
 impl ProjectDiagnostics {
@@ -141,14 +253,16 @@ impl ProjectDiagnostics {
             }
         }
 
+        let kick = Arc::new(Kick::default());
         let pump = std::thread::Builder::new()
             .name(format!("cide-diag-{project}"))
             .spawn({
                 let store = Arc::clone(&store);
                 let handles = Arc::clone(&handles);
                 let stop = Arc::clone(&stop);
+                let kick = Arc::clone(&kick);
                 let roots = roots.clone();
-                move || pump(app, project, roots, store, handles, stop)
+                move || pump(app, project, roots, store, handles, stop, kick)
             })
             .ok();
 
@@ -160,6 +274,7 @@ impl ProjectDiagnostics {
             stop,
             pump: Mutex::new(pump),
             usages_in_flight: Mutex::new(None),
+            kick,
         }
     }
 
@@ -197,7 +312,7 @@ impl ProjectDiagnostics {
             // `Session`'s document builders are pure — they need no session state — so a
             // throwaway one is enough to shape the message. Threading the live session out of
             // the pump thread would mean a lock around the whole protocol conversation.
-            let (session, _) = cide_lsp::Session::new(&self.roots, server.binary());
+            let (session, _) = cide_lsp::Session::new(&self.roots, server);
             if let cide_lsp::Effect::Send(value) =
                 message(&session, uri.clone(), server.language_id())
             {
@@ -593,6 +708,320 @@ impl ProjectDiagnostics {
         }
     }
 
+    /// Files changed on disk, by somebody who is not this editor. (M18)
+    ///
+    /// The other half of document sync, and the half that was missing. `cmd::diagnostics`'
+    /// `did_open`/`did_change`/`did_save` cover the buffer the *user* is typing in; this covers
+    /// everything else — an agent's `Edit`, a `git checkout`, a `cargo fmt`, a `go mod tidy`.
+    ///
+    /// Runs on the **watcher thread** (see `files::on_watch_event`), so it does three cheap things
+    /// and parks the expensive one:
+    ///
+    /// 1. **Marks the store dirty.** The panel then says "may be out of date" on rows whose file
+    ///    has moved underneath them, which is the honest state until the analyser re-reports. A
+    ///    row that silently keeps a wrong line number is the reported bug.
+    /// 2. **Tells gopls at once**, with `workspace/didChangeWatchedFiles`. gopls has no watcher of
+    ///    its own and this notification *is* how it learns; there is nothing to debounce, because
+    ///    one watcher event already carries a whole batch of paths and gopls does its own
+    ///    throttling.
+    /// 3. **Parks a flycheck kick** for rust-analyzer on the [`Kick`] coalescer. That one is a
+    ///    `cargo check` of the workspace and must not be started per event.
+    ///
+    /// Paths are split per server rather than broadcast: `go.mod` matters to gopls and `Cargo.toml`
+    /// to rust-analyzer, and neither has any use for the other's.
+    pub fn files_changed(&self, paths: &[PathBuf]) {
+        let mut go: Vec<&PathBuf> = Vec::new();
+        let mut rust = false;
+        for path in paths {
+            match owner_of(path) {
+                Some(Server::Gopls) => go.push(path),
+                Some(Server::RustAnalyzer) => rust = true,
+                None => {}
+            }
+        }
+        if go.is_empty() && !rust {
+            return;
+        }
+
+        // Only paths something has already reported on can be marked — see `mark_dirty` — so this
+        // is bounded by the length of the problems list rather than by the size of the burst.
+        let marked = {
+            let mut store = self.store.lock();
+            store.mark_dirty(paths.iter().filter_map(|p| p.to_str()))
+        };
+        self.kick.schedule(marked);
+
+        if !go.is_empty() {
+            /*
+             * `2` changed, `3` deleted — LSP's `FileChangeType`.
+             *
+             * The watcher does not say which, so the disk is asked. One `stat` per changed Go file
+             * is cheap next to what the alternative costs: telling gopls a deleted file merely
+             * "changed" leaves its diagnostics standing for a file that is gone, which is the
+             * same class of stale row this whole change is about. `1` (created) is deliberately
+             * not distinguished from `2`: nothing downstream treats them differently, and telling
+             * them apart would need a memory of what existed before the event.
+             */
+            let changes: Vec<(String, u8)> = go
+                .iter()
+                .map(|path| {
+                    let kind = if path.exists() { 2 } else { 3 };
+                    (cide_lsp::convert::path_to_uri(path), kind)
+                })
+                .collect();
+            self.notify_server(Server::Gopls, |session| {
+                session.did_change_watched_files(changes.clone())
+            });
+        }
+    }
+
+    /// Re-run everything, now, because the user asked. (M18)
+    ///
+    /// The Problems panel's *Re-run analysis* button and the `problems.refresh` command. Returns
+    /// the sentence to show, because a control whose whole effect happens in another process over
+    /// the next few seconds is otherwise indistinguishable from a control that is wired to
+    /// nothing — which is this repository's named recurring defect and the user's actual
+    /// complaint.
+    ///
+    /// # What it costs, and why it is not a restart
+    ///
+    /// A restart of rust-analyzer on a large workspace is minutes of re-indexing, and it is
+    /// already available per source in the panel's footer (`diagnostics.restart`, unchanged). This
+    /// is the cheap one: `rust-analyzer/runFlycheck` re-runs `cargo check` without touching the
+    /// index, and a `didChangeWatchedFiles` sweep makes gopls re-read the files it has findings
+    /// for. Seconds rather than minutes, and it is what the user means by "re-run it".
+    ///
+    /// **The staleness marks are not cleared here, and that is the point of them.** An earlier
+    /// version cleared them wholesale right after sending the kick, reasoning that the button
+    /// would otherwise look inert. The kick is asynchronous: `runFlycheck` is a `cargo check`
+    /// and the gopls sweep is a re-read, so results are seconds to minutes away. Clearing on
+    /// send therefore took the "may be out of date" mark off every row while every row was
+    /// still exactly as out of date as it had been — which is the state the mark exists to
+    /// describe, and the state the user reported landing in when a click on a fixed diagnostic
+    /// navigated them into unrelated comments.
+    ///
+    /// `DiagnosticStore::publish` already clears a path's mark when its source speaks about it
+    /// again, so the marks come down one file at a time as the answers actually arrive, and a
+    /// row that nothing re-reported keeps saying so. What stops the button looking inert is the
+    /// sentence it returns, not the silent removal of a warning that was still true.
+    pub fn refresh(&self, app: &tauri::AppHandle) -> String {
+        let running: Vec<Server> = self
+            .handles
+            .lock()
+            .iter()
+            .map(cide_lsp::LspHandle::server)
+            .collect();
+        if running.is_empty() {
+            return "No language server is running for this project, so there is nothing to \
+                    re-run. Rust needs rust-analyzer and Go needs gopls on PATH."
+                .to_string();
+        }
+
+        if running.contains(&Server::RustAnalyzer) {
+            self.notify_server(Server::RustAnalyzer, cide_lsp::Session::run_flycheck);
+        }
+        if running.contains(&Server::Gopls) {
+            /*
+             * gopls has no "re-check everything" primitive a client may call, so the honest thing
+             * is to tell it what a client normally tells it: these files may have changed. It
+             * re-reads them from disk and re-diagnoses, which is the effect being asked for.
+             *
+             * Every path gopls has *looked at* — an empty publish counts, which is what
+             * `known_paths` gives — rather than only the ones with findings. A file whose last
+             * error was fixed elsewhere is exactly the file a user presses this button about.
+             */
+            let changes: Vec<(String, u8)> = self
+                .store
+                .lock()
+                .known_paths()
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| owner_of(path) == Some(Server::Gopls) && path.exists())
+                .map(|path| (cide_lsp::convert::path_to_uri(&path), 2u8))
+                .collect();
+            if !changes.is_empty() {
+                self.notify_server(Server::Gopls, |session| {
+                    session.did_change_watched_files(changes.clone())
+                });
+            }
+        }
+
+        self.kick.clear();
+        crate::emit::diagnostics(app, self.project);
+
+        let names: Vec<&str> = running.iter().map(|s| s.binary()).collect();
+        format!(
+            "Re-running {}. Results replace the current list as they arrive.",
+            match names.as_slice() {
+                [one] => (*one).to_string(),
+                _ => names.join(" and "),
+            }
+        )
+    }
+
+    /// Send one notification to every handle for `server`.
+    ///
+    /// The shape [`Self::notify_document`] already uses — a throwaway [`cide_lsp::Session`] to
+    /// build the message, because the document and workspace builders are pure and the live
+    /// session never leaves the supervisor thread — with the per-path server lookup dropped,
+    /// since these messages are *about* the server rather than about one file.
+    fn notify_server(
+        &self,
+        server: Server,
+        message: impl Fn(&cide_lsp::Session) -> cide_lsp::Effect,
+    ) {
+        for handle in self.handles.lock().iter() {
+            if handle.server() != server {
+                continue;
+            }
+            let (session, _) = cide_lsp::Session::new(&self.roots, server);
+            if let cide_lsp::Effect::Send(value) = message(&session) {
+                handle.send(value);
+            }
+        }
+    }
+
+    /// Where the thing under the caret is *implemented*, as opposed to declared. (M18)
+    ///
+    /// # Why this is a second request and not a smarter first one
+    ///
+    /// The user's report was that Go to definition in Go lands on the interface. It does, and
+    /// gopls is right: `textDocument/definition` on a call through an interface resolves to the
+    /// interface's method, because that is where the thing being called is declared. "Take me to
+    /// the concrete one" is `textDocument/implementation`, a different question, and cide had no
+    /// gesture that asked it.
+    ///
+    /// Making Ctrl+B ask *this* first and fall back was the obvious alternative and it regresses
+    /// Rust: rust-analyzer answers `implementation` on a struct name with its `impl` blocks and on
+    /// a trait with its implementors, so Ctrl+click on an ordinary type name would stop opening
+    /// the declaration. A separate bindable id is what this codebase already reached for when
+    /// Ctrl+click's discriminator could guess wrong — see `navigate.usages` in
+    /// `cide_core::commands` — and it is the same answer here.
+    ///
+    /// Returns [`cide_ipc::UsagesAnswer`] and reuses the Find usages popup wholesale, because the
+    /// shape of the answer is identical: an interface with many implementors is the common case,
+    /// and "several results, pick one" is a picker that already exists and is already tested.
+    ///
+    /// **Blocks for up to `timeout`.** Blocking pool only, handles lock dropped before the wait —
+    /// the rules [`Self::usages`] states, which apply here unchanged. It shares
+    /// [`Self::usages_in_flight`] with that method deliberately: one popup, one outstanding
+    /// request, so Escape cancels whichever is running without the webview naming it.
+    pub fn implementations(
+        &self,
+        path: &std::path::Path,
+        line: u32,
+        column: u32,
+        timeout: std::time::Duration,
+    ) -> cide_ipc::UsagesAnswer {
+        use cide_ipc::UsagesAnswer;
+
+        let (server, requester) = match self.requester_for(path) {
+            Ok(pair) => pair,
+            Err(missing) => {
+                return UsagesAnswer::Unavailable {
+                    reason: missing.sentence("Go to implementation"),
+                };
+            }
+        };
+
+        // The one case worth refusing outright, and `None` is deliberately not it — the whole
+        // argument is written out in `usages`, and it is the same three-state reading.
+        let known = {
+            let handles = self.handles.lock();
+            handles
+                .iter()
+                .find(|handle| handle.server() == server)
+                .and_then(cide_lsp::LspHandle::supports_implementation)
+        };
+        if known == Some(false) {
+            return UsagesAnswer::Unavailable {
+                reason: format!(
+                    "{} does not offer Go to implementation. It answered the handshake without \
+                     `implementationProvider`.",
+                    server.binary()
+                ),
+            };
+        }
+
+        // No `context` member: `textDocument/implementation` takes a bare `TextDocumentPositionParams`,
+        // unlike `references`, so there is no `includeDeclaration` to set. The origin is still
+        // filtered out of the reply by `rows_from` — an "implementation" at the caret is where the
+        // user already is.
+        let params = position_params(path, line, column);
+
+        self.cancel_usages();
+        let slot = &self.usages_in_flight;
+        let mine = std::cell::Cell::new(0i64);
+        let answer =
+            requester.request_tracked("textDocument/implementation", params, timeout, |id| {
+                mine.set(id);
+                *slot.lock() = Some((requester.clone(), id));
+            });
+        // Cleared only if it is still ours — the same race `usages` documents: a second gesture
+        // that superseded us has already put its own id in the slot, and a blind `take` would
+        // leave Escape with nothing to cancel.
+        {
+            let mut in_flight = slot.lock();
+            if in_flight.as_ref().map(|(_, id)| *id) == Some(mine.get()) {
+                *in_flight = None;
+            }
+        }
+
+        match answer {
+            Ok(value) => match cide_lsp::convert::locations(&value) {
+                Some(rows) => {
+                    let (rows, truncated) = self.rows_from(rows, path, line, column);
+                    UsagesAnswer::Found { rows, truncated }
+                }
+                // `null`: there is no symbol at this position at all. The caller falls back to Go
+                // to definition on this, which is what makes the command always do *something*.
+                None => UsagesAnswer::NotFound,
+            },
+            /*
+             * A rejected *question*, folded into "there is nothing here". (M18)
+             *
+             * Not a guess: `gopls_goes_to_the_implementation_rather_than_the_interface` caught it
+             * on the first run. gopls answers `textDocument/implementation` on a position that is
+             * not a type with a JSON-RPC **error** — literally `s is a var, not a type` — where
+             * the spec's own answer for "nothing to report" is `null`. Rendered as
+             * `Unavailable`, a Ctrl+Alt+B on an ordinary local variable would put that sentence
+             * on screen as though the server were broken.
+             *
+             * `NotFound` is what the caller falls back to Go to definition on, which is the
+             * useful thing to do with a caret the question does not apply to — and it is what
+             * makes this command always do *something* rather than being silent on the majority
+             * of positions it is pressed at.
+             *
+             * The server's own words are kept, in the log rather than on screen: a genuinely
+             * broken server still reaches here, and throwing its explanation away would leave
+             * nothing to diagnose it with. `Timeout`, `Cancelled` and `ServerGone` are untouched
+             * — those are failures of the *transport*, not answers about the position, and each
+             * keeps its own sentence.
+             */
+            Err(cide_lsp::RequestError::Failed(message)) => {
+                tracing::debug!(
+                    target: "cide::lsp",
+                    server = server.binary(),
+                    %message,
+                    "the server refused an implementation query at this position"
+                );
+                UsagesAnswer::NotFound
+            }
+            Err(cide_lsp::RequestError::Cancelled) => UsagesAnswer::Unavailable {
+                reason: "The search was cancelled.".to_string(),
+            },
+            Err(cide_lsp::RequestError::Timeout) => UsagesAnswer::Unavailable {
+                reason: format!(
+                    "{} did not answer in time — it is probably still indexing. Try again in a moment.",
+                    server.binary()
+                ),
+            },
+            Err(error) => UsagesAnswer::Unavailable {
+                reason: format!("{}: {error}", server.binary()),
+            },
+        }
+    }
+
     /// Restart one source after it gave up.
     pub fn restart(&self, app: &tauri::AppHandle, source: cide_ipc::DiagnosticSourceId) {
         // tree-sitter and Claude are not processes and have nothing to restart.
@@ -766,7 +1195,29 @@ fn server_for(path: &std::path::Path) -> Option<Server> {
     }
 }
 
-/// Drain the handles, fold into the store, emit — coalesced.
+/// Which server *cares* about a path — [`server_for`] widened to the build manifests. (M18)
+///
+/// A separate function rather than a widening of `server_for`, and the split is the point.
+/// `server_for` answers "who would I send a `textDocument/didOpen` for this buffer to", and a
+/// `Cargo.toml` has no `languageId` and must not be opened as a document. This one answers "whose
+/// view of the world does a write here invalidate", which is a strictly larger set: editing
+/// `go.mod` changes what gopls resolves, and editing `Cargo.toml` changes rust-analyzer's crate
+/// graph, and in both cases a diagnostic in some `.rs` or `.go` file may now be wrong.
+///
+/// `go.work` and `Cargo.lock` are included for the same reason; `.gitignore` and the rest are not,
+/// because a change there moves nothing either server has said.
+fn owner_of(path: &std::path::Path) -> Option<Server> {
+    if let Some(server) = server_for(path) {
+        return Some(server);
+    }
+    match path.file_name()?.to_str()? {
+        "Cargo.toml" | "Cargo.lock" => Some(Server::RustAnalyzer),
+        "go.mod" | "go.sum" | "go.work" | "go.work.sum" => Some(Server::Gopls),
+        _ => None,
+    }
+}
+
+/// Drain the handles, fold into the store, emit — coalesced. Pay what a disk change owes.
 fn pump(
     app: tauri::AppHandle,
     project: ProjectId,
@@ -774,6 +1225,7 @@ fn pump(
     store: Arc<Mutex<DiagnosticStore>>,
     handles: Arc<Mutex<Vec<LspHandle>>>,
     stop: Arc<AtomicBool>,
+    kick: Arc<Kick>,
 ) {
     // The two halves of the debounce: when the first un-emitted change arrived, and when the last
     // one did. See the module docs for why both are needed.
@@ -808,6 +1260,40 @@ fn pump(
                             store.lock().publish(source, abs_path, converted);
                         }
                     }
+                }
+            }
+        }
+
+        /*
+         * A disk change moved the staleness marks, so the snapshot the panel reads has changed
+         * even though no server said a word. Folded into the *emit* debounce and not the kick's:
+         * the mark is what tells the user "this row may point at the wrong line", and it is worth
+         * nothing if it appears only after the re-check it is warning about has already finished.
+         */
+        if kick.take_marked() {
+            changed = true;
+        }
+
+        /*
+         * And the expensive half, once the burst has settled. Taken here rather than in
+         * `files_changed` because that runs on the watcher thread: a `cargo fmt` over four hundred
+         * files is four hundred events inside a second, and four hundred `cargo check` runs is a
+         * machine that never recovers. See `KICK_DEBOUNCE`.
+         *
+         * gopls is deliberately absent from this branch. It was told at once, in `files_changed`,
+         * because `workspace/didChangeWatchedFiles` is how it learns anything at all and it does
+         * its own throttling; rust-analyzer's kick is a whole-workspace `cargo check` and is the
+         * only one that has to be rationed.
+         */
+        if kick.take_due() {
+            let handles = handles.lock();
+            for handle in handles.iter() {
+                if handle.server() != Server::RustAnalyzer {
+                    continue;
+                }
+                let (session, _) = cide_lsp::Session::new(&roots, Server::RustAnalyzer);
+                if let cide_lsp::Effect::Send(value) = session.run_flycheck() {
+                    handle.send(value);
                 }
             }
         }
@@ -954,6 +1440,7 @@ mod tests {
             message: "boom".into(),
             source: "rust-analyzer".into(),
             code: Some("E0308".into()),
+            stale: false,
         }
     }
 
@@ -1217,6 +1704,127 @@ mod tests {
         assert_eq!(
             PREVIEW_BYTES,
             cide_search::content::Limits::default().max_line_bytes
+        );
+    }
+
+    #[test]
+    fn a_build_manifest_belongs_to_a_server_even_though_no_buffer_opens_it() {
+        // `server_for` answers "who do I send a didOpen for this buffer to", and a `Cargo.toml`
+        // has no `languageId`. `owner_of` answers "whose view of the world does a write here
+        // invalidate", which is strictly larger — editing `go.mod` changes what gopls resolves,
+        // and a diagnostic in some `.go` file may now be wrong.
+        use std::path::Path;
+        assert_eq!(
+            owner_of(Path::new("/r/Cargo.toml")),
+            Some(Server::RustAnalyzer)
+        );
+        assert_eq!(
+            owner_of(Path::new("/r/Cargo.lock")),
+            Some(Server::RustAnalyzer)
+        );
+        assert_eq!(owner_of(Path::new("/r/go.mod")), Some(Server::Gopls));
+        assert_eq!(owner_of(Path::new("/r/go.work")), Some(Server::Gopls));
+        assert_eq!(
+            owner_of(Path::new("/r/src/a.rs")),
+            Some(Server::RustAnalyzer)
+        );
+        assert_eq!(owner_of(Path::new("/r/a.go")), Some(Server::Gopls));
+        // And nothing else. A `.gitignore` or a `README.md` moves nothing either server has said,
+        // and treating it as a change would start a `cargo check` every time a note was saved.
+        assert_eq!(owner_of(Path::new("/r/.gitignore")), None);
+        assert_eq!(owner_of(Path::new("/r/README.md")), None);
+        // `server_for` stays narrow, which is the point of having two functions.
+        assert_eq!(server_for(Path::new("/r/Cargo.toml")), None);
+    }
+
+    #[test]
+    fn a_burst_of_disk_changes_produces_one_flycheck_and_not_one_each() {
+        // The correctness requirement the `Kick` type exists for. A `cargo fmt` over four hundred
+        // files is four hundred watcher events inside a second, and four hundred whole-workspace
+        // `cargo check` runs is a machine that never recovers — the same argument the emit
+        // coalescer above makes, one order of magnitude up.
+        let kick = Kick::default();
+        for _ in 0..400 {
+            kick.schedule(false);
+        }
+        assert!(
+            !kick.take_due(),
+            "the kick fired while the burst was still arriving"
+        );
+
+        // Nothing has arrived for longer than the trailing debounce: now it is due, exactly once.
+        {
+            let mut state = kick.state.lock();
+            state.last = Some(Instant::now() - KICK_DEBOUNCE - Duration::from_millis(10));
+        }
+        assert!(kick.take_due(), "a settled burst never became due");
+        assert!(!kick.take_due(), "one burst produced two kicks");
+    }
+
+    #[test]
+    fn a_burst_that_never_settles_still_gets_re_checked() {
+        // The failure a bare trailing debounce always has. `cargo watch` in a terminal pane, or
+        // any tool that touches a file every few hundred milliseconds, would reset `last` for ever
+        // and the kick would never fire at all.
+        let kick = Kick::default();
+        kick.schedule(false);
+        {
+            let mut state = kick.state.lock();
+            state.first = Some(Instant::now() - KICK_CEILING - Duration::from_millis(10));
+            // Still arriving: the trailing debounce alone would say "not yet".
+            state.last = Some(Instant::now());
+        }
+        assert!(
+            kick.take_due(),
+            "the ceiling did not override the trailing debounce"
+        );
+    }
+
+    #[test]
+    fn nothing_owed_is_never_due() {
+        // A pump that fired on an empty kick would send `runFlycheck` every 100 ms for the life of
+        // the project, which is a `cargo check` loop nobody asked for.
+        let kick = Kick::default();
+        assert!(!kick.take_due());
+        assert!(!kick.take_marked());
+    }
+
+    #[test]
+    fn the_panels_marks_are_due_immediately_and_the_flycheck_is_not() {
+        // Two different clocks on purpose. The stale mark is worth nothing if it appears only
+        // after the re-check it is warning about has already finished, so it rides the emit
+        // coalescer (250 ms) rather than the kick's debounce (500 ms) and ceiling (5 s).
+        let kick = Kick::default();
+        kick.schedule(true);
+        assert!(
+            kick.take_marked(),
+            "the panel had to wait out the kick debounce"
+        );
+        assert!(!kick.take_marked(), "the flag was not consumed");
+        assert!(!kick.take_due(), "the expensive half fired at once");
+    }
+
+    #[test]
+    fn a_manual_rerun_cancels_what_the_watcher_had_parked() {
+        // Otherwise the button's kick is followed a moment later by the burst's kick, which is
+        // two `cargo check` runs for one gesture.
+        let kick = Kick::default();
+        kick.schedule(true);
+        kick.clear();
+        assert!(!kick.take_marked());
+        assert!(!kick.take_due());
+    }
+
+    #[test]
+    fn the_kick_is_rationed_more_heavily_than_the_emit() {
+        // Both are debounces and they are not interchangeable: coalescing an emit too eagerly
+        // costs a redundant serialization, kicking flycheck too eagerly costs a whole `cargo
+        // check` of the workspace.
+        assert!(KICK_DEBOUNCE > COALESCE);
+        assert!(KICK_CEILING > COALESCE_CEILING);
+        assert!(
+            TICK < KICK_DEBOUNCE,
+            "the pump cannot notice its own debounce"
         );
     }
 

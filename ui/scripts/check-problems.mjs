@@ -96,6 +96,8 @@ try {
     ALL_VISIBLE,
     applyFilters,
     visible,
+    STALE_NOTE,
+    sourceRows,
   } = model
 
   const at = (path, line, column, severity, message, extra = {}) => ({
@@ -410,6 +412,85 @@ try {
     'a genuinely clean workspace still says so when nothing was hidden',
   )
 
+  // --- Staleness, and the analyser list. (M18) --------------------------------------------
+
+  /*
+   * The half of the M18 report the model owns.
+   *
+   * A diagnostic keeps the line number it was published with, and an out-of-editor write — an
+   * agent's edit, a `git checkout` — moves the file underneath it. The row must stay clickable (a
+   * jump a few lines off beats a dead row) and must say which it is, or the user lands in a
+   * comment with nothing on screen to explain why. That was the report, verbatim.
+   */
+  {
+    const mixed = groupByFile([
+      at('src/a.rs', 1, 1, 'error', 'boom', { stale: true }),
+      at('src/a.rs', 9, 1, 'hint', 'consider'),
+      at('src/b.rs', 4, 1, 'warning', 'unused'),
+    ])
+    eq(mixed[0].stale, true, 'a group with any stale row is marked')
+    eq(mixed[1].stale, false, 'and a group with none is not — a mark on everything says nothing')
+    eq(
+      groupByFile([at('src/a.rs', 1, 1, 'error', 'boom')])[0].stale,
+      false,
+      'absent means "nothing has said this is out of date", which is what every pre-M18 fixture ' +
+        'relies on',
+    )
+    ok(
+      STALE_NOTE.length > 0 && STALE_NOTE.length < 80,
+      'the note fits under a group heading in a 252px panel',
+    )
+  }
+
+  /*
+   * `sources` has been on the wire since M12 and the panel drew none of it, so
+   * "rust-analyzer is not installed" — the one sentence that explains an empty list — arrived and
+   * was discarded. And `restartable` is the field that stops a Restart button appearing on a
+   * source that is not a process, where `ProjectDiagnostics::restart` returns immediately.
+   */
+  {
+    deep(sourceRows(NO_SOURCE), [], 'a snapshot with no source array yields no rows, not fake ones')
+
+    const rows = sourceRows({
+      kind: 'unavailable',
+      reason: 'nothing running',
+      sources: [
+        {
+          id: 'rustAnalyzer',
+          label: 'rust-analyzer',
+          status: { kind: 'unavailable', reason: 'rust-analyzer is not on PATH.' },
+          items: 0,
+        },
+        { id: 'gopls', label: 'gopls', status: { kind: 'scanning', detail: 'Loading' }, items: 0 },
+        { id: 'treeSitter', label: 'tree-sitter', status: { kind: 'ready' }, items: 3 },
+        { id: 'claude', label: 'claude', status: { kind: 'ready' }, items: 0 },
+      ],
+    })
+    deep(
+      rows.map((r) => r.restartable),
+      [true, true, false, false],
+      'only the two that are separate processes offer a restart — a button on the others would ' +
+        'do nothing when pressed',
+    )
+    eq(
+      rows[0].detail,
+      'rust-analyzer is not on PATH.',
+      'the unavailable reason is shown whole: it is the only actionable sentence this panel has',
+    )
+    eq(rows[1].detail, 'Loading', 'a scanning source shows the server’s own progress line')
+    eq(rows[2].detail, 'Ready — 3 findings.', 'and a ready one shows what it found')
+    eq(rows[3].detail, 'Ready — nothing found.', 'including nothing, which is a real answer')
+    eq(
+      sourceRows({
+        kind: 'unavailable',
+        reason: 'x',
+        sources: [{ id: 'gopls', label: 'gopls', status: { kind: 'scanning', detail: '' }, items: 0 }],
+      })[0].detail,
+      'Starting…',
+      'a blank progress line becomes words — an empty line under a name reads as a broken row',
+    )
+  }
+
   // --- Source pins: three fixes a later edit would quietly undo. --------------------------
 
   const read = (rel) => readFileSync(join(UI, rel), 'utf8')
@@ -572,6 +653,84 @@ try {
     rogue2.claim !== 'No problems found',
     'a panel that renders problems must never headline that there are none',
   )
+
+  /*
+   * The rendered half of M18. The model can be perfectly right about staleness and about the
+   * analyser list while the component draws neither — which is exactly the state the panel was in
+   * for `snapshot.sources` between M12 and M18, with every model assertion above it green.
+   */
+  {
+    const stale = story('stale')
+    deep(stale.staleGroups, ['src/a.rs'], 'only the group whose file moved is marked')
+    eq(stale.staleNote, true, 'and the note that says why is on screen')
+    eq(stale.staleRows.length, 3, 'every row in that group carries the mark')
+    eq(
+      stale.rowTag,
+      'button',
+      'a stale row stays clickable — a jump that may be a few lines off beats a dead row',
+    )
+    eq(story('ready-wired').staleNote, false, 'and a current list says nothing about staleness')
+    deep(story('ready-wired').staleGroups, [], 'nor marks any group')
+  }
+
+  {
+    const sources = story('sources')
+    deep(
+      sources.sources,
+      [
+        'rustAnalyzer :: rust-analyzer is not on PATH.',
+        'gopls :: Loading packages',
+        'treeSitter :: Ready — 2 findings.',
+        'claude :: Ready — nothing found.',
+      ],
+      'the analyser list is drawn on an `unavailable` snapshot — the state that most needs it',
+    )
+    eq(
+      sources.refresh,
+      false,
+      'with no `onRefresh` the control is absent, not disabled: there is no condition under ' +
+        'which it would work, and dressing a dead thing as live is this panel’s named failure',
+    )
+    deep(sources.restarts, [], 'and no Restart buttons either')
+
+    const wired = story('sources-wired')
+    eq(wired.refresh, true, 'a host that can re-run gets the button the user asked for')
+    deep(
+      wired.restarts,
+      ['rustAnalyzer', 'gopls'],
+      'and Restart appears on exactly the two sources that are processes',
+    )
+  }
+
+  /*
+   * The panel's two new controls are *reachable*. (M18)
+   *
+   * Every render assertion above is satisfied by a component with the right props; none of them
+   * can see that `App.tsx` never passes those props, which is precisely how `diagnostics.restart`
+   * sat fully built and callable with no caller anywhere in the app from M12 to M18.
+   */
+  ok(
+    /<ProblemsPanel[\s\S]{0,900}onRefresh=\{/.test(app),
+    'App.tsx wires the Re-run control, so the button is not merely renderable',
+  )
+  ok(
+    /<ProblemsPanel[\s\S]{0,900}onRestartSource=\{/.test(app),
+    'and the per-source Restart, which is the first caller `diagnostics.restart` has ever had',
+  )
+  {
+    const actions = read('src/sidebar/ProblemsPanel/actions.ts')
+    ok(
+      /diagnosticsApi\s*\.\s*refresh\(/.test(actions) &&
+        /diagnosticsApi\s*\.\s*restart\(/.test(actions),
+      'both gestures go through the IPC client rather than being faked in the component',
+    )
+    const dispatch = read('src/keys/dispatch.ts')
+    ok(
+      dispatch.includes("case 'problems.refresh':") &&
+        dispatch.includes('refreshDiagnostics(project.id)'),
+      'and the palette/keymap id calls the same function the button does, so they cannot drift',
+    )
+  }
 
   for (const [name, d] of Object.entries(digests)) {
     eq(d.unclassed, 0, `${name}: every audit-hooked element carries a class from the stylesheet`)

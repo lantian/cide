@@ -327,6 +327,35 @@ pub fn defaults() -> Vec<Binding> {
              * ⌥F7 — which is IDEA's mac binding for the same action, correctly and by luck.
              */
             ("alt+f7", "navigate.usages", "editorFocused"),
+            /*
+             * Go to implementation — IDEA's own chord, unchanged. (M18)
+             *
+             * # What it costs, checked in every layer rather than assumed
+             *
+             * * **In `defaults()`**: the Ctrl+Alt entries are the three splits
+             *   (`ctrl+alt+right`/`down`), the four pane moves (`ctrl+alt+h/j/k/l`) and
+             *   `ctrl+alt+shift+n`. Nothing uses `ctrl+alt+b`. Free.
+             * * **In CodeMirror**: `defaultKeymap` binds `Mod-b` nowhere on Linux — `Ctrl-b` lives
+             *   only in `emacsStyleKeymap`, which `standardKeymap` re-exposes under a **mac-only**
+             *   `mac:` property — and binds no `Mod-Alt` letter at all. Free.
+             * * **On KDE, the development platform**: `ctrl+alt+l` is Lock Screen and is avoided
+             *   elsewhere in this table for that reason; `ctrl+alt+b` is not a stock KDE global.
+             * * **In xterm**: Ctrl+Alt+B is `ESC ^B`, which is readline's `backward-word` on a
+             *   terminal that maps Alt to Escape-prefix. That is a real byte a shell user wants,
+             *   which is precisely why the clause below is not optional.
+             *
+             * `editorFocused`, for the reason `ctrl+b` above states at length: the gate is a
+             * window **capture** listener, so an unscoped chord is swallowed in every terminal
+             * pane in every window, for a command that needs a caret to mean anything.
+             *
+             * `ctrl+b` keeps meaning "definition" and is untouched. Two questions, two chords —
+             * see the id's own comment in `cide_core::commands` for why folding them into one
+             * would regress Rust's most-used gesture to fix a Go complaint.
+             *
+             * macOS: `platform_layer` rewrites Ctrl to Meta and leaves Alt alone, so this becomes
+             * ⌘⌥B — which is IDEA's mac binding for the same action, correctly and by luck.
+             */
+            ("ctrl+alt+b", "navigate.implementation", "editorFocused"),
             // Go to line, on IDEA's and VS Code's chord for it.
             //
             // # What it costs, named rather than discovered later
@@ -1458,6 +1487,39 @@ mod tests {
                 key != "f3" && key != "shift+f3",
                 "{key} is bound to {} — F3 is find-next inside the editor, and the window \
                  capture gate would take it from the buffer and the find field together",
+                binding.command
+            );
+        }
+    }
+
+    /// **Ctrl+F is not bound here either, and for the third version of the same argument.**
+    ///
+    /// It means two different things in two different panes, and the keymap can express neither
+    /// without breaking the other. In an editor it is `@codemirror/search`'s `Mod-f`, which opens
+    /// the find bar and is reached *only* because this table stays silent about the key —
+    /// `ui/src/editor/EditorSurface.tsx` says so where it fixed the read-only-buffer keymap. In a
+    /// terminal it opens that pane's find bar, and that is resolved focus-scoped in
+    /// `ui/src/terminal/keys.ts` from xterm's own custom key handler, beside Ctrl+C and Ctrl+V.
+    ///
+    /// A `when: "terminalFocused"` binding is the shape that looks like it would work and does
+    /// not, for the reason [`the_terminal_clipboard_chords_are_not_bound_here`] spells out: the
+    /// gate's second entry point is a window **capture** listener and that flag is derived from
+    /// `tab.tree.focused`, not from the caret. It stays true while the user is typing into a
+    /// rename field, the commit message box or the Explorer's search input, so the binding would
+    /// take Ctrl+F from every one of them in any window whose focused pane is a terminal.
+    ///
+    /// `terminal.find` is a registered command with a `terminalFocused` clause all the same, so
+    /// it has a palette row and a user who wants the chord in the keymap — ⌘F on a Mac, say —
+    /// writes one line of `keymap.json`. What must not happen is cide shipping that line.
+    #[test]
+    fn ctrl_f_is_not_bound_here_because_two_panes_mean_two_things_by_it() {
+        for binding in defaults().into_iter().chain(platform_defaults()) {
+            let key = normalize_key(&binding.key);
+            assert!(
+                key != "ctrl+f" && key != "meta+f",
+                "{key} is bound to {} — Ctrl+F is CodeMirror's find bar in an editor and the \
+                 terminal's own focus-scoped chord in a pane, and the window capture gate would \
+                 take it from both at once; see ui/src/terminal/keys.ts",
                 binding.command
             );
         }

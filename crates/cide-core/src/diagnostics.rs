@@ -41,7 +41,7 @@
 //! a user who hid hints made a statement about their own screen, not about what Claude should be
 //! told. See [`DiagnosticStore::for_abs_path`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cide_ipc::{
     Diagnostic, DiagnosticSourceId, DiagnosticsSnapshot, InspectionSettings, SourceReport,
@@ -92,6 +92,24 @@ impl SourceState {
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticStore {
     sources: BTreeMap<DiagnosticSourceId, SourceState>,
+    /// Per source, the absolute paths that changed on disk since that source last spoke about
+    /// them. (M18)
+    ///
+    /// # Why this is keyed by source and not by path alone
+    ///
+    /// More than one source reports on one file — tree-sitter parses the buffer the user has
+    /// open while rust-analyzer checks the whole crate — and they answer at completely different
+    /// times. A single `BTreeSet<String>` cleared by whichever source published first would
+    /// *un*-mark rust-analyzer's rows the instant tree-sitter re-parsed the same file, which is
+    /// under-reporting: a row that is silently wrong about its line number, which is the whole
+    /// defect this field exists to make visible. Over-reporting is the safe direction here and
+    /// under-reporting is not, so the mark is per `(source, path)` and each source clears only
+    /// its own.
+    ///
+    /// A path nothing has ever reported on is **not** marked — see [`DiagnosticStore::mark_dirty`]
+    /// — which is what keeps this bounded by the findings rather than by the size of the
+    /// workspace.
+    dirty: BTreeMap<DiagnosticSourceId, BTreeSet<String>>,
 }
 
 impl DiagnosticStore {
@@ -119,11 +137,59 @@ impl DiagnosticStore {
         abs_path: String,
         items: Vec<Diagnostic>,
     ) {
+        // The source has just spoken about this path, so whatever staleness was recorded against
+        // it is answered. Before the insert or after makes no difference; what matters is that
+        // the two live in one function, because a `publish` that forgot this would leave a
+        // permanent "may be out of date" on rows that are perfectly current.
+        if let Some(marks) = self.dirty.get_mut(&source) {
+            marks.remove(&abs_path);
+            if marks.is_empty() {
+                self.dirty.remove(&source);
+            }
+        }
         self.sources
             .entry(source)
             .or_insert_with(SourceState::new)
             .by_path
             .insert(abs_path, items);
+    }
+
+    /// These absolute paths changed on disk. Mark every source's findings for them as stale. (M18)
+    ///
+    /// Called from the file watcher, through `cide_app::files::FsEvents`. Returns whether anything
+    /// was actually marked, so the caller can skip an emit that would carry no change — a
+    /// `cargo build` touching four hundred files nobody has a finding in must not produce four
+    /// hundred snapshots.
+    ///
+    /// **Only paths something has already reported on are marked.** A path with no findings has no
+    /// row to mark, so recording it would grow this map with the size of the workspace instead of
+    /// with the size of the problem list — and it would never be cleared, because a source only
+    /// publishes for files it has something to say about... including, note, an empty list, which
+    /// is exactly why `has_looked_at` and not "has non-empty findings" is the test.
+    pub fn mark_dirty<'a>(&mut self, abs_paths: impl IntoIterator<Item = &'a str>) -> bool {
+        let mut marked = false;
+        for abs_path in abs_paths {
+            for (id, state) in &self.sources {
+                if !state.by_path.contains_key(abs_path) {
+                    continue;
+                }
+                marked |= self
+                    .dirty
+                    .entry(*id)
+                    .or_default()
+                    .insert(abs_path.to_string());
+            }
+        }
+        marked
+    }
+
+    /// Forget every staleness mark. (M18)
+    ///
+    /// Is this source's finding for this path known to be out of date?
+    fn is_dirty(&self, source: DiagnosticSourceId, abs_path: &str) -> bool {
+        self.dirty
+            .get(&source)
+            .is_some_and(|marks| marks.contains(abs_path))
     }
 
     /// Forget everything one source ever said — it exited, or was turned off.
@@ -133,6 +199,10 @@ impl DiagnosticStore {
     /// matters most for Claude, where re-finding costs tokens.
     pub fn clear_source(&mut self, source: DiagnosticSourceId) {
         self.sources.remove(&source);
+        // Its staleness marks go with it. They name paths in a map that no longer exists, and a
+        // restarted server that republishes a *subset* of them would otherwise leave the rest
+        // marked for ever with nothing able to clear them.
+        self.dirty.remove(&source);
     }
 
     /// Every diagnostic for one absolute path, from every source, **unfiltered**.
@@ -196,11 +266,27 @@ impl DiagnosticStore {
 
         // Items first, because both the `Scanning` and `Ready` arms carry them and the reports
         // need per-source counts of the *filtered* set.
+        // Iterated per `(source, path)` rather than through `SourceState::items`, because the
+        // staleness mark is keyed by both and this is the one place it can be stamped: the store
+        // is the truth, a `Diagnostic` is a copy handed to a view, and rewriting the flag anywhere
+        // downstream would be a second implementation of the rule in another language.
         let mut items: Vec<Diagnostic> = enabled
             .iter()
-            .flat_map(|(_, state)| state.items())
-            .filter(|d| settings.shows_severity(d.severity) && settings.shows_source(&d.source))
-            .cloned()
+            .flat_map(|(id, state)| {
+                state
+                    .by_path
+                    .iter()
+                    .map(move |(abs_path, found)| (self.is_dirty(*id, abs_path), found))
+            })
+            .flat_map(|(stale, found)| found.iter().map(move |d| (stale, d)))
+            .filter(|(_, d)| {
+                settings.shows_severity(d.severity) && settings.shows_source(&d.source)
+            })
+            .map(|(stale, d)| {
+                let mut d = d.clone();
+                d.stale = stale;
+                d
+            })
             .collect();
         // A total order, so the prefix a cap keeps is the *worst* problems rather than whichever
         // path sorted first. `sort_by` on (severity, path, line, column) mirrors the panel's own
@@ -367,6 +453,7 @@ mod tests {
             message: message.to_string(),
             source: source.to_string(),
             code: None,
+            stale: false,
         }
     }
 
@@ -616,6 +703,148 @@ mod tests {
         store.clear_source(DiagnosticSourceId::RustAnalyzer);
         assert!(!store.has_looked_at("/repo/src/a.rs"));
         assert!(store.known_paths().is_empty());
+    }
+
+    /// The items a snapshot carries, whatever arm it is. Only `Ready`/`Scanning` have any.
+    fn items_of(snapshot: &DiagnosticsSnapshot) -> Vec<Diagnostic> {
+        match snapshot {
+            DiagnosticsSnapshot::Unavailable { .. } => Vec::new(),
+            DiagnosticsSnapshot::Scanning { items, .. }
+            | DiagnosticsSnapshot::Ready { items, .. } => items.clone(),
+        }
+    }
+
+    #[test]
+    fn a_file_that_changed_since_it_was_checked_reports_its_rows_as_stale() {
+        // The user report this whole mechanism exists for: Claude edits a file, the finding keeps
+        // the line number it had when it was published, and clicking the row lands in whatever is
+        // now at that line — for them, a comment. The row still ships, because a jump that may be
+        // a few lines off beats a row that vanished while the error is still there; what changes
+        // is that it says so.
+        let mut store = ready_store();
+        assert!(
+            items_of(&store.snapshot(&InspectionSettings::default(), EMIT_CAP))
+                .iter()
+                .all(|d| !d.stale)
+        );
+
+        assert!(store.mark_dirty(["/repo/src/a.rs"]), "nothing was marked");
+        let items = items_of(&store.snapshot(&InspectionSettings::default(), EMIT_CAP));
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|d| d.stale), "{items:#?}");
+    }
+
+    #[test]
+    fn a_republish_answers_the_staleness_it_was_asked_about() {
+        // The other half, and the half that makes the flag temporary rather than a permanent
+        // smear. Without it every file the user ever touched would read "may be out of date" for
+        // the rest of the session, which is a warning nobody reads.
+        let mut store = ready_store();
+        store.mark_dirty(["/repo/src/a.rs"]);
+        store.publish(
+            DiagnosticSourceId::RustAnalyzer,
+            "/repo/src/a.rs".into(),
+            vec![item("src/a.rs", Severity::Error, "rust-analyzer", "boom")],
+        );
+        let items = items_of(&store.snapshot(&InspectionSettings::default(), EMIT_CAP));
+        assert!(items.iter().all(|d| !d.stale), "{items:#?}");
+    }
+
+    #[test]
+    fn one_sources_republish_does_not_clear_another_sources_mark() {
+        // Why `dirty` is keyed by `(source, path)` and not by path alone. tree-sitter re-parses
+        // the open buffer on every keystroke; rust-analyzer re-checks the crate on a flycheck run
+        // that may be twenty seconds away. A path-keyed set would let the first un-mark the
+        // second's rows, which is *under*-reporting — a row that is silently wrong about its line
+        // number, which is exactly the defect being fixed.
+        let mut store = ready_store();
+        store.set_status(DiagnosticSourceId::TreeSitter, SourceStatus::Ready);
+        store.publish(
+            DiagnosticSourceId::TreeSitter,
+            "/repo/src/a.rs".into(),
+            vec![item("src/a.rs", Severity::Error, "tree-sitter", "unclosed")],
+        );
+        store.mark_dirty(["/repo/src/a.rs"]);
+
+        store.publish(
+            DiagnosticSourceId::TreeSitter,
+            "/repo/src/a.rs".into(),
+            vec![item("src/a.rs", Severity::Error, "tree-sitter", "unclosed")],
+        );
+        let items = items_of(&store.snapshot(&InspectionSettings::default(), EMIT_CAP));
+        let stale: Vec<&str> = items
+            .iter()
+            .filter(|d| d.stale)
+            .map(|d| d.source.as_str())
+            .collect();
+        assert_eq!(stale, ["rust-analyzer", "rust-analyzer"], "{items:#?}");
+    }
+
+    #[test]
+    fn marking_a_path_nothing_has_reported_on_is_not_recorded() {
+        // The bound on this map. A `cargo build` touches thousands of files; the ones with no
+        // finding have no row to mark, and recording them would grow the store with the size of
+        // the workspace and never shrink — no source ever publishes for a file it has nothing to
+        // say about, so nothing would clear them.
+        let mut store = ready_store();
+        assert!(
+            !store.mark_dirty(["/repo/src/never-mentioned.rs"]),
+            "a path with no findings was marked"
+        );
+    }
+
+    #[test]
+    fn clearing_a_source_takes_its_marks_with_it() {
+        // A restart republishes a *subset* of what the old life reported. Marks left behind would
+        // name paths the new server may never mention, and nothing could ever clear them.
+        let mut store = ready_store();
+        store.mark_dirty(["/repo/src/a.rs"]);
+        store.clear_source(DiagnosticSourceId::RustAnalyzer);
+        store.set_status(DiagnosticSourceId::RustAnalyzer, SourceStatus::Ready);
+        store.publish(
+            DiagnosticSourceId::RustAnalyzer,
+            "/repo/src/b.rs".into(),
+            vec![item("src/b.rs", Severity::Error, "rust-analyzer", "boom")],
+        );
+        let items = items_of(&store.snapshot(&InspectionSettings::default(), EMIT_CAP));
+        assert!(items.iter().all(|d| !d.stale), "{items:#?}");
+    }
+
+    /// A manual *Re-run analysis* must NOT take the marks down when it sends the kick.
+    ///
+    /// There was a `clear_dirty()` doing exactly that, on the reasoning that the button would
+    /// otherwise look inert. The kick is asynchronous — a `cargo check`, or a gopls re-read —
+    /// so clearing on send removed the "may be out of date" warning from rows that were still
+    /// precisely as out of date as before, which is what put the user in unrelated comments
+    /// when they clicked one. The mark is answered by the source speaking again, and by
+    /// nothing else; `publish` is where that happens, one path at a time.
+    #[test]
+    fn a_rerun_leaves_a_mark_up_until_its_source_answers_for_that_path() {
+        let mut store = ready_store();
+        store.mark_dirty(["/repo/src/a.rs"]);
+
+        let stale_now = |store: &DiagnosticStore| {
+            items_of(&store.snapshot(&InspectionSettings::default(), EMIT_CAP))
+                .iter()
+                .filter(|d| d.stale)
+                .count()
+        };
+        let marked = stale_now(&store);
+        assert!(marked > 0, "the fixture must actually mark something");
+
+        // The source answers for that path. Even an empty answer counts: "I looked, there is
+        // nothing here now" is exactly the case a fixed diagnostic produces. Only the answering
+        // source's mark comes down, which is why this counts rather than asserting zero — the
+        // path is known to more than one source and the others have not spoken yet.
+        store.publish(
+            DiagnosticSourceId::RustAnalyzer,
+            "/repo/src/a.rs".into(),
+            Vec::new(),
+        );
+        assert!(
+            stale_now(&store) < marked,
+            "a republish is what answers the question the mark asked"
+        );
     }
 
     #[test]

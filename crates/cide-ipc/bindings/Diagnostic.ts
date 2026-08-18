@@ -37,4 +37,28 @@ source: string,
  * type without changing what serde writes, so on an outbound DTO it promises an absent
  * field and sends a null one. See [`crate::Symbol::detail`].
  */
-code: string | null, };
+code: string | null, 
+/**
+ * The file this is about changed on disk after this diagnostic was published. (M18)
+ *
+ * # Why the panel needs this, and why it is a field on the item
+ *
+ * A diagnostic carries the line number it had *when it was published*. Nothing rewrites that
+ * number when the file moves underneath it, and nothing can: the analyser is the only thing
+ * that knows where the finding is now, and until it re-reports we are holding a position
+ * that may name a different line. The user report this exists for is exactly that — *"after
+ * claude fixes some hints I still see them and clicking on it goes to some comments"*. The
+ * row was not wrong about there having been an error; it was wrong about where.
+ *
+ * Set by [`cide_core::diagnostics::DiagnosticStore::snapshot`] from the set of paths marked
+ * dirty since their last publish, and cleared the moment the source republishes that path.
+ *
+ * **Over-reporting is the safe direction and is deliberate.** A row that says "may be out of
+ * date" when it is not costs the user a glance; a row that is silently wrong costs them a
+ * jump into the wrong part of a file, which is the bug. The same asymmetry
+ * [`crate::DiagnosticsSnapshot`] is built around one level up.
+ *
+ * Not `#[ts(optional)]`, for the reason [`Self::code`] states: an outbound DTO that promises
+ * an absent field and sends `false` is a lie about the wire.
+ */
+stale: boolean, };

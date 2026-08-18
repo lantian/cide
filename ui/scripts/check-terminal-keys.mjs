@@ -14,9 +14,18 @@
  *   runaway command and from a mid-turn `claude`, and a copy feature that swallows it is worse
  *   than no copy feature. The rule returns `null` there, which is what makes xterm send `ETX`
  *   exactly as it always did; the sweep below asserts that for every modifier combination.
- * * **Ctrl+V in a Claude pane has to stay Claude's.** The CLI binds it itself and reads the
- *   system clipboard out of `xclip`/`wl-paste`, which is how an *image* reaches a prompt.
- *   Claiming the chord there would trade a working image paste for a text-only one.
+ * * **Ctrl+V is claimed in both pane kinds, and image paste still has to survive it.** The rule
+ *   used to return `null` for a Claude pane so `^V` reached the CLI, which binds it and reads
+ *   the system clipboard out of `xclip`/`wl-paste` — the only path an *image* has into a prompt.
+ *   That handler exists at the CLI's main prompt and nowhere else, so at a numbered-choice
+ *   question the keystroke was swallowed and nothing happened; the reported bug. The chord is
+ *   now always intercepted and `terminal/clipboard.ts` re-emits `^V` when the clipboard held no
+ *   text, which is where the image path lives. This file pins the half that is a pure function:
+ *   the rule no longer branches on the kind.
+ * * **Ctrl+F opens the pane's find bar**, in both kinds, and only for a plain-Ctrl keydown. It
+ *   is here rather than in `cide_core::keymap` for the reason the two above are, and
+ *   `keymap::ctrl_f_is_not_bound_here_because_two_panes_mean_two_things_by_it` is the other end
+ *   of that claim.
  *
  * Compiled standalone with the TypeScript already in `node_modules`, the same shape as
  * `check-exit-marker.mjs`: this module imports nothing, deliberately, so that this can.
@@ -57,9 +66,8 @@ try {
     { stdio: 'inherit' },
   )
 
-  const { SHIFT_ENTER, terminalKeyBytes, terminalClipboardAction } = await import(
-    `file://${join(out, 'keys.js')}`
-  )
+  const { SHIFT_ENTER, terminalKeyBytes, terminalClipboardAction, terminalOpensFind } =
+    await import(`file://${join(out, 'keys.js')}`)
 
   /** A `TerminalKeyEvent`, with every modifier off unless named. */
   const ev = (spec) => ({
@@ -128,9 +136,7 @@ try {
                 ? selection === ''
                   ? null
                   : { kind: 'copy', text: selection }
-                : kind === 'claude'
-                  ? null
-                  : { kind: 'paste' }
+                : { kind: 'paste' }
 
           swept += 1
           eq(
@@ -191,9 +197,16 @@ try {
   )
   eq(
     terminalClipboardAction(ev({ key: 'v', ctrl: true }), { selection: '', kind: 'claude' }),
-    null,
-    "Ctrl+V in a Claude pane is the CLI's own: it reads the system clipboard from xclip/wl-paste " +
-      'and that is the only path an image has into a prompt',
+    { kind: 'paste' },
+    'Ctrl+V in a Claude pane pastes too. It used to resolve to `null` so the CLI got `^V`, and ' +
+      'that only worked at the main prompt — at a numbered-choice question nothing was ' +
+      'listening and the keystroke vanished. `terminal/clipboard.ts` hands `^V` back to the CLI ' +
+      'when the clipboard holds no text, so image paste is unchanged',
+  )
+  eq(
+    terminalClipboardAction(ev({ key: 'v', ctrl: true }), { selection: 'x', kind: 'claude' }),
+    { kind: 'paste' },
+    'and a selection does not change it — only Ctrl+C consults the selection',
   )
   eq(
     terminalClipboardAction(ev({ key: 'v', ctrl: true }), { selection: '', kind: 'shell' }),
@@ -230,11 +243,62 @@ try {
     )
   }
 
+  /* ------------------------------------------------------------------------------ Ctrl+F */
+
+  /*
+   * The find chord, swept exactly like the clipboard pair and for the same reason: the claim
+   * worth measuring is not that ⌃F resolves, it is that the *other fifteen* modifier
+   * combinations on that key — and every other key — do not.
+   *
+   * ⌃F costs a child a real byte (`^F` is readline's `forward-char` and vim's page-forward), so
+   * a rule that fired one modifier wide would take a second key from every shell in every pane.
+   */
+  let findSwept = 0
+  for (const key of ['f', 'F', 'g', 'v', 'Enter']) {
+    for (let bits = 0; bits < 16; bits++) {
+      const mods = {
+        ctrl: (bits & 1) !== 0,
+        alt: (bits & 2) !== 0,
+        shift: (bits & 4) !== 0,
+        meta: (bits & 8) !== 0,
+      }
+      const plainCtrl = mods.ctrl && !mods.alt && !mods.shift && !mods.meta
+      findSwept += 1
+      eq(
+        terminalOpensFind(ev({ key, ...mods })),
+        plainCtrl && key.toLowerCase() === 'f',
+        `terminalOpensFind: ${JSON.stringify(mods)} ${key}`,
+      )
+    }
+  }
+  eq(findSwept, 5 * 16, 'swept the find chord across the key set × 16 modifier combinations')
+
+  for (const type of ['keyup', 'keypress']) {
+    eq(
+      terminalOpensFind(ev({ key: 'f', ctrl: true, type })),
+      false,
+      `${type} is not a chord — xterm offers all three to one handler, and opening the bar on ` +
+        'three of them would re-select the field twice for one press',
+    )
+  }
+
+  // Ctrl+Shift+F is `sidebar.search` in `cide_core::keymap::defaults()`, resolved by the key
+  // gate before this module is ever reached. Claiming it here would be a second meaning for a
+  // chord that already has one, in the one surface where the gate's decision arrives second.
+  eq(
+    terminalOpensFind(ev({ key: 'f', ctrl: true, shift: true })),
+    false,
+    'ctrl+shift+f is find-in-files and is left to the key gate',
+  )
+
   if (failed > 0) {
     console.error(`\ncheck-terminal-keys: ${failed} failure(s)`)
     process.exit(1)
   }
-  console.log(`check-terminal-keys: ok (${swept} chords swept, Shift+Enter table pinned)`)
+  console.log(
+    `check-terminal-keys: ok (${swept} clipboard chords and ${findSwept} find chords swept, ` +
+      'Shift+Enter table pinned)',
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

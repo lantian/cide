@@ -76,6 +76,23 @@
   --red: #c0332b;
   --cyan: #0f6c7c;
   /*
+   * A gitignored row in the file tree, once *Show ignored files* is on. (M18)
+   *
+   * A token of its own rather than `--faint` or `--yellow`, because it has to carry a meaning
+   * those two already have. `--faint` is "quiet", and it is what a *deleted* row's letter uses;
+   * an ignored row painted with it would say only "less important", which is the same thing the
+   * dim `--dim` untracked rows say. `--yellow` is a *syntax* colour and an ANSI slot — it is
+   * pitched to be read as code, and at #8a5a00 it is louder here than the filename beside it.
+   *
+   * So: IDEA's treatment, in this palette's own hue family. IDEA tints ignored files a muted
+   * olive-brown, which reads as "outside the project" rather than as "wrong" — and the warm
+   * end of this palette (`--yellow`, `--grad-to`) is already brown-going-orange, so the family
+   * is there to borrow. Desaturated and darkened to sit at 5.22:1 on `--panel`, deliberately
+   * the same readability band as `--faint` (5.19:1): an ignored file is *legible and
+   * uninteresting*, not hidden — the whole point of showing it is that you can read it.
+   */
+  --ignored: #7d6a45;
+  /*
    * Selection is in the accent family rather than the mock's blue: it is the one large
    * tinted surface in a white theme and a blue one would fight the red/orange. Kept pale so
    * that syntax-coloured text stays readable *on* it — the worst case is `--green` at
@@ -186,6 +203,12 @@
   --yellow: #dfae68;
   --red: #e06c75;
   --cyan: #6fb3c0;
+  /*
+   * The same olive-brown, pitched for #151518: 4.77:1 on `--panel`, against `--text`'s 12.72:1.
+   * Not the dark `--faint` (2.76:1) — a row a user turned *on* has to be readable, and the
+   * light theme's ignored token is AA for the same reason.
+   */
+  --ignored: #8f8256;
   --sel: #2b3a55;
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
 

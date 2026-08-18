@@ -28,7 +28,7 @@ pub mod trash;
 pub mod watch;
 
 pub use error::{FsError, Result};
-pub use filter::Filter;
+pub use filter::{Filter, Visibility};
 pub use groups::{Entry, Expanded, GroupState, Groups};
 pub use index::{BuildOptions, Index, Root, WalkItem};
 pub use watch::{Coalescer, WatchConfig, WatchEvent, Watcher};

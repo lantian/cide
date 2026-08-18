@@ -375,6 +375,56 @@ impl Capability {
             _ => Self::Unknown,
         }
     }
+
+    fn of(yes: bool) -> u8 {
+        if yes { Self::Yes as u8 } else { Self::No as u8 }
+    }
+}
+
+/// The handshake answers anybody outside the supervisor needs, as atomics. (M18)
+///
+/// One `Arc<Caps>` rather than one `Arc<AtomicU8>` per question, and the reason is the signature
+/// list below it: `references` was threaded through five functions as its own parameter, and
+/// `supervise`/`supervise_lives`/`run_once` already carry `#[allow(clippy::too_many_arguments)]`.
+/// Adding a second atomic for `implementationProvider` would have made that six copies of the same
+/// plumbing; adding a third would make nine. The struct is the thing that has to be extended
+/// instead, and extending it touches [`store_from`] and nothing else.
+#[derive(Default)]
+struct Caps {
+    /// `textDocument/references` — see [`LspHandle::supports_references`].
+    references: std::sync::atomic::AtomicU8,
+    /// `textDocument/implementation` — see [`LspHandle::supports_implementation`].
+    implementation: std::sync::atomic::AtomicU8,
+}
+
+impl Caps {
+    /// Back to "nobody has said yet", which is what a new life of a server means.
+    fn forget(&self) {
+        self.references
+            .store(Capability::Unknown as u8, Ordering::Release);
+        self.implementation
+            .store(Capability::Unknown as u8, Ordering::Release);
+    }
+
+    /// Record what this life's `initialize` result said.
+    fn store_from(&self, session: &Session) {
+        self.references.store(
+            Capability::of(session.supports_references()),
+            Ordering::Release,
+        );
+        self.implementation.store(
+            Capability::of(session.supports_implementation()),
+            Ordering::Release,
+        );
+    }
+
+    fn read(slot: &std::sync::atomic::AtomicU8) -> Option<bool> {
+        match Capability::from_u8(slot.load(Ordering::Acquire)) {
+            Capability::Unknown => None,
+            Capability::Yes => Some(true),
+            Capability::No => Some(false),
+        }
+    }
 }
 
 /// A running (or permanently stopped) language server.
@@ -387,8 +437,8 @@ pub struct LspHandle {
     stop: Arc<AtomicBool>,
     next_id: Arc<std::sync::atomic::AtomicI64>,
     pending: Pending,
-    /// See [`Capability`]. Written by the supervisor, read by whoever is about to ask.
-    references: Arc<std::sync::atomic::AtomicU8>,
+    /// See [`Capability`] and [`Caps`]. Written by the supervisor, read by whoever is about to ask.
+    caps: Arc<Caps>,
     supervisor: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -408,18 +458,18 @@ impl LspHandle {
         let (event_tx, event_rx) = crossbeam_channel::unbounded::<LspEvent>();
         let stop = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let references = Arc::new(std::sync::atomic::AtomicU8::new(Capability::Unknown as u8));
+        let caps = Arc::new(Caps::default());
 
         let supervisor = {
             let stop = Arc::clone(&stop);
             let roots = roots.clone();
             let pending = Arc::clone(&pending);
-            let references = Arc::clone(&references);
+            let caps = Arc::clone(&caps);
             std::thread::Builder::new()
                 .name(format!("cide-lsp-{}", server.binary()))
                 .spawn(move || {
                     supervise(
-                        server, binary, roots, outbox_rx, event_tx, stop, pending, references,
+                        server, binary, roots, outbox_rx, event_tx, stop, pending, caps,
                     )
                 })
                 .map_err(|error| LspError::Spawn {
@@ -435,7 +485,7 @@ impl LspHandle {
             stop,
             next_id: Arc::new(std::sync::atomic::AtomicI64::new(REQUEST_ID_BASE)),
             pending,
-            references,
+            caps,
             supervisor: Some(supervisor),
         })
     }
@@ -451,11 +501,20 @@ impl LspHandle {
     /// wait ending in *"probably still indexing"* into an immediate, true sentence. Both shipped
     /// servers answer `true`, so today this only ever prevents a lie in the future.
     pub fn supports_references(&self) -> Option<bool> {
-        match Capability::from_u8(self.references.load(Ordering::Acquire)) {
-            Capability::Unknown => None,
-            Capability::Yes => Some(true),
-            Capability::No => Some(false),
-        }
+        Caps::read(&self.caps.references)
+    }
+
+    /// Does this server answer `textDocument/implementation`? `None` while it is still starting.
+    ///
+    /// The same three states as [`Self::supports_references`], and the `None` is load-bearing for
+    /// the same reason: a Go to implementation pressed a moment after launch must be *asked*, not
+    /// refused with the one sentence that is certainly wrong.
+    ///
+    /// Both shipped servers answer `true`, so `Some(false)` prevents no lie today — it prevents
+    /// one from a server nobody has installed yet, which is where the twenty-second
+    /// "probably still indexing" wait comes from.
+    pub fn supports_implementation(&self) -> Option<bool> {
+        Caps::read(&self.caps.implementation)
     }
 
     /// A cloneable sender for request/response traffic.
@@ -556,17 +615,10 @@ fn supervise(
     events: Sender<LspEvent>,
     stop: Arc<AtomicBool>,
     pending: Pending,
-    references: Arc<std::sync::atomic::AtomicU8>,
+    caps: Arc<Caps>,
 ) {
     supervise_lives(
-        server,
-        binary,
-        roots,
-        &outbox,
-        &events,
-        &stop,
-        &pending,
-        &references,
+        server, binary, roots, &outbox, &events, &stop, &pending, &caps,
     );
     /*
      * The last word on every waiter, wherever the supervisor exited.
@@ -595,7 +647,7 @@ fn supervise_lives(
     events: &Sender<LspEvent>,
     stop: &Arc<AtomicBool>,
     pending: &Pending,
-    references: &Arc<std::sync::atomic::AtomicU8>,
+    caps: &Arc<Caps>,
 ) {
     let mut crashes: Vec<Instant> = Vec::new();
 
@@ -613,14 +665,12 @@ fn supervise_lives(
          * binary (the toolchain moved, the user installed a build without the feature) would keep
          * answering `Yes` from the corpse of the old one.
          */
-        references.store(Capability::Unknown as u8, Ordering::Release);
+        caps.forget();
 
         // Every exit inside `run_once` ends this life, so the waiters go here — once, around the
         // call, rather than at each of its four exits, which is how one of them gets missed.
         // `supervise` above repeats it for the paths that never reach this line at all.
-        let outcome = run_once(
-            server, &binary, &roots, outbox, events, stop, pending, references,
-        );
+        let outcome = run_once(server, &binary, &roots, outbox, events, stop, pending, caps);
         cancel_pending(pending, RequestError::ServerGone);
         match outcome {
             Ok(()) => return,
@@ -717,7 +767,7 @@ fn run_once(
     events: &Sender<LspEvent>,
     stop: &AtomicBool,
     pending: &Pending,
-    references: &Arc<std::sync::atomic::AtomicU8>,
+    caps: &Arc<Caps>,
 ) -> Result<(), Failure> {
     let mut command = Command::new(binary);
     command
@@ -809,7 +859,7 @@ fn run_once(
             })?
     };
 
-    let (mut session, initial) = Session::new(roots, server.binary());
+    let (mut session, initial) = Session::new(roots, server);
     // When a held-back `Ready` becomes believable. See `READY_SETTLE`.
     let mut ready_at: Option<Instant> = None;
     let write = |stdin: &mut std::process::ChildStdin,
@@ -877,14 +927,7 @@ fn run_once(
                     // `publishDiagnostics` during a burst of hundreds is work for an answer
                     // nobody asked a second time.
                     if !handshook_before && session.ever_handshook() {
-                        references.store(
-                            if session.supports_references() {
-                                Capability::Yes as u8
-                            } else {
-                                Capability::No as u8
-                            },
-                            Ordering::Release,
-                        );
+                        caps.store_from(&session);
                     }
                     if let Err(reason) = write(&mut stdin, effects, &mut ready_at) {
                         break Err(Failure { reason, ever_handshook: session.ever_handshook() });
@@ -1178,7 +1221,7 @@ mod tests {
                 events,
                 stop,
                 Arc::clone(&pending),
-                Arc::new(std::sync::atomic::AtomicU8::new(Capability::Unknown as u8)),
+                Arc::new(Caps::default()),
             );
 
             assert_eq!(

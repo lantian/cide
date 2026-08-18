@@ -262,3 +262,140 @@
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
+
+/* --- Staleness, and the controls that answer it. (M18) ------------------------------ */
+
+/*
+ * A group whose file has changed since the analyser last spoke about it.
+ *
+ * Dimmed rather than struck through or tinted red: nothing here is *wrong*, and an alarm colour
+ * would say the file is broken when what is actually true is that we do not know yet. The row
+ * stays clickable — a jump that may be a few lines off beats a dead row — so the only job of
+ * this rule is to make the note beneath the heading land as a qualification of the group rather
+ * than as decoration.
+ */
+.groupStale .groupPath,
+.groupStale .groupCount {
+  color: var(--faint);
+}
+
+.staleNote {
+  margin: 0 0 1px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--faint);
+  font-style: italic;
+}
+
+/* The mark on the row itself: the message and the `12:5` fade together, so a provisional row is
+   legible but visibly not the same claim as the row under it. The severity glyph keeps its full
+   colour deliberately — the *severity* is not in doubt, only the position. */
+.rowStale .where,
+.rowStale .message {
+  opacity: 0.72;
+}
+
+/*
+ * The footer: one line per analyser, and the two controls the user asked for.
+ *
+ * `margin-top: auto` is deliberate — it pins the block to the bottom of a short list and lets it
+ * scroll away under a long one, which is where a status footer belongs in both cases.
+ */
+.footer {
+  margin-top: 18px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.footerHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.footerTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/*
+ * A small text button, matching nothing else in this panel because nothing else in this panel is
+ * a control. Bordered rather than bare so it reads as pressable at 10.5px, where a colour change
+ * alone is not enough.
+ */
+.action {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
+}
+
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.action:disabled {
+  cursor: default;
+  color: var(--faint);
+  border-color: var(--border-soft);
+}
+
+.source {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+}
+
+.sourceText {
+  flex: 1;
+  min-width: 0;
+}
+
+.sourceLabel {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.sourceDetail {
+  margin: 1px 0 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+
+/* The status dot. Three states, three tokens, and `unavailable` is dim rather than red for the
+   same reason `.claimUnknown` is: not running is not broken. */
+.sourceDot {
+  flex: none;
+  width: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.sourceReady {
+  color: var(--green);
+}
+
+.sourceScanning {
+  color: var(--yellow);
+}

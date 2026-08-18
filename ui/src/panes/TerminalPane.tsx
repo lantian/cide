@@ -24,6 +24,9 @@ import {
   spawnFailureText,
 } from './exitMarker'
 import { restartOffer, type RestartMode, type RestartOffer } from './restartRule'
+import { TerminalFindBar } from './TerminalFindBar'
+import { openTerminalFind } from '@/terminal/findStore'
+import findStyles from './TerminalFindBar.module.css'
 import { registerRestarter } from './paneRestart'
 import { acknowledge } from './awaiting'
 import {
@@ -208,20 +211,25 @@ function specFor(
  * dropped, and if the pane is never resized again it is also the only one: every child
  * would sit at the fallback 80x24 forever, in a window that is plainly much larger.
  * So the spawn path calls this explicitly once the session exists.
+ *
+ * Returns a promise that settles once the child has actually been told, so a caller that
+ * pushes a size of its own afterwards — the alt-screen repaint nudge in `start` — can order
+ * itself behind this one. Two un-awaited `session_resize` calls in flight at once is how a
+ * pane ends up parked at the nudge's transient `cols - 1`.
  */
-function syncSize(paneId: string): void {
+function syncSize(paneId: string): Promise<void> {
   const host = getHost(paneId)
   const handle = host.terminal
-  if (!handle) return
+  if (!handle) return Promise.resolve()
   try {
     handle.fit.fit()
   } catch {
-    return
+    return Promise.resolve()
   }
   // Never push a degenerate size at a live child. A pane that is momentarily unlaid-out
   // fits to 2x1, and forwarding that would reflow the TUI into garbage for no reason.
-  if (!plausible(handle.term.cols, handle.term.rows)) return
-  if (!host.sessionId) return
+  if (!plausible(handle.term.cols, handle.term.rows)) return Promise.resolve()
+  if (!host.sessionId) return Promise.resolve()
 
   const cell = handle.cellSize()
   const geo = {
@@ -243,11 +251,11 @@ function syncSize(paneId: string): void {
     last.cellWidth === geo.cellWidth &&
     last.cellHeight === geo.cellHeight
   ) {
-    return
+    return Promise.resolve()
   }
   host.lastGeometry = geo
 
-  void sessionApi.resize(host.sessionId, geo).catch((e) => {
+  return sessionApi.resize(host.sessionId, geo).catch((e) => {
     // Cleared so the next callback retries: a dropped resize leaves the child at a size the
     // pane is not, and silently remembering the size we failed to send would make that
     // permanent.
@@ -367,11 +375,16 @@ async function sessionIsLive(session: string): Promise<boolean> {
  * the clipboard straight at the pty, so a multi-line paste executed line by line in `bash` and
  * submitted at the first newline in `claude`; `term.paste` wraps in bracketed paste when, and
  * only when, the child has asked for it.
+ *
+ * The pane's kind goes through because it decides what happens when the clipboard holds no
+ * *text*: in a Claude pane the `^V` byte is handed to the CLI so its own image paste runs. That
+ * is why this menu item now reaches image paste too — it used to be the one route that could
+ * only ever paste text, which was the half of the bug nobody had noticed.
  */
-async function pasteInto(paneId: string): Promise<void> {
+async function pasteInto(paneId: string, kind: TerminalPaneKind): Promise<void> {
   const term = getHost(paneId).terminal?.term
   if (!term) return
-  await pasteIntoTerminal(term)
+  await pasteIntoTerminal(term, kind)
 }
 
 async function copySelection(paneId: string): Promise<void> {
@@ -521,7 +534,7 @@ export function TerminalPane({
           host.sessionId === undefined
             ? undefined
             : () => {
-                void pasteInto(paneId).catch((error: unknown) => {
+                void pasteInto(paneId, runKind).catch((error: unknown) => {
                   console.error('[cide] paste failed', error)
                   void diag
                     .log(`pane ${paneId}: paste failed — ${String(error)}`)
@@ -535,6 +548,29 @@ export function TerminalPane({
         id: 'select-all',
         label: 'Select all',
         run: term === undefined ? undefined : () => term.selectAll(),
+      },
+      {
+        /*
+         * *Find…*, and it is here for discoverability rather than for convenience.
+         *
+         * Ctrl+F is resolved focus-scoped in `terminal/keys.ts` rather than bound in
+         * `cide_core::keymap` — the argument is in the registry entry for `terminal.find` — and
+         * the price of that is a chord Settings → Keymap does not list and the palette draws no
+         * chip for. A menu item is the answer to the same question a chip answers: *what can I
+         * do to this pane?* The palette row exists too, for the keyboard.
+         *
+         * `command:` all the same. It costs nothing today (there is no binding, so no chip is
+         * drawn) and it is what makes the chip appear by itself the moment a user binds the
+         * command in their own `keymap.json`, which is the whole point of it being a command.
+         *
+         * No session is required, unlike Paste: a pane whose child has exited still holds its
+         * transcript, and that is one of the times somebody most wants to search it.
+         */
+        id: 'find',
+        label: 'Find…',
+        command: 'terminal.find',
+        run: term === undefined ? undefined : () => openTerminalFind(paneId),
+        disabledReason: term === undefined ? 'This pane has no terminal yet' : undefined,
       },
       {
         id: 'clear',
@@ -756,8 +792,6 @@ export function TerminalPane({
       }
 
       const host = getHost(paneId)
-      const alt = await sessionApi.inAlternateScreen(id)
-      if (disposed) return
 
       // The ack goes in `term.write`'s completion callback, not here. Reaching this line
       // only means the bytes arrived; the callback fires once xterm has actually parsed
@@ -795,6 +829,71 @@ export function TerminalPane({
       })
       if (disposed) return
 
+      /*
+       * `session_attach` resized the child before it registered this sink — unconditionally,
+       * to the `geo` measured at the top of this function, which is now several IPC round
+       * trips old. So the cache no longer describes what the child thinks its size is.
+       *
+       * Clearing it is not belt and braces. A `ResizeObserver` callback landing in any of
+       * the awaits above runs `syncSize`, which sends the pane's *true* size and records it
+       * here; the attach then quietly puts the child back to the stale one, and the recovery
+       * `syncSize` below measures the true size, finds it equal to what the cache says it
+       * already sent, and returns without sending anything. The child is then left drawing
+       * frames for a geometry the viewport does not have, with no path back until the pane's
+       * pixel size changes — which is exactly why maximising the pane "fixed" it.
+       *
+       * `releaseHost` (see `layout/paneHosts.ts`) already applies this rule for the same
+       * reason; the cache means "what this host last told the child, with no other writer
+       * since", and `session_attach` is another writer. The cost is one extra resize per
+       * attach, and the cache exists to collapse a *drag*, not an attach.
+       */
+      host.lastGeometry = undefined
+
+      /*
+       * Which of the terminal's two buffers the child is painting into.
+       *
+       * Asked *after* the attach, deliberately: the answer must never be older than the
+       * snapshot, or the check below decides against a screen it cannot see. It costs no
+       * extra latency — this is the same three sequential round trips as before, reordered.
+       */
+      const alt = await sessionApi.inAlternateScreen(id)
+      if (disposed) return
+
+      /*
+       * A hydrated terminal can still be on the wrong buffer, and that is its own bug.
+       *
+       * `host.hydrated` means "this terminal already holds the mirror's bytes". It says
+       * nothing about *which* buffer it holds them in, and the two are not the same claim:
+       * this pane's sink is detached in the effect cleanup and re-registered here, so a
+       * `\x1b[?1049h` or `\x1b[?1049l` the child wrote in between reached neither this
+       * terminal nor — because `hydrated` is still true — the snapshot this branch would
+       * otherwise discard. From then on xterm and the child paint different buffers, for
+       * good. Both directions were in one bug report: stuck on the alternate buffer the pane
+       * loses its scrollbar and xterm turns the wheel into cursor keys aimed at the child, so
+       * scrolling edits the agent's prompt; stuck on the normal one the child's
+       * cursor-addressed repaints land in rows that have scrolled away, so a question it drew
+       * is never seen until a resize forces a full repaint.
+       *
+       * Dropping `hydrated` rather than writing a bare `\x1b[?1049h` is what makes this safe:
+       * the switch on its own would show an empty alternate screen, whereas the snapshot
+       * carries the switch *and* the screen that belongs to it (see
+       * `cide_pty::reattach_bytes`). It cannot duplicate anything either — the snapshot opens
+       * with `\x1b[H\x1b[J`, so it replaces the visible screen — and `needsReset` is false on
+       * this path, so the terminal keeps the scrollback the user may have scrolled into.
+       */
+      if (host.hydrated && alt !== (term.buffer.active.type === 'alternate')) {
+        host.hydrated = false
+        // Said out loud, because this repair is otherwise invisible and the bug it repairs
+        // was reported as "rendering is broken". A line here means the two halves had
+        // genuinely drifted; silence over a long session is the honest evidence that the
+        // snapshot is now carrying the buffer it belongs to.
+        void diag
+          .log(
+            `pane ${paneId}: terminal was on the ${alt ? 'primary' : 'alternate'} buffer while session ${id} is on the ${alt ? 'alternate' : 'primary'} one; repainting from the mirror`,
+          )
+          .catch(() => {})
+      }
+
       // Exactly once per host. A split or a close remounts the surviving leaf — React swaps
       // a leaf node for a split node at that position — and this terminal already holds
       // those bytes; writing them again appends a second copy of the whole transcript. The
@@ -825,17 +924,72 @@ export function TerminalPane({
       setExit(null)
       setResumable(false)
 
-      if (alt) {
-        // A fullscreen TUI's own model is authoritative for everything the screen mirror
-        // does not track — OSC 8 hyperlinks, OSC 52 clipboard traffic, DEC 2026 sync
-        // framing. Nudging the size by one column makes it repaint from that model.
-        await sessionApi.resize(id, { ...geo, cols: Math.max(1, geo.cols - 1) })
-        await sessionApi.resize(id, geo)
-      }
+      /*
+       * Now that the session exists, adopt the pane's real size — and only then nudge a
+       * fullscreen TUI into repainting.
+       *
+       * The order is the fix. The nudge used to run *before* `syncSize` and to use `geo` —
+       * the geometry measured before this function's three awaits — so it re-imposed a size
+       * the pane may no longer have, on top of the same stale value `session_attach` had
+       * already written. Nothing then told `syncSize` the child had been resized behind its
+       * back, so it found its cache in agreement with the pane's real size and sent nothing,
+       * and the child spent the rest of its life drawing frames for rows the viewport had
+       * not got. Maximising the pane changed the pixel size, which is the only thing that
+       * broke the agreement — which is why maximising "repaired the rendering".
+       *
+       * Still inside one `requestAnimationFrame`, and still the same three size pushes in the
+       * ordinary case, so this is not another resize bolted on to win a race — it is the same
+       * pushes, ordered so that the last one is the size the pane actually has. (A fourth is
+       * sent only when a resize genuinely raced the nudge; the guard at the end of the block
+       * says why, and it is silent when nothing raced.) Layout has certainly settled by here:
+       * several IPC round trips have happened since mount.
+       */
+      requestAnimationFrame(() => {
+        void (async () => {
+          await syncSize(paneId)
+          // The pane may have been unmounted while the resize was in flight — a re-dock, a
+          // split, a closed tab. Its child is somebody else's now.
+          if (disposed || !alt) return
+          // A fullscreen TUI's own model is authoritative for everything the screen mirror
+          // does not track — OSC 8 hyperlinks, OSC 52 clipboard traffic, DEC 2026 sync
+          // framing. Nudging the size by one column makes it repaint from that model.
+          //
+          // Read after the await, so it is the size `syncSize` has just settled on rather
+          // than the one measured before this function's three round trips. `geo` is the
+          // fallback for the case where `syncSize` had nothing plausible to measure and so
+          // recorded nothing.
+          const before = getHost(paneId).lastGeometry
+          const at = before ?? geo
+          await sessionApi.resize(id, { ...at, cols: Math.max(1, at.cols - 1) })
+          await sessionApi.resize(id, at)
 
-      // Now that the session exists, adopt the pane's real size. Layout has certainly
-      // settled by this point — several IPC round trips have happened since mount.
-      requestAnimationFrame(() => syncSize(paneId))
+          /*
+           * The nudge is a writer like every other, so it owes the cache the same honesty
+           * `session_attach` does — and the two awaits above are a window a `ResizeObserver`
+           * callback can land in. When one does, `syncSize` sends the pane's *new* size and
+           * records it here, and then the line above quietly puts the child back to `at`. The
+           * cache then agrees with a size the child has not got, which is the exact state this
+           * whole path exists to make unreachable: nothing corrects it until the pane's pixel
+           * size changes again, and for the last frame of a divider drag that may be never.
+           *
+           * Identity and not equality, because `syncSize` stores a fresh object on every write:
+           * a different object means somebody else wrote, whatever the numbers say. Undefined
+           * on both sides means nothing was recorded before *or* after — `syncSize` measured
+           * nothing plausible, or its resize was rejected and it cleared itself — and in that
+           * case there is nothing to correct back to and the next callback retries anyway.
+           *
+           * Costs nothing in the common case (no callback, so no second resize) and one
+           * resize in the case that would otherwise have been permanently wrong.
+           */
+          if (getHost(paneId).lastGeometry !== before) {
+            getHost(paneId).lastGeometry = undefined
+            await syncSize(paneId)
+          }
+        })().catch(() => {
+          // A failed nudge costs a repaint, not correctness: the pane already holds the
+          // snapshot, and the next real resize nudges it again.
+        })
+      })
 
       // A session that was already dead when this pane attached will never produce an event
       // — the watcher fired before anyone was listening. One check, not a poll: this is the
@@ -1131,17 +1285,30 @@ export function TerminalPane({
 
   return (
     <>
-      <PaneSlot paneId={paneId} className={className} onResize={() => syncSize(paneId)} />
+      <PaneSlot paneId={paneId} className={className} onResize={() => void syncSize(paneId)} />
       {/*
-        * The bar is a *sibling* of the slot and is absolutely positioned, and both halves of
-        * that matter. Rendering it above the terminal in flow is what the restored-shell banner
-        * did: `PaneSlot` still claims `height: 100%`, so the terminal was pushed its own height
-        * past the bottom of the pane frame and painted over the row below. And the slot itself
-        * is never conditionally rendered — rule 2 of `layout/paneHosts.ts` — so the terminal,
-        * its scrollback and the `— exited —` line the user is reading all stay exactly where
-        * they were while the control sits over the last two lines.
+        * Both bottom bars, in one absolutely-positioned stack that is a *sibling* of the slot.
+        *
+        * Every half of that matters. Rendering either bar above the terminal **in flow** is what
+        * the restored-shell banner did: `PaneSlot` still claims `height: 100%`, so the terminal
+        * was pushed its own height past the bottom of the pane frame and painted over the row
+        * below. And the slot itself is never conditionally rendered — rule 2 of
+        * `layout/paneHosts.ts` — so the terminal, its scrollback and the `— exited —` line the
+        * user is reading all stay exactly where they were while a control sits over the last two
+        * lines.
+        *
+        * One stack rather than two `bottom: 0` boxes, because both states can be true at once: a
+        * child that has exited leaves a transcript, and searching a dead pane's transcript is
+        * exactly the moment somebody reaches for Ctrl+F. Stacked in this order the restart bar
+        * keeps the bottom edge it has always had and the find bar sits above it, so neither
+        * moves the other's pixels and neither is covered. `TerminalFindBar.module.css` carries
+        * the argument for why this is at the bottom of the pane at all — the top-right is the
+        * floating control cluster's, and the editor already paid for finding that out.
         */}
-      {offer !== null && <ExitedBar offer={offer} onRun={runRestart} />}
+      <div className={findStyles.stack ?? ''}>
+        <TerminalFindBar paneId={paneId} />
+        {offer !== null && <ExitedBar offer={offer} onRun={runRestart} />}
+      </div>
       {/* Portals out of here entirely; it is in the tree so React owns its lifetime. */}
       {menu}
     </>
@@ -1154,10 +1321,15 @@ export function TerminalPane({
  * module.
  */
 const barStyle: CSSProperties = {
-  position: 'absolute',
-  left: 0,
-  right: 0,
-  bottom: 0,
+  /*
+   * In flow inside the bottom stack, which is the box that is absolutely positioned.
+   *
+   * This used to be `position: absolute; left/right/bottom: 0; z-index: 1` itself, and the
+   * reasons for that are unchanged and are now the stack's — see the JSX above and
+   * `TerminalFindBar.module.css`. What moved is only *which* box claims the pane's bottom edge,
+   * and it had to move the moment a second bar wanted the same edge: two children both at
+   * `bottom: 0` do not stack, they overlap, and the one drawn second wins silently.
+   */
   display: 'flex',
   alignItems: 'center',
   gap: 10,
@@ -1168,10 +1340,6 @@ const barStyle: CSSProperties = {
   fontSize: 12,
   lineHeight: '19px',
   color: 'var(--dim)',
-  // Under the pane frame's floating control cluster, which is `z-index: 2` inside a stacking
-  // context of its own — so this cannot cover the close button, and the cluster cannot cover
-  // these two, because they sit at the other end of the pane.
-  zIndex: 1,
 }
 
 const statusStyle: CSSProperties = {

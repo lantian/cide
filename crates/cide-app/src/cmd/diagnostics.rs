@@ -18,10 +18,11 @@
 //! file is read, no lock is held for longer than a map lookup. That is the same argument
 //! `claude_send_lines` writes out under its own "Not `spawn_blocking`" note.
 //!
-//! The exceptions are the ones that really do wait: [`diagnostics_restart`] spawns a process, and
-//! [`diagnostics_definition`], [`diagnostics_probe`] and [`diagnostics_usages`] each block on a
-//! reply from one. All four go to the blocking pool, because a command polled on the main thread
-//! holds the GTK loop and freezes every window in the app.
+//! The exceptions are the ones that really do wait: [`diagnostics_restart`] spawns a process,
+//! [`diagnostics_definition`], [`diagnostics_probe`], [`diagnostics_usages`] and
+//! [`diagnostics_implementations`] each block on a reply from one, and [`diagnostics_refresh`]
+//! stats every path it is about to name. All six go to the blocking pool, because a command
+//! polled on the main thread holds the GTK loop and freezes every window in the app.
 //!
 //! [`diagnostics_usages_cancel`] is deliberately *not* among them: it takes a mutex and pushes one
 //! notification, and making it wait would defeat its whole purpose, since the thing it races is a
@@ -273,6 +274,79 @@ pub fn diagnostics_usages_cancel(registry: State<'_, DiagnosticsRegistry>, proje
     if let Some(diagnostics) = registry.get(project) {
         diagnostics.cancel_usages();
     }
+}
+
+/// Every place the symbol at this position is *implemented*. (M18)
+///
+/// The Go half of the M18 report: `textDocument/definition` on a call through an interface
+/// resolves to the interface's method — gopls is right, and that is not what the user meant.
+/// This asks `textDocument/implementation` instead, which is the protocol's name for the question
+/// they were asking.
+///
+/// Shares [`USAGES_TIMEOUT`] and [`diagnostics_usages_cancel`] with its neighbour above, because
+/// it shares the popup: one list on screen, one outstanding request, so Escape cancels whichever
+/// is running without the webview having to name it.
+///
+/// `spawn_blocking` and never `Err`, same as its neighbours.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_implementations(
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+    path: std::path::PathBuf,
+    line: u32,
+    column: u32,
+) -> Result<cide_ipc::UsagesAnswer, ()> {
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(cide_ipc::UsagesAnswer::Unavailable {
+            reason: "No language server is running for this project. Rust needs rust-analyzer \
+                     and Go needs gopls on PATH."
+                .to_string(),
+        });
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        diagnostics.implementations(&path, line, column, USAGES_TIMEOUT)
+    })
+    .await
+    .unwrap_or(cide_ipc::UsagesAnswer::Unavailable {
+        reason: "The search did not finish.".to_string(),
+    }))
+}
+
+/// Re-run every analyser for this project, because the user asked. (M18)
+///
+/// The Problems panel's *Re-run analysis* button and the `problems.refresh` command.
+///
+/// # Why this returns a sentence
+///
+/// Because the whole of its effect happens in another process over the following seconds, and a
+/// button whose effect is invisible is indistinguishable from a button that is wired to nothing —
+/// which is the defect this repository keeps producing and, in this case, the user's own
+/// complaint. The caller shows what comes back. It names the servers that were kicked, or says
+/// plainly that there was nothing to kick.
+///
+/// Distinct from [`diagnostics_restart`], and the panel offers both under different labels: this
+/// one re-runs the checks and takes seconds, that one replaces the process and, on a large
+/// workspace, takes minutes of re-indexing.
+///
+/// `spawn_blocking`: it takes the handles lock, stats the paths it is about to name, and pushes
+/// notifications. None of that waits on a reply, but a `stat` per known path is enough file I/O
+/// that it has no business on the thread that owns the GTK loop.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn diagnostics_refresh(
+    app: tauri::AppHandle,
+    registry: State<'_, DiagnosticsRegistry>,
+    project: ProjectId,
+) -> Result<String, String> {
+    let Some(diagnostics) = registry.get(project) else {
+        return Ok(
+            "No language server is running for this project. Rust needs rust-analyzer \
+                   and Go needs gopls on PATH."
+                .to_string(),
+        );
+    };
+    tauri::async_runtime::spawn_blocking(move || diagnostics.refresh(&app))
+        .await
+        .map_err(|error| format!("the re-run did not start: {error}"))
 }
 
 /// Restart one analyser after it gave up.

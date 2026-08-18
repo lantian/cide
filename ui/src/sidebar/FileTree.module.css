@@ -457,8 +457,22 @@
   color: var(--dim);
 }
 
+/*
+ * A gitignored row — `target/`, `node_modules/` — which only exists at all when the user has
+ * turned *Show ignored files* on (`cide_ipc::ExplorerSettings`).
+ *
+ * It takes a colour and **no letter**, which is `letterFor()`'s rule and is what lets it live
+ * beside the M/A/D column instead of fighting it: the tag column answers "what will git do with
+ * this file when you commit", and the answer for an ignored file is *nothing*. A `?` or an `I`
+ * there would be a fourth glyph competing with three that mean staged changes, and it would put
+ * a mark on 200,000 rows in a repository with a build directory.
+ *
+ * `--ignored` is this palette's muted olive-brown; tokens.css has the derivation and IDEA's
+ * precedent. The name is tinted and nothing else is — no strike-through, no italics — because
+ * an ignored file is ordinary, just not the project's.
+ */
 .statusIgnored {
-  color: var(--faint);
+  color: var(--ignored);
 }
 
 /* A row whose chunk has not landed yet. Occupies its height and draws nothing, so the

@@ -259,6 +259,14 @@ pub struct SpawnSpec {
     ///
     /// Whatever is in here is *dead text*: it was produced by a process that no longer
     /// exists. Saying so is the caller's job — see `cide_app::lifecycle::restore_notice`.
+    ///
+    /// `screen_state()` and not [`PtySession::reattach_state`], deliberately, and the
+    /// difference is load-bearing here: the new child is a fresh shell on the *normal*
+    /// buffer, so a preload that dragged the mirror onto the alternate one — which is what a
+    /// user who quit cide with `vim` on screen would produce — would leave the replayed
+    /// picture in a grid nobody is showing and send every byte the new child writes there
+    /// too. `screen_state()` is the buffer-agnostic picture, which is the right shape for a
+    /// replay.
     pub preload: Vec<u8>,
 }
 
@@ -568,8 +576,9 @@ impl PtySession {
     /// between them — and it makes mirroring a session into a second pane fall out for
     /// free rather than being a feature.
     ///
-    /// The caller is responsible for first delivering [`Self::screen_state`] so the new
-    /// consumer starts from the current screen rather than mid-stream.
+    /// The caller is responsible for first delivering [`Self::reattach_state`] so the new
+    /// consumer starts from the current screen — on the buffer the child is painting into —
+    /// rather than mid-stream.
     pub fn attach(&self, sink: Arc<dyn Sink>) -> SinkId {
         let id = self.mint_sink_id();
         self.sinks.lock().push(registered(id, sink));
@@ -628,7 +637,11 @@ impl PtySession {
         }
 
         self.sinks.lock().push(registered(id, sink));
-        (id, self.screen_state())
+        // `reattach_state`, not `screen_state`: this is still a sink adopting a child's
+        // current screen, and the fallback path differing from the coalescer path in *which
+        // buffer the receiver ends up on* would make the alt-screen desync depend on whether
+        // the coalescer answered in time. See [`reattach_bytes`].
+        (id, self.reattach_state())
     }
 
     fn mint_sink_id(&self) -> SinkId {
@@ -687,14 +700,41 @@ impl PtySession {
     }
 
     /// A byte sequence that reconstructs the current screen on a fresh terminal:
-    /// contents, cursor, alt-screen flag, bracketed paste and mouse protocol modes.
+    /// contents, cursor, bracketed paste and mouse protocol modes — and **not** which of the
+    /// two buffers that screen is a picture of.
     ///
-    /// This is the reattach primitive. It is a *screen model*, not a byte-exact recorder —
-    /// OSC 8 hyperlinks, OSC 52 clipboard traffic and DEC 2026 sync framing are not
-    /// modelled. For a fullscreen TUI the caller should follow it with a one-frame
-    /// `cols-1 → cols` resize nudge so the application repaints from its own state.
+    /// The doc used to claim it carried the "alt-screen flag" and it never did: this is
+    /// `vt100::Screen::state_formatted`, whose `write_contents_formatted` dumps
+    /// `self.grid()` — and `grid()` (vt100 0.16.2, `screen.rs`) silently returns whichever of
+    /// the normal and alternate grids is active, with nothing said about which. Replaying it
+    /// can therefore neither enter nor leave the alternate screen. That omission is
+    /// [`Self::reattach_state`]'s to repair, and the two are separate functions rather than
+    /// one because the two consumers genuinely want different things:
+    ///
+    /// * **A picture of a dead child**, replayed into a *fresh* mirror so the user gets their
+    ///   last screen back after a restart (`SpawnSpec::preload`, and `cide_app::lifecycle`'s
+    ///   `screens.json`). The new child is a fresh shell on the *normal* buffer, so a picture
+    ///   that pulled the mirror onto the alternate one would put every byte the new child
+    ///   writes into a grid the pane is not showing. This function.
+    /// * **A reattach to a child that is still running**, which must land on the buffer the
+    ///   child is painting into or the two diverge for the rest of the session.
+    ///   [`Self::reattach_state`].
+    ///
+    /// It is a *screen model* either way, not a byte-exact recorder — OSC 8 hyperlinks,
+    /// OSC 52 clipboard traffic and DEC 2026 sync framing are not modelled. For a fullscreen
+    /// TUI the caller should follow it with a one-frame `cols-1 → cols` resize nudge so the
+    /// application repaints from its own state.
     pub fn screen_state(&self) -> Vec<u8> {
         self.vt.lock().screen().state_formatted()
+    }
+
+    /// [`Self::screen_state`] made self-sufficient: the buffer identity first, then the
+    /// screen. **This is the reattach primitive**, and every sink that is being handed the
+    /// current screen of a *live* child gets this one.
+    ///
+    /// See [`reattach_bytes`] for what it prepends and the bug that made it necessary.
+    pub fn reattach_state(&self) -> Vec<u8> {
+        reattach_bytes(&self.vt)
     }
 
     /// Whether the child currently has the alternate screen engaged, i.e. it is a
@@ -781,6 +821,61 @@ fn registered(id: SinkId, sink: Arc<dyn Sink>) -> Registered {
     }
 }
 
+/// The mirror's screen, preceded by which of the terminal's two buffers it is a picture of.
+///
+/// # The bug this exists to prevent
+///
+/// `vt100::Screen::state_formatted` writes the contents of whichever grid is active and says
+/// nothing about which one it was — `write_contents_formatted` walks `self.grid()`, and
+/// `grid()` picks between the normal and alternate grids with no marker in the output; the
+/// only modes `write_input_mode_formatted` emits are application keypad, application cursor,
+/// bracketed paste and the mouse protocol and its encoding. So the snapshot could neither
+/// enter nor leave the alternate screen, in either direction, and every consumer of it took
+/// it raw.
+///
+/// That is not cosmetic. A sink that missed the child's own `\x1b[?1049h`/`\x1b[?1049l` — and
+/// missing bytes is *designed* behaviour here, see [`broadcast`]: a choked sink has raw
+/// frames skipped and is handed this snapshot instead — then sat on a different buffer from
+/// the child for the rest of the session, with nothing to bring the two back. Both directions
+/// of the desync are user-visible and were both in one bug report:
+///
+/// * **xterm on the alternate buffer, child on the normal one.** The alternate buffer has no
+///   scrollback, so the pane loses its scrollbar and xterm turns the wheel into cursor keys
+///   and sends them to the child — the user's wheel starts editing the agent's prompt instead
+///   of scrolling its output.
+/// * **xterm on the normal buffer, child on the alternate one.** The child's cursor-addressed
+///   repaints land in rows that have since scrolled away, so a question the agent drew is
+///   never seen; resizing the pane forces a full repaint and it "fixes itself", which is what
+///   made this look like a rendering bug rather than a state one.
+///
+/// # Why prepending is safe unconditionally
+///
+/// Both `\x1b[?1049h` and `\x1b[?1049l` are guarded no-ops in a terminal that is already on
+/// the buffer they name (xterm's `BufferSet.activateAltBuffer`/`activateNormalBuffer` return
+/// early when the requested buffer is already active), and the cursor save/restore they carry
+/// is immediately overwritten: `state_formatted` opens with `\x1b[m\x1b[H\x1b[J` and closes
+/// with an absolute cursor position, both of which are unconditional.
+///
+/// The leading `\x1b\\` (ST) is for the splice. A catch-up frame is substituted for a raw
+/// frame that was *skipped*, so the bytes the receiving parser last saw may have opened an
+/// OSC or DCS whose terminator was in a skipped frame — and a parser sitting in a string
+/// state would swallow this entire snapshot as payload and paint nothing. ST closes any
+/// pending string sequence, aborts a half-written CSI (any `ESC` does), and is ignored in the
+/// ground state, so it costs two bytes and can only help.
+fn reattach_bytes(vt: &Mutex<vt100::Parser>) -> Vec<u8> {
+    let vt = vt.lock();
+    let screen = vt.screen();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b\\");
+    out.extend_from_slice(if screen.alternate_screen() {
+        b"\x1b[?1049h"
+    } else {
+        b"\x1b[?1049l"
+    });
+    out.extend_from_slice(&screen.state_formatted());
+    out
+}
+
 /// Handle one control request, on the coalescer thread.
 ///
 /// The order is the whole point and it is not interchangeable:
@@ -812,7 +907,7 @@ fn serve_control(
             // A caller that has given up (see `ATTACH_TIMEOUT`) leaves nobody on the other
             // end. The sink stays attached regardless — it is registered and will receive
             // output; only the atomicity of its first frame was lost.
-            let _ = reply.send(vt.lock().screen().state_formatted());
+            let _ = reply.send(reattach_bytes(vt));
         }
     }
 }
@@ -991,7 +1086,7 @@ fn broadcast(
         }
 
         let payload: &[u8] = if r.missed.swap(false, Ordering::AcqRel) {
-            catchup.get_or_insert_with(|| vt.lock().screen().state_formatted())
+            catchup.get_or_insert_with(|| reattach_bytes(vt))
         } else {
             &bytes
         };
@@ -1830,6 +1925,115 @@ mod tests {
         let text = String::from_utf8_lossy(&catchup);
         assert!(
             text.contains("WHILE-CHOKED"),
+            "the catch-up frame did not carry what the sink missed"
+        );
+    }
+
+    /// The reattach primitive must be able to *enter* the alternate screen.
+    ///
+    /// `state_formatted()` alone cannot: it dumps whichever grid is active and emits no
+    /// `?1049`, so replaying an alt-screen snapshot into a fresh terminal left that terminal
+    /// on the normal buffer while the child kept painting the alternate one. The child's
+    /// cursor-addressed repaints then landed in rows that had scrolled away, which is
+    /// "Claude renders a question and I never see it".
+    #[test]
+    fn an_alt_screen_snapshot_puts_a_fresh_terminal_on_the_alternate_screen() {
+        let vt = Mutex::new(vt100::Parser::new(24, 80, 100));
+        vt.lock().process(b"\x1b[?1049h\x1b[HTUI FRAME");
+        assert!(
+            vt.lock().screen().alternate_screen(),
+            "the fixture never entered the alternate screen"
+        );
+
+        let bytes = reattach_bytes(&vt);
+        assert!(
+            !vt100::Parser::new(24, 80, 100).screen().alternate_screen(),
+            "a fresh parser is expected to start on the primary screen"
+        );
+
+        let mut fresh = vt100::Parser::new(24, 80, 100);
+        fresh.process(&bytes);
+        assert!(
+            fresh.screen().alternate_screen(),
+            "the snapshot did not carry the alternate screen: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            fresh.screen().contents().contains("TUI FRAME"),
+            "the snapshot carried the buffer but lost the screen"
+        );
+    }
+
+    /// And it must be able to *leave* it, which is the direction that loses the scrollbar.
+    ///
+    /// A terminal stuck on the alternate buffer reports no scrollback, and xterm then turns
+    /// the wheel into cursor keys and sends them to the child — the wheel edits the agent's
+    /// prompt instead of scrolling its output, which is exactly what was reported.
+    #[test]
+    fn a_primary_screen_snapshot_brings_an_alt_screen_terminal_back() {
+        let vt = Mutex::new(vt100::Parser::new(24, 80, 100));
+        vt.lock().process(b"\x1b[HSHELL PROMPT");
+        let bytes = reattach_bytes(&vt);
+
+        let mut stuck = vt100::Parser::new(24, 80, 100);
+        stuck.process(b"\x1b[?1049h");
+        assert!(
+            stuck.screen().alternate_screen(),
+            "the fixture is not stuck"
+        );
+
+        stuck.process(&bytes);
+        assert!(
+            !stuck.screen().alternate_screen(),
+            "the snapshot could not bring a terminal off the alternate screen: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            stuck.screen().contents().contains("SHELL PROMPT"),
+            "the snapshot left the terminal on the right buffer with the wrong screen"
+        );
+    }
+
+    /// The regression test for the reported bug, on the path that actually fires.
+    ///
+    /// Volume is the trigger: only a *choke* skips raw frames, and a choke that straddles the
+    /// child's own `?1049h` is what desynced the buffers. The catch-up frame is the sink's
+    /// only route back, so it has to say which buffer the screen it carries belongs to.
+    #[test]
+    fn a_catch_up_frame_carries_the_buffer_the_sink_missed_the_switch_to() {
+        let h = Harness::new(policy(500, 100, Duration::from_secs(3600)));
+        let (sink, log) = recording();
+        let id = h.attach(sink);
+
+        // Choke it first, so everything after this is skipped rather than delivered.
+        h.feed(b"NORMAL SCREEN\r\n");
+        for _ in 0..10 {
+            h.feed(&vec![b'x'; 400]);
+        }
+        assert!(h.choked(id), "never choked");
+
+        // The switch the sink must not be allowed to miss, and a frame drawn after it.
+        h.feed(b"\x1b[?1049h\x1b[HQUESTION: proceed?");
+        let raw_seen = log.lock().concat();
+        assert!(
+            !String::from_utf8_lossy(&raw_seen).contains("QUESTION"),
+            "a choked sink was still being sent raw output"
+        );
+
+        h.ack(id, h.outstanding(id));
+        h.tick();
+
+        let catchup = log.lock().last().cloned().expect("a catch-up frame");
+        let mut pane = vt100::Parser::new(24, 80, 100);
+        pane.process(&raw_seen);
+        pane.process(&catchup);
+        assert!(
+            pane.screen().alternate_screen(),
+            "a sink that was choked across `?1049h` never reached the alternate screen: {:?}",
+            String::from_utf8_lossy(&catchup)
+        );
+        assert!(
+            pane.screen().contents().contains("QUESTION: proceed?"),
             "the catch-up frame did not carry what the sink missed"
         );
     }

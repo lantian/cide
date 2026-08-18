@@ -112,6 +112,10 @@ pub fn diagnostic(
             lsp_types::NumberOrString::Number(n) => n.to_string(),
             lsp_types::NumberOrString::String(s) => s.clone(),
         }),
+        // Never stale at the moment of conversion — this *is* the server speaking, which is the
+        // event that answers staleness. The flag is owned by `cide_core::diagnostics`, which is
+        // the only layer that knows what has happened to the file since; see its `dirty` map.
+        stale: false,
     }
 }
 

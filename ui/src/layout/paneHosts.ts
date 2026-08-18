@@ -96,6 +96,16 @@ export interface PaneHost {
    *
    * On the host rather than in the component: the host is what survives a remount, and a
    * re-mounted pane whose size has not changed must not re-send either.
+   *
+   * **It means "what this host last told the child, with no other writer since", and every
+   * other writer must clear it.** There are three besides `syncSize`: `session_attach`
+   * resizes the child unconditionally (`TerminalPane`'s attach path clears it), a font change
+   * resizes every terminal (`settings/useSettings.ts` clears it), and any *other* pane — a
+   * mirror, another window, a re-dock — can resize the same session while this host is out of
+   * the tree (`parkHost` and `releaseHost` clear it). A cache that outlives a write it did not
+   * make does not merely go stale: it makes the next `syncSize` skip the correction, so the
+   * child keeps drawing frames for a geometry the viewport has not got until the pane's pixel
+   * size happens to change.
    */
   lastGeometry?: { cols: number; rows: number; cellWidth: number; cellHeight: number } | undefined
 }
@@ -217,7 +227,7 @@ export function ensureTerminal(paneId: string, kind: TerminalPaneKind): Terminal
   const host = getHost(paneId)
   if (host.terminal) return host.terminal
 
-  const handle = createTerminal(kind)
+  const handle = createTerminal(kind, paneId)
   host.terminal = handle
   return handle
 }
@@ -324,6 +334,16 @@ export function parkHost(paneId: string): void {
   if (!host) return
   host.mounted = false
   host.lastUsed = now()
+  // The same rule `releaseHost` states below, and for the same reason: `lastGeometry` means
+  // "what this host last told the child, with no other writer since", and a parked host has
+  // no way of knowing. A mirror of the same session in another tab or another window, a
+  // `session_attach` from any pane, or a font change all resize the child; the cache would
+  // then let the next `syncSize` decide the child already has a size it does not, and a pane
+  // that comes back to a mismatched geometry is a TUI drawing frames for rows the viewport
+  // has not got. The cost is one `session_resize` the next time this host is mounted and
+  // measured — a split, a project switch, a re-dock; *not* a tab switch, which never unmounts
+  // a slot (`TabContent` hides panels with `visibility`) and so never reaches here.
+  host.lastGeometry = undefined
   if (host.el.parentElement !== parking) {
     quiesce(host)
     parking.appendChild(host.el)

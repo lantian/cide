@@ -13,6 +13,7 @@ import type {
   ClaudeCliSupport,
   ClaudeSettings,
   EditorSettings,
+  ExplorerSettings,
   Settings,
   SettingsPatch,
   SettingsSection,
@@ -62,6 +63,11 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     description: 'Which claude is launched, and the arguments and environment it is given.',
   },
   { id: 'editor', title: 'Editor', description: 'The code buffer.' },
+  {
+    id: 'files',
+    title: 'Files',
+    description: 'What the project tree walks, and therefore what it draws and what Ctrl+P finds.',
+  },
   {
     id: 'inspections',
     title: 'Inspections',
@@ -380,6 +386,45 @@ function Editor({ settings, patch }: SectionProps) {
   )
 }
 
+/**
+ * What the file tree walks. (M18)
+ *
+ * Two toggles and a long hint each, because both of them change what *opening a project costs*
+ * rather than only what it looks like — flipping either one re-walks every open project, which
+ * `cide_ipc::ExplorerSettings` explains and `cmd::settings::settings_set` performs. A toggle
+ * with that consequence and a three-word label would be a trap.
+ *
+ * The wording is deliberately concrete about the cost of the second one. "Show ignored files" is
+ * a reasonable-sounding request until it means `target/`, and a user who turns it on without
+ * being told that has a slow Ctrl+P and no idea why.
+ */
+function Files({ settings, patch }: SectionProps) {
+  const explorer = settings.explorer
+  const set = (next: Partial<ExplorerSettings>) => patch({ explorer: { ...explorer, ...next } })
+
+  return (
+    <Group>
+      <ToggleRow
+        label="Show hidden files"
+        hint="Dot-prefixed entries — .claude, .github, .env — in the file tree and in Ctrl+P. .git itself stays hidden: it is a database of one object per version of every file ever committed, and nothing in a tree can act on one."
+        checked={explorer.showHiddenFiles}
+        onChange={(v) => set({ showHiddenFiles: v })}
+      />
+      <ToggleRow
+        label="Show ignored files"
+        hint="Everything .gitignore covers — target/, node_modules/, dist/ — drawn in a muted olive, the way IDEA draws them. Off by default because it is expensive: on a Rust project it is hundreds of thousands of extra rows to walk, hold and offer to Ctrl+P. One ignore decision serves every surface, so this widens Find in Files and the symbol index with the tree — a find-in-files over a built project will read your object files. They are shown but not watched, so changes inside an ignored directory appear when the project is indexed again rather than as they happen."
+        checked={explorer.showIgnoredFiles}
+        onChange={(v) => set({ showIgnoredFiles: v })}
+      />
+      <Note title="Changing either one re-walks every open project">
+        The rows are not hidden, they are <em>unwalked</em> — there is nothing in the index to
+        reveal — so the walk runs again. Large projects take a moment, and Ctrl+P fills as it
+        goes.
+      </Note>
+    </Group>
+  )
+}
+
 function Git() {
   return (
     <Note title="No git settings yet">
@@ -467,6 +512,8 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       )
     case 'editor':
       return <Editor {...props} />
+    case 'files':
+      return <Files {...props} />
     case 'inspections':
       return <Inspections {...props} />
     case 'git':

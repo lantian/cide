@@ -21,8 +21,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
-use cide_fs::{BuildOptions, Filter, Index, Root, WalkItem, WatchConfig, WatchEvent, Watcher};
-use cide_ipc::{FsChange, FsStatus, ProjectId, WatchBackend, WatchStatus};
+use cide_fs::{
+    BuildOptions, Filter, Index, Root, Visibility, WalkItem, WatchConfig, WatchEvent, Watcher,
+};
+use cide_ipc::{FsChange, FsStatus, ProjectId, Settings, WatchBackend, WatchStatus};
 use cide_search::{Candidate, Matcher as _, NucleoMatcher};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -43,6 +45,24 @@ use tauri::AppHandle;
 pub trait FsEvents: Send + Sync + 'static {
     fn status(&self, project: ProjectId, status: &FsStatus);
     fn changed(&self, project: ProjectId, change: &FsChange);
+
+    /// Files changed on disk, for whoever needs to know beyond the tree. (M18)
+    ///
+    /// Separate from [`Self::changed`], which carries an `FsChange` to the *webview*, because the
+    /// consumer is in Rust and one of the two must not be reshaped for the other: this hands
+    /// owned paths to `cide_app::lsp`, where a language server is told an agent rewrote a file it
+    /// has findings for. Routing it through the webview instead was the alternative and it loses
+    /// — a round trip per changed file, the frontend reading files it has no reason to hold, and
+    /// a second copy of the "which server owns this extension" map that `ui/src/editor/docSync.ts`
+    /// explicitly refuses to grow. The watcher already runs in Rust, next to the registry.
+    ///
+    /// **Defaulted to nothing, and only for the test doubles.** The reason this trait exists at
+    /// all is that a walk can then be driven from an ordinary `#[test]` (see the note above), and
+    /// those doubles are asserting on tree events rather than on language servers. The one
+    /// implementation that matters is `AppHandle`'s below, and it is not defaulted.
+    fn files_changed(&self, project: ProjectId, paths: &[PathBuf]) {
+        let _ = (project, paths);
+    }
 }
 
 impl FsEvents for AppHandle {
@@ -52,6 +72,34 @@ impl FsEvents for AppHandle {
 
     fn changed(&self, project: ProjectId, change: &FsChange) {
         crate::emit::fs_changed(self, project, change);
+    }
+
+    fn files_changed(&self, project: ProjectId, paths: &[PathBuf]) {
+        use tauri::Manager as _;
+        // `try_state` rather than `state`: this runs on a watcher thread that outlives nothing in
+        // particular, and during shutdown the managed registry may already be gone. `state` panics
+        // there, which would abort the process over an event nobody was waiting for.
+        let Some(registry) = self.try_state::<crate::lsp::DiagnosticsRegistry>() else {
+            return;
+        };
+        // A project with no language server has no entry, which is the ordinary case for a
+        // TypeScript repository and is not an error.
+        if let Some(diagnostics) = registry.get(project) {
+            diagnostics.files_changed(paths);
+        }
+    }
+}
+
+/// What the user's settings say the file tree walks.
+///
+/// The one place `cide_ipc::ExplorerSettings` becomes `cide_fs::Visibility`. Two types rather
+/// than one because the crate that owns the walk must not depend on the wire's settings shape
+/// and cannot see `cide-ipc`'s defaults — and one conversion function is what keeps the two from
+/// drifting into a tree that shows what the watcher hides.
+pub fn visibility_of(settings: &Settings) -> Visibility {
+    Visibility {
+        hidden: settings.explorer.show_hidden_files,
+        ignored: settings.explorer.show_ignored_files,
     }
 }
 
@@ -78,6 +126,20 @@ impl FsRegistry {
 
     pub fn close_all(&self) {
         self.projects.clear();
+    }
+
+    /// Every project with an entry here, with the roots it was walked over.
+    ///
+    /// The answer to "which projects would a settings change have to re-walk". Collected into a
+    /// `Vec` rather than handing out an iterator over the map, because the caller starts a walk
+    /// per entry and a walk takes the same map's lock through [`FsRegistry::claim`] — iterating
+    /// a `DashMap` while a task re-enters it is a self-deadlock, and it is the kind that only
+    /// shows up when a second project is open.
+    pub fn indexed(&self) -> Vec<(ProjectId, Vec<PathBuf>)> {
+        self.projects
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().root_paths()))
+            .collect()
     }
 
     /// Claim a project for indexing, creating its entry if it has none.
@@ -110,7 +172,12 @@ impl FsRegistry {
     /// A project whose **roots changed** is not either case — its entry is dropped below and
     /// it is walked again. That distinction is the whole reason this is keyed on the root
     /// list rather than on the project id.
-    pub fn claim(&self, project: ProjectId, roots: Vec<PathBuf>) -> Result<Indexing, FsStatus> {
+    pub fn claim(
+        &self,
+        project: ProjectId,
+        roots: Vec<PathBuf>,
+        visibility: Visibility,
+    ) -> Result<Indexing, FsStatus> {
         // A project can gain or lose a root between two indexings. Reusing the old entry
         // would then walk the old set for ever, with no error anywhere to say so — the tree
         // would simply be missing a root the user added.
@@ -118,10 +185,17 @@ impl FsRegistry {
         // The comparison is done in a statement of its own: `DashMap::remove` while a `Ref`
         // into the same shard is alive is a self-deadlock, and letting the guard live to the
         // end of an `if let` block is exactly how that happens.
+        //
+        // `visibility` joins the root list in that comparison for exactly the same reason. An
+        // index built with *Show ignored files* off does not contain `target/` — those entries
+        // were never walked, so there is nothing to reveal — and an index built with it on
+        // cannot have them removed without re-deriving the ignore verdict for every node it
+        // holds. Either way the answer is a fresh walk, and treating a changed setting as
+        // "already indexed" is how a toggle comes to do nothing at all.
         let stale = self
             .projects
             .get(&project)
-            .is_some_and(|entry| entry.root_paths() != roots);
+            .is_some_and(|entry| entry.root_paths() != roots || entry.visibility != visibility);
         if stale {
             self.projects.remove(&project);
         }
@@ -129,6 +203,7 @@ impl FsRegistry {
         let entry = self.projects.entry(project).or_insert_with(|| {
             Arc::new(ProjectFs::new(
                 roots.iter().cloned().map(Root::new).collect(),
+                visibility,
             ))
         });
         let fs = Arc::clone(entry.value());
@@ -184,7 +259,15 @@ impl Indexing {
         let matcher = Arc::clone(&fs.matcher);
         let index = Index::build(
             fs.roots.clone(),
-            BuildOptions::default(),
+            BuildOptions {
+                // The user's setting, taken from the entry rather than read again here: the
+                // whole entry was rebuilt if it moved, so this is the value `claim` decided to
+                // walk with and the value `Filter::build` below is about to be given. Reading
+                // the workspace a second time would open a window in which the walk and the
+                // filter disagree.
+                visibility: fs.visibility,
+                ..BuildOptions::default()
+            },
             &move |batch: &[WalkItem]| {
                 for item in batch.iter().filter(|i| !i.is_dir) {
                     matcher.push(Candidate::new(
@@ -196,8 +279,18 @@ impl Indexing {
         );
 
         let root_paths: Vec<PathBuf> = fs.roots.iter().map(|r| r.path.clone()).collect();
+        // Every visited directory, so that every `.gitignore` under the roots is found — which
+        // with *Show ignored files* on includes the ones inside `target/`.
         let dirs = index.dir_paths();
-        let filter = Arc::new(Filter::build(&root_paths, dirs.iter().map(|p| p.as_path())));
+        let filter = Arc::new(Filter::build(
+            &root_paths,
+            dirs.iter().map(|p| p.as_path()),
+            fs.visibility,
+        ));
+        // NOT `dirs`. With ignored entries shown the tree holds thousands of directories the
+        // watcher must not take a descriptor on — see `cide_fs::filter`'s module note, which
+        // owns that trade — and `watch_dirs` is where the two lists are told apart.
+        let watched = index.watch_dirs(&filter);
 
         *fs.index.write() = index;
         *fs.filter.write() = Arc::clone(&filter);
@@ -205,7 +298,7 @@ impl Indexing {
 
         let config = WatchConfig {
             roots: root_paths,
-            dirs,
+            dirs: watched,
             ..WatchConfig::default()
         };
         let watcher = Watcher::start(config, filter, {
@@ -239,6 +332,13 @@ impl Drop for IndexingGuard {
 /// One project's index, picker and watcher.
 pub struct ProjectFs {
     pub roots: Vec<Root>,
+    /// What this project's index was walked with.
+    ///
+    /// Immutable for the life of the entry: [`FsRegistry::claim`] drops and rebuilds the whole
+    /// entry when the user's setting moves, rather than mutating this and leaving an arena that
+    /// disagrees with it. That is what makes [`ProjectFs::filter`] — handed to the content
+    /// search and to `Index::apply` — provably the same answer the walk used.
+    visibility: Visibility,
     index: RwLock<Index>,
     /// The synthetic groups drawn *after* the index's rows — *External Libraries*, and whatever
     /// comes next.
@@ -310,17 +410,19 @@ pub struct ProjectFs {
 }
 
 impl ProjectFs {
-    fn new(roots: Vec<Root>) -> Self {
+    fn new(roots: Vec<Root>, visibility: Visibility) -> Self {
         Self {
-            index: RwLock::new(Index::empty(roots.clone())),
+            index: RwLock::new(Index::empty(roots.clone(), visibility)),
             // Empty, and it stays empty until the first tree read probes for a manifest. Opening
             // a project must cost nothing here — see `crate::libraries`.
             groups: crate::groups::ProjectGroups::new(),
             filter: RwLock::new(Arc::new(Filter::build(
                 &roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
                 Vec::new(),
+                visibility,
             ))),
             roots,
+            visibility,
             matcher: Arc::new(NucleoMatcher::new()),
             watcher: Mutex::new(None),
             watch_status: Mutex::new(WatchStatus {
@@ -847,6 +949,20 @@ fn on_watch_event(
                     tauri::async_runtime::spawn_blocking(move || fs.refresh_symbols(&touched));
                 }
             }
+            /*
+             * The language servers, before the webview is told anything. (M18)
+             *
+             * Order is not load-bearing — these are two independent consumers — but the *call* is:
+             * without it a file an agent rewrote reaches the tree, the picker and `cide-lang`, and
+             * stops there. rust-analyzer and gopls learn nothing, their diagnostics keep the line
+             * numbers they were published with, and clicking one lands wherever that line now is.
+             * That is the reported bug, and this line is the fix for its first half.
+             *
+             * Unfiltered by language on purpose: `ProjectDiagnostics::files_changed` owns the
+             * question of which paths matter to which server — including the build manifests,
+             * which `cide_lang::Lang::of_path` above deliberately does not know about.
+             */
+            events.files_changed(project, &change.paths);
             events.changed(project, &change);
         }
         WatchEvent::Status(status) => {

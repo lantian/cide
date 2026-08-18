@@ -223,9 +223,15 @@ mod tests {
         let project = ProjectId::new();
         let roots = vec![dir.path().join("project")];
         let events: Arc<dyn FsEvents> = Arc::new(Silent);
-        crate::cmd::fs::index_project(events, &registry, project, roots)
-            .await
-            .expect("the project index");
+        crate::cmd::fs::index_project(
+            events,
+            &registry,
+            project,
+            roots,
+            cide_fs::Visibility::CONSERVATIVE,
+        )
+        .await
+        .expect("the project index");
 
         let fs = registry.get(project).expect("the project is registered");
         {

@@ -336,7 +336,7 @@ fn a_real_rust_analyzer_resolves_a_definition() {
     // The file has to be open before the server will answer about it — the same prerequisite
     // `docSync.ts` exists to satisfy in the app.
     let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), "rust-analyzer");
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
     let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
     if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
         handle.send(message);
@@ -427,7 +427,7 @@ fn a_real_rust_analyzer_finds_the_usages_of_a_declaration() {
     );
 
     let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
-    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), "rust-analyzer");
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
     let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
     if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
         handle.send(message);
@@ -479,5 +479,377 @@ fn a_real_rust_analyzer_finds_the_usages_of_a_declaration() {
     assert!(
         !rows.iter().any(|row| row.line == 1),
         "the declaration came back despite includeDeclaration: false: {rows:?}"
+    );
+}
+
+/* -------------------------------------------------------------------------- M18 --------- */
+
+/// A Cargo project with one deliberately broken file, at a unique temp path.
+///
+/// Factored out because the three M18 tests below all need the same fixture and the same "wait for
+/// flycheck to report the error" preamble, and three copies of it is three chances for one of them
+/// to drift into asserting something slightly different from what its neighbour asserts.
+fn broken_rust_crate(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cide-lsp-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write");
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> u32 { \"nope\" }\n").expect("write");
+    dir
+}
+
+/// Does any event in the tail carry a `mismatched types`?
+fn saw_mismatch(events: &[LspEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(e, LspEvent::Published { items, .. } if items.iter().any(|d| d.message.contains("mismatched types")))
+    })
+}
+
+#[test]
+#[ignore = "spawns the real rust-analyzer"]
+fn a_flycheck_kick_refreshes_diagnostics_an_on_disk_edit_alone_would_not() {
+    /*
+     * The exact inverse of `an_on_disk_edit_alone_never_refreshes_diagnostics`, and the proof
+     * that M18's fix for the Rust half of the report is real rather than plausible.
+     *
+     * That test repairs the file on disk, sends nothing, waits two minutes and asserts the
+     * diagnostic is **still there**. It stays exactly as it is: it is the guard on the assumption,
+     * and it stays true because it still sends nothing.
+     *
+     * This one does the same thing and then sends `rust-analyzer/runFlycheck` — the notification
+     * `ProjectDiagnostics::files_changed` parks on the `Kick` coalescer for the pump to send once
+     * a burst of watcher events settles. If rust-analyzer ever stops implementing that extension,
+     * or changes its params, this test fails and the panel's "Re-run analysis" button silently
+     * becomes decoration. There is no other gate on it: a notification produces no reply, so a
+     * server that has never heard of the method drops it without a word — which is what makes
+     * sending it safe and also what makes it invisible when it breaks.
+     */
+    let dir = broken_rust_crate("flycheck");
+    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let (saw_error, seen) = wait_for(&handle, Duration::from_secs(180), saw_mismatch);
+    assert!(
+        saw_error,
+        "flycheck never reported the error on load, so this test cannot say anything about \
+         clearing it.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" rust-analyzer gave up: {reason}"),
+            None => format!(" Seen: {seen:#?}"),
+        }
+    );
+
+    std::fs::write(dir.join("src/lib.rs"), "pub fn f() -> u32 { 7 }\n").expect("write");
+    // Drain whatever is queued so the assertion below reads only what arrives *after* the kick.
+    // Without this the pre-repair publish is still sitting in the channel and would be mistaken
+    // for the answer.
+    let _ = handle.drain();
+
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
+    let cide_lsp::Effect::Send(kick) = session.run_flycheck() else {
+        panic!("run_flycheck must be a Send effect")
+    };
+    handle.send(kick);
+
+    // A `cargo check` of a one-file crate, plus rust-analyzer noticing the VFS change. Generous,
+    // because a cold cargo on a loaded machine is not fast and a flake here would be read as "the
+    // kick does not work".
+    let (cleared, after) = wait_for(&handle, Duration::from_secs(120), |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, LspEvent::Published { items, .. } if !items.iter().any(|d| d.message.contains("mismatched types"))))
+    });
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        cleared,
+        "`rust-analyzer/runFlycheck` did not re-run the check after an on-disk repair. The \
+         Problems panel's Re-run button and every agent edit depend on this notification; if the \
+         extension has been renamed or its params have changed, a notification fails silently and \
+         nothing else in this repository would notice. Seen after the kick: {after:#?}"
+    );
+}
+
+#[test]
+#[ignore = "spawns the real rust-analyzer"]
+fn rust_analyzer_answers_go_to_implementation() {
+    /*
+     * The Rust half of the ITEM 3 guarantee — and the reason Ctrl+B was **not** changed to try
+     * implementation first.
+     *
+     * rust-analyzer answers `textDocument/implementation` on a trait's method with the concrete
+     * `impl` blocks, which is the feature. It also answers on an ordinary struct or trait *name*
+     * with its impls — so an implementation-first Ctrl+click would stop opening declarations for
+     * every plain type in a Rust workspace. This test pins the first behaviour; the separate
+     * command id is what protects the second.
+     */
+    let dir = std::env::temp_dir().join(format!("cide-lsp-impl-rs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write");
+    // `trait Greet { fn hello(&self); }` on line 1, and the impl's `hello` on line 6.
+    std::fs::write(
+        dir.join("src/lib.rs"),
+        "pub trait Greet {\n    fn hello(&self);\n}\n\npub struct En;\n\nimpl Greet for En {\n    fn hello(&self) {}\n}\n",
+    )
+    .expect("write");
+
+    let handle = LspHandle::start(Server::RustAnalyzer, vec![dir.clone()]).expect("start");
+    let (_, seen) = wait_for(&handle, Duration::from_secs(180), ready);
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("src/lib.rs"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::RustAnalyzer);
+    let text = std::fs::read_to_string(dir.join("src/lib.rs")).expect("read");
+    if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "rust", 1, text) {
+        handle.send(message);
+    }
+
+    // The handshake is done, so the capability has been read. `None` would mean `Caps::store_from`
+    // stopped being called and the refusal branch in `ProjectDiagnostics::implementations` would
+    // be reading a permanently-unknown atomic.
+    assert_eq!(
+        handle.supports_implementation(),
+        Some(true),
+        "rust-analyzer advertises implementationProvider; a None means the capability was never \
+         read off the handshake.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    // 0-based: line 1 is `    fn hello(&self);`, character 7 is the `h` of the trait's method.
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 1, "character": 7 },
+    });
+    let requester = handle.requester();
+    let mut answer: Option<Vec<cide_lsp::convert::Loc>> = None;
+    for _ in 0..20 {
+        match requester.request(
+            "textDocument/implementation",
+            params.clone(),
+            Duration::from_secs(10),
+        ) {
+            Ok(value) => {
+                if let Some(rows) = cide_lsp::convert::locations(&value)
+                    && !rows.is_empty()
+                {
+                    answer = Some(rows);
+                    break;
+                }
+            }
+            Err(error) => panic!("the request failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let rows = answer.expect("rust-analyzer never answered with an implementation of `hello`");
+    // 1-based. Line 8 is the impl's `fn hello(&self) {}`. Line 2 would be the trait's own
+    // declaration, i.e. the answer `textDocument/definition` already gives.
+    assert!(
+        rows.iter().any(|row| row.line == 8),
+        "the concrete `hello` on line 8 is missing — this is the whole feature: {rows:?}"
+    );
+}
+
+#[test]
+#[ignore = "spawns the real gopls"]
+fn gopls_goes_to_the_implementation_rather_than_the_interface() {
+    /*
+     * The report, reproduced and then answered.
+     *
+     * `Speak(s Speaker)` calls `s.Say()` through an interface. `textDocument/definition` on that
+     * call resolves to the *interface's* `Say` — which is gopls being correct, and is exactly what
+     * the user saw and did not want. `textDocument/implementation` on the same position resolves
+     * to `En.Say`, the concrete method.
+     *
+     * Both halves are asserted, in one test, deliberately: the point is not that implementation
+     * works, it is that the two requests give **different** answers at the same caret. A test that
+     * only asked the second could pass on a build where definition had quietly started answering
+     * the same thing, and the separate command would then be pointless.
+     */
+    let dir = std::env::temp_dir().join(format!("cide-lsp-impl-go-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("go.mod"), "module probe\n\ngo 1.21\n").expect("write");
+    /*
+     * Line-numbered, 1-based, because both assertions below are about which line came back:
+     *   1 package probe
+     *   2
+     *   3 type Speaker interface {
+     *   4     Say() string
+     *   5 }
+     *   6
+     *   7 type En struct{}
+     *   8
+     *   9 func (En) Say() string { return "hi" }
+     *  10
+     *  11 func Speak(s Speaker) string { return s.Say() }
+     */
+    std::fs::write(
+        dir.join("probe.go"),
+        "package probe\n\ntype Speaker interface {\n\tSay() string\n}\n\ntype En struct{}\n\nfunc (En) Say() string { return \"hi\" }\n\nfunc Speak(s Speaker) string { return s.Say() }\n",
+    )
+    .expect("write");
+
+    let handle = LspHandle::start(Server::Gopls, vec![dir.clone()]).expect("start");
+    let (_, seen) = wait_for(&handle, Duration::from_secs(120), ready);
+    let uri = cide_lsp::convert::path_to_uri(&dir.join("probe.go"));
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::Gopls);
+    let text = std::fs::read_to_string(dir.join("probe.go")).expect("read");
+    if let cide_lsp::Effect::Send(message) = session.did_open(uri.clone(), "go", 1, text) {
+        handle.send(message);
+    }
+
+    assert_eq!(
+        handle.supports_implementation(),
+        Some(true),
+        "gopls advertises implementationProvider.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => String::new(),
+        }
+    );
+
+    /*
+     * 0-based: line 10 is `func Speak(s Speaker) string { return s.Say() }`, and character 40 is
+     * the `S` of `Say`.
+     *
+     * Counted rather than guessed, and the difference is a real failure this test already caught
+     * once: character 38 is the receiver `s`, and gopls answers
+     * `textDocument/implementation` there with a JSON-RPC **error** — *"s is a var, not a type"*
+     * — rather than with `null`. That behaviour is why `ProjectDiagnostics::implementations`
+     * folds `RequestError::Failed` into `NotFound`; see the comment there.
+     */
+    let params = serde_json::json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 10, "character": 40 },
+    });
+    let requester = handle.requester();
+
+    let ask = |method: &str| -> Vec<cide_lsp::convert::Loc> {
+        for _ in 0..20 {
+            match requester.request(method, params.clone(), Duration::from_secs(10)) {
+                Ok(value) => {
+                    if let Some(rows) = cide_lsp::convert::locations(&value)
+                        && !rows.is_empty()
+                    {
+                        return rows;
+                    }
+                }
+                Err(error) => panic!("{method} failed: {error}"),
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        Vec::new()
+    };
+
+    let definition = ask("textDocument/definition");
+    let implementation = ask("textDocument/implementation");
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The report, reproduced: definition lands on the interface's method, line 4.
+    assert!(
+        definition.iter().any(|row| row.line == 4),
+        "gopls no longer resolves the interface call to the interface's own method — the premise \
+         of this whole change. Got: {definition:?}"
+    );
+    // And the answer: implementation lands on the concrete one, line 9.
+    assert!(
+        implementation.iter().any(|row| row.line == 9),
+        "`textDocument/implementation` did not reach `En.Say` on line 9: {implementation:?}"
+    );
+    assert!(
+        !implementation.iter().any(|row| row.line == 4),
+        "implementation came back with the interface declaration, which is the answer the user \
+         already had and did not want: {implementation:?}"
+    );
+}
+
+#[test]
+#[ignore = "spawns the real gopls"]
+fn gopls_re_diagnoses_a_file_it_was_told_changed_on_disk() {
+    /*
+     * The Go half of the stale-diagnostics report.
+     *
+     * gopls has **no file watcher of its own**: it registers watch patterns through
+     * `client/registerCapability` and then waits for `workspace/didChangeWatchedFiles`. cide
+     * answered that registration with `null` and sent the notification nowhere, so a file an agent
+     * rewrote — one the user never opened, so no `didChange` either — kept its diagnostics with
+     * their original line numbers for the rest of the session.
+     *
+     * The file here is deliberately **never opened**: no `didOpen`, no `didChange`. If this test
+     * passes only because of an editor notification, it is not testing the path that was broken.
+     */
+    let dir = std::env::temp_dir().join(format!("cide-lsp-watch-go-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("go.mod"), "module probe\n\ngo 1.21\n").expect("write");
+    // `undefinedName` is an unresolved identifier, which gopls reports without needing to build.
+    std::fs::write(
+        dir.join("probe.go"),
+        "package probe\n\nfunc F() int { return undefinedName }\n",
+    )
+    .expect("write");
+
+    let handle = LspHandle::start(Server::Gopls, vec![dir.clone()]).expect("start");
+    let broken = |events: &[LspEvent]| {
+        events.iter().any(|e| {
+            matches!(e, LspEvent::Published { items, .. } if items.iter().any(|d| d.message.contains("undefinedName")))
+        })
+    };
+    let (saw_error, seen) = wait_for(&handle, Duration::from_secs(120), broken);
+    assert!(
+        saw_error,
+        "gopls never reported the undefined name, so this test cannot say anything about \
+         clearing it.{}",
+        match gave_up(&seen) {
+            Some(reason) => format!(" It gave up: {reason}"),
+            None => format!(" Seen: {seen:#?}"),
+        }
+    );
+
+    std::fs::write(
+        dir.join("probe.go"),
+        "package probe\n\nfunc F() int { return 7 }\n",
+    )
+    .expect("write");
+    let _ = handle.drain();
+
+    let (session, _) = cide_lsp::Session::new(std::slice::from_ref(&dir), Server::Gopls);
+    // `2` is LSP's `FileChangeType::Changed`. This is byte-for-byte what
+    // `ProjectDiagnostics::files_changed` sends from the watcher thread.
+    let cide_lsp::Effect::Send(notice) = session.did_change_watched_files(vec![(
+        cide_lsp::convert::path_to_uri(&dir.join("probe.go")),
+        2,
+    )]) else {
+        panic!("did_change_watched_files must be a Send effect")
+    };
+    handle.send(notice);
+
+    let (cleared, after) = wait_for(&handle, Duration::from_secs(60), |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, LspEvent::Published { items, .. } if !items.iter().any(|d| d.message.contains("undefinedName"))))
+    });
+
+    drop(handle);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        cleared,
+        "gopls did not re-diagnose a file it was told had changed on disk. Every agent edit to a \
+         Go file the user has not opened depends on this notification. Seen after it: {after:#?}"
     );
 }

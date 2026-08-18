@@ -58,6 +58,7 @@ import { openBranchPopup } from '@/chrome/BranchSelector'
 import { explain, pullReport, type RepoFetch } from '@/chrome/branchModel'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
+import { openTerminalFind } from '@/terminal/findStore'
 import { paneRestarter } from '@/panes/paneRestart'
 import { useGitCount } from '@/chrome/gitCountStore'
 import { requestFocus } from '@/chrome/focusRequests'
@@ -80,7 +81,8 @@ import {
 } from '@/ipc/client'
 import { focusedCaret, focusedWord } from '@/editor/caretTrack'
 import { goToDefinition } from '@/editor/goToDefinition'
-import { findUsages } from '@/editor/codeIntel'
+import { findUsages, goToImplementation } from '@/editor/codeIntel'
+import { refreshDiagnostics } from '@/sidebar/ProblemsPanel/actions'
 import { navigate } from '@/editor/jump'
 import { memberStep } from '@/editor/memberNav'
 import { symbolsOf } from '@/editor/outlineStore'
@@ -580,9 +582,39 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (paneSessionId(on.pane) === undefined) {
           return unmet(command, 'the focused pane has no session yet')
         }
-        void pasteIntoTerminal(term).catch(
+        // The pane's kind, because it decides the no-text branch: a Claude pane hands `^V` to
+        // the CLI so its own image paste runs, a shell pane must not (readline's
+        // `quoted-insert` would eat the next keystroke). Read off `target`, which carries the
+        // whole `Pane`, rather than off `on`, which is the three ids a `pane_*` command takes.
+        // Same mapping `TerminalPane` makes — anything that is not the Claude CLI is a shell as
+        // far as this chord is concerned.
+        void pasteIntoTerminal(term, target?.pane.kind === 'claude' ? 'claude' : 'shell').catch(
           (error: unknown) => void diag.log(`terminal.paste failed: ${String(error)}`),
         )
+        return
+      }
+
+      case 'terminal.find': {
+        /*
+         * The find bar over the focused terminal pane. Ctrl+F reaches this the short way — the
+         * terminal's own key handler calls `openTerminalFind` directly, because the chord is
+         * focus-scoped and never enters the keymap (see `cide_core::commands`' entry for the
+         * argument) — so this arm is the palette's route, and a user's own `keymap.json` chord's.
+         *
+         * Both routes end in the same store write, which is what stops the row in the palette
+         * and the keystroke being two different features.
+         *
+         * A session is deliberately *not* required, unlike `terminal.paste`: a pane whose child
+         * has exited still holds its whole transcript, and searching a dead pane's output is one
+         * of the times somebody most wants this. What is required is a terminal to search, which
+         * a diff or editor pane has none of — the clause says so and this re-checks it, because
+         * the gate never reads a `Command::when`.
+         */
+        if (on === null) return unmet(command, 'no focused pane')
+        if (peekHost(on.pane)?.terminal === undefined) {
+          return unmet(command, 'the focused pane has no terminal')
+        }
+        openTerminalFind(on.pane)
         return
       }
 
@@ -1074,6 +1106,32 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
       }
 
+      case 'navigate.implementation': {
+        /*
+         * Ctrl+Alt+B — the concrete thing, as opposed to the declaration. (M18)
+         *
+         * Same shape as `navigate.definition` and `navigate.usages` above and for the same
+         * reason: a `when` gates the palette and never the keyboard, so the chord arriving from a
+         * terminal pane has to be refused with a sentence rather than run against a caret that
+         * does not exist.
+         *
+         * Ctrl+B is untouched and still means "definition". The user's report was that goto in Go
+         * lands on the interface — which is `textDocument/definition` behaving correctly — so the
+         * fix is a second question, not a different answer to the first. Folding them together
+         * would regress Rust, where `implementation` on a struct name answers with its `impl`
+         * blocks; the id's own comment in `cide_core::commands` has the whole argument.
+         *
+         * An empty answer falls back to Go to definition inside `goToImplementation`, so this
+         * command always does something wherever a caret is.
+         */
+        const caret = focusedCaret()
+        if (caret === null) return unmet(command, 'no editor focused')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        goToImplementation(project.id, caret.path, caret.line, caret.column, focusedWord())
+        return
+      }
+
       case 'navigate.back':
       case 'navigate.forward': {
         /*
@@ -1251,6 +1309,25 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
         deps.showSidebar('git')
         return
+
+      case 'problems.refresh': {
+        /*
+         * Re-run the analysers. The Problems panel's own button calls the same function. (M18)
+         *
+         * `projectOpen` is the command's clause and it is re-checked here, per this file's rule:
+         * the clause filters the palette, the keyboard is never gated by it, and an id a user has
+         * bound in `keymap.json` arrives whatever the workspace looks like.
+         *
+         * Deliberately **not** gated on the sidebar being open or on the Problems view being
+         * selected. The thing being re-run is a language server, not a panel, and a user who
+         * pressed a chord they bound for this while looking at a terminal means exactly what they
+         * said. `sidebar/ProblemsPanel/actions.ts` puts the outcome on screen either way.
+         */
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        refreshDiagnostics(project.id)
+        return
+      }
 
       case 'sidebar.problems':
         // Reveal, never toggle — the same call `sidebar.files` and `sidebar.git` make, and for

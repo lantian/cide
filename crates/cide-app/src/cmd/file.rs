@@ -1584,11 +1584,15 @@ mod tests {
             .expect("retargets");
         }
 
+        // Strip order, and it is the reverse of the order they were opened in: `open_tab`
+        // inserts each new tab immediately right of the pinned console, so the scratch tab —
+        // opened on the first of the thirty clicks — sits in front of the kept one. What the
+        // test is about is unchanged: two tabs, and the double-clicked one still there.
         assert_eq!(
             diff_tabs(&ws, project),
             vec![
-                ("src/keep.rs".into(), false),
                 ("src/file29.rs".into(), true),
+                ("src/keep.rs".into(), false),
             ]
         );
     }
@@ -1629,8 +1633,8 @@ mod tests {
         );
         assert_eq!(
             diff_tabs(&ws, project),
-            vec![("src/keep.rs".into(), false), ("src/a.rs".into(), true)],
-            "the preview tab still holds what it held"
+            vec![("src/a.rs".into(), true), ("src/keep.rs".into(), false)],
+            "the preview tab still holds what it held — and is still where it was opened,              immediately right of the console"
         );
         assert_eq!(
             workspace::preview_diff_tab(&ws, project).expect("exists"),
@@ -1663,9 +1667,11 @@ mod tests {
         // the tab that was just promoted.
         retarget_git_diff(&mut ws, project, repo, "src/b.rs", DiffSide::Combined, None)
             .expect("retargets");
+        // The new preview tab opens where every new tab opens — next to the console — so it
+        // lands in front of the one that was just promoted rather than after it.
         assert_eq!(
             diff_tabs(&ws, project),
-            vec![("src/a.rs".into(), false), ("src/b.rs".into(), true)]
+            vec![("src/b.rs".into(), true), ("src/a.rs".into(), false)]
         );
     }
 

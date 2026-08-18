@@ -19,9 +19,32 @@
 //! * `.gitignore` files **above** a project root are not consulted. `WalkBuilder::parents`
 //!   is turned off to match. Replicating it would mean walking an unbounded ancestor chain
 //!   on every event, and a cide project root is a project, not an arbitrary subdirectory.
-//! * Dotfiles are ignored wholesale, which is `WalkBuilder`'s `hidden(true)` default and the
-//!   behaviour the file tree wants. The exception is the handful of paths under `.git` that
-//!   [`Filter::git_paths`] names, which are watched on purpose.
+//! * Dotfiles and ignored files are shown or not according to [`Visibility`], which is a user
+//!   setting. `.git` is the one thing neither half of that setting can bring back — see
+//!   [`Visibility`] for why — apart from the handful of paths under it that
+//!   [`Filter::git_paths`] names, which are watched on purpose and never drawn.
+//!
+//! # Two questions, not one: [`Filter::admits`] and [`Filter::watchable`]
+//!
+//! They were the same function until ignored files could be shown, and separating them is the
+//! whole of how *show ignored files* is affordable. `admits` answers "does the tree contain
+//! this", `watchable` answers "does the watcher watch and report this", and `watchable` is the
+//! stricter of the two by exactly one rule: **an ignored path is never watched, even when it
+//! is shown**.
+//!
+//! The asymmetry is deliberate and it is the cheap half of a trade that has no free option:
+//!
+//! * A watch is per *directory* (see `crate::watch`), so watching a shown `target/` costs one
+//!   inotify descriptor per directory in it — thousands, against a per-user
+//!   `fs.inotify.max_user_watches` that is 8192 on some distributions — and then one event per
+//!   file `cargo build` writes, which is the storm this crate was written to avoid.
+//! * The cost of *not* watching it is that rows under an ignored directory are the walk's
+//!   snapshot: a build that rewrites `target/debug/` does not move them until the project is
+//!   indexed again. That is a stale corner of a subtree the user opted into seeing, and it is
+//!   visibly better than a file tree that repaints every two seconds for the length of a build.
+//!
+//! Nothing else in the crate is allowed to re-derive either answer: `Index` asks `admits`, the
+//! watcher asks `watchable`, and the app's watch list is `dir_paths()` put through `watchable`.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -38,6 +61,64 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 /// actually happens.
 const GIT_WATCHED: [&str; 5] = ["HEAD", "index", "refs", "refs/heads", "refs/tags"];
 
+/// The directory neither half of [`Visibility`] can uncover.
+const GIT_DIR: &str = ".git";
+
+/// Which of the two populations the walk used to drop wholesale the tree actually shows.
+///
+/// Two independent booleans rather than one "show everything" flag, because they cost
+/// completely different things and the user's two questions are unrelated:
+///
+/// * **`hidden`** is dotfiles — `.claude`, `.github`, `.env`. There are tens of them in a
+///   repository, they are project files like any other, and the reported bug was that cide
+///   could not show `.claude` at all. It defaults **on** in
+///   `cide_ipc::ExplorerSettings`, because the cost is a rounding error and the absence is a
+///   surprise.
+/// * **`ignored`** is everything `.gitignore` covers — `target/`, `node_modules/`, `dist/`.
+///   On this repository alone that is ~200,000 entries against ~1,500 tracked ones, and every
+///   one of them becomes an arena node, a `Ctrl+P` candidate and a row the scrollbar has to
+///   span. It defaults **off**, and the Settings screen says what turning it on costs.
+///
+/// # `.git` is not on this list, and that is a decision rather than an omission
+///
+/// A `.git` directory is a database, not content: it holds one loose object per version of
+/// every file ever committed — 60,000 of them in this repository — none of which can be
+/// usefully opened, renamed or deleted from a file tree, and all of which would be indexed by
+/// the picker and watched by the watcher. IDEA hides it, every editor hides it, and the
+/// watcher already watches the five paths inside it that mean something (see [`GIT_WATCHED`])
+/// without drawing a row for any of them. So `.git` is excluded structurally: a component
+/// named `.git` is refused by [`Filter::admits`] and pruned by the walk, whatever `hidden`
+/// says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Visibility {
+    /// Show dot-prefixed entries.
+    pub hidden: bool,
+    /// Show entries the ignore rules cover. See the cost note above.
+    pub ignored: bool,
+}
+
+impl Visibility {
+    /// Neither population — what every walk in this workspace did before the setting existed.
+    ///
+    /// This is [`Default`], and it is deliberately **not** the app's default: `cide-ipc`'s
+    /// `ExplorerSettings` turns `hidden` on, and the app passes the user's setting explicitly
+    /// at every walk it starts. Two defaults that must agree is a drift bug waiting to happen,
+    /// so these two are allowed to differ *and* the app is never allowed to fall back to this
+    /// one. It exists for the walks that are nobody's file tree — a dependency package's
+    /// sources under *External Libraries*, a scratch directory — where the conservative answer
+    /// is the right one and there is no user setting to consult.
+    pub const CONSERVATIVE: Self = Self {
+        hidden: false,
+        ignored: false,
+    };
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Self::CONSERVATIVE
+    }
+}
+
 /// Ignore rules, reusable from any thread.
 #[derive(Debug)]
 pub struct Filter {
@@ -48,9 +129,12 @@ pub struct Filter {
     excludes: HashMap<PathBuf, Gitignore>,
     /// `core.excludesFile` / `$XDG_CONFIG_HOME/git/ignore`.
     global: Gitignore,
-    /// Explicitly watched paths under a git directory, which the dotfile rule would
+    /// Explicitly watched paths under a git directory, which the `.git` rule would
     /// otherwise reject.
     git_paths: Vec<PathBuf>,
+    /// Which populations the tree shows. Read by [`Filter::admits`] and by nothing else —
+    /// [`Filter::watchable`] deliberately does not consult `ignored`.
+    visibility: Visibility,
 }
 
 impl Filter {
@@ -59,7 +143,17 @@ impl Filter {
     /// `dirs` is read for `.gitignore` files with one `stat` each. That is a few thousand
     /// syscalls on a large tree, done once, off the walk's critical path — cheap next to
     /// re-deriving the rules per event, which is the alternative.
-    pub fn build<'a>(roots: &[PathBuf], dirs: impl IntoIterator<Item = &'a Path>) -> Self {
+    ///
+    /// `visibility` must be the same value the walk that produced `dirs` was given. It is a
+    /// parameter rather than a default so that the one caller who knows — the app, holding the
+    /// user's settings — has to say, and so that a caller who does not know cannot silently
+    /// disagree with its own walk: a `Filter` that hides what the walk showed deletes those
+    /// rows again on the first watcher burst that rescans their directory.
+    pub fn build<'a>(
+        roots: &[PathBuf],
+        dirs: impl IntoIterator<Item = &'a Path>,
+        visibility: Visibility,
+    ) -> Self {
         let (global, err) = Gitignore::global();
         if let Some(err) = err {
             tracing::debug!(%err, "global gitignore was read with complaints");
@@ -115,7 +209,13 @@ impl Filter {
             excludes,
             global,
             git_paths,
+            visibility,
         }
+    }
+
+    /// What this filter was built to show.
+    pub fn visibility(&self) -> Visibility {
+        self.visibility
     }
 
     /// The git metadata paths worth an explicit watch.
@@ -135,31 +235,82 @@ impl Filter {
     /// as `build/` matches a directory only — and the alternative is dropping deletions,
     /// which is worse than occasionally reporting one that was ignored.
     pub fn admits(&self, path: &Path, is_dir: bool) -> bool {
+        match self.classify(path) {
+            Verdict::Refused => false,
+            Verdict::Always => true,
+            // The whole of what *show ignored files* does on this side of the crate: the
+            // gitignore question is still asked — `is_ignored` below is what paints the rows
+            // olive and what keeps them out of the watcher — it just stops being a veto.
+            Verdict::Ask => self.visibility.ignored || !self.is_ignored(path, is_dir),
+        }
+    }
+
+    /// Whether the **watcher** should watch this directory, or report this path.
+    ///
+    /// [`Filter::admits`] and one extra rule: an ignored path is never watched. See the module
+    /// note for the trade — descriptors and a build's worth of events against a subtree that
+    /// updates on the next index rather than live.
+    pub fn watchable(&self, path: &Path, is_dir: bool) -> bool {
+        match self.classify(path) {
+            Verdict::Refused => false,
+            Verdict::Always => true,
+            Verdict::Ask => !self.is_ignored(path, is_dir),
+        }
+    }
+
+    /// The part of the decision [`Visibility`] has no say in.
+    fn classify(&self, path: &Path) -> Verdict {
+        // The five watched paths under a git directory. First, because the `.git` rule below
+        // would refuse every one of them.
         if self.is_git_path(path) {
-            return true;
+            return Verdict::Always;
         }
         let Some(root) = self.root_of(path) else {
-            return false;
+            return Verdict::Refused;
         };
         if path == root {
-            return true;
+            return Verdict::Always;
         }
-        // `WalkBuilder::hidden(true)`: any dot-prefixed component takes the whole path out.
-        if let Ok(rel) = path.strip_prefix(root)
-            && rel.components().any(is_hidden_component)
-        {
-            return false;
+        if let Ok(rel) = path.strip_prefix(root) {
+            for component in rel.components() {
+                let Component::Normal(name) = component else {
+                    continue;
+                };
+                // `.git` whatever the setting says — see `Visibility`. Checked per component
+                // rather than on the last one so that `…/.git/objects/ab/cd` is refused too.
+                if name == GIT_DIR {
+                    return Verdict::Refused;
+                }
+                // `WalkBuilder::hidden(true)`: any dot-prefixed component takes the whole path
+                // out. A *component*, not the file name: a file inside `.claude/` is hidden
+                // even though its own name is ordinary, which is what the walk does and
+                // therefore what the watcher has to do.
+                if !self.visibility.hidden && name.as_encoded_bytes().first() == Some(&b'.') {
+                    return Verdict::Refused;
+                }
+            }
         }
+        Verdict::Ask
+    }
 
+    /// Whether the ignore rules cover this path, with no regard for whether it is *shown*.
+    ///
+    /// Separate from [`Filter::admits`] because with *show ignored files* on, the tree needs
+    /// the paths and the watcher needs the verdict about them, and one function cannot answer
+    /// both.
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         // Deepest first — a `.gitignore` nearer the file wins, including when it whitelists
         // something a shallower one ignored. `matched_path_or_any_parents` also applies the
         // rule that nothing inside an ignored directory can be brought back.
+        let Some(root) = self.root_of(path) else {
+            return false;
+        };
         let mut dir = path.parent();
         while let Some(d) = dir {
             if let Some(gi) = self.per_dir.get(d) {
                 match matched_under(gi, path, is_dir) {
-                    Match::Ignore(_) => return false,
-                    Match::Whitelist(_) => return true,
+                    Match::Ignore(_) => return true,
+                    Match::Whitelist(_) => return false,
                     Match::None => {}
                 }
             }
@@ -171,8 +322,8 @@ impl Filter {
 
         if let Some(gi) = self.excludes.get(root) {
             match matched_under(gi, path, is_dir) {
-                Match::Ignore(_) => return false,
-                Match::Whitelist(_) => return true,
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
                 Match::None => {}
             }
         }
@@ -183,10 +334,12 @@ impl Filter {
         // project that is not below the cwd. The cost is that a global rule naming a
         // directory does not propagate to that directory's contents, which for the `*.swp`
         // and `.DS_Store` a global ignore file actually contains is no cost at all.
-        !self.global.matched(path, is_dir).is_ignore()
+        self.global.matched(path, is_dir).is_ignore()
     }
 
     /// The root this path belongs to, longest first so a nested root wins.
+    ///
+    /// `None` means "outside every root", which both public answers treat as a refusal.
     fn root_of(&self, path: &Path) -> Option<&PathBuf> {
         self.roots
             .iter()
@@ -218,11 +371,17 @@ fn matched_under<'a>(
     gi.matched_path_or_any_parents(path, is_dir)
 }
 
-fn is_hidden_component(c: Component<'_>) -> bool {
-    match c {
-        Component::Normal(name) => name.as_encoded_bytes().first() == Some(&b'.'),
-        _ => false,
-    }
+/// What the visibility-independent half of the decision concluded.
+///
+/// An enum rather than two `bool`s so the two public answers cannot drift: both match on all
+/// three arms, and the compiler names the omission if a fourth is ever added.
+enum Verdict {
+    /// Outside every root, under `.git`, or hidden with `hidden` off. Nobody shows it.
+    Refused,
+    /// A root itself, or one of the watched git paths. Nobody may filter it out.
+    Always,
+    /// An ordinary path: the ignore rules and [`Visibility::ignored`] decide.
+    Ask,
 }
 
 /// The real git directory for a root, or `None` when the root is not in a repository.
@@ -263,7 +422,7 @@ mod tests {
         std::fs::write(dir.join("src/main.rs"), "").unwrap();
 
         let roots = vec![dir.to_path_buf()];
-        let filter = Filter::build(&roots, vec![dir.path()]);
+        let filter = Filter::build(&roots, vec![dir.path()], Visibility::CONSERVATIVE);
 
         assert!(filter.admits(&dir.join("src/main.rs"), false));
         assert!(!filter.admits(&dir.join("target"), true));
@@ -280,7 +439,11 @@ mod tests {
         std::fs::write(dir.join("web/.gitignore"), "!dist/\n").unwrap();
 
         let roots = vec![dir.to_path_buf()];
-        let filter = Filter::build(&roots, vec![dir.path(), &dir.join("web")]);
+        let filter = Filter::build(
+            &roots,
+            vec![dir.path(), &dir.join("web")],
+            Visibility::CONSERVATIVE,
+        );
 
         assert!(!filter.admits(&dir.join("dist"), true));
         assert!(filter.admits(&dir.join("web/dist"), true));
@@ -292,7 +455,11 @@ mod tests {
         std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
 
-        let filter = Filter::build(&[dir.to_path_buf()], vec![dir.path()]);
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            vec![dir.path()],
+            Visibility::CONSERVATIVE,
+        );
 
         assert!(!filter.admits(&dir.join(".env"), false));
         assert!(!filter.admits(&dir.join(".git/objects/ab/cd"), false));
@@ -301,11 +468,86 @@ mod tests {
         assert!(filter.is_git_path(&dir.join(".git/refs/heads/main")));
     }
 
+    /// The reported bug: `.claude` could not be shown at all.
+    #[test]
+    fn showing_hidden_files_uncovers_dotfiles_but_never_the_git_directory() {
+        let dir = scratch("filter-show-hidden");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects/ab")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let filter = Filter::build(
+            &[dir.to_path_buf()],
+            vec![dir.path()],
+            Visibility {
+                hidden: true,
+                ignored: false,
+            },
+        );
+
+        assert!(filter.admits(&dir.join(".claude"), true));
+        assert!(
+            filter.admits(&dir.join(".claude/settings.json"), false),
+            "a file inside a dot directory too — the rule is per component, and one that only \
+             looked at the file's own name would show the directory and none of its contents"
+        );
+        assert!(
+            filter.watchable(&dir.join(".claude/settings.json"), false),
+            "and it is watched, because it is not ignored: hidden and ignored are separate axes"
+        );
+        assert!(
+            !filter.admits(&dir.join(".git/objects/ab/cd"), false),
+            "`.git` stays out whatever the setting says — see `Visibility`"
+        );
+        assert!(
+            filter.admits(&dir.join(".git/HEAD"), false),
+            "except the five watched paths, which are what tell the tree a commit happened"
+        );
+    }
+
+    /// The other half, and the expensive one: `target/` shown, and still not watched.
+    #[test]
+    fn showing_ignored_files_admits_them_and_the_watcher_still_refuses_them() {
+        let dir = scratch("filter-show-ignored");
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n*.log\n!keep.log\n").unwrap();
+
+        let shown = Visibility {
+            hidden: true,
+            ignored: true,
+        };
+        let filter = Filter::build(&[dir.to_path_buf()], vec![dir.path()], shown);
+
+        assert!(filter.admits(&dir.join("target"), true));
+        assert!(filter.admits(&dir.join("target/debug/x.o"), false));
+        assert!(filter.admits(&dir.join("noise.log"), false));
+        assert!(filter.admits(&dir.join("src/main.rs"), false));
+
+        assert!(
+            !filter.watchable(&dir.join("target"), true),
+            "the row exists and the watch does not: one inotify descriptor per directory under \
+             `target/` is the ENOSPC this crate was written to avoid, and a cargo build would \
+             then deliver one event per object file"
+        );
+        assert!(!filter.watchable(&dir.join("target/debug/x.o"), false));
+        assert!(!filter.watchable(&dir.join("noise.log"), false));
+        assert!(
+            filter.watchable(&dir.join("src/main.rs"), false),
+            "everything that is not ignored is watched exactly as before"
+        );
+        assert!(
+            filter.watchable(&dir.join("keep.log"), false),
+            "including a whitelisted path inside an ignored glob"
+        );
+        assert_eq!(filter.visibility(), shown);
+    }
+
     #[test]
     fn a_path_outside_every_root_is_rejected() {
         let dir = scratch("filter-outside");
         std::fs::create_dir_all(&dir).unwrap();
-        let filter = Filter::build(&[dir.join("project")], vec![]);
+        let filter = Filter::build(&[dir.join("project")], vec![], Visibility::CONSERVATIVE);
         assert!(!filter.admits(&dir.join("elsewhere/file.rs"), false));
     }
 
@@ -320,7 +562,7 @@ mod tests {
         std::fs::write(root.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();
 
         assert_eq!(git_dir(&root).as_deref(), Some(real.as_path()));
-        let filter = Filter::build(&[root], vec![]);
+        let filter = Filter::build(&[root], vec![], Visibility::CONSERVATIVE);
         assert!(filter.git_paths().contains(&real.join("HEAD")));
     }
 }
