@@ -9,4 +9,4 @@
  * and every one of those call sites silently wrong; widening the enum makes the compiler and
  * `check-groups.mjs` name each one.
  */
-export type TreeRowKind = "dir" | "file" | "group" | "note";
+export type TreeRowKind = "dir" | "file" | "group" | "note" | "pin";

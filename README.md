@@ -448,8 +448,11 @@ observed failing. It wants a Mac and one change, not a Linux guess in two halves
 
 ### Finding `claude` from a Finder-launched `.app`
 
-Two problems that compound, neither of which has a compile or test signal, and together they are
-the likeliest way a Mac user concludes cide is broken.
+Three problems that compound, none of which has a compile or test signal, and together they are
+the likeliest way a Mac user concludes cide is broken. The third was reported from a Mac in M17
+and is fixed; the first two are still open, and the fix for the third is what makes fixing them
+safe. The heading is now narrower than the section — this is about every binary cide runs, not
+only `claude`.
 
 **`search_paths()` names the wrong directories for the platform.** It is `PATH` plus
 `~/.cargo/bin` and `~/go/bin` (`cide_core::toolchain`), and its own comment names precisely the
@@ -470,13 +473,103 @@ only**. A `claude` in `~/.cargo/bin` and not on `PATH` therefore passes cide's c
 fails at exec with no cide-authored explanation. That is latent on Linux today and materially
 more likely on macOS, where the two path sets diverge much further.
 
-They are recorded together because **fixing either one alone makes things worse**: adding
-`/opt/homebrew/bin` to `search_paths` without closing the exec gap converts a clear refusal with
-a remedy in it into an opaque `ENOENT` from portable-pty. The honest fix is one change — let the
-spawn use the resolved absolute path *when, and only when, the bare name is not on `PATH`*, so
-the self-update property that makes a bare name right in the common case is kept — plus the macOS
-directories. It touches the most load-bearing spawn in the app and wants the platform in front of
-it.
+**And there is a third, one level deeper than either, which is the one a user actually reported.**
+The two above are about *finding* a binary. This one is about the binary cide **did** find:
+
+> *"goto in golang project not working on macos (but works on linux), it just prints: gopls no
+> views, rust-analyzer also not working, it writes: the language server stopped"*
+
+Discovery worked. `search_paths()` has `~/go/bin` on it, `which("gopls")` returned a path, and
+`cide_lsp::discover`'s *not on PATH, install it with…* sentence was never produced — which is why
+the report names two runtime failures rather than a missing server. cide then spawned `gopls` and
+handed it **cide's own environment, `PATH` included**, because `child_env`'s bundle scrub only
+ever *removes* variables; nothing in the workspace set `PATH` on a child. For a Finder-launched
+`.app` that `PATH` is launchd's four directories, so the language server cide had successfully
+started could not exec `go`. A `gopls` with no usable `go` builds no workspace view and answers
+the JSON-RPC error `no views` to every request over that session; a `~/.cargo/bin/rust-analyzer`
+installed by rustup is a *proxy* that re-execs through `rustup`, and with no toolchain reachable
+it exits. Both strings the user quoted are cide's own, from
+`crates/cide-app/src/lsp.rs`'s `format!("{}: {error}", server.binary())` over
+`cide_lsp::RequestError::Failed` (which carries the server's own message verbatim) and
+`::ServerGone` (whose `Display` is literally *the language server stopped*).
+
+None of this is macOS-only — it is guaranteed there. A Linux cide started from a `.desktop`
+launcher or an AppImage hands its children the same too-short `PATH`, for the same reason
+`search_paths()`'s own comment already names.
+
+**The fix, taken in M17, is one rule: the directories cide searches to *find* a binary and the
+directories it gives that binary's process to search are the same directories.**
+`cide_core::toolchain::extra_dirs()` is that one list. `search_paths()` reads it (so `which`
+searches it) and `child_path_from()` **appends** it to whatever `PATH` a child would otherwise
+inherit; `child_env::prepare_command` — renamed from `scrub_command`, because a function called
+*scrub* that adds a variable is a comment waiting to go stale — applies both passes at the single
+chokepoint every `std::process` spawn already goes through, and `cmd::session::base_env` does the
+same for the PTY lane. On macOS `extra_dirs()` also parses `/etc/paths` and `/etc/paths.d/*`
+itself, since that is the mechanism `path_helper(8)` implements and the Go pkg installer writes
+`/etc/paths.d/go`; Homebrew deliberately does *not* write there, so `/opt/homebrew/bin` and
+friends are a hardcoded floor under the parsed list.
+
+Two deliberate choices, both of which can be got wrong later:
+
+* **Append, never prepend.** Putting `/opt/homebrew/bin` ahead of `/usr/bin` changes which `git`,
+  `python3` and `openssl` every child of cide resolves, on a machine where the user's own shell
+  may order them the other way. The reported failure is a directory being *absent*, not shadowed.
+* **No existence filter**, for the same reason `search_paths()` has none: filtering would let the
+  two lists diverge again, and the test `the_path_a_child_searches_is_the_path_which_searched`
+  in `cide-core::toolchain` is what keeps them from doing so.
+
+That test is also what makes the *first* problem above safe to fix at all. Widening
+`search_paths()` widens `claude_cli::resolve`'s acceptance, and the paragraph this replaces was
+right that doing it alone converts a clear refusal into an opaque `ENOENT`. **The exec gap is
+closed by the same change rather than by a second one:** the bare name is kept in every case — so
+the CLI's self-update property is never lost — because the child's `PATH` now *contains* the
+directories `search_paths()` searched, and portable-pty resolves a bare program against the
+builder's `PATH` (`cmdbuilder.rs`) exactly as `std::process` swaps `environ` before `execvp`. Two
+lists that had to agree became one list.
+
+**What is verified, on Linux.** The pure path building has unit tests, including the one that
+holds the two lists together. The macOS list itself is built and asserted from here —
+`extra_dirs_in()` takes its `HOME` and its `/etc` as arguments precisely so that the half of this
+feature no machine in CI can run is still exercised
+(`the_macos_list_is_path_helper_then_the_hardcoded_floor_with_no_repeats`): the order of the four
+sources, and that a directory arriving from both `/etc/paths` and the hardcoded floor is listed
+once. That the names in that floor are *the right names* is not something a Linux test can say.
+The link that had only been read out of `std`'s source — that a
+`PATH` set on a `Command` is the `PATH` a **bare** program name resolves against — is now
+executed by `a_path_set_on_a_command_is_the_path_a_bare_program_name_is_resolved_on`, which
+spawns a bare name that fails on launchd's four directories and succeeds once the directory
+holding it is appended. The portable-pty half of the same claim (`cmdbuilder.rs` resolves a bare
+program against the builder's `PATH`) is still source-read only.
+
+**What is not verified.** No Mac was in front of any of this. That launchd hands a Finder-launched
+`.app` those four directories is taken from Apple's documentation, not observed; the hardcoded
+macOS directory names and the `/etc/paths.d` layout are reasoned from Homebrew's, MacPorts' and
+Go's installers, not observed; and that `gopls` answers exactly `no views` when it cannot exec
+`go` is inferred from its view model plus the user's verbatim report. Getting a name wrong is
+cheap (append-only, one failed `stat`); getting the list *short* is the real risk. **Why
+rust-analyzer stopped on that machine is still unknown** — `ServerGone` is reported both for
+"never started" and for "died", so the string does not discriminate, and the sentence that would
+say is the one `cide_lsp::server::start_failure_reason` writes into the log. The fix is necessary
+for it (the rustup proxy shells out) and cannot be called sufficient from here.
+
+Two gaps this leaves standing, recorded rather than quietly fixed:
+
+* The shell pane still opens `/bin/bash -l` (see the Platforms list above), which never reads
+  `~/.zshrc`. A user whose `PATH` exists only inside `eval "$(brew shellenv)"` now gets those
+  directories in cide's *children* and still not in their own shell pane.
+* `search_paths()` reads the **unscrubbed** process `PATH` while a child gets the scrubbed one, so
+  under an AppImage `which()` can in principle see a binary in `$APPDIR/usr/bin` that no child
+  can. Harmless today because that directory holds only cide's own binaries, and left alone
+  because closing it means teaching discovery about the bundle.
+
+The option not taken was probing the user's login shell for its `PATH`, as VS Code does. It is
+strictly more accurate — it is the only way to learn a `PATH` that exists solely inside a
+`~/.zshrc` — and it loses on two counts that are not close: `cide_core::toolchain` opens by
+stating that nothing in it spawns a process, and `$SHELL -ilc 'echo $PATH'` runs the user's
+interactive rc, which can block on a prompt, an ssh-agent unlock or a slow network mount. VS Code
+carries a timeout, a cancel path and a user-facing *resolving shell environment failed* dialog
+because that hangs in the field. It is the principled next step if a report names a directory the
+static list cannot reach, and it should arrive with a timeout and a log line rather than silently.
 
 ### Packaging, and the half that money buys
 
@@ -818,7 +911,12 @@ one run to confirm the caret changed no measured dimension. The strip **clips ra
 (`.tabs` is `overflow: hidden`), so a tab past the right edge is neither painted nor hit-testable
 and cannot be a drop target; the caret clamps to the last visible boundary. That is inherited, not
 introduced — making the strip scrollable interacts with the awaiting marker's reserved box and is a
-separate change. `tab_reopen_file` resolves its plan under one lock and reinserts under another, so
+separate change. Half of it has since been answered: the strip's right end now carries a `▾` that
+lists the tabs currently out of view and activates the one picked (`chrome/tabOverflow.ts`,
+`check:tab-overflow`), so a clipped tab is **reachable** again. The rest of the sentence still
+stands — a clipped tab is still not a drop target, and activating one from that list switches the
+pane without bringing its tab back into view, because the strip still does not scroll.
+`tab_reopen_file` resolves its plan under one lock and reinserts under another, so
 a second shell window opening the same file in between can produce two tabs over one path; that is
 the same window `tab_reopen_closed` has always had. And the **bulk close stops at the first
 unanticipated refusal** rather than marching on — a file that turns dirty between the one question
@@ -991,6 +1089,13 @@ else warns. `mise`, `asdf`, `direnv` and a plain shell wrapper are all legitimat
 paid for the opposite arrangement once, with `~/.cargo/bin/rust-analyzer`, which is a symlink to
 `rustup` and passes any on-PATH-and-executable probe before failing at exec.
 
+**The parenthesis in that paragraph was a half-truth until M17**, and it is worth naming because
+it is the shape of bug this whole area produces: cide accepted a `claude` in `~/.cargo/bin` that
+was not on `PATH`, then passed the bare name to a spawn whose child searched `PATH` only, and the
+check and the exec disagreed. `base_env` now appends `toolchain::extra_dirs()` to the child's
+`PATH`, so the two consult the same list and the bare name is kept in every case. See *Finding
+`claude` from a Finder-launched `.app`* under Platforms.
+
 The verdict is unlatched and per-binary, which is a change: `version::check_once` describes whichever
 binary was probed first in the process, which was free while `claude` was a constant and became a lie
 the moment it was a setting — a user who fixes a typo would read back the verdict for the binary that
@@ -1087,6 +1192,68 @@ the setting is the better answer and is a change to the resume path, not to this
 no way to spell *remove* in the environment editor, deliberately: a removal control would let a user
 delete the `ANTHROPIC_API_KEY` their own login environment carries, which is the only credential some
 Console customers have.
+
+### The arguments cide adds are switchable, and renameable (M17)
+
+**Settings → Claude sessions → *What cide adds to the command line* has one row per argument cide
+injects** — the session id, the resume, the fork flag and the hook settings — each with a switch and
+a spelling. It exists because a pane is the obvious place to drive a different harness (`opencode`,
+or a wrapper around Claude Code) and cide always added `--session-id` and `--settings` regardless of
+the configured binary: `program_is_claude` answers from what the *frontend* asked for, which is the
+bare string `claude` for every Claude pane however the binary is set, and that ordering is correct
+for the reason above and is not going to change.
+
+**Defaults preserve today's behaviour exactly**, and that is the one property with no runtime symptom
+if it breaks. `bool::default()` is `false` and `ClaudeCli` carries `#[serde(default)]`, so a
+*derived* `Default` on `ClaudeInjection` would load every `workspace.json` already on disk with all
+four injections off — no hooks and no resume, for every user, on the launch after an upgrade, from a
+screen they never opened, with the pane starting perfectly well and simply reporting nothing. The
+`Default` is written by hand with that paragraph beside it, and pinned from three sides:
+`cide-ipc`'s old-JSON round-trip test, `cide-core`'s `the_default_injects_exactly_what_this_build_injected_before_the_switch_existed`,
+and `check-claude-cli.mjs`, which reads the `impl` out of the Rust.
+
+**What each switch costs is stated on its own row**, not in a note at the foot of the section, because
+every one of them silently disables a feature that gets reported later as something else:
+
+| off | what stops |
+| --- | --- |
+| `--session-id` | no transcript is filed under the id the pane is saved with: **resume stops working**, and the Resume button over a dead pane goes away. *Not* the status bar — token figures and busy/idle chrome ride on the hooks and on `CIDE_SESSION`, which cide sets separately |
+| `--resume` | every restored pane starts fresh; cide stops *offering* resume rather than offering a button that quietly starts a new session (`plan_restore` and `session_resumable` both read the switch) |
+| `--fork-session` | *Split → fork* continues the conversation instead of branching it |
+| `--settings` | **no hooks at all**: no token or cost figures, a close confirm that cannot tell busy from idle, buffers reloading on a poll instead of on a tool write, no finished-turn notification — and no `theme`, so Claude Code draws itself dark inside a light pane |
+
+**The refusal table and the injection table are one fact.** `REFUSED_ARGS` refuses `--session-id`,
+`--resume`, `--fork-session`, `--settings` and `--continue` *because cide passes them*; stop passing
+one and the refusal has to lift, or the screen disables a feature and then forbids the replacement.
+Rather than two lists, each row carries `because: Option<Injection>`, and a rename moves the refusal
+to the new spelling: rename the session id to `--sid` and `--sid` becomes refused while
+`--session-id` becomes the user's to pass. `--continue` carries `Injection::SessionId` and not a
+variant of its own — it is illegal *beside* an injected session id — while `--bare` and `--print`
+carry `None` and stay refused whatever cide adds. `every_injected_flag_is_refused_and_every_injection_refusal_is_injected`
+and `disabling_an_injection_relaxes_exactly_its_own_refusals` are the guards, and
+`check-claude-cli.mjs` compares the `because` column across the two implementations the way it
+already compares aliases and `takes_value`.
+
+**A rename is validated by two rules, both of which discard rather than reject.** It must begin with
+`-`, because `claude`'s first positional argument is a *prompt* and a bare `sid` would start every
+pane by asking the model something; and it must not be another injection's spelling, defaults
+included, because one flag written twice is the silent breakage this whole area is about. Either way
+cide falls back to its own spelling and Rust's sentence appears under the row.
+
+**The degraded argv shapes are the risk, and they are unit-tested.** `--resume <parent> --session-id
+<minted>` without `--fork-session` is rejected outright by 2.1.227 — every Resume click failing
+before a pane appears — so a fork whose fork flag is switched off falls back to the plain resume, and
+a resume whose resume flag is off degrades to a fresh session rather than emitting a lone
+`--fork-session`. **Those shapes have never been put in front of the real binary**: `tests/
+real_session_args.rs` is `#[ignore]`d and drives the shipped defaults only.
+
+**Not done.** Nothing here has been run against `opencode` or any other harness — the honest claim is
+"cide stops adding flags", not "another harness works". The headless one-shot lane keeps its own
+fixed argv (`-p --output-format json …`) and is deliberately not configurable, so *Generate commit
+message* and *Explain selection* fail against a binary that is not Claude Code whatever is set here;
+the screen says so. And no automated check forks a `claude` and reads a status bar, so "with
+`--settings` off the pane loses exactly the four named features" is argued from where the hooks are
+consumed, not observed.
 
 ## Ctrl+P can reach External Libraries (M16)
 
@@ -1770,6 +1937,62 @@ the editor resolves to no row either. Nothing retargets an **open editor tab** w
 `fs_rename` and Cut+Paste have always had that gap and this does not widen it. And none of it has
 been confirmed on screen: the gesture needs a pointer, KDE will not raise a shell-launched window,
 and the Wayland compositor exposes no capture protocol.
+
+## Project Notes (M17), and what is not done
+
+**Project Notes** is one pinned row at the **top** of the file tree — above *External Libraries*
+and above *Scratches* — that opens one markdown file per project in an ordinary editor tab. Double
+click it, press Enter on it, right-click it and choose *Open*, or run *Open Project Notes*
+(`file.projectNotes`) from the palette; all four go through the one command, which is why they
+cannot come to behave in four ways.
+
+**Where the file is.** `$XDG_STATE_HOME/cide/notes/<blake3 of the project's canonical first
+root>/notes.md`, beside the scratch drawer and keyed identically — `cide_core::notes` reuses
+`cide_core::scratch::key` rather than writing a third copy of the hashing rule. Not inside the
+project, for the reasons a scratch is not, plus two that are specific to a pinned row: cide would
+be creating an untracked file in somebody's repository on a single click, and the file would be
+drawn **twice** (once as the pin, once as a walked row) or — once gitignored, since the walk is
+gitignore-aware — as the pin and never as itself. A sibling `<key>.json` records which project the
+directory belongs to. A multi-root project has **one** notes file, keyed by `roots[0]`, which is
+the identity `RecentProject` and the scratch drawer already use.
+
+**Nothing is created at project open.** The row is drawn from a constant label; the first click
+runs `fs_notes_ensure`, which creates the directory and the file. That call is idempotent and uses
+`create_new(true)`, so the second and hundredth clicks cannot truncate what the user has written —
+that is the one line in the feature that could destroy data, and `cide_core::notes` has a test
+whose only job is to prove it.
+
+**The tab is an ordinary File tab**, deliberately and with no new tab kind: save, the dirty marker,
+undo, find-in-file and the markdown grammar all work because nothing about it is special.
+`file_read` and `file_write` apply no containment check — only the dependency-cache read-only rule,
+which this path is not under — so the editor saves it.
+
+**The row is not a file, and everything that assumes a row is a path excludes it.** It is a new
+`TreeRowKind::Pin` whose `path` is the same `cide://group/<id>` sentinel a group header carries, so
+it is not absolute and `cide_fs::ops::check_within` refuses it: rename, delete, drag, drop, *Copy
+Path*, *Reveal*, the clipboard and the trash confirmation all decline it by rules that already
+existed. `rowVerbs('pin')` grants `openable` and nothing else. The fs watcher never sees it — the
+file is outside every root, so it is never walked, never watched, never a Ctrl+P or content-search
+candidate.
+
+**The write/rename asymmetry is deliberate.** The editor saves the file; the tree will not rename,
+cut or trash it, because the notes directory is **not** in `ProjectGroups::writable_dirs`. A rename
+would leave the pin pointing at nothing and the next click would create a second, empty `notes.md`
+beside the user's real notes. Adding the directory to `writable_dirs` to "make it consistent"
+re-opens that bug; the comment there says so.
+
+**Divergences and what is not done.** The notes cannot be committed or shared with a team, and a
+project that is moved or renamed gets a new key and appears to have lost its notes — the same cost
+scratches, changelists and the shelf already pay, unmitigated beyond the breadcrumb. If
+committable notes are ever wanted the honest shape is a setting with two values, not a change of
+default: `cide_core::notes::file_for` is the only thing that decides the path. There is no default
+binding (the palette and `keymap.json` are one step away), no garbage collection, and no watcher —
+an edit made by another program is noticed by the editor's own conflict machinery on the next tab
+activation, not by the tree. **And none of it has been confirmed on screen.** The coverage is
+`cide_core::notes`, `cide_fs::groups`, `cide_app::notes` and `check:notes`; no check script can
+mount CodeMirror, so that the tab really highlights markdown and that the row really draws the
+markdown glyph above *External Libraries* are claims only a manual `./run.sh` can settle, and
+neither audit covers this feature.
 
 ## Scratch files and Select opened file (M13), and what is not done
 

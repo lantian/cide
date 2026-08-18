@@ -15,6 +15,7 @@ pub mod ide;
 pub mod libraries;
 pub mod lifecycle;
 pub mod lsp;
+pub mod notes;
 pub mod positions_state;
 pub mod scratches;
 // Comment stripping for this crate's structural source assertions. Test-only: a source
@@ -382,6 +383,7 @@ pub fn run() {
             cmd::fs::fs_create,
             cmd::fs::fs_create_in,
             cmd::fs::fs_scratch_new,
+            cmd::fs::fs_notes_ensure,
             cmd::fs::fs_writable_roots,
             cmd::fs::fs_reveal_roots,
             cmd::fs::fs_rename,

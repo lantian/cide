@@ -38,6 +38,13 @@
 //! A group that is *ready before it is expanded* — a directory listing, say — simply calls
 //! [`Groups::fulfil`] at [`Groups::show`] time and never sees `Resolve`.
 //!
+//! 4. A group that is a **pin** — one row that *opens* instead of expanding — is [`Groups::pin`]
+//!    instead of [`Groups::show`], and that is the whole of it. It has no children, no state
+//!    machine and no twisty; it draws as [`TreeRowKind::Pin`], it sorts above every header
+//!    whatever order the two calls happened to run in, and the file it stands for is the
+//!    caller's business entirely — this module never learns what it is. *Project Notes* is the
+//!    first one.
+//!
 //! # What this deliberately does not do
 //!
 //! No watching, no indexing, no ignore rules, no `Filter`, no incremental `apply`, no deletion
@@ -203,6 +210,20 @@ struct Group {
     state: GroupState,
     expanded: bool,
     children: Vec<Node>,
+    /// A **pin**: one row that opens rather than expanding. See [`Groups::pin`].
+    ///
+    /// `state`, `children` and `expanded` are inert for one — it has no contents to resolve and
+    /// nothing to unfold — which is why [`Groups::fulfil`], [`Groups::start`] and
+    /// [`Groups::invalidate`] carry a `debug_assert!` rather than a branch: calling any of them
+    /// on a pinned id is a caller bug, and the cheapest place to say so is the call itself.
+    ///
+    /// A field rather than a second `pins: Vec<Pin>` beside `groups`, which was the cleaner type
+    /// and the worse change: a separate vector forces a `pins.len()` base offset into `count`,
+    /// `rows`, `match_rows`, `row_of_group` and `position_of` — five edits to the most delicate
+    /// arithmetic in this crate — where this costs one field and three branches, because every
+    /// one of those walks already guards its children loop on `expanded` and a pin is never
+    /// expanded.
+    pin: bool,
 }
 
 /// Every synthetic group of one project, in draw order.
@@ -232,7 +253,45 @@ impl Groups {
             state: GroupState::Unresolved,
             expanded: false,
             children: Vec::new(),
+            pin: false,
         });
+    }
+
+    /// Draw a **pinned** row with this id, or do nothing if it is already there.
+    ///
+    /// A pin is a top-level row that *opens* instead of expanding: no twisty, no children, no
+    /// resolution, [`TreeRowKind::Pin`]. It carries the same `cide://group/<id>` sentinel a
+    /// header does, so every containment check in `cmd::fs` refuses it by the rule it already
+    /// applies and `reveal`/`kind_of`/`match_rows` address it exactly as they address a header.
+    ///
+    /// **Inserted above every non-pinned group**, not appended. Draw order must not depend on
+    /// which caller happened to run first, and it otherwise would: `ProjectGroups::new_scratch`
+    /// calls [`Groups::show`] and can run before `prepare` has ever run for that project — a
+    /// window whose sidebar was never opened, then ⇧⌥S — which would leave *Project Notes*
+    /// underneath *Scratches* in that window and above it in every other. Pins keep their own
+    /// relative order, so a second pin lands under the first.
+    ///
+    /// Idempotent, for the reason [`Groups::show`] is: two windows racing the first tree read
+    /// must draw one row between them.
+    pub fn pin(&mut self, id: &str, label: &str) {
+        if self.groups.iter().any(|g| g.id == id) {
+            return;
+        }
+        let at = self.groups.iter().take_while(|g| g.pin).count();
+        self.groups.insert(
+            at,
+            Group {
+                id: id.to_string(),
+                label: label.to_string(),
+                detail: None,
+                // Inert for a pin, and set to the state that means "nobody will ask": `expand`
+                // must never answer `Resolve` for a row with nothing to resolve.
+                state: GroupState::Ready,
+                expanded: false,
+                children: Vec::new(),
+                pin: true,
+            },
+        );
     }
 
     pub fn state(&self, id: &str) -> Option<GroupState> {
@@ -247,6 +306,7 @@ impl Groups {
         let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
             return false;
         };
+        debug_assert!(!group.pin, "a pin has no contents to resolve");
         group.state = GroupState::Resolving;
         group.children = vec![Node::from_entry(placeholder)];
         true
@@ -262,6 +322,7 @@ impl Groups {
         let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
             return false;
         };
+        debug_assert!(!group.pin, "a pin has no rows to install");
         group.children = rows.into_iter().map(Node::from_entry).collect();
         group.detail = detail;
         group.state = GroupState::Ready;
@@ -281,6 +342,7 @@ impl Groups {
     /// and the next expand will ask.
     pub fn invalidate(&mut self, id: &str) -> Option<Expanded> {
         let group = self.groups.iter_mut().find(|g| g.id == id)?;
+        debug_assert!(!group.pin, "a pin has no answer that could go stale");
         group.children = Vec::new();
         if group.expanded {
             group.state = GroupState::Resolving;
@@ -323,12 +385,23 @@ impl Groups {
                 out.push(TreeRow {
                     path: group_path(&group.id),
                     name: group.label.clone(),
+                    // Depth 0 for a pin too: it sits at the same indentation as a header and as
+                    // a top-level file, because it is a top-level thing.
                     depth: 0,
-                    kind: TreeRowKind::Group,
+                    kind: if group.pin {
+                        TreeRowKind::Pin
+                    } else {
+                        TreeRowKind::Group
+                    },
+                    // A pin is never expanded — `expand` refuses to mark one — so this is
+                    // always false for it, and reading the field rather than hard-coding it
+                    // keeps the two facts from being stated in two places.
                     expanded: group.expanded,
-                    // Always, even before it has been resolved: a header with no twisty is a
-                    // header nobody can open, and opening it is what starts the resolution.
-                    has_children: true,
+                    // Always for a header, even before it has been resolved: a header with no
+                    // twisty is a header nobody can open, and opening it is what starts the
+                    // resolution. **Never** for a pin: it has nothing under it, and a twisty on
+                    // a row whose click opens a tab is a control that does nothing.
+                    has_children: !group.pin,
                     symlink: false,
                     root: NO_ROOT,
                     detail: group.detail.clone(),
@@ -389,6 +462,21 @@ impl Groups {
     pub fn expand(&mut self, path: &Path) -> Option<Expanded> {
         if let Some(id) = group_id_of(path) {
             let group = self.groups.iter_mut().find(|g| g.id == id)?;
+            if group.pin {
+                /*
+                 * A pin answers "there is nothing to do" **without** being marked expanded.
+                 *
+                 * Unreachable through the UI — `rowVerbs('pin').expandable` is false, so
+                 * `treeStore.toggle` and ArrowRight never call `fs_expand` for one — but
+                 * `treeStore.revealGroup` calls it unconditionally after a reveal, and any
+                 * future caller might. A pin marked `expanded` would make `count()` and
+                 * `position_of()` (which add 1 for an unexpanded group and then walk its
+                 * children) still agree, while `rows()` drew a twisty in the open state on a row
+                 * with nothing under it: a control the user can click that folds nothing.
+                 * Refusing the state is cheaper than making every walk tolerate it.
+                 */
+                return Some(Expanded::Ready);
+            }
             group.expanded = true;
             if group.state == GroupState::Unresolved {
                 // Moved *before* the answer is returned, so two windows expanding the same
@@ -489,11 +577,16 @@ impl Groups {
     /// `Index::kind_of` exists to avoid.
     pub fn kind_of(&self, path: &Path) -> Option<TreeRowKind> {
         if let Some(id) = group_id_of(path) {
-            return self
-                .groups
-                .iter()
-                .any(|g| g.id == id)
-                .then_some(TreeRowKind::Group);
+            // The sentinel scheme is shared by headers and pins, so the answer comes off the
+            // group rather than off the path: a caller that asked "what is at this sentinel"
+            // and got `Group` for a pin would offer a twisty on a row that opens a tab.
+            return self.groups.iter().find(|g| g.id == id).map(|g| {
+                if g.pin {
+                    TreeRowKind::Pin
+                } else {
+                    TreeRowKind::Group
+                }
+            });
         }
         self.node(path).map(Node::kind)
     }
@@ -850,6 +943,92 @@ mod tests {
         let mut groups = shown();
         groups.show(ID, "External Libraries");
         assert_eq!(groups.count(), 1);
+    }
+
+    const PIN: &str = "projectNotes";
+
+    /// A pin is one row that opens: no twisty, never expanded, `Pin` and not `Group`.
+    #[test]
+    fn a_pin_is_one_row_with_no_twisty_that_is_never_expanded() {
+        let mut groups = Groups::new();
+        groups.pin(PIN, "Project Notes");
+        assert_eq!(groups.count(), 1);
+        let rows = groups.rows(0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, TreeRowKind::Pin);
+        assert_eq!(rows[0].name, "Project Notes");
+        assert_eq!(rows[0].depth, 0, "a pin is a top-level row, like a header");
+        assert_eq!(rows[0].path, group_path(PIN));
+        assert!(
+            !rows[0].has_children,
+            "a twisty on a row whose click opens a tab is a control that does nothing"
+        );
+        assert!(!rows[0].expanded);
+        assert_eq!(groups.kind_of(&group_path(PIN)), Some(TreeRowKind::Pin));
+        assert_eq!(groups.kind_of(&group_path("nothing")), None);
+
+        groups.pin(PIN, "Project Notes");
+        assert_eq!(groups.count(), 1, "pinning twice draws one row");
+    }
+
+    /// The order rule: a pin sits above every header whichever call ran first.
+    #[test]
+    fn a_pin_draws_above_every_header_whatever_order_the_calls_came_in() {
+        let mut first = Groups::new();
+        first.pin(PIN, "Project Notes");
+        first.show(ID, "External Libraries");
+        first.show("scratches", "Scratches");
+        assert_eq!(
+            names(&first),
+            ["Project Notes", "External Libraries", "Scratches"]
+        );
+
+        // The order `new_scratch` can produce: a window that made a scratch before its sidebar
+        // was ever opened has shown a header before anything pinned anything.
+        let mut later = Groups::new();
+        later.show("scratches", "Scratches");
+        later.show(ID, "External Libraries");
+        later.pin(PIN, "Project Notes");
+        assert_eq!(
+            names(&later),
+            ["Project Notes", "Scratches", "External Libraries"],
+            "draw order must not depend on which caller ran first"
+        );
+    }
+
+    /// `expand` on a pin cannot make it expanded, so no walk can disagree about its row count.
+    #[test]
+    fn expanding_a_pin_changes_nothing_at_all() {
+        let mut groups = Groups::new();
+        groups.pin(PIN, "Project Notes");
+        groups.show(ID, "External Libraries");
+        let before = groups.count();
+
+        assert_eq!(groups.expand(&group_path(PIN)), Some(Expanded::Ready));
+        assert_eq!(groups.count(), before, "a pin has nothing to unfold");
+        assert!(!groups.rows(0, 10)[0].expanded);
+        assert_eq!(
+            groups.rows(0, 10)[1].name,
+            "External Libraries",
+            "and the row under it did not move"
+        );
+        groups.collapse(&group_path(PIN));
+        assert_eq!(groups.count(), before);
+    }
+
+    /// Addressing: `reveal` and speed search find a pin exactly as they find a header.
+    #[test]
+    fn a_pin_is_revealed_by_its_sentinel_and_found_by_its_label() {
+        let mut groups = Groups::new();
+        groups.pin(PIN, "Project Notes");
+        groups.show(ID, "External Libraries");
+        assert_eq!(groups.reveal(&group_path(PIN)), Some(0));
+        assert_eq!(groups.reveal(&group_path(ID)), Some(1));
+
+        let needle = crate::speed::Needle::new("notes").expect("needle");
+        let (hits, _) = groups.match_rows(&needle, 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row, 0, "speed search lands on the pin's own row");
     }
 
     /// The handover contract: the first expand asks for a resolution, and only the first.

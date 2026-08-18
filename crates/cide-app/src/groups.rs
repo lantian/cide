@@ -66,6 +66,17 @@ pub struct ProjectGroups {
     /// touch this path" — see [`ProjectGroups::writable_dirs`] — which is asked on every
     /// mutating file command, and recomputing it is a `canonicalize` and a hash each time.
     pub(crate) scratch_dir: Mutex<Option<PathBuf>>,
+    // --- Project Notes (see `crate::notes`) --------------------------------------------
+    //
+    // **Nothing.** The pin deliberately carries no remembered path, and that absence is the
+    // design rather than an omission: `cide_core::notes::file_for` is arithmetic over the
+    // project's primary root, `cmd::fs::fs_notes_ensure` is the only caller that ever needs the
+    // answer, and it is reached once per click. A memoised `notes_file` was written here first
+    // and removed — nothing read it, so it was a second derivation of the one path the user's
+    // writing lives at, free to drift from the live one the day a project's roots change under
+    // a `prepare` that has already run. `scratch_dir` above is remembered because
+    // `writable_dirs` asks for it on every mutating file command; the notes file is
+    // deliberately not in that set, so no such caller exists.
 }
 
 impl Default for ProjectGroups {
@@ -103,14 +114,22 @@ impl ProjectGroups {
     /// at all: its first contact with the project is `fs_tree_count`, and a `file.reveal` on a
     /// restored session's tab reaches `fs_reveal` first.
     ///
-    /// **Order is draw order.** `Groups::show` appends, so *External Libraries* is asked first
-    /// and *Scratches* sits under it — IDEA's order, and the right one here for a second
-    /// reason: Scratches is the mutable group and belongs next to the user's own files at the
-    /// bottom edge of the panel.
+    /// **Order is draw order**, and it is now stated twice over. `Groups::show` appends, so
+    /// *External Libraries* is asked before *Scratches* and sits above it — IDEA's order, and
+    /// the right one here for a second reason: Scratches is the mutable group and belongs next
+    /// to the user's own files at the bottom edge of the panel.
+    ///
+    /// *Project Notes* is asked **first** and, being a pin, `Groups::pin` puts it above both
+    /// headers regardless — which is deliberate belt and braces, because the order of these
+    /// three calls is not the only thing that decides the order of the rows: `new_scratch` shows
+    /// the *Scratches* header on its own, from a window whose tree may never have been read, so
+    /// an appended pin would land under it there and above it everywhere else. Notes leads
+    /// because it is the row a user opens daily; the two below it are browsers.
     pub fn prepare(&self, roots: &[PathBuf]) {
         if self.probed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.show_notes(roots.first());
         self.probe_libraries(roots);
         self.show_scratches(roots.first());
     }
@@ -179,6 +198,20 @@ impl ProjectGroups {
     /// Empty until the scratch group has been shown, which is the first tree read. A mutation
     /// arriving before then is refused, and that is the safe direction: the only way to name a
     /// scratch path is to have been shown one.
+    ///
+    /// # *Project Notes* deliberately contributes nothing here
+    ///
+    /// Which is why `mutationRefusal` greys *Rename…*, *Cut* and *Move to Trash* on its row and
+    /// `fs_show_in_manager` refuses it — and it looks like an omission, so: the row is **pinned
+    /// to one path**. A rename would leave the pin pointing at a file that is no longer there,
+    /// and the very next click on it would create a second, empty `notes.md` beside the user's
+    /// real notes with no way back to them from the tree. Deleting on its own would be harmless
+    /// (the next click recreates it) and is not worth carrying the rename hazard for.
+    ///
+    /// The editor still saves the file, because `file_write` asks a different question — it
+    /// applies no containment check at all, only `toolchain::read_only_reason_in`, which is
+    /// about dependency caches. That asymmetry is the design; adding the notes directory here to
+    /// "make it consistent" re-opens the orphaning bug.
     pub fn writable_dirs(&self) -> Vec<PathBuf> {
         self.scratch_dir.lock().iter().cloned().collect()
     }

@@ -38,6 +38,7 @@ import { createAppWindowDriver } from '@/layout/appWindowDriver'
 import { DetachedPaneWindow } from '@/windows/DetachedPaneWindow'
 import { SplitTree } from '@/layout/SplitTree'
 import { TabContent } from '@/layout/TabContent'
+import { PROJECT_NOTES } from '@/sidebar/groupRows'
 import { Explorer } from '@/sidebar/Explorer'
 import { GitPanel } from '@/sidebar/GitPanel'
 import { SearchPanel } from '@/sidebar/SearchPanel'
@@ -956,6 +957,17 @@ export function App() {
                */
               openedFile={focusedTabPath(boot)}
               onSelectOpened={() => runCommand('file.reveal', null)}
+              /*
+               * A pinned row's open, routed through the **command** for the same reason
+               * `onSelectOpened` above is: the double-click, the palette row and any chord a
+               * user binds in `keymap.json` must not become three code paths that behave in
+               * three ways. The id is checked rather than assumed — a pin this build has never
+               * heard of (an older webview against a newer backend) does nothing rather than
+               * running a command that does not exist.
+               */
+              onOpenPin={(id) => {
+                if (id === PROJECT_NOTES) runCommand('file.projectNotes', null)
+              }}
               onOpenFile={(path) => {
                 if (!activeProjectId) return
                 // `UNKNOWN_LINE`: the Explorer names a file and not a place in it, so the

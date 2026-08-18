@@ -35,14 +35,16 @@
  */
 import { useState, type ReactNode } from 'react'
 import type { ClaudeCli, ClaudeCliSupport, ClaudeEnvVar } from '@/ipc/client'
-import { Group, Note, PathReadout, Row } from './controls'
+import { Group, Note, PathReadout, Row, Toggle } from './controls'
 import {
+  effectiveFlags,
   judgeArgs,
   judgeEnv,
   reasonFor,
   refusalSummary,
   resolvedArgvParts,
   type Fate,
+  type InjectionKey,
 } from './claudeCli'
 import styles from './ClaudeCliSection.module.css'
 
@@ -140,6 +142,17 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
         </Note>
       </Group>
 
+      <Group title="What cide adds to the command line">
+        <InjectionRows cli={cli} onChange={onChange} reasons={support?.injectReasons ?? []} />
+        <Note title="These reach claude panes only">
+          The one-shots behind Generate commit message and Explain selection keep cide’s own
+          argv — <code>-p --output-format json</code> and the rest, from{' '}
+          <code>cide_claude::headless::argv</code> — and are not configurable here, because
+          those flags are not customisation but the parse of a reply. A binary that is not
+          Claude Code will fail those two features whatever is set above.
+        </Note>
+      </Group>
+
       <Group title="What a pane is actually spawned with">
         <Argv parts={resolvedArgvParts(cli, 'fresh')} />
         {summary !== null && (
@@ -151,8 +164,10 @@ export function ClaudeCliSection({ cli, onChange, support }: ClaudeCliSectionPro
       </Group>
 
       <Note title="Applied at spawn">
-        A pane already running keeps the binary, arguments and environment it was spawned with.
-        Close and reopen it, or relaunch cide, for a change here to reach it.
+        A pane already running keeps the binary, the arguments — yours and cide’s — and the
+        environment it was spawned with. Close and reopen it, or relaunch cide, for anything on
+        this screen to reach it. A pane that was spawned with the hook settings goes on
+        reporting until it exits, and one spawned without them does not start.
       </Note>
     </>
   )
@@ -178,6 +193,163 @@ function Argv({ parts }: { parts: { text: string; ours: boolean }[] }) {
       ))}
     </pre>
   )
+}
+
+
+/**
+ * The arguments cide adds itself: one row per injection, each with what switching it off
+ * costs, stated on the row.
+ *
+ * # The copy is on the row, deliberately
+ *
+ * Every one of these silently disables a feature the user will report as broken later without
+ * connecting it to this screen — "the status bar shows no tokens", "Resume does nothing" — so
+ * a footnote at the bottom of the section would be read by nobody who needed it. The sentences
+ * are here rather than in Rust (where `RefusedArg::reason` lives) because they answer a
+ * different question: Rust's reasons answer *why can I not pass this myself*, and these answer
+ * *what do I lose by turning cide's off*. `check-claude-cli.mjs` asserts the expensive words
+ * are still present, so they cannot be tidied into vagueness.
+ *
+ * Nothing here is validated on save, like everything else on this screen: a rename that cannot
+ * be used is stored, struck through, and explained with Rust's own sentence, and the resolved
+ * argv below shows what the pane actually gets.
+ */
+function InjectionRows({
+  cli,
+  onChange,
+  reasons,
+}: {
+  cli: ClaudeCli
+  onChange: (next: ClaudeCli) => void
+  reasons: readonly { name: string; reason: string }[]
+}) {
+  const rows = effectiveFlags(cli)
+  /*
+   * Read through a default, like `claudeCli.ts`'s own `setting`, rather than indexing `cli
+   * .inject` directly. The generated type says the field is there and Rust's serde always emits
+   * it — but this component also renders from a fixture and from whatever an older window's
+   * snapshot carried, and a settings screen that throws is a screen a user cannot reach to fix
+   * the thing that broke it. The default is `enabled: true`, which is what such a configuration
+   * actually does.
+   */
+  const stored = (key: InjectionKey): { enabled: boolean; flag: string } =>
+    cli.inject?.[key] ?? { enabled: true, flag: '' }
+  const set = (key: InjectionKey, next: { enabled?: boolean; flag?: string }) => {
+    const inject = { ...cli.inject, [key]: { ...stored(key), ...next } }
+    onChange({ ...cli, inject })
+  }
+
+  return (
+    <div className={styles.injections}>
+      {rows.map((row) => {
+        const copy = INJECTION_COPY[row.key]
+        const value = stored(row.key)
+        return (
+          <div key={row.key} className={styles.injection}>
+            <div className={styles.injectionHead}>
+              <Toggle
+                label={`Pass ${row.flag}`}
+                checked={row.enabled}
+                onChange={(enabled) => set(row.key, { enabled })}
+              />
+              <input
+                /*
+                 * Keyed by content as well as by injection, for the reason the token rows
+                 * spell out at length: `defaultValue` is read once at mount, so a value that
+                 * changed underneath an uncontrolled input is a stale DOM value that the next
+                 * blur commits back over the new one.
+                 */
+                key={`${row.key}:${value.flag}`}
+                className={`${styles.input} ${styles.injectionFlag} ${
+                  row.discarded ? styles.refused : ''
+                }`}
+                type="text"
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+                aria-label={`${copy.title} flag`}
+                /*
+                 * Never `disabled`, not even when the toggle beside it is off, for the reason
+                 * `.refused` in the stylesheet gives about a struck-out row: a value you
+                 * cannot select, correct or focus is worse than one that is merely inert. A
+                 * spelling typed while the injection is off is stored and shown, and it takes
+                 * effect the moment the switch comes back on.
+                 *
+                 * The placeholder is the *effective* spelling, so a field the user has not
+                 * touched reads as the flag cide will write rather than as an empty box.
+                 */
+                placeholder={row.flag}
+                defaultValue={value.flag}
+                onBlur={(e) => {
+                  if (e.target.value !== value.flag) set(row.key, { flag: e.target.value })
+                }}
+              />
+            </div>
+            <p className={styles.injectionCost}>{copy.cost}</p>
+            {/* Rust's sentence for a rename that was thrown away — a positional, or a spelling
+                another injection already has. Nothing at all in the ordinary case. */}
+            <Why text={reasons.find((entry) => entry.name === row.key)?.reason ?? null} />
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * What each injection is, and what switching it off costs.
+ *
+ * A table rather than four inline blocks so `check-claude-cli.mjs` can assert on it, and so a
+ * fifth injection added in Rust is a missing key here rather than a row with no explanation.
+ */
+const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> = {
+  sessionId: {
+    title: 'Session id',
+    cost: (
+      <>
+        cide names the conversation, and that uuid <em>is</em> the pane’s own session id. Off,
+        Claude Code mints its own and no transcript is filed under the id this pane is saved
+        with: <strong>Resume stops working</strong> — a restored pane starts a new conversation,
+        and the Resume button over a dead pane goes away. The status bar is not the casualty
+        here: token figures and busy-versus-idle chrome ride on the hooks and on{' '}
+        <code>CIDE_SESSION</code>, which cide sets separately and the child echoes back.
+      </>
+    ),
+  },
+  resume: {
+    title: 'Resume',
+    cost: (
+      <>
+        cide names the conversation a restored pane continues. Off, <strong>every restored pane
+        starts fresh</strong> — the transcript is still on disk, cide simply stops asking for
+        it — and cide stops offering Resume at all rather than offering a button that silently
+        starts a new session.
+      </>
+    ),
+  },
+  forkSession: {
+    title: 'Fork',
+    cost: (
+      <>
+        What makes <em>Split → fork</em> branch a conversation instead of continuing it. Off, a
+        fork is an ordinary resume: the new pane continues the same conversation rather than
+        branching from it, and both panes append to one transcript.
+      </>
+    ),
+  },
+  settings: {
+    title: 'Hook settings',
+    cost: (
+      <>
+        The inline hook payload. Off, <strong>this pane has no hooks at all</strong>: no live
+        token or cost figures in the status bar; the close confirmation cannot tell a busy agent
+        from an idle one; buffers reload on a filesystem poll instead of the moment a tool
+        writes; and no notification when a turn finishes. It also carries the CLI’s{' '}
+        <code>theme</code>, so Claude Code draws itself dark inside a light pane — white text on
+        white, which is a 24-bit colour no terminal palette can correct.
+      </>
+    ),
+  },
 }
 
 /** The class for a row's fate. `accepted` gets none, which is the common case. */

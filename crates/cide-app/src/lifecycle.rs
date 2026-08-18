@@ -515,6 +515,12 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
     let mut plan = Vec::new();
     // Read once for the whole plan: it is one bool for the launch, not a per-pane decision.
     let resume_all = ws.settings.claude.resume_all_on_launch;
+    // The other bool, and it is the honest half of the `--resume` switch. With that injection
+    // off cide passes no `--resume` at all, so a pane restored as `Resumable` would offer
+    // **Resume this conversation** and then silently start a *new* one — a button that lies
+    // about what it does is worse than a pane that opens fresh and says so. A transcript that
+    // still exists is not the question here; whether cide will name it is.
+    let resume_enabled = ws.settings.claude.cli.inject.resume.enabled;
 
     for (id, project) in &ws.projects {
         // `validate` forbids a rootless project, but a restore plan is the wrong place to
@@ -538,6 +544,7 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
                     &root.path,
                     projects_dir,
                     resume_all,
+                    resume_enabled,
                 ) {
                     plan.push(entry);
                 }
@@ -558,6 +565,7 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
                 &root.path,
                 projects_dir,
                 resume_all,
+                resume_enabled,
             ) {
                 plan.push(entry);
             }
@@ -568,6 +576,7 @@ fn plan_restore_in(ws: &Workspace, projects_dir: Option<&Path>) -> Vec<PaneResto
 }
 
 /// One plan entry, or `None` for a pane that runs no process at all.
+#[allow(clippy::too_many_arguments)]
 fn entry_for(
     pane: &Pane,
     window: WindowLabel,
@@ -576,13 +585,14 @@ fn entry_for(
     cwd: &Path,
     projects_dir: Option<&Path>,
     resume_all: bool,
+    resume_enabled: bool,
 ) -> Option<PaneRestore> {
     // A diff or an editor pane has nothing to spawn, and listing it would leave the
     // frontend to filter out entries it can only ignore.
     if !matches!(pane.kind, PaneKind::Claude | PaneKind::Shell) {
         return None;
     }
-    let restore = restore_for(pane, cwd, projects_dir);
+    let restore = restore_for(pane, cwd, projects_dir, resume_enabled);
     Some(PaneRestore {
         window,
         project: project.id,
@@ -604,10 +614,21 @@ fn entry_for(
     })
 }
 
-fn restore_for(pane: &Pane, cwd: &Path, projects_dir: Option<&Path>) -> SessionRestore {
+fn restore_for(
+    pane: &Pane,
+    cwd: &Path,
+    projects_dir: Option<&Path>,
+    resume_enabled: bool,
+) -> SessionRestore {
     // A shell's scrollback died with its process. There is nothing to resume and nothing to
     // replay, and the frontend says so rather than showing a stale screen.
     if pane.kind != PaneKind::Claude {
+        return SessionRestore::Fresh;
+    }
+    // cide has been told not to pass `--resume`. The transcript may well still be there, and
+    // saying `Resumable` would still produce a pane — a pane holding a *new* conversation,
+    // under a heading promising the old one.
+    if !resume_enabled {
         return SessionRestore::Fresh;
     }
     let Some(session) = pane.session else {
@@ -671,8 +692,14 @@ fn claude_projects_dir() -> Option<PathBuf> {
 /// `cwd` is the directory the session was spawned in — the project's primary root, which is
 /// what the pane passes to `session_spawn`. Nothing is read or written under the transcript
 /// directory; see [`transcript_exists`], which is the whole of the filesystem contact.
-pub fn resumable(cwd: &Path, session: SessionId) -> bool {
-    claude_projects_dir().is_some_and(|dir| transcript_exists(&dir, cwd, session))
+///
+/// `resume_enabled` is `Settings → Claude sessions →` the `--resume` injection, handed in
+/// rather than read here because this function has no workspace and must stay a pure question
+/// about the filesystem. `false` there means `false` here however many transcripts exist: cide
+/// will not name one on the command line, so the offer would start a new conversation under a
+/// button that says otherwise. [`plan_restore_in`] makes the same decision for the launch.
+pub fn resumable(cwd: &Path, session: SessionId, resume_enabled: bool) -> bool {
+    resume_enabled && claude_projects_dir().is_some_and(|dir| transcript_exists(&dir, cwd, session))
 }
 
 /// Whether Claude Code holds a transcript for `session`, started in `cwd`.
@@ -1540,6 +1567,51 @@ mod tests {
             .find(|e| e.kind == PaneKind::Claude && !e.eager)
             .expect("the secondary claude pane is planned");
         assert_eq!(secondary.restore, SessionRestore::Fresh);
+    }
+
+    /// With the `--resume` injection switched off, nothing is resumable however many
+    /// transcripts are on disk.
+    ///
+    /// The honest half of that toggle. cide passes no `--resume`, so a pane planned as
+    /// `Resumable` would come back holding a *new* conversation under a heading promising the
+    /// old one — and the bar over a dead pane would offer a **Resume this conversation** button
+    /// that silently starts a fresh session. The transcript still exists; cide has simply been
+    /// told not to name it.
+    #[test]
+    fn nothing_is_resumable_once_cide_stops_passing_resume() {
+        let root = temp_dir("resume-off");
+        let projects_dir = temp_dir("projects-resume-off");
+        let mut ws = fixture(&root);
+        let primary = ws
+            .projects
+            .values()
+            .next()
+            .expect("fixture project")
+            .primary_session;
+        write_transcript(&projects_dir, &root, primary);
+
+        // With the shipped configuration it is resumable, which is what makes the second half
+        // of this test an assertion about the setting rather than about the fixture.
+        assert!(matches!(
+            plan_restore_in(&ws, Some(&projects_dir))
+                .iter()
+                .find(|e| e.eager)
+                .expect("the primary pane is planned")
+                .restore,
+            SessionRestore::Resumable { .. }
+        ));
+
+        ws.settings.claude.cli.inject.resume.enabled = false;
+        let plan = plan_restore_in(&ws, Some(&projects_dir));
+        assert!(
+            plan.iter().all(|e| e.restore == SessionRestore::Fresh),
+            "a pane cide will not pass --resume for is not resumable: {plan:?}"
+        );
+        // And the same rule from the one-pane door, which is what a dead pane asks. Only the
+        // `false` half is asserted: the `true` half reads the *real* `~/.claude/projects`,
+        // which this test's fixture is deliberately not in — `transcript_exists` owns that
+        // question and `a_claude_pane_with_a_transcript_is_resumable` drives it.
+        assert!(!resumable(&root, primary, false));
     }
 
     /// After `/clear`, the pane must come back on the conversation the user last had — not

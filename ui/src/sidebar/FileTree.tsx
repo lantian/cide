@@ -234,9 +234,23 @@ export interface FileTreeProps {
    * the item disabled with the reason attached. See the note in `Explorer`.
    */
   onOpenToSide?: ((path: string) => void) | undefined
+  /**
+   * A **pinned** row was opened — *Project Notes*. The argument is the pin's id, not a path.
+   *
+   * An id and not a path because a pin's `path` is a `cide://group/…` sentinel that names
+   * nothing on disk: the file behind it is created and named by Rust (`fs_notes_ensure`), and
+   * handing the sentinel to `onOpen` would reach `tab_open_file` with a string `check_within`
+   * refuses. The host turns the id into a **command**, which is what keeps the double-click, the
+   * palette row and any future chord one code path — the same routing `onSelectOpened` uses.
+   *
+   * Optional for the reason `onOpenToSide` is: a host that cannot open tabs must not have this
+   * panel pretend otherwise. Without it the row's click does nothing and its menu item is the
+   * only thing that would have — see the menu below.
+   */
+  onOpenPin?: ((id: string) => void) | undefined
 }
 
-export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
+export function FileTree({ project, onOpen, onOpenToSide, onOpenPin }: FileTreeProps) {
   const count = useFileTree((s) => s.count)
   const chunks = useFileTree((s) => s.chunks)
   const degraded = useFileTree((s) => s.degraded)
@@ -787,9 +801,23 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
       // toolchain's dependency cache. See `groupRows.ts` for why there is no confirmation here.
       const verbs = rowVerbs(row.kind, true)
       if (action.toggle && verbs.expandable) void store.toggle(row)
-      if (action.open && verbs.openable) onOpen?.(row.path)
+      if (action.open && verbs.openable) {
+        /*
+         * A **pin** is openable and has no path: its `path` is the same `cide://group/…`
+         * sentinel a header carries, so handing it to `onOpen` would call `tab_open_file` with a
+         * string `cide_fs::ops::check_within` refuses — a click that reports an error about a
+         * row the user was told they could open. The id is what the host turns into a command,
+         * and the command is what learns the real path from Rust.
+         *
+         * This is the single place clicks, Enter and a speed-search accept all open through, so
+         * the branch is written once.
+         */
+        const pin = row.kind === 'pin' ? groupIdOf(row.path) : null
+        if (pin !== null) onOpenPin?.(pin)
+        else onOpen?.(row.path)
+      }
     },
-    [onOpen, reported],
+    [onOpen, onOpenPin, reported],
   )
 
   /**
@@ -1611,6 +1639,32 @@ export function FileTree({ project, onOpen, onOpenToSide }: FileTreeProps) {
        * rather than a disabled version of the full one is the honest shape: fourteen greyed rows
        * with fourteen identical reasons teaches nothing and looks broken.
        */
+      /*
+       * A **pin** offers one thing too, and it is the opposite of the header's: *Open*.
+       *
+       * Same shape and same reasoning as the group branch below — every item past this point is
+       * about a file, and this row is not one. It has no path to copy (its `path` is a
+       * sentinel), nothing to reveal in a file manager, and nothing to rename: the row is pinned
+       * to one path, so a rename would leave it pointing at nothing. Returning one live item
+       * rather than fifteen greyed ones is the honest shape.
+       *
+       * `row.path` rather than a live `rowAt`, unlike the header: opening needs no `expanded`
+       * flag off the current row, so an eviction between the right-click and the click cannot
+       * make this quietly do nothing.
+       */
+      if (row.kind === 'pin') {
+        const id = groupIdOf(row.path)
+        return [
+          {
+            id: 'open',
+            label: 'Open',
+            ...(id === null || onOpenPin === undefined
+              ? { disabledReason: 'This window cannot open editor tabs' }
+              : { run: () => onOpenPin(id) }),
+          },
+        ]
+      }
+
       if (row.kind === 'group') {
         const live = at === null ? undefined : store.rowAt(at)
         return [
@@ -2358,12 +2412,14 @@ function Row({
    * `rowVerbs` again with the real answer.
    */
   const verbs = rowVerbs(row.kind, true)
-  const synthetic = row.kind === 'group' || row.kind === 'note'
+  const synthetic = row.kind === 'group' || row.kind === 'note' || row.kind === 'pin'
   /** A synthetic row's glyph, or `null` for one that draws none. See `groupRows.groupIcon`. */
   const stem = groupIcon(row.kind, row.expanded, groupIdOf(row.path))
   // A synthetic row has no path on disk, so it has no git status either. Asking anyway would
   // resolve `cide://group/externalLibraries` against the status map's ancestor walk, which
-  // terminates but is work per row per frame for an answer that is always `clean`.
+  // terminates but is work per row per frame for an answer that is always `clean`. A pin's path
+  // is the same kind of sentinel, and the file behind it lives outside every repository, so it
+  // could never carry a tag even if the row were asked about the real path.
   const tone = synthetic ? 'clean' : statusAt(statuses, row.path)
   const letter = letterFor(tone, isDir)
   /*
@@ -2523,6 +2579,10 @@ function Row({
        * theme, and a note gets none at all: the Material table associates *filenames* with
        * icons, so `iconFor` would hand a sentence to the extension lookup and draw the default
        * document — a row that reads as a file called "cargo is not on PATH".
+       *
+       * A **pin** goes down the same branch and needs no arm of its own: `groupIcon` answers
+       * `markdown` for it, so it draws the glyph of the file it opens rather than a folder. The
+       * `stem === null` test is what separates the three — only a note has no stem.
        */}
       {synthetic ? (
         stem === null ? (

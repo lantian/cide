@@ -18,32 +18,257 @@
 //! *more* accurate than the environment rules below and both cost a `fork`/`exec` on a path
 //! that is asked about every time a file is opened, so the rules are the documented defaults
 //! plus the documented overrides, and nothing else.
+//!
+//! It does now read two *files* on macOS — `/etc/paths` and `/etc/paths.d/*`, see
+//! [`path_helper_dirs`] — which is not the same thing and is not what that rule was written
+//! against: a read has no `fork`, no `exec`, no interpreter, no rc file to hang in, and it is
+//! done once per process behind a `OnceLock` rather than once per lookup.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ==========================================================================================
-// Part one: finding a binary.
+// Part one: finding a binary — and giving a child the same list to find it on.
 // ==========================================================================================
+//
+// # The bug the second half of this section exists to stop (M17)
+//
+// Reported from macOS: *"goto in golang project not working on macos (but works on linux), it
+// just prints: gopls no views, rust-analyzer also not working, it writes: the language server
+// stopped"*.
+//
+// That is one level deeper than the discovery failure `search_paths` was written for, and the
+// two are easy to confuse. `search_paths` worked: `~/go/bin` is on the list, `which("gopls")`
+// found the binary, and the user therefore never saw the *"not on PATH, install it with…"*
+// sentence `cide_lsp::discover` would have produced. cide then spawned it — and handed it its
+// **own** `PATH`, unchanged, because `child_env::bundle_scrub` only ever *removes*.
+//
+// A `.app` launched from Finder, the Dock or Spotlight inherits launchd's environment:
+// `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. `/etc/paths` and `path_helper(8)` are a *shell*
+// mechanism and do not run for it. So the language server cide successfully started could not
+// exec `go` — and `gopls` with no usable `go` cannot build a workspace view, which is precisely
+// what it answers `no views` to every request over. `~/.cargo/bin/rust-analyzer` on a rustup
+// install is a *proxy* that re-execs through `rustup`; with no toolchain reachable it exits,
+// which `cide_lsp::server` surfaces as `the language server stopped`. Both strings are built by
+// `cide_app::lsp`'s `format!("{}: {error}", server.binary())`.
+//
+// The rule that follows from that, and the reason [`extra_dirs`] is one list with two consumers:
+// **the directories cide searches to find a binary and the directories it gives that binary's
+// process to search are the same directories.** `search_paths` reads them; [`child_path_from`]
+// appends them to what a child would otherwise inherit. The test
+// `the_path_a_child_searches_is_the_path_which_searched` asserts the two cannot drift, which
+// matters more than it looks: widening `search_paths` alone widens `claude_cli::resolve`'s
+// acceptance, turning a refusal that names a remedy into an opaque `ENOENT` from `execvp` —
+// the compounding failure `README.md` records under *Finding `claude` from a Finder-launched
+// `.app`*.
 
-/// `PATH`, plus the two directories the toolchains install into.
+/// The directories cide adds to whatever `PATH` it was started with.
 ///
-/// Hand-rolled rather than a `which` crate for a dozen lines. The extra directories are not
-/// belt-and-braces: `~/.cargo/bin` and `~/go/bin` are added by a shell rc file, so a cide started
-/// from a terminal sees them and the same cide started from a desktop launcher or an AppImage
-/// does **not** — and the failure is a Problems panel that says the server is missing on a machine
-/// where the user can run it by hand.
+/// Not belt-and-braces: `~/.cargo/bin` and `~/go/bin` are put on `PATH` by a shell rc file, so a
+/// cide started from a terminal sees them and the same cide started from a desktop launcher or
+/// an AppImage does **not**.
+///
+/// # Why it is cached
+///
+/// `which` calls [`search_paths`] on every lookup and a lookup happens on every project open and
+/// every diagnostic refresh. Nothing here can change during the life of the process — `HOME` is
+/// fixed, and a `/etc/paths.d` fragment dropped in by an installer mid-session is not a case
+/// worth three file reads per lookup — so it is computed once. On Linux this is two `PathBuf`s
+/// and no I/O at all.
+///
+/// # The macOS list, and how much of it is guessed
+///
+/// [`path_helper_dirs`] is the part that is *not* guessed: `/etc/paths` and `/etc/paths.d/*` are
+/// the documented mechanism `path_helper(8)` implements, and the Go pkg installer writes
+/// `/etc/paths.d/go` — so an installer nobody here can enumerate still gets its directory on the
+/// list. It cannot stand alone, because Homebrew deliberately does **not** write there: it tells
+/// users to put `eval "$(brew shellenv)"` in their rc file, which is exactly the shell mechanism
+/// a GUI launch skips. So the hardcoded names below are the floor under the parsed list —
+/// Homebrew's two prefixes (`/opt/homebrew` on Apple silicon, `/usr/local` on Intel), MacPorts,
+/// the Go pkg install location, and `~/.local/bin`, which is where Claude Code's own native
+/// installer puts `claude`.
+///
+/// **No Mac was in front of this.** The names are reasoned from those installers' documentation.
+/// Getting one wrong is cheap and getting the list *short* is the real risk: an entry that does
+/// not exist costs one failed `stat` per lookup, which every real `PATH` already has several of,
+/// and a missing entry costs the user the feature. There is deliberately **no existence filter**
+/// for the same reason `search_paths` has none — filtering would let the list cide searches and
+/// the list it hands a child diverge, which is the drift this whole section exists to prevent.
+pub fn extra_dirs() -> &'static [PathBuf] {
+    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(build_extra_dirs)
+}
+
+fn build_extra_dirs() -> Vec<PathBuf> {
+    // The only two impure inputs, read here so that everything below is a function of its
+    // arguments. `etc` doubles as the platform switch: `Some` *is* "assemble the macOS list,
+    // rooted here", which is a thing a Linux test can ask for and a `cfg!(target_os)` inside
+    // the builder would not have been. Only this line is gated.
+    let etc = cfg!(target_os = "macos").then(|| PathBuf::from("/etc"));
+    extra_dirs_in(home().as_deref(), etc.as_deref())
+}
+
+/// [`build_extra_dirs`] over inputs handed in rather than read from the process.
+///
+/// Pure for the same reason [`child_path_from`] is, and for one more that is specific to this
+/// function: **the macOS half of the list is the half no machine here can run.** Gated with a
+/// `#[cfg]` it was unreachable from a test on Linux, so the ordering rule below, the claim in
+/// [`push_unique`] that `/usr/local/bin` really does arrive twice, and every one of the
+/// hardcoded names were assertions nothing checked on any machine in CI. `etc` is `Some` on
+/// macOS and `None` everywhere else, so a Linux test can build either list.
+///
+/// The order is the rule: the toolchain directories first (they are the ones a language server
+/// is most often looking for), then what `path_helper(8)` would have assembled, then
+/// `~/.local/bin` and the hardcoded floor. It matters far less than it looks — every one of
+/// these is *appended* to the user's own `PATH`, so none of them can shadow anything the user
+/// arranged — but two launches on one machine must produce the same list, which is also why
+/// [`path_helper_dirs`] sorts its fragments.
+fn extra_dirs_in(home: Option<&Path>, etc: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home {
+        push_unique(&mut dirs, home.join(".cargo/bin"));
+        push_unique(&mut dirs, home.join("go/bin"));
+    }
+    let Some(etc) = etc else {
+        return dirs;
+    };
+    for dir in path_helper_dirs(etc) {
+        push_unique(&mut dirs, dir);
+    }
+    if let Some(home) = home {
+        push_unique(&mut dirs, home.join(".local/bin"));
+    }
+    for dir in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/opt/local/bin",
+        "/opt/local/sbin",
+        "/usr/local/go/bin",
+    ] {
+        push_unique(&mut dirs, PathBuf::from(dir));
+    }
+    dirs
+}
+
+/// Append `dir` unless the list already holds it, or it is empty.
+///
+/// `Vec::dedup` is the wrong tool and was the first thing tried: it merges only *adjacent*
+/// duplicates, so `/usr/local/bin` arriving from `/etc/paths` and again from the hardcoded floor
+/// would have survived as two entries and doubled a `stat` on every lookup for ever. An empty
+/// entry is dropped because in a `PATH` it means the current directory, and cide has no business
+/// putting a child's cwd on its own search path.
+fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dir.as_os_str().is_empty() && !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
+/// The directories `path_helper(8)` would have assembled from `etc/paths` and `etc/paths.d`.
+///
+/// One path per line; blank lines are skipped, and so are lines starting with `#` — a tolerance
+/// rather than a documented feature, on the grounds that a real directory whose name begins with
+/// a hash does not exist and a commented fragment does.
+///
+/// `etc` is a parameter and this function is **`pub` and unconditional**, both deliberately, for
+/// two reasons that pull the same way. A private `#[cfg(target_os = "macos")]` helper is dead
+/// code on Linux and `clippy -D warnings` fails the build for it — so the macOS-only spelling
+/// would have had to be `#[allow(dead_code)]`, which is how a function stops being read. And a
+/// `#[test]` over a fixture directory is the only way this parser is ever *exercised*: the
+/// machine this was written on has no `/etc/paths` and no Mac was available. The platform
+/// decision lives in [`build_extra_dirs`], as the one `cfg!` that chooses whether an `etc` is
+/// passed at all.
+pub fn path_helper_dirs(etc: &Path) -> Vec<PathBuf> {
+    fn read_into(file: &Path, out: &mut Vec<PathBuf>) {
+        // A missing or unreadable file is the normal case on every platform but one. There is
+        // nothing to report and nothing to fall back to: the hardcoded floor is the fallback.
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            push_unique(out, PathBuf::from(line));
+        }
+    }
+
+    let mut dirs = Vec::new();
+    read_into(&etc.join("paths"), &mut dirs);
+
+    // Sorted, because `read_dir` order is the filesystem's and `path_helper` reads the fragments
+    // in name order. Two launches on one machine must not produce two different `PATH`s.
+    let mut fragments: Vec<PathBuf> = match std::fs::read_dir(etc.join("paths.d")) {
+        Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+        Err(_) => Vec::new(),
+    };
+    fragments.sort();
+    for fragment in fragments {
+        read_into(&fragment, &mut dirs);
+    }
+    dirs
+}
+
+/// `PATH`, plus every directory in [`extra_dirs`] it does not already contain.
+///
+/// Hand-rolled rather than a `which` crate for a dozen lines.
 pub fn search_paths() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    if let Some(home) = home() {
-        for extra in [home.join(".cargo/bin"), home.join("go/bin")] {
-            if !dirs.contains(&extra) {
-                dirs.push(extra);
-            }
+    for extra in extra_dirs() {
+        if !dirs.contains(extra) {
+            dirs.push(extra.clone());
         }
     }
     dirs
+}
+
+/// The `PATH` a child should be given, or `None` to leave the one it would inherit alone.
+///
+/// Pure, over the inputs handed in rather than read from the process, for exactly the reason
+/// [`read_only_reason_in`] and [`crate::child_env::bundle_scrub_from`] are: `set_var` is `unsafe`
+/// in edition 2024 because it races every other thread, so a test that had to arrange a `PATH`
+/// could not be written safely at all. [`crate::child_env::child_path`] is the impure wrapper.
+///
+/// # Append, never prepend
+///
+/// The brief that produced this asked for a *prepend*, and it loses. Putting `/opt/homebrew/bin`
+/// ahead of `/usr/bin` changes which `git`, `python3`, `openssl` and `make` **every** child of
+/// cide resolves — on a machine where the user's own shell may deliberately order them the other
+/// way round. That is a toolchain-selection decision cide has no business making on the user's
+/// behalf, and it can only break configurations that work today. The reported failure is a
+/// directory being *absent*, not shadowed. Appending fixes exactly that and can regress nothing.
+///
+/// # Returning `None` rather than an equal value
+///
+/// Same rule `bundle_scrub_from` states: *a child's environment should differ from its parent's
+/// only where we can say why*. Started from a terminal, every extra is already on `PATH`, this
+/// returns `None`, and not one byte of any child's environment changes.
+///
+/// An empty entry in `current` is preserved verbatim. It means the current directory, which is a
+/// thing the user's shell said and not a thing for this function to edit — only `bundle_scrub`
+/// drops empty entries, and only ones it created itself.
+///
+/// `join_paths` fails when an entry contains the separator, and the answer to that is `None` —
+/// leave `PATH` alone. A partially-joined or lossy `PATH` is worse than an unhelpful one.
+pub fn child_path_from(current: Option<&OsStr>, extra: &[PathBuf]) -> Option<OsString> {
+    let mut dirs: Vec<PathBuf> = current
+        .map(|path| std::env::split_paths(path).collect())
+        .unwrap_or_default();
+    let inherited = dirs.len();
+    for dir in extra {
+        if !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    if dirs.len() == inherited {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()
 }
 
 /// The first executable called `binary` on [`search_paths`], or `None`.
@@ -333,6 +558,216 @@ mod tests {
             assert!(dirs.contains(&home.join(".cargo/bin")), "{dirs:?}");
             assert!(dirs.contains(&home.join("go/bin")), "{dirs:?}");
         }
+    }
+
+    // --- the PATH a child is given ----------------------------------------------------------
+
+    fn dirs(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    fn child(current: Option<&str>, extra: &[&str]) -> Option<Vec<PathBuf>> {
+        let extra = dirs(extra);
+        let current = current.map(OsString::from);
+        let joined = child_path_from(current.as_deref(), &extra)?;
+        Some(std::env::split_paths(&joined).collect())
+    }
+
+    #[test]
+    fn only_the_missing_directories_are_added_and_they_go_on_the_end() {
+        // The append-not-prepend rule, asserted as a rule: the first entry of the inherited
+        // PATH is still first. Prepending would change which `git`, `python3` and `openssl`
+        // every child of cide resolves, which is a decision that is not cide's to make.
+        let path = child(
+            Some("/usr/bin:/bin"),
+            &["/usr/bin", "/opt/homebrew/bin", "/home/u/go/bin"],
+        )
+        .expect("two of the three were missing");
+        assert_eq!(
+            path,
+            dirs(&["/usr/bin", "/bin", "/opt/homebrew/bin", "/home/u/go/bin"]),
+            "an already-present entry must not be repeated, and nothing may jump the queue"
+        );
+    }
+
+    #[test]
+    fn nothing_to_add_means_the_child_inherits_byte_for_byte() {
+        // The `./run.sh`-from-a-terminal case, and the whole of why Linux is unaffected: every
+        // extra is already there, so no `PATH` is set on any child at all. Returning an equal
+        // value instead would be a difference nobody could explain later.
+        assert_eq!(
+            child(Some("/home/u/go/bin:/usr/bin"), &["/home/u/go/bin"]),
+            None
+        );
+        assert_eq!(child(Some("/usr/bin"), &[]), None);
+        assert_eq!(child(None, &[]), None);
+    }
+
+    #[test]
+    fn a_child_with_no_inherited_path_still_gets_the_extras() {
+        assert_eq!(
+            child(None, &["/home/u/.cargo/bin", "/home/u/go/bin"]),
+            Some(dirs(&["/home/u/.cargo/bin", "/home/u/go/bin"]))
+        );
+    }
+
+    #[test]
+    fn an_empty_entry_in_the_inherited_path_is_left_exactly_where_it_was() {
+        // An empty entry means the current directory. It is a thing the user's shell said, and
+        // rewriting it — dropping it, or moving it — changes what a child resolves from its own
+        // cwd. Only `bundle_scrub_from` is entitled to drop one, and only ones it created.
+        let path = child(Some("/usr/bin::/bin"), &["/opt/homebrew/bin"]).expect("one was missing");
+        assert_eq!(path, dirs(&["/usr/bin", "", "/bin", "/opt/homebrew/bin"]));
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_joined_leaves_the_path_alone_rather_than_half_written() {
+        // `join_paths` refuses an entry containing the separator. A truncated or lossy PATH is
+        // worse than the one the child would have inherited, so the answer is "no change".
+        assert_eq!(child(Some("/usr/bin"), &["/opt/a:b"]), None);
+    }
+
+    /// The anti-drift assertion, and the reason [`extra_dirs`] is one list rather than two.
+    ///
+    /// `which` searches [`search_paths`]; a child searches the `PATH` [`child_path_from`] built.
+    /// If those two ever name different directories, cide is back to the compounding failure
+    /// `README.md` records: `claude_cli::resolve` says yes about a directory the child cannot
+    /// see, and a refusal that named a remedy becomes an opaque `ENOENT` from `execvp` three
+    /// processes down. Making it structural rather than a convention is the whole design.
+    #[test]
+    fn the_path_a_child_searches_is_the_path_which_searched() {
+        let current = std::env::var_os("PATH");
+        let built = child_path_from(current.as_deref(), extra_dirs()).or(current);
+        let searched: Vec<PathBuf> = built
+            .as_deref()
+            .map(|path| std::env::split_paths(path).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            searched,
+            search_paths(),
+            "the directories cide searches and the directories it gives a child to search have \
+             drifted apart — that is the bug, not a detail of it"
+        );
+    }
+
+    #[test]
+    fn the_path_helper_files_are_read_in_the_order_path_helper_reads_them() {
+        // `/etc/paths` first, then `/etc/paths.d/*` by name — which is where the Go pkg
+        // installer writes `go`, and the reason this is parsed rather than guessed at.
+        let etc = temp("path-helper");
+        std::fs::create_dir_all(etc.join("paths.d")).expect("mkdir");
+        std::fs::write(
+            etc.join("paths"),
+            "/usr/local/bin\n\n# a comment\n  /usr/bin  \n/bin\n",
+        )
+        .expect("write");
+        std::fs::write(etc.join("paths.d/go"), "/usr/local/go/bin\n").expect("write");
+        // Sorted by name, so `a-first` precedes `go` however `read_dir` felt about it. Repeats
+        // `/usr/bin`, which must not appear twice.
+        std::fs::write(etc.join("paths.d/a-first"), "/opt/x/bin\n/usr/bin\n").expect("write");
+
+        assert_eq!(
+            path_helper_dirs(&etc),
+            dirs(&[
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/opt/x/bin",
+                "/usr/local/go/bin"
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&etc);
+    }
+
+    #[test]
+    fn a_machine_with_no_path_helper_files_gets_an_empty_list_and_no_error() {
+        // Every Linux machine, and the reason the hardcoded floor in `build_extra_dirs` exists.
+        let etc = temp("no-path-helper");
+        assert!(path_helper_dirs(&etc).is_empty());
+        assert!(path_helper_dirs(Path::new("/cide-no-such-etc")).is_empty());
+        let _ = std::fs::remove_dir_all(&etc);
+    }
+
+    #[test]
+    fn the_extra_directories_are_listed_once_each() {
+        // `Vec::dedup` merges only adjacent duplicates, and on macOS `/usr/local/bin` arrives
+        // both from `/etc/paths` and from the hardcoded floor. A repeat is a doubled `stat` on
+        // every lookup for the life of the process.
+        let mut seen = extra_dirs().to_vec();
+        let listed = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), listed, "{:?}", extra_dirs());
+        assert!(
+            !seen.iter().any(|dir| dir.as_os_str().is_empty()),
+            "an empty entry means the child's own cwd: {seen:?}"
+        );
+    }
+
+    /// The macOS list, built on Linux — the half of this feature no machine in CI can run.
+    ///
+    /// Until [`extra_dirs_in`] took its inputs as arguments this was behind a `#[cfg]` and
+    /// therefore behind nothing at all: every hardcoded name, the order, and the dedup claim
+    /// [`push_unique`] makes were unchecked on every machine that ever built this crate. What
+    /// is asserted here is only what a Linux machine can honestly assert — that the builder
+    /// composes the four sources in `path_helper` order, that a directory arriving from both
+    /// `/etc/paths` and the hardcoded floor is listed once, and that the two toolchain
+    /// directories stay in front. Whether `/opt/homebrew/bin` is *the right name* is still a
+    /// claim from Homebrew's documentation and not from a Mac; see `README.md`.
+    #[test]
+    fn the_macos_list_is_path_helper_then_the_hardcoded_floor_with_no_repeats() {
+        let etc = temp("macos-extras");
+        std::fs::create_dir_all(etc.join("paths.d")).expect("mkdir");
+        // What a stock `/etc/paths` holds, plus the entry the Go pkg installer drops in — and
+        // `/usr/local/bin`, which is *also* in the hardcoded floor below. That overlap is the
+        // one `push_unique` exists for and it is real on every Mac, not a contrived input.
+        std::fs::write(etc.join("paths"), "/usr/local/bin\n/usr/bin\n/bin\n").expect("write");
+        std::fs::write(etc.join("paths.d/go"), "/usr/local/go/bin\n").expect("write");
+
+        let home = PathBuf::from("/Users/u");
+        let built = extra_dirs_in(Some(&home), Some(&etc));
+        assert_eq!(
+            built,
+            dirs(&[
+                // The toolchains first: these are what a language server most often cannot find.
+                "/Users/u/.cargo/bin",
+                "/Users/u/go/bin",
+                // Then `path_helper`'s own list, `/etc/paths` before `/etc/paths.d/*`.
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/usr/local/go/bin",
+                // Then the floor. `/usr/local/bin` and `/usr/local/go/bin` came from the files
+                // above and must not appear a second time.
+                "/Users/u/.local/bin",
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/sbin",
+                "/opt/local/bin",
+                "/opt/local/sbin",
+            ])
+        );
+
+        // A Mac with no `/etc/paths` at all — nothing to parse, and the floor is what is left.
+        // This is the case the hardcoded names exist for, so it must not be empty.
+        let bare = extra_dirs_in(Some(&home), Some(Path::new("/cide-no-such-etc")));
+        assert!(
+            bare.contains(&PathBuf::from("/opt/homebrew/bin")),
+            "{bare:?}"
+        );
+        assert!(bare.contains(&PathBuf::from("/usr/local/bin")), "{bare:?}");
+
+        // And the non-macOS spelling, which is the whole of why Linux behaviour is unchanged:
+        // exactly the two directories `search_paths` added before any of this existed.
+        assert_eq!(
+            extra_dirs_in(Some(&home), None),
+            dirs(&["/Users/u/.cargo/bin", "/Users/u/go/bin"])
+        );
+        // A process with no `HOME` — a systemd unit, a `.app` launched oddly — must not produce
+        // an entry rooted at nothing.
+        assert_eq!(extra_dirs_in(None, None), Vec::<PathBuf>::new());
+
+        let _ = std::fs::remove_dir_all(&etc);
     }
 
     #[test]

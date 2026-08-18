@@ -891,6 +891,60 @@ pub async fn fs_scratch_new(
     .await?
 }
 
+/// Make sure this project's notes file exists, and answer where it is.
+///
+/// The whole of the *Project Notes* wire surface. The frontend calls this, gets an absolute
+/// path, and hands that path to `file.open` — so the tab that appears is an **ordinary**
+/// `TabKind::File` tab and save, the dirty marker, undo, find-in-file and the markdown grammar
+/// all work with no special case anywhere in the editor. Nothing about notes reaches `file_read`
+/// or `file_write`: they apply no containment check, only
+/// `cide_core::toolchain::read_only_reason_in`, and `$XDG_STATE_HOME/cide/notes` is not a
+/// dependency cache.
+///
+/// # The name
+///
+/// `ensure` rather than `fs_notes_open`, which it is not — it opens no tab, and a name promising
+/// one would put the routing in the wrong place — and rather than `fs_notes_new`, which it is
+/// also not: it makes a file the *first* time and answers the same path for ever after. The one
+/// thing it must never do is truncate; `cide_core::notes::ensure` carries that argument and the
+/// `create_new` that enforces it.
+///
+/// # No `events.status`, and that is not a forgotten line
+///
+/// `fs_scratch_new` emits one because it adds a **row**, and the other window's scroller has to
+/// be resized in the same frame. This adds no row at all — the pin is drawn from a constant
+/// label whether or not the file exists — so there is nothing for another window to redraw.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fs_notes_ensure(
+    registry: State<'_, FsRegistry>,
+    project: ProjectId,
+) -> Result<PathBuf, FsError> {
+    let fs = project_fs(&registry, project)?;
+    blocking("fs_notes_ensure", move || {
+        // Through `prepare`, for the reason `fs_writable_roots` states: this can be the first
+        // thing a window asks about a project — the palette row runs before the sidebar has ever
+        // been opened — and the pin has to exist before the reveal that follows this call looks
+        // for it.
+        if fs.groups().needs_prepare() {
+            fs.groups().prepare(&fs.root_paths());
+        }
+        // `roots[0]`, which is the project's identity everywhere else in this codebase:
+        // `RecentProject` is keyed by it, and so are the scratch drawer and the notes file. A
+        // multi-root project has **one** notes file, which is what "per project" means to the
+        // person using it — one per root would put N pinned rows in one tree.
+        let root = fs
+            .roots
+            .first()
+            .map(|root| root.path.clone())
+            .ok_or(FsError::NoIndex)?;
+        cide_core::notes::ensure(&root).map_err(|error| FsError::Io {
+            path: root.display().to_string(),
+            message: error.to_string(),
+        })
+    })
+    .await?
+}
+
 /// Every directory the file tree's disk-changing verbs may act inside.
 ///
 /// The project's roots, plus the scratch drawer. The frontend needs the same list Rust checks
@@ -2572,6 +2626,19 @@ mod scratch_tests {
         fs.groups().rows(0, 4096)
     }
 
+    /// How many **pinned** rows sit above every group header. See `crate::notes`.
+    ///
+    /// *Project Notes* is a pin, so `prepare` draws it at row 0 of the group arena for every
+    /// project — before *External Libraries* and before *Scratches*, deliberately and whatever
+    /// order the three policies ran in. Named once here rather than open-coded into every
+    /// index below, so the day a second pin exists these tests say why they moved.
+    const PINS: usize = 1;
+
+    /// The group rows with the pins skipped: what the *Scratches* assertions are about.
+    fn scratch_rows(fs: &crate::files::ProjectFs) -> Vec<cide_ipc::TreeRow> {
+        group_rows(fs).into_iter().skip(PINS).collect()
+    }
+
     /// The sequence a user performs: open a project, make a scratch, find it in the tree,
     /// edit it, rename it, throw it away.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2584,10 +2651,16 @@ mod scratch_tests {
         prepare(&fs, None);
         assert_eq!(
             tree_count(&fs),
-            walked + 1,
-            "one header, collapsed, for a project that has never had a scratch"
+            walked + 1 + PINS,
+            "the Project Notes pin, then one header, collapsed, for a project that has never \
+             had a scratch"
         );
-        let header = group_rows(&fs).remove(0);
+        assert_eq!(
+            group_rows(&fs)[0].kind,
+            TreeRowKind::Pin,
+            "and the pin is above the header, which is the row order the panel promises"
+        );
+        let header = scratch_rows(&fs).remove(0);
         assert_eq!(header.kind, TreeRowKind::Group);
         assert_eq!(header.name, "Scratches");
         assert_eq!(header.path, group_path(GROUP_ID));
@@ -2598,7 +2671,7 @@ mod scratch_tests {
         );
 
         fs.groups().expand(&header.path);
-        let rows = group_rows(&fs);
+        let rows = scratch_rows(&fs);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].kind, TreeRowKind::Note);
         assert!(
@@ -2614,7 +2687,7 @@ mod scratch_tests {
             created.file_name().and_then(|n| n.to_str()),
             Some("scratch.rs")
         );
-        let rows = group_rows(&fs);
+        let rows = scratch_rows(&fs);
         assert_eq!(rows.len(), 2, "the note is replaced, not appended to");
         assert_eq!(rows[1].kind, TreeRowKind::File);
         assert_eq!(rows[1].path, created);
@@ -2652,7 +2725,7 @@ mod scratch_tests {
             "…and the drawer says it changed, which is what becomes a cide://fs-status so the \
              second window redraws — nothing watches this directory"
         );
-        assert_eq!(group_rows(&fs)[1].name, "notes.md");
+        assert_eq!(scratch_rows(&fs)[1].name, "notes.md");
         // A rename *out of* the drawer into the project is deliberately **allowed** — both
         // sides are in the writable set, and "this scratch turned out to be worth keeping" is a
         // real thing to want. Not asserted here as a success, because `ops::rename` is one
@@ -2673,7 +2746,7 @@ mod scratch_tests {
         assert_eq!(trashed.len(), 1);
         assert!(moved, "and the drawer changed");
         assert!(!renamed.exists());
-        let rows = group_rows(&fs);
+        let rows = scratch_rows(&fs);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].kind, TreeRowKind::Note);
         assert_eq!(rows[0].detail, None);
@@ -2703,19 +2776,24 @@ mod scratch_tests {
         let at = reveal_path(&fs, &b).expect("a scratch has a row");
         assert_eq!(
             at as usize,
-            walked + 2,
-            "the walked rows, then the header, then scratch.rs, then scratch_1.rs"
+            walked + PINS + 2,
+            "the walked rows, then the Project Notes pin, then the header, then scratch.rs, \
+             then scratch_1.rs"
         );
         let rows = fs.groups().rows(at as usize - walked, 1);
         assert_eq!(rows[0].path, b);
         assert!(
-            fs.groups().rows(0, 1)[0].expanded,
+            fs.groups().rows(PINS, 1)[0].expanded,
             "revealing into a collapsed group has to open it, or the row is not on screen"
+        );
+        assert!(
+            !fs.groups().rows(0, 1)[0].expanded,
+            "and the pin above it is untouched: it has nothing to unfold"
         );
 
         assert_eq!(
             reveal_path(&fs, &a).expect("and the other one"),
-            (walked + 1) as u32
+            (walked + PINS + 1) as u32
         );
         let main = reveal_path(&fs, &root.join("src/main.rs"))
             .expect("and an ordinary project file still has a row");
@@ -3036,5 +3114,111 @@ mod external_libraries_tests {
         );
         assert!(at as usize >= walked, "the row is past the walked index");
         assert_eq!(fs.groups().rows(at as usize - walked, 1)[0].path, target);
+    }
+}
+
+/// *Project Notes* through the real command layer: the pin's row, and the file behind it.
+///
+/// `cide_core::notes` proves the creation contract and `cide_app::notes` proves the pin's draw
+/// order in isolation. What neither can see is the **composed** tree — the pin's row index is the
+/// walked index's count plus its position in the group arena, and that arithmetic is the piece
+/// `cmd::fs` owns. So this drives `prepare`, `reveal_path` and `cide_core::notes::ensure` over a
+/// real walked project on a real disk, which is the same shape `scratch_tests` above uses and for
+/// the same reason.
+#[cfg(test)]
+mod notes_tests {
+    use super::*;
+    use crate::notes::{GROUP_ID, GROUP_LABEL};
+    use cide_fs::groups::group_path;
+    use cide_ipc::TreeRowKind;
+    use std::path::Path;
+
+    struct Silent;
+    impl FsEvents for Silent {
+        fn status(&self, _: ProjectId, _: &cide_ipc::FsStatus) {}
+        fn changed(&self, _: ProjectId, _: &cide_ipc::FsChange) {}
+    }
+
+    async fn project(tag: &str) -> (FsRegistry, ProjectId, Arc<crate::files::ProjectFs>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("cide-notescmd-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("seed");
+
+        let registry = FsRegistry::default();
+        let events: Arc<dyn FsEvents> = Arc::new(Silent);
+        let id = ProjectId::new();
+        index_project(events, &registry, id, vec![root.clone()])
+            .await
+            .expect("the walk");
+        let fs = registry.get(id).expect("an indexed project");
+        (registry, id, fs, root)
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = std::fs::remove_dir_all(cide_core::notes::dir_for(root));
+        let _ = std::fs::remove_file(cide_core::notes::origin_path(root));
+        let _ = std::fs::remove_dir_all(cide_core::scratch::dir_for(root));
+        let _ = std::fs::remove_file(cide_core::scratch::origin_path(root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The sequence the frontend performs: open a project, click the row, click it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pin_is_the_first_group_row_and_its_file_is_made_on_the_first_click() {
+        let (_registry, _id, fs, root) = project("lifecycle").await;
+        let walked = fs.with_index(|index| index.count());
+
+        // 1. The row exists before the file does, and opening the project wrote nothing.
+        prepare(&fs, None);
+        let sentinel = group_path(GROUP_ID);
+        let at = reveal_path(&fs, &sentinel).expect("the pin has a row");
+        assert_eq!(
+            at as usize, walked,
+            "the pin is the FIRST group row, so it sits immediately after the walked index"
+        );
+        let row = fs.groups().rows(at as usize - walked, 1).remove(0);
+        assert_eq!(row.kind, TreeRowKind::Pin);
+        assert_eq!(row.name, GROUP_LABEL);
+        assert_eq!(row.path, sentinel);
+        assert!(!row.has_children, "a pin opens; it does not unfold");
+        assert!(
+            !cide_core::notes::file_for(&root).exists(),
+            "and opening the project wrote nothing into $XDG_STATE_HOME"
+        );
+
+        // 2. The click. The file is created, and it is an ordinary writable file — which is the
+        //    whole claim the feature rests on: the tab that opens is a plain File tab.
+        let path = cide_core::notes::ensure(&root).expect("the first click");
+        assert_eq!(path, cide_core::notes::file_for(&root));
+        assert!(path.is_file());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "");
+        assert!(
+            cide_core::toolchain::read_only_reason(&path, &fs.root_paths()).is_none(),
+            "the notes file must not be caught by the dependency-cache read-only rule, or the \
+             tab would open unwritable"
+        );
+        cide_core::document::write(&path, "# today\n").expect("the editor's save");
+
+        // 3. The second click. This is the assertion that stands between a user's notes and
+        //    `File::create`.
+        assert_eq!(
+            cide_core::notes::ensure(&root).expect("the second click"),
+            path
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "# today\n");
+
+        // 4. And the row did not move or gain a child: nothing about the pin depends on the file.
+        assert_eq!(reveal_path(&fs, &sentinel), Some(at));
+        assert!(!fs.groups().rows(at as usize - walked, 1)[0].has_children);
+
+        // 5. The negative half. The tree may not change anything about it: the notes directory
+        //    is deliberately not in the writable set, so a rename cannot orphan the pin.
+        assert!(ops::check_within(&fs.writable_paths(), &path).is_err());
+        assert!(
+            ops::check_within(&fs.writable_paths(), &sentinel).is_err(),
+            "and the sentinel is not absolute, so it is refused by the check that already existed"
+        );
+        cleanup(&root);
     }
 }

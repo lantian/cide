@@ -28,10 +28,24 @@
  * A third group needs its own id, its own Rust-side `Groups::show`, and a `case` in
  * `dispatch.ts` if it wants a command; see `crates/cide-fs/src/groups.rs` for that half of the
  * contract.
+ *
+ * *Project Notes* is the third id and the one that **did** need a rule here, because it is not a
+ * group at all: it is a `pin`, a single top-level row that *opens* instead of expanding. That is
+ * a new `RowKind`, one arm in `rowVerbs` and one branch in `groupIcon`, and nothing else in this
+ * module moved — every existing rule keyed on kind, which is why widening the kind was the
+ * cheap change and why `kind: 'file'` with a sentinel path was not (it would have made *Copy
+ * Path* live on a row whose path names nothing).
  */
 
-/** The four things a tree row can be. Structurally `TreeRowKind` from the generated wire types. */
-export type RowKind = 'dir' | 'file' | 'group' | 'note'
+/**
+ * The five things a tree row can be. Structurally `TreeRowKind` from the generated wire types.
+ *
+ * Hand-maintained, because this module is import-free so that `check:groups` can compile it
+ * standalone — which is exactly why `check:notes` reads both this union and `TreeRowKind` in
+ * `ui/src/ipc/generated.ts` as text and asserts they name the same set. That assertion is the
+ * only thing keeping the two in step.
+ */
+export type RowKind = 'dir' | 'file' | 'group' | 'note' | 'pin'
 
 /**
  * The scheme every synthetic row's path uses.
@@ -57,6 +71,20 @@ export const EXTERNAL_LIBRARIES = 'externalLibraries'
  * (`fs_writable_roots`), rather than from a second copy of the rule kept in step by memory.
  */
 export const SCRATCHES = 'scratches'
+
+/**
+ * *Project Notes*. Matches `cide_app::notes::GROUP_ID` exactly.
+ *
+ * The third id, and the first that is a **pin**: one top-level row that *opens* rather than
+ * expanding. It carries the same `cide://group/<id>` sentinel a header does — so
+ * `isSyntheticPath`, `mutationRefusal` and `treeDrag` refuse it by the rules they already
+ * apply — and the file it opens is **named by Rust and never by this string**: the frontend
+ * calls `fs_notes_ensure`, which creates the file on the first call and answers its path. That
+ * separation is what makes it impossible to open the sentinel by mistake; a handler that passed
+ * `cide://group/projectNotes` to `file.open` would fail loudly at `check_within` rather than
+ * quietly opening the wrong thing.
+ */
+export const PROJECT_NOTES = 'projectNotes'
 
 /** The `path` a group header carries. Mirrors `cide_fs::groups::group_path`. */
 export function groupPath(id: string): string {
@@ -127,6 +155,7 @@ const NOTHING: RowVerbs = {
  * | --- | --- | --- | --- | --- | --- |
  * | `group` | yes | no | no | no | no |
  * | `note` | no | no | no | no | no |
+ * | `pin` | no | **yes** | no | no | no |
  * | `dir` in a project | yes | no | yes | yes | yes |
  * | `dir` outside | yes | no | yes | **no** | yes |
  * | `file` in a project | no | yes | yes | yes | yes |
@@ -135,6 +164,20 @@ const NOTHING: RowVerbs = {
  * A group header is deliberately **not actionable**: the arrows may land on it (that is how a
  * keyboard reaches the twisty at all) but Ctrl+X on the cursor must not put `cide://group/…` on
  * the clipboard, and *Move 3 Items to Trash* must not count it.
+ *
+ * A **pin** — *Project Notes* — is the mirror image: `openable` and nothing else. The three
+ * `false`s are each a decision rather than a default. `expandable: false` because it has no
+ * children and Rust refuses to mark it expanded, so a twisty on it would fold nothing.
+ * `actionable: false` for the header's reason exactly: Ctrl+X on the cursor must not put a
+ * sentinel on the clipboard and *Move 3 Items to Trash* must not count it. `addressable: false`
+ * because *Copy Path* would copy the literal string `cide://group/projectNotes` — a
+ * correct-looking answer about the wrong thing, which is the defect class this panel keeps
+ * paying for; the file's real path is known only to Rust, and the row is not a way to learn it.
+ *
+ * A pin's verbs do **not** depend on `inProject`, unlike a `file`'s: it has no path on disk for
+ * containment to be a question about. The *file it opens* is outside every root and is saved
+ * anyway, because `file_write` applies no containment check — that asymmetry is argued in
+ * `crates/cide-app/src/notes.rs`, and nothing in this module needs to know about it.
  *
  * A library file **is openable**, and that is the decision worth stating. The tab it opens is
  * read-only — `cide_core::toolchain::read_only_reason` clears `FileDoc::writable` for anything
@@ -155,6 +198,8 @@ export function rowVerbs(kind: RowKind, inProject: boolean): RowVerbs {
       return { ...NOTHING, expandable: true }
     case 'note':
       return NOTHING
+    case 'pin':
+      return { ...NOTHING, openable: true }
     case 'dir':
       return {
         expandable: true,
@@ -191,6 +236,10 @@ export function rowVerbs(kind: RowKind, inProject: boolean): RowVerbs {
  * library folder and ships in `public/icons/` in both variants, which `check-icons.mjs` proves.
  */
 export function groupIcon(kind: RowKind, expanded: boolean, id: string | null): string | null {
+  // A pin has no open and closed variant — it never folds — so it takes its stem whole and
+  // before the `-open` suffix below could be appended to it. An unknown pin id falls back to
+  // the plain document glyph rather than to a folder: a pin stands for one file.
+  if (kind === 'pin') return STEMS[id ?? ''] ?? 'document'
   // A note draws no icon at all. It is a sentence, and a document glyph in front of it would
   // read as a file called "cargo is not on PATH".
   if (kind !== 'group') return null
@@ -212,8 +261,14 @@ export function groupIcon(kind: RowKind, expanded: boolean, id: string | null): 
  * An unknown id falls back to the plain folder rather than throwing: a group this build has
  * never heard of is an older webview against a newer backend, the same case `rowVerbs`'s
  * `default` arm covers.
+ *
+ * *Project Notes* is the one entry here that is not a folder, because the row is not a drawer:
+ * `markdown` is the Material theme's own glyph for a `.md` file, which is what the row opens, so
+ * the pin looks like the tab it produces. Both variants ship in `public/icons/`, re-checked on
+ * disk by `check:notes` for the same reason `check:scratch` re-checks its two.
  */
 const STEMS: Readonly<Record<string, string>> = {
   [EXTERNAL_LIBRARIES]: 'folder-lib',
   [SCRATCHES]: 'folder-temp',
+  [PROJECT_NOTES]: 'markdown',
 }

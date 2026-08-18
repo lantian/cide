@@ -58,9 +58,286 @@
 
 use std::path::{Path, PathBuf};
 
-use cide_ipc::ClaudeCli;
+use cide_ipc::{ClaudeCli, ClaudeInjection, ClaudeInjections};
 
 use crate::child_env::EnvChange;
+
+// ==========================================================================================
+// The arguments cide adds itself, and whether it still adds them.
+// ==========================================================================================
+
+/// One argument **cide itself** puts on a Claude pane's command line.
+///
+/// # Why four toggles with a spelling, rather than a harness profile
+///
+/// The need this answers was reported as *"need to be able to rename arguments or even
+/// disable, in case i want to run another harness instead of claude code, for example opencode
+/// or some wrapper over the claude code"*. Three shapes could serve it; this is the one that
+/// did, and the two that lost are worth keeping written down because both look cheaper.
+///
+/// * **A coarse harness profile** — one enum on [`cide_ipc::ClaudeCli`], `ClaudeCode` (today)
+///   or `Raw` (inject nothing). Half this code and a one-row screen, and it collapses two
+///   decisions whose costs are not remotely alike. A wrapper that forwards argv verbatim wants
+///   everything cide injects; a wrapper that mints its own conversation ids wants the hooks and
+///   not `--session-id`. One enum makes that second user give up hooks — and with them the
+///   status bar's token and cost figures, the busy-versus-idle close confirm, the fast buffer
+///   reload, the finished-turn notification and the CLI's own theme — in order to drop a single
+///   flag. Hooks are by far the expensive half of what cide injects, and forcing them off to
+///   fix an unrelated flag is a trade nobody would choose. The stored shape below would migrate
+///   to a profile cleanly if the four-row screen ever proves confusing; the reverse is not true.
+/// * **Toggles with no rename.** Satisfies the letter of the report, which led with "disable".
+///   Rejected because once the injected set is a *table* rather than four string literals in
+///   two functions, the spelling is one more column of that table and needs no new mechanism —
+///   and because refusing a rename would be arbitrary beside [`cide_ipc::ClaudeCli::binary`],
+///   which already lets the user substitute the *program*. If the rename inputs turn out to be
+///   a footgun they can be dropped without touching the toggles.
+/// * **A free-form argv template** (`--session-id {id}`). The most flexible, and rejected
+///   hardest. It re-invents the quoting language `ClaudeCli::args` explicitly refused to invent
+///   — one token per row, straight to `execvp`, no shell and no parser to get wrong — and,
+///   decisively, it would stop the injected flag set being **enumerable**. That property is the
+///   only reason the conditional half of [`REFUSED_ARGS`] can be derived from this table at
+///   all: a template is text, and you cannot ask text which flags it will emit. The refusal
+///   list and the injection could then only be kept in step by a human, which is exactly the
+///   arrangement [`RefusedArg::because`] exists to end.
+///
+/// Adding a variant is one row of [`INJECTIONS`], one field on [`cide_ipc::ClaudeInjections`],
+/// and one `because` on the refusal it relaxes — and the set-equality test refuses to let the
+/// third be forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Injection {
+    /// `--session-id <uuid>`, on a fresh session and on a fork. The uuid *is* the pane's
+    /// `SessionId`, which is what makes resume free.
+    SessionId,
+    /// `--resume <uuid>`, when a restored pane continues its conversation.
+    Resume,
+    /// `--fork-session`, beside a resume, when a split branches the conversation.
+    ForkSession,
+    /// `--settings <inline json>`: the hook payload, and therefore everything cide knows about
+    /// what a pane's agent is doing.
+    Settings,
+}
+
+/// One row of [`INJECTIONS`]: what cide adds, how it spells it, and where the user's
+/// configuration for it lives.
+pub struct InjectionSpec {
+    pub injection: Injection,
+    /// The spelling cide uses when the user has not overridden it — `claude --help`'s, checked
+    /// rather than remembered, exactly as [`REFUSED_ARGS`]'s are.
+    pub default_flag: &'static str,
+    /// The camelCase name of this injection's field on [`cide_ipc::ClaudeInjections`].
+    ///
+    /// What crosses the wire, and therefore what a Settings row is keyed by — a discarded
+    /// rename's sentence is looked up under this, not under the flag, because the flag it was
+    /// looked up by is the one that was thrown away. `check-claude-cli.mjs` asserts these are
+    /// the same four names the screen uses; a typo here is a sentence that never appears.
+    pub key: &'static str,
+    /// Which field of [`cide_ipc::ClaudeInjections`] configures this one.
+    ///
+    /// A function pointer rather than a `match` at each of the four consumers: an injection
+    /// added there and not here would be a stored setting nothing reads, which is this
+    /// project's most-repeated defect. Returns a reference, so resolving an argv costs no
+    /// allocation beyond the spellings themselves.
+    pub of: fn(&ClaudeInjections) -> &ClaudeInjection,
+}
+
+/// Everything cide puts on a Claude pane's command line that the user did not type.
+///
+/// The list is closed and it is this one. `cide_claude::conversation` emits the first three and
+/// `cmd::session.rs` the fourth; nothing else adds an argument to a pane, and the headless
+/// one-shot lane (`cide_claude::headless::argv`) is deliberately not here — see its own note
+/// and the sentence the Settings screen carries about it.
+pub const INJECTIONS: &[InjectionSpec] = &[
+    InjectionSpec {
+        injection: Injection::SessionId,
+        key: "sessionId",
+        default_flag: "--session-id",
+        of: |inject| &inject.session_id,
+    },
+    InjectionSpec {
+        injection: Injection::Resume,
+        key: "resume",
+        default_flag: "--resume",
+        of: |inject| &inject.resume,
+    },
+    InjectionSpec {
+        injection: Injection::ForkSession,
+        key: "forkSession",
+        default_flag: "--fork-session",
+        of: |inject| &inject.fork_session,
+    },
+    InjectionSpec {
+        injection: Injection::Settings,
+        key: "settings",
+        default_flag: "--settings",
+        of: |inject| &inject.settings,
+    },
+];
+
+/// The row for one injection. Total, because [`INJECTIONS`] is exhaustive by construction and
+/// a missing row would be a panic in a `const` table rather than a runtime surprise.
+pub fn spec_of(which: Injection) -> &'static InjectionSpec {
+    INJECTIONS
+        .iter()
+        .find(|spec| spec.injection == which)
+        .expect("INJECTIONS covers every Injection variant")
+}
+
+/// The flags cide will actually put on this pane's command line, in [`INJECTIONS`] order.
+///
+/// A resolved value rather than a `&ClaudeInjections`, and that is the point: the spelling has
+/// already survived the override rules by the time anything holds one of these, so the spawn,
+/// the refusal table and the Settings readout cannot disagree about what will be written. It
+/// travels inside [`Plan`] for the same reason `Plan` exists at all.
+///
+/// `Default` is **nothing injected**, which is what a shell pane gets — see `Plan::default()`'s
+/// use at the spawn site. The configured default is [`Injected::defaults`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Injected(Vec<(Injection, String)>);
+
+impl Injected {
+    /// The spelling this injection will be written with, or `None` when it is switched off.
+    ///
+    /// The one accessor a caller should reach for: `if let Some(flag) = injected.flag(..)` is
+    /// simultaneously the enabled check and the spelling, so there is no way to write the flag
+    /// without having asked whether it is on.
+    pub fn flag(&self, which: Injection) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(injection, _)| *injection == which)
+            .map(|(_, flag)| flag.as_str())
+    }
+
+    /// Whether cide passes this argument at all.
+    pub fn has(&self, which: Injection) -> bool {
+        self.flag(which).is_some()
+    }
+
+    /// Every injection, at its default spelling: byte-for-byte what cide passed before these
+    /// switches existed, and what [`cide_ipc::ClaudeCli::default`] still resolves to.
+    ///
+    /// For tests and for `tests/real_session_args.rs`, which puts these shapes in front of the
+    /// installed binary and must keep asking about the shipped default.
+    pub fn defaults() -> Self {
+        Self(
+            INJECTIONS
+                .iter()
+                .map(|spec| (spec.injection, spec.default_flag.to_string()))
+                .collect(),
+        )
+    }
+
+    /// The pairs, in [`INJECTIONS`] order. What the set-equality test walks.
+    pub fn iter(&self) -> impl Iterator<Item = (Injection, &str)> {
+        self.0
+            .iter()
+            .map(|(injection, flag)| (*injection, flag.as_str()))
+    }
+}
+
+/// An override that is not a flag, discarded. See [`injected`].
+const OVERRIDE_NOT_A_FLAG: &str = "An argument cide adds has to begin with `-`. A bare token \
+                                   would be claude's first POSITIONAL argument, which is a \
+                                   *prompt* — every pane would start by asking the model \
+                                   something. cide is using its own spelling instead.";
+
+/// Two injections given one spelling, both discarded. See [`injected`].
+const OVERRIDE_COLLIDES: &str = "Two of the arguments cide adds cannot be spelled the same, and \
+                                 this one clashes with another. A command line carrying one \
+                                 flag twice is the silent breakage this whole screen exists to \
+                                 prevent. cide is using its own spelling instead.";
+
+/// Resolve [`cide_ipc::ClaudeInjections`] against [`INJECTIONS`]: what cide will write, and a
+/// note per override it threw away.
+///
+/// # The two rules an override has to survive
+///
+/// * **It must begin with `-`.** `claude`'s first positional argument is a prompt — the same
+///   trap [`user_args`]'s value-swallowing rule exists for — so an override of `sid` rather
+///   than `--sid` would not be a differently-named flag, it would start every pane by asking
+///   the model something.
+/// * **It must not be another injection's spelling**, its default included, and a clash
+///   discards *both* sides rather than picking a winner. Two injections writing one flag is
+///   the duplicate-flag bug this module is about, arriving through the new door; and a rule
+///   that silently preferred whichever row came first in the table would make the outcome
+///   depend on an ordering nobody can see. Reserved even when the other injection is switched
+///   off, because a rename that becomes invalid the moment an unrelated toggle is flipped back
+///   on is worse than one that was never accepted.
+///
+/// A discarded override falls back to the default spelling, which is always safe: the defaults
+/// are distinct from each other by construction, and they are what cide passed before this
+/// setting existed.
+///
+/// Notes are produced for a **disabled** injection's bad override too. It is not noise: the
+/// screen disables that input when the toggle is off, so the only way to reach one is a
+/// hand-edited `workspace.json`, and a rename that will be discarded the moment the toggle
+/// comes back on is worth one line rather than a silent surprise later.
+///
+/// The [`Judged::index`] on a note is the row's position in [`INJECTIONS`], not a position in
+/// anything the user typed — these four rows are a fixed table, and the screen finds its row
+/// by injection rather than by text.
+pub fn injected(cli: &ClaudeCli) -> (Injected, Vec<Judged>) {
+    let cfg = &cli.inject;
+    let mut notes: Vec<Judged> = Vec::new();
+
+    // Pass one: the shape rule, row by row. `None` means "no usable override; use the default".
+    let proposed: Vec<Option<&str>> = INJECTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let over = (spec.of)(cfg).flag.trim();
+            if over.is_empty() {
+                return None;
+            }
+            if !over.starts_with('-') {
+                notes.push(Judged {
+                    index,
+                    text: over.to_string(),
+                    verdict: Verdict::Refused(OVERRIDE_NOT_A_FLAG),
+                });
+                return None;
+            }
+            Some(over)
+        })
+        .collect();
+
+    // Pass two: the collision rule, decided against the snapshot above rather than against a
+    // list being mutated as it is read. Order-independent on purpose — both halves of a clash
+    // lose, and each then falls back to a default that is unique among defaults, so a single
+    // pass is enough and there is no second round to reason about.
+    let mut resolved: Vec<String> = Vec::with_capacity(INJECTIONS.len());
+    for (index, spec) in INJECTIONS.iter().enumerate() {
+        let flag = match proposed.get(index).copied().flatten() {
+            None => spec.default_flag.to_string(),
+            Some(over) => {
+                let clashes = INJECTIONS.iter().enumerate().any(|(other, other_spec)| {
+                    other != index
+                        && (other_spec.default_flag == over
+                            || proposed.get(other).copied().flatten() == Some(over))
+                });
+                if clashes {
+                    notes.push(Judged {
+                        index,
+                        text: over.to_string(),
+                        verdict: Verdict::Refused(OVERRIDE_COLLIDES),
+                    });
+                    spec.default_flag.to_string()
+                } else {
+                    over.to_string()
+                }
+            }
+        };
+        resolved.push(flag);
+    }
+
+    let out = INJECTIONS
+        .iter()
+        .zip(resolved)
+        .filter(|(spec, _)| (spec.of)(cfg).enabled)
+        .map(|(spec, flag)| (spec.injection, flag))
+        .collect();
+
+    (Injected(out), notes)
+}
 
 // ==========================================================================================
 // The tables.
@@ -80,51 +357,76 @@ use crate::child_env::EnvChange;
 ///
 /// **This is a list of somebody else's flag names and it will go stale**, exactly as
 /// `SUPPORTED_CLI` does. `cide_claude::version`'s module header keeps the table of what a patch
-/// release can retract; this list is on it, and `cide-claude/tests/real_cli_args.rs` is the
+/// release can retract; this list is on it, and `cide-claude/tests/real_session_args.rs` is the
 /// `#[ignore]`d check that puts these shapes in front of the installed binary. A flag that is
 /// renamed upstream stops being refused, which degrades to today's behaviour — the user gets
 /// what they asked for and the pane breaks — rather than to a refusal of something harmless.
+///
+/// # Four of the seven are conditional, and three are not
+///
+/// [`RefusedArg::because`] carries that distinction, and it is the whole reason the injection
+/// switches are safe to have. Four entries here exist *because cide passes the flag*; the
+/// moment it stops, the refusal has to lift or the screen would disable a feature and then
+/// forbid the replacement. Three — `--bare`, `--print` and `--continue` — are about the flag
+/// itself or about a combination, and `--continue` is the one worth reading twice: it is
+/// illegal *beside* an injected session id, so it carries `Injection::SessionId` rather than a
+/// variant of its own.
 pub const REFUSED_ARGS: &[RefusedArg] = &[
     RefusedArg {
         flag: "--session-id",
         aliases: &[],
         takes_value: true,
-        reason: "cide passes --session-id itself: the uuid *is* the pane's SessionId, and the \
-                 hooks report against it. A second one makes every hook frame name a session \
-                 this process has never heard of — no token figures, no busy-versus-idle close \
-                 confirm — and writes an id into workspace.json with no transcript behind it.",
+        reason: "cide passes this itself: the uuid *is* the pane's SessionId, and the hooks \
+                 report against it. A second one makes every hook frame name a session this \
+                 process has never heard of — no token figures, no busy-versus-idle close \
+                 confirm — and writes an id into workspace.json with no transcript behind it. \
+                 Settings → Claude sessions → What cide adds to the command line can switch \
+                 cide's own off, and this refusal lifts with it.",
+        because: Some(Injection::SessionId),
     },
     RefusedArg {
         flag: "--resume",
         aliases: &["-r"],
         takes_value: true,
-        reason: "cide passes --resume itself when a restored pane continues its conversation. A \
+        reason: "cide passes this itself when a restored pane continues its conversation. A \
                  second one resumes something else under a pane bound to this one, and the \
-                 duplicate-session guard keys on cide having chosen it.",
+                 duplicate-session guard keys on cide having chosen it. Settings → Claude \
+                 sessions → What cide adds to the command line can switch cide's own off, and \
+                 this refusal lifts with it.",
+        because: Some(Injection::Resume),
     },
     RefusedArg {
         flag: "--fork-session",
         aliases: &[],
         takes_value: false,
-        reason: "Only legal beside --session-id or --resume, both of which cide owns. A stray \
+        reason: "Only legal beside a session id or a resume, both of which cide owns. A stray \
                  one changes which conversation the pane *is*, and cide's Split and fork \
-                 gesture is what passes it deliberately.",
+                 gesture is what passes it deliberately. Settings → Claude sessions → What \
+                 cide adds to the command line can switch cide's own off, and this refusal \
+                 lifts with it.",
+        because: Some(Injection::ForkSession),
     },
     RefusedArg {
         flag: "--continue",
         aliases: &["-c"],
         takes_value: false,
-        reason: "The CLI refuses --session-id beside --continue unless --fork-session is also \
-                 given, so this does not degrade a feature — every Claude pane fails to start.",
+        reason: "The CLI refuses a session id beside --continue unless --fork-session is also \
+                 given, so this does not degrade a feature — every Claude pane fails to start. \
+                 It is the session id injection that makes it illegal, so switching that one \
+                 off in Settings lifts this refusal too.",
+        because: Some(Injection::SessionId),
     },
     RefusedArg {
         flag: "--settings",
         aliases: &[],
         takes_value: true,
-        reason: "cide passes --settings itself, carrying the inline hook payload that makes the \
-                 status line, the token figures and the fast buffer reload work. One of the two \
-                 loses, and if yours wins every hook dies with nothing on screen saying so. Put \
-                 your own settings in ~/.claude/settings.json, which cide never edits.",
+        reason: "cide passes this itself, carrying the inline hook payload that makes the \
+                 status line, the token figures and the fast buffer reload work. One of the \
+                 two loses, and if yours wins every hook dies with nothing on screen saying \
+                 so. Put your own settings in ~/.claude/settings.json, which cide never edits \
+                 — or switch cide's injection off in Settings, which lifts this refusal and \
+                 costs you every one of those features.",
+        because: Some(Injection::Settings),
     },
     RefusedArg {
         flag: "--bare",
@@ -134,6 +436,7 @@ pub const REFUSED_ARGS: &[RefusedArg] = &[
                  apiKeyHelper — OAuth and the keychain are never read. For a Claude Max or Pro \
                  subscriber that is an authentication failure in every pane, with nothing \
                  naming the cause.",
+        because: None,
     },
     RefusedArg {
         flag: "--print",
@@ -142,9 +445,9 @@ pub const REFUSED_ARGS: &[RefusedArg] = &[
         reason: "Turns an interactive pane into a one-shot that answers and exits. cide has a \
                  headless lane of its own for that — Generate commit message, Explain selection \
                  — and it is not this one.",
+        because: None,
     },
 ];
-
 /// Arguments that are legitimate, cost something cide cannot repair, and are allowed anyway.
 ///
 /// The line between this table and [`REFUSED_ARGS`] is whether the user could plausibly mean it.
@@ -158,6 +461,9 @@ pub const WARNED_ARGS: &[RefusedArg] = &[RefusedArg {
     reason: "Starts with hooks disabled, so this pane reports no session state: the status bar \
              shows no token figures and the close confirmation cannot tell a busy agent from an \
              idle one. The pane itself works.",
+    // Nothing cide injects is implicated: this is a flag whose *effect* overlaps the hooks,
+    // not a duplicate of one cide passes, so it is warned however the injections are set.
+    because: None,
 }];
 
 /// One entry of [`REFUSED_ARGS`] or [`WARNED_ARGS`].
@@ -170,7 +476,29 @@ pub struct RefusedArg {
     /// Whether a following token that is not itself a flag belongs to this one.
     pub takes_value: bool,
     /// One sentence, printed beside the struck-out token. Prose, because the screen prints it.
+    ///
+    /// **Names the thing, not the token.** These sentences used to embed their own spelling
+    /// ("cide passes `--session-id` itself"), which stopped being true the moment the spelling
+    /// became configurable — a user who renamed the injection would read a paragraph about a
+    /// flag nobody is passing.
     pub reason: &'static str,
+    /// The injection this refusal exists *because of*, or `None` for one that stands whatever
+    /// cide passes.
+    ///
+    /// This field is the **one place** the two facts are kept together, and keeping them apart
+    /// is the failure it exists to prevent. `--session-id` is refused because cide passes it;
+    /// stop passing it and the refusal must relax, or the user has a switch that turns a
+    /// feature off and then blocks the replacement — worse than not having the switch. In the
+    /// other direction a refusal that relaxed while cide still injected would put the user's
+    /// flag and cide's on one command line, which is the silent breakage this whole table was
+    /// written for. Both directions are pinned by
+    /// `every_injected_flag_is_refused_and_every_injection_refusal_is_injected`.
+    ///
+    /// `--continue` carries [`Injection::SessionId`] and not a variant of its own: it is
+    /// illegal *beside* an injected session id, so it is that injection's refusal rather than
+    /// one about `--continue` itself. `--bare` and `--print` carry `None` — they break
+    /// authentication and turn a pane into a one-shot regardless of what cide adds.
+    pub because: Option<Injection>,
 }
 
 impl RefusedArg {
@@ -184,6 +512,16 @@ impl RefusedArg {
     pub fn matches(&self, token: &str) -> bool {
         let name = token.split_once('=').map_or(token, |(name, _)| name);
         name == self.flag || self.aliases.contains(&name)
+    }
+
+    /// Does `token` name `flag`, ignoring this entry's own spelling?
+    ///
+    /// For a refusal whose flag cide has been told to spell differently. The aliases are
+    /// deliberately **not** consulted: `-r` is Claude Code's short form for `--resume`, and a
+    /// user who renamed the injection is driving something that is not Claude Code — refusing
+    /// `-r` there would block a flag of the other harness's that cide never passes.
+    fn matches_as(flag: &str, token: &str) -> bool {
+        token.split_once('=').map_or(token, |(name, _)| name) == flag
     }
 
     /// Did this token carry its value inline, as `--resume=abc`?
@@ -387,6 +725,18 @@ pub struct Plan {
     pub arg_notes: Vec<Judged>,
     /// Every environment row, in the order the user wrote them.
     pub env_notes: Vec<Judged>,
+    /// The arguments cide will add itself, resolved: which of them, spelled how.
+    ///
+    /// In `Plan` rather than resolved again at the spawn, so the set folded into the argv is
+    /// **the same value** the verdicts above were computed against. Two resolutions is two
+    /// chances to refuse a user's `--session-id` while passing none of cide's, which is the
+    /// one outcome the switches must never produce — the same argument this type's own doc
+    /// makes about the screen and the spawn.
+    ///
+    /// `Plan::default()` injects nothing, which is what a shell pane gets.
+    pub inject: Injected,
+    /// Injection overrides that were discarded, and why. See [`injected`].
+    pub inject_notes: Vec<Judged>,
 }
 
 impl Plan {
@@ -395,16 +745,54 @@ impl Plan {
         self.arg_notes
             .iter()
             .chain(&self.env_notes)
+            // The discarded renames belong here too: a spawn that quietly used the default
+            // spelling because the override was a positional would otherwise be the one
+            // refusal with no line anywhere, and `workspace.json` is hand-editable.
+            .chain(&self.inject_notes)
             .filter(|judged| judged.verdict.is_refused())
     }
+}
+
+/// The refusal that covers this token, given what cide is actually going to inject.
+///
+/// # The three ways an entry is matched, and why they differ
+///
+/// * `because: None` — matched on its own name and aliases, always. `--bare` and `--print`
+///   break a pane whatever cide adds.
+/// * `because: Some(i)` where the entry *is* the injected flag — matched on the **effective**
+///   spelling, and not at all when `i` is switched off. Rename the session id injection to
+///   `--sid` and `--sid` becomes the refused token while `--session-id` becomes the user's to
+///   pass; that is the whole point of deriving one from the other.
+/// * `because: Some(i)` where the entry is a *different* flag that is illegal beside the
+///   injected one — `--continue` beside a session id. Matched on its own name, because it is
+///   the CLI's flag rather than cide's, and merely gated on the injection being on.
+fn refusal_for(token: &str, injected: &Injected) -> Option<&'static RefusedArg> {
+    REFUSED_ARGS.iter().find(|entry| match entry.because {
+        None => entry.matches(token),
+        Some(which) => match injected.flag(which) {
+            None => false,
+            Some(effective) => {
+                let default = spec_of(which).default_flag;
+                if entry.flag == default && effective != default {
+                    RefusedArg::matches_as(effective, token)
+                } else {
+                    entry.matches(token)
+                }
+            }
+        },
+    })
 }
 
 /// The verdict on one argument token, ignoring its neighbours.
 ///
 /// Neighbours matter — a refused `--resume` takes the `abc` after it — which is why the whole
 /// list goes through [`user_args`] and this answers only about the token itself.
-pub fn arg_verdict(token: &str) -> Verdict {
-    if let Some(entry) = REFUSED_ARGS.iter().find(|entry| entry.matches(token)) {
+///
+/// Takes the resolved [`Injected`] rather than reading the configuration itself, so a caller
+/// cannot ask about a set of flags different from the one about to be written. Pass
+/// [`Injected::defaults`] for "what cide has always injected".
+pub fn arg_verdict(token: &str, injected: &Injected) -> Verdict {
+    if let Some(entry) = refusal_for(token, injected) {
         return Verdict::Refused(entry.reason);
     }
     if let Some(entry) = WARNED_ARGS.iter().find(|entry| entry.matches(token)) {
@@ -475,6 +863,15 @@ pub fn env_verdict(name: &str, value: &str, appdir: Option<&str>) -> Verdict {
 ///
 /// A token written as `--resume=abc` carries its own value and swallows nothing.
 pub fn user_args(cli: &ClaudeCli) -> (Vec<String>, Vec<Judged>) {
+    user_args_in(cli, &injected(cli).0)
+}
+
+/// [`user_args`], against an [`Injected`] the caller has already resolved.
+///
+/// Exists so [`plan`] resolves the injections **once** and judges the user's tokens against
+/// the same value it puts in `Plan::inject`. Not public: a caller who could pass an unrelated
+/// `Injected` could produce a readout about a command line nothing will spawn.
+fn user_args_in(cli: &ClaudeCli, injected: &Injected) -> (Vec<String>, Vec<Judged>) {
     let mut kept = Vec::new();
     let mut notes: Vec<Judged> = Vec::with_capacity(cli.args.len());
     // Set when the previous token was refused and is still owed a value.
@@ -494,9 +891,9 @@ pub fn user_args(cli: &ClaudeCli) -> (Vec<String>, Vec<Judged>) {
             continue;
         }
 
-        let verdict = arg_verdict(token);
+        let verdict = arg_verdict(token, injected);
         if let Verdict::Refused(reason) = verdict
-            && let Some(entry) = REFUSED_ARGS.iter().find(|entry| entry.matches(token))
+            && let Some(entry) = refusal_for(token, injected)
             && entry.takes_value
             && !entry.inline_value(token)
         {
@@ -559,13 +956,18 @@ pub fn user_env(cli: &ClaudeCli, appdir: Option<&str>) -> (Vec<EnvChange>, Vec<J
 
 /// Both halves in one pass, for a spawn site that wants the survivors and a log line.
 pub fn plan(cli: &ClaudeCli, appdir: Option<&str>) -> Plan {
-    let (args, arg_notes) = user_args(cli);
+    // Resolved first and threaded through both halves: the verdict on a user's `--session-id`
+    // and the decision to write cide's own are one question asked once.
+    let (inject, inject_notes) = injected(cli);
+    let (args, arg_notes) = user_args_in(cli, &inject);
     let (env, env_notes) = user_env(cli, appdir);
     Plan {
         args,
         env,
         arg_notes,
         env_notes,
+        inject,
+        inject_notes,
     }
 }
 
@@ -687,14 +1089,314 @@ mod tests {
                     value: (*value).into(),
                 })
                 .collect(),
+            // `..Default::default()` rather than a literal, so a fifth injection added to the
+            // DTO does not need an edit here — and so these tests keep asking about the
+            // *shipped* default, which is the property most of them are about.
+            ..Default::default()
+        }
+    }
+
+    /// A `ClaudeCli` with one injection switched off.
+    fn without(which: Injection) -> ClaudeCli {
+        let mut cli = ClaudeCli::default();
+        field_mut(&mut cli, which).enabled = false;
+        cli
+    }
+
+    /// A `ClaudeCli` with one injection renamed.
+    fn renamed_cli(which: Injection, flag: &str) -> ClaudeCli {
+        let mut cli = ClaudeCli::default();
+        field_mut(&mut cli, which).flag = flag.to_string();
+        cli
+    }
+
+    /// The mutable half of `InjectionSpec::of`, which the shipping code has no use for: it
+    /// only ever reads the configuration. Written out here rather than added to the table so
+    /// the table stays the read-only description it is.
+    fn field_mut(cli: &mut ClaudeCli, which: Injection) -> &mut ClaudeInjection {
+        match which {
+            Injection::SessionId => &mut cli.inject.session_id,
+            Injection::Resume => &mut cli.inject.resume,
+            Injection::ForkSession => &mut cli.inject.fork_session,
+            Injection::Settings => &mut cli.inject.settings,
+        }
+    }
+
+    fn flags(cli: &ClaudeCli) -> Vec<String> {
+        injected(cli)
+            .0
+            .iter()
+            .map(|(_, flag)| flag.to_string())
+            .collect()
+    }
+
+    /// Nothing of the *user's* is added by default — and everything of cide's still is.
+    ///
+    /// The second half used to be `plan == Plan::default()`, which stopped being the right
+    /// assertion the moment `Plan` carried the injections: `Plan::default()` injects nothing,
+    /// which is what a shell pane gets. Spelled out explicitly instead, so a change to what
+    /// cide passes out of the box is a failing test rather than a silent one.
+    #[test]
+    fn the_default_adds_nothing_of_the_users_and_everything_of_cides() {
+        let plan = plan(&ClaudeCli::default(), None);
+        assert!(plan.args.is_empty());
+        assert!(plan.env.is_empty());
+        assert!(plan.arg_notes.is_empty());
+        assert!(plan.env_notes.is_empty());
+        assert!(plan.inject_notes.is_empty());
+        assert_eq!(plan.inject, Injected::defaults());
+        assert_eq!(
+            plan.inject
+                .iter()
+                .map(|(_, flag)| flag)
+                .collect::<Vec<&str>>(),
+            ["--session-id", "--resume", "--fork-session", "--settings"],
+            "the default configuration spells cide's own arguments exactly as it always has"
+        );
+        assert_eq!(ClaudeSettings::default().cli.binary, "claude");
+    }
+
+    // ======================================================================================
+    // The injections, and the relationship the design hangs on.
+    // ======================================================================================
+
+    /// The property the whole feature rests on: the flags cide injects and the flags it
+    /// refuses *for an injection reason* are the same set, in both directions.
+    ///
+    /// Two lists would be two chances to disable an injection and leave its refusal standing —
+    /// a switch that turns a feature off and then forbids the replacement — or to relax a
+    /// refusal while cide still injects, which puts the user's flag and cide's on one command
+    /// line and is the silent breakage `REFUSED_ARGS` was written for.
+    ///
+    /// Delete a `because` from a row that has one and
+    /// `disabling_an_injection_relaxes_exactly_its_own_refusals` fails; delete an injection's
+    /// refusal outright, or add an injection with none, and this one does.
+    #[test]
+    fn every_injected_flag_is_refused_and_every_injection_refusal_is_injected() {
+        for spec in INJECTIONS {
+            assert!(
+                REFUSED_ARGS
+                    .iter()
+                    .any(|entry| entry.because == Some(spec.injection)
+                        && entry.flag == spec.default_flag),
+                "cide injects {} and nothing refuses it: a user could pass a second copy",
+                spec.default_flag
+            );
+        }
+        for entry in REFUSED_ARGS {
+            let Some(which) = entry.because else { continue };
+            assert!(
+                INJECTIONS.iter().any(|spec| spec.injection == which),
+                "{} is refused because of an injection that does not exist",
+                entry.flag
+            );
+        }
+        // And the unconditional ones stay unconditional. A `because` added to `--bare` would
+        // make an authentication failure switchable from a screen about spelling.
+        for flag in ["--bare", "--print"] {
+            assert!(
+                REFUSED_ARGS
+                    .iter()
+                    .find(|entry| entry.flag == flag)
+                    .is_some_and(|entry| entry.because.is_none()),
+                "{flag} breaks a pane whatever cide passes, so it is not an injection's refusal"
+            );
         }
     }
 
     #[test]
-    fn the_default_adds_nothing_at_all() {
-        let plan = plan(&ClaudeCli::default(), None);
-        assert_eq!(plan, Plan::default());
-        assert_eq!(ClaudeSettings::default().cli.binary, "claude");
+    fn disabling_an_injection_relaxes_exactly_its_own_refusals() {
+        let off = injected(&without(Injection::SessionId)).0;
+        for token in ["--session-id", "--session-id=abc", "--continue", "-c"] {
+            assert_eq!(
+                arg_verdict(token, &off),
+                Verdict::Accepted,
+                "{token} is illegal only beside a session id cide passes, and it no longer does"
+            );
+        }
+        for token in [
+            "--resume",
+            "-r",
+            "--fork-session",
+            "--settings",
+            "--bare",
+            "--print",
+        ] {
+            assert!(
+                arg_verdict(token, &off).is_refused(),
+                "{token} has nothing to do with the session id injection"
+            );
+        }
+
+        // The settings injection, whose refusal is the expensive one to get wrong in either
+        // direction: relaxed while cide still passes it, both payloads land and one loses.
+        let off = injected(&without(Injection::Settings)).0;
+        assert_eq!(arg_verdict("--settings", &off), Verdict::Accepted);
+        assert!(arg_verdict("--session-id", &off).is_refused());
+    }
+
+    #[test]
+    fn renaming_an_injection_moves_the_refusal_to_the_new_spelling() {
+        let renamed = injected(&renamed_cli(Injection::SessionId, "--sid")).0;
+        assert_eq!(renamed.flag(Injection::SessionId), Some("--sid"));
+        assert!(
+            arg_verdict("--sid", &renamed).is_refused(),
+            "the flag cide now writes is the one a second copy of would break"
+        );
+        assert!(
+            arg_verdict("--sid=abc", &renamed).is_refused(),
+            "and the `=` form of it"
+        );
+        assert_eq!(
+            arg_verdict("--session-id", &renamed),
+            Verdict::Accepted,
+            "and the spelling cide has stopped writing is the user's to pass"
+        );
+        // The alias goes with the flag it was an alias *for*. A renamed injection is driving
+        // something that is not Claude Code, and `-r` there is that harness's flag, not ours.
+        let renamed = injected(&renamed_cli(Injection::Resume, "--continue-from")).0;
+        assert!(arg_verdict("--continue-from", &renamed).is_refused());
+        assert_eq!(arg_verdict("-r", &renamed), Verdict::Accepted);
+        assert_eq!(arg_verdict("--resume", &renamed), Verdict::Accepted);
+    }
+
+    /// `claude`'s first positional argument is a prompt, which is the same trap `user_args`'
+    /// value-swallowing rule exists for. An override of `sid` would not rename a flag; it
+    /// would start every pane by asking the model something.
+    #[test]
+    fn a_positional_override_is_discarded_because_claudes_first_positional_is_a_prompt() {
+        let cli = renamed_cli(Injection::SessionId, "sid");
+        let (inject, notes) = injected(&cli);
+        assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].verdict.is_refused());
+        assert_eq!(notes[0].text, "sid");
+        assert!(
+            notes[0]
+                .verdict
+                .note()
+                .unwrap_or_default()
+                .contains("prompt"),
+            "the discard says why, or the field silently ignores what was typed into it"
+        );
+    }
+
+    #[test]
+    fn two_injections_cannot_be_given_the_same_spelling() {
+        // Against another injection's *default*, which is reserved whether or not that
+        // injection is switched on.
+        let cli = renamed_cli(Injection::SessionId, "--resume");
+        let (inject, notes) = injected(&cli);
+        assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
+        assert_eq!(inject.flag(Injection::Resume), Some("--resume"));
+        assert_eq!(notes.len(), 1);
+
+        // And against another injection's override. Both lose: picking a winner would make the
+        // outcome depend on a table order nobody can see.
+        let mut cli = ClaudeCli::default();
+        field_mut(&mut cli, Injection::SessionId).flag = "--id".into();
+        field_mut(&mut cli, Injection::Settings).flag = "--id".into();
+        let (inject, notes) = injected(&cli);
+        assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
+        assert_eq!(inject.flag(Injection::Settings), Some("--settings"));
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().all(|note| note.verdict.is_refused()));
+
+        // Even a *swap*, whose two spellings would in fact stay unique. Reserving the default
+        // spellings unconditionally is what makes the fallback well-founded: a discarded
+        // override falls back to its own default, and that default can then never collide with
+        // an override that was accepted. The alternative — allow the swap, and chase whether
+        // each fallback re-collides — is a fixpoint loop over a settings field, to buy a
+        // configuration nobody has asked for. Both rows are discarded and both say so.
+        let mut cli = ClaudeCli::default();
+        field_mut(&mut cli, Injection::SessionId).flag = "--resume".into();
+        field_mut(&mut cli, Injection::Resume).flag = "--session-id".into();
+        let (inject, notes) = injected(&cli);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
+        assert_eq!(inject.flag(Injection::Resume), Some("--resume"));
+    }
+
+    /// Defaults preserve today's behaviour exactly. Flip `ClaudeInjection::default()` to
+    /// `enabled: false` and this fails, which is the point: the hazard is silent, because a
+    /// pane with no injections starts perfectly well and simply reports nothing.
+    #[test]
+    fn the_default_injects_exactly_what_this_build_injected_before_the_switch_existed() {
+        let (inject, notes) = injected(&ClaudeCli::default());
+        assert!(notes.is_empty());
+        assert_eq!(inject, Injected::defaults());
+        assert_eq!(
+            flags(&ClaudeCli::default()),
+            ["--session-id", "--resume", "--fork-session", "--settings"]
+        );
+        for spec in INJECTIONS {
+            assert!(
+                inject.has(spec.injection),
+                "{} is off by default: every user's hooks or resume would die on upgrade",
+                spec.default_flag
+            );
+        }
+    }
+
+    /// The wire keys are the field names of `ClaudeInjections`, which is what the Settings row
+    /// looks a discarded rename's sentence up by. A typo is a sentence that never appears.
+    #[test]
+    fn every_injection_names_the_field_that_configures_it() {
+        let value = serde_json::to_value(ClaudeInjections::default()).expect("serializes");
+        let fields = value.as_object().expect("a struct");
+        assert_eq!(fields.len(), INJECTIONS.len());
+        for spec in INJECTIONS {
+            assert!(
+                fields.contains_key(spec.key),
+                "`{}` is not a field of ClaudeInjections",
+                spec.key
+            );
+        }
+    }
+
+    /// A disabled injection is absent from the argv and nothing else changes.
+    #[test]
+    fn a_disabled_injection_is_simply_not_written() {
+        let (inject, notes) = injected(&without(Injection::Settings));
+        assert!(notes.is_empty());
+        assert_eq!(inject.flag(Injection::Settings), None);
+        assert!(!inject.has(Injection::Settings));
+        assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
+        assert_eq!(flags(&without(Injection::Settings)).len(), 3);
+    }
+
+    /// A rename on a switched-off injection still gets its note, because the only way to
+    /// reach one is a hand-edited `workspace.json` and it will bite the moment the toggle
+    /// comes back on.
+    #[test]
+    fn a_bad_override_on_a_disabled_injection_is_still_reported() {
+        let mut cli = ClaudeCli::default();
+        field_mut(&mut cli, Injection::Resume).enabled = false;
+        field_mut(&mut cli, Injection::Resume).flag = "resume-please".into();
+        let (inject, notes) = injected(&cli);
+        assert!(!inject.has(Injection::Resume));
+        assert_eq!(notes.len(), 1);
+    }
+
+    /// The discarded overrides reach the log line, so a hand-edited `workspace.json` is not
+    /// the one refusal nothing anywhere mentions.
+    #[test]
+    fn a_discarded_override_is_one_of_the_plans_refusals() {
+        let plan = plan(&renamed_cli(Injection::Settings, "settings"), None);
+        assert_eq!(plan.refusals().count(), 1);
+        assert_eq!(plan.inject.flag(Injection::Settings), Some("--settings"));
+    }
+
+    /// Whitespace is trimmed, and a whitespace-only override is simply "no override" rather
+    /// than a refusal — it is what a text input holds after the user clears it.
+    #[test]
+    fn an_override_is_trimmed_and_a_blank_one_is_not_an_error() {
+        let (inject, notes) = injected(&renamed_cli(Injection::SessionId, "  --sid  "));
+        assert_eq!(inject.flag(Injection::SessionId), Some("--sid"));
+        assert!(notes.is_empty());
+        let (inject, notes) = injected(&renamed_cli(Injection::SessionId, "   "));
+        assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
+        assert!(notes.is_empty());
     }
 
     /// The whole point of the argument table, one row at a time.
@@ -713,7 +1415,7 @@ mod tests {
             "-p",
         ] {
             assert!(
-                arg_verdict(token).is_refused(),
+                arg_verdict(token, &Injected::defaults()).is_refused(),
                 "{token} duplicates an argument cide passes itself"
             );
         }
@@ -735,7 +1437,7 @@ mod tests {
             "plan",
         ] {
             assert_eq!(
-                arg_verdict(token),
+                arg_verdict(token, &Injected::defaults()),
                 Verdict::Accepted,
                 "{token} is not one of cide's own arguments"
             );
@@ -744,8 +1446,8 @@ mod tests {
 
     #[test]
     fn the_equals_form_is_the_same_flag() {
-        assert!(arg_verdict("--resume=abc").is_refused());
-        assert!(arg_verdict("--session-id=1234").is_refused());
+        assert!(arg_verdict("--resume=abc", &Injected::defaults()).is_refused());
+        assert!(arg_verdict("--session-id=1234", &Injected::defaults()).is_refused());
         // …and it carries its own value, so nothing after it is swallowed.
         let (kept, notes) = user_args(&cli(&["--resume=abc", "--model", "opus"], &[]));
         assert_eq!(kept, ["--model", "opus"]);

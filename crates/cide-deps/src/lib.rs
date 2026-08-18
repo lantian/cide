@@ -469,7 +469,7 @@ fn extra_paths_hint(kind: Toolchain) -> String {
 
 /// Fork a resolver, wait for it, and hand back its stdout.
 ///
-/// `scrub_command` then `arm`, in that order and never one without the other — the rule
+/// `prepare_command` then `arm`, in that order and never one without the other — the rule
 /// `CLAUDE.md` states about every `Command::new` in this workspace. The order matters only in
 /// that `arm` installs a `pre_exec` hook and reads no environment, so mirroring
 /// `cide_lsp::server`'s sequence keeps the two spawn sites readable side by side.
@@ -484,7 +484,7 @@ fn extra_paths_hint(kind: Toolchain) -> String {
 /// pipe buffer. **It also does the waiting on this thread**, which is what satisfies `arm`'s
 /// contract — see [`resolve`].
 fn run(kind: Toolchain, mut command: Command, what: &str) -> Result<Vec<u8>, DepsError> {
-    cide_core::child_env::scrub_command(&mut command);
+    cide_core::child_env::prepare_command(&mut command);
     cide_core::child_env::arm(&mut command);
     command
         .stdin(std::process::Stdio::null())

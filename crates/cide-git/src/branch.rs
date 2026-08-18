@@ -564,7 +564,7 @@ fn fetch_with(
             let mut command = Command::new("git");
             // Same reason as `push_via_binary`, and the same one line: a bundled launch must
             // not lend this `git` the AppImage's loader path. See `cide_core::child_env`.
-            cide_core::child_env::scrub_command(&mut command);
+            cide_core::child_env::prepare_command(&mut command);
             // After the bundle scrub, which never touches a proxy name. Same ordering and
             // same reason as `push_via_binary`.
             proxy.apply(&mut command);

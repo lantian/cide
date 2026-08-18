@@ -448,6 +448,104 @@ pub struct ClaudeCli {
     /// implements — later wins — so a shadowed duplicate can be shown as shadowed rather than
     /// silently dropped.
     pub env: Vec<ClaudeEnvVar>,
+
+    /// The arguments **cide itself** adds, and whether it still adds them.
+    ///
+    /// Everything above is what the user adds to a Claude Code launch. This is the other half,
+    /// and it is what lets the pane drive something that is *not* Claude Code — `opencode`, or
+    /// a wrapper that mints its own conversation ids. See `cide_core::claude_cli::INJECTIONS`,
+    /// which holds the flag spellings, the default-on rule and the argument for this shape.
+    pub inject: ClaudeInjections,
+}
+
+/// One argument cide adds to a Claude pane's command line, and whether it still does.
+///
+/// # `Default` is written by hand, and it is the most dangerous line in this file
+///
+/// `bool::default()` is `false`. [`ClaudeCli`] carries a container-level `#[serde(default)]`,
+/// so a *derived* `Default` here would make every `workspace.json` written before this field
+/// existed — which is every one of them — deserialize with **all four injections off**. Every
+/// user's hooks and resume would die on the launch after an upgrade, from a screen they never
+/// opened, with no runtime symptom pointing at it: the pane starts fine and simply reports
+/// nothing. `ProxyScope` carries the same hand-written `Default` for the same class of bug.
+///
+/// `a_configuration_predating_the_injection_switches_still_injects_everything` is the guard.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ClaudeInjection {
+    /// Whether cide passes this argument at all. `true` is today's behaviour and the default.
+    ///
+    /// Off, the argument is simply absent from the argv. Nothing else changes — the pane still
+    /// gets `CIDE_SESSION` and `CLAUDE_CODE_SSE_PORT`, and the registry still keys on cide's
+    /// own id. What is lost is stated on the toggle in `ClaudeCliSection.tsx`, per injection,
+    /// because each of these silently disables a feature the user will otherwise report as
+    /// broken without connecting it to this switch.
+    pub enabled: bool,
+
+    /// The spelling to use instead of the default one, or empty for the default.
+    ///
+    /// Empty rather than `Option<String>`: the field is edited by a text input that is empty
+    /// when untouched, and a `None`/`Some("")` distinction the UI cannot express is a
+    /// distinction that only ever produces a bug. `cide_core::claude_cli::injected` trims it
+    /// and discards an override that is not a flag (a bare token would become `claude`'s first
+    /// positional argument, which is a *prompt*) or that collides with another injection's
+    /// spelling.
+    pub flag: String,
+}
+
+impl Default for ClaudeInjection {
+    fn default() -> Self {
+        Self {
+            // Today's behaviour, exactly. See the struct's note for why this cannot be derived.
+            enabled: true,
+            // Empty means "whatever `INJECTIONS` spells it", so the default spelling lives in
+            // exactly one place and a CLI rename is one edit rather than two.
+            flag: String::new(),
+        }
+    }
+}
+
+/// The four arguments cide adds to a Claude pane, each independently switchable.
+///
+/// Four named fields rather than a map keyed by a string: the set is closed — it is exactly
+/// what `cide_core::claude_cli::INJECTIONS` enumerates — and a map would let `workspace.json`
+/// name an injection that does not exist, which is a setting wired to nothing.
+///
+/// Hand-written `Default` for the same reason [`ClaudeInjection`]'s is; a derived one here
+/// would be correct only for as long as that one stays hand-written, which is not a property
+/// worth depending on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct ClaudeInjections {
+    /// `--session-id <uuid>`. Off: no stable pane-to-conversation identity, and resume stops
+    /// working — the CLI mints its own id and files the transcript under it.
+    pub session_id: ClaudeInjection,
+    /// `--resume <uuid>`. Off: a restored pane starts a fresh conversation.
+    pub resume: ClaudeInjection,
+    /// `--fork-session`. Off: Split → fork branches nothing; it becomes a plain resume.
+    pub fork_session: ClaudeInjection,
+    /// `--settings <inline json>`. Off: **no hooks at all** — see the toggle's own copy.
+    pub settings: ClaudeInjection,
+}
+
+// Clippy is right that this is `#[derive(Default)]` *today*, and wrong about what that costs.
+// The derive is correct only for as long as `ClaudeInjection`'s hand-written `Default` stays
+// hand-written; the day somebody derives that one, this one silently becomes "every injection
+// off" for every `workspace.json` on disk — no hooks, no resume, on the launch after an
+// upgrade. Written out so the two live next to each other and one cannot quietly change the
+// other's meaning.
+#[allow(clippy::derivable_impls)]
+impl Default for ClaudeInjections {
+    fn default() -> Self {
+        Self {
+            session_id: ClaudeInjection::default(),
+            resume: ClaudeInjection::default(),
+            fork_session: ClaudeInjection::default(),
+            settings: ClaudeInjection::default(),
+        }
+    }
 }
 
 impl Default for ClaudeCli {
@@ -457,6 +555,9 @@ impl Default for ClaudeCli {
             binary: "claude".to_string(),
             args: Vec::new(),
             env: Vec::new(),
+            // All four on: the argv a pane is spawned with is byte-for-byte what it was before
+            // these switches existed. See `ClaudeInjection`'s note.
+            inject: ClaudeInjections::default(),
         }
     }
 }
@@ -477,6 +578,9 @@ impl fmt::Debug for ClaudeCli {
             .field("args", &self.args)
             // Values do not survive. See the struct's note.
             .field("env", &self.env)
+            // Not secret at all, and the single most useful thing in this line when a pane has
+            // no hooks or will not resume: it says whether cide still passes the flag.
+            .field("inject", &self.inject)
             .finish()
     }
 }
@@ -577,8 +681,9 @@ pub enum ProxyMode {
 ///
 /// The trap is that "cide does not add a proxy for git" and "git does not use a proxy" are
 /// **not the same sentence**. `std::process::Command` inherits this process's environment
-/// wholesale, and `cide_core::child_env::scrub_command` filters by value prefix against
-/// `$APPDIR` — a proxy URL never points inside an AppImage, so it survives untouched. A cide
+/// wholesale, and `cide_core::child_env::prepare_command` touches only two things: values
+/// prefixed with `$APPDIR`, and `PATH`. A proxy URL is neither — it never points inside an
+/// AppImage and it is not `PATH` — so it survives untouched. A cide
 /// launched from a shell that exports `HTTPS_PROXY` therefore *already* sends every
 /// `git push` through that proxy, and a two-state switch could only ever decide whether cide
 /// adds one on top. So there are three states and the middle one is the default:
@@ -1190,6 +1295,111 @@ mod tests {
         );
         // And the rest of the file still parsed.
         assert_eq!(settings.sidebar.files_width, 300);
+    }
+
+    /// **The upgrade trap, and it is the one that matters.**
+    ///
+    /// Every `workspace.json` on disk predates `ClaudeCli::inject`. `ClaudeCli` carries a
+    /// container-level `#[serde(default)]`, so a *derived* `Default` on [`ClaudeInjection`] —
+    /// where `bool::default()` is `false` — would load every one of those files with all four
+    /// injections off: no `--settings` and therefore **no hooks at all**, and no `--session-id`
+    /// and therefore no resume, for every user, on the launch after an upgrade, from a screen
+    /// they never opened. There is no runtime symptom pointing at it; the pane starts fine and
+    /// simply reports nothing.
+    ///
+    /// Hand-edit `ClaudeInjection::default()` to `enabled: false` and this fails.
+    #[test]
+    fn a_configuration_predating_the_injection_switches_still_injects_everything() {
+        // An M16-era value, exactly as that build wrote it.
+        let legacy = r#"{"binary":"claude","args":[],"env":[]}"#;
+        let cli: ClaudeCli = serde_json::from_str(legacy).expect("legacy claude cli");
+        assert_eq!(cli, ClaudeCli::default());
+        for injection in [
+            &cli.inject.session_id,
+            &cli.inject.resume,
+            &cli.inject.fork_session,
+            &cli.inject.settings,
+        ] {
+            assert!(injection.enabled, "an upgrade must change nothing");
+            assert_eq!(injection.flag, "", "and the spelling is still cide's own");
+        }
+
+        // The same for a whole settings document that predates the field, since that is the
+        // shape actually on disk.
+        let legacy = r#"{"theme":"dark","claude":{"cli":{"binary":"/opt/claude"}}}"#;
+        let settings: Settings = serde_json::from_str(legacy).expect("legacy settings");
+        assert_eq!(settings.claude.cli.binary, "/opt/claude");
+        assert!(settings.claude.cli.inject.settings.enabled);
+    }
+
+    /// One toggle set does not turn the others off, which is what a hand-written `Default` on
+    /// the *container* is for: `#[serde(default)]` fills a missing field from
+    /// `ClaudeInjections::default()`, not from `ClaudeInjection`'s derive.
+    #[test]
+    fn one_named_injection_leaves_the_other_three_alone() {
+        let json = r#"{"inject":{"settings":{"enabled":false}}}"#;
+        let cli: ClaudeCli = serde_json::from_str(json).expect("partial inject");
+        assert!(!cli.inject.settings.enabled);
+        assert!(cli.inject.session_id.enabled);
+        assert!(cli.inject.resume.enabled);
+        assert!(cli.inject.fork_session.enabled);
+        // …and a toggle with no spelling beside it is still the default spelling.
+        assert_eq!(cli.inject.session_id.flag, "");
+    }
+
+    /// The wire names, which the Settings screen reads off the generated bindings.
+    #[test]
+    fn an_injection_survives_the_json_round_trip_under_its_camel_case_name() {
+        let mut cli = ClaudeCli::default();
+        cli.inject.fork_session.flag = "--branch".into();
+        cli.inject.session_id.enabled = false;
+        let json = serde_json::to_string(&cli).expect("serializes");
+        assert!(
+            json.contains(r#""forkSession":{"enabled":true,"flag":"--branch"}"#),
+            "{json}"
+        );
+        assert!(json.contains(r#""sessionId":{"enabled":false"#), "{json}");
+        assert_eq!(serde_json::from_str::<ClaudeCli>(&json).unwrap(), cli);
+    }
+
+    /// The hand-written `Debug` on `ClaudeCli` is a list that can fall behind the struct, and
+    /// the failure is silent: the missing field simply stops appearing in every log line. The
+    /// injections are the single most useful thing in that line when a pane has no hooks or
+    /// will not resume, because they say whether cide still passes the flag at all.
+    #[test]
+    fn a_claude_cli_debug_print_names_every_field() {
+        let printed = format!("{:?}", ClaudeCli::default());
+        let value = serde_json::to_value(ClaudeCli::default()).expect("serializes");
+        let fields = value.as_object().expect("a struct");
+        assert!(!fields.is_empty());
+        for name in fields.keys() {
+            let flattened: String = name.chars().filter(char::is_ascii_alphanumeric).collect();
+            let haystack: String = printed
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_lowercase();
+            assert!(
+                haystack.contains(&flattened.to_lowercase()),
+                "`{name}` is a field of ClaudeCli and does not appear in {printed}"
+            );
+        }
+    }
+
+    /// And the reason that `Debug` is hand-written in the first place still holds: a value the
+    /// user typed is a place a token for their own MCP server ends up.
+    #[test]
+    fn an_environment_value_does_not_survive_debug() {
+        let cli = ClaudeCli {
+            env: vec![ClaudeEnvVar {
+                name: "MY_MCP_TOKEN".into(),
+                value: "hunter2".into(),
+            }],
+            ..ClaudeCli::default()
+        };
+        let printed = format!("{:?}", cli);
+        assert!(printed.contains("MY_MCP_TOKEN"), "{printed}");
+        assert!(!printed.contains("hunter2"), "{printed}");
     }
 
     #[test]

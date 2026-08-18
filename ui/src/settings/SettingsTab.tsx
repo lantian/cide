@@ -57,6 +57,22 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
    * blocking pool — per *distinct* binary, not per keystroke: the field commits on blur, so
    * `settings.claude.cli.binary` changes once per edit rather than once per character.
    *
+   * # …and when the injections change, which is a second reason and a newer one
+   *
+   * `ClaudeCliSupport` stopped being a fact about a binary the moment the injection switches
+   * existed. `argReasons` is now keyed by the flag cide will *actually* write — a refusal lifts
+   * when an injection is switched off and moves when it is renamed — and `injectReasons` exists
+   * only for the configuration that produced it. Keyed on the binary alone this effect never
+   * re-ran for either, so a user who typed `sid` into a flag field got the input struck through
+   * with **no sentence under it**, and a `--sid` of their own struck through with the sentence
+   * for a flag nobody passes. Both are the exact state `CliReason` was added to end, and the
+   * only cure was editing the binary or closing the tab.
+   *
+   * Serialised rather than depended on by identity: `settings` is a fresh object on every
+   * workspace snapshot, so the reference changes constantly and the string does not. It changes
+   * when a toggle or a spelling does, and both commit on blur or on click — the same order of
+   * frequency the binary field already pays a probe for.
+   *
    * `cliSupport` degrades to a verdict-free value rather than throwing, so a build without the
    * command still draws.
    */
@@ -64,6 +80,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
   // so the first probe waits for the real value instead of firing once for the default and
   // again for whatever the user actually configured.
   const configuredBinary = settings?.claude.cli.binary
+  const configuredInjections = JSON.stringify(settings?.claude.cli.inject ?? null)
   const [cliSupport, setCliSupport] = useState<ClaudeCliSupport | null>(null)
   useEffect(() => {
     if (configuredBinary === undefined) return
@@ -74,7 +91,7 @@ export function SettingsTab({ project, section }: SettingsTabProps) {
     return () => {
       live = false
     }
-  }, [configuredBinary])
+  }, [configuredBinary, configuredInjections])
 
   /**
    * The log directory, resolved by opening it.

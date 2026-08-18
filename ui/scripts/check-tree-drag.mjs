@@ -117,6 +117,19 @@ try {
     expanded: false,
     hasChildren: false,
   })
+  /**
+   * *Project Notes* — a pinned row. It **opens**, which is what makes it worth asserting here:
+   * it is the first synthetic row with a live gesture on it, and "openable" must not leak into
+   * "draggable" or "a folder you can drop onto". Its path is the same non-absolute sentinel a
+   * header carries, so both refusals fall out of rules that already existed.
+   */
+  const pin = (name) => ({
+    path: 'cide://group/projectNotes',
+    kind: 'pin',
+    name,
+    expanded: false,
+    hasChildren: false,
+  })
 
   const MAIN = `${ROOT}/src/main.rs`
   const LIB = `${ROOT}/src/lib.rs`
@@ -156,6 +169,12 @@ try {
 
   eq(pick(header('External Libraries')), null, 'a group header is not a drag source at all')
   eq(pick(note('cargo is not on PATH')), null, 'and neither is a note')
+  eq(
+    pick(pin('Project Notes')),
+    null,
+    'a pin is openable and is still not a drag source: `grab` gates on `actionable`, so a '
+      + 'Ctrl+X or a drag would otherwise carry a sentinel that names no file',
+  )
 
   eq(pick(file(MAIN)).label, 'main.rs', 'the ghost calls one file by its name')
   eq(pick(dir(SRC)).label, 'src/', 'and one folder with the slash that says it is one')
@@ -253,6 +272,12 @@ try {
     'and names the heading, because its path is a cide:// sentinel that means nothing to a user',
   )
   eq(drop(one, note('cargo is not on PATH')).kind, 'refuse', 'a note refuses')
+  eq(
+    drop(one, pin('Project Notes')).kind,
+    'refuse',
+    'and so does a pin: its path is a sentinel, so `targetFor` would hand back the "parent" of '
+      + 'a string that names nothing and Rust would refuse the move after the drop',
+  )
 
   const intoCrate = drop(one, dir(`${CRATE}/src`))
   eq(intoCrate.kind, 'refuse', 'a dependency source directory refuses as a DESTINATION too')

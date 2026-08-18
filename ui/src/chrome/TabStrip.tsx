@@ -27,13 +27,41 @@
  * out of hit-testing, so the OS title says one session wants you and the only surface that
  * could say which is behind a tab you have to guess at. The tab strip is the one part of a
  * background tab that stays visible, which is why the count goes here.
+ *
+ * # The `▾` at the right end, and why it is a sibling of the tabs box
+ *
+ * `.tabs` is `overflow: hidden` and `.tab` is `flex: none`, so an overfull strip *clips*: the
+ * tabs past the edge are not painted, not hit-testable and — as `useTabDrag` records — not even
+ * droppable. The chevron opens a list of exactly those, and activating one switches to it. The
+ * rule for which those are is `tabOverflow.clippedTabs`, measured off the DOM below.
+ *
+ * Two decisions about where it lives, both of which have already been made once in this app:
+ *
+ * 1. **Outside the tablist.** `.tabs` is `role="tablist"`, and a generic element inside it
+ *    breaks the ownership the tabs pattern requires — the same reason `TabItem`'s row is
+ *    `role="presentation"`. It is also the bug `AppHeader` fixed by moving `<ProjectMenu>` out
+ *    of *its* `.tabs` box: a control that opens the list of what is clipped, placed inside the
+ *    box that does the clipping, eventually clips itself. Outside, it is pinned.
+ * 2. **The slot is always rendered; only the button is conditional.** So the tabs box has the
+ *    same width whether or not the chevron is showing, and `clippedTabs` stays a function of
+ *    geometry alone. A slot that appeared with the button would narrow the tabs box, which can
+ *    clip one more tab, which keeps the button on — two self-consistent states with the outcome
+ *    depending on which way the window was last resized, plus a width literal in TypeScript that
+ *    has to agree with the stylesheet for ever. The reserve is 24px of the strip's right-hand
+ *    third, which is empty spacer in every state except an overfull one.
+ *
+ * The tabs themselves are *not* shrunk to make room, and that is a requirement rather than a
+ * preference: `.tab { flex: none }` is what keeps the 12/13px paddings the chrome audit measures,
+ * and a horizontal reserve taken out of the thing being reserved against has been rejected in
+ * this app once already (the pane cluster over the find bar, README's M16).
  */
-import { useRef, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
 import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
-import { tabMenuEntries } from './menuModel'
+import { overflowEntries, tabMenuEntries } from './menuModel'
+import { clippedTabs, overflowHint } from './tabOverflow'
 import { useTabDrag } from './useTabDrag'
 import styles from './TabStrip.module.css'
 
@@ -118,6 +146,109 @@ export function TabStrip({
       : {}),
   })
 
+  /*
+   * The ids the strip is currently hiding, and the three things that can change them.
+   *
+   * The measurement is deliberately dumb — read every `[data-tab-id]` box, hand the numbers to
+   * `clippedTabs` — because everything that could be wrong about it is arithmetic, and the
+   * arithmetic is the half `check:tab-overflow` can actually run. `offsetLeft` is relative to
+   * `.tabs` (it is `position: relative`, the line the drag caret also depends on), and
+   * `clientWidth` is that box's *visible* width, which already tracks the window: `.tabs` is
+   * `flex: 0 1 auto` next to a `flex: 1` spacer whose basis is 0, so an overfull strip shrinks
+   * the tabs box and nothing else.
+   *
+   * `[data-tab-id]` rather than a ref per tab, exactly as `useTabDrag.aim` does: the attribute is
+   * already there for the context menu, and a ref array would need its own invalidation.
+   */
+  const overflowAnchor = useRef<HTMLButtonElement | null>(null)
+  const [hidden, setHidden] = useState<readonly string[]>([])
+  const measure = useCallback(() => {
+    const box = tablist.current
+    if (box === null) return
+    const boxes = Array.from(box.querySelectorAll<HTMLElement>('[data-tab-id]')).map((el) => ({
+      id: el.dataset.tabId ?? '',
+      left: el.offsetLeft,
+      width: el.offsetWidth,
+    }))
+    const next = clippedTabs(boxes, { viewport: box.clientWidth, scroll: box.scrollLeft })
+    // Identity-stable when nothing changed, and that is not a micro-optimisation: the layout
+    // effect below runs on *every* commit with no dependency array, so a fresh array every time
+    // would be a state write every time — a render loop that only shows up as the app pinning a
+    // core.
+    setHidden((prev) =>
+      prev.length === next.length && prev.every((id, i) => id === next[i]) ? prev : next,
+    )
+  }, [])
+
+  /*
+   * Trigger 1: every commit, before paint.
+   *
+   * No dependency array on purpose. Anything that changes a tab's *width* changes the answer,
+   * and the list of those is not enumerable: a file going dirty swaps a 12px `×` for a 14px `•`,
+   * a `claudeFull` tab's title is renamed by the agent, a badge goes from `·` to `TOML`, a tab is
+   * opened or closed or reordered. A dependency array here is how the chevron goes stale, and
+   * stale is worse than absent — it lists a tab that is on screen, or hides while three are not.
+   *
+   * `useLayoutEffect` rather than `useEffect` so the control is never one painted frame late; the
+   * reads are ~12 `offsetLeft`/`offsetWidth` on elements the engine has just laid out.
+   */
+  useLayoutEffect(measure)
+
+  /*
+   * Trigger 2: the box changing size — or scrolling — without the tabs changing.
+   *
+   * Resizing the window, dragging the sidebar splitter, a detached window being tiled. None of
+   * those re-render this component with different props, so no commit happens and trigger 1 never
+   * fires. The `typeof` guard is the same one `PaneSlot` and `GitDiffPane` carry.
+   */
+  useEffect(() => {
+    const box = tablist.current
+    if (box === null) return
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => measure())
+    ro?.observe(box)
+    /*
+     * ...and the box *scrolling* without either changing, which is the same class of miss and
+     * was very nearly shipped unwired: `clippedTabs` takes `scroll` as a real input — the whole
+     * reason it compares against both edges rather than only the right one — but a scroll
+     * changes no box's size and re-renders nothing, so without this listener the only trigger
+     * that could ever deliver a non-zero `scrollLeft` to the rule was an unrelated commit that
+     * happened to follow it. `overflow: hidden` is still a scroll container and WebKit scrolls
+     * one programmatically to reveal a focused descendant, so Tab-ing into a clipped tab's
+     * button leaves the strip scrolled with the *leading* tabs gone: the chevron would then be
+     * offering a tab that is on screen and omitting the three that are not.
+     *
+     * `passive` because this listener never calls `preventDefault`, and in capture for the
+     * reason the menus' dismissal listener states — a `scroll` event does not bubble.
+     */
+    const onScroll = () => measure()
+    box.addEventListener('scroll', onScroll, { passive: true })
+    return () => {
+      ro?.disconnect()
+      box.removeEventListener('scroll', onScroll)
+    }
+  }, [measure])
+
+  /*
+   * Trigger 3: the webfonts resolving.
+   *
+   * The opposite case to trigger 2, and it is the one that would have been missed. An unloaded
+   * face is measured at the fallback stack's metrics — `App.tsx` already waits on `fonts.ready`
+   * for exactly this — and when the swap lands on an *already overfull* strip, every tab changes
+   * width while `.tabs` does not, so the ResizeObserver never fires and no re-render happens
+   * either. The mounted flag is because `fonts.ready` can settle after this strip is gone: a
+   * detached-tab window's strip outlives nothing, but the audit fixture's does.
+   */
+  useEffect(() => {
+    if (typeof document === 'undefined' || document.fonts === undefined) return
+    let alive = true
+    void document.fonts.ready.then(() => {
+      if (alive) measure()
+    })
+    return () => {
+      alive = false
+    }
+  }, [measure])
+
   const menu = useContextMenu({
     label: 'Tab',
     items: ({ target }) => {
@@ -138,6 +269,28 @@ export function TabStrip({
         ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
       })
     },
+  })
+
+  /*
+   * The `▾` list, on the same hook the strip's context menu uses.
+   *
+   * Reusing `useContextMenu` rather than writing a popup is the whole of the keyboard and
+   * dismissal story: Escape, arrows, Home/End, Tab cycling within the menu, pointerdown outside,
+   * scroll, resize and blur all come with it, it portals to the app root so no `overflow: hidden`
+   * ancestor can clip it, and `placeMenu` flips it near the window edge — which matters here more
+   * than anywhere, because this control lives *at* the right edge by construction.
+   *
+   * The one inherited wart: pressing `▾` while its menu is open re-opens rather than toggling
+   * shut, because the hook's capture-phase `pointerdown` dismissal fires before the `click`.
+   * `ProjectMenu`'s `▾` behaves identically today, and matching it beats inventing a fourth
+   * dismissal path for one button.
+   *
+   * `items` is called at open time, so the list is built from the measurement as it stands when
+   * the user presses — not from whatever was true at the last render.
+   */
+  const overflow = useContextMenu({
+    label: 'Tabs not in view',
+    items: () => overflowEntries(tabs, hidden, { ...(onActivate ? { activate: onActivate } : {}) }),
   })
 
   // The `data-audit` attributes below are how chrome/layoutAudit.ts locates this surface:
@@ -194,7 +347,37 @@ export function TabStrip({
         )}
       </div>
       <div className={styles.spacer} />
+      {/*
+       * The reserved slot. Always here, empty when everything fits — see the module comment:
+       * this is what keeps `.tabs`'s width independent of whether the control is showing, and
+       * therefore what stops the detector oscillating at the boundary.
+       */}
+      <div className={styles.overflowSlot}>
+        {hidden.length > 0 && (
+          <button
+            type="button"
+            ref={overflowAnchor}
+            className={styles.overflow}
+            // The count lives in the tooltip and the accessible name, never on the glyph: a
+            // label that grew a digit would change this slot's width, which changes what is
+            // clipped, which changes the digit. See `overflowHint`.
+            title={overflowHint(hidden.length)}
+            aria-label={overflowHint(hidden.length)}
+            aria-haspopup="menu"
+            aria-expanded={overflow.isOpen}
+            onClick={() => {
+              const el = overflowAnchor.current
+              if (el !== null) overflow.openFor(el)
+            }}
+          >
+            {/* The glyph `ProjectMenu` already uses for "this opens a list", which is also the
+                control the report asked for: "a dropdown icon (like > but down)". */}
+            ▾
+          </button>
+        )}
+      </div>
       {menu.menu}
+      {overflow.menu}
     </div>
   )
 }

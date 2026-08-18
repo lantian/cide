@@ -49,7 +49,7 @@
  */
 import { useOverlays } from '@/overlays/store'
 import { useFileTree } from '@/sidebar/treeStore'
-import { EXTERNAL_LIBRARIES, SCRATCHES } from '@/sidebar/groupRows'
+import { EXTERNAL_LIBRARIES, PROJECT_NOTES, SCRATCHES, groupPath } from '@/sidebar/groupRows'
 import { useGitStatus } from '@/sidebar/gitStatusStore'
 import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
@@ -65,6 +65,8 @@ import {
   branch as branchApi,
   claudeSend,
   diag,
+  file as fileApi,
+  fs as fsApi,
   git as gitApi,
   settings as settingsApi,
   tab as tabApi,
@@ -961,6 +963,47 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
        * which a detached-pane window is in permanently. A notice there would fire on every
        * stray ⇧⌥S in a torn-out terminal.
        */
+      /*
+       * The project's notes: the pinned row's double-click, its context menu, and the palette
+       * row, all arriving here.
+       *
+       * Three calls in a fixed order, and each one is load-bearing:
+       *
+       *   1. `notesEnsure` — creates the file and its directory on the **first** call and
+       *      answers the path. It never truncates, so the second and hundredth clicks are safe;
+       *      the guarantee lives in `cide_core::notes::ensure` and is the one line in this
+       *      feature that could lose data.
+       *   2. `file.open` — an **ordinary** file tab. That is the whole reason the feature is one
+       *      command rather than a new tab kind: save, the dirty marker, undo, find-in-file and
+       *      the markdown grammar all work because nothing about this tab is special.
+       *   3. `reveal` of the pin's sentinel — **not** `revealGroup`, which issues an
+       *      `fs_expand` a pin has nothing to answer. `reveal` scrolls to the row and selects
+       *      it, which is what tells the user where the thing they just opened lives.
+       *
+       * The refusals are `unmet` rather than notices, the same deliberate difference
+       * `scratch.new` below draws: these are "this window is not the one with a project and a
+       * file tree", which the palette already hides the row for and which a detached-pane window
+       * is in permanently — a notice there would fire on every stray keystroke in a torn-out
+       * terminal.
+       *
+       * Deliberately uncaught, like every other command call in this file: `chrome/Failures.tsx`
+       * turns a rejection into the sentence that says why. And deliberately no `jumpTo` — the
+       * same reasoning `createScratch` states in `App.tsx`: a notes file has no place in it to
+       * navigate to, and recording a Back stop on it would put a history entry on nothing.
+       */
+      case 'file.projectNotes': {
+        if (boot()?.role.kind !== 'shell') return unmet(command, 'this window has no file tree')
+        const notesProject = activeProjectOf(boot())
+        if (notesProject === null) return unmet(command, 'no open project')
+        void fsApi.notesEnsure(notesProject.id).then(async (path) => {
+          await fileApi.open(notesProject.id, path)
+          await useWorkspace.getState().hydrate()
+          deps.showSidebar?.('files')
+          await useFileTree.getState().reveal(groupPath(PROJECT_NOTES))
+        })
+        return
+      }
+
       case 'scratch.new': {
         if (boot()?.role.kind !== 'shell') return unmet(command, 'this window has no file tree')
         if (activeProjectOf(boot()) === null) return unmet(command, 'no open project')

@@ -38,6 +38,7 @@
   "fs_delete",
   "fs_expand",
   "fs_index",
+  "fs_notes_ensure",
   "fs_paste",
   "fs_paste_plan",
   "fs_paths_exist",

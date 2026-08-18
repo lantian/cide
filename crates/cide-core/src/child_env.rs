@@ -91,7 +91,32 @@
 //! * Nothing is scrubbed when `APPDIR` is unset, which is every development run, every `.deb`
 //!   install and every Flatpak. `./run.sh` produces an identical environment before and after
 //!   this module existed.
+//!
+//! ---
+//!
+//! # Part one and a half: what a child must be *given* (M17)
+//!
+//! The scrub only ever takes away, and that turned out to be half a rule. A macOS user reported
+//! *"goto in golang project not working on macos (but works on linux), it just prints: gopls no
+//! views, rust-analyzer also not working, it writes: the language server stopped"*. cide had
+//! **found** `gopls` — `toolchain::search_paths` adds `~/go/bin`, so discovery never failed and
+//! the user never saw the sentence about installing it — spawned it, and handed it launchd's
+//! `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, because that is what a Finder-launched `.app` inherits
+//! and because everything below this line only removes. A `gopls` that cannot exec `go` cannot
+//! build a workspace view and answers `no views` to every request; a rustup `rust-analyzer`
+//! proxy with no toolchain reachable exits, which reads as `the language server stopped`.
+//!
+//! So [`child_path`] is the second half: **append** the directories
+//! [`crate::toolchain::extra_dirs`] names — the same ones `which` searched — to whatever `PATH`
+//! the child would otherwise have got. [`prepare_command`] applies both passes together, which
+//! is why it is no longer called `scrub_command`: a function named for removing that also adds
+//! is exactly the drift the comments in this file exist to prevent, and the alternative — leave
+//! the name and add a second call at each of the seven spawn sites — recreates the
+//! forgettable-second-line failure mode ADR 0008's `arm` already suffers from.
+//!
+//! The composition order is load-bearing and is stated in [`child_path_in`].
 
+use std::ffi::OsStr;
 use std::process::Command;
 
 /// One change to make to a child's inherited environment: `Some(value)` sets it, `None`
@@ -238,13 +263,79 @@ fn under(entry: &str, root: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// Apply [`bundle_scrub`] to a [`Command`] that is about to be spawned.
+/// The `PATH` a child should be given, or `None` to leave the inherited one alone.
 ///
-/// For the children spawned with `std::process` — the `claude` one-shots, `git push`,
-/// `claude --version`. PTY children take the same changes through `SpawnSpec`, in
-/// `cide_app::cmd::session::base_env`, because this crate cannot see `cide-pty`'s types.
-pub fn scrub_command(command: &mut Command) {
-    for (name, value) in bundle_scrub() {
+/// The impure wrapper: reads this process's `PATH` and [`crate::toolchain::extra_dirs`], and
+/// hands both to [`child_path_in`]. `scrub` must be the [`bundle_scrub`] the same spawn is about
+/// to apply — see [`child_path_in`] for why that is not optional.
+pub fn child_path(scrub: &[EnvChange]) -> Option<EnvChange> {
+    child_path_in(
+        scrub,
+        std::env::var_os("PATH").as_deref(),
+        crate::toolchain::extra_dirs(),
+    )
+}
+
+/// The rule itself, over a scrub, an inherited `PATH` and a list of directories handed in.
+///
+/// # Why it takes the scrub, and why that ordering is not a detail
+///
+/// `bundle_scrub` may rewrite `PATH` — under an AppImage it does, dropping `$APPDIR/usr/bin`,
+/// which is the whole of ADR 0007's first line. A `PATH` recomputed from the **process's** value
+/// and applied afterwards would put those entries straight back and reintroduce ADR 0007 through
+/// the door built to close it: a child would once again resolve binaries out of a mount point
+/// that ceases to exist the moment cide quits. So the base is the scrub's own `PATH` entry when
+/// it has one, and `inherited` only otherwise. `path_is_built_on_the_scrubbed_value` is the test
+/// that fails if someone later "simplifies" [`child_path`] to read the process environment.
+///
+/// A scrub that *removed* `PATH` outright — every entry it had was inside the bundle, so the
+/// user had none of their own — still gets the extras, and that is deliberate: the removal said
+/// "none of those directories were yours", not "this child must search nowhere".
+///
+/// # Non-UTF-8
+///
+/// [`EnvChange`] is `(String, Option<String>)`, so a `PATH` that is not valid UTF-8 cannot be
+/// carried through it. The answer is `None` — leave it alone. A lossy conversion would *corrupt*
+/// a working `PATH` rather than fail to improve it, which is strictly worse than doing nothing.
+/// (`bundle_scrub_from` sidesteps the same question by taking `std::env::vars()`, which skips
+/// non-UTF-8 variables entirely.)
+pub fn child_path_in(
+    scrub: &[EnvChange],
+    inherited: Option<&OsStr>,
+    extra: &[std::path::PathBuf],
+) -> Option<EnvChange> {
+    let base = match scrub.iter().find(|(name, _)| name == "PATH") {
+        Some((_, Some(value))) => Some(std::ffi::OsString::from(value)),
+        Some((_, None)) => None,
+        None => inherited.map(std::ffi::OsString::from),
+    };
+    let joined = crate::toolchain::child_path_from(base.as_deref(), extra)?;
+    Some(("PATH".to_string(), Some(joined.into_string().ok()?)))
+}
+
+/// Apply [`bundle_scrub`] and [`child_path`] to a [`Command`] that is about to be spawned.
+///
+/// For the children spawned with `std::process` — the language servers, `cargo metadata`,
+/// `go list`, the `claude` one-shots, `git push`, `claude --version`. PTY children take the same
+/// two passes through `SpawnSpec`, in `cide_app::cmd::session::base_env`, because this crate
+/// cannot see `cide-pty`'s types.
+///
+/// **Named `prepare_command`, not `scrub_command`.** It was the latter until M17, when it grew
+/// the `PATH` pass; a function called *scrub* that adds a variable is the kind of drift the
+/// comments in this file exist to prevent, and the compiler finding all seven call sites made the
+/// rename the cheap half of the change.
+///
+/// [`arm`] is deliberately **not** folded in here, even though every one of those call sites
+/// wants both. Its contract — *the forking thread must outlive the child* — is an obligation on
+/// the caller that no function signature can discharge, and hiding the call would make that
+/// obligation unstateable at the place it has to be met.
+///
+/// The `PATH` pass goes last, so that where both produce a `PATH` the appended list wins; it was
+/// built *from* the scrubbed value, so nothing the scrub removed comes back.
+pub fn prepare_command(command: &mut Command) {
+    let scrub = bundle_scrub();
+    let path = child_path(&scrub);
+    for (name, value) in scrub.into_iter().chain(path) {
         match value {
             Some(value) => command.env(name, value),
             None => command.env_remove(name),
@@ -686,6 +777,142 @@ mod tests {
         let vars = [("PATH".to_string(), "/usr/bin".to_string())];
         assert!(bundle_scrub_from(vars.clone(), "").is_empty());
         assert!(bundle_scrub_from(vars, "usr").is_empty());
+    }
+
+    // --- part one and a half: the PATH a child is given ---------------------------------
+
+    fn extra(names: &[&str]) -> Vec<std::path::PathBuf> {
+        names.iter().map(std::path::PathBuf::from).collect()
+    }
+
+    fn path_of(change: Option<EnvChange>) -> Option<String> {
+        let (name, value) = change?;
+        assert_eq!(name, "PATH");
+        value
+    }
+
+    /// The ADR 0007 composition test, and the one that fails if [`child_path`] is ever
+    /// "simplified" to read the process environment directly.
+    #[test]
+    fn the_child_path_is_built_on_the_scrubbed_value_and_never_on_the_inherited_one() {
+        // What an AppImage actually hands us: `AppRun` prepended two directories inside the
+        // mount, and `bundle_scrub` has already decided they must go. Rebuilding from the
+        // process's own PATH here would put them straight back — a child resolving binaries out
+        // of a mount point that vanishes the moment cide quits, which is the exact failure ADR
+        // 0007 exists to close.
+        let scrub = vec![("PATH".to_string(), Some("/usr/bin".to_string()))];
+        let inherited = std::ffi::OsString::from(
+            "/tmp/.mount_cide_0OOoGFm/usr/bin:/tmp/.mount_cide_0OOoGFm/usr/sbin:/usr/bin",
+        );
+        let path = path_of(child_path_in(
+            &scrub,
+            Some(&inherited),
+            &extra(["/home/u/go/bin"].as_slice()),
+        ))
+        .expect("one directory was missing, so a PATH is set");
+        assert_eq!(path, "/usr/bin:/home/u/go/bin");
+        assert!(
+            !path.contains(".mount_"),
+            "the bundle's own directories came back through the PATH pass: {path}"
+        );
+    }
+
+    #[test]
+    fn a_scrub_that_removed_path_outright_still_leaves_the_child_the_extras() {
+        // Every entry the variable had was inside the bundle, so the user had none of their own.
+        // "None of those were yours" is not the same statement as "search nowhere".
+        let scrub = vec![("PATH".to_string(), None)];
+        let inherited = std::ffi::OsString::from("/tmp/.mount_cide_0OOoGFm/usr/bin");
+        assert_eq!(
+            path_of(child_path_in(
+                &scrub,
+                Some(&inherited),
+                &extra(["/home/u/.cargo/bin"].as_slice())
+            )),
+            Some("/home/u/.cargo/bin".to_string())
+        );
+        // …but with nothing to add there is nothing to say, and the removal stands alone.
+        assert_eq!(child_path_in(&scrub, Some(&inherited), &[]), None);
+    }
+
+    #[test]
+    fn a_terminal_launch_sets_no_path_on_any_child() {
+        // The `./run.sh` case and the whole reason Linux is unaffected in practice: every extra
+        // is already on PATH, so nothing is emitted and no child's environment differs by a byte.
+        let inherited = std::ffi::OsString::from("/home/u/.cargo/bin:/usr/bin");
+        assert_eq!(
+            child_path_in(
+                &[],
+                Some(&inherited),
+                &extra(["/home/u/.cargo/bin"].as_slice())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_left_alone_rather_than_mangled() {
+        // `EnvChange` is String-shaped. A lossy conversion would corrupt a PATH that works
+        // today, which is strictly worse than declining to improve it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let inherited = std::ffi::OsString::from_vec(b"/usr/bin:/\xff\xfeodd".to_vec());
+            assert_eq!(
+                child_path_in(&[], Some(&inherited), &extra(["/home/u/go/bin"].as_slice())),
+                None
+            );
+        }
+    }
+
+    /// The link in the chain that was read from `std`'s source and never executed.
+    ///
+    /// Every sentence above assumes that a `PATH` set on a `Command` is the `PATH` the kernel
+    /// searches for a **bare** program name. It is true — `std::sys::process` swaps `environ`
+    /// before `execvp` — but "true in the standard library I read" is not the same claim as
+    /// "true in the standard library this binary links", and the whole fix rests on it. So it is
+    /// executed: a directory that is *not* on the minimal `PATH`, a bare name in it, and the
+    /// same spawn twice.
+    ///
+    /// The first half is the more valuable assertion. Without it a test that only checked the
+    /// success case would still pass if the child were somehow resolving out of the *parent's*
+    /// `PATH` — which is exactly the failure being fixed, and which would be invisible on a
+    /// developer machine where the real `PATH` has everything on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_set_on_a_command_is_the_path_a_bare_program_name_is_resolved_on() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("cide-child-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let program = dir.join("cide-probe-not-a-real-binary");
+        std::fs::write(&program, "#!/bin/sh\necho found\n").expect("write");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // launchd's four directories, which is what a Finder-launched `.app` inherits.
+        let minimal = "/usr/bin:/bin:/usr/sbin:/sbin";
+        let run = |path: &str| {
+            Command::new("cide-probe-not-a-real-binary")
+                .env("PATH", path)
+                .output()
+        };
+
+        assert!(
+            run(minimal).is_err(),
+            "the bare name resolved against something other than the PATH set on the Command — \
+             every assumption in this module about giving a child a PATH is then wrong"
+        );
+
+        let appended = crate::toolchain::child_path_from(
+            Some(std::ffi::OsStr::new(minimal)),
+            std::slice::from_ref(&dir),
+        )
+        .expect("the directory was missing, so a PATH is built");
+        let output = run(&appended.into_string().expect("utf-8")).expect("spawn");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "found");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- part two: arming --------------------------------------------------------------

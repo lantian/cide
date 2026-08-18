@@ -121,7 +121,7 @@ pub fn check_once(program: &Path) -> &'static Support {
 /// process that failed to start at all and was reported as *not installed*.
 pub fn probe(program: &Path) -> Option<String> {
     let mut command = std::process::Command::new(program);
-    cide_core::child_env::scrub_command(&mut command);
+    cide_core::child_env::prepare_command(&mut command);
     let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;

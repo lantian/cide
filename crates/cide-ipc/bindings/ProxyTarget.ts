@@ -11,8 +11,9 @@
  *
  * The trap is that "cide does not add a proxy for git" and "git does not use a proxy" are
  * **not the same sentence**. `std::process::Command` inherits this process's environment
- * wholesale, and `cide_core::child_env::scrub_command` filters by value prefix against
- * `$APPDIR` — a proxy URL never points inside an AppImage, so it survives untouched. A cide
+ * wholesale, and `cide_core::child_env::prepare_command` touches only two things: values
+ * prefixed with `$APPDIR`, and `PATH`. A proxy URL is neither — it never points inside an
+ * AppImage and it is not `PATH` — so it survives untouched. A cide
  * launched from a shell that exports `HTTPS_PROXY` therefore *already* sends every
  * `git push` through that proxy, and a two-state switch could only ever decide whether cide
  * adds one on top. So there are three states and the middle one is the default:

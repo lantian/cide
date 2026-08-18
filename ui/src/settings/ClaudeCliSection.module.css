@@ -208,3 +208,65 @@
   font-size: 11px;
   color: var(--text);
 }
+
+/* --- the arguments cide adds itself --- */
+
+.injections {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+/*
+ * One injection: a switch and its flag name on one line, the cost of switching it off under
+ * them.
+ *
+ * The cost sentence is part of the ROW rather than a note at the foot of the section, and that
+ * is the whole point of this block: each of these switches silently disables a feature the
+ * user will report later as "the status bar shows nothing" or "Resume does nothing", and a
+ * footnote is read by nobody who needed it.
+ */
+.injection {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.injection:last-of-type {
+  border-bottom: 0;
+}
+
+.injectionHead {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+/* The flag name is a value the user can edit, so it is a field and not a label. It takes the
+   slack beside the switch; the switch itself has a fixed size. */
+.injectionFlag {
+  flex: 1;
+  min-width: 0;
+}
+
+/*
+ * `--dim`, like `.why`: this is the explanation under a control, not an alarm. It is prose and
+ * it is meant to be read, so it gets the line height of prose rather than of a hint.
+ */
+.injectionCost {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.injectionCost code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.injectionCost strong {
+  color: var(--text);
+  font-weight: 600;
+}

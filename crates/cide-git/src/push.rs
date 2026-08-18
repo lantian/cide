@@ -181,7 +181,7 @@ fn push_via_binary(
     // `git` is the child most exposed to a bundled launch after `claude`: it dlopens the
     // host's libcurl and OpenSSL for the network half, and an AppImage's `LD_LIBRARY_PATH`
     // puts eleven bundled libraries ahead of them. See `cide_core::child_env`.
-    cide_core::child_env::scrub_command(&mut command);
+    cide_core::child_env::prepare_command(&mut command);
     // After the bundle scrub, which never touches a proxy name — the two passes answer
     // different questions and the ordering only has to be stated once.
     proxy.apply(&mut command);

@@ -36,15 +36,15 @@ export interface IconRow {
    * Only `'dir'` takes the folder table; **everything else takes the filename table**, which is
    * what `'file'` has always meant here.
    *
-   * The two synthetic kinds are listed so a whole `TreeRow` still assigns to this structurally —
-   * that is the property this interface exists for, and narrowing it would have forced the tree
-   * to destructure a row and lose the compile error a renamed field is supposed to cause. They
-   * never actually reach [`iconFor`]: `sidebar/groupRows.ts` decides their glyph and the tree
-   * passes it to `FileIcon` as an explicit `stem`. If one ever did arrive here it would draw the
-   * generic document rather than throw, which is the right degradation for a row that is only
-   * ever a sentence.
+   * The three synthetic kinds are listed so a whole `TreeRow` still assigns to this
+   * structurally — that is the property this interface exists for, and narrowing it would have
+   * forced the tree to destructure a row and lose the compile error a renamed field is supposed
+   * to cause. They never actually reach [`iconFor`]: `sidebar/groupRows.ts` decides their glyph
+   * and the tree passes it to `FileIcon` as an explicit `stem`. If one ever did arrive here it
+   * would draw the generic document rather than throw, which is the right degradation for a row
+   * that is only ever a sentence or a heading.
    */
-  readonly kind: 'dir' | 'file' | 'group' | 'note'
+  readonly kind: 'dir' | 'file' | 'group' | 'note' | 'pin'
   /** Directories only. Absent or false draws the closed folder. */
   readonly expanded?: boolean | undefined
 }

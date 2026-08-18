@@ -347,6 +347,66 @@
   flex: 1;
 }
 
+/*
+ * The reserve the `▾` sits in, and it is reserved *permanently* — the button inside comes and
+ * goes, this box does not.
+ *
+ * That is the load-bearing half. `tabOverflow.clippedTabs` answers "what is out of view" from
+ * `.tabs`'s own `clientWidth`, and that number has to mean the same thing whether or not the
+ * control is on screen. A slot that appeared with its button would narrow `.tabs` by 24px, which
+ * can clip one more tab, which keeps the button on — two self-consistent states, and which one
+ * you land in depends on which way the window was last resized. It would also put the button's
+ * width in the TypeScript as a literal that has to agree with this file for ever, which is the
+ * drift the awaiting reserve invented a custom property to avoid.
+ *
+ * The price is 24px plus the strip's 1px gap, taken off `.spacer` — which is empty in every state
+ * except an overfull strip, and in that one state it buys reachability for the two or three tabs
+ * that had none. It is explicitly NOT taken off the tabs: `.tab` keeps `flex: none` and the
+ * 12/13px paddings the chrome audit measures, and squeezing the thing being reserved against is
+ * the fix this app rejected once already (the pane cluster over the find bar).
+ *
+ * Its own custom property rather than `--awaiting-w`: that token has exactly three readers and
+ * `check:awaiting` counts them, so borrowing it would break an unrelated gate silently.
+ */
+.overflowSlot {
+  --tab-overflow-w: 24px;
+  flex: none;
+  width: var(--tab-overflow-w);
+  display: flex;
+  align-items: stretch;
+}
+
+/*
+ * Shaped after the header's `.recent` caret, down to the lit state while its menu is open —
+ * `aria-expanded` is already on the button for assistive tech, so styling from it means there is
+ * no second "is it open" flag that can disagree with the first.
+ *
+ * Physical properties only (`width`, not `inline-size`): this file is prefixed-property checked
+ * and the strip has no writing mode of its own to respect, the same call `.caret` documents.
+ */
+.overflow {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--faint);
+  /* Not `font: inherit`. The tabs' shape classes set 12-12.5px, and `▾` at that size reads as a
+     misplaced character rather than a control; 9px is what the header's caret uses. */
+  font-family: inherit;
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.overflow:hover,
+.overflow[aria-expanded='true'] {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
 /* Nothing in this strip has a border to hang focus on, and the tabs box clips its overflow,
    so an outset ring on the last tab would be cut in half. The ring is drawn inside. */
 .strip button:focus-visible {

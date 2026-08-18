@@ -935,10 +935,21 @@ pub struct ClaudeCliSupport {
     /// `~/.cargo/bin/rust-analyzer` is a symlink to `rustup`, which passes any
     /// on-PATH-and-executable probe and then fails at exec.
     pub problem: Option<String>,
-    /// Every argument sentence, keyed by long-form flag. See [`CliReason`].
+    /// Every argument sentence, keyed by the flag **as cide will actually spell it**. See
+    /// [`CliReason`] and [`arg_reasons`].
     pub arg_reasons: Vec<CliReason>,
     /// Every environment sentence, keyed by variable name.
     pub env_reasons: Vec<CliReason>,
+
+    // --- M17: the arguments cide adds ------------------------------------------------------
+    /// Why a rename typed into the injection rows was thrown away, keyed by the injection's
+    /// wire name (`sessionId`, `resume`, `forkSession`, `settings`).
+    ///
+    /// Keyed by the injection rather than by the text, because the text is exactly what was
+    /// discarded — and because the same string may legitimately appear as a user argument
+    /// elsewhere on the screen, where it means something else and has a different sentence.
+    /// Empty in the common case: a rename that survived says nothing.
+    pub inject_reasons: Vec<CliReason>,
 }
 
 /// Whether the configured CLI can be run, and whether this build's IDE protocol was ever
@@ -975,13 +986,18 @@ pub struct ClaudeCliSupport {
 pub async fn claude_cli_support(app: AppHandle) -> ClaudeCliSupport {
     // Read on this thread and cloned out: the workspace lock is `parking_lot` and must not be
     // held across an await, let alone across a `fork`.
-    let binary = app
+    // The whole launch configuration, not only the binary: since the injection switches exist,
+    // *which* arguments are refused depends on which ones cide is still going to pass, so a
+    // verdict computed from the binary alone would strike out a `--session-id` the user is now
+    // entitled to write.
+    let cli = app
         .try_state::<WorkspaceState>()
-        .map(|state| claude_cli(&state).binary)
-        .unwrap_or_else(|| cide_ipc::ClaudeCli::default().binary);
+        .map(|state| claude_cli(&state))
+        .unwrap_or_default();
     // A join failure means the pool is going away, which is a shutting-down application. The
     // no-CLI answer is the honest one to draw with and this screen must still render.
-    tauri::async_runtime::spawn_blocking(move || cli_support(&binary))
+    let fallback = cli.clone();
+    tauri::async_runtime::spawn_blocking(move || cli_support(&cli))
         .await
         .unwrap_or_else(|_| ClaudeCliSupport {
             version: None,
@@ -991,8 +1007,9 @@ pub async fn claude_cli_support(app: AppHandle) -> ClaudeCliSupport {
             binary: String::new(),
             resolved: None,
             problem: None,
-            arg_reasons: arg_reasons(),
+            arg_reasons: arg_reasons(&fallback),
             env_reasons: env_reasons(),
+            inject_reasons: inject_reasons(&fallback),
         })
 }
 
@@ -1004,8 +1021,8 @@ pub async fn claude_cli_support(app: AppHandle) -> ClaudeCliSupport {
 /// *forking thread* exits, and a `--version` that outlives this function by a millisecond has
 /// nothing to leak — it is not a session, it holds no subscription slot and it exits on its
 /// own. Arming it would only add a `pre_exec` to a process that is already gone.
-fn cli_support(binary: &str) -> ClaudeCliSupport {
-    let resolved = cide_core::claude_cli::resolve(binary);
+fn cli_support(cli: &cide_ipc::ClaudeCli) -> ClaudeCliSupport {
+    let resolved = cide_core::claude_cli::resolve(&cli.binary);
     // Only probed when there is something to probe. Forking a binary already known to be
     // missing would spend a Node boot to learn what `resolve` just said, and would produce a
     // second, worse sentence for the same problem.
@@ -1014,7 +1031,7 @@ fn cli_support(binary: &str) -> ClaudeCliSupport {
         Err(_) => cide_claude::version::Support::Missing,
     };
     let handshake = cide_core::handshake::load(&cide_core::handshake::handshake_path());
-    verdict(&support, handshake, binary, resolved)
+    verdict(&support, handshake, cli, resolved)
 }
 
 /// Build the answer from a verdict and a record, without touching `PATH` or the disk.
@@ -1036,7 +1053,7 @@ fn cli_support(binary: &str) -> ClaudeCliSupport {
 fn verdict(
     support: &cide_claude::version::Support,
     handshake: Option<cide_core::handshake::Handshake>,
-    binary: &str,
+    cli: &cide_ipc::ClaudeCli,
     resolved: Result<PathBuf, cide_core::claude_cli::BinaryProblem>,
 ) -> ClaudeCliSupport {
     ClaudeCliSupport {
@@ -1047,29 +1064,85 @@ fn verdict(
         // this build's would erase the one signal that says the record is from a different
         // build — which is the case the screen has its own sentence for.
         handshake,
-        binary: binary.to_string(),
+        binary: cli.binary.clone(),
         resolved: resolved
             .as_ref()
             .ok()
             .map(|path| path.to_string_lossy().into_owned()),
         problem: resolved.err().map(|problem| problem.message()),
-        arg_reasons: arg_reasons(),
+        arg_reasons: arg_reasons(cli),
         env_reasons: env_reasons(),
+        inject_reasons: inject_reasons(cli),
     }
 }
 
-/// Every argument sentence, refused and warned alike, keyed by long-form flag.
+/// Every argument sentence, refused and warned alike, keyed by the flag the screen will match.
 ///
 /// Both tables in one list because the *screen* does not need them separated — the row already
 /// knows its own verdict from matching the name locally; what it lacks is the prose.
-fn arg_reasons() -> Vec<CliReason> {
-    use cide_core::claude_cli::{REFUSED_ARGS, WARNED_ARGS};
+///
+/// # Why this takes the configuration, and what would go wrong without it
+///
+/// Since the injection switches, a refusal can be *lifted* and a flag can be *renamed*, and
+/// this table is looked up by name. Keyed by `entry.flag` unconditionally it would produce two
+/// wrong screens: a sentence beside a `--session-id` the user is now entitled to pass — which
+/// is a refusal claimed for a token that reaches the child — and no sentence at all beside the
+/// `--sid` cide has been told to write instead, which is the state the whole `CliReason`
+/// mechanism was added to end.
+///
+/// So a conditional entry is keyed by the **effective** spelling and dropped entirely when its
+/// injection is off. An unconditional one (`--bare`, `--print`) and every warned one are keyed
+/// by their own name, as before: nothing cide passes is involved in either.
+fn arg_reasons(cli: &cide_ipc::ClaudeCli) -> Vec<CliReason> {
+    use cide_core::claude_cli::{REFUSED_ARGS, WARNED_ARGS, injected, spec_of};
+
+    let inject = injected(cli).0;
     REFUSED_ARGS
         .iter()
-        .chain(WARNED_ARGS.iter())
-        .map(|entry| CliReason {
+        .filter_map(|entry| {
+            let name = match entry.because {
+                None => entry.flag.to_string(),
+                // Nothing to explain about a flag the user may now pass.
+                Some(which) => {
+                    let effective = inject.flag(which)?;
+                    // Only the entry that *is* the injected flag follows the rename;
+                    // `--continue` is the CLI's own flag, merely illegal beside ours.
+                    if entry.flag == spec_of(which).default_flag {
+                        effective.to_string()
+                    } else {
+                        entry.flag.to_string()
+                    }
+                }
+            };
+            Some(CliReason {
+                name,
+                reason: entry.reason.to_string(),
+            })
+        })
+        .chain(WARNED_ARGS.iter().map(|entry| CliReason {
             name: entry.flag.to_string(),
             reason: entry.reason.to_string(),
+        }))
+        .collect()
+}
+
+/// Why a rename typed into the injection rows was discarded, keyed by the injection's wire
+/// name. Empty in the common case.
+///
+/// The prose is `cide_core::claude_cli`'s, like every other sentence on this screen and for
+/// the same reason: written twice it would say two things, and this side has no way to notice.
+fn inject_reasons(cli: &cide_ipc::ClaudeCli) -> Vec<CliReason> {
+    use cide_core::claude_cli::{INJECTIONS, injected};
+
+    injected(cli)
+        .1
+        .into_iter()
+        .filter_map(|note| {
+            let spec = INJECTIONS.get(note.index)?;
+            Some(CliReason {
+                name: spec.key.to_string(),
+                reason: note.verdict.note()?.to_string(),
+            })
         })
         .collect()
 }
@@ -1124,6 +1197,83 @@ pub fn app_open_log_dir(app: tauri::AppHandle) -> Result<String, String> {
 mod tests {
     use super::*;
     use cide_ipc::{SIDEBAR_MAX_WIDTH, SidebarSettings, Theme, WindowMode};
+
+    /// A launch configuration with nothing but the binary set — every injection at its
+    /// shipped default, which is what these verdict tests are about.
+    fn named(binary: &str) -> cide_ipc::ClaudeCli {
+        cide_ipc::ClaudeCli {
+            binary: binary.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The sentences follow the flag cide will actually write, and disappear when it stops
+    /// writing one.
+    ///
+    /// Keyed by `entry.flag` unconditionally — which is what stood here before the injections
+    /// existed — this screen would strike nothing out beside a renamed `--sid` while claiming a
+    /// refusal for a `--session-id` that now reaches the child untouched. Both halves are a
+    /// wrong label on the only surface a user has for this.
+    #[test]
+    fn an_argument_sentence_follows_the_injection_it_belongs_to() {
+        let names = |cli: &cide_ipc::ClaudeCli| -> Vec<String> {
+            arg_reasons(cli).into_iter().map(|r| r.name).collect()
+        };
+
+        let shipped = names(&named("claude"));
+        assert!(shipped.contains(&"--session-id".to_string()));
+        assert!(shipped.contains(&"--continue".to_string()));
+        assert!(shipped.contains(&"--bare".to_string()));
+        assert!(shipped.contains(&"--safe-mode".to_string()));
+
+        let mut off = named("claude");
+        off.inject.session_id.enabled = false;
+        let off = names(&off);
+        assert!(
+            !off.contains(&"--session-id".to_string()),
+            "cide no longer passes it, so there is nothing to explain about the user's own"
+        );
+        assert!(
+            !off.contains(&"--continue".to_string()),
+            "it was only illegal beside an injected session id"
+        );
+        assert!(
+            off.contains(&"--bare".to_string()),
+            "an authentication failure is not an injection's business"
+        );
+
+        let mut renamed = named("claude");
+        renamed.inject.session_id.flag = "--sid".into();
+        let renamed = names(&renamed);
+        assert!(renamed.contains(&"--sid".to_string()));
+        assert!(!renamed.contains(&"--session-id".to_string()));
+        assert!(
+            renamed.contains(&"--continue".to_string()),
+            "`--continue` is the CLI's own flag; the rename is cide's, so it stays put"
+        );
+    }
+
+    /// A discarded rename gets its sentence, keyed by the injection rather than by the text
+    /// that was thrown away.
+    #[test]
+    fn a_discarded_rename_says_why_and_an_accepted_one_says_nothing() {
+        assert!(inject_reasons(&named("claude")).is_empty());
+
+        let mut cli = named("claude");
+        cli.inject.session_id.flag = "sid".into();
+        let reasons = inject_reasons(&cli);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].name, "sessionId");
+        assert!(
+            reasons[0].reason.contains("prompt"),
+            "{}",
+            reasons[0].reason
+        );
+
+        let mut cli = named("claude");
+        cli.inject.settings.flag = "--sid".into();
+        assert!(inject_reasons(&cli).is_empty(), "a usable rename is silent");
+    }
 
     #[test]
     fn a_patch_touches_only_the_fields_it_names() {
@@ -1494,7 +1644,12 @@ mod tests {
         let newer = Support::Newer {
             version: "9.9.9".into(),
         };
-        let answer = verdict(&newer, None, "claude", Ok(PathBuf::from("/usr/bin/claude")));
+        let answer = verdict(
+            &newer,
+            None,
+            &named("claude"),
+            Ok(PathBuf::from("/usr/bin/claude")),
+        );
         assert_eq!(answer.version.as_deref(), Some("9.9.9"));
         let warning = answer.warning.expect("a CLI past the range is news");
         assert!(warning.contains("9.9.9"), "{warning}");
@@ -1512,7 +1667,7 @@ mod tests {
             verdict(
                 &verified,
                 None,
-                "claude",
+                &named("claude"),
                 Ok(PathBuf::from("/usr/bin/claude"))
             )
             .warning,
@@ -1525,7 +1680,7 @@ mod tests {
             verdict(
                 &Support::Missing,
                 None,
-                "claude",
+                &named("claude"),
                 Err(cide_core::claude_cli::BinaryProblem::NotOnPath {
                     name: "claude".into(),
                 }),
@@ -1546,7 +1701,7 @@ mod tests {
                 !verdict(
                     support,
                     None,
-                    "claude",
+                    &named("claude"),
                     Ok(PathBuf::from("/usr/bin/claude"))
                 )
                 .verified_range
@@ -1572,7 +1727,7 @@ mod tests {
                 version: "2.1.227".into(),
             },
             Some(stored.clone()),
-            "claude",
+            &named("claude"),
             Ok(PathBuf::from("/usr/bin/claude")),
         );
 
@@ -1591,7 +1746,7 @@ mod tests {
     /// either way.
     #[test]
     fn the_real_verdict_assembles_with_a_range_whatever_is_installed() {
-        let support = cli_support("claude");
+        let support = cli_support(&named("claude"));
         assert!(!support.verified_range.is_empty());
         assert_eq!(
             support.warning.is_some(),

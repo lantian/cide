@@ -41,8 +41,12 @@
 //! A language server is the second long-lived, memory-hungry child in this application, and it
 //! needs both of them:
 //!
-//! * **ADR 0007** — `child_env::scrub_command`, or an AppImage lends the server the bundle's
+//! * **ADR 0007** — `child_env::prepare_command`, or an AppImage lends the server the bundle's
 //!   `LD_LIBRARY_PATH` and it dies on a symbol lookup three processes below anything cide logs.
+//!   Since M17 the same call also *gives* the server a `PATH`: finding `gopls` and starting it
+//!   is not the same as it being able to find `go`, and the difference is the whole of the
+//!   `gopls: no views` / `rust-analyzer: the language server stopped` report from macOS. See
+//!   `cide_core::toolchain`'s part one.
 //! * **ADR 0008** — `child_env::arm`, or a `SIGKILL` of cide leaves a 1–4 GB indexer running with
 //!   nothing left to talk to.
 

@@ -78,6 +78,7 @@ try {
     ONLY_PROJECT,
     PINNED_REASON,
     closable,
+    overflowEntries,
     pathOf,
     projectTabEntries,
     recentEntries,
@@ -351,7 +352,96 @@ try {
   }
 
   // =====================================================================================
-  // 4. The header's row controls
+  // 4. The `▾` list of tabs the strip is hiding
+  // =====================================================================================
+  //
+  // The geometry — *which* tabs are out of view — is `chrome/tabOverflow.ts` and is exercised by
+  // `check:tab-overflow`. What is checked here is the half that decides what a user reads and
+  // what they may do: the list is reachability only, it never offers to close anything, and it
+  // does not lie about which file a line names.
+
+  {
+    const modRs = tab('t3', { kind: 'file', path: '/repo/src/lib/mod.rs', dirty: false })
+    const modRs2 = tab('t4', { kind: 'file', path: '/repo/src/net/mod.rs', dirty: true })
+    const settings = tab('t5', { kind: 'settings' })
+    const all = [console_, file, extra, modRs, modRs2, settings]
+
+    const activated = []
+    const entries = overflowEntries(all, ['t1', 't5'], { activate: (id) => activated.push(id) })
+
+    eq(shape(entries), ['overflow:t1', 'overflow:t5'], 'one line per hidden tab, and only those')
+    eq(
+      entries.map((e) => e.label),
+      ['main.rs', 'Settings'],
+      'labelled the way the strip and the switcher label them',
+    )
+    entries.forEach((e) => e.run())
+    eq(activated, ['t1', 't5'], 'and picking a line activates that tab')
+
+    /*
+     * The requirement, expressed as an assertion rather than as a comment: this control only
+     * activates. `OverflowActions` has no `close` field at all, so there is no door for one to
+     * come through — but a future edit could still add a `danger`-flagged line, and the strip is
+     * the one surface in this app where a mis-click is a lost buffer.
+     */
+    ok(
+      entries.every((e) => e.danger === undefined),
+      'no line in the overflow list is destructive',
+    )
+    ok(
+      !JSON.stringify(entries.map((e) => [e.id, e.label])).toLowerCase().includes('close'),
+      'and none of them so much as mentions closing',
+    )
+
+    // Strip order, not measurement order. The list has to read the way the strip reads or it is
+    // one more thing to translate.
+    eq(
+      shape(overflowEntries(all, ['t5', 't0', 't3'], { activate: () => {} })),
+      ['overflow:t0', 'overflow:t3', 'overflow:t5'],
+      'the list is in strip order whatever order the ids were measured in',
+    )
+
+    /*
+     * The pinned console is listed like anything else. Its pin is about closing and moving; a
+     * strip scrolled far enough right to hide it is exactly when a user needs it in the list.
+     */
+    ok(
+      typeof item(overflowEntries(all, ['t0'], { activate: () => {} }), 'overflow:t0').run
+        === 'function',
+      'the pinned console is reachable from the list: the pin is about closing, not reaching',
+    )
+
+    /*
+     * Duplicate basenames. Four clipped `mod.rs` lines answer nothing, and a Rust or Go tree is
+     * full of them. Only the colliders expand — `main.rs` beside them stays short.
+     */
+    const dupes = overflowEntries(all, ['t1', 't3', 't4'], { activate: () => {} })
+    eq(
+      dupes.map((e) => e.label),
+      ['main.rs', '/repo/src/lib/mod.rs', '/repo/src/net/mod.rs'],
+      'same-basename tabs fall back to their whole path, and only they do',
+    )
+
+    // The strip is measured at layout time and the menu is built at open time; a
+    // `cide://workspace-changed` in between can close a tab the measurement still names.
+    eq(
+      shape(overflowEntries(all, ['t1', 'gone'], { activate: () => {} })),
+      ['overflow:t1'],
+      'an id naming no tab is skipped rather than drawn as a line onto nothing',
+    )
+    eq(shape(overflowEntries(all, [], { activate: () => {} })), [], 'nothing hidden, no lines')
+
+    // The chrome audit renders a handler-free `<TabStrip>`. A live-looking line that does
+    // nothing is the failure this whole model exists to make unrepresentable.
+    const inert = overflowEntries(all, ['t1', 't5'], {})
+    ok(
+      inert.every((e) => e.run === undefined && e.disabledReason === NO_HOST),
+      'with no activate handler every line is disabled and says why',
+    )
+  }
+
+  // =====================================================================================
+  // 5. The header's row controls
   // =====================================================================================
 
   const boot = (project) => ({
@@ -392,7 +482,7 @@ try {
   )
 
   // =====================================================================================
-  // 5. The bulk close, as source — because everything above passes with nothing wired
+  // 6. The bulk close, as source — because everything above passes with nothing wired
   // =====================================================================================
   //
   // Section 3 drives `tabMenuEntries` against a fixture `closeMany`, so all of it stays green

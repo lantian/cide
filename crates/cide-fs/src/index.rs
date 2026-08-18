@@ -722,10 +722,10 @@ impl Index {
             match n.kind {
                 TreeRowKind::Dir => self.dirs = self.dirs.saturating_sub(1),
                 TreeRowKind::File => self.files = self.files.saturating_sub(1),
-                // The walk produces neither. A synthetic group is a second row source that
-                // never enters this arena — see `crate::groups` for why it is beside the index
-                // rather than grafted into it.
-                TreeRowKind::Group | TreeRowKind::Note => {}
+                // The walk produces none of these. Every synthetic row — a group header, a
+                // note, a pin — is a second row source that never enters this arena; see
+                // `crate::groups` for why it is beside the index rather than grafted into it.
+                TreeRowKind::Group | TreeRowKind::Note | TreeRowKind::Pin => {}
             }
             stack.extend_from_slice(&n.children);
             doomed.push(id);

@@ -112,6 +112,24 @@ try {
     [false, false, false, false, false],
     'a note is a sentence — every verb is off, including the twisty',
   )
+  /*
+   * The pin — *Project Notes* — is the header's mirror image: it opens and does nothing else.
+   * Each of the four `false`s is a decision. `expandable` because Rust refuses to mark a pin
+   * expanded, so a twisty would fold nothing; `actionable` because Ctrl+X on the cursor must not
+   * put `cide://group/projectNotes` on the clipboard; `addressable` because *Copy Path* would
+   * copy that same sentinel — a correct-looking answer about the wrong thing.
+   */
+  eq(
+    verbs('pin'),
+    [false, true, false, false, false],
+    'a pin OPENS and does nothing else: no twisty, no clipboard, no rename, no Copy Path',
+  )
+  eq(
+    verbs('pin', false),
+    [false, true, false, false, false],
+    'and its verbs do not depend on containment — it has no path on disk for that to be a ' +
+      'question about',
+  )
   eq(verbs('dir'), [true, false, true, true, true], 'a project directory keeps everything it had')
   eq(verbs('file'), [false, true, true, true, true], 'and so does a project file')
 
@@ -170,6 +188,25 @@ try {
     'folder',
     'an unknown id falls back to the plain folder — an older webview against a newer backend ' +
       'draws a generic row rather than a 404 and a blank one',
+  )
+  /*
+   * A pin draws the glyph of the file it opens, not a folder, and it has no open variant — it
+   * never folds, so a `-open` suffix would name an icon nothing ever draws.
+   */
+  eq(
+    g.groupIcon('pin', false, g.PROJECT_NOTES),
+    'markdown',
+    'Project Notes draws the markdown glyph, so the row looks like the tab it produces',
+  )
+  eq(
+    g.groupIcon('pin', true, g.PROJECT_NOTES),
+    'markdown',
+    'and a pin has no open variant, because it never folds',
+  )
+  eq(
+    g.groupIcon('pin', false, 'a-pin-this-build-has-never-heard-of'),
+    'document',
+    'an unknown pin falls back to a document rather than a folder: a pin stands for one file',
   )
   eq(
     g.groupIcon('note', false, null),

@@ -26,6 +26,7 @@ pub mod error;
 pub mod handshake;
 pub mod keymap;
 pub mod layout;
+pub mod notes;
 pub mod persist;
 pub mod proxy;
 pub mod scratch;

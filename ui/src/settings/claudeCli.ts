@@ -30,11 +30,108 @@
  * twice is a sentence that will say two things, and this side has no way to notice.
  */
 
+/** One injection's stored configuration. Mirrors `cide_ipc::ClaudeInjection`. */
+export interface Inj {
+  enabled: boolean
+  flag: string
+}
+
+/** The four arguments cide adds. Mirrors `cide_ipc::ClaudeInjections`' field names. */
+export type InjectionKey = 'sessionId' | 'resume' | 'forkSession' | 'settings'
+
 /** The stored shape, structurally. Mirrors `cide_ipc::ClaudeCli`. */
 export interface CliConfig {
   binary: string
   args: string[]
   env: { name: string; value: string }[]
+  inject: Record<InjectionKey, Inj>
+}
+
+/**
+ * What cide adds to a pane's command line, and how it spells it by default.
+ *
+ * Mirrors `cide_core::claude_cli::INJECTIONS`, key for key and spelling for spelling, and
+ * `check-claude-cli.mjs` reads that table out of the Rust and compares. The order is the order
+ * the rows are drawn in and the order `resolvedArgv` writes them, which is not cosmetic:
+ * `--resume <parent>` and `--session-id <ours>` both take a uuid, so a swap is still a valid
+ * command line that resumes the wrong conversation.
+ */
+export const INJECTIONS: readonly { key: InjectionKey; defaultFlag: string }[] = [
+  { key: 'sessionId', defaultFlag: '--session-id' },
+  { key: 'resume', defaultFlag: '--resume' },
+  { key: 'forkSession', defaultFlag: '--fork-session' },
+  { key: 'settings', defaultFlag: '--settings' },
+]
+
+/** One injection, resolved: what will be written, and whether a rename was thrown away. */
+export interface Effective {
+  key: InjectionKey
+  /** Whether cide will write this argument at all. */
+  enabled: boolean
+  /** The spelling it would be written with — the default one when no override survived. */
+  flag: string
+  /** Whether the stored override was discarded. The row says why, from Rust's sentence. */
+  discarded: boolean
+}
+
+/**
+ * One injection's stored value, defaulting to *today's behaviour* when it is missing.
+ *
+ * Errs safe in the same direction the module header describes for `APPDIR`: a fixture, an
+ * older window's snapshot or a hand-edited file with no `inject` key draws as "cide passes
+ * everything", which is what such a configuration actually does — `ClaudeInjection`'s
+ * hand-written `Default` in Rust is `enabled: true` for exactly this reason. Reading it as
+ * `false` would paint every injection off on a screen where nothing is.
+ */
+function setting(cli: CliConfig, key: InjectionKey): Inj {
+  const table = cli.inject as Partial<Record<InjectionKey, Inj>> | undefined
+  return table?.[key] ?? { enabled: true, flag: '' }
+}
+
+/**
+ * Resolve the injection settings: what cide will write, spelled how.
+ *
+ * A port of `cide_core::claude_cli::injected`, including both discard rules, because the
+ * screen has to strike a bad rename out as it is typed:
+ *
+ *  - **an override must begin with `-`** — `claude`'s first positional argument is a *prompt*,
+ *    so a bare `sid` would not rename a flag, it would start every pane by asking the model
+ *    something;
+ *  - **it must not be another injection's spelling**, its default included, and a clash
+ *    discards both sides rather than picking a winner nobody can see.
+ *
+ * A discarded override falls back to the default spelling, which is always safe: the defaults
+ * are distinct from one another and they are what cide passed before this setting existed.
+ */
+export function effectiveFlags(cli: CliConfig): Effective[] {
+  // Pass one: the shape rule. `null` means "no usable override; use the default".
+  const proposed = INJECTIONS.map(({ key }) => {
+    const over = setting(cli, key).flag.trim()
+    if (over === '' || !over.startsWith('-')) return null
+    return over
+  })
+
+  return INJECTIONS.map(({ key, defaultFlag }, index) => {
+    const over = proposed[index] ?? null
+    const enabled = setting(cli, key).enabled
+    const typed = setting(cli, key).flag.trim()
+    if (over === null) {
+      return { key, enabled, flag: defaultFlag, discarded: typed !== '' }
+    }
+    // Pass two: the collision rule, decided against the snapshot rather than against a list
+    // being rewritten as it is read.
+    const clashes = INJECTIONS.some(
+      (other, i) => i !== index && (other.defaultFlag === over || proposed[i] === over),
+    )
+    return { key, enabled, flag: clashes ? defaultFlag : over, discarded: clashes }
+  })
+}
+
+/** The spelling this injection will be written with, or null when cide will not write it. */
+export function flagFor(cli: CliConfig, key: InjectionKey): string | null {
+  const row = effectiveFlags(cli).find((entry) => entry.key === key)
+  if (row === undefined || !row.enabled) return null
+  return row.flag
 }
 
 /** What cide will do with one row. Mirrors `cide_core::claude_cli::Verdict`. */
@@ -54,20 +151,37 @@ export interface Judged {
  * Spellings and aliases are `claude --help`'s, checked rather than remembered, and the check
  * script asserts this table is the same set as Rust's.
  */
-export const REFUSED_ARGS: readonly { flag: string; aliases: readonly string[]; value: boolean }[] =
-  [
-    { flag: '--session-id', aliases: [], value: true },
-    { flag: '--resume', aliases: ['-r'], value: true },
-    { flag: '--fork-session', aliases: [], value: false },
-    { flag: '--continue', aliases: ['-c'], value: false },
-    { flag: '--settings', aliases: [], value: true },
-    { flag: '--bare', aliases: [], value: false },
-    { flag: '--print', aliases: ['-p'], value: false },
-  ]
+export const REFUSED_ARGS: readonly {
+  flag: string
+  aliases: readonly string[]
+  value: boolean
+  /**
+   * The injection this refusal exists *because of*, or null for one that stands whatever cide
+   * passes. Mirrors `cide_core::claude_cli::RefusedArg::because`, which carries the argument
+   * at length: a flag cide has stopped passing must stop being refused, or the screen disables
+   * a feature and then forbids the replacement.
+   *
+   * `--continue` carries `sessionId` and not a key of its own — it is illegal *beside* an
+   * injected session id, so it is that injection's refusal rather than one about itself.
+   */
+  because: InjectionKey | null
+}[] = [
+  { flag: '--session-id', aliases: [], value: true, because: 'sessionId' },
+  { flag: '--resume', aliases: ['-r'], value: true, because: 'resume' },
+  { flag: '--fork-session', aliases: [], value: false, because: 'forkSession' },
+  { flag: '--continue', aliases: ['-c'], value: false, because: 'sessionId' },
+  { flag: '--settings', aliases: [], value: true, because: 'settings' },
+  { flag: '--bare', aliases: [], value: false, because: null },
+  { flag: '--print', aliases: ['-p'], value: false, because: null },
+]
 
 /** Arguments that cost something cide cannot repair and are allowed anyway. */
-export const WARNED_ARGS: readonly { flag: string; aliases: readonly string[]; value: boolean }[] =
-  [{ flag: '--safe-mode', aliases: [], value: false }]
+export const WARNED_ARGS: readonly {
+  flag: string
+  aliases: readonly string[]
+  value: boolean
+  because: InjectionKey | null
+}[] = [{ flag: '--safe-mode', aliases: [], value: false, because: null }]
 
 /** Variables cide sets itself, or must never set. */
 export const REFUSED_ENV: readonly string[] = [
@@ -109,9 +223,50 @@ function names(entry: { flag: string; aliases: readonly string[] }, token: strin
   return head === entry.flag || entry.aliases.includes(head)
 }
 
-/** The verdict on one argument token, ignoring its neighbours. */
-export function argFate(token: string): Fate {
-  if (REFUSED_ARGS.some((entry) => names(entry, token))) return 'refused'
+/**
+ * The refusal that covers this token, given what cide is going to inject. A port of
+ * `cide_core::claude_cli::refusal_for`, whose doc carries the three matching rules:
+ *
+ *  - `because: null` — matched on its own name and aliases, always;
+ *  - the entry that *is* an injected flag — matched on the **effective** spelling, and not at
+ *    all when that injection is off. Rename the session id to `--sid` and `--sid` becomes the
+ *    refused token while `--session-id` becomes the user's to pass;
+ *  - an entry that is a *different* flag, illegal beside an injected one (`--continue`) —
+ *    matched on its own name, and merely gated on that injection being on. It is the CLI's
+ *    flag, not cide's, so cide renaming its own does not move it.
+ */
+function refusalFor(
+  token: string,
+  cli: CliConfig,
+): { flag: string; aliases: readonly string[]; value: boolean } | null {
+  for (const entry of REFUSED_ARGS) {
+    if (entry.because === null) {
+      if (names(entry, token)) return entry
+      continue
+    }
+    const effective = flagFor(cli, entry.because)
+    if (effective === null) continue
+    const spec = INJECTIONS.find((injection) => injection.key === entry.because)
+    if (spec !== undefined && entry.flag === spec.defaultFlag && effective !== spec.defaultFlag) {
+      const at = token.indexOf('=')
+      const head = at === -1 ? token : token.slice(0, at)
+      if (head === effective) return { ...entry, flag: effective, aliases: [] }
+      continue
+    }
+    if (names(entry, token)) return entry
+  }
+  return null
+}
+
+/**
+ * The verdict on one argument token, ignoring its neighbours.
+ *
+ * Takes the whole configuration rather than the token alone, because since the injection
+ * switches the answer depends on what cide is still going to pass: a `--session-id` is the
+ * user's to write once cide has stopped writing one, and a renamed `--sid` becomes cide's.
+ */
+export function argFate(token: string, cli: CliConfig): Fate {
+  if (refusalFor(token, cli) !== null) return 'refused'
   if (WARNED_ARGS.some((entry) => names(entry, token))) return 'warned'
   return 'accepted'
 }
@@ -152,9 +307,9 @@ export function judgeArgs(cli: CliConfig): Judged[] {
       return
     }
     swallowing = false
-    const fate = argFate(text)
+    const fate = argFate(text, cli)
     if (fate === 'refused') {
-      const entry = REFUSED_ARGS.find((candidate) => names(candidate, text))
+      const entry = refusalFor(text, cli)
       if (entry?.value === true && !text.includes('=')) swallowing = true
     }
     out.push({ index, text, fate })
@@ -190,16 +345,32 @@ export function resolvedArgv(cli: CliConfig, shape: 'fresh' | 'resume' | 'fork')
   const mine = judgeArgs(cli)
     .filter((row) => row.fate !== 'refused')
     .map((row) => row.text)
-  // Mirrors `cide_claude::conversation`'s three shapes. A plain resume names no `--session-id`,
-  // which is not a simplification: the CLI keeps the parent's id when it is not forking, and
-  // 2.1.227 removed the combination outright.
+  const sessionId = flagFor(cli, 'sessionId')
+  const resume = flagFor(cli, 'resume')
+  const fork = flagFor(cli, 'forkSession')
+  const settings = flagFor(cli, 'settings')
+
+  // Mirrors `cide_claude::conversation`, degraded shapes included, because those are exactly
+  // what a user who has switched something off needs to be able to read.
+  //
+  // A plain resume names no session id, which is not a simplification: the CLI keeps the
+  // parent's id when it is not forking, and 2.1.227 rejects the combination outright. The same
+  // rule is why a fork whose `--fork-session` is switched off falls back to the plain resume
+  // rather than to `--resume <uuid> --session-id <uuid>`, which is the pair that fails.
+  const fresh = sessionId === null ? [] : [sessionId, '<uuid>']
   const conversation =
-    shape === 'fresh'
-      ? ['--session-id', '<uuid>']
-      : shape === 'resume'
-        ? ['--resume', '<uuid>']
-        : ['--resume', '<uuid>', '--fork-session']
-  return [cli.binary.trim() || 'claude', ...mine, ...conversation, '--settings', '<cide hooks>']
+    shape === 'fresh' || resume === null
+      ? fresh
+      : shape === 'resume' || fork === null
+        ? [resume, '<uuid>']
+        : [resume, '<uuid>', fork, ...fresh]
+
+  return [
+    cli.binary.trim() || 'claude',
+    ...mine,
+    ...conversation,
+    ...(settings === null ? [] : [settings, '<cide hooks>']),
+  ]
 }
 
 /**
@@ -235,7 +406,15 @@ export function resolvedArgvParts(
  * "configured" would have no empty state at all.
  */
 export function isDefaultConfig(cli: CliConfig): boolean {
-  return cli.binary.trim() === 'claude' && cli.args.length === 0 && cli.env.length === 0
+  return (
+    cli.binary.trim() === 'claude' &&
+    cli.args.length === 0 &&
+    cli.env.length === 0 &&
+    // …and cide still adds what it always did. A pane spawned with no `--settings` is the most
+    // configured this screen gets, and calling that "nothing here yet" would be a lie in the
+    // one place a user goes to find out why their status bar is empty.
+    INJECTIONS.every(({ key }) => setting(cli, key).enabled && setting(cli, key).flag.trim() === '')
+  )
 }
 
 /**

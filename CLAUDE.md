@@ -79,9 +79,10 @@ Which check covers what you touched:
 | `keys/`, a default binding, `cide-core::commands` | `check:keys`, `check:commands`, `check:switcher` |
 | `sidebar/GitPanel/`, `cide-git` | `check:git`, `check:render`, `check:diff`, `check:diff-render`, `check:branches` |
 | the file tree, fs ops | `check:tree-status`, `check:tree-flicker`, `check:fs-clipboard`, `check:new-entry` |
+| a synthetic tree row — a group, a note, a pin | `check:groups`, `check:notes`, `check:scratch`, `check:tree-drag` |
 | `layout/` — splits, dividers, pane grid | `check:rows` |
 | `editor/` | `check:editor` |
-| menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
+| menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:tab-overflow`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
 | terminal input, session state | `check:input`, `check:exit`, `check:awaiting`, `check:format` |
 | overlays, pickers, search | `check:picker`, `check:search`, `check:problems` |
 | terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
@@ -203,9 +204,12 @@ Claude is hosted three ways at once (ADR 0005): a real PTY, the IDE-integration 
   environment.
 - **No child inherits the bundle's environment, and every child is armed.** Both rules live in
   `cide-core::child_env`, which is the module every spawn site passes through.
-  `scrub_command` (ADR 0007): an AppImage's `AppRun` leaves `PYTHONHOME` and `LD_LIBRARY_PATH`
-  pointing inside a mount, and a `claude` that inherits them cannot start a single stdio MCP
-  server — it reports `CONNECTION_CLOSED` from three processes below anything cide logs.
+  `prepare_command` (ADR 0007, and since M17 one pass more): an AppImage's `AppRun` leaves
+  `PYTHONHOME` and `LD_LIBRARY_PATH` pointing inside a mount, and a `claude` that inherits them
+  cannot start a single stdio MCP server — it reports `CONNECTION_CLOSED` from three processes
+  below anything cide logs. It also *appends* `cide-core::toolchain::extra_dirs` to the child's
+  `PATH`, because a child that inherits a GUI launch's `PATH` cannot find its own toolchain —
+  which is what made `gopls` answer `no views` on a Mac where cide had found and started it.
   `arm` (ADR 0008, moved here from `cide-claude` in M12) hands the kernel a pid to kill when cide
   dies, and its contract is that **the forking thread must outlive the child** — which is what
   `on_spawn_thread` is for, and why a language server is never spawned from a Tauri command

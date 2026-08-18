@@ -725,9 +725,18 @@ fn run_once(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Both spawn rules, and neither is optional — see the crate docs. `scrub_command` first
+    // Both spawn rules, and neither is optional — see the crate docs. `prepare_command` first
     // because `arm` installs a `pre_exec` hook and reads nothing from the environment.
-    cide_core::child_env::scrub_command(&mut command);
+    //
+    // This is the spawn the M17 macOS report was about, and the half of `prepare_command` that
+    // fixes it is the *additive* half. Discovery had already worked — `which` found `gopls` in
+    // `~/go/bin` — and then this line handed the server cide's own `PATH`, which for a
+    // Finder-launched `.app` is launchd's `/usr/bin:/bin:/usr/sbin:/sbin`. A `gopls` that cannot
+    // exec `go` builds no workspace view and answers `no views` to everything; a rustup
+    // `rust-analyzer` proxy with no reachable toolchain exits and reads as `the language server
+    // stopped`. `prepare_command` now appends `cide_core::toolchain::extra_dirs` — the same
+    // directories `discover::find` searched — so the server searches the list cide searched.
+    cide_core::child_env::prepare_command(&mut command);
     cide_core::child_env::arm(&mut command);
 
     let mut child: Child = command.spawn().map_err(|e| Failure {

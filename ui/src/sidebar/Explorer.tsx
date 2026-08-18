@@ -54,6 +54,16 @@ export interface ExplorerProps {
    * `App.tsx` always supplies it in the shell window, which is the only window with a sidebar.
    */
   onSelectOpened?: (() => void) | undefined
+  /**
+   * A **pinned** row was opened — today that is *Project Notes*, and the argument is its id.
+   *
+   * An id rather than a path, because a pin has no path: the row carries a `cide://group/…`
+   * sentinel and the file it stands for is created and named by Rust. The host turns the id into
+   * a **command**, exactly as [`onSelectOpened`] above turns its click into `file.reveal`, and
+   * for the identical reason — one code path for the double-click, the palette row and any chord
+   * somebody binds later, rather than three call sites with three copies of the preconditions.
+   */
+  onOpenPin?: ((id: string) => void) | undefined
 }
 
 export function Explorer({
@@ -62,6 +72,7 @@ export function Explorer({
   onOpenFileToSide,
   openedFile = null,
   onSelectOpened,
+  onOpenPin,
 }: ExplorerProps) {
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
@@ -250,7 +261,12 @@ export function Explorer({
           </button>
         )}
       </div>
-      <FileTree project={project} onOpen={onOpenFile} onOpenToSide={onOpenFileToSide} />
+      <FileTree
+        project={project}
+        onOpen={onOpenFile}
+        onOpenToSide={onOpenFileToSide}
+        onOpenPin={onOpenPin}
+      />
     </div>
   )
 }

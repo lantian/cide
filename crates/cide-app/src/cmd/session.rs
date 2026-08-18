@@ -133,7 +133,24 @@ fn base_env(
     claude: &cide_ipc::ClaudeSettings,
     user_env: Vec<cide_core::child_env::EnvChange>,
 ) -> SpawnSpec {
-    let spec = apply_env_changes(spec, cide_core::child_env::bundle_scrub())
+    // Two passes, and the second is M17's. `bundle_scrub` only ever *removes*, so until now a
+    // pane's child got cide's own `PATH` verbatim — which for a Finder-launched `.app` is
+    // launchd's `/usr/bin:/bin:/usr/sbin:/sbin` and contains neither Homebrew nor `~/.local/bin`.
+    // `child_path` appends the directories `toolchain::search_paths` already searches, and it is
+    // built *from* the scrub's `PATH` so nothing the scrub dropped comes back; chained rather
+    // than folded separately so the ordering is visible in one expression.
+    //
+    // This is also what closes the exec gap README records under *Finding `claude` from a
+    // Finder-launched `.app`*: `claude_cli::resolve` validates a bare `claude` against
+    // `search_paths()`, and portable-pty resolves a bare program against the builder's own
+    // `PATH` — so the check and the spawn now consult the same list instead of disagreeing about
+    // a directory and turning a refusal with a remedy in it into an opaque `ENOENT`.
+    //
+    // `user_env` still folds last (below), so a `PATH` a user set in Settings → Claude keeps the
+    // last word over this.
+    let scrub = cide_core::child_env::bundle_scrub();
+    let path = cide_core::child_env::child_path(&scrub);
+    let spec = apply_env_changes(spec, scrub.into_iter().chain(path))
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env("TERM_PROGRAM", "cide")
@@ -477,7 +494,11 @@ pub async fn session_spawn(
     let minted = SessionId::new();
     let mut id = minted;
     if is_claude {
-        let (effective, args) = cide_claude::conversation(minted, resume, wants_fork(fork));
+        // `plan.inject` and not a fresh resolution: the flags folded here are the same value
+        // the refusal verdicts above were computed against, so cide can never refuse a user's
+        // `--session-id` while passing none of its own — or pass its own beside theirs.
+        let (effective, args) =
+            cide_claude::conversation(minted, resume, wants_fork(fork), &plan.inject);
         id = effective;
         for a in args {
             spec = spec.arg(a);
@@ -528,12 +549,29 @@ pub async fn session_spawn(
             // inside one must not drive that pane's busy/idle chrome.
             spec = spec.env("CIDE_SESSION", id.to_string());
 
-            match hook_settings(theme) {
-                Some(json) => spec = spec.arg("--settings").arg(json),
-                // Without an absolute path to `cide-hook` the child cannot run it: its cwd is
-                // the project root and its PATH is the user's. Skipping the flag leaves a
-                // working session with no hooks, which is the right way to fail here.
-                None => tracing::warn!("cannot locate cide-hook; this session reports no state"),
+            // Gated on the injection, and the `hook_settings` call moved *inside* the gate so
+            // a disabled one does not pay the `cide-hook` `exists()` stat per spawn.
+            //
+            // There are now three ways to reach a pane with no hooks and they are not equally
+            // surprising: the `None` arm below (no `cide-hook` binary beside ours, a packaging
+            // failure), a user `--safe-mode` or `--bare`, and — since the injection switches —
+            // the user having turned this off deliberately. The last one is silent by design,
+            // says what it costs at the toggle in `ClaudeCliSection.tsx`, and gets no warning
+            // line here: a log line per spawn for a setting somebody chose is noise.
+            //
+            // `CIDE_SESSION` and `CIDE_HOOK_SOCK` above stay set either way, deliberately.
+            // They cost nothing to a harness that ignores them, and a wrapper that ends up
+            // exec'ing the real `claude` still routes its hooks back to this pane.
+            if let Some(flag) = plan.inject.flag(cide_core::claude_cli::Injection::Settings) {
+                match hook_settings(theme) {
+                    Some(json) => spec = spec.arg(flag).arg(json),
+                    // Without an absolute path to `cide-hook` the child cannot run it: its cwd
+                    // is the project root and its PATH is the user's. Skipping the flag leaves
+                    // a working session with no hooks, which is the right way to fail here.
+                    None => {
+                        tracing::warn!("cannot locate cide-hook; this session reports no state")
+                    }
+                }
             }
         }
     }
@@ -1068,9 +1106,30 @@ pub fn session_list(registry: State<'_, SessionRegistry>) -> Vec<SessionId> {
 ///
 /// `false` for every way of being unable to tell. A wrong `false` costs a button; a wrong
 /// `true` costs a `claude --resume` that fails in front of the user.
+///
+/// # Why it reads the workspace (M17)
+///
+/// The `--resume` injection can be switched off, and then cide names no conversation on the
+/// command line at all. A transcript that still exists on disk is no longer the whole
+/// question: offering *Resume this conversation* would spawn a pane holding a **new**
+/// conversation under a button promising the old one. `plan_restore` makes the same decision
+/// for a launch; this is the same rule for a pane whose child has just died.
+///
+/// The lock is taken and dropped before anything else happens, matching `session_spawn`'s note
+/// above: `WorkspaceState::with` runs under a non-reentrant lock, and `resumable` touches the
+/// filesystem. `try_state` because a test harness may have no workspace, in which case the
+/// shipped default — the injection is on — is the right answer.
+///
+/// A `State` parameter does not drift `contract/commands.json`: that file is a list of command
+/// *names*, and Tauri injects state rather than taking it off the wire, so `ui/src/ipc/
+/// client.ts` is untouched.
 #[tauri::command(rename_all = "camelCase")]
-pub fn session_resumable(cwd: String, session: SessionId) -> bool {
-    crate::lifecycle::resumable(std::path::Path::new(&cwd), session)
+pub fn session_resumable(app: tauri::AppHandle, cwd: String, session: SessionId) -> bool {
+    let resume_enabled = app
+        .try_state::<crate::workspace_state::WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.claude.cli.inject.resume.enabled))
+        .unwrap_or(true);
+    crate::lifecycle::resumable(std::path::Path::new(&cwd), session, resume_enabled)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1083,6 +1142,7 @@ pub fn session_kill(registry: State<'_, SessionRegistry>, session: SessionId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cide_core::claude_cli::Injected;
 
     /// Spawn a shell that ends with `code`, and wait until the reaper has the status.
     ///
@@ -1174,7 +1234,7 @@ mod tests {
 
         let id = SessionId::new();
         assert_eq!(
-            cide_claude::conversation(id, None, wants_fork(None)),
+            cide_claude::conversation(id, None, wants_fork(None), &Injected::defaults()),
             (id, vec!["--session-id".to_string(), id.to_string()]),
             "an ordinary pane spawns plain"
         );
@@ -1194,12 +1254,24 @@ mod tests {
         let minted = SessionId::new();
         let parent = SessionId::new();
         assert_eq!(
-            cide_claude::conversation(minted, Some(parent), wants_fork(None)).0,
+            cide_claude::conversation(
+                minted,
+                Some(parent),
+                wants_fork(None),
+                &Injected::defaults()
+            )
+            .0,
             parent,
             "a plain resume runs under the parent's id"
         );
         assert_eq!(
-            cide_claude::conversation(minted, Some(parent), wants_fork(Some(true))).0,
+            cide_claude::conversation(
+                minted,
+                Some(parent),
+                wants_fork(Some(true)),
+                &Injected::defaults()
+            )
+            .0,
             minted,
             "a fork runs under the id we minted, because `--session-id` is passed"
         );
@@ -1251,6 +1323,45 @@ mod tests {
             spec.env_remove.iter().any(|k| k == "PYTHONHOME"),
             "removed {:?}",
             spec.env_remove
+        );
+    }
+
+    /// The scrub and the `PATH` pass reach the spec as one `PATH`, in that order.
+    ///
+    /// `base_env` chains them, and a chain is exactly the shape a later edit turns back into two
+    /// folds in the wrong order. Both halves are asserted over synthetic inputs because
+    /// `bundle_scrub` and `child_path` read the real process environment; `cide-core`'s own tests
+    /// own the rules, and what is only checkable here is that the composition survives the trip
+    /// into a `SpawnSpec` — a `SpawnSpec` that carried the scrub's `PATH` and dropped the
+    /// appended one would put the M17 bug straight back with nothing to say so.
+    #[test]
+    fn the_scrubbed_path_and_the_appended_directories_arrive_as_one_entry() {
+        let scrub = vec![("PATH".to_string(), Some("/usr/bin".to_string()))];
+        let path = cide_core::child_env::child_path_in(
+            &scrub,
+            Some(std::ffi::OsStr::new(
+                "/tmp/.mount_cide_0OOoGFm/usr/bin:/usr/bin",
+            )),
+            std::slice::from_ref(&std::path::PathBuf::from("/home/u/go/bin")),
+        );
+        let spec = apply_env_changes(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir()),
+            scrub.into_iter().chain(path),
+        );
+        // The *last* one, not the first: `SpawnSpec::env` is an ordered list and
+        // `PtySession::spawn` replays it into `CommandBuilder::env`, where a later write wins.
+        // `value_of` finds the first, which is the scrub's — so asserting with it here would
+        // pass while the child got the unappended `PATH`.
+        let last = spec
+            .env
+            .iter()
+            .rfind(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(last, Some("/usr/bin:/home/u/go/bin"));
+        assert_eq!(
+            value_of(&spec, "PATH"),
+            Some("/usr/bin"),
+            "the scrub's own PATH must still be first, or the two passes were folded backwards"
         );
     }
 

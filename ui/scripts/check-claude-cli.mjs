@@ -112,9 +112,35 @@ try {
     resolvedArgvParts,
     isDefaultConfig,
     refusalSummary,
+    INJECTIONS,
+    effectiveFlags,
+    flagFor,
   } = cli
 
-  const config = (args = [], env = []) => ({ binary: 'claude', args, env })
+  /**
+   * A stored configuration. `inject` defaults to the shipped one — every argument cide adds,
+   * at its own spelling — because that is what every assertion about today's behaviour is
+   * about, and because a fixture that quietly injected nothing would make half this file pass
+   * for the wrong reason.
+   */
+  const config = (args = [], env = [], inject = {}) => ({
+    binary: 'claude',
+    args,
+    env,
+    inject: {
+      sessionId: { enabled: true, flag: '' },
+      resume: { enabled: true, flag: '' },
+      forkSession: { enabled: true, flag: '' },
+      settings: { enabled: true, flag: '' },
+      ...inject,
+    },
+  })
+
+  /** The same, with one injection switched off. */
+  const without = (key) => config([], [], { [key]: { enabled: false, flag: '' } })
+
+  /** The same, with one injection renamed. */
+  const spelled = (key, flag) => config([], [], { [key]: { enabled: true, flag } })
 
   // =====================================================================================
   // 1. The two tables are the same tables.
@@ -135,16 +161,65 @@ try {
   function rustArgTable(name) {
     const start = rust.indexOf(`pub const ${name}: &[RefusedArg] = &[`)
     if (start < 0) return null
-    const end = rust.indexOf('\n];', start)
+    // The first `];` and not the first `\n];`: `WARNED_ARGS` is a one-entry table written as
+    // `&[RefusedArg { … }];`, so a newline-anchored end ran past it and swallowed the `struct
+    // RefusedArg` declaration below — whose `RefusedArg {` the splitter then read as two more
+    // entries. `aliases: &[]` ends with `],`, never `];`, so this cannot stop early.
+    const end = rust.indexOf('];', start)
     if (end < 0) return null
-    const body = rust.slice(start, end)
-    return [...body.matchAll(/flag:\s*"([^"]+)",\s*aliases:\s*&\[([^\]]*)\],\s*takes_value:\s*(true|false)/g)].map(
-      (m) => ({
-        flag: m[1],
-        aliases: [...m[2].matchAll(/"([^"]+)"/g)].map((a) => a[1]),
-        value: m[3] === 'true',
-      }),
-    )
+    // Split per entry rather than matching the whole row in one regex: `reason` is a multi-line
+    // string literal sitting between `takes_value` and `because`, and a single pattern spanning
+    // it would have to be non-greedy across entries — which silently pairs one row's flag with
+    // the next row's `because` the first time somebody reorders a field.
+    return rust
+      .slice(start, end)
+      .split('RefusedArg {')
+      .slice(1)
+      .map((entry) => {
+        const flag = /flag:\s*"([^"]+)"/.exec(entry)
+        const aliases = /aliases:\s*&\[([^\]]*)\]/.exec(entry)
+        const value = /takes_value:\s*(true|false)/.exec(entry)
+        const because = /because:\s*(None|Some\(Injection::(\w+)\))/.exec(entry)
+        return {
+          flag: flag?.[1] ?? null,
+          aliases: [...(aliases?.[1] ?? '').matchAll(/"([^"]+)"/g)].map((a) => a[1]),
+          value: value?.[1] === 'true',
+          // `Injection::SessionId` on this side, `sessionId` on the other: compared under the
+          // wire name, which is what `ClaudeInjections`' fields are called and what the screen
+          // keys its rows by.
+          because:
+            because?.[2] === undefined
+              ? null
+              : because[2][0].toLowerCase() + because[2].slice(1),
+        }
+      })
+      // A chunk with no `flag:` is not an entry — belt and braces beside the `end` rule above,
+      // because a splitter that silently invents rows is how a table comparison passes for the
+      // wrong reason.
+      .filter((entry) => entry.flag !== null)
+  }
+
+  /**
+   * The injection table: `key` and `default_flag` per row, read out of the same file.
+   *
+   * This is the half that makes the conditional refusals safe. If the screen thought cide
+   * injected a different set from the one Rust injects, it would strike out a flag the user is
+   * entitled to pass, or draw as fine one the spawn will refuse.
+   */
+  function rustInjections() {
+    const start = rust.indexOf('pub const INJECTIONS: &[InjectionSpec] = &[')
+    if (start < 0) return null
+    const end = rust.indexOf('];', start)
+    if (end < 0) return null
+    return rust
+      .slice(start, end)
+      .split('InjectionSpec {')
+      .slice(1)
+      .map((entry) => ({
+        key: /key:\s*"([^"]+)"/.exec(entry)?.[1] ?? null,
+        defaultFlag: /default_flag:\s*"([^"]+)"/.exec(entry)?.[1] ?? null,
+      }))
+      .filter((entry) => entry.key !== null)
   }
 
   /** The names of a `pub const NAME: &[(&str, &str)] = &[("A", "…"), …];` table. */
@@ -170,14 +245,17 @@ try {
   // disagreed would make the screen draw a surviving argument the spawn actually swallows —
   // the readout would promise the child a token it never gets.
   eq(
-    (rustRefusedArgs ?? []).map((e) => [e.flag, e.aliases, e.value]),
-    REFUSED_ARGS.map((e) => [e.flag, [...e.aliases], e.value]),
+    (rustRefusedArgs ?? []).map((e) => [e.flag, e.aliases, e.value, e.because]),
+    REFUSED_ARGS.map((e) => [e.flag, [...e.aliases], e.value, e.because]),
     'the arguments the screen strikes out are exactly the ones the spawn refuses, alias for '
-      + 'alias and value-taking flag for value-taking flag',
+      + 'alias, value-taking flag for value-taking flag, and — since the injection switches — '
+      + 'reason-for-existing for reason-for-existing. A `because` that disagreed would relax a '
+      + 'refusal on one side only: the screen would draw a flag as fine and the spawn would '
+      + 'drop it, or the screen would strike out one the child actually gets',
   )
   eq(
-    (rustWarnedArgs ?? []).map((e) => [e.flag, e.aliases, e.value]),
-    WARNED_ARGS.map((e) => [e.flag, [...e.aliases], e.value]),
+    (rustWarnedArgs ?? []).map((e) => [e.flag, e.aliases, e.value, e.because]),
+    WARNED_ARGS.map((e) => [e.flag, [...e.aliases], e.value, e.because]),
     'and the warned arguments agree too — a flag moved between the two tables changes what '
       + 'reaches the child, not merely how it is drawn',
   )
@@ -215,17 +293,129 @@ try {
   // 2. The port behaves like the rule.
   // =====================================================================================
 
-  eq(argFate('--resume'), 'refused', 'a long flag is refused')
-  eq(argFate('-r'), 'refused', 'and so is its short alias')
-  eq(argFate('--resume=abc'), 'refused', 'and the `=` form, which commander accepts')
-  eq(argFate('--safe-mode'), 'warned', 'a flag that costs the hooks is warned, not refused')
-  eq(argFate('--model'), 'accepted', 'an ordinary flag passes')
+  eq(argFate('--resume', config()), 'refused', 'a long flag is refused')
+  eq(argFate('-r', config()), 'refused', 'and so is its short alias')
+  eq(argFate('--resume=abc', config()), 'refused', 'and the `=` form, which commander accepts')
+  eq(argFate('--safe-mode', config()), 'warned', 'a flag that costs the hooks is warned, not refused')
+  eq(argFate('--model', config()), 'accepted', 'an ordinary flag passes')
 
   // Whole tokens only. `--append-system-prompt` contains `-p`; a `startsWith`/`includes`
   // implementation refuses it, and the user's system prompt silently disappears.
   for (const token of ['--append-system-prompt', '--resumed-thing', '--no-resume', '--printer']) {
-    eq(argFate(token), 'accepted', `${token} merely contains a refused flag and is not one`)
+    eq(argFate(token, config()), 'accepted', `${token} merely contains a refused flag and is not one`)
   }
+
+  // =====================================================================================
+  // 1b. The injections: the relationship the conditional refusals hang on.
+  // =====================================================================================
+
+  const rustInject = rustInjections()
+  ok(rustInject != null && rustInject.length === 4, 'INJECTIONS is readable out of claude_cli.rs')
+  eq(
+    (rustInject ?? []).map((e) => [e.key, e.defaultFlag]),
+    INJECTIONS.map((e) => [e.key, e.defaultFlag]),
+    'the screen and the spawn inject the same four arguments, spelled the same way. Disagree '
+      + 'here and the screen strikes out a flag the user is now entitled to pass, or draws as '
+      + 'fine one the spawn will drop',
+  )
+  eq(
+    (rustInject ?? []).map((e) => e.defaultFlag),
+    ['--session-id', '--resume', '--fork-session', '--settings'],
+    'and the shipped spellings are still what cide has always passed. The default is the whole '
+      + 'safety property of this feature: a user who never opens the screen sees no change',
+  )
+
+  // **The upgrade trap, from this side.** `ClaudeInjection`'s `Default` is hand-written in
+  // `cide-ipc` because `bool::default()` is `false` and `ClaudeCli` carries a container-level
+  // `#[serde(default)]`: derive it and every `workspace.json` already on disk — which is every
+  // one of them — loads with all four injections OFF. No hooks and no resume, for every user,
+  // on the launch after an upgrade, from a screen they never opened. `cide-ipc`'s own test is
+  // the guard; this is the second pair of eyes, because the failure has no runtime symptom.
+  {
+    const ipc = shipping(repoFile('crates/cide-ipc/src/settings.rs'))
+    const impl = ipc.slice(ipc.indexOf('impl Default for ClaudeInjection {'))
+    ok(
+      /enabled:\s*true/.test(impl.slice(0, impl.indexOf('}'))),
+      'every injection is ON by default, so a user who never opens this screen sees no change '
+        + 'whatsoever. Derived, this is `false` and their hooks and resume die on upgrade',
+    )
+    ok(
+      !/#\[derive\([^)]*Default[^)]*\)\]\s*(#\[[^\]]*\]\s*)*pub struct ClaudeInjection\b/.test(ipc),
+      'and it is not derived',
+    )
+  }
+
+  // The relationship, from this side. Every `because` names an injection that exists, and every
+  // injection has a refusal that names it — two lists would be two chances to disable a feature
+  // and then forbid the replacement.
+  const becauses = [...new Set(REFUSED_ARGS.map((e) => e.because).filter((k) => k !== null))]
+  eq(
+    [...becauses].sort(),
+    INJECTIONS.map((e) => e.key).sort(),
+    'every injection is refused for the user, and every conditional refusal names an injection '
+      + 'that cide actually adds',
+  )
+  for (const { key, defaultFlag } of INJECTIONS) {
+    ok(
+      REFUSED_ARGS.some((e) => e.flag === defaultFlag && e.because === key),
+      `${defaultFlag} is refused because cide injects it, and the two facts are the same row`,
+    )
+  }
+  for (const flag of ['--bare', '--print']) {
+    ok(
+      REFUSED_ARGS.find((e) => e.flag === flag)?.because === null,
+      `${flag} breaks a pane whatever cide passes — an authentication failure and a one-shot `
+        + 'pane are not a spelling question, so they must not become switchable from this screen',
+    )
+  }
+
+  // Switching one off relaxes exactly its own refusals.
+  eq(argFate('--session-id', without('sessionId')), 'accepted', 'cide no longer passes it')
+  eq(
+    argFate('--continue', without('sessionId')),
+    'accepted',
+    '--continue was only illegal beside an injected session id, and there is no longer one',
+  )
+  eq(argFate('-c', without('sessionId')), 'accepted', 'alias and all')
+  eq(argFate('--settings', without('sessionId')), 'refused', 'and nothing else moved')
+  eq(argFate('--resume', without('sessionId')), 'refused')
+  eq(argFate('--bare', without('sessionId')), 'refused')
+  eq(argFate('--settings', without('settings')), 'accepted', 'the hooks payload is the user’s now')
+  eq(argFate('--session-id', without('settings')), 'refused', 'and only that one moved')
+
+  // A rename moves the refusal with it, in both directions.
+  eq(argFate('--sid', spelled('sessionId', '--sid')), 'refused', 'the flag cide now writes')
+  eq(argFate('--sid=abc', spelled('sessionId', '--sid')), 'refused', 'and the `=` form of it')
+  eq(
+    argFate('--session-id', spelled('sessionId', '--sid')),
+    'accepted',
+    'and the spelling cide has stopped writing is the user’s to pass',
+  )
+  eq(
+    argFate('--continue', spelled('sessionId', '--sid')),
+    'refused',
+    '--continue is the CLI’s own flag; cide renaming its own does not move it',
+  )
+
+  // The two discard rules, which the screen has to draw as it is typed.
+  eq(flagFor(spelled('sessionId', 'sid'), 'sessionId'), '--session-id',
+    'a bare token is a POSITIONAL and claude’s first positional is a PROMPT — every pane would '
+      + 'start by asking the model something, so the override is discarded')
+  ok(
+    effectiveFlags(spelled('sessionId', 'sid')).find((r) => r.key === 'sessionId')?.discarded,
+    'and the discard is visible, because a field that silently ignores what was typed into it '
+      + 'is the state this whole screen exists to avoid',
+  )
+  eq(flagFor(spelled('sessionId', '--resume'), 'sessionId'), '--session-id',
+    'two injections cannot be spelled the same: a command line carrying one flag twice is the '
+      + 'silent breakage the refusal table was written for')
+  eq(flagFor(spelled('sessionId', '  --sid  '), 'sessionId'), '--sid', 'and an override is trimmed')
+  eq(flagFor(without('settings'), 'settings'), null, 'a switched-off injection writes nothing')
+  eq(
+    effectiveFlags(config()).map((r) => [r.key, r.enabled, r.flag, r.discarded]),
+    INJECTIONS.map((e) => [e.key, true, e.defaultFlag, false]),
+    'and the shipped configuration resolves to exactly what cide always passed',
+  )
 
   eq(envFate('ANTHROPIC_API_KEY'), 'refused', 'the credential name is refused')
   eq(envFate('anthropic_api_key'), 'refused', 'in any case')
@@ -355,12 +545,80 @@ try {
       + 'forking, and 2.1.227 removed the combination outright',
   )
 
+  /* ------------------------------------------- the readout under every toggle and rename */
+  //
+  // This readout is the ONLY surface a user has for the injection switches, so a wrong readout
+  // is the whole feature wrong. Driven across all three conversation shapes for each toggle.
+
+  for (const shape of ['fresh', 'resume', 'fork']) {
+    ok(
+      !resolvedArgv(without('settings'), shape).includes('--settings'),
+      `${shape}: --settings is absent once the hook injection is off — which is the pane that `
+        + 'reports no tokens, cannot tell busy from idle, and reloads buffers on a poll',
+    )
+    ok(
+      resolvedArgv(without('sessionId'), shape).every((t) => t !== '--session-id'),
+      `${shape}: no session id is named once that injection is off`,
+    )
+    ok(
+      resolvedArgv(spelled('settings', '--config'), shape).includes('--config'),
+      `${shape}: a renamed injection is written under its new spelling`,
+    )
+    ok(
+      !resolvedArgv(spelled('settings', '--config'), shape).includes('--settings'),
+      `${shape}: and not under its old one as well`,
+    )
+  }
+
+  // **The shape 2.1.227 rejects, reached through the new door.** A fork with `--fork-session`
+  // switched off must not become `--resume <uuid> --session-id <uuid>`: the CLI answers
+  // "--session-id can only be used with --continue or --resume if --fork-session is also
+  // specified" and the pane never appears.
+  {
+    const argv = resolvedArgv(without('forkSession'), 'fork')
+    ok(argv.includes('--resume'), 'a fork with no fork flag is still a resume')
+    ok(
+      !argv.includes('--session-id'),
+      'and it names no session id, because that pair is what the CLI rejects outright — every '
+        + 'Resume click failing before a pane appears',
+    )
+  }
+  eq(
+    resolvedArgv(without('resume'), 'resume').includes('--resume'),
+    false,
+    'with the resume injection off a restored pane starts fresh, rather than emitting a lone '
+      + '--fork-session for the CLI to reject',
+  )
+  ok(
+    resolvedArgv(without('resume'), 'resume').includes('--session-id'),
+    'and it is a genuine fresh session, named as one',
+  )
+  eq(
+    resolvedArgv(config([], [], {
+      sessionId: { enabled: false, flag: '' },
+      resume: { enabled: false, flag: '' },
+      forkSession: { enabled: false, flag: '' },
+      settings: { enabled: false, flag: '' },
+    }), 'fork'),
+    ['claude'],
+    'everything off is the bare binary: what a harness that is not Claude Code gets, which is '
+      + 'the whole point of the switches',
+  )
+
   eq(refusalSummary(config()), null, 'nothing refused, nothing said')
   eq(refusalSummary(config(['--bare'])), '1 entry is refused', 'and the singular is singular')
   eq(refusalSummary(config(['--bare', '--print'])), '2 entries are refused', 'and the plural is not')
 
   eq(isDefaultConfig(config()), true, 'the untouched configuration is the default')
   eq(isDefaultConfig(config(['--model'])), false, 'and one argument is enough to be configured')
+  eq(
+    isDefaultConfig(without('settings')),
+    false,
+    'and so is a switched-off injection: a pane spawned with no hooks is the most configured '
+      + 'this screen gets, and calling it “nothing here yet” would be a lie in the one place a '
+      + 'user goes to find out why their status bar is empty',
+  )
+  eq(isDefaultConfig(spelled('sessionId', '--sid')), false, 'a rename is a configuration too')
 
   // =====================================================================================
   // 4. The rule is reached from the spawn — over comment-stripped source.
@@ -406,15 +664,57 @@ try {
 
   {
     // The argv ordering, at the one place it is real.
+    //
+    // The `--settings` literal used to be right here in `session.rs`; it now lives in
+    // `claude_cli.rs`'s INJECTIONS table and reaches the spawn as `plan.inject`, so the fold is
+    // found by the injection it is gated on rather than by the string. The spelling itself is
+    // asserted against the Rust table above.
     const userArgs = session.indexOf('for a in plan.args')
     const conversation = session.indexOf('cide_claude::conversation')
-    const settingsArg = session.indexOf('"--settings"')
+    const settingsArg = session.indexOf('Injection::Settings')
     ok(userArgs >= 0 && conversation >= 0 && settingsArg >= 0, 'the three argv folds are readable')
     ok(
       userArgs < conversation && userArgs < settingsArg,
       'the user’s arguments are folded before cide’s conversation arguments and before '
         + '--settings. See the readout assertion above for why the order is the whole '
         + 'protection against a variadic flag',
+    )
+    ok(
+      !/spec\.arg\("--settings"\)/.test(session),
+      'and the hook payload is no longer attached under a hardcoded flag. A literal here would '
+        + 'be a `--settings` the switches cannot turn off and the rename cannot move, while the '
+        + 'screen drew both',
+    )
+    ok(
+      /plan\.inject/.test(session),
+      'the spawn folds the SAME resolved injection set the verdicts were computed against. '
+        + 'Resolved twice, cide could refuse the user’s --session-id while passing none of its '
+        + 'own — a switch that turns a feature off and then forbids the replacement',
+    )
+    ok(
+      /conversation\(\s*minted,\s*resume,\s*wants_fork\(fork\),\s*&plan\.inject/.test(session),
+      'and the conversation arguments are built from it too, not from three literals',
+    )
+  }
+
+  {
+    // The honest half of the `--resume` switch. With it off cide passes no `--resume`, so a
+    // pane planned as `Resumable` — or a dead pane offered *Resume this conversation* — would
+    // silently start a NEW conversation under a heading promising the old one.
+    const lifecycle = shipping(repoFile('crates/cide-app/src/lifecycle.rs'))
+    ok(
+      /inject\.resume\.enabled/.test(lifecycle),
+      '`lifecycle.rs` reads the resume injection when it plans a restore',
+    )
+    ok(
+      /resume_enabled/.test(lifecycle) && /if !resume_enabled/.test(lifecycle),
+      'and answers Fresh when cide will not pass --resume, rather than offering a button that '
+        + 'starts a new session',
+    )
+    ok(
+      /inject\.resume\.enabled/.test(session),
+      'and `session_resumable` — what a pane whose child just died asks — makes the same '
+        + 'decision, or the launch and the dead-pane bar would disagree',
     )
   }
 
@@ -479,10 +779,73 @@ try {
     'and it renders Rust’s binary verdict, which is the only side that can stat a path',
   )
   ok(
-    !/disabled/.test(section) || !/refused/.test(section.slice(section.indexOf('disabled'))),
-    'a refused row is not disabled — it stays selectable and editable, because a value you '
-      + 'cannot correct is worse than one that is merely wrong',
+    !/disabled/.test(section),
+    'no input on this screen is disabled — every row stays selectable and editable, including '
+      + 'the rename beside a switched-off injection, because a value you cannot correct is '
+      + 'worse than one that is merely wrong',
   )
+
+  /* ------------------------------------------------ the injections, and what they cost */
+  //
+  // Each of these switches silently disables a feature the user will report later without
+  // connecting it to this screen — "the status bar shows nothing", "Resume does nothing". The
+  // copy is the only thing standing between the switch and that report, so it is asserted
+  // word by word rather than left to be tidied into vagueness.
+  ok(
+    /effectiveFlags\(/.test(section),
+    'the section resolves the injections through the checked module rather than re-deciding '
+      + 'which flag it is about — a rule inside a component is a rule no check script can run',
+  )
+  ok(
+    /injectReasons/.test(section),
+    'and it draws Rust’s sentence for a discarded rename, which is the only place that '
+      + 'refusal can be seen at all',
+  )
+  {
+    const copy = section.slice(section.indexOf('INJECTION_COPY'))
+    const sessionCopy = copy.slice(copy.indexOf('sessionId:'), copy.indexOf('resume:'))
+    ok(
+      /Resume/.test(sessionCopy),
+      'the session-id row says that Resume stops working. That is the casualty, and a user who '
+        + 'is not told names the wrong switch — turning the hooks off as well, chasing a status '
+        + 'bar that was never affected',
+    )
+    ok(
+      /CIDE_SESSION/.test(sessionCopy),
+      '...and that the busy/idle chrome is NOT the casualty, because it routes on CIDE_SESSION',
+    )
+    const settingsCopy = copy.slice(copy.indexOf('settings:'))
+    for (const word of ['token', 'close', 'reload', 'notification', 'theme']) {
+      ok(
+        new RegExp(word, 'i').test(settingsCopy),
+        `the --settings row names what it costs: ${word}. Off, this pane has no hooks AT ALL, `
+          + 'and every one of those features stops with nothing on screen connecting it to '
+          + 'this switch',
+      )
+    }
+  }
+
+  // …and the sentence has to be *fetched again* when the configuration changes, or the whole
+  // `inject_reasons` path is dead in the running app.
+  //
+  // `ClaudeCliSupport` stopped being a fact about a binary the moment the injections became
+  // configurable: `argReasons` is keyed by the flag cide will actually write, and
+  // `injectReasons` exists only for the configuration that produced it. The effect that fetches
+  // it was keyed on the binary alone, so typing `sid` into a flag field struck the input through
+  // with NO sentence under it until the user edited the binary or closed the tab — the exact
+  // state `CliReason` was added to end.
+  {
+    const tab = strip(uiFile('src/settings/SettingsTab.tsx'))
+    const deps = /\}, \[([^\]]*)\]\)/g
+    const support = tab.slice(tab.indexOf('claudeTasks.cliSupport('))
+    const dep = deps.exec(support)?.[1] ?? ''
+    ok(
+      /binary/i.test(dep) && /inject/i.test(dep),
+      'the cliSupport probe re-runs on the injection configuration as well as on the binary, '
+        + 'or a discarded rename is struck through with no explanation and a refusal names a '
+        + `flag nobody passes. Its dependencies are: ${dep || '(none found)'}`,
+    )
+  }
 
   const css = uiFile('src/settings/ClaudeCliSection.module.css')
   ok(

@@ -307,6 +307,118 @@ export function tabMenuEntries(
   ]
 }
 
+// --- tabs the strip is hiding -----------------------------------------------------------------
+
+/**
+ * The one thing the overflow list may do.
+ *
+ * There is deliberately **no `close` and no `closeMany` here**, and the missing fields are the
+ * enforcement rather than a comment asking nicely. The requirement is that this control never
+ * closes anything: it exists because tabs past the right edge are unreachable, and a close
+ * button on a line naming a tab the user cannot see is a destructive action aimed at something
+ * invisible. Expressed as an actions bag with one member, a future edit that copies
+ * [`TabActions`]'s shape into here has to *add a field* to violate it, which is a change a
+ * reviewer sees. Expressed as a comment on a five-field bag, it lasts until the first copy.
+ *
+ * (The pin is enforced in Rust either way — `cide_core::workspace::close_tab` refuses the
+ * console. This is about not offering the gesture at all.)
+ */
+export interface OverflowActions {
+  activate?: ((id: TabId) => void) | undefined
+}
+
+/**
+ * What one hidden tab is called in the list.
+ *
+ * The vocabulary is `TabStrip.viewFor`'s and `Switcher.tabRow`'s — "Claude" for the console,
+ * the basename for a file — because the same tab appearing under two different names in two
+ * surfaces of one app is a small lie the user has to reconcile. Restated rather than imported
+ * for the reason `Switcher` gives about the same duplication: `viewFor` returns JSX bound to the
+ * strip's own CSS modules, and importing it here would drag a stylesheet into a file that a bare
+ * `tsc` has to compile alone.
+ */
+function overflowLabel(tab: Tab): string {
+  switch (tab.kind.kind) {
+    case 'claudeHome':
+      return 'Claude'
+    case 'claudeFull':
+      return tab.kind.title
+    case 'file':
+      return basename(tab.kind.path)
+    case 'diff':
+      return tab.kind.spec.title
+    case 'settings':
+      return 'Settings'
+    default:
+      // A `TabKind` variant added later. A line that says *something* beats a hole in the list;
+      // `TabStrip.viewFor` is where the compiler is made to care about the new variant.
+      return 'Tab'
+  }
+}
+
+function basename(path: string): string {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return path.slice(cut + 1)
+}
+
+/**
+ * The `▾` menu at the right end of the tab strip: the tabs that are currently out of view.
+ *
+ * `hidden` is measured off the DOM by `tabOverflow.clippedTabs`; this function turns it into
+ * prose and enablement. The split is the same one `tabDrag.ts`/`useTabDrag.ts` make and for the
+ * same reason — geometry in the import-free module its own check compiles, wording and
+ * enablement in the menu model whose check already exists.
+ *
+ * Three rules that are not obvious:
+ *
+ * * **An id naming no tab is skipped.** The list is measured at layout time and the menu is
+ *   built at open time, and `cide://workspace-changed` can close a tab in between — a background
+ *   window, a hook, another window's ⌘W. The same staleness `tabDrag.dropOutcome` guards against
+ *   by looking the id up rather than trusting it.
+ * * **Order is the strip's**, not the measurement's, so the list reads the way the strip does.
+ *   `hidden` already arrives in strip order; iterating `tabs` and filtering makes that true by
+ *   construction rather than by the caller remembering.
+ * * **Duplicate labels fall back to the whole path.** Four clipped tabs reading
+ *   `mod.rs / mod.rs / mod.rs / mod.rs` is a menu that answers nothing, and the case is not
+ *   exotic — it is what a Rust or a Go tree looks like. Only the colliding entries expand, so
+ *   one `main.rs` beside a `Cargo.toml` stays short.
+ */
+export function overflowEntries(
+  tabs: readonly Tab[],
+  hidden: readonly string[],
+  actions: OverflowActions,
+): MenuEntry[] {
+  const { activate } = actions
+  const wanted = new Set(hidden)
+  const listed = tabs.filter((tab) => wanted.has(tab.id))
+
+  // How many listed tabs would wear each label. Counted over the *listed* set only: a collision
+  // with a tab that is comfortably on screen is not a collision the reader of this menu can see.
+  const seen = new Map<string, number>()
+  for (const tab of listed) {
+    const label = overflowLabel(tab)
+    seen.set(label, (seen.get(label) ?? 0) + 1)
+  }
+
+  return listed.map((tab) => {
+    const label = overflowLabel(tab)
+    const collides = (seen.get(label) ?? 0) > 1
+    const path = pathOf(tab)
+    return {
+      // Prefixed, because a menu's ids only have to be unique within the menu but they are also
+      // what a check script asserts on, and a bare tab id would read as though the entry *were*
+      // the tab rather than a way to reach it.
+      id: `overflow:${tab.id}`,
+      label: collides && path !== null ? path : label,
+      ...(activate
+        ? { run: () => activate(tab.id) }
+        : // The chrome audit renders a handler-free `<TabStrip>`; a live-looking line that does
+          // nothing on click is the failure this whole model exists to make unrepresentable.
+          { disabledReason: NO_HOST }),
+    }
+  })
+}
+
 // --- the header's row controls --------------------------------------------------------------
 
 export interface RowTarget {

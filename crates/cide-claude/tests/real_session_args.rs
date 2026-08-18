@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use cide_claude::conversation;
+use cide_core::claude_cli::Injected;
 use cide_ipc::SessionId;
 
 /// The exact prose 2.1.227 prints when `--session-id` is used where it may not be.
@@ -103,10 +104,22 @@ fn the_real_cli_accepts_every_shape_we_build() {
     // argument validation and be told so, not to resume anything.
     let parent = SessionId::new();
 
+    // The shipped configuration, which is the one this test is about: an injection switched
+    // off in Settings produces a *shorter* argv, and a shorter one cannot be rejected for a
+    // combination it no longer contains. The degraded shapes are unit-tested in
+    // `cide_claude::session` and have never been put in front of the binary.
+    let shipped = Injected::defaults();
+
     for (name, (_, args)) in [
-        ("fresh", conversation(minted, None, false)),
-        ("resume", conversation(minted, Some(parent), false)),
-        ("resume + fork", conversation(minted, Some(parent), true)),
+        ("fresh", conversation(minted, None, false, &shipped)),
+        (
+            "resume",
+            conversation(minted, Some(parent), false, &shipped),
+        ),
+        (
+            "resume + fork",
+            conversation(minted, Some(parent), true, &shipped),
+        ),
     ] {
         let said = says(&claude, &args);
         assert!(

@@ -170,7 +170,7 @@ fn claude_version(binary: &str) -> Option<String> {
     let mut command = std::process::Command::new(binary);
     // The CLI is node, and a bundled launch would otherwise hand it this AppImage's
     // `LD_LIBRARY_PATH`. See `cide_core::child_env`.
-    cide_core::child_env::scrub_command(&mut command);
+    cide_core::child_env::prepare_command(&mut command);
     let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;

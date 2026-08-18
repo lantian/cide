@@ -635,6 +635,39 @@ fn build() -> Vec<Command> {
                 "snippet",
             ]),
         /*
+         * The project's notes file: one pinned markdown file per project, opened as an ordinary
+         * editor tab.
+         *
+         * The row is pinned to the **top** of the file tree rather than the bottom, so unlike
+         * the two `view.*` rows below it is not unreachable-by-scrolling — but it is still worth
+         * a command for the two reasons that are always worth one here: a gesture with no
+         * command has no chord anyone can bind in `keymap.json`, and the row's double-click, the
+         * palette row and any future binding must not become three code paths that behave in
+         * three ways. `ui/src/App.tsx` routes the click through `runCommand` for exactly that,
+         * the same way `Explorer`'s ⌖ button routes through `file.reveal`.
+         *
+         * `shellWindow` because the tab and the tree the gesture ends in live there — a
+         * detached-pane window would create a file and open its tab in the window next door.
+         * `projectOpen` because `roots[0]` is what keys the file. The handler re-checks both:
+         * the clause gates the palette and never the keyboard.
+         *
+         * No default binding. Every free chord in this app is free because somebody wanted it,
+         * and the palette and `keymap.json` are both one step away.
+         *
+         * No ellipsis: it opens a tab rather than asking a question first, which is the house
+         * rule *New scratch file…* one screen up is on the other side of.
+         */
+        Command::new("file.projectNotes", "Open Project Notes", FILE)
+            .when("shellWindow && projectOpen")
+            .keywords(&[
+                "notes",
+                "notepad",
+                "todo",
+                "scratchpad",
+                "markdown",
+                "journal",
+            ]),
+        /*
          * Git — and the clause here is `projectOpen`, not "a repository is open".
          *
          * It *was* `repoOpen`, and that is the whole of the bug this group is being rewritten
@@ -863,9 +896,13 @@ fn build() -> Vec<Command> {
          * `projectOpen` because the drawer is keyed by the project's primary root; the handler
          * re-checks, because the clause gates the palette and never the keyboard.
          */
+        // `notes` is deliberately **not** a keyword here any more: it moved to
+        // `file.projectNotes`, which is the command a user typing *notes* into the palette means.
+        // Leaving it on both offered two rows for one word, one of which scrolls to a drawer of
+        // scratch files.
         Command::new("view.scratches", "Show Scratches", VIEW)
             .when("shellWindow && projectOpen")
-            .keywords(&["scratch", "buffer", "temporary", "notes", "playground"]),
+            .keywords(&["scratch", "buffer", "temporary", "playground"]),
         Command::new("palette.commands", "Show all commands", VIEW),
         Command::new("theme.toggle", "Toggle light/dark theme", VIEW),
         // Settings opens as a *tab inside a project*, so with no project open there is

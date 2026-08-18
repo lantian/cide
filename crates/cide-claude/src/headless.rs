@@ -347,12 +347,12 @@ fn wait_with_deadline(
 /// one the user set themselves would break the Console customers for whom it is the only
 /// credential they have.
 ///
-/// [`cide_core::child_env::scrub_command`] runs first and answers a different question — not
+/// [`cide_core::child_env::prepare_command`] runs first and answers a different question — not
 /// "which of cide's variables are wrong for a one-shot" but "which of them were never cide's
 /// to pass on". A `claude` launched from the AppImage inherits a `PYTHONHOME` naming a prefix
 /// with no Python in it, which kills every stdio MCP server this run would have loaded.
 fn scrub_env(command: &mut Command) {
-    cide_core::child_env::scrub_command(command);
+    cide_core::child_env::prepare_command(command);
     command
         .env_remove("CLAUDE_CODE_SSE_PORT")
         .env_remove("CLAUDE_CODE_AUTO_CONNECT_IDE")

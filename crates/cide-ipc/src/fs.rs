@@ -132,6 +132,22 @@ pub enum TreeRowKind {
     /// one look identical, and the one thing a user cannot debug is a twisty that opens onto
     /// nothing. Not selectable, not openable, carries no menu.
     Note,
+    /// A **pinned** top-level row — *Project Notes*. It **opens** rather than expanding, which
+    /// is the one thing a [`TreeRowKind::Group`] cannot do.
+    ///
+    /// Like a header it is synthetic: it has no children, is never expanded, and its `path` is
+    /// the same `cide://group/<id>` sentinel, so `cide_fs::ops::check_within` refuses it and a
+    /// frontend bug that sent it to `fs_rename` or to `file_read` gets an error rather than an
+    /// action. Unlike a header it is not a drawer with contents — the file it stands for is
+    /// named by Rust, created by the command the row's click routes to, and opened as an
+    /// **ordinary** `TabKind::File` tab so that save, the dirty marker, undo, find-in-file and
+    /// the markdown grammar all work with no special case anywhere.
+    ///
+    /// Why a kind rather than reusing `File` with the sentinel path: `rowVerbs('file')` is
+    /// `addressable`, so *Copy Path* would be live on the row and would put the literal string
+    /// `cide://group/projectNotes` on the clipboard — the correct-looking answer about the
+    /// wrong thing. A pin is openable and nothing else.
+    Pin,
 }
 
 impl TreeRowKind {

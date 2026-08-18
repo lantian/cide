@@ -578,6 +578,25 @@ export const fs = {
     invoke<string>('fs_scratch_new', { project: projectId, ext }),
 
   /**
+   * Make sure this project's notes file exists, and answer its absolute path.
+   *
+   * The whole wire surface of *Project Notes*. The caller hands the answer straight to
+   * `file.open`, so what appears is an **ordinary** file tab — save, the dirty marker, undo,
+   * find-in-file and the markdown grammar all work with no special case, which is the reason
+   * the feature is one command and not a new tab kind.
+   *
+   * Idempotent and **never truncating**: the first call creates the file and its directory, and
+   * every call after that answers the same path with the contents untouched. The path is a
+   * blake3 of the project's canonicalised primary root under `$XDG_STATE_HOME/cide/notes`, which
+   * is why it comes from Rust rather than being assembled here — a second copy of the keying
+   * rule is a second copy that can drift, and the one it would drift from decides where the
+   * user's writing is.
+   *
+   * A multi-root project has one notes file, keyed by `roots[0]`.
+   */
+  notesEnsure: (projectId: ProjectId) => invoke<string>('fs_notes_ensure', { project: projectId }),
+
+  /**
    * Every directory the file tree's disk-changing verbs may act inside.
    *
    * The project's roots **plus** the scratch drawer, which is outside all of them. Asked once
@@ -1648,6 +1667,16 @@ export interface ClaudeCliSupport {
    */
   argReasons: { name: string; reason: string }[]
   envReasons: { name: string; reason: string }[]
+  /**
+   * Why a rename typed into *What cide adds to the command line* was thrown away, keyed by the
+   * injection's wire name (`sessionId`, `resume`, `forkSession`, `settings`).
+   *
+   * Keyed by the injection and not by the text, because the text is exactly what was discarded
+   * — and the same string may appear as a user argument elsewhere on the screen, where it means
+   * something else and has a different sentence. Empty in the common case: a rename that
+   * survived says nothing.
+   */
+  injectReasons: { name: string; reason: string }[]
 }
 
 /**
@@ -1709,6 +1738,7 @@ export const claudeTasks = {
         // still renders when the command is unavailable.
         argReasons: [],
         envReasons: [],
+        injectReasons: [],
         // Not `null` and not the default `'claude'`: an empty string is what the screen reads
         // as "no answer yet", and inventing a binary name here would caption the fallback with
         // a claim about a program nothing probed.
