@@ -66,6 +66,19 @@ export interface PaneHost {
    * to `undefined`: `forgetSession` clears it when a pane restarts.
    */
   sessionId?: string | undefined
+  /**
+   * True when this pane adopted a session it does not own — a `SplitIntent::Mirror`, and
+   * (once M18 lands) every subagent run opened from the Agents panel.
+   *
+   * It lives **on the host** because the host is what survives a remount, and because the
+   * spawn plan is consumed exactly once — by the time anything asks, the pane no longer
+   * knows how it got its id.
+   *
+   * It exists for exactly one reader, `closePane`, which kills `host.sessionId` on the way
+   * out. Without it, closing a mirror pane kills the child in the pane being *mirrored*,
+   * which is what shipped.
+   */
+  mirrored?: boolean | undefined
   cleanup: Array<() => void>
   /** True while the element sits in a live slot. A mounted host is never evicted. */
   mounted: boolean
@@ -135,6 +148,15 @@ interface PaneRecord {
   evictions: number
   /** Survives eviction; cleared when the pane is genuinely finished. */
   sessionId?: string | undefined
+  /**
+   * Carried beside `sessionId` and for the same reason.
+   *
+   * `getHost` hands an evicted pane its session back, so without this an evicted mirror pane
+   * would come back holding somebody else's id and *not* knowing it — and `closePane` would
+   * kill the mirrored child after all. The flag has to survive exactly as far as the id it
+   * qualifies, or the fix has a hole in it the size of `HOST_CAP`.
+   */
+  mirrored?: boolean | undefined
 }
 
 const ledger = new Map<string, PaneRecord>()
@@ -188,6 +210,7 @@ export function getHost(paneId: string): PaneHost {
   // and orphan the first, which for a Claude pane is a duplicated conversation and bill.
   const prior = ledger.get(paneId)
   if (prior?.sessionId !== undefined) host.sessionId = prior.sessionId
+  if (prior?.mirrored !== undefined) host.mirrored = prior.mirrored
 
   hosts.set(paneId, host)
   parking.appendChild(el)
@@ -292,7 +315,38 @@ export function mountHost(paneId: string, slot: HTMLElement): void {
   host.mounted = true
   host.released = false
   host.lastUsed = now()
-  if (host.el.parentElement !== slot) slot.appendChild(host.el)
+  const moved = host.el.parentElement !== slot
+  if (moved) slot.appendChild(host.el)
+
+  /*
+   * Repaint a host that was out of the document, or it comes back showing the frame it was
+   * parked on.
+   *
+   * `parking` is never appended to `document.body` (see its declaration), so a parked host is
+   * *detached* — and this module's own header states what that means to xterm: a
+   * non-intersecting element pauses `RenderService`. The buffer keeps taking writes while
+   * paused, so the terminal's state is correct throughout; what stops is the painting. Coming
+   * back therefore shows whatever was on the canvas at the moment of parking.
+   *
+   * That is the "the pane still looks like it is working, and going full-screen fixes it"
+   * report. Parking is reached by a split, a **project switch** and a re-dock — not by a tab
+   * switch, which only flips `visibility` — so the reproduction is: switch project, let a turn
+   * finish, switch back. Maximising repaired it because it resizes, and a resize redraws from
+   * the buffer; nothing else on the mount path ever asked for a frame.
+   *
+   * In a `requestAnimationFrame` so the element has been laid out and the observer has had a
+   * chance to report it intersecting again. Safe in either order: `refreshRows` while still
+   * paused sets xterm's own `_needsFullRefresh`, which the intersection callback then spends,
+   * so this arms the repaint rather than racing it. Guarded on `moved` so an ordinary re-render
+   * — `PaneSlot`'s effect runs whenever `paneId` changes identity — does not queue a full
+   * repaint of every pane on screen for nothing.
+   */
+  if (moved) {
+    requestAnimationFrame(() => {
+      const term = hosts.get(paneId)?.terminal?.term
+      if (term !== undefined) term.refresh(0, term.rows - 1)
+    })
+  }
 
   // `releaseHost` handed this pane's WebGL context back while it was out of the tree, and
   // `openTerminal` grants one only on the first open ever — so without this a re-docked pane
@@ -401,7 +455,10 @@ export function destroyHost(paneId: string): void {
   // user has closed. The counters stay: the claim they support is about the pane's whole
   // life, not about hosts that happen to be resident.
   const entry = ledger.get(paneId)
-  if (entry) entry.sessionId = undefined
+  if (entry) {
+    entry.sessionId = undefined
+    entry.mirrored = undefined
+  }
 
   const host = hosts.get(paneId)
   if (!host) return
@@ -467,6 +524,7 @@ function evictBeyondCap(): void {
     const entry = record(victim.paneId)
     entry.evictions += 1
     if (victim.sessionId !== undefined) entry.sessionId = victim.sessionId
+    if (victim.mirrored !== undefined) entry.mirrored = victim.mirrored
     teardown(victim)
   }
 }
@@ -530,13 +588,20 @@ export function forgetSession(paneId: string): void {
   const host = hosts.get(paneId)
   if (host) {
     host.sessionId = undefined
+    // A restarted pane owns its new child: whatever it adopted is gone, and the id it is
+    // about to hold is one this pane spawned. Leaving the flag set would make `closePane`
+    // spare a child nobody else is watching.
+    host.mirrored = undefined
     host.exitMarked = false
     host.hydrated = false
     host.busy = false
     host.lastGeometry = undefined
   }
   const entry = ledger.get(paneId)
-  if (entry) entry.sessionId = undefined
+  if (entry) {
+    entry.sessionId = undefined
+    entry.mirrored = undefined
+  }
 }
 
 export function liveHosts(): Iterable<PaneHost> {

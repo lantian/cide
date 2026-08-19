@@ -215,6 +215,38 @@ try {
   // guarantee and was rejected — the fixtures above deliberately omit them to exercise the
   // withheld path, and that coverage is worth more than the compile-time check.
   // The add-TILE gesture is still a pane gesture, so `App.tsx` still supplies it.
+  /*
+   * A host coming back into the document asks for a frame.
+   *
+   * `parking` is never appended to `document.body`, so a parked host is detached, and a
+   * detached element is non-intersecting — which pauses xterm's `RenderService`. The buffer
+   * keeps taking writes the whole time, so the terminal's *state* stays right and only the
+   * painting stops; the pane then comes back showing the frame it was parked on. That was
+   * reported as "the pane still looks like it is working, and going full-screen fixes it",
+   * full-screen being the only gesture on that path that resizes and therefore redraws.
+   *
+   * Parking is reached by a split, a project switch and a re-dock — never by a tab switch,
+   * which flips `visibility` and leaves the slot mounted. So this is asserted on the source:
+   * there is no DOM here, and the reproduction needs two projects and a turn that finishes
+   * while one of them is hidden.
+   */
+  const paneHosts = readFileSync('src/layout/paneHosts.ts', 'utf8')
+  const mount = paneHosts.slice(
+    paneHosts.indexOf('export function mountHost('),
+    paneHosts.indexOf('\nfunction quiesce('),
+  )
+  ok(
+    mount !== '' && /term\.refresh\(0, term\.rows - 1\)/.test(mount),
+    'mountHost repaints a host it just moved back into the document — a parked terminal is ' +
+      'detached, xterm pauses its renderer while non-intersecting, and nothing else on the ' +
+      'mount path ever asks for a frame',
+  )
+  ok(
+    mount !== '' && /if \(moved\)/.test(mount),
+    '…and only when it actually moved, so an ordinary re-render does not queue a full repaint ' +
+      'of every pane on screen',
+  )
+
   const app = readFileSync('src/App.tsx', 'utf8')
   ok(
     /\bonAddTile=\{/.test(app),
