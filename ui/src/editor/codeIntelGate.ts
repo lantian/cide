@@ -199,7 +199,7 @@ export function onGlyph(x: number, y: number, rect: Rect, charWidth: number): bo
  * after you have already stopped moving reads as the feature not working. It still collapses a
  * whole drag across a line into a single request.
  */
-export const SETTLE_MS = 150
+export const SETTLE_MS = 10
 
 /**
  * The deadline a hover asks with.
