@@ -36,13 +36,37 @@
  * in, so the whole band of a changelist is a target rather than its 24px header; a repository
  * row, another repository's list, and the three sibling lists (`Unversioned Files`,
  * `Ignored Files`, `Merge Conflicts`) refuse, each with the reason written here and drawn on
- * the ghost. Refusing visibly matters more than usual for the sibling lists, because filing an
- * untracked path *succeeds* in the sidecar and is then dropped by the next status walk — a
- * silent no-op that looks exactly like a broken feature.
+ * the ghost. Refusing visibly matters more than usual for the sibling lists, because filing a
+ * path git does not track *succeeds* in the sidecar and is then dropped by the next status
+ * walk — a silent no-op that looks exactly like a broken feature.
  *
  * **What a same-list drop does.** Nothing, and says so. `paths` holds only the files that
  * actually change list, so a drop that moves three of five files sends three, and a drop where
  * every file is already there sends nothing at all — no command, no busy line, no flash.
+ *
+ * # Unversioned files are a second verb, not a refused move
+ *
+ * > *"i should be able to move files from Unversioned Files to any of change list via drag and
+ * > drop and via context, currently it doesn't allow and in context it writes that files are
+ * > not staged - but when dragging it should stage them automatically."*
+ *
+ * A drag out of `Unversioned Files` used to hit the same refusal as `Ignored Files` — *"Only
+ * tracked changes belong to a changelist"* — which is a true sentence about the state of the
+ * world and a useless one about the gesture, because the thing the user is asking for is
+ * precisely to change that state. IDEA answers it by *adding the file to git*, and so does
+ * this now: the drop is `track`, a two-step operation (add the paths to the index, then file
+ * them) shown as one gesture.
+ *
+ * It is a **separate outcome kind** rather than a `move` with a flag, for one reason: adding a
+ * path to git writes to the repository, and every branch that draws a verdict — the ghost, the
+ * target ring, the context-menu label — has to be able to say so. A boolean on `move` would
+ * have made "add these three files to git" a detail that any of those three could forget to
+ * mention, and a drag that silently `git add`s is the failure this variant exists to prevent.
+ * See `useGitPanel::trackPaths` for what it costs in the repository, and ADR 0004 for why the
+ * index entry it creates does not survive committing a *different* changelist.
+ *
+ * `ignored` keeps the old refusal, verbatim. An ignored path dropped on `Changes` would be a
+ * very surprising way to un-ignore something, and the sentence is still exactly true of it.
  */
 import { changelistIdOf, flatFiles, type Row } from './model'
 import type { GroupKind, RepoId, StatusView } from './types'
@@ -60,7 +84,21 @@ export interface DraggedFile {
 /** What a grab picked up. */
 export interface DragSet {
   repo: RepoId
-  /** Which of the four lists these came from. Only `changelist` can be moved. */
+  /**
+   * Which of the four lists these came from — **one** kind for the whole load.
+   *
+   * That is not a simplification, it is enforced by `grab`: the widening filters on
+   * `f.kind === kind`, so a selection spanning `Changes` and `Unversioned Files` is narrowed
+   * to whichever list the grabbed row sits in. It is what makes a mixed drop impossible to
+   * represent, and therefore what lets `dropOutcome` answer with one verb: `changelist` is a
+   * `move`, `unversioned` is a `track`, and the other two refuse.
+   *
+   * The alternative — carry both kinds and add the untracked half to git while merely
+   * re-filing the tracked half — was rejected because the ghost would then have to describe
+   * two operations at once over a set the user cannot see the composition of. Dragging from
+   * the tracked row and again from the untracked one is two gestures, each of which says
+   * plainly what it does.
+   */
   kind: GroupKind
   /** The row the gesture started on. */
   origin: string
@@ -181,11 +219,55 @@ export type DropOutcome =
       paths: string[]
       hint: string
     }
+  | {
+      /**
+       * Add these paths to git, *then* file them — the `Unversioned Files` drop.
+       *
+       * Deliberately not a `move` carrying a flag; see the header. Everything that draws a
+       * verdict switches on `kind`, so a new kind is what forces each of them to be told
+       * about the write to the repository rather than inheriting the move's wording.
+       */
+      kind: 'track'
+      repo: RepoId
+      changelist: string
+      list: string
+      /**
+       * Every dragged path, and all of them are staged.
+       *
+       * Not filtered against `DraggedFile.changelist` the way `move` is, and that is a fix
+       * rather than an omission. `status::repo_changes` sets `changelist` from
+       * `Sidecar::owner_of`, which answers *the active list* for any path nobody has filed —
+       * untracked paths included, even though they are drawn under `Unversioned Files` and
+       * are in no changelist at all. Filtering on it would make a drop onto the active
+       * changelist — by far the most likely target — compute an empty set and report
+       * `Already in “Changes”` over a file that is not in `Changes` and is not in git.
+       */
+      paths: string[]
+      hint: string
+    }
   | { kind: 'noop'; list: string; hint: string }
   | { kind: 'refuse'; reason: string; hint: string }
 
 function refuse(reason: string): DropOutcome {
   return { kind: 'refuse', reason, hint: reason }
+}
+
+/**
+ * The clause that admits the write to the repository, for the ghost.
+ *
+ * Written once and read by both routes to this operation. The context menu cannot say the
+ * whole sentence — it opens the chooser, so it does not know the list yet — but it must make
+ * the same claim, which is why `trackMenuLabel` below is its sibling rather than its own
+ * string somewhere in `GitPanelHost`. The two sentences drifting apart is how one route ends
+ * up promising a re-filing and performing a `git add`.
+ */
+export function trackHint(count: number, list: string): string {
+  return `Add ${plural(count)} to git and move to “${list}”`
+}
+
+/** The same claim, as a context-menu item. Title case, and a `…` because a chooser follows. */
+export function trackMenuLabel(count: number): string {
+  return `Add ${plural(count)} to Git and Move to Changelist…`
 }
 
 /**
@@ -196,9 +278,16 @@ function refuse(reason: string): DropOutcome {
  * complaint per changelist.
  */
 export function dropOutcome(drag: DragSet, target: Row | null): DropOutcome {
-  if (drag.kind !== 'changelist') {
+  if (drag.kind !== 'changelist' && drag.kind !== 'unversioned') {
     // The wording the context menu already uses for the same refusal, so the two routes to
-    // this operation do not explain themselves differently.
+    // this operation do not explain themselves differently. `unversioned` used to land here
+    // too and no longer does — it has a verb now, one row down.
+    //
+    // Written as "not one of the two that have a verb" rather than as "conflicts or ignored",
+    // which reads better and fails the wrong way: a fifth `GroupKind` added later would fall
+    // past both branches and be treated as a plain `move`, silently writing an assignment for
+    // a set of paths nobody has decided belongs in a changelist. Refusing an unknown kind
+    // costs a wrong-ish sentence on a list that does not exist yet; admitting it costs a write.
     return refuse(
       drag.kind === 'conflicts'
         ? 'Resolve the conflict first — conflicts are listed apart from changelists'
@@ -213,6 +302,18 @@ export function dropOutcome(drag: DragSet, target: Row | null): DropOutcome {
   const id = changelistIdOf(target.group)
   if (id === null) {
     return refuse(`“${target.label}” is not a changelist — nothing can be filed there`)
+  }
+
+  if (drag.kind === 'unversioned') {
+    const paths = drag.files.map((f) => f.path)
+    return {
+      kind: 'track',
+      repo: drag.repo,
+      changelist: id,
+      list: target.label,
+      paths,
+      hint: trackHint(paths.length, target.label),
+    }
   }
 
   const paths = drag.files.flatMap((f) => (f.changelist === id ? [] : [f.path]))

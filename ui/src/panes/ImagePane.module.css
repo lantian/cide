@@ -1,0 +1,168 @@
+/*
+ * The image pane's chrome. `ImagePane.tsx` carries the reasoning; this file carries the two
+ * pieces of it that are purely visual.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+}
+
+/*
+ * The default view: the picture, centred, scaled **down** to fit and never up.
+ *
+ * `max-width`/`max-height` rather than `object-fit: contain` on a stretched element, and the
+ * difference is the one that matters for this app's actual content. `object-fit` needs the
+ * element to have a size, which means giving it `width: 100%` — and that upscales a 16×16
+ * favicon to fill an editor pane, which is both ugly and a lie about the file. Constraints
+ * alone leave a small image at its own size and shrink a 4000px screenshot until it fits,
+ * which is what every image viewer does.
+ *
+ * The checkerboard is not decoration: a transparent PNG on a flat background is
+ * indistinguishable from a PNG with an opaque background of that colour, and "does this icon
+ * have a transparent background" is one of about three questions anyone opens a PNG in an IDE
+ * to answer. Built from theme tokens so it inverts with the theme like everything else.
+ */
+.canvas {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  overflow: auto;
+  background-color: var(--panel);
+  background-image:
+    linear-gradient(45deg, var(--chrome) 25%, transparent 25%, transparent 75%, var(--chrome) 75%),
+    linear-gradient(45deg, var(--chrome) 25%, transparent 25%, transparent 75%, var(--chrome) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+}
+
+/*
+ * 1:1 — added *beside* `.canvas`, never instead of it.
+ *
+ * `display: block` rather than the flex centring above, and that is a bug fix written down in
+ * advance rather than a preference. A flex item larger than its container and centred by
+ * `justify-content` / `align-items` overflows in **both** directions, and the half that
+ * overflows past the container's start edge cannot be scrolled to in any engine — so
+ * inspecting the top-left corner of a 4000px screenshot at 1:1 would be impossible, which is
+ * the one thing this toggle exists for. `text-align` centres the image while it still fits and
+ * leaves it at the scrollable origin once it does not.
+ *
+ * The `safe center` keyword solves this properly and is not used: WebKitGTK drops the whole
+ * declaration when it does not know the keyword, which would silently restore the broken
+ * centring. See `scripts/check-css-prefix.mjs` for the class of failure that reasoning comes
+ * from.
+ */
+.actual {
+  display: block;
+  text-align: center;
+}
+
+.image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.actual .image {
+  display: inline-block;
+  max-width: none;
+  max-height: none;
+}
+
+/*
+ * The pane's footer. Sized and coloured like the app's other in-pane strips (see
+ * `EditorPane.module.css`'s conflict bar) rather than like the window status bar, because it
+ * belongs to this pane and a split shows one per image.
+ *
+ * No `--pane-corner-clear` reservation, unlike that conflict bar: the floating pane controls
+ * are pinned to the pane's *top* right, and this strip is at the bottom.
+ */
+.bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--chrome);
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.facts {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--font-mono);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.button {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--chrome-hi);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.button:hover {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The two states that are not a picture. Deliberately the same shape as `EditorPane`'s. */
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 100%;
+  padding: 16px;
+  background: var(--panel);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.noticeTitle {
+  font-size: 13px;
+  color: var(--text-hi);
+}
+
+.noticeWhy {
+  max-width: 60ch;
+  line-height: 1.5;
+  color: var(--faint);
+  /* A path or an OS message can be long and has no spaces to break on. */
+  overflow-wrap: anywhere;
+}

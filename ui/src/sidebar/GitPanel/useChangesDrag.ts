@@ -72,6 +72,16 @@ export interface UseChangesDragOptions {
    * pretending: a drag that cannot land is a drag that should not start.
    */
   onMove?: ((repo: RepoId, changelist: string, paths: string[]) => void) | undefined
+  /**
+   * Run the *track* — add these paths to git, then file them. The `Unversioned Files` drop.
+   *
+   * A second handler rather than a flag on `onMove`, mirroring the second `DropOutcome` kind
+   * it serves: the two do different things to the repository, and a panel that wired up only
+   * one of them must be inert for that one alone rather than silently running the wrong verb.
+   * Which one a given press needs is decided at `pointerdown`, from the row's group kind, so
+   * a tree with `onMove` and no `onTrack` still drags tracked changes.
+   */
+  onTrack?: ((repo: RepoId, changelist: string, paths: string[]) => void) | undefined
 }
 
 export interface ChangesDrag {
@@ -90,7 +100,7 @@ export interface ChangesDrag {
 }
 
 export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
-  const { rows, view, carried, container, onMove } = options
+  const { rows, view, carried, container, onMove, onTrack } = options
   const [state, setState] = useState<ChangesDragState | null>(null)
 
   /*
@@ -99,8 +109,8 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
    * as they were at mousedown would drop onto a changelist that has since moved. Refs rather
    * than dependencies, because re-subscribing window listeners mid-drag loses the capture.
    */
-  const live = useRef({ rows, view, carried, onMove })
-  live.current = { rows, view, carried, onMove }
+  const live = useRef({ rows, view, carried, onMove, onTrack })
+  live.current = { rows, view, carried, onMove, onTrack }
   /** Everything about the gesture in flight. `null` between gestures. */
   const gesture = useRef<{
     pointerId: number
@@ -127,8 +137,14 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
     active?.stop?.()
     setState(null)
     const outcome = active?.outcome
-    if (!commit || outcome === undefined || outcome === null || outcome.kind !== 'move') return
-    live.current.onMove?.(outcome.repo, outcome.changelist, outcome.paths)
+    if (!commit || outcome === undefined || outcome === null) return
+    // The two verbs, dispatched on the kind the rules produced. Nothing else lands: `noop` and
+    // `refuse` deliberately send no command at all, which is what makes a drop onto the list a
+    // file is already in cost no round trip and no busy line.
+    if (outcome.kind !== 'move' && outcome.kind !== 'track') return
+    const run =
+      outcome.kind === 'move' ? live.current.onMove : live.current.onTrack
+    run?.(outcome.repo, outcome.changelist, outcome.paths)
   }, [])
 
   const onPointerDown = useCallback(
@@ -156,9 +172,15 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
        * optional call. That is the silent failure this feature exists to remove, dressed as
        * the feature. Read through `live` rather than closed over, so a panel that gains the
        * action between renders is not stuck inert until it remounts.
+       *
+       * Per *kind*, because there are two verbs and two handlers: a row in `Unversioned Files`
+       * needs `onTrack`, everything else needs `onMove`. Requiring both would make a tree that
+       * wired up only the move inert for every row, which is a larger lie than the one this
+       * guard exists to prevent; requiring neither is the lie itself.
        */
-      if (live.current.onMove === undefined) return
-      if (grab(live.current.view, live.current.carried, row) === null) return
+      const load = grab(live.current.view, live.current.carried, row)
+      if (load === null) return
+      if (handlerFor(live.current, load) === undefined) return
 
       const el = e.currentTarget
       if (!(el instanceof HTMLElement)) return
@@ -245,6 +267,22 @@ export function useChangesDrag(options: UseChangesDragOptions): ChangesDrag {
   useEffect(() => () => finish(false), [finish])
 
   return { state, onPointerDown, dragged: () => wasDrag.current }
+}
+
+/**
+ * Which handler a load of this kind would end up calling, so the press can refuse to start
+ * when it is missing.
+ *
+ * It answers from the *grab* rather than from the drop, which is the only thing available at
+ * `pointerdown` — the target is not known until the pointer has moved. A `conflicts` or
+ * `ignored` grab needs no handler at all and is checked against `onMove`: those drags exist
+ * solely to draw their refusal, and a tree with no move handler has nothing to refuse *for*.
+ */
+function handlerFor(
+  handlers: { onMove?: unknown; onTrack?: unknown },
+  load: DragSet,
+): unknown {
+  return load.kind === 'unversioned' ? handlers.onTrack : handlers.onMove
 }
 
 /**

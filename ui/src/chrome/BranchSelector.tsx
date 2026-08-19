@@ -35,7 +35,9 @@
  * Every decision about *which* rows appear and *what a refusal says* is in `branchModel.ts`,
  * which has no React in it and is driven directly by `ui/scripts/check-branches.mjs`.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+
+import { notify } from '@/chrome/notices'
 import { create } from 'zustand'
 import {
   branch as branchApi,
@@ -66,6 +68,12 @@ import {
   primaryRepo,
   refusalOf,
   visibleBranches,
+  alreadyOn,
+  type BranchFocus,
+  clampFocus,
+  enterAction,
+  FILTER,
+  navigate,
   type GitOp,
   type Refusal,
 } from './branchModel'
@@ -288,17 +296,70 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
     useBranches.getState().intent === 'new' ? { kind: 'new', from: null } : { kind: 'list' },
   )
   const [openRow, setOpenRow] = useState<string | null>(null)
+  /*
+   * Where the arrows have walked to. `FILTER` is a *place*, not the absence of a selection —
+   * "Up from the first branch returns to the filter" is then a transition the reducer states
+   * rather than an off-by-one somebody clamps away. See `branchModel::navigate`.
+   */
+  const [focus, setFocus] = useState<BranchFocus>(FILTER)
   const search = useRef<HTMLInputElement>(null)
+  const popupEl = useRef<HTMLDivElement>(null)
+  const rowsEl = useRef<HTMLDivElement>(null)
 
   const list = listFor(lists, chosen)
   const rows = visibleBranches(list, query)
   const repo = list?.repo.id ?? null
 
   useEffect(() => {
-    search.current?.focus()
     // Consumed: reopening from the widget starts on the list again.
     useBranches.setState({ intent: 'list' })
   }, [])
+
+  /*
+   * Focus follows the panel, and it has to.
+   *
+   * Every key this popup answers — the arrows and Enter on the search field, Escape on the
+   * scrim — is a React handler on an element *inside* the scrim. A panel that unmounts the
+   * field leaves focus on `document.body`, which is outside that subtree, and all three go
+   * dead at once with nothing on screen to say so. Enter put that on the ordinary keyboard
+   * route: it can raise the refusal panel, and Escape then failed to back out of the panel
+   * the keystroke had just produced.
+   *
+   * Keyed on `mode.kind` rather than `mode`, so the delete panel hardening its question
+   * (`force` flips, `kind` does not) does not yank focus back mid-read. `new` and `rename`
+   * are deliberately absent: they are `NameForm`, which focuses its own field on mount, and a
+   * child's effect runs before its parent's — reaching in from here would take focus straight
+   * back off the name box. The other two panels have no field to want it, so the dialog takes
+   * it; it is `tabIndex={-1}`, focusable programmatically and skipped by Tab.
+   */
+  useEffect(() => {
+    if (mode.kind === 'list') search.current?.focus()
+    else if (mode.kind === 'delete' || mode.kind === 'refusal') popupEl.current?.focus()
+  }, [mode.kind])
+
+  /*
+   * The highlight, made safe against a list that changed underneath it.
+   *
+   * Derived every render rather than corrected in an effect: an effect leaves one frame in
+   * which the popup draws a highlight on a row that is not there, and a keystroke arriving in
+   * that frame reads the stale index. Two live routes shorten the list — typing into the
+   * filter, and `cide://git-status`, which fires whenever anything touches the refs, so a
+   * `git branch -d` in a terminal pane re-renders this popup with fewer rows.
+   */
+  const at = clampFocus(focus, rows.length)
+  const rowId = (index: number) => `branch-row-${index}`
+
+  /*
+   * Keep the highlighted row on screen. `.rows` scrolls, and arrows that walk the highlight
+   * out of sight look like a list that is not moving at all.
+   *
+   * `useLayoutEffect` so the scroll lands in the same frame as the highlight; `block: 'nearest'`
+   * so a highlight already in view does not re-centre the list under the pointer.
+   */
+  useLayoutEffect(() => {
+    if (at.kind !== 'row') return
+    rowsEl.current?.querySelector(`#${rowId(at.index)}`)?.scrollIntoView({ block: 'nearest' })
+  }, [at.kind, at.kind === 'row' ? at.index : -1])
 
   /*
    * Escape backs out one level rather than closing outright when a panel is open: the panels
@@ -323,6 +384,16 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
     if (project === null || repo === null) return
     setMode({ kind: 'list' })
     setOpenRow(null)
+    /*
+     * And take focus back, which the effect above cannot be relied on to do.
+     *
+     * Fetch, Pull and Push are reachable only *from* the list, so the line above writes the
+     * value `mode.kind` already held. That effect is keyed on `mode.kind` — deliberately, so a
+     * panel re-render does not yank focus mid-read — so it does not re-run. Focus stays on the
+     * button the pointer pressed, and every arrow key is a handler on the search field, so one
+     * click on Fetch silently killed the keyboard navigation this popup exists for.
+     */
+    search.current?.focus()
     void useBranches.getState().run(() => work(project, repo), op)
   }
 
@@ -343,10 +414,27 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
       try {
         const outcome = await branchApi.checkout(project, repo, name, how)
         setMode({ kind: 'list' })
-        // A clean switch says nothing — see `checkoutNote`. `null`, not `''`: an empty string
-        // would draw the note bar with nothing in it.
+        /*
+         * "It should close after selection" — answered here, **after the checkout resolved**,
+         * and deliberately not on the click.
+         *
+         * `CheckoutWouldOverwrite` is a real refusal this popup answers with a panel naming
+         * the files that would be lost, and `explain` produces a sentence for every other
+         * failure. A popup that had already closed would have thrown both away, leaving the
+         * user standing on the branch they started from with nothing to say why. So the
+         * dismiss lives on the success path only; the `catch` below leaves the popup up.
+         *
+         * The note goes to `chrome/notices` rather than the store's note bar, because that bar
+         * is inside the popup that is being unmounted on the next line — a stash that was
+         * taken along, or a local branch created from a remote, would otherwise be reported
+         * into a component nobody can see. `restoreFailed` is an error: it means the stash was
+         * made and could not be put back, which is the one outcome the user must act on.
+         */
         const said = checkoutNote(outcome)
-        useBranches.getState().say(said === '' ? null : said)
+        if (said !== '') {
+          notify(said, { kind: outcome.restoreFailed !== null ? 'error' : 'info' })
+        }
+        onDismiss()
       } catch (error) {
         const refusal = refusalOf(error)
         if (refusal !== null) setMode({ kind: 'refusal', refusal })
@@ -375,6 +463,14 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
         role="dialog"
         aria-label="Branches"
         data-audit="branchPopup"
+        ref={popupEl}
+        /*
+         * Focusable programmatically, skipped by Tab. The delete and refusal panels have no
+         * field of their own, so the dialog takes focus itself — otherwise it lands on
+         * `document.body`, outside the scrim, and Escape stops backing out of the very panel
+         * the user is reading.
+         */
+        tabIndex={-1}
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/*
@@ -407,14 +503,39 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                 placeholder="Search branches"
                 value={query}
                 spellCheck={false}
-                onChange={(e) => setQuery(e.target.value)}
+                role="combobox"
+                aria-expanded
+                aria-controls="branch-rows"
+                /*
+                 * DOM focus never leaves this field on the arrow route, so the field is what
+                 * names the highlighted row for a screen reader. Real focus movement was the
+                 * alternative and it loses twice: the current branch's row button is
+                 * `disabled` and cannot be focused — making the branch you are on the one row
+                 * the keyboard cannot reach — and a focused row swallows typing, so filtering
+                 * would stop working the moment you pressed Down.
+                 */
+                aria-activedescendant={at.kind === 'row' ? rowId(at.index) : undefined}
+                onChange={(e) => {
+                  setQuery(e.target.value)
+                  // Typing re-filters, so the old index means nothing. Back to the field.
+                  setFocus(FILTER)
+                }}
                 onKeyDown={(e) => {
-                  // ⏎ on a filtered list checks out the only remaining row. With more than
-                  // one it does nothing rather than guessing — a checkout is not a gesture to
-                  // resolve an ambiguity with.
-                  if (e.key === 'Enter' && rows.length === 1 && rows[0] !== undefined) {
-                    tryCheckout(rows[0].name)
+                  if (e.key === 'Enter') {
+                    const action = enterAction(rows, at)
+                    if (action.kind === 'checkout') tryCheckout(action.name)
+                    // Said rather than silent: the current branch is pinned first, so it is
+                    // the row the first Down always lands on, and an ⏎ that did nothing at
+                    // all there is how a user concludes the keyboard is not wired up.
+                    else if (action.kind === 'already') useBranches.getState().say(alreadyOn(action.name))
+                    return
                   }
+                  const next = navigate(e.key, at, rows.length)
+                  // `null` is "not ours, or nowhere to go", and the key is left to the field's
+                  // own caret behaviour rather than eaten.
+                  if (next === null) return
+                  e.preventDefault()
+                  setFocus(next)
                 }}
               />
               <div className={styles.actions}>
@@ -466,7 +587,13 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
               </div>
             </div>
 
-            <div className={styles.rows} role="listbox" aria-label="Branches">
+            <div
+              className={styles.rows}
+              role="listbox"
+              aria-label="Branches"
+              id="branch-rows"
+              ref={rowsEl}
+            >
               {!loaded && <div className={styles.empty}>Reading branches…</div>}
               {loaded && rows.length === 0 && (
                 <div className={styles.empty}>
@@ -481,6 +608,8 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   // splitting the array: one flat list is one keyboard sequence, and the
                   // heading is a property of the boundary.
                   heading={sectionOf(entry, rows[index - 1])}
+                  id={rowId(index)}
+                  active={at.kind === 'row' && at.index === index}
                   open={openRow === entry.name}
                   busy={busy}
                   onToggleMenu={() => setOpenRow(openRow === entry.name ? null : entry.name)}
@@ -660,6 +789,10 @@ function sectionOf(entry: BranchRef, previous: BranchRef | undefined): string | 
 interface RowProps {
   entry: BranchRef
   heading: string | null
+  /** Stable per index, so the field's `aria-activedescendant` can name it. */
+  id: string
+  /** The arrows have walked here. Drawn, but never focused — see the field's comment. */
+  active: boolean
   open: boolean
   busy: boolean
   onToggleMenu: () => void
@@ -669,7 +802,7 @@ interface RowProps {
   onDelete: () => void
 }
 
-function Row({ entry, heading, open, busy, ...on }: RowProps) {
+function Row({ entry, heading, id, active, open, busy, ...on }: RowProps) {
   const actions = actionsFor(entry)
   const ahead = entry.ahead > 0 ? `↑${entry.ahead}` : ''
   const behind = entry.behind > 0 ? `↓${entry.behind}` : ''
@@ -677,12 +810,20 @@ function Row({ entry, heading, open, busy, ...on }: RowProps) {
   return (
     <>
       {heading !== null && <div className={styles.section}>{heading}</div>}
-      <div className={entry.current ? styles.rowCurrent : styles.row}>
+      <div
+        id={id}
+        className={`${entry.current ? styles.rowCurrent : styles.row}${active ? ` ${styles.rowOn}` : ''}`}
+      >
         <button
           type="button"
           className={styles.rowMain}
           role="option"
-          aria-selected={entry.current}
+          /*
+           * The *highlight*, not the current branch. `aria-selected` on a listbox option means
+           * "this is the one you are choosing", which is what the arrows move; the branch you
+           * are standing on is already spelled out in the row itself.
+           */
+          aria-selected={active}
           // The current branch cannot be checked out again — the whole row is inert rather
           // than clickable-and-silent.
           disabled={busy || entry.current}

@@ -213,8 +213,14 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
             onOpenDiff={git.openDiff}
             /* Drag and drop's only connection to git. The rules live in `dragDrop.ts` and the
                gesture in `useChangesDrag.ts`; by the time this is called the target has been
-               named and the same-list paths dropped. */
+               named and the same-list paths dropped.
+
+               Two of them, because a drop out of `Unversioned Files` is a different operation:
+               it adds the paths to git before filing them. Passing only the first is what the
+               panel did until the user reported that unversioned files could not be dragged
+               anywhere at all. */
             onMovePaths={git.movePaths}
+            onTrackPaths={git.trackPaths}
             onContextMenu={treeMenu?.onContextMenu}
             menu={treeMenu?.menu}
           />

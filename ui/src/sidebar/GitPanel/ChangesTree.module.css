@@ -428,8 +428,15 @@
  * the same reason `.rowCurrent` uses an inset shadow. `accept` is the accent (this app's one
  * "yes"), `noop` is a neutral `--border` ring on the selection ground (the drop is allowed and
  * changes nothing, which is not an error), and `refuse` is `--red` with the reason on the ghost.
+ *
+ * `track` — an unversioned file being added to git and filed — takes the same accent ring as
+ * `move`. It is a yes, and drawing it in a fourth colour would spend one of the panel's three
+ * meanings on a distinction the ghost already makes in words. The colour says "this will
+ * land"; *what* lands is a sentence, because "these files are added to git" cannot be said in
+ * a hue.
  */
-.row[data-drop='move'] {
+.row[data-drop='move'],
+.row[data-drop='track'] {
   background: var(--sel);
   box-shadow:
     inset 0 0 0 1px var(--accent),
@@ -451,6 +458,7 @@
  * no band to join.
  */
 .row[data-drop-band='move'],
+.row[data-drop-band='track'],
 .row[data-drop-band='noop'] {
   background-image: linear-gradient(var(--chrome-hi), var(--chrome-hi));
   background-image: linear-gradient(
@@ -504,12 +512,26 @@
   color: var(--dim);
 }
 
-.ghost[data-outcome='move'] {
+.ghost[data-outcome='move'],
+.ghost[data-outcome='track'] {
   border-color: var(--accent);
 }
 
-.ghost[data-outcome='move'] .ghostHint {
+/*
+ * The hint wraps for a `track`, as it does for a refusal.
+ *
+ * `Add 3 files to git and move to “fixes”` is longer than the 260px card and a single-line
+ * ellipsis would cut it at *“Add 3 files to git and move to…”* — losing the target, or on a
+ * narrower list the admission that git is being written to, which is the half of the sentence
+ * this outcome exists to say out loud.
+ */
+.ghost[data-outcome='move'] .ghostHint,
+.ghost[data-outcome='track'] .ghostHint {
   color: var(--accent);
+}
+
+.ghost[data-outcome='track'] .ghostHint {
+  white-space: normal;
 }
 
 /* Refused, in words. The colour alone would say "no" to everyone who can see it and nothing

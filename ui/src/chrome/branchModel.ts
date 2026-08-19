@@ -134,6 +134,153 @@ export function remoteOf(entry: BranchRef): string | null {
   return cut < 0 ? null : entry.name.slice(0, cut)
 }
 
+// --- where the keyboard is -----------------------------------------------------------------
+
+/**
+ * Where the popup's keyboard highlight sits: in the filter field, or on one visible row.
+ *
+ * > *"when this popup with list of branches is opening it focus on filter input - this is ok,
+ * > but when i pressing UP/DOWN buttons - i should be able to travers through branches and back
+ * > to filter input if top of the list of branches"*
+ *
+ * The filter is a *place* in this model, not the absence of a selection, and that is the whole
+ * point of the union: `-1 means the field` inside a plain number would have made the one
+ * transition the user actually asked for — Up from the first branch landing back in the filter
+ * — an off-by-one waiting to be clamped away by somebody tidying up.
+ *
+ * DOM focus never leaves the input. The rows are real `<button>`s and moving focus onto them
+ * would have been the obvious implementation, but it loses twice: the current branch's button
+ * is `disabled` (it cannot be checked out again), and a disabled button cannot take focus — so
+ * the branch you are standing on would be the one row the arrows could never reach — and a row
+ * with focus swallows typing, so the user could no longer narrow the list without a trip back
+ * to the field. Highlight-in-the-model, focus-in-the-field is what `overlays/CommandPalette.tsx`
+ * and `overlays/ScratchType.tsx` already do; this is the same arrangement with one extra state.
+ */
+export type BranchFocus = { kind: 'filter' } | { kind: 'row'; index: number }
+
+/** The resting place: the filter field, which is what the popup opens on. */
+export const FILTER: BranchFocus = { kind: 'filter' }
+
+/**
+ * How far Page Up / Page Down jump.
+ *
+ * Ten, the same as `overlays/listKeys.ts::PAGE_ROWS`, and deliberately *not* imported from it:
+ * this module compiles standalone under `check-branches.mjs` with no module resolution at all
+ * (see the foot-note), and a value import would break that with a resolution error rather than
+ * a sentence. The number is duplicated; the reasoning is not, and it is one number.
+ */
+export const PAGE_ROWS = 10
+
+/**
+ * The keystroke, resolved against a list of `count` rows with `focus` highlighted.
+ *
+ * `null` means *nothing to do with the list* — either the key is not one of ours, or it is but
+ * there is nowhere for it to go. The caller uses that to decide whether to `preventDefault`, so
+ * a Down on the last row leaves the text field's own caret behaviour alone rather than eating
+ * the key.
+ *
+ * **Movement does not wrap**, unlike the file picker's. Wrapping would make Up from the first
+ * branch select the *last* one, and Up from the first branch is precisely the gesture that has
+ * to return to the filter field. The two rules cannot both hold, and the user asked for this
+ * one; a bottom row that does not roll round to the top is the smaller loss, and End is here.
+ *
+ * `Home` and `End` do nothing while the focus is in the field, because there they are the
+ * caret's keys and a filter you cannot jump to the start of is a filter you cannot edit.
+ * `Escape` is absent for a different reason: the popup's scrim already owns it, and it means
+ * *back out one panel*, which is a question about `Mode` that this reducer cannot see.
+ */
+export function navigate(key: string, focus: BranchFocus, count: number): BranchFocus | null {
+  // An empty list — no branches, or a filter that matched nothing — has no row to move onto,
+  // and the highlight is already in the field. Every key is the field's.
+  if (count === 0) return null
+
+  // `-1` for the field *inside* this function only: the arithmetic below is "one place up or
+  // down a column that starts with the filter", and writing it out as branches per key made
+  // four copies of the same clamp. The union is what crosses the boundary.
+  const at = focus.kind === 'filter' ? -1 : focus.index
+  const last = count - 1
+  const row = (index: number): BranchFocus => ({
+    kind: 'row',
+    index: Math.min(Math.max(index, 0), last),
+  })
+
+  switch (key) {
+    case 'ArrowDown':
+      return at >= last ? null : row(at + 1)
+    case 'ArrowUp':
+      // The transition the report is about. From the first row the answer is the field, not
+      // "stay put" and not "wrap to the bottom".
+      if (at < 0) return null
+      return at === 0 ? FILTER : row(at - 1)
+    case 'PageDown':
+      return at >= last ? null : row(at + PAGE_ROWS)
+    case 'PageUp':
+      // A page jump from anywhere below the top lands *on the top row*, not in the field: a
+      // jump that ends in a text box swallows the next thing typed. Only the row-0 case
+      // continues into the field, so that holding Up and holding PageUp end in the same place.
+      if (at < 0) return null
+      return at === 0 ? FILTER : row(at - PAGE_ROWS)
+    case 'Home':
+      return at < 0 ? null : row(0)
+    case 'End':
+      return at < 0 ? null : row(last)
+    default:
+      return null
+  }
+}
+
+/**
+ * `focus` made safe against a list that changed underneath it.
+ *
+ * The classic bug this exists to prevent: the highlight points past the end and ⏎ checks out
+ * `undefined`, or nothing, silently. It has two live routes here, and neither is exotic —
+ * typing into the filter shortens the list under the highlight, and `cide://git-status` fires
+ * whenever anything touches the refs, so a `git branch -d` typed into a terminal pane, a fetch
+ * that prunes, or another window's delete all re-render this popup with fewer rows.
+ *
+ * Derived on every render rather than corrected in an effect: an effect would leave one frame
+ * in which the popup drew a highlight on a row that is not there, and — worse — a keystroke
+ * arriving in that frame would read the stale index.
+ *
+ * Landing on the *last* row rather than back in the field, because the user is walking the list
+ * and yanking their place out into a text box mid-keypress is the more surprising of the two.
+ */
+export function clampFocus(focus: BranchFocus, count: number): BranchFocus {
+  if (focus.kind === 'filter') return focus
+  if (count === 0 || focus.index < 0) return FILTER
+  return focus.index >= count ? { kind: 'row', index: count - 1 } : focus
+}
+
+/**
+ * What ⏎ means right now.
+ *
+ * Three answers rather than a nullable branch name, because "there is nothing here" and "you
+ * are already on that one" are different things to say and the second one has to be *said*: a
+ * key that does nothing at all is how a user concludes the keyboard is not wired up, and the
+ * branch you are standing on is the first row of the unfiltered list — the row Down lands on
+ * first, every single time the popup opens.
+ *
+ * The filter case is the older behaviour, kept: ⏎ with the list narrowed to exactly one row
+ * checks that row out. With more than one it does nothing rather than guessing, because a
+ * checkout is not a gesture to resolve an ambiguity with — press Down and choose.
+ */
+export type EnterAction =
+  | { kind: 'none' }
+  | { kind: 'checkout'; name: string }
+  | { kind: 'already'; name: string }
+
+export function enterAction(rows: readonly BranchRef[], focus: BranchFocus): EnterAction {
+  const entry = focus.kind === 'row' ? rows[focus.index] : rows.length === 1 ? rows[0] : undefined
+  if (entry === undefined) return { kind: 'none' }
+  if (entry.current) return { kind: 'already', name: entry.name }
+  return { kind: 'checkout', name: entry.name }
+}
+
+/** The sentence for [`EnterAction`]`.already`. One place, so the popup and its check agree. */
+export function alreadyOn(name: string): string {
+  return `You are already on ${name}`
+}
+
 // --- what a row may do ---------------------------------------------------------------------
 
 /** The per-branch actions, in the order the row menu lists them. */

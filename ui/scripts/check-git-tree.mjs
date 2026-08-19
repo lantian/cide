@@ -1009,6 +1009,7 @@ try {
   const rowB = rowsE.find((r) => r.label === 'b.rs')
   const rowSrc = rowsE.find((r) => r.kind === 'dir' && r.path === 'src')
   const rowNotes = rowsE.find((r) => r.label === 'notes.md')
+  const rowIgnored = rowsE.find((r) => r.label === 'target')
   eq(
     [rowSrc.kind, rowSrc.depth, rowSrc.label, rowSrc.groupKind],
     ['dir', 1, 'src', 'changelist'],
@@ -1375,9 +1376,11 @@ try {
   eq(
     paths(carry([rowA.id, rowNotes.id], rowA)),
     ['a.rs'],
-    'an unversioned row is never swept into a changelist gesture even when it is selected: '
-      + '`status::repo_changes` builds `live` from paths that are neither Untracked nor '
-      + 'Ignored, so filing one is a write the next status walk undoes',
+    'an unversioned row is never swept into a TRACKED drag even when it is selected: the '
+      + 'widening filters on the group kind, so one grab carries one kind. That is what lets '
+      + '`dropOutcome` answer with a single verb — filing a tracked change is a re-filing, '
+      + 'filing an unversioned one adds it to git, and a ghost cannot honestly describe both '
+      + 'at once over a set whose composition the user cannot see',
   )
   eq(
     paths(carry([rowNotes.id], rowNotes)),
@@ -1474,11 +1477,66 @@ try {
     'the ignored list too',
   )
   eq(
-    d.dropOutcome(d.grab(withEmptyView, new Set(), rowNotes), group('fixes')).reason,
+    d.dropOutcome(d.grab(withEmptyView, new Set(), rowIgnored), group('fixes')).reason,
     'Only tracked changes belong to a changelist',
-    'and an unversioned file refuses wherever it is dropped — the source is reported before '
-      + 'the target, so the answer is the same over every row instead of a new complaint per '
-      + 'changelist. Same sentence the context menu gives',
+    'a drag OUT of the ignored list keeps the old refusal, word for word. `target/` dropped '
+      + 'on `Changes` would be a very surprising way to un-ignore something, and unlike an '
+      + 'unversioned file nobody asked for it — only the unversioned list gained a verb',
+  )
+  /*
+   * The reported bug, and the shape of its fix.
+   *
+   * > *"i should be able to move files from Unversioned Files to any of change list via drag
+   * > and drop and via context, currently it doesn't allow"*
+   *
+   * An unversioned drag used to hit the same refusal as an ignored one — a true sentence about
+   * the state of the world and no answer at all to what was asked, since changing that state
+   * is the request. It is a second outcome kind rather than a `move` with a flag precisely so
+   * that every surface drawing a verdict has to say what it does: the ghost, the target ring
+   * and the menu label all switch on `kind`.
+   */
+  const unversioned = d.grab(withEmptyView, new Set(), rowNotes)
+  eq(
+    d.dropOutcome(unversioned, group('fixes')),
+    {
+      kind: 'track',
+      repo: APP,
+      changelist: 'fixes',
+      list: 'fixes',
+      paths: ['notes.md'],
+      hint: 'Add 1 file to git and move to “fixes”',
+    },
+    'an unversioned file dropped on a changelist is TRACKED: added to git, then filed. The '
+      + 'hint says the `git add` out loud, because that is a change to the repository and not '
+      + 'a re-filing — silent staging is the thing this outcome exists to prevent',
+  )
+  eq(
+    d.dropOutcome(unversioned, group('Changes')),
+    {
+      kind: 'track',
+      repo: APP,
+      changelist: 'default',
+      list: 'Changes',
+      paths: ['notes.md'],
+      hint: 'Add 1 file to git and move to “Changes”',
+    },
+    'and dropping it on the ACTIVE changelist is a track too, not `Already in “Changes”`. '
+      + '`ChangeEntry.changelist` comes from `Sidecar::owner_of`, which answers the active '
+      + "list for every unfiled path — untracked ones included — so the `move` branch's "
+      + 'same-list filter would compute an empty set and report the file as already being in '
+      + 'a list it is not in and in a git that has never seen it',
+  )
+  eq(
+    d.dropOutcome(unversioned, group('Ignored Files')).kind,
+    'refuse',
+    'the sibling lists still refuse it: `Ignored Files` is not a changelist, so there is '
+      + 'nothing to file into and nothing to add to git for',
+  )
+  ok(
+    d.trackHint(3, 'fixes') === 'Add 3 files to git and move to “fixes”'
+      && d.trackMenuLabel(3) === 'Add 3 files to Git and Move to Changelist…',
+    'and the claim is written once, for both routes: the ghost and the context-menu item read '
+      + 'the same two helpers, so a drag cannot promise a `git add` that the menu calls a move',
   )
   eq(
     d.dropOutcome(carried, null).kind,
@@ -1554,8 +1612,10 @@ try {
       + 'than either of them being wrong on its own',
   )
   ok(
-    /function dirMenu\([\s\S]{0,900}?git\.moveToChangelist\(row\.repo, paths\)/.test(host),
-    'a directory row can be moved from the keyboard, not only dragged',
+    /function dirMenu\([\s\S]{0,1600}?git\.moveToChangelist\(row\.repo, paths, untracked\)/.test(host),
+    'a directory row can be moved from the keyboard, not only dragged — and it carries the '
+      + '`untracked` fact to the chooser, so a folder of unversioned files opens the dialog '
+      + 'that adds them to git rather than the one that only re-files',
   )
   ok(
     /label: `Move \$\{plural\(count\)\} to Changelist…`,\s*\.\.\.\(empty/.test(host),
@@ -1572,14 +1632,14 @@ try {
    * disabled there and a directory row inside the same list must not be the way around it.
    */
   ok(
-    /function dirMenu\([\s\S]{0,2600}?label: untracked \? `Delete \$\{plural\(count\)\}` : `Roll Back \$\{plural\(count\)\}`/
+    /function dirMenu\([\s\S]{0,3400}?label: untracked \? `Delete \$\{plural\(count\)\}` : `Roll Back \$\{plural\(count\)\}`/
       .test(host),
     'a directory of UNVERSIONED files says Delete, not Roll Back: git has nothing to restore '
       + 'them from, so the command removes them from disk, and the dialog must not promise a '
       + 'restore before running a delete',
   )
   ok(
-    /function dirMenu\([\s\S]{0,2900}?\.\.\.\(ignored\s*\?\s*\{ disabledReason:/.test(host),
+    /function dirMenu\([\s\S]{0,3700}?\.\.\.\(ignored\s*\?\s*\{ disabledReason:/.test(host),
     'and a directory inside IGNORED FILES refuses to roll back at all — `target/` and '
       + '`node_modules/` are not part of any change, and the group row above it has refused '
       + 'the same verb since it shipped',
@@ -1595,9 +1655,11 @@ try {
   const tree2 = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangesTree.tsx'), 'utf8')
   ok(
     /onPointerDown=\{\(e\) => drag\.onPointerDown\(e, row\)\}/.test(tree2)
-      && /useChangesDrag\(\{ rows, view, carried, container, onMove: onMovePaths \}\)/.test(tree2),
+      && /onMove: onMovePaths,\s*onTrack: onTrackPaths,/.test(tree2),
     'every row is a drag source candidate and the tree is wired to the pointer state machine — '
-      + 'the rules being right is worth nothing if no gesture reaches them',
+      + 'the rules being right is worth nothing if no gesture reaches them. BOTH verbs are '
+      + 'wired: a tree given only the move would drag tracked changes and drop unversioned '
+      + 'ones into nothing at all',
   )
   /*
    * And it does not start when there is nothing to land on. Without this the drag ran in full
@@ -1607,9 +1669,12 @@ try {
    */
   const gesture = readFileSync(join(UI, 'src/sidebar/GitPanel/useChangesDrag.ts'), 'utf8')
   ok(
-    /if \(live\.current\.onMove === undefined\) return/.test(gesture),
-    'a tree with no `onMovePaths` is inert rather than decorative: a press never becomes a '
-      + 'drag, instead of a full gesture whose drop silently does nothing',
+    /if \(handlerFor\(live\.current, load\) === undefined\) return/.test(gesture)
+      && /load\.kind === 'unversioned' \? handlers\.onTrack : handlers\.onMove/.test(gesture),
+    'a tree with no handler for what this row would do is inert rather than decorative: a '
+      + 'press never becomes a drag, instead of a full gesture whose drop silently does '
+      + 'nothing. Per KIND, because there are two verbs — requiring both would make a tree '
+      + 'that wired up only the move inert for every row',
   )
   ok(
     /onMouseUp=\{\(e\) => \{\s*if \(e\.button !== 0\) return\s*if \(drag\.dragged\(\)\) \{/.test(tree2),
@@ -1693,6 +1758,64 @@ try {
       && /gitApi\.changelist\.movePaths\(p, repo, changelist, paths\)/.test(model),
     'and a drop reaches `git_changelist_move_paths` through the panel itself — no line in '
       + 'App.tsx, which this feature does not own, stands between the gesture and the command',
+  )
+  /*
+   * The unversioned drop, traced from the gesture to the two commands it runs.
+   *
+   * This is the half the panel has got wrong before: a rule that decides correctly, a ghost
+   * that says so, and nothing on the other end. Every link is asserted separately, because
+   * any one of them missing leaves a gesture that looks alive and does nothing.
+   */
+  ok(
+    /onTrackPaths=\{git\.trackPaths\}/.test(panel),
+    'the panel passes the track handler as well as the move handler — without it a drop out '
+      + 'of `Unversioned Files` computes its outcome, draws its ghost, and lands on an '
+      + 'optional call that is not there',
+  )
+  ok(
+    /await gitApi\.stage\(project, repo, wholeFiles\(paths\)\)/.test(model)
+      && /await gitApi\.changelist\.movePaths\(project, repo, changelist, paths\)/.test(model),
+    'and `trackPaths` runs both halves in order: the `git add` FIRST, then the filing. The '
+      + 'other order is a write that undoes itself — `status::repo_changes` builds `live` from '
+      + 'paths that are neither Untracked nor Ignored, so an assignment recorded while the '
+      + 'path is still untracked is dropped by `Sidecar::reconcile` on the next status walk',
+  )
+  ok(
+    /added\s*\?\s*`\$\{files\(paths\.length\)\} were added to git, but the move failed/.test(model)
+      && /: `nothing was added to git/.test(model),
+    'and a half-applied gesture SAYS SO, naming which half ran. A failed add leaves the move '
+      + 'impossible and must not be silent; a failed move after a successful add leaves the '
+      + 'files in git and in the active changelist, which the user cannot be left to discover',
+  )
+  ok(
+    /label: untracked\s*\n?\s*\? trackMenuLabel\(scope\.paths\.length\)/.test(host)
+      && /\.\.\.\(row\.groupKind === 'changelist' \|\| untracked/.test(host),
+    'the CONTEXT MENU takes the same route — the item is enabled on an unversioned row and '
+      + 'labelled from the same helper the drag ghost reads. It was disabled there with '
+      + '"Only tracked changes belong to a changelist", which is the sentence the user '
+      + 'reported: a statement about the state of the world where an answer was wanted',
+  )
+  const dialog = readFileSync(join(UI, 'src/sidebar/GitPanel/ChangelistDialog.tsx'), 'utf8')
+  ok(
+    /const TRACK_TITLE = 'Add to git and move to changelist'/.test(dialog)
+      && /Git is not tracking th/.test(dialog),
+    'and the chooser the menu opens says it too, in its title and in a sentence, before '
+      + 'anything runs. A dialog that looked identical for the two operations would be the '
+      + 'silent staging this whole path exists to avoid, reached through the keyboard',
+  )
+  ok(
+    /if \(track\) \{\s*trackPaths\(repo, id, \[\.\.\.paths\]\)/.test(model),
+    'and answering it runs the same operation the drop runs, not a plain move: one '
+      + 'implementation, so the two routes cannot come to do different things to the repository',
+  )
+  ok(
+    /const here = track\s*\?\s*new Set<string>\(\)/.test(model),
+    'and the chooser does not grey out the row most of these files are headed for. '
+      + '`ChangeEntry.changelist` comes from `Sidecar::owner_of`, which answers the ACTIVE '
+      + 'list for every unfiled path — untracked ones included — so the "already here" '
+      + 'suppression, read literally, disables the active changelist on a set of files that '
+      + 'is in no changelist at all. Same fact `dropOutcome`\'s track branch is built around, '
+      + 'asserted here because the menu route reaches it through different code',
   )
 
   if (failed > 0) {

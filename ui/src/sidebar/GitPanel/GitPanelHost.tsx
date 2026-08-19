@@ -39,7 +39,7 @@ import { copyText } from '../copyText'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
 import { DEFAULT_CHANGELIST, changelistIdOf, groupOf, type Row } from './model'
-import { grab, plural } from './dragDrop'
+import { grab, plural, trackMenuLabel } from './dragDrop'
 
 export interface GitPanelProps {
   /** The active project, or `null` before one is open — then the panel is simply empty. */
@@ -97,6 +97,15 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
       const staged = entry.index !== 'unmodified'
       const unstaged = entry.worktree !== 'unmodified'
       const conflicted = entry.index === 'conflicted' || entry.worktree === 'conflicted'
+      /*
+       * From the *group* the row is drawn in, not from `entry.worktree`.
+       *
+       * They agree today, and one of them is the question being asked: "is this row in the
+       * `Unversioned Files` list", which is what decides whether filing it has to add it to
+       * git first. `grab` narrows a widened selection to one group kind, so `scope.paths` is
+       * all-untracked or none-untracked and this one flag answers for the whole set.
+       */
+      const untracked = row.groupKind === 'unversioned'
 
       const entries: MenuEntry[] = [
         {
@@ -140,19 +149,30 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
            * has — and *Move 4 Files to Changelist…* is a different sentence from *Move to
            * Changelist…*. The dialog then names every path before anything happens, so there
            * is no step at which the set being moved is invisible.
+           *
+           * An unversioned row gets the third sentence, from `dragDrop.ts` so that the menu
+           * and the drag ghost make the same claim: the files are **added to git** on the way
+           * into the list. It used to be disabled here with *"Only tracked changes belong to a
+           * changelist"*, which is the state of the world and not an answer to what was asked
+           * — the user wants that state changed, and IDEA changes it. See
+           * `useGitPanel::trackPaths` for what it does to the repository.
            */
-          label:
-            scope.paths.length > 1
+          label: untracked
+            ? trackMenuLabel(scope.paths.length)
+            : scope.paths.length > 1
               ? `Move ${scope.paths.length} Files to Changelist…`
               : 'Move to Changelist…',
-          ...(row.groupKind === 'changelist'
-            ? { run: () => git.moveToChangelist(scope.repo, scope.paths) }
+          ...(row.groupKind === 'changelist' || untracked
+            ? { run: () => git.moveToChangelist(scope.repo, scope.paths, untracked) }
             : {
-                // Filing an untracked, ignored or conflicted path is a write nothing can see:
+                // Filing an ignored or conflicted path is a write nothing can see:
                 // `cide_git::status` builds its `live` set from paths that are neither
                 // `Untracked` nor `Ignored`, so `reconcile` drops the assignment on the next
                 // status walk, and a conflicted path is drawn in the conflicts list whatever
-                // it is filed under.
+                // it is filed under. Unversioned paths used to be refused here for the same
+                // reason and now have a verb that removes it — an ignored one does not, and an
+                // ignored file dragged into `Changes` would be a very surprising way to
+                // un-ignore something.
                 disabledReason:
                   row.groupKind === 'conflicts'
                     ? 'Resolve the conflict first — conflicts are listed apart from changelists'
@@ -195,7 +215,9 @@ function dirMenu(row: Row, git: ReturnType<typeof useGitPanel>): MenuEntry[] {
   const count = paths.length
   const path = row.path ?? row.label
   // What `Roll Back` would actually do to these files. An untracked path has nothing in HEAD,
-  // so `stage::rollback` deletes it; an ignored one is not part of any change at all.
+  // so `stage::rollback` deletes it; an ignored one is not part of any change at all. It is
+  // also what decides whether filing this directory into a changelist has to add its files to
+  // git on the way — see the `move` item below.
   const untracked = row.groupKind === 'unversioned'
   const ignored = row.groupKind === 'ignored'
   return [
@@ -203,14 +225,18 @@ function dirMenu(row: Row, git: ReturnType<typeof useGitPanel>): MenuEntry[] {
       id: 'move',
       // The count is the safeguard, exactly as on a file row: *Move 4 Files to Changelist…*
       // is a sentence the user reads before clicking, and the dialog then names every path.
-      label: `Move ${plural(count)} to Changelist…`,
-      ...(row.groupKind === 'changelist' && count > 0
-        ? { run: () => git.moveToChangelist(row.repo, paths) }
+      // A directory of unversioned files says the other sentence, the one that admits the
+      // `git add` — same string as the drag ghost and the file row's menu.
+      label: untracked ? trackMenuLabel(count) : `Move ${plural(count)} to Changelist…`,
+      ...((row.groupKind === 'changelist' || untracked) && count > 0
+        ? { run: () => git.moveToChangelist(row.repo, paths, untracked) }
         : {
             disabledReason:
               row.groupKind === 'conflicts'
                 ? 'Resolve the conflict first — conflicts are listed apart from changelists'
-                : 'Only tracked changes belong to a changelist',
+                : count === 0
+                  ? 'Nothing under this directory to file'
+                  : 'Only tracked changes belong to a changelist',
           }),
     },
     { kind: 'separator' },
@@ -287,6 +313,36 @@ function groupMenu(
     const unversioned = row.groupKind === 'unversioned'
     return [
       newList,
+      {
+        id: 'move',
+        /*
+         * The whole unversioned list, added to git and filed — the keyboard's answer to
+         * dragging a group header, which the pointer deliberately cannot do (a press on one
+         * folds it; see `dragDrop.ts`). Same string as the file row's item and the drag ghost,
+         * so all three describe the `git add` the same way.
+         *
+         * Only on the unversioned group. The conflicts and ignored lists have no such verb —
+         * `dropOutcome` refuses both, and this menu must not become the way around a rule the
+         * drag enforces.
+         */
+        label: unversioned ? trackMenuLabel(count) : 'Move to Changelist…',
+        ...(unversioned && !empty
+          ? {
+              run: () => {
+                const found = groupOf(git.view, repo, row.group ?? '')
+                if (found !== undefined) {
+                  git.moveToChangelist(repo, [...found.entries.map((e) => e.path)], true)
+                }
+              },
+            }
+          : {
+              disabledReason: unversioned
+                ? 'Nothing in this group'
+                : row.groupKind === 'conflicts'
+                  ? 'Resolve the conflict first — conflicts are listed apart from changelists'
+                  : 'Only tracked changes belong to a changelist',
+            }),
+      },
       { kind: 'separator' },
       {
         id: 'revertGroup',
@@ -345,7 +401,7 @@ function groupMenu(
             run: () => {
               const found = groupOf(git.view, repo, row.group ?? '')
               if (found !== undefined) {
-                git.moveToChangelist(repo, [...found.entries.map((e) => e.path)])
+                git.moveToChangelist(repo, [...found.entries.map((e) => e.path)], false)
               }
             },
           }),

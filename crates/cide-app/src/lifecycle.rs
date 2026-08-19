@@ -12,10 +12,28 @@
 //! cide keeps **no background daemon**. Quitting quits its Claude sessions. What survives a
 //! quit is the *workspace* — windows, tabs, splits — and the conversations, which resume
 //! because a pane's `SessionId` **is** the value passed to `claude --session-id`.
+//!
+//! # The teardown does not run on the main thread
+//!
+//! It used to, and the user's report was "on closing, the window freezes". It was not hung; it
+//! was busy, and it could not say so. On Linux the main thread **is** the GTK thread, so for
+//! the whole of the teardown — two atomic file writes, the IDE servers, every language server's
+//! own `shutdown`/`exit`/SIGTERM/SIGKILL ladder (a rust-analyzer can be holding 1–4 GB), a
+//! screen serialised per shell pane, and then the child ladder's graces — nothing repainted,
+//! nothing dispatched, and the compositor eventually greyed the window out as unresponsive.
+//! It also explains why the window was still *there* to freeze on a gesture that had just
+//! destroyed it: the destroy is a request the loop has to get back to the Wayland socket to
+//! flush, and the loop never got back — so what stayed on screen was a dead copy of the app.
+//! (That last step is the reading of the report that fits, not something anyone instrumented.)
+//!
+//! So [`exit_requested`] answers `RunEvent::ExitRequested` with `api.prevent_exit()`, hands the
+//! teardown to a worker thread, and lets the event loop keep running until the worker reports
+//! done and asks for the exit again. [`notice`] draws what is happening while that runs.
+//! See [`exit_requested`] for why this and not "paint a modal first, then block".
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,10 +49,49 @@ use crate::state::SessionRegistry;
 use crate::windows;
 use crate::workspace_state::WorkspaceState;
 
-/// Set the first time [`shutdown`] runs, because it can be reached twice: the signal thread
-/// calls it, then asks the event loop to exit, which raises `RunEvent::ExitRequested`.
-/// Running the ladder a second time would signal children that are already reaped.
+/// Set the first time a teardown *starts*, because it can be reached four times over: the
+/// signal thread calls it, then asks the event loop to exit, which raises
+/// `RunEvent::ExitRequested` and then `RunEvent::Exit`; and a second close gesture can arrive
+/// while the first teardown is still running. Running the ladder twice would signal children
+/// that are already reaped.
+///
+/// A latch over the **start**, not over completion. [`TEARDOWN`] is the other half, and both
+/// are needed: this one stops a second teardown beginning, and that one stops the process
+/// exiting out from under the first while it is still writing.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the teardown has run to its last step, and something to wait on until it has.
+///
+/// The `Condvar` is what makes [`shutdown`] safe to call from a *second* thread once the work
+/// has moved off the main one: a SIGTERM arriving while the worker is mid-ladder must block the
+/// signal thread until the worker is finished, or the `std::process::exit` at the end of
+/// [`install_signal_handlers`] would cut the teardown in half — losing exactly the workspace
+/// flush and transcript-preserving ladder the signal path exists to guarantee.
+struct Teardown {
+    done: Mutex<bool>,
+    wake: Condvar,
+}
+
+static TEARDOWN: Teardown = Teardown {
+    done: Mutex::new(false),
+    wake: Condvar::new(),
+};
+
+/// The longest a second caller waits for a teardown another thread is already running.
+///
+/// Bounded rather than infinite, and the trade is worth stating. The teardown's own steps are
+/// all bounded (the child ladder is 2.5 s of graces at worst, a language server 3 s), so
+/// reaching this means something is genuinely wedged — and an app that cannot be killed by a
+/// SIGTERM is a worse failure than a `gopls` cache that did not finish writing. Everything
+/// durable is written in the first two steps, long before this can expire.
+const TEARDOWN_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How long the process waits for the event loop to end it after the teardown is finished.
+///
+/// Only armed on the deferred path, and only *after* the last step, so nothing is lost when it
+/// fires. It exists because that path has prevented one exit already: if the second request
+/// somehow never reaches the loop, the app would sit there with no window and no way to quit.
+const LOOP_EXIT_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Guards against a second signal thread, which would fight the first over the same
 /// children.
@@ -51,19 +108,134 @@ const EXIT_DEADLINE: Duration = Duration::from_millis(1_500);
 
 // --- shutdown -------------------------------------------------------------------------
 
-/// Flush durable state, then bring the children down.
+/// Answer `RunEvent::ExitRequested` — the window close and the quit from the UI.
 ///
-/// Called from the signal thread and from `RunEvent::ExitRequested`; idempotent, so both
-/// firing costs nothing. Blocks for as long as the ladder takes, which on the main thread
-/// means the event loop stalls until the last child is gone — acceptable only because the
-/// process is on its way out.
-pub fn shutdown(app: &AppHandle) {
-    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+/// Holds the exit, runs the teardown off the main thread, and lets the loop keep painting
+/// until the worker asks for the exit again. Returns having either prevented the exit (the
+/// teardown is now in flight elsewhere) or having run the whole teardown here.
+///
+/// # Why this and not "show a modal, then block"
+///
+/// The other design in the report was: tell the webview to draw a notice, let it paint, then
+/// run the teardown as before. It cannot be made to work here, for two independent reasons.
+///
+/// * **There is usually no webview left.** Every gesture that reaches this event has already
+///   destroyed the windows: `cmd::window::quit` destroys them explicitly, and a close from the
+///   compositor destroys the last one — `ExitRequested` is precisely what the runtime raises
+///   *because* the window map went empty (`tauri-runtime-wry`'s `TaoWindowEvent::Destroyed`
+///   arm). A notice emitted to "every window" here reaches nobody on the ordinary path, which
+///   is this project's recurring defect wearing a spinner.
+/// * **Nothing can wait for a paint.** `emit` hands the payload to WebKit's *other* process
+///   and returns; there is no acknowledgement to block on that would not itself need the main
+///   loop to run, which is the thing being blocked. Sleeping "long enough" is a guess that is
+///   wrong on the machine that is already under load — exactly the machine that freezes.
+///
+/// So the work moves instead, and the notice is drawn by [`notice`] from the loop we just
+/// freed. `prevent_exit` is the whole mechanism: `tauri-runtime-wry` leaves `ControlFlow` at
+/// `Wait` when it is called, so the loop goes on dispatching with zero windows open — the same
+/// property a tray application relies on.
+///
+/// # The two cases that must not be deferred
+///
+/// `AppHandle::restart` ignores `prevent_exit` (it is documented to, and `ExitRequestApi`
+/// checks the code before sending anything), so deferring there would let the loop exit while
+/// the worker was still writing. And a thread that cannot be spawned is not a reason to skip a
+/// teardown. Both fall through to [`shutdown`], which blocks here exactly as every version
+/// before this one did: a frozen window is bad, an unflushed workspace is worse.
+pub fn exit_requested(app: &AppHandle, code: Option<i32>, api: &tauri::ExitRequestApi) {
+    if code != Some(tauri::RESTART_EXIT_CODE) && defer_teardown(app) {
+        api.prevent_exit();
         return;
     }
+    shutdown(app);
+}
 
+/// Start the teardown on a worker thread. Returns whether the caller must hold the exit.
+///
+/// `false` means "let the process go": either the teardown has already finished (this is the
+/// second `ExitRequested`, the one the worker asked for) or no thread could be had and the
+/// caller has to run it inline.
+fn defer_teardown(app: &AppHandle) -> bool {
+    if teardown_finished() {
+        return false;
+    }
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        // A teardown is already running — a second close gesture, or the signal thread got
+        // here first. Hold the exit for it; do not start another.
+        return true;
+    }
+
+    notice::arm(app);
+
+    let handle = app.clone();
+    let spawned = thread::Builder::new()
+        .name("cide-shutdown".into())
+        .spawn(move || {
+            // The guard, not a call at the end of the closure: a panic in any step below would
+            // otherwise unwind past the `app.exit` and leave the process alive with no window,
+            // no exit request and nothing on screen — a worse outcome than the freeze this
+            // change exists to remove.
+            let _finish = Finish::requesting_exit(handle.clone());
+            run_teardown(&handle);
+        });
+
+    match spawned {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(%error, "could not start the shutdown thread; tearing down inline");
+            // Nobody else can be racing this: winning the swap above is what let us get here,
+            // and the thread that would have contended never started. Releasing the latch is
+            // what lets the caller's `shutdown` actually run the teardown rather than wait for
+            // one that will never happen.
+            SHUTTING_DOWN.store(false, Ordering::SeqCst);
+            false
+        }
+    }
+}
+
+/// Flush durable state, then bring the children down — blocking until it is finished.
+///
+/// Called from the signal thread, from `RunEvent::Exit`, and from [`exit_requested`] when the
+/// work cannot be deferred. Idempotent, and — since the teardown moved off the main thread —
+/// *waiting*: when another thread is already running it this blocks until that one is done
+/// rather than returning early. The signal thread ends the process 1.5 s after it returns, so returning early would
+/// hand `std::process::exit` a half-written shutdown.
+pub fn shutdown(app: &AppHandle) {
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        wait_for_teardown();
+        return;
+    }
+    // No `requesting_exit` here, because on both of this function's callers an exit request
+    // would be a message nobody reads. The signal thread asks for the exit itself and then
+    // enforces it with the right `128 + n` status. `RunEvent::Exit` is the loop's own
+    // teardown: `AppHandle::exit` only *queues* `Message::RequestExit` on the event-loop
+    // proxy (`request_exit` deliberately bypasses `send_user_message`, so it neither runs
+    // inline nor panics on the main thread — the `panic!` arm in `handle_user_message` is
+    // unreachable from it), and by the time `RunEvent::Exit` is delivered tao is about to
+    // `break` out of `run_return`. The queued request would be dropped with the loop.
+    //
+    // Stated because the wrong version of this note stood here first, claiming the call
+    // panics on the main thread. It does not, in the tauri this workspace pins; what it does
+    // is nothing at all, which is the same reason not to make it and a worse one to discover
+    // by trying.
+    let _finish = Finish::quiet();
+    notice::arm(app);
+    run_teardown(app);
+}
+
+/// Every step of the teardown, in the order the steps have to happen in.
+///
+/// Runs on the `cide-shutdown` worker for a window close or a quit from the UI, and on the
+/// calling thread for a signal or a `RunEvent::Exit`. Nothing here touches the event loop, so
+/// it is correct on either — and that is the property that lets the loop keep painting.
+fn run_teardown(app: &AppHandle) {
     // Unconditionally, not `flush_if_due`: waiting out a 500 ms debounce on the way to exit
     // is how the user's last change gets lost.
+    //
+    // **First, and still first.** This is the one step whose failure the user can never
+    // recover from, so it happens before anything that can block: if a language server or a
+    // stubborn child hangs the rest of this function, the layout is already on disk.
+    notice::say("Saving your workspace…");
     match app.try_state::<WorkspaceState>() {
         Some(state) => state.write_now(),
         // `try_state` rather than `state`, which panics. Reaching here means shutdown ran
@@ -86,27 +258,36 @@ pub fn shutdown(app: &AppHandle) {
     // rejection over a socket that is still open; killing it first would end the turn with a
     // transport error where a plain "the user did not accept it" was available, and killing
     // it *after* would leave the rejection racing the SIGKILL.
+    //
+    // Still on this thread, and still ahead of everything below it: it is the one ordering in
+    // this function that another process can observe.
+    notice::say("Disconnecting Claude Code…");
     if let Some(servers) = app.try_state::<crate::ide::IdeServers>() {
         servers.stop_all();
     }
 
-    // Then the language servers, and in this order: a blocked `openDiff` needs its socket first
-    // (above), where a `gopls` needs only enough time to write its cache. Each handle's `Drop`
-    // runs `shutdown` → `exit` → SIGTERM → SIGKILL, which is why this can be a single call and
-    // still be a ladder.
+    // Then the language servers. Each handle's `Drop` runs `shutdown` → `exit` → SIGTERM →
+    // SIGKILL, which is why this can be a single call and still be a ladder.
     //
-    // Before the PTY ladder below, because a rust-analyzer holding 1–4 GB is the largest thing
-    // in the process and giving the kernel that memory back early makes the rest of the shutdown
-    // cheaper on a machine that is already under pressure.
-    if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
-        diagnostics.close_all();
-    }
+    // **Started before the child ladder, finished after it.** It used to be a plain call here,
+    // on the argument that a rust-analyzer holding 1–4 GB is the largest thing in the process
+    // and giving the kernel that memory back early makes the rest of the shutdown cheaper.
+    // That argument survives — this still *starts* first — but it was buying the memory at the
+    // price of the whole wait, and the wait is the complaint: `close_all` drops its projects
+    // one at a time, and each handle's ladder is a 2 s grace plus a 1 s kill grace *serially*,
+    // so two servers over two projects is up to twelve seconds of nothing before the first
+    // child is even signalled. The two waits are independent — different processes, different
+    // registries, neither reads the other — so they overlap, and the worst case becomes the
+    // larger of the two instead of their sum.
+    //
+    // The join below is not optional. Detaching would let the process exit while a `gopls` was
+    // still writing the cache the ladder exists to preserve.
+    let servers = close_language_servers(app);
 
-    // A store per project, and the only thing on this path that reaches a content search: the
-    // ladder below blocks the main thread for as long as the slowest child takes, and a walker
-    // thread per core reading a repository nobody will see the results of is disk the dying
-    // children are competing for. `cmd::fs::close_all` also cancels, but nothing calls it —
-    // this is the quit path.
+    // A store per project, and the only thing on this path that reaches a content search: a
+    // walker thread per core reading a repository nobody will see the results of is disk the
+    // dying children are competing for. `cmd::fs::close_all` also cancels, but nothing calls
+    // it — this is the quit path.
     //
     // Deliberately not `cmd::fs::close_all`, which would drop every project's index here:
     // that is the teardown `fs_close` hands to a blocking worker precisely because it is too
@@ -117,6 +298,7 @@ pub fn shutdown(app: &AppHandle) {
 
     let Some(registry) = app.try_state::<SessionRegistry>() else {
         tracing::error!("no session registry during shutdown; children may outlive the app");
+        join_language_servers(servers);
         return;
     };
 
@@ -129,8 +311,17 @@ pub fn shutdown(app: &AppHandle) {
     // writing happens. `WorkspaceState::with` is not reentrant and this path serialises a
     // screen per pane and writes a file; holding the lock across that would stall every other
     // thread that wants the workspace, on the way out, for no reason.
+    //
+    // Left here rather than moved after the ladder, and the cost was checked rather than
+    // assumed before leaving it: it is bounded by `MAX_SCREENS` × `MAX_SCREEN_BYTES`
+    // (24 × 128 KiB) of `vt100` state and one atomic write, which is nothing beside the
+    // seconds of graces below it. It could not move after the ladder in any case without
+    // publishing the screens of shells that have already been killed.
     if let Some(state) = app.try_state::<WorkspaceState>() {
         let shells = state.with(shell_sessions);
+        if !shells.is_empty() {
+            notice::say(format!("Saving {}…", screens_phrase(shells.len())));
+        }
         save_screens(&shells, &registry);
     }
 
@@ -139,7 +330,464 @@ pub fn shutdown(app: &AppHandle) {
         .into_iter()
         .filter_map(|id| registry.get(id))
         .collect();
-    stop_children(&children, Ladder::default());
+    // The rung, not a precomputed count, is what the notice reports: a session that goes on
+    // the first SIGHUP is never named, and the two rungs that cost real time say why they are
+    // costing it. See `rung_line`.
+    stop_children_reporting(&children, Ladder::default(), &mut |rung, count| {
+        notice::say(rung_line(rung, count));
+    });
+
+    join_language_servers(servers);
+}
+
+/// Drop every language server on a thread of its own, so its ladder overlaps the children's.
+///
+/// `None` when there is no registry (shutdown before `manage`) or no thread to be had; both
+/// mean the work has already been done inline, and [`join_language_servers`] has nothing to
+/// wait for.
+fn close_language_servers(app: &AppHandle) -> Option<thread::JoinHandle<()>> {
+    app.try_state::<crate::lsp::DiagnosticsRegistry>()?;
+    let handle = app.clone();
+    let spawned = thread::Builder::new()
+        .name("cide-lsp-shutdown".into())
+        .spawn(move || {
+            if let Some(diagnostics) = handle.try_state::<crate::lsp::DiagnosticsRegistry>() {
+                diagnostics.close_all();
+            }
+        });
+    match spawned {
+        Ok(joiner) => Some(joiner),
+        Err(error) => {
+            // Inline instead. Slower — this is the serial wait the overlap exists to hide —
+            // but a language server that is not stopped is one that outlives the app.
+            tracing::warn!(%error, "no thread for the language-server shutdown; running it inline");
+            if let Some(diagnostics) = app.try_state::<crate::lsp::DiagnosticsRegistry>() {
+                diagnostics.close_all();
+            }
+            None
+        }
+    }
+}
+
+/// Wait out the language servers' own ladder. See [`close_language_servers`].
+///
+/// Says so first, and only when there is something to wait for: by the time this runs the
+/// children are down, so a `rust-analyzer` still writing its cache is the whole of the
+/// remaining wait and the notice would otherwise sit on a line about sessions that have
+/// already gone.
+fn join_language_servers(servers: Option<thread::JoinHandle<()>>) {
+    let Some(servers) = servers else {
+        return;
+    };
+    notice::say("Waiting for the language servers…");
+    if servers.join().is_err() {
+        // A panic in the drop chain is not a reason to abandon the rest of the shutdown, and
+        // the process is on its way out either way. Worth a line because the servers may then
+        // be the thing that outlives us.
+        tracing::error!("the language-server shutdown panicked");
+    }
+}
+
+/// What the notice says while one rung of the child ladder is outstanding.
+///
+/// A free function so the wording is pinned by a test rather than buried in a closure. The
+/// first rung is the ordinary case and reads as a plain statement of work; the two below it
+/// only ever appear for a session that has *refused* to stop, which is the one moment the user
+/// is owed a reason for the wait rather than a spinner.
+fn rung_line(rung: Rung, count: usize) -> String {
+    let sessions = sessions_phrase(count);
+    match rung {
+        Rung::Hup => format!("Closing {sessions}…"),
+        Rung::Term => format!("Waiting for {sessions} to finish writing…"),
+        Rung::Kill => format!("Force-stopping {sessions}…"),
+    }
+}
+
+/// `1 session` / `3 sessions`.
+fn sessions_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{count} sessions")
+    }
+}
+
+/// `1 terminal screen` / `3 terminal screens`.
+fn screens_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 terminal screen".to_string()
+    } else {
+        format!("{count} terminal screens")
+    }
+}
+
+/// Publishes the end of the teardown, whatever ends it — including a panic.
+///
+/// Two jobs, and the second only on the deferred path. `Drop` rather than a call at the end of
+/// [`run_teardown`], because the one thing that must not happen is a shutdown that stops
+/// halfway and never says so: every other thread would then wait out [`TEARDOWN_DEADLINE`] and
+/// the deferred path would sit for ever with no window and no exit request.
+struct Finish {
+    /// The handle to ask for the exit with, or `None` when the caller does that itself.
+    exit: Option<AppHandle>,
+}
+
+impl Finish {
+    /// For the worker thread: mark the teardown done, then ask the loop to end.
+    ///
+    /// **Only for a thread the loop outlives.** `AppHandle::exit` queues
+    /// `Message::RequestExit` on the event-loop proxy and returns; it is safe from any
+    /// thread, but it is only *answered* by a loop that is still turning. Used from
+    /// `RunEvent::Exit` — the one caller that is inside the loop's own teardown — the request
+    /// would go into a queue tao is about to drop. See the note in [`shutdown`].
+    fn requesting_exit(app: AppHandle) -> Self {
+        Self { exit: Some(app) }
+    }
+
+    /// For the signal thread and `RunEvent::Exit`, both of which end the process themselves.
+    fn quiet() -> Self {
+        Self { exit: None }
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        notice::say("Closed.");
+        {
+            // `unwrap_or_else(into_inner)` rather than `expect`: a poisoned lock here would
+            // mean a previous panic, and refusing to publish the completion because of it is
+            // how a hang gets built out of a crash.
+            let mut done = TEARDOWN.done.lock().unwrap_or_else(|e| e.into_inner());
+            *done = true;
+        }
+        TEARDOWN.wake.notify_all();
+
+        if let Some(app) = self.exit.take() {
+            // The exit that was prevented, now asked for again. `exit_requested` sees a
+            // finished teardown and lets this one through.
+            app.exit(0);
+            arm_exit_watchdog();
+        }
+    }
+}
+
+/// Whether the teardown has run to its last step.
+fn teardown_finished() -> bool {
+    *TEARDOWN.done.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Block until the teardown another thread is running has finished, or the deadline passes.
+fn wait_for_teardown() {
+    let done = TEARDOWN.done.lock().unwrap_or_else(|e| e.into_inner());
+    let (done, timeout) = TEARDOWN
+        .wake
+        .wait_timeout_while(done, TEARDOWN_DEADLINE, |done| !*done)
+        .unwrap_or_else(|e| e.into_inner());
+    if timeout.timed_out() && !*done {
+        tracing::error!(
+            "the shutdown did not finish within {TEARDOWN_DEADLINE:?}; ending the process anyway"
+        );
+    }
+}
+
+/// Make sure the process really ends after a deferred teardown reported done.
+///
+/// Nothing this module owns is lost when it fires: it is armed after the last step, so the
+/// workspace, the positions and the screens are on disk and every child has been through the
+/// ladder. It exists because [`exit_requested`] prevented one exit, and an app that has
+/// prevented its own exit and then failed to ask for another is one no gesture can close.
+///
+/// One durable write is *not* ours and is not covered: `tauri-plugin-window-state` saves
+/// window geometry from `RunEvent::Exit`. Firing here means that event never arrived, so the
+/// geometry was never going to be written on this run whatever we did — the choice is between
+/// losing it and a process that cannot be quit, and it is not a close one.
+fn arm_exit_watchdog() {
+    let spawned = thread::Builder::new()
+        .name("cide-exit-watchdog".into())
+        .spawn(|| {
+            thread::sleep(LOOP_EXIT_DEADLINE);
+            tracing::error!("the event loop did not exit after the shutdown finished; exiting");
+            std::process::exit(0);
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "no exit watchdog; a wedged event loop would keep the process up");
+    }
+}
+
+// --- the notice ---------------------------------------------------------------------------
+
+/// How long the teardown may run before the notice appears.
+///
+/// An ordinary quit with an idle session is over in well under this, and a window that flashes
+/// up for 80 ms is a worse artefact than the thing it was announcing. A freeze is not perceived
+/// as one until a few hundred milliseconds have passed either, so nothing is lost by waiting:
+/// the notice appears exactly when the wait starts to be noticed.
+const NOTICE_DELAY: Duration = Duration::from_millis(250);
+
+/// How often the notice repaints the line the teardown is on.
+const NOTICE_TICK: Duration = Duration::from_millis(120);
+
+/// What the user sees while cide is closing.
+///
+/// # Why this is drawn in GTK and not in the webview
+///
+/// Because on every ordinary quit gesture there is no webview left to draw it in. `quit`
+/// destroys the windows; a compositor close destroys the last one; and `ExitRequested` is
+/// raised *because* the window map went empty. A React overlay here would be a mechanism that
+/// paints on no path anybody uses — which is this project's recurring defect, and the reason
+/// the brief this was built from asked for a notice that "must not depend on a webview that is
+/// already gone".
+///
+/// GTK is what is left, and it is enough: `gtk` is already a dependency of this crate (the
+/// folder picker parents a dialog with it), tao's event loop iterates the default main context
+/// on every turn — `gtk::main_iteration_do` at the bottom of `run_return` — so a plain toplevel
+/// created here is dispatched and painted by the same loop [`exit_requested`] just freed, and it
+/// costs no second web process at the exact moment the app is trying to give memory back.
+///
+/// A window rather than a line in the log because the report was about the screen. The log gets
+/// it too: [`say`] writes every step, which is what a headless or macOS quit is left with.
+///
+/// # What it can and cannot promise
+///
+/// It cannot appear at all if the event loop is already gone — a `RunEvent::Exit` with no
+/// preceding `ExitRequested`, which is macOS's ⌘Q and nothing on Linux. That path is still the
+/// blocking teardown it always was, and the steps go to the log instead.
+mod notice {
+    // Deliberately no `use super::*` and no blanket `use tauri::…`: everything below the
+    // `LINE` mutex is behind a platform `cfg`, and an import that only one arm needs is a
+    // warning — and therefore a failed `clippy -D warnings` — on the other.
+    use std::sync::Mutex;
+
+    /// The step the teardown is on, written by the shutdown thread and read by the GTK tick.
+    ///
+    /// A `String` behind a mutex rather than a channel or a widget handle: the writer is
+    /// whichever thread is running the teardown and the reader is the main thread, they run at
+    /// completely different rates, and only the *latest* value is ever wanted. A channel would
+    /// queue steps nobody will see; a widget handle would be a GTK object touched off the main
+    /// thread, which is undefined behaviour.
+    static LINE: Mutex<String> = Mutex::new(String::new());
+
+    /// Record what the teardown is doing now, for the notice and for the log.
+    ///
+    /// Always both. The log line is the only report on the paths that cannot draw — a signal
+    /// with no display, macOS's ⌘Q, `cide-headless` — and it is what makes "which step was it
+    /// stuck on" answerable after the fact from `~/.local/state/cide`.
+    pub fn say(line: impl Into<String>) {
+        let line = line.into();
+        tracing::info!(target: "cide::shutdown", "{line}");
+        *LINE.lock().unwrap_or_else(|e| e.into_inner()) = line;
+    }
+
+    /// The current step, or a neutral line before the first [`say`].
+    pub fn current() -> String {
+        let line = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        if line.is_empty() {
+            "Finishing up…".to_string()
+        } else {
+            line.clone()
+        }
+    }
+
+    /// Ask the event loop to show the notice, if the teardown is still running by then.
+    ///
+    /// Safe to call from any thread: `run_on_main_thread` runs the closure inline when it is
+    /// already the main thread and posts it otherwise, so the GTK calls below always happen on
+    /// the GTK thread. An `Err` means the loop has gone, which is the one case with nothing to
+    /// draw into and nothing to do about it.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    pub fn arm(app: &tauri::AppHandle) {
+        let posted = app.run_on_main_thread(|| {
+            gtk::glib::timeout_add_local_once(super::NOTICE_DELAY, || {
+                // The fast quit — nothing was still running by the time the delay expired, so
+                // there is nothing to announce and a window would only flash.
+                if super::teardown_finished() {
+                    return;
+                }
+                show();
+            });
+        });
+        if let Err(error) = posted {
+            tracing::debug!(%error, "no event loop to show the shutdown notice in");
+        }
+    }
+
+    /// Off the platforms that have GTK the steps go to the log alone. See the module docs.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    pub fn arm(_app: &tauri::AppHandle) {}
+
+    /// Put the window up and keep its line current until the teardown is finished.
+    ///
+    /// Returns the window it made so the display test below can assert on it; the caller in
+    /// [`arm`] has no use for it — GTK owns a toplevel, and the tick holds the reference that
+    /// keeps the label alive.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    fn show() -> gtk::Window {
+        show_until(super::teardown_finished)
+    }
+
+    /// [`show`], with the "is it over yet" question handed in.
+    ///
+    /// A parameter rather than a direct call to `teardown_finished`, purely so the display
+    /// test below can drive the window without touching the process-global completion latch:
+    /// that latch is a one-way switch, and a test that flipped it would break
+    /// `a_second_caller_waits_for_the_teardown_already_in_flight` whenever the two ran in one
+    /// process (`cargo test -- --include-ignored`). A `fn` pointer keeps it `'static` for the
+    /// timeout without an allocation.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    fn show_until(finished: fn() -> bool) -> gtk::Window {
+        use gtk::prelude::*;
+
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_title("Closing cide");
+        window.set_default_size(420, -1);
+        window.set_resizable(false);
+        // There is nothing to cancel: by the time this is on screen the workspace is written
+        // and the children have been signalled. A close button that abandoned the ladder would
+        // orphan the very children it was drawn to explain.
+        window.set_deletable(false);
+        window.connect_delete_event(|_, _| gtk::glib::Propagation::Stop);
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Dialog);
+        window.set_position(gtk::WindowPosition::CenterAlways);
+        window.set_skip_taskbar_hint(true);
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        row.set_border_width(20);
+        // The "loader" the report asked for, and endless on purpose: the teardown has no
+        // percentage to report — it is a set of waits on other processes — and a bar that
+        // guessed at one would be wrong in exactly the direction that makes people wait.
+        let spinner = gtk::Spinner::new();
+        spinner.set_size_request(24, 24);
+        spinner.start();
+        row.pack_start(&spinner, false, false, 0);
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let heading = gtk::Label::new(None);
+        heading.set_markup("<b>Closing cide</b>");
+        heading.set_xalign(0.0);
+        let detail = gtk::Label::new(Some(&current()));
+        detail.set_xalign(0.0);
+        // The line names counts ("Closing 3 sessions…"), so a long one must not resize a
+        // window that is deliberately not resizable.
+        detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        column.pack_start(&heading, false, false, 0);
+        column.pack_start(&detail, false, false, 0);
+        row.pack_start(&column, true, true, 0);
+        window.add(&row);
+        window.show_all();
+
+        let ticking = window.clone();
+        gtk::glib::timeout_add_local(super::NOTICE_TICK, move || {
+            detail.set_text(&current());
+            if finished() {
+                // Hidden rather than destroyed: `WidgetExt::destroy` is an `unsafe` call in
+                // gtk-rs and this buys nothing over hiding — the process ends a moment later
+                // and takes the window with it. What matters is that the last thing on screen
+                // is not a notice that has stopped meaning anything.
+                ticking.hide();
+                return gtk::glib::ControlFlow::Break;
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+
+        window
+    }
+
+    /// The one thing no other check in this repository can see: that the notice paints.
+    ///
+    /// `#[ignore]`d because it needs a display, in the same spirit as `CIDE_AUDIT_PANES=1` —
+    /// the pieces that cannot be verified by reading them get a check that a human runs
+    /// deliberately. Run it with:
+    ///
+    /// ```sh
+    /// cargo test -p cide-app --lib the_notice_paints -- --ignored --nocapture
+    /// ```
+    ///
+    /// It drives the same `show` the shutdown path uses, off tao's loop and on a bare GTK one,
+    /// and holds it on screen for two seconds so the window can be looked at as well as
+    /// asserted on. What it proves without eyes: the widget tree builds with no GTK criticals,
+    /// the window is mapped, the tick keeps re-reading [`say`], and the completion latch takes
+    /// the window down instead of leaving a notice on screen that has stopped meaning anything.
+    #[cfg(all(
+        test,
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )
+    ))]
+    mod display {
+        use gtk::prelude::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// This test's own stand-in for the teardown's completion latch. See `show_until`.
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+
+        fn finished() -> bool {
+            FINISHED.load(Ordering::SeqCst)
+        }
+
+        /// Pump the real main context, exactly as tao's `run_return` does per turn.
+        fn pump(for_: Duration) {
+            let until = Instant::now() + for_;
+            while Instant::now() < until {
+                gtk::main_iteration_do(false);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        #[ignore = "needs a display; the only check that the shutdown notice paints"]
+        fn the_notice_paints_and_takes_itself_down() {
+            gtk::init().expect("no display; run this one deliberately");
+
+            super::say("Closing 3 sessions…");
+            let window = super::show_until(finished);
+            pump(Duration::from_millis(400));
+            // `is_mapped`, not `is_visible`: the second is the flag `show_all` sets and would
+            // be true for a window the compositor never put up.
+            assert!(window.is_mapped(), "the notice never mapped");
+
+            // The step changes under it, which is the half a static dialog would not do.
+            super::say(super::super::rung_line(super::super::Rung::Term, 1));
+            pump(Duration::from_millis(1_600));
+            assert!(window.is_mapped());
+
+            // And the end of the teardown takes it away.
+            FINISHED.store(true, Ordering::SeqCst);
+            pump(Duration::from_millis(400));
+            assert!(
+                !window.is_visible(),
+                "the notice outlived the teardown it was describing"
+            );
+        }
+    }
 }
 
 /// Catch SIGTERM, SIGINT and SIGHUP and run the same shutdown path as a quit from the UI.
@@ -178,6 +826,11 @@ pub fn install_signal_handlers(app: &AppHandle) {
                 return;
             };
             tracing::info!(signal, "shutting down on a signal");
+            // Blocking, and it has to be — including when the teardown is already running on
+            // the `cide-shutdown` worker, in which case this waits for that one rather than
+            // starting a second. The `std::process::exit` below is what makes the difference:
+            // returning early from a teardown someone else is still running would end the
+            // process in the middle of it.
             shutdown(&app);
 
             // Ask the event loop to exit so plugins get their teardown, then make sure of
@@ -283,19 +936,44 @@ impl Default for Ladder {
 /// Each rung is delivered only to children still running, so a session that goes on SIGHUP
 /// is never sent a SIGTERM.
 pub fn stop_children<C: Stoppable>(children: &[C], ladder: Ladder) {
+    stop_children_reporting(children, ladder, &mut |_, _| {});
+}
+
+/// The ladder, telling `on_rung` what it is about to wait for.
+///
+/// **The ladder is per rung, not per child, and that is worth stating because the shutdown's
+/// cost turns on it.** Every surviving child is signalled, and *then* one wait covers all of
+/// them — so twenty sessions cost the same 2.5 s of graces as one, and a single stubborn
+/// session does not add its own grace on top of its neighbours'. (The one-at-a-time shape the
+/// quit-freeze report guessed at is real elsewhere in the teardown: the language servers are
+/// dropped serially, which is why `run_teardown` overlaps them with this.)
+///
+/// `on_rung` is called once per rung actually delivered, with the number of children that got
+/// it. A callback rather than a return value because the interesting moment is *before* the
+/// grace, not after it: the point of the notice is to say what is being waited for while the
+/// waiting happens.
+pub fn stop_children_reporting<C: Stoppable>(
+    children: &[C],
+    ladder: Ladder,
+    on_rung: &mut dyn FnMut(Rung, usize),
+) {
     for (rung, grace) in [
         (Rung::Hup, ladder.hup_grace),
         (Rung::Term, ladder.term_grace),
     ] {
-        if !signal_survivors(children, rung) {
+        let signalled = signal_survivors(children, rung);
+        if signalled == 0 {
             return;
         }
+        on_rung(rung, signalled);
         if wait_for_exit(children, grace, ladder.poll) {
             return;
         }
     }
 
-    if signal_survivors(children, Rung::Kill) {
+    let signalled = signal_survivors(children, Rung::Kill);
+    if signalled > 0 {
+        on_rung(Rung::Kill, signalled);
         // Worth a line in the log: this is the case where the next launch may find a
         // transcript that Claude Code will not resume.
         tracing::warn!("a session ignored SIGHUP and SIGTERM and was killed outright");
@@ -303,14 +981,14 @@ pub fn stop_children<C: Stoppable>(children: &[C], ladder: Ladder) {
     }
 }
 
-/// Deliver `rung` to every child still running. Returns whether there were any.
-fn signal_survivors<C: Stoppable>(children: &[C], rung: Rung) -> bool {
-    let mut any = false;
+/// Deliver `rung` to every child still running. Returns how many there were.
+fn signal_survivors<C: Stoppable>(children: &[C], rung: Rung) -> usize {
+    let mut signalled = 0;
     for child in children.iter().filter(|c| !c.has_exited()) {
         child.signal(rung);
-        any = true;
+        signalled += 1;
     }
-    any
+    signalled
 }
 
 /// Wait up to `grace` for every child to exit. Returns whether they all did.
@@ -1156,6 +1834,92 @@ mod tests {
         stop_children(&children, quick());
         assert_eq!(children[0].rungs(), vec![Rung::Hup]);
         assert_eq!(children[1].rungs(), vec![Rung::Hup, Rung::Term, Rung::Kill]);
+    }
+
+    #[test]
+    fn every_rung_that_is_waited_on_is_reported() {
+        // The notice's whole claim is that it says what is being waited for. A rung that is
+        // delivered without being reported is a spinner with no sentence, and a rung reported
+        // without being delivered is a sentence about nothing.
+        let children = [FakeChild::dying_at(Rung::Term), FakeChild::immortal()];
+        let mut reported = Vec::new();
+        stop_children_reporting(&children, quick(), &mut |rung, count| {
+            reported.push((rung, count));
+        });
+        assert_eq!(
+            reported,
+            vec![(Rung::Hup, 2), (Rung::Term, 2), (Rung::Kill, 1)],
+            "the counts must be the children still running at that rung, not the total"
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_when_every_child_has_already_gone() {
+        // A quit with no live session must not put "Closing 0 sessions…" on screen.
+        let children = [FakeChild::already_gone()];
+        let mut reported = Vec::new();
+        stop_children_reporting(&children, quick(), &mut |rung, count| {
+            reported.push((rung, count));
+        });
+        assert!(reported.is_empty(), "{reported:?}");
+    }
+
+    #[test]
+    fn the_notice_says_what_is_happening_rather_than_that_something_is() {
+        // The wording is the feature. "Closing 3 sessions" was the ask; a bare spinner was
+        // explicitly not.
+        assert_eq!(rung_line(Rung::Hup, 3), "Closing 3 sessions…");
+        assert_eq!(rung_line(Rung::Hup, 1), "Closing 1 session…");
+        assert_eq!(
+            rung_line(Rung::Term, 1),
+            "Waiting for 1 session to finish writing…"
+        );
+        assert_eq!(rung_line(Rung::Kill, 2), "Force-stopping 2 sessions…");
+        assert_eq!(screens_phrase(1), "1 terminal screen");
+        assert_eq!(screens_phrase(4), "4 terminal screens");
+    }
+
+    #[test]
+    fn the_step_the_notice_shows_is_the_last_one_announced() {
+        notice::say("Saving your workspace…");
+        assert_eq!(notice::current(), "Saving your workspace…");
+        notice::say(rung_line(Rung::Hup, 2));
+        assert_eq!(notice::current(), "Closing 2 sessions…");
+    }
+
+    /// A second caller does not return until the teardown in flight has finished.
+    ///
+    /// This is the property that keeps the deferred teardown safe. The signal thread runs
+    /// `std::process::exit` 1.5 s after `shutdown` returns; before this latch existed, a
+    /// re-entrant call returned *immediately*, so a SIGTERM arriving while the worker was
+    /// mid-ladder would have ended the process on top of it — killing children before their
+    /// transcripts were written and, worse, while `write_atomic` was renaming over
+    /// `workspace.json`.
+    ///
+    /// The only test that touches the process-global latch, deliberately: it leaves it set.
+    #[test]
+    fn a_second_caller_waits_for_the_teardown_already_in_flight() {
+        assert!(!teardown_finished(), "the latch starts clear");
+        let waiter = thread::spawn(wait_for_teardown);
+
+        // Long enough that a `wait_for_teardown` which did not actually wait would have
+        // returned, and far short of `TEARDOWN_DEADLINE`.
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            !waiter.is_finished(),
+            "the second caller returned before the teardown finished"
+        );
+
+        // What the worker's guard does at the end of `run_teardown`, panic or not.
+        drop(Finish::quiet());
+
+        let joined = Instant::now();
+        waiter.join().expect("the waiting thread panicked");
+        assert!(
+            joined.elapsed() < Duration::from_secs(5),
+            "publishing the completion did not wake the waiter"
+        );
+        assert!(teardown_finished());
     }
 
     /// The rung the fakes cannot prove: that a real signal reaches a real child.
@@ -2064,6 +2828,17 @@ mod tests {
             "the run-loop closure matches the exit events but never calls \
              `lifecycle::shutdown`, which is the only thing on that path that flushes state \
              and brings the children down"
+        );
+        // And the half that makes the teardown visible instead of a freeze. Without this call
+        // the `ExitRequested` arm is back to running the whole teardown on the GTK thread:
+        // every step still happens, nothing is lost, and the window sits there dead for
+        // several seconds with no way to say why — which is the bug, and the one shape of it
+        // that no test but a source check can see.
+        assert!(
+            run.contains("lifecycle::exit_requested(app, code, &api)"),
+            "the run-loop closure does not answer `ExitRequested` with \
+             `lifecycle::exit_requested`, so nothing calls `api.prevent_exit()` and the \
+             teardown runs on the main thread again — the freeze this module moved off it"
         );
     }
 }

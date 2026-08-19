@@ -3,7 +3,15 @@
 //! One [`RepoChanges`] per repository, roots before their submodules, with every changed
 //! path filed under the changelist that owns it. Untracked and ignored entries are kept in
 //! their own buckets rather than in a changelist, matching IDEA's `Unversioned` and `Ignore`
-//! groups — they are not commit candidates until they are moved.
+//! groups — they are not commit candidates.
+//!
+//! An untracked path cannot be moved *into* a changelist either, and that is this module's
+//! doing rather than the sidecar's: `live` below excludes `Untracked` and `Ignored`, and
+//! [`changelist::Sidecar::reconcile`] drops every assignment outside it, so filing one
+//! succeeds and is gone by the next walk. The panel's answer is to add the file to git first
+//! — `stage::stage`, then the move — which takes it out of `Untracked` and therefore into
+//! `live`. See `filing_an_untracked_path_after_adding_it_sticks` in `tests/staging.rs` for
+//! the sequence and `ui/src/sidebar/GitPanel/dragDrop.ts` for the gesture that runs it.
 //!
 //! Both sides of the index are reported per path. Collapsing them into one status is what
 //! makes a partially-staged file render as a lie, and the tri-state checkbox in the tree is

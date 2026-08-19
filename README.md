@@ -2720,6 +2720,40 @@ reports in an old frame shape **silently** — no error, no log line, just chrom
 updates. And the hook log now prints `session` and `cli` separately; when they differ, only
 `session` addresses a pane.
 
+
+## Images, and the four things that would have failed silently (M18)
+
+Opening a `png`, `jpg`, `jpeg`, `gif`, `webp`, `bmp`, `ico` or `svg` shows the image rather than
+its bytes. The interesting parts are all refusals.
+
+**The bytes go over Tauri's asset protocol, not the IPC control plane.** `emit`/`listen`
+string-interpolates JSON into an `eval`'d script and is control-plane only; a 32 MB PNG marshalled
+that way is the pathological case that argument exists for. The protocol needs three things to
+line up, and any one of them missing fails *silently* — a blank pane, no error anywhere: the
+`protocol-asset` cargo feature, `assetProtocol.enable` in `tauri.conf.json`, and
+`img-src … asset: http://asset.localhost` in the CSP. All three were already at HEAD.
+
+The static `assetProtocol.scope` is **empty, and stays empty**. A scope wide enough to serve a
+repository is a scope wide enough to serve `~/.ssh`, so instead `image_read` grants
+`asset_protocol_scope().allow_file()` for the one path the user opened — and grants it *after*
+the size, type and header refusals have run, so a directory, a FIFO or a 2 GB tarball never
+reaches the protocol on the strength of somebody having clicked something.
+
+**`MAX_IMAGE_BYTES` is 32 MB and is checked against the editor's own cap**, so the two cannot
+drift into a state where a file is too big to view and small enough to open as text.
+
+**SVG renders through `<img>` and is never inlined.** An SVG is a document that can carry script,
+and inlining one into the DOM is a straightforward XSS vector for a repository you cloned. `<img>`
+does not execute script, which is what makes rendering an untrusted one safe at all. The cost is
+recorded here rather than hidden: `.svg` no longer opens as editable XML in CodeMirror, which it
+used to. That is a real capability loss for anyone who edits SVG source by hand, and it is the one
+part of this feature that may need an *Open as text* affordance if it turns out to matter.
+
+**A file that is not what its extension claims fails with a sentence.** `cide_core::image::sniff`
+reads the header and says so, rather than mounting a pane that draws nothing. `tiff`, `avif`,
+`jxl` and `svgz` are deliberately absent from the extension table: WebKitGTK either cannot decode
+them or decodes them only in some builds, and a format that works on one machine and not another
+is worse than one that works nowhere — a refusal from Rust is at least readable.
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the

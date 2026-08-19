@@ -47,6 +47,17 @@ const TITLE: Record<ChangelistDialogState['mode'], string> = {
   move: 'Move to changelist',
 }
 
+/**
+ * The title for the one case where the dialog does more than move: unversioned files, which
+ * are added to git on the way into the list.
+ *
+ * A title of its own rather than the same one with a note underneath, because the title is
+ * the part a user reads before deciding whether to keep going, and *"Move to changelist"* over
+ * an operation that runs `git add` is the silent staging this path exists to avoid. The body
+ * and the button below say it again in full; this is the one that is read first.
+ */
+const TRACK_TITLE = 'Add to git and move to changelist'
+
 export function ChangelistDialog({
   state,
   onCancel,
@@ -75,7 +86,15 @@ export function ChangelistDialog({
     [state.lists, state.id, trimmed],
   )
   const nameOk = trimmed !== '' && !clash
-  const submitLabel = state.mode === 'rename' ? 'Rename' : state.mode === 'create' ? 'Create' : 'Create and move'
+  const title = state.mode === 'move' && state.track ? TRACK_TITLE : TITLE[state.mode]
+  const submitLabel =
+    state.mode === 'rename'
+      ? 'Rename'
+      : state.mode === 'create'
+        ? 'Create'
+        : state.track
+          ? 'Create, add and move'
+          : 'Create and move'
 
   const submit = () => {
     if (nameOk) onSubmitName(trimmed)
@@ -91,18 +110,31 @@ export function ChangelistDialog({
   }
 
   return (
-    <OverlayCard label={TITLE[state.mode]} onDismiss={onCancel}>
+    <OverlayCard label={title} onDismiss={onCancel}>
       <div className={styles.dialog} onKeyDown={onKeyDown} data-audit="changelistDialog">
         <div className={styles.head}>
           <h2 className={styles.title} data-audit="changelistDialogTitle">
-            {TITLE[state.mode]}
+            {title}
             {state.repoName !== '' && <span className={styles.repo}> · {state.repoName}</span>}
           </h2>
           {state.mode === 'move' && (
-            <p className={styles.body}>
-              {state.paths.length === 1
-                ? 'This file moves to the changelist you pick.'
-                : `These ${state.paths.length} files move to the changelist you pick.`}
+            /*
+             * What picking a list will do, in a sentence. The `track` wording names the write
+             * to the repository — a changelist cannot hold a path git does not track, so
+             * these files are added to it, which is a change to the repository and not a
+             * re-filing. The drag says the same thing on its ghost (`dragDrop.ts::trackHint`);
+             * the two routes must not describe one operation two ways.
+             */
+            <p className={styles.body} data-audit="changelistDialogBody">
+              {state.track
+                ? state.paths.length === 1
+                  ? 'Git is not tracking this file. It is added to git, then moved to the '
+                    + 'changelist you pick.'
+                  : `Git is not tracking these ${state.paths.length} files. They are added to `
+                    + 'git, then moved to the changelist you pick.'
+                : state.paths.length === 1
+                  ? 'This file moves to the changelist you pick.'
+                  : `These ${state.paths.length} files move to the changelist you pick.`}
             </p>
           )}
         </div>

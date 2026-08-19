@@ -10,6 +10,8 @@
 pub mod git;
 pub mod headless;
 pub mod ids;
+/// Image documents. Identity only — never the pixels; the module header says why.
+pub mod image;
 pub mod keymap;
 /// Per-file view memory. Its own module, and deliberately not part of [`workspace`] — the
 /// header of `positions.rs` says why at length.
@@ -20,6 +22,7 @@ pub mod workspace;
 
 pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
+pub use image::{ImageDoc, ImageFormat};
 pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
 pub use positions::ViewPosition;
 pub use settings::{

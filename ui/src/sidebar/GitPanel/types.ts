@@ -174,6 +174,21 @@ export interface ChangelistDialogState {
   name: string
   /** `move`: the repo-relative paths that will be moved. Named in the dialog, not counted. */
   paths: readonly string[]
+  /**
+   * `move`: these paths are unversioned, so picking a list **adds them to git** first.
+   *
+   * The context menu's half of `dragDrop.ts`'s `track` outcome. It rides on the dialog state
+   * rather than being re-derived when the chooser is answered, because by then the tree has
+   * very possibly refreshed — this panel repaints several times a second while an agent edits
+   * — and a path that was untracked when the menu opened would be looked up again in a view
+   * that no longer says so. The gesture decided what it was; the answer to the chooser must
+   * not quietly become a different operation.
+   *
+   * It is also what the dialog reads to say, in words, that git is being written to. A
+   * chooser that looked identical for the two operations would be the silent staging this
+   * whole path exists to avoid, arrived at through the keyboard instead of the pointer.
+   */
+  track: boolean
 }
 
 /*

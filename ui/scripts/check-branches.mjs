@@ -50,6 +50,57 @@ const ok = (cond, what) => {
   if (!cond) fail(what)
 }
 
+/** Source, read relative to this script. */
+const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
+
+/**
+ * Source with comments removed.
+ *
+ * A grep over raw source matches the *explanation* of a rule as happily as the rule, so an
+ * assertion written that way stays green after the code is deleted and only the prose is left.
+ * That is a lesson this repository has paid for; `check-scratch.mjs` and `check-paths.mjs` strip
+ * for the same reason. String-aware, so a `'//'` inside a literal does not eat the rest of the
+ * line.
+ */
+const stripComments = (source) => {
+  let out = ''
+  let i = 0
+  while (i < source.length) {
+    const ch = source[i]
+    if (ch === '/' && source[i + 1] === '/') {
+      while (i < source.length && source[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && source[i + 1] === '*') {
+      i += 2
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const quote = ch
+      out += ch
+      i++
+      while (i < source.length && source[i] !== quote) {
+        if (source[i] === '\\') {
+          out += source[i]
+          i++
+        }
+        if (i < source.length) {
+          out += source[i]
+          i++
+        }
+      }
+      out += quote
+      i++
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
 try {
   // --- the wire shape, pinned against the generated types ---------------------------------
 
@@ -603,6 +654,267 @@ try {
     { text: '', detail: '' },
     'no results is not a sentence — `dispatch.ts` never notifies for it, and this pins that '
       + 'calling it anyway cannot produce an empty toast with a bullet in it',
+  )
+
+  // --- the keyboard, which is the half a browserless harness can still own -------------------
+
+  /*
+   * > *"when i pressing UP/DOWN buttons - i should be able to travers through branches and back
+   * > to filter input if top of the list of branches, enter (keyboard button) on a branch should
+   * > switch to that branch with popup close"*
+   *
+   * Every transition below is driven directly, because the alternative is a component test this
+   * project has no runner for. The two that matter most, and would both look fine in a casual
+   * read of the component: Up from the FIRST row landing in the *filter field* rather than
+   * wrapping to the bottom, and a highlight that survives the list shrinking under it.
+   */
+  const row = (index) => ({ kind: 'row', index })
+
+  eq(m.FILTER, { kind: 'filter' }, 'the resting place is the field the popup opens focused on')
+
+  eq(m.navigate('ArrowDown', m.FILTER, 5), row(0), 'Down out of the filter enters the list')
+  eq(m.navigate('ArrowDown', row(0), 5), row(1), 'Down walks the list')
+  eq(
+    m.navigate('ArrowDown', row(4), 5),
+    null,
+    'Down on the last row does not wrap to the top — the key is handed back to the field ' +
+      'rather than silently moving the highlight somewhere the user was not looking',
+  )
+  eq(
+    m.navigate('ArrowUp', row(0), 5),
+    m.FILTER,
+    'Up from the FIRST branch returns to the filter input — the transition the report spells ' +
+      'out, and the one a wrap-around would have eaten',
+  )
+  eq(m.navigate('ArrowUp', row(3), 5), row(2), 'Up walks the list')
+  eq(
+    m.navigate('ArrowUp', m.FILTER, 5),
+    null,
+    'and Up in the field is the field’s own key — there is nothing above it',
+  )
+
+  /*
+   * Down to the bottom and back up again. A loop rather than three more literals, because what
+   * is being pinned is that the two directions are inverses over the whole list: an asymmetry
+   * anywhere in the middle is exactly the bug a user reports as "it skips one".
+   */
+  {
+    const count = 6
+    let focus = m.FILTER
+    for (let i = 0; i < count; i += 1) {
+      focus = m.navigate('ArrowDown', focus, count) ?? focus
+      eq(focus, row(i), `Down ${i + 1} times from the filter is row ${i}`)
+    }
+    eq(m.navigate('ArrowDown', focus, count), null, 'and the bottom is the bottom')
+    for (let i = count - 1; i > 0; i -= 1) {
+      focus = m.navigate('ArrowUp', focus, count) ?? focus
+      eq(focus, row(i - 1), `Up from row ${i} is row ${i - 1}`)
+    }
+    eq(m.navigate('ArrowUp', focus, count), m.FILTER, 'and the top is the filter again')
+  }
+
+  for (const key of ['ArrowDown', 'ArrowUp', 'Home', 'End', 'PageUp', 'PageDown']) {
+    eq(
+      m.navigate(key, m.FILTER, 0),
+      null,
+      `${key} with nothing to walk — a filter that matched no branch — moves nothing`,
+    )
+  }
+  for (const key of ['Enter', 'Escape', 'Tab', 'a', ' ']) {
+    eq(m.navigate(key, row(1), 5), null, `${key} is not the list’s key`)
+  }
+  /*
+   * Escape in particular. It is absent from `navigate` on purpose: the popup's scrim owns it
+   * and it means *back out one panel* — a question about `Mode`, which the reducer cannot see.
+   * Claiming it here would have taken `preventDefault` on the one key that has to keep bubbling.
+   */
+  eq(m.navigate('Escape', m.FILTER, 5), null, 'Escape still belongs to the scrim, from anywhere')
+
+  eq(m.navigate('Home', m.FILTER, 5), null, 'Home in the field is the caret’s — it edits text')
+  eq(m.navigate('End', m.FILTER, 5), null, 'and so is End')
+  eq(m.navigate('Home', row(3), 5), row(0), 'Home in the list is the first row')
+  eq(m.navigate('End', row(0), 5), row(4), 'End in the list is the last')
+
+  eq(m.navigate('PageDown', m.FILTER, 40), row(m.PAGE_ROWS - 1), 'a page down from the field')
+  eq(m.navigate('PageDown', m.FILTER, 5), row(4), 'a page longer than the list stops at the end')
+  eq(m.navigate('PageUp', row(20), 40), row(20 - m.PAGE_ROWS), 'a page up walks back')
+  eq(
+    m.navigate('PageUp', row(5), 40),
+    row(0),
+    'a page up from near the top lands ON the top row, not in the field: a jump that ends in a ' +
+      'text box swallows the next thing typed',
+  )
+  eq(m.navigate('PageUp', row(0), 40), m.FILTER, 'and from the top row it continues into the field')
+  eq(m.navigate('PageUp', m.FILTER, 40), null, 'a page up in the field moves nothing')
+
+  // --- the highlight cannot point past the list ----------------------------------------------
+
+  /*
+   * The off-by-one this list has two live routes to, neither of them exotic: typing into the
+   * filter shortens the list under the highlight, and `cide://git-status` re-renders the popup
+   * whenever anything touches the refs — a `git branch -d` in a terminal pane, a fetch that
+   * prunes, another window's delete. An index left past the end is ⏎ checking out `undefined`.
+   */
+  eq(m.clampFocus(row(4), 2), row(1), 'a highlight past the end lands on the last surviving row')
+  eq(m.clampFocus(row(0), 0), m.FILTER, 'a list that emptied puts the highlight back in the field')
+  eq(m.clampFocus(m.FILTER, 0), m.FILTER, 'the field is always a valid place to be')
+  eq(m.clampFocus(m.FILTER, 5), m.FILTER, 'and is never dragged into the list')
+  eq(m.clampFocus(row(1), 5), row(1), 'an index inside the list is left alone')
+  eq(m.clampFocus(row(-1), 5), m.FILTER, 'a negative index is not an index')
+
+  /*
+   * The whole gesture, end to end: highlight the last of five rows, then type. The filtered
+   * list is two rows long, and what ⏎ acts on has to be a branch that is still on screen.
+   */
+  {
+    const all = m.visibleBranches(list, '')
+    const narrowed = m.visibleBranches(list, 'login')
+    eq(all.length, 5, 'the fixture is five rows unfiltered')
+    const kept = m.clampFocus(row(all.length - 1), narrowed.length)
+    eq(kept, row(1), 'the highlight follows the shrinking list rather than pointing off its end')
+    eq(
+      m.enterAction(narrowed, kept),
+      { kind: 'checkout', name: 'origin/feature/login' },
+      '⏎ checks out a row that is actually visible — the classic off-by-one is a checkout of ' +
+        'the branch that USED to be at that index',
+    )
+  }
+
+  // --- what ⏎ does ---------------------------------------------------------------------------
+
+  const rows = m.visibleBranches(list, '')
+  eq(
+    m.enterAction(rows, row(1)),
+    { kind: 'checkout', name: 'feature/login' },
+    '⏎ on a highlighted branch checks it out',
+  )
+  eq(
+    m.enterAction(rows, row(0)),
+    { kind: 'already', name: 'main' },
+    'the current branch is pinned first, so it is the row the first Down lands on — and ⏎ ' +
+      'there has to SAY something rather than do nothing, which reads as a dead keyboard',
+  )
+  ok(m.alreadyOn('main').includes('main'), 'and the sentence names the branch')
+  eq(
+    m.enterAction(m.visibleBranches(list, 'maint'), m.FILTER),
+    { kind: 'checkout', name: 'maintenance' },
+    '⏎ straight from the filter checks out the only remaining row — the older behaviour, kept',
+  )
+  eq(
+    m.enterAction(rows, m.FILTER),
+    { kind: 'none' },
+    'with more than one row it does nothing rather than guessing: a checkout is not a gesture ' +
+      'to resolve an ambiguity with',
+  )
+  eq(m.enterAction([], m.FILTER), { kind: 'none' }, 'nothing matched, nothing to check out')
+  eq(m.enterAction(rows, row(99)), { kind: 'none' }, 'and an impossible index is not a checkout')
+
+  // --- and the popup actually uses all of it ---------------------------------------------------
+
+  /*
+   * The defect this repository keeps producing is a model that is designed, documented and
+   * never called. Everything above passes just as happily against a `BranchSelector.tsx` that
+   * imports none of it, so the wiring is asserted here — over comment-stripped source, because
+   * a grep matches the *explanation* of a rule as happily as the rule itself.
+   */
+  const popup = stripComments(read('../src/chrome/BranchSelector.tsx'))
+  const css = read('../src/chrome/BranchSelector.module.css')
+
+  for (const call of ['navigate(', 'clampFocus(', 'enterAction(', 'alreadyOn(', 'setFocus(FILTER)']) {
+    ok(popup.includes(call), `BranchSelector.tsx actually calls ${call} — the model is wired up`)
+  }
+  ok(
+    /scrollIntoView\(\{\s*block: 'nearest'\s*\}\)/.test(popup),
+    'the highlight is scrolled into view: `.rows` scrolls, and arrows that walk the highlight ' +
+      'out of sight look like a list that is not moving',
+  )
+  ok(
+    popup.includes('aria-activedescendant'),
+    'the field names the highlighted row, so focus can stay in the filter and a screen reader ' +
+      'still follows the arrows',
+  )
+  ok(popup.includes('styles.rowOn'), 'the highlight has a class…')
+  ok(css.includes('.rowOn'), '…and the class exists in the stylesheet — one without the other ' +
+    'is a highlight nobody can see')
+
+  /*
+   * Where the dismiss is, and where it is not.
+   *
+   * "It should close after selection" is answered *after the checkout resolves*, never on the
+   * click: `CheckoutWouldOverwrite` is a real refusal that this popup answers with a panel
+   * naming the files, and a popup that had already closed would have thrown that away — the
+   * user would be left standing on the branch they started from with no explanation.
+   */
+  const success = popup.slice(
+    popup.indexOf('await branchApi.checkout('),
+    popup.indexOf('} catch (error) {', popup.indexOf('await branchApi.checkout(')),
+  )
+  ok(success !== '' && success.includes('onDismiss()'), 'a checkout that succeeded closes the popup')
+  const failure = popup.slice(
+    popup.indexOf('} catch (error) {', popup.indexOf('await branchApi.checkout(')),
+    popup.indexOf('} finally {', popup.indexOf('await branchApi.checkout(')),
+  )
+  ok(
+    failure !== '' && !failure.includes('onDismiss'),
+    'a checkout that was REFUSED leaves the popup up — closing on a refusal would hide the ' +
+      'panel and the sentence that `explain` exists to produce',
+  )
+  /*
+   * Focus has to come back to the field when a panel closes, and go *somewhere inside the
+   * scrim* while one is open.
+   *
+   * Every key this popup answers — the arrows and ⏎ on the search field, Escape on the scrim —
+   * is a React handler on an element inside the scrim. A panel that unmounts the field leaves
+   * focus on `document.body`, which is outside that subtree, and all three keys go dead at
+   * once. ⏎ is what put that on the ordinary route: it can raise the refusal panel, and Escape
+   * then failed to back out of the panel the keystroke had just produced.
+   *
+   * Grepped rather than driven, because it is DOM: `jsdom` is not a dependency here and adding
+   * one to assert `document.activeElement` would be a larger commitment than the four lines it
+   * covers. What is pinned is that the effect exists and is keyed on the panel, which is the
+   * part a later edit would drop.
+   */
+  /*
+   * And `act` has to take focus back itself, because the effect above cannot do it for the one
+   * route that needs it most.
+   *
+   * Fetch, Pull and Push are reachable only *from* the list, so `act`'s `setMode({kind:'list'})`
+   * writes the value `mode.kind` already held. The effect is keyed on `mode.kind` — deliberately,
+   * so a panel re-render does not yank focus mid-read — so it does not re-run. Focus stays on the
+   * button the pointer pressed, and every arrow key is a handler on the search field. One click
+   * on Fetch therefore killed the keyboard navigation this popup exists for, with nothing on
+   * screen to say so and no panel involved for the effect above to notice.
+   */
+  const actBody = popup.slice(popup.indexOf('const act = ('), popup.indexOf('void useBranches.getState().run(', popup.indexOf('const act = (')))
+  ok(
+    actBody !== '' && actBody.includes('search.current?.focus()'),
+    'Fetch/Pull/Push return focus to the search field — they do not change `mode.kind`, so the '
+      + 'effect above never fires for them and the arrows would go dead after one click',
+  )
+  ok(
+    /useEffect\(\(\) => \{\s*if \(mode\.kind === 'list'\) search\.current\?\.focus\(\)/.test(popup),
+    'returning to the list refocuses the search field — otherwise the arrows and ⏎ are inert '
+      + 'after any panel, because focus is left on `document.body` outside the scrim',
+  )
+  ok(
+    /\}, \[mode\.kind\]\)/.test(popup),
+    'and that effect is keyed on the panel, not on mount alone: a mount-only focus call is '
+      + 'exactly the version that leaves the keyboard dead after Cancel',
+  )
+  ok(
+    popup.includes('popupEl.current?.focus()') && popup.includes('tabIndex={-1}'),
+    'the delete and refusal panels own no field, so the dialog itself takes focus — Escape has '
+      + 'to keep working on the panel ⏎ produced',
+  )
+  ok(
+    css.includes('.popup:focus'),
+    '…and that programmatic focus is not allowed to paint a ring around the whole popup',
+  )
+
+  ok(
+    success.includes('notify('),
+    'and a success that had something to say — a stash taken, a tracking branch created, a ' +
+      'restore that conflicted — hands it to the notice stack, which outlives the popup',
   )
 } finally {
   rmSync(out, { recursive: true, force: true })

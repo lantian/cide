@@ -610,13 +610,17 @@ fn a_changelist_entry_whose_file_was_committed_elsewhere_converges() {
     }
 }
 
-/// Filing an *untracked* path into a changelist does not stick, and the panel's menu is built
-/// on that: `repo_changes` computes its `live` set from paths that are neither `Untracked` nor
-/// `Ignored`, so an assignment for one is dropped by the very next status walk.
+/// Filing an *untracked* path into a changelist does not stick: `repo_changes` computes its
+/// `live` set from paths that are neither `Untracked` nor `Ignored`, so an assignment for one
+/// is dropped by the very next status walk.
 ///
-/// Pinned as a test rather than left as a comment because the git panel disables *Move to
-/// Changelist…* on unversioned and ignored rows on the strength of it — the alternative was a
-/// menu item that appeared to work and silently undid itself a moment later.
+/// Pinned as a test rather than left as a comment because the whole git panel is built around
+/// it. It used to be the reason *Move to Changelist…* was **disabled** on unversioned rows —
+/// the alternative then being a menu item that appeared to work and silently undid itself a
+/// moment later. It is now the reason that gesture *stages first*: see
+/// `filing_an_untracked_path_after_adding_it_sticks` below, which is the same sequence with
+/// the one missing step, and `ui/src/sidebar/GitPanel/dragDrop.ts`'s `track` outcome for the
+/// gesture that runs it. The refusal survives for the ignored list, which has no such verb.
 #[test]
 fn filing_an_untracked_path_into_a_changelist_does_not_stick() {
     let repo = TempRepo::new("changelist-untracked");
@@ -643,6 +647,85 @@ fn filing_an_untracked_path_into_a_changelist_does_not_stick() {
             .unwrap()
             .paths
             .is_empty()
+    );
+}
+
+/// The gesture the git panel calls *track*: add an unversioned file to git, **then** file it.
+///
+/// > *"i should be able to move files from Unversioned Files to any of change list via drag
+/// > and drop and via context ... but when dragging it should stage them automatically."*
+///
+/// This is the whole claim of that feature, in the order it makes it. `stage::stage` over a
+/// whole untracked path does what `git add` does, which takes the path out of `Untracked` and
+/// therefore into `repo_changes`'s `live` set; only then does the assignment survive
+/// `Sidecar::reconcile`. The reverse order is the test above — a write that undoes itself
+/// roughly 150 ms later, which is what the panel used to refuse rather than perform.
+///
+/// The last assertion is the point of the exercise: committing that changelist commits the
+/// file. A path filed into a list that a commit of the list would skip is a changelist entry
+/// that lies, and `commit::default_selections` skips anything still `Untracked`.
+#[test]
+fn filing_an_untracked_path_after_adding_it_sticks() {
+    let repo = TempRepo::new("changelist-track");
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("new.txt", b"fresh\n");
+
+    let fixes = changelist::update(&repo.root, |data| data.create("Fixes", "")).unwrap();
+    // Step one, exactly what `useGitPanel::trackPaths` sends first.
+    stage::stage(&repo.root, &[selection("new.txt", Selection::Whole)]).expect("stage");
+    // Step two, unchanged from the ordinary move.
+    changelist::update(&repo.root, |data| {
+        data.move_paths(&fixes, &["new.txt".to_string()])
+    })
+    .unwrap();
+
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    let changes = status::repo_changes(&info, status::StatusRequest::default()).expect("status");
+    assert!(
+        changes.unversioned.is_empty(),
+        "the file has left the Unversioned Files list: it is in the index now"
+    );
+    let list = changes
+        .changelists
+        .iter()
+        .find(|l| l.id == fixes)
+        .expect("the Fixes list");
+    assert_eq!(
+        list.changes
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<_>>(),
+        ["new.txt"],
+        "and it is drawn in the changelist it was dropped on, after a full status walk — the \
+         reconcile that drops an untracked path's assignment has already run here"
+    );
+    assert!(
+        changelist::load(&repo.root)
+            .get(&fixes)
+            .unwrap()
+            .paths
+            .contains("new.txt"),
+        "the sidecar kept it too"
+    );
+
+    // And the assignment means what it says: committing that list commits the new file.
+    commit::commit(
+        &repo.root,
+        &CommitRequest {
+            message: "add the new file".into(),
+            amend: false,
+            changelist: Some(fixes.clone()),
+            selections: None,
+            force: false,
+        },
+    )
+    .expect("commit");
+    assert!(
+        repo.git(&["show", "--name-only", "--format=", "HEAD"])
+            .contains("new.txt"),
+        "an untracked path filed this way is a commit candidate, which is the only reason \
+         filing it was worth doing"
     );
 }
 

@@ -18,6 +18,8 @@
 import { useState, type ReactNode } from 'react'
 import { TerminalPane } from './TerminalPane'
 import { EditorPane } from './EditorPane'
+import { ImagePane } from './ImagePane'
+import { imageKindFor } from './imageKinds'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
 import { ResumeSplash } from '@/windows/ResumeSplash'
 import { paneSessionId } from '@/layout/paneHosts'
@@ -142,6 +144,27 @@ export function PaneBody({
   // unsaved text. Keying on the pane means a File tab has exactly one editor, which is what
   // makes one dirty flag per tab the right shape rather than a race.
   if (editor && pane.kind === 'editor') {
+    /*
+     * An image is a file tab too, and the fork is here rather than in Rust. (M18)
+     *
+     * `imageKindFor` reads the extension and nothing else, which is the only input available
+     * on a pane's first render — the alternative, a `PaneKind::Image` written by
+     * `tab_open_file`, was rejected for two reasons. It would put a *derived* fact in
+     * `workspace.json`, so a `.png` opened before the format list grew would come back as an
+     * editor for ever; and it would have needed a second extension table in Rust, which is
+     * precisely the drift `cide_core::image` refuses to carry (it sniffs bytes instead).
+     *
+     * Keying on `pane.kind === 'editor'` still, so this inherits the rule the comment below
+     * states: splitting a File tab makes a *Claude* pane, and a tab-level fork would render a
+     * second image viewer inside it.
+     *
+     * `ImagePane` is not lazy-loaded and must not become so. A pane that renders nothing for a
+     * frame while a chunk arrives is a pane the layout measures at zero, which is the failure
+     * `layout/paneHosts.ts` spends thirty lines preventing for terminals.
+     */
+    if (imageKindFor(editor.path) !== null) {
+      return <ImagePane path={editor.path} root={cwd} onScreen={onScreen} />
+    }
     return (
       <EditorPane
         path={editor.path}

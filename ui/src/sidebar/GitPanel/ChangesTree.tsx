@@ -144,6 +144,15 @@ export interface ChangesTreeProps {
    * becomes a drag at all, so there is no gesture that picks rows up and puts them back.
    */
   onMovePaths?: ((repo: RepoId, changelist: string, paths: string[]) => void) | undefined
+  /**
+   * Unversioned paths dropped on a changelist row: added to git, then filed.
+   *
+   * Separate from `onMovePaths` because it is a different operation on the repository — see
+   * `dragDrop.ts`'s `track` outcome. Absent makes *that* drop inert on its own, leaving the
+   * ordinary move working, which is why the hook checks them per row kind rather than
+   * together.
+   */
+  onTrackPaths?: ((repo: RepoId, changelist: string, paths: string[]) => void) | undefined
   /** From the host's `useContextMenu`. Absent in a render with no window to open one in. */
   onContextMenu?: ((e: React.MouseEvent) => void) | undefined
   /** The portalled menu itself. It must be rendered or nothing appears. */
@@ -186,11 +195,19 @@ export function ChangesTree({
   onToggleExpand,
   onOpenDiff,
   onMovePaths,
+  onTrackPaths,
   onContextMenu,
   menu,
 }: ChangesTreeProps) {
   const container = useRef<HTMLDivElement>(null)
-  const drag = useChangesDrag({ rows, view, carried, container, onMove: onMovePaths })
+  const drag = useChangesDrag({
+    rows,
+    view,
+    carried,
+    container,
+    onMove: onMovePaths,
+    onTrack: onTrackPaths,
+  })
   /**
    * The row whose plain press deferred its collapse, until the mouseup answers for it.
    *

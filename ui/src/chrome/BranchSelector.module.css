@@ -81,6 +81,17 @@
   overflow: hidden;
 }
 
+/*
+ * The dialog takes focus itself whenever the panel on screen owns no field — otherwise focus
+ * falls to `document.body`, outside the scrim, and Escape stops backing out. That focus is
+ * never the user aiming at the box, so it must not draw a ring: a 460px outline around the
+ * whole popup every time the refusal panel opens reads as a rendering fault. `tabIndex={-1}`
+ * already keeps Tab away from it, so nothing that a keyboard user needs to see is being hidden.
+ */
+.popup:focus {
+  outline: none;
+}
+
 /* The repository strip, only drawn when the project holds more than one. */
 .repos {
   flex: none;
@@ -224,6 +235,24 @@
 .row:hover,
 .rowCurrent:hover {
   background: var(--chrome-hi);
+}
+
+/*
+ * The row the arrow keys have walked to.
+ *
+ * A modifier over `.row` / `.rowCurrent` rather than a third row class, because "highlighted"
+ * and "is the branch you are on" are independent — the current branch is pinned first, so it is
+ * the row the first Down lands on.
+ *
+ * Both a wash and a bar: the wash alone is `--chrome-hi`, which is exactly what `:hover` paints,
+ * so a mouse resting anywhere in the list would be indistinguishable from the thing ⏎ is about
+ * to act on. The 2px accent bar is the part only the keyboard can produce. An `inset` shadow
+ * rather than a `border-left`, because a border is laid out and every row would shift two pixels
+ * sideways as the highlight arrived.
+ */
+.rowOn {
+  background: var(--chrome-hi);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .rowMain {

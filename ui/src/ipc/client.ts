@@ -10,7 +10,7 @@
  * from the function name; the dotted names here are the vocabulary the rest of the app
  * uses.
  */
-import { Channel, invoke } from '@tauri-apps/api/core'
+import { Channel, convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
   Axis,
@@ -31,6 +31,7 @@ import type {
   KeymapReport,
   ResolvedBinding,
   FileDoc,
+  ImageDoc,
   FileStamp,
   PaneId,
   PaneRestore,
@@ -1517,6 +1518,50 @@ export const file = {
 
   /** Where the user last was in `path`, or `null`. */
   position: (path: string) => invoke<ViewPosition | null>('file_position', { path }),
+}
+
+/**
+ * Images. Two calls, and the second one is not an `invoke` at all. (M18)
+ *
+ * The split matters, so it is stated here rather than left to be discovered:
+ *
+ * * `read` is an ordinary command. It answers **identity** — format, byte size, mtime, and the
+ *   canonical path — and it grants this webview permission to fetch that one file over the
+ *   asset protocol. It rejects with a `CoreError` whose message is a sentence: too large, not
+ *   a regular file, empty, or the headline case, a name that promised a PNG over bytes that
+ *   are not one.
+ * * `srcUrl` builds the URL the `<img>` actually loads. **No pixels ever cross the IPC.**
+ *   See `crates/cide-app/src/cmd/file.rs::image_read` for why — in one line, Tauri's IPC is
+ *   JSON, and a 40 MB PNG base64'd into a JSON string is over 100 MB of peak footprint on the
+ *   thread that draws every terminal in the window.
+ */
+export const image = {
+  read: (path: string) => invoke<ImageDoc>('image_read', { path }),
+
+  /**
+   * The URL for an image `read` has already vouched for.
+   *
+   * `convertFileSrc` is the fourth import from `@tauri-apps/api` in this file and it is the
+   * one that is neither `invoke` nor `listen`. It belongs here anyway, for the reason the
+   * header gives about the whole module: it is a seam onto Tauri, and a seam that lives in a
+   * component is a seam nobody can grep for. It is also not a call — it reads
+   * `window.__TAURI_INTERNALS__` and returns a string — so it costs nothing to route through
+   * a function.
+   *
+   * Built from `doc.path`, which is **canonical**, because that is what Tauri's asset scope
+   * matches against; see `ImageDoc::path`.
+   *
+   * The query string is a cache-buster and not decoration. The asset protocol serves a
+   * cacheable HTTP-shaped response keyed by URL, so an image an agent has just rewritten would
+   * otherwise keep showing yesterday's pixels for the life of the tab. Tauri's handler reads
+   * `request.uri().path()`, which excludes the query, so this is invisible to the Rust side.
+   * A doc with no stamp — a filesystem that would not answer — simply gets no buster, which is
+   * the behaviour cide had before and not worth a failure.
+   */
+  srcUrl: (doc: ImageDoc): string => {
+    const base = convertFileSrc(doc.path)
+    return doc.stamp === null ? base : `${base}?v=${doc.stamp.mtimeNanos}-${doc.stamp.len}`
+  },
 }
 
 /* --------------------------------------------------------------------------------------

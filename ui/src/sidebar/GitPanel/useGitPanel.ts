@@ -140,6 +140,16 @@ function files(n: number): string {
   return `${n} ${n === 1 ? 'file' : 'files'}`
 }
 
+/**
+ * The `shownFor` key for "add to git, then file" — one key for a gesture that is two calls.
+ *
+ * Keyed as one operation on purpose: the panel shows a single line, only the operation that
+ * wrote it may clear it (see `note`), and the two halves of this gesture must not be able to
+ * clear each other's message. A failed add followed by a successful anything-else would
+ * otherwise wipe the only record that the files never made it into git.
+ */
+const TRACK_NOTE = 'git add and file'
+
 /** Coalescing window for refresh bursts. One edit reports several paths. */
 const REFRESH_DEBOUNCE_MS = 60
 
@@ -276,8 +286,15 @@ export interface GitPanelActions {
   /** Its paths fall back to the default list — no work is lost, so this does not confirm. */
   deleteChangelist: (repo: RepoId, id: string) => void
   setActiveChangelist: (repo: RepoId, id: string) => void
-  /** Open the chooser on `Move to changelist` for these repo-relative paths. */
-  moveToChangelist: (repo: RepoId, paths: string[]) => void
+  /**
+   * Open the chooser on `Move to changelist` for these repo-relative paths.
+   *
+   * `track` says the paths are unversioned: picking a list **adds them to git** and then
+   * files them, which the dialog says in words before anything runs. The menu passes it from
+   * the row's group kind, exactly as a drag passes it through `dragDrop.ts`'s `track`
+   * outcome, so the two routes cannot end up doing different things to the repository.
+   */
+  moveToChangelist: (repo: RepoId, paths: string[], track: boolean) => void
   /**
    * File these paths into that changelist. No dialog — the target was already named by the
    * gesture, which is what a drop onto a changelist row is.
@@ -288,6 +305,15 @@ export interface GitPanelActions {
    * a target and a non-empty path list has already been told the move is legal.
    */
   movePaths: (repo: RepoId, changelist: string, paths: string[]) => void
+  /**
+   * Add these unversioned paths to git and file them into that changelist — one gesture, two
+   * calls, and no dialog. What a drop out of `Unversioned Files` runs.
+   *
+   * Separate from `movePaths` because it writes to the repository: it is a `git add`, and
+   * ADR 0004's index-is-derived model makes that a decision with consequences rather than a
+   * detail. The implementation carries them.
+   */
+  trackPaths: (repo: RepoId, changelist: string, paths: string[]) => void
   /** Throw away everything in one group. **Opens the confirmation**, which names every file. */
   revertGroup: (repo: RepoId, group: string) => void
   /**
@@ -969,6 +995,7 @@ export function useGitPanel(
         id: null,
         name: '',
         paths: [],
+        track: false,
       })
     },
     [view],
@@ -985,22 +1012,39 @@ export function useGitPanel(
         id,
         name: lists.find((l) => l.id === id)?.name ?? '',
         paths: [],
+        track: false,
       })
     },
     [view],
   )
 
   const moveToChangelist = useCallback(
-    (repo: RepoId, paths: string[]) => {
+    /**
+     * `track` says these paths are unversioned, so picking a list adds them to git first —
+     * the context menu's route to `dragDrop.ts`'s `track` outcome. It is a required argument
+     * rather than one defaulting to `false`, because every call site knows the answer from
+     * the row it was opened on and a default would let a new one silently promise a plain
+     * re-filing over files git has never seen.
+     */
+    (repo: RepoId, paths: string[], track: boolean) => {
       if (paths.length === 0) return
       // The list the paths are in *now*, when they all share one — the dialog disables that
       // row, because moving a file to where it already is is a gesture that appears to work
       // and changes nothing.
-      const here = new Set(
-        flatFiles(view)
-          .filter((f) => f.repo === repo && paths.includes(f.entry.path))
-          .map((f) => f.changelist),
-      )
+      //
+      // Never for an unversioned set. `ChangeEntry.changelist` comes from `Sidecar::owner_of`,
+      // which answers *the active list* for anything nobody has filed — so an untracked path
+      // claims to be in `Changes` while being drawn under `Unversioned Files` and being in no
+      // list at all. Trusting it here greyed out the active changelist, which is the one row
+      // most of these files are headed for. Same fact `dropOutcome`'s `track` branch is built
+      // around.
+      const here = track
+        ? new Set<string>()
+        : new Set(
+            flatFiles(view)
+              .filter((f) => f.repo === repo && paths.includes(f.entry.path))
+              .map((f) => f.changelist),
+          )
       setDialog({
         mode: 'move',
         repo,
@@ -1009,6 +1053,7 @@ export function useGitPanel(
         id: here.size === 1 ? ([...here][0] ?? null) : null,
         name: '',
         paths,
+        track,
       })
     },
     [view],
@@ -1033,6 +1078,106 @@ export function useGitPanel(
     [mutate],
   )
 
+  /**
+   * The other drop: add unversioned paths to git, *then* file them.
+   *
+   * > *"i should be able to move files from Unversioned Files to any of change list via drag
+   * > and drop and via context ... but when dragging it should stage them automatically."*
+   *
+   * # Why this is a `git add` and not something lighter
+   *
+   * A changelist assignment for an untracked path is a write that undoes itself.
+   * `status::repo_changes` builds its `live` set from every entry that is neither `Untracked`
+   * nor `Ignored` and hands it to `Sidecar::reconcile`, which drops every assignment outside
+   * it — so filing an untracked path succeeds in the sidecar and is gone by the next status
+   * walk, roughly 150 ms later. `dropOutcome` used to refuse the drag for exactly that reason.
+   * The path has to *leave* the untracked state for the assignment to survive, and the only
+   * thing that does that is putting it in the index.
+   *
+   * `git add -N` (intent-to-add) was the lighter option and it loses twice. It does not buy
+   * the thing that matters — `commit::rebuild_index` resets the index to HEAD before writing
+   * the changelist anyway, so an intent-to-add entry is no more durable than a full one — and
+   * `cide-git` has no way to make one: every IA entry in its tests is created by forking the
+   * `git` binary (`an_intent_to_add_entry_stages_by_hunk`), because git2 offers it only by
+   * hand-setting `IndexEntry` extended flags, which is not a thing to invent on the one code
+   * path in this project where a mistake destroys uncommitted work. `stage::stage` is the call
+   * every other staging gesture in the panel already goes through, property-tested against
+   * real `git apply --cached`, and for a whole untracked file it does what `git add` does —
+   * `assert_matches_git_add` is the test that says so.
+   *
+   * # What it costs, per ADR 0004
+   *
+   * The file is now in `.git/index`, and the index is a derived artifact here: committing a
+   * *different* changelist runs `rebuild_index`, which resets the index to HEAD and writes
+   * only that list's selections. The newly added file's index entry goes with it, the path is
+   * untracked again, and `reconcile` then drops the changelist assignment it just earned — so
+   * it reappears under `Unversioned Files`. That is the changelists-are-the-truth model doing
+   * exactly what the ADR says it does, not a bug in this path, and it is why the ghost says
+   * *"Add N files to git"* rather than *"track N files"*: the promise made is the one that is
+   * kept. Committing the list the files were filed into commits them, which is the case the
+   * gesture is actually for.
+   *
+   * The staging does **not** raise the external-index guard bar: `stage::stage` ends in
+   * `changelist::record_index`, so the fingerprint the guard compares against is cide's own
+   * new one. A drag that accused the user of staging outside cide would be absurd.
+   *
+   * # Two calls, and what happens when the first one fails
+   *
+   * There is no single command for this, and it is deliberately *not* dressed as one that
+   * cannot fail halfway. If the add fails nothing else is attempted — the move would be a
+   * write the next status walk erases — and the line says nothing was added. If the add
+   * succeeds and the move fails, the line says that too, naming both halves, because the
+   * files are then in git and in the *active* changelist rather than the one they were
+   * dropped on, and a message about a failed "move" alone would leave the user with no idea
+   * their repository had changed. Silence in either case is the failure this panel has had
+   * before.
+   */
+  const trackPaths = useCallback(
+    (repo: RepoId, changelist: string, paths: string[]) => {
+      if (project === null || paths.length === 0) return
+      void (async () => {
+        // One busy line for the whole gesture. It is one operation to the person who dropped
+        // the files, and a label that flipped from `Adding to git…` to `Moving…` halfway would
+        // be reporting cide's plumbing rather than what they asked for.
+        setBusy('Adding to git…')
+        let added = false
+        try {
+          await gitApi.stage(project, repo, wholeFiles(paths))
+          added = true
+          const moved = await gitApi.changelist.movePaths(project, repo, changelist, paths)
+          note(TRACK_NOTE, null)
+          setBusy(null)
+          // The command's own answer, adopted directly — see `mutate` for why a `refresh()`
+          // here would show a frame of the files back where they came from.
+          //
+          // There is still one frame in between, and it is honest: `git_stage` broadcasts its
+          // own tree, in which the files are added to git and sit in the *active* changelist
+          // (`Sidecar::owner_of` answers the active list for anything unfiled). That is what
+          // the repository actually contains at that instant. Collapsing the two calls into
+          // one command would remove the frame and is the only thing that would; it is not
+          // worth a new entry in the IPC contract for a flicker that shows the truth.
+          adopt(absorb(moved))
+          return
+        } catch (e) {
+          const detail = e instanceof Error ? e.message : String(e)
+          note(
+            TRACK_NOTE,
+            added
+              ? `${files(paths.length)} were added to git, but the move failed — ${detail}`
+              : `nothing was added to git — ${detail}`,
+          )
+          void diag.log(`git panel: add to git and file failed: ${detail}`)
+        }
+        setBusy(null)
+        // Whatever happened, the tree on screen is now a guess. A status walk is how the panel
+        // gets back to something true — including, after a half-applied gesture, showing the
+        // files where they actually ended up.
+        await refresh()
+      })()
+    },
+    [project, note, refresh, adopt, absorb],
+  )
+
   const dismissDialog = useCallback(() => setDialog(null), [])
 
   const deleteChangelist = useCallback(
@@ -1054,13 +1199,21 @@ export function useGitPanel(
   const pickChangelist = useCallback(
     (id: string) => {
       if (dialog === null || dialog.mode !== 'move') return
-      const { repo, paths } = dialog
+      const { repo, paths, track } = dialog
       setDialog(null)
+      // The same two operations the drop has, chosen the same way. The chooser is the
+      // keyboard's route to a gesture the pointer makes by dragging, and a route that ran a
+      // plain move over unversioned paths would write an assignment the next status walk
+      // erases — the silent no-op this whole item is about.
+      if (track) {
+        trackPaths(repo, id, [...paths])
+        return
+      }
       mutate('git changelist move', 'Moving…', (p) =>
         gitApi.changelist.movePaths(p, repo, id, [...paths]),
       )
     },
-    [dialog, mutate],
+    [dialog, mutate, trackPaths],
   )
 
   /**
@@ -1077,7 +1230,7 @@ export function useGitPanel(
   const submitChangelistName = useCallback(
     (name: string) => {
       if (dialog === null || project === null) return
-      const { mode, repo, id, paths } = dialog
+      const { mode, repo, id, paths, track } = dialog
       setDialog(null)
       if (mode === 'rename') {
         if (id === null) return
@@ -1113,6 +1266,16 @@ export function useGitPanel(
           adopt(absorb(created))
           return
         }
+        // Create-and-move over unversioned paths is create-and-*add-and*-move. `trackPaths`
+        // owns both halves and their failure wording; duplicating the add here would be a
+        // second place for the two routes to disagree about what a drop into a brand new
+        // changelist does.
+        if (track) {
+          setBusy(null)
+          adopt(absorb(created))
+          trackPaths(repo, fresh, [...paths])
+          return
+        }
         const moved = await guarded('git changelist move', () =>
           gitApi.changelist.movePaths(project, repo, fresh, [...paths]),
         )
@@ -1121,7 +1284,7 @@ export function useGitPanel(
         else adopt(absorb(moved))
       })()
     },
-    [dialog, project, mutate, guarded, refresh, adopt, absorb, note],
+    [dialog, project, mutate, guarded, refresh, adopt, absorb, note, trackPaths],
   )
 
   // --- reverting, which is the one thing here with no undo ------------------------------------
@@ -1529,6 +1692,7 @@ export function useGitPanel(
     setActiveChangelist,
     moveToChangelist,
     movePaths,
+    trackPaths,
     revertGroup,
     revertFiles,
     shelveGroup,

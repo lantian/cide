@@ -94,6 +94,7 @@
   "git_unshelve",
   "git_unstage",
   "graphics_status",
+  "image_read",
   "keymap_edit",
   "keymap_report",
   "pane_add_row",

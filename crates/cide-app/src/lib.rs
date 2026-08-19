@@ -297,6 +297,7 @@ pub fn run() {
             cmd::file::claude_selection_changed,
             cmd::file::claude_send_lines,
             cmd::file::file_read,
+            cmd::file::image_read,
             cmd::file::file_write,
             cmd::file::file_note_position,
             cmd::file::file_position,
@@ -567,6 +568,16 @@ pub fn run() {
                 // `ExitRequested` covers a window close and a quit from the UI. A SIGTERM
                 // never reaches it, which is why `lifecycle` also owns a signal thread.
                 //
+                // It is answered by `lifecycle::exit_requested` rather than by `shutdown`
+                // directly, because this arm runs **on the GTK main thread** and the teardown
+                // it used to run inline takes seconds: two file writes, the IDE servers, every
+                // language server's own kill ladder and then the children's. Nothing repainted
+                // for the whole of it and the compositor greyed the window out — the "closing
+                // freezes the window" report. `exit_requested` holds the exit with
+                // `api.prevent_exit()`, runs the teardown on a worker, and asks for the exit
+                // again when it is done; `api` is what makes that possible, so this arm has to
+                // bind it rather than match `{ .. }`.
+                //
                 // `Exit` is the *other* way out, and on macOS it is the only one the common
                 // gesture takes. ⌘Q goes `NSApp terminate:` → `applicationWillTerminate` →
                 // `AppState::exit()` → `Event::LoopDestroyed`, which tauri-runtime-wry turns
@@ -580,9 +591,14 @@ pub fn run() {
                 // Costs Linux nothing and is a small correctness win there too: `Exit` also
                 // follows `app.exit(code)` and a runtime-initiated teardown, both of which
                 // reach here without an `ExitRequested`. `shutdown` sets `SHUTTING_DOWN`
-                // first and returns immediately on a second call, so the ordinary Linux
-                // sequence — `ExitRequested` then `Exit` — still runs the ladder exactly once.
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                // first, so the ordinary Linux sequence — `ExitRequested`, the teardown on its
+                // worker, the worker's own `app.exit`, a second `ExitRequested`, then `Exit` —
+                // still runs the ladder exactly once. What the later calls do is *wait* for
+                // the one in flight, which by then has already finished.
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    lifecycle::exit_requested(app, code, &api);
+                }
+                tauri::RunEvent::Exit => {
                     lifecycle::shutdown(app);
                 }
                 _ => {}

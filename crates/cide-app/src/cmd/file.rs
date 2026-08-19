@@ -795,6 +795,92 @@ fn open_roots(state: &WorkspaceState) -> Vec<PathBuf> {
     })
 }
 
+/// Read an image file for an image pane — identity and a *permit*, never the pixels. (M18)
+///
+/// > *"need render images when opening them"*
+///
+/// # What used to happen
+///
+/// A file tab has always had exactly one reader: `document::read`, which refuses anything with
+/// a NUL byte in its first 8 KiB. So `logo.png` opened a tab and the tab said
+/// **"logo.png looks like a binary file"** — a refusal, not mojibake and not a crash, which is
+/// the one piece of luck in the report. (`cide_core::image`'s
+/// `a_png_is_refused_by_the_text_reader` pins that, so the sentence stays a fact.) SVG was the
+/// exception and opened as XML source, because it is text.
+///
+/// # How the bytes reach the webview, and the two candidates that lost
+///
+/// **Tauri's asset protocol.** `convertFileSrc(path)` gives the pane an `asset://localhost/…`
+/// URL that wry serves from `tauri::protocol::asset`: a real streaming response with `Range`
+/// support, read off the webview's own thread, never marshalled and never copied through
+/// Rust. A 40 MB PNG costs this command a `stat` and an 8 KiB header read.
+///
+/// * **A `data:` URI over the IPC** was the obvious one. Tauri's IPC is JSON; base64 inflates
+///   by a third; and the string is built in Rust, parsed by the JSON reader, retained by the
+///   JS engine and decoded again by the image decoder — over 100 MB of peak footprint for that
+///   same 40 MB PNG, on the thread that also draws every terminal in the window. `CLAUDE.md`'s
+///   rule about the control plane is written about `emit`/`listen`, and the reasoning
+///   (interpolated JSON evaluated on the GTK main loop) is the same one.
+/// * **A custom `cide-image://` protocol** would work and is what the asset protocol already
+///   *is*. Registering a second one means a second CSP source to add, a second scope
+///   implementation to get right, and a second answer to "how does a file reach the webview".
+///
+/// ## The CSP admits it, and here is how that was verified rather than assumed
+///
+/// `crates/cide-app/tauri.conf.json` sets
+/// `img-src 'self' data: blob: asset: http://asset.localhost`, and enables
+/// `app.security.assetProtocol` (the `protocol-asset` cargo feature is on in the workspace
+/// manifest). Tauri's injected `convertFileSrc` — `tauri-2.11.5/scripts/core.js` — emits
+/// `asset://localhost/<encoded>` on Linux and macOS and `http://asset.localhost/<encoded>` on
+/// Windows, and **both** spellings are in that `img-src` list. A source the CSP forbids fails
+/// silently in this engine, which is precisely why this paragraph names the file and the line
+/// rather than saying "the CSP allows it".
+///
+/// # The permit, which is the part that is easy to leave out
+///
+/// `assetProtocol.scope` in the config is `[]` — *nothing* is servable — and it is left that
+/// way on purpose. A static `["**"]` would turn the asset protocol into an unauthenticated
+/// read of every file on the machine for the lifetime of the process, which is a much larger
+/// grant than this feature needs and one no gesture would ever narrow again.
+///
+/// Instead the scope is widened here, one file at a time, **after** `cide_core::image::read`
+/// has proved the path is a regular file under the cap whose bytes really are an image. So the
+/// protocol can serve exactly the images the user has opened, and a path that failed any
+/// refusal is never admitted at all. The cost is that the pattern list grows by one entry per
+/// distinct image opened in a session; `Scope::is_allowed` is a linear walk over it, and a
+/// user who opens a thousand images pays a thousand glob matches on each fetch, which is
+/// nothing next to decoding the image.
+///
+/// This is a real widening and it is worth being honest about its size: a *compromised
+/// webview* could already read any file through `file_read` beside this function, which has no
+/// containment check at all and says so. What this adds is a second route to bytes the same
+/// origin could already ask for, restricted to files a user opened. Containment against the
+/// project roots is deliberately **not** applied, for `file_read`'s stated reason: an image
+/// under *External Libraries*, or one the user approved by name through
+/// `terminal_open_path`'s out-of-project dialog, is a file they asked for.
+///
+/// `spawn_blocking` for the same reason as `file_read`: a `canonicalize`, a `stat` and an
+/// 8 KiB read on a path the user chose, which on a stalled NFS mount would otherwise take the
+/// event loop and with it every terminal in the window.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn image_read(app: tauri::AppHandle, path: String) -> Result<cide_ipc::ImageDoc> {
+    let doc = blocking(move || cide_core::image::read(&PathBuf::from(path))).await?;
+
+    // After the read, never before. `allow_file` is the capability grant, and granting it
+    // ahead of the refusals would admit a directory, a FIFO or a 2 GB tarball to the protocol
+    // on the strength of the user having clicked something.
+    app.asset_protocol_scope()
+        .allow_file(&doc.path)
+        .map_err(|e| {
+            CoreError::Io(format!(
+                "{} could not be served to the viewer: {e}",
+                doc.path.display()
+            ))
+        })?;
+
+    Ok(doc)
+}
+
 /// Read a file for an editor pane.
 ///
 /// # The read-only rule, and the bug it closes

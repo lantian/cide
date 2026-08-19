@@ -25,6 +25,7 @@
     "check:git": "node scripts/check-git-tree.mjs",
     "check:groups": "node scripts/check-groups.mjs",
     "check:icons": "node scripts/check-icons.mjs",
+    "check:image": "node scripts/check-image.mjs",
     "check:input": "node scripts/check-input-emitters.mjs",
     "check:keymap": "node scripts/check-keymap.mjs",
     "check:keys": "node scripts/check-key-gate.mjs",
