@@ -22,10 +22,28 @@
  * The decisions — the clamp, the defaults, the cache encoding — are in `./sidebarWidth.ts`,
  * which is import-free so `ui/scripts/check-sidebar.mjs` can compile and assert on it. What
  * is left here is the part that only exists in a browser.
+ *
+ * Two later corrections to the paragraph above, both about *how often* that one property is
+ * written rather than about which one it is:
+ *
+ * * The token sits on `<html>` and is inherited, so re-declaring it invalidates style for every
+ *   node in the document — and this window's document is mostly terminal rows. WebKitGTK reports
+ *   `pointermove` at the mouse's rate rather than the frame rate, so a 125 Hz mouse was paying
+ *   for that twice per frame. The write is now coalesced onto one `requestAnimationFrame`; the
+ *   arithmetic stays synchronous, so `live.current` is still the pointer's real answer and
+ *   `pointerup` commits without waiting for a frame.
+ * * Every write goes through [`writeToken`], which drops one that changes nothing. `paint` is
+ *   called from the adopt effect — i.e. on *every* `cide://workspace-changed`, which is every
+ *   tab opened and every setting flipped — and from a `resize` listener that fires per frame of
+ *   a window drag, and in nearly all of those the number is the one already on screen.
+ *
+ * And the drag is bracketed by `@/layout/resizeGesture`, which is what stops every terminal in
+ * every tab refitting on every frame of it.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { settings as settingsApi } from '@/ipc/client'
 import { lockBodyForDrag, unlockBodyAfterDrag } from './dragLock'
+import { beginResizeGesture, endResizeGesture } from '@/layout/resizeGesture'
 import { useWorkspace } from '@/store/workspace'
 import {
   SIDEBAR_CACHE_KEY,
@@ -124,11 +142,27 @@ function painted(widths: SidebarWidths): SidebarWidths {
   }
 }
 
+/**
+ * What each token was last set to, so an unchanged value costs nothing.
+ *
+ * These are inherited custom properties on the root element: writing one invalidates style for
+ * the whole document, and most of this document is terminal rows. `paint` runs on every
+ * workspace snapshot and on every frame of a window resize, and in nearly all of those the
+ * width has not moved — so the comparison is not a micro-optimisation, it is the difference
+ * between a document-wide style invalidation and nothing at all.
+ */
+const written = new Map<string, string>()
+
+function writeToken(property: string, value: string): void {
+  if (written.get(property) === value) return
+  written.set(property, value)
+  document.documentElement.style.setProperty(property, value)
+}
+
 /** Write every token onto `<html>`. The whole of how a width reaches the screen. */
 function paint(widths: SidebarWidths): void {
-  const root = document.documentElement
   for (const [property, value] of widthDeclarations(painted(widths))) {
-    root.style.setProperty(property, value)
+    writeToken(property, value)
   }
 }
 
@@ -180,6 +214,16 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
   const live = useRef(held[panel])
   const selfRef = useRef<HTMLDivElement>(null)
   const commitTimer = useRef<number | null>(null)
+  /** The pending token write, so a burst of moves paints once. */
+  const frame = useRef<number | null>(null)
+  /**
+   * True while a run of arrow-key nudges is open.
+   *
+   * A held arrow repeats at roughly 30 Hz and each repeat resizes the pane area, so key repeat
+   * is a resize gesture in every sense that matters downstream. Closed by `flushCommit`, which
+   * is already wired to keyup, blur and unmount.
+   */
+  const keying = useRef(false)
 
   /**
    * Adopt the workspace's widths.
@@ -217,9 +261,18 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
   // and a resize cursor for the rest of the session.
   useEffect(
     () => () => {
+      if (frame.current !== null) cancelAnimationFrame(frame.current)
       if (dragging.current) {
+        dragging.current = false
         gesturing = false
         unlockBodyAfterDrag()
+        // Left open, this would stop every terminal in the window refitting until
+        // `resizeGesture`'s watchdog noticed. A view switch can land here mid-drag.
+        endResizeGesture()
+      }
+      if (keying.current) {
+        keying.current = false
+        endResizeGesture()
       }
     },
     [],
@@ -242,17 +295,18 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     [panel],
   )
 
-  const stop = useCallback(
-    (doCommit: boolean) => {
-      if (!dragging.current) return
-      dragging.current = false
-      gesturing = false
-      setActive(false)
-      unlockBodyAfterDrag()
-      if (doCommit) commit(live.current)
-    },
-    [commit],
-  )
+  const stop = (doCommit: boolean) => {
+    if (!dragging.current) return
+    dragging.current = false
+    gesturing = false
+    setActive(false)
+    // The last pointer event may not have been painted yet, and the gesture is over: put the
+    // width being committed on screen rather than letting a frame land after the model moved.
+    settle()
+    unlockBodyAfterDrag()
+    endResizeGesture()
+    if (doCommit) commit(live.current)
+  }
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return
@@ -266,6 +320,9 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     dragging.current = true
     gesturing = true
     setActive(true)
+    // Before the first move, so nothing downstream refits on the frames this drag is about to
+    // produce. Paired in `stop` and in the unmount effect.
+    beginResizeGesture()
     // On the body, not on this element: the pointer spends the drag over the panel and the
     // panes, and without this the cursor flickers to a text caret on every crossing. Through
     // `dragLock` because the selection half of it cannot be written as `style.userSelect` in
@@ -273,11 +330,34 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     lockBodyForDrag('col-resize')
   }
 
-  /** Move the edge. No React, no store, one custom property. */
+  /** Put `live.current` on screen. One custom property, plus the aria the gesture owes. */
+  const paintLive = () => {
+    writeToken(SIDEBAR_TOKEN[panel], `${live.current}px`)
+    selfRef.current?.setAttribute('aria-valuenow', String(live.current))
+  }
+
+  /**
+   * Move the edge. No React, no store, one custom property — on the next frame.
+   *
+   * The width is recorded synchronously and only the write waits, so `stop` can commit
+   * `live.current` without a frame having had to land first.
+   */
   const show = (width: number) => {
     live.current = width
-    document.documentElement.style.setProperty(SIDEBAR_TOKEN[panel], `${width}px`)
-    selfRef.current?.setAttribute('aria-valuenow', String(width))
+    if (frame.current !== null) return
+    frame.current = requestAnimationFrame(() => {
+      frame.current = null
+      paintLive()
+    })
+  }
+
+  /** Drop a scheduled write and put the final position on screen now. */
+  const settle = () => {
+    if (frame.current !== null) {
+      cancelAnimationFrame(frame.current)
+      frame.current = null
+    }
+    paintLive()
   }
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -292,6 +372,10 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
    * the pointer path exists to avoid, arriving through the keyboard instead.
    */
   const moveTo = (width: number) => {
+    if (!keying.current) {
+      keying.current = true
+      beginResizeGesture()
+    }
     show(clampSidebarWidth(width, window.innerWidth))
     if (commitTimer.current !== null) window.clearTimeout(commitTimer.current)
     commitTimer.current = window.setTimeout(() => {
@@ -302,6 +386,11 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
 
   /** Send a pending keyboard commit immediately, so none is ever dropped to a blur. */
   const flushCommit = () => {
+    if (keying.current) {
+      keying.current = false
+      settle()
+      endResizeGesture()
+    }
     if (commitTimer.current === null) return
     window.clearTimeout(commitTimer.current)
     commitTimer.current = null

@@ -3519,6 +3519,92 @@ reads the header and says so, rather than mounting a pane that draws nothing. `t
 `jxl` and `svgz` are deliberately absent from the extension table: WebKitGTK either cannot decode
 them or decodes them only in some builds, and a format that works on one machine and not another
 is worse than one that works nowhere — a refusal from Rust is at least readable.
+
+## Three things the commit tool window got wrong about a changelist
+
+Reported together, and they turn out to be one story:
+
+> *"on commit changes that was moved from Uncommited to custom list goes into Uncommited again,
+> but should stay in custom list. When commiting - i should be able to commit only selected
+> (checkbox) change lists. Also i see some 'Partial' state - i don't need it."*
+
+### A commit of one changelist unstaged every other one
+
+ADR 0004 makes the index a derived artifact, and `cide_git::commit::rebuild_index` is where that
+decision acts: reset to HEAD, write the selections, commit. That is what makes *"commit one
+changelist and the other is untouched"* true of the **tree**. It was not true of the **index**,
+and there is one class of file for which the index is the whole of what makes it a change at
+all — a new file that has been `git add`ed is tracked because it has an index entry and for no
+other reason.
+
+The chain, every link of it invisible: commit `Changes`; `rebuild_index` resets the index and the
+added file's entry goes with it; the next status walk reports the path `Untracked`;
+`status::repo_changes` builds its `live` set from paths that are neither untracked nor ignored;
+`Sidecar::reconcile` drops every assignment outside that set. A file the user had deliberately
+filed into a list of its own reappeared under `Unversioned Files` after a commit that never named
+it, with nothing on screen saying why. It was even written down as correct — a *"What it costs,
+per ADR 0004"* paragraph in `useGitPanel::trackPaths` explained it as the model working as
+intended. It was a bug, and the paragraph now says so.
+
+`commit` saves the entries the rebuild is about to erase and puts back every one the commit did
+not consume. `staged_entries` is the `HEAD → index` diff, so it is a handful of paths rather than
+the whole index — this runs on every commit, and a repository can have a hundred thousand tracked
+files. Entries are replayed **from memory**, never re-added from the working tree: `add_path`
+would stage whatever the file says now, which for a file staged and then edited again is not the
+content the user staged. A staged *deletion* is saved as an absence and restored as one.
+
+The refusal path was the same bug with a worse ending. `write_commit` can fail after
+`rebuild_index` has already run, and the index was then left as the rebuild made it — a silent
+`git reset` of everything staged in every other list, delivered as the answer to *"nothing to
+commit"*. `rewind_index` puts HEAD's tree back and replays the saved entries over it, which *is*
+the pre-commit index by construction, and it is guarded on the mode: in staging-area mode nothing
+was rebuilt, and rewinding there would throw away an index the user built by hand.
+`committing_one_changelist_leaves_the_others_staged_files_staged` and
+`a_commit_refused_after_the_rebuild_puts_the_index_back` are the two tests, the second of which
+reaches the post-rebuild refusal by unsetting `user.email` — any failure from there on would do,
+and that is the one a test can arrange without reaching inside the function.
+
+### The tick did not follow the file into its new changelist
+
+A file row's id is its repository and its path — `model.ts::fileRowId` — and filing a change into
+another list changes neither. So the tick stayed exactly where it was: filing a file **out** of
+the changelist that was about to be committed left it ticked, and the commit took it anyway. That
+is the panel answering *"commit only the lists I ticked"* with *"and also the file you just filed
+away"*, and it is not visible — the tick is 12px, several rows down, inside a changelist whose
+whole point was to be left alone.
+
+`ticksAfterMove` is the rule and it lives in `model.ts`, where `check:git` can run it. A moved
+file adopts the answer its destination is already giving: joins the commit if that list has
+anything ticked, leaves it otherwise. Reading the **destination** rather than the active flag is
+what keeps both intentions alive — a user who has ticked a non-active list is building a commit
+out of it, and unticking each file as it arrived would make that gesture undo itself. A list that
+does not exist yet (*New changelist…* mints one and moves in a single gesture) holds nothing and
+so takes the second answer, which is what moving files somewhere new is nearly always for.
+
+All four routes into filing go through it: the drop, the chooser, *New changelist…*, and the
+`Unversioned Files` drop that stages first. The chooser used to run its own copy of the same
+command, which is exactly how a fifth route would quietly keep the old behaviour, so it now calls
+`movePaths` like everything else.
+
+### `partial` meant two things, and one of them was not true
+
+The tri-state box had a second meaning: a ticked file whose index held only part of it — `staged`
+and a dirty worktree both — was drawn `–` as well, with a bordered `partial` chip beside its name,
+and the partiality climbed to its directory row and its changelist. A list ticked whole therefore
+read `–`, and **no gesture in the panel could make it read `✓`**: the box was reporting a property
+of `.git/index`, while the only thing a click on it can change is the ticks.
+
+It was also a claim about the commit that the commit does not honour. In changelist mode
+`cide_git::commit` resets the index to HEAD and writes the selections in, so what the index
+happened to hold for a file has no bearing whatever on what lands — a ticked file is committed
+whole however it was staged. The thing that genuinely does narrow a commit is a hunk selection
+held by the diff pane, and that already has its own line above the tree, which can say how many
+files it is about and offer to clear them; neither is something a `–` in a 12px box can do.
+
+So `checkState` is now a function of the ticks alone, and `isPartiallyStaged` is gone. The
+fixture's half-staged file is deliberately kept: `check:git` and `check:render` now pin the
+opposite behaviour from the same data.
+
 ## The git tool window: log, graph, file history and blame (M19)
 
 A bottom panel — IDEA's *Git* tool window — opened from a new button pinned to the foot of the

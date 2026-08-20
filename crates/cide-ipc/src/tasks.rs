@@ -103,6 +103,20 @@ pub enum TaskAuthor {
     Agent { agent: AgentId, label: String },
 }
 
+impl TaskAuthor {
+    /// [`Self::User`], as a function, because that is the shape `#[serde(default = "…")]` takes.
+    ///
+    /// Named rather than reached through a `Default` impl on purpose. A `Default for TaskAuthor`
+    /// would make "the user" the silent answer *everywhere* the type appears — including a comment
+    /// whose author failed to deserialise, which would sign an agent's line with the user's name.
+    /// The only place an absent author legitimately means the user is [`Task::created_by`] on a
+    /// file written before that field existed, and that call site says so out loud.
+    #[must_use]
+    pub const fn user() -> Self {
+        Self::User
+    }
+}
+
 /// One line of a task's log.
 ///
 /// # Append-only for **agents**. The user may edit and delete. (M21)
@@ -235,6 +249,32 @@ pub struct Task {
     pub agent: Option<AgentId>,
     /// Oldest first, which is the order the panel renders and the order an agent reads.
     pub comments: Vec<TaskComment>,
+    /// Who asked for this task: the person at the keyboard, the orchestrator, or a subagent.
+    /// (M21)
+    ///
+    /// # Why this is a field now, having deliberately not been one
+    ///
+    /// `TaskStore::create` used to answer *who asked for this* by **seeding the log**: a task an
+    /// agent created opened with one comment saying so, and a task the user created opened with
+    /// nothing. The reasoning was that a `creator` field is one more thing an agent must be taught
+    /// to fill and one more column the panel must draw.
+    ///
+    /// Both halves of that turned out to be wrong here. Nothing has to be *taught* — every
+    /// `create` call already carries a [`TaskAuthor`], because that is where a comment's author
+    /// comes from, so the field is filled by the seam rather than by a model. And the absence of a
+    /// line was doing the work of "the user made this", which is a fact inferred from a *missing*
+    /// record: a user who deletes that seeded comment — which M21 lets them do — would silently
+    /// turn an agent's task into their own.
+    ///
+    /// So it is stored, once, at creation, and never edited afterwards: [`TaskEdit`] has no
+    /// variant for it and no MCP tool can express one. A creator that could be rewritten is
+    /// provenance that lies, which is the thing the log's append-only rule exists to prevent.
+    ///
+    /// **Absent means [`TaskAuthor::User`]**, which is what a file written before this field
+    /// existed decays to — and `cide_tasks::repair` recovers the real answer for those files from
+    /// the seeded comment before anything reads them.
+    #[serde(default = "TaskAuthor::user")]
+    pub created_by: TaskAuthor,
     pub created_unix_ms: u64,
     /// Bumped on every accepted mutation, and **load-bearing beyond display**: the
     /// out-of-process merge in `cide_tasks` resolves a task that changed on both sides by
@@ -473,6 +513,7 @@ mod tests {
                 edited_at_unix_ms: None,
                 deleted: false,
             }],
+            created_by: TaskAuthor::Orchestrator,
             created_unix_ms: 1_699_999_999_000,
             updated_unix_ms: 1_700_000_000_000,
         }
@@ -483,10 +524,35 @@ mod tests {
         let json = serde_json::to_string(&a_task()).expect("serialize");
         // Equality alone would pass with snake_case on both sides, and every multi-word field
         // would read `undefined` in the webview.
-        for wire in ["createdUnixMs", "updatedUnixMs", "atUnixMs"] {
+        for wire in ["createdBy", "createdUnixMs", "updatedUnixMs", "atUnixMs"] {
             assert!(json.contains(wire), "missing {wire} in {json}");
         }
         assert_eq!(serde_json::from_str::<Task>(&json).unwrap(), a_task());
+    }
+
+    /// A task from a file written before `Task::created_by` existed still parses, and reads as
+    /// the user. (M21)
+    ///
+    /// The decay is deliberate and it is only half the answer: `cide_tasks::repair` recovers the
+    /// real creator of an agent-made task from the comment `create` used to seed. What this test
+    /// pins is that the *parse* cannot fail — `.cide/tasks.json` is the user's committed data, and
+    /// a build that refused to open last week's file over a field it added would be the tracker
+    /// locking the team out of its own repository.
+    #[test]
+    fn a_task_written_before_the_creator_field_still_parses() {
+        let json = r#"{
+            "id": "t-3",
+            "title": "Write the loader",
+            "body": "",
+            "status": "todo",
+            "agent": null,
+            "comments": [],
+            "createdUnixMs": 1699999999000,
+            "updatedUnixMs": 1700000000000
+        }"#;
+        let task: Task =
+            serde_json::from_str(json).expect("a file this build has to be able to open");
+        assert_eq!(task.created_by, TaskAuthor::User);
     }
 
     #[test]

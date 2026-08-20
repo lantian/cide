@@ -97,6 +97,10 @@ function task(over: Partial<TaskView> & Pick<TaskView, 'id' | 'title'>): TaskVie
     status: 'todo',
     agent: null,
     comments: [],
+    // The user, by default, because that is what the panel's own New task button produces. The
+    // stories that need the other answer say so; see `BARE`, which is the card's half of the pair
+    // that pins the creator to the author enum rather than to a name.
+    createdBy: { kind: 'user' },
     createdMs: NOW_MS - 86_400_000,
     updatedMs: NOW_MS - 600_000,
     ...over,
@@ -117,6 +121,9 @@ const T15 = task({
   title: 'Sweep the phase table',
   status: 'review',
   agent: 'developer',
+  // A subagent decomposed this one into existence. The third arm of the author union, so all
+  // three are somewhere in the fixtures rather than only the two the card stories draw.
+  createdBy: { kind: 'agent', agent: 'developer', label: 'Developer' },
 })
 
 const T16 = task({ id: 't-16', title: 'Write check-agents' })
@@ -251,7 +258,22 @@ function card(over: Partial<TaskDetailProps> & Pick<TaskDetailProps, 'task'>): T
  * card that collapsed those rows would be indistinguishable on screen from one that failed to
  * render them.
  */
-const BARE = task({ id: 't-19', title: '', body: '', status: 'todo', agent: null })
+const BARE = task({
+  id: 't-19',
+  title: '',
+  body: '',
+  status: 'todo',
+  agent: null,
+  /*
+   * Created by the orchestrator, which is the second half of the creator assertion. (M21)
+   *
+   * `card` is the user's — *Created by You* — and this one is not, over a task that is
+   * *unassigned*: the pair is what proves the head names the **creator** and not the assignee,
+   * which is the one way that line can be quietly wrong. A card whose creator followed `agent`
+   * would print nothing here and pass every other assertion in the story.
+   */
+  createdBy: { kind: 'orchestrator' },
+})
 
 /** A title mid-edit: the draft differs from the task's, which is what makes it *dirty*. */
 const TITLE_DRAFT: FieldEdit = { field: 'title', draft: 'Add the retry bar, with a reason' }

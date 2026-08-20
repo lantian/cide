@@ -64,6 +64,7 @@ import {
   agentChip,
   assignableRoles,
   assigneeFromDraft,
+  authorLabel,
   beginEdit,
   cancelEdit,
   closeCard,
@@ -76,7 +77,6 @@ import {
   statusLabel,
   statusTone,
   type Chip,
-  type CommentAuthor,
   type EditIntent,
   type EditableField,
   type FieldEdit,
@@ -287,14 +287,6 @@ function asRun(chip: Chip): RunView {
   }
 }
 
-/** Who wrote a comment, as a word. Read off the author enum, never off a name string. */
-function authorLabel(author: CommentAuthor): string {
-  if (author.kind === 'user') return 'You'
-  if (author.kind === 'orchestrator') return 'Orchestrator'
-  if (author.label.trim() !== '') return author.label
-  return author.agent.trim() !== '' ? author.agent : 'Agent'
-}
-
 export interface TaskDetailProps {
   task: TaskView
   /** Every run cide knows about, so the live-run strip can find this task's. */
@@ -466,6 +458,33 @@ export function TaskDetail(props: TaskDetailProps) {
         </span>
         <span className={styles.detailId} data-audit="tasksDetailId">
           {task.id}
+        </span>
+        {/*
+          * Who asked for this task, in the head with the id rather than as a field. (M21)
+          *
+          * It belongs beside the id because it is the same kind of thing: an unchangeable fact
+          * about which task this is, not a value the card is offering to edit. A `FieldRow` would
+          * have put it in the column of four rows that all carry a pencil, and the one without
+          * one reads as a field whose affordance failed to render — the failure `restText` and
+          * the status segment are both written against, one row down.
+          *
+          * The **creator**, never the assignee: `Task::agent` is the role the work is *for* and
+          * it already has its own row and its own chip. Two names on one card that mean different
+          * things need the words that tell them apart, which is why this says "Created by" in
+          * full rather than leaning on position.
+          *
+          * **No timestamp.** `elapsed` is a run's clock — `12s`, `4m`, `1h 04m` — and a tracker
+          * holds tasks that are weeks old, so it would print `847h 00m ago` on the row a user is
+          * most likely to be reading. A creation *date* wants a second time vocabulary (days,
+          * then weeks) that nothing else in this panel has, and the question asked was who, not
+          * when; `Task::createdMs` is on the view when that day comes.
+          */}
+        <span
+          className={styles.detailCreator}
+          data-audit="tasksCreator"
+          data-creator={task.createdBy.kind}
+        >
+          Created by {authorLabel(task.createdBy)}
         </span>
         {/*
           * The explicit way out, and the one that is always available.

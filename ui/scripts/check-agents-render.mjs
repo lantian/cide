@@ -834,6 +834,22 @@ try {
     )
     ok(rest.close, 'the card carries an explicit close control — a modal with none is a trap, ' +
       'and neither the scrim nor Escape is discoverable')
+    /*
+     * Who asked for this task. (M21)
+     *
+     * `card` is the user's and `card-bare` is the orchestrator's, and the pair is the assertion:
+     * a card that string-matched a name, or that quietly drew the *assignee*, would pass one of
+     * these and fail the other. The story below is unassigned on purpose, so a creator line
+     * reading `Task::agent` prints nothing there.
+     *
+     * Reported as *missing* — a tracker whose rows are written by six subagents and a person, in
+     * which nothing on screen says which of them wanted the row you are reading.
+     */
+    eq(
+      rest.creator,
+      'user|Created by You',
+      'the card names its creator, and the user’s own tasks say You',
+    )
     eq(
       rest.comments,
       [
@@ -960,6 +976,12 @@ try {
     ok(
       bare.fieldValues?.every((v) => (v.split('|')[1] ?? '') !== ''),
       '...and not one of the three is the empty string',
+    )
+    eq(
+      bare.creator,
+      'orchestrator|Created by Orchestrator',
+      'and a task nobody is assigned to still names who asked for it — the creator is not the ' +
+        'assignee, and this is the half of that pair where the two differ',
     )
 
     const live = t('card-with-live-run')

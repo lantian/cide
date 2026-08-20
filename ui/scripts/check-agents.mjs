@@ -189,6 +189,7 @@ try {
     newerBoard,
     canWrite,
     commentOrder,
+    authorLabel,
     TASK_FIELDS,
     EDITABLE_FIELDS,
     UNASSIGNED,
@@ -503,6 +504,7 @@ try {
     status: 'doing',
     agent: 'developer',
     comments: [],
+    createdBy: { kind: 'user' },
     createdMs: 1_699_999_000_000,
     updatedMs: 1_700_000_000_000,
     ...over,
@@ -1021,6 +1023,48 @@ try {
       'a log a merge interleaved is put back in time order',
     )
     eq(commentOrder(task({ comments: [] })).length, 0, 'an empty log is an empty log')
+  }
+
+  /* == who wrote it, and who asked for it =================================================== */
+
+  {
+    eq(
+      authorLabel({ kind: 'user' }),
+      'You',
+      'the user’s own lines and the user’s own tasks say You — the second person, because the ' +
+        'panel is talking to the person who wrote them',
+    )
+    eq(authorLabel({ kind: 'orchestrator' }), 'Orchestrator', 'the project’s main session')
+    eq(
+      authorLabel({ kind: 'agent', agent: 'developer', label: 'Developer' }),
+      'Developer',
+      'a subagent is named by its label, which is the name the user chose in `.cide/`',
+    )
+    eq(
+      authorLabel({ kind: 'agent', agent: 'developer', label: '   ' }),
+      'developer',
+      'a role whose label is blank falls back to its id rather than to a blank line — an ' +
+        'unattributed line in a log is one no reader can weigh',
+    )
+    eq(
+      authorLabel({ kind: 'agent', agent: '', label: '' }),
+      'Agent',
+      'and a role that has lost both still gets a word. The ladder is `agentChip`’s, for its ' +
+        'reason: a role renamed or deleted out of `.cide/` must not blank a record of what it did',
+    )
+    eq(
+      authorLabel({ kind: 'agent', agent: 'you', label: 'You' }),
+      'You',
+      'a role *called* You still renders its own label — the point of asserting this is the ' +
+        'other direction: `authorLabel` never string-matches a name to decide whose line it is, ' +
+        'so this cannot make an agent’s task read as the user’s anywhere it matters. The kind ' +
+        'is what the card branches on, and `data-creator` is what the render check reads',
+    )
+    eq(
+      task({}).createdBy.kind,
+      'user',
+      'and a task carries a creator at all — the field the panel reads to say any of the above',
+    )
   }
 
   /* == the status filter ==================================================================== */

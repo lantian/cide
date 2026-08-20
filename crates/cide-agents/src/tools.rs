@@ -1553,6 +1553,20 @@ fn render_summary(task: &Task) -> String {
 /// is oldest first, and its doc says so.
 fn render_full(task: &Task) -> String {
     let mut out = render_summary(task);
+    /*
+     * Who asked for this, on its own line. (M21)
+     *
+     * It used to arrive as the first *comment* — `TaskStore::create` seeded one — so an agent
+     * reading a task has always been able to see who wanted it, and this keeps that true now that
+     * the fact is a field instead. It is worth a line here and not in `render_summary`: a
+     * subagent picking a task up decides differently depending on whether the user asked for it or
+     * another agent decomposed it into existence, and that decision is made from the full task
+     * rather than from a list.
+     */
+    out.push_str(&format!(
+        "  asked for by {}\n",
+        author_label(&task.created_by)
+    ));
     if !task.body.trim().is_empty() {
         out.push_str("  body:\n");
         out.push_str(&indented(&task.body));
@@ -1571,7 +1585,7 @@ fn render_full(task: &Task) -> String {
     out
 }
 
-/// Who wrote a comment, in one phrase.
+/// Who wrote a comment — or who asked for a task — in one phrase.
 ///
 /// `Agent` renders both the id and the label because they answer different questions — the id is
 /// what `cide_task_assign` takes, the label is what the user sees in the panel — and a comment
@@ -1675,6 +1689,10 @@ mod tests {
                 status: TaskStatus::Todo,
                 agent: agent.cloned(),
                 comments: Vec::new(),
+                // The real store stamps this from the identity the RPC connection carried; every
+                // call that reaches a `TaskSink` is one of those, so the fake answers as the side
+                // of the wire it stands in for.
+                created_by: TaskAuthor::Orchestrator,
                 created_unix_ms: 1,
                 updated_unix_ms: 1,
             };
@@ -1730,6 +1748,7 @@ mod tests {
             status,
             agent: agent.map(|a| AgentId(a.to_string())),
             comments: Vec::new(),
+            created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 1,
         }

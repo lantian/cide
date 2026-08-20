@@ -114,6 +114,10 @@ function task(from: WireTask): TaskView {
      * where a comment used to be.
      */
     comments: from.comments.filter((c) => !c.deleted).map(comment),
+    // Who asked for it. Through the same `author` switch as a comment's, because it is the same
+    // union — and a `createdBy` passed through raw would go on compiling after a variant was
+    // added in Rust that this panel has never heard of.
+    createdBy: author(from.createdBy),
     createdMs: ms(from.createdUnixMs),
     updatedMs: ms(from.updatedUnixMs),
   }

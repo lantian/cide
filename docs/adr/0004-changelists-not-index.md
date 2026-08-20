@@ -61,6 +61,12 @@ Three mitigations ship with it, and none is optional:
 
 - The UI in the mock is implementable as drawn, including committing one changelist while
   another is untouched.
+- The rewrite is **scoped**: the commit restores every index entry it did not consume, so a
+  file staged into another changelist is still staged afterwards. Without that, "another is
+  untouched" held for the tree and not for the index — and for a `git add`ed new file the
+  index entry is the only thing making it a change at all, so committing one list dropped
+  another list's file back to untracked and `Sidecar::reconcile` then deleted its changelist
+  assignment. `cide_git::commit::staged_entries` is where that is written down.
 - Staging state now exists in two places, and cide is responsible for reconciling them. The
   guard bar is the user-visible admission of that; a design that never showed it would be
   claiming a consistency it does not have.

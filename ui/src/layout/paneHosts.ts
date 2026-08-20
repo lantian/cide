@@ -30,6 +30,12 @@ import { createTerminal, promoteWebgl, releaseWebgl, type TerminalHandle } from 
 import { attachInputProbe, attachInputRouting } from '@/terminal/inputHost'
 import { attachPathLinks } from '@/terminal/pathLinks'
 import type { TerminalPaneKind } from '@/terminal/keys'
+import {
+  STALL_MS,
+  isRenderStalled,
+  shouldRepairRender,
+  type RenderStallInput,
+} from '@/terminal/renderStall'
 import { diag } from '@/ipc/client'
 
 export interface PaneHost {
@@ -121,6 +127,22 @@ export interface PaneHost {
    * size happens to change.
    */
   lastGeometry?: { cols: number; rows: number; cellWidth: number; cellHeight: number } | undefined
+  /**
+   * `performance.now()` when bytes were last *parsed* into this terminal, and when it last
+   * painted a frame.
+   *
+   * The pair is the whole of the render watchdog's evidence — see `terminal/renderStall.ts`
+   * for the failure it exists to notice. Parsed rather than delivered, for the same reason
+   * the credit ack is taken from `term.write`'s completion callback: arrival says only that
+   * the bytes reached the webview, and the claim being made here is that xterm has them in
+   * its buffer and still has not drawn.
+   */
+  lastParsedAt?: number | undefined
+  lastRenderedAt?: number | undefined
+  /** When this host was last unstuck, so a repair that did not work cannot become a loop. */
+  lastRepairAt?: number | undefined
+  /** The armed stall check, so at most one is outstanding per host. */
+  stallTimer?: ReturnType<typeof setTimeout> | undefined
 }
 
 /**
@@ -288,6 +310,18 @@ export function openTerminal(paneId: string, kind: TerminalPaneKind): TerminalHa
   host.cleanup.push(attachInputRouting(handle, host.el))
 
   /*
+   * The other half of the render watchdog's evidence.
+   *
+   * `onRender` fires from `RenderService._renderRows`, which is the one function a paused
+   * renderer never reaches — so "no `onRender` since the last bytes" is exactly the state
+   * `terminal/renderStall.ts` describes, observed rather than inferred.
+   */
+  const rendered = handle.term.onRender(() => {
+    host.lastRenderedAt = now()
+  })
+  host.cleanup.push(() => rendered.dispose())
+
+  /*
    * File links, third and last on this element. Its `mousedown` listener is also in capture and
    * also relies on being an ancestor of everything xterm owns, but it touches no keyboard event
    * and the two above touch no mouse event, so the order between them is free.
@@ -354,6 +388,163 @@ export function mountHost(paneId: string, slot: HTMLElement): void {
   // keep theirs. After the append, not before: the addon builds its context against a
   // rendered element, and a line ago this one was detached in parking.
   if (redocked && host.terminal) promoteWebgl(host.terminal)
+}
+
+/* ----------------------------------------------------------------------------------------
+ * The render watchdog.
+ *
+ * `terminal/renderStall.ts` carries the failure this exists for and the reasoning behind the
+ * rule; this half is the wiring, which is the part that needs a DOM. In one sentence: xterm
+ * pauses its own renderer when `.xterm-screen` reports non-intersecting and un-pauses it only
+ * when that same observer reports intersecting again, so a pause caused by something that was
+ * never a DOM change — a minimised window, another virtual desktop, an occluded surface — can
+ * outlive the condition and freeze the picture over a buffer that is still correct.
+ *
+ * `mountHost` already repairs the one path with a DOM change on both sides (park, mount). This
+ * is the generalisation: notice that a frame is owed and has not come, and put the element
+ * through a real layout change, which is precisely what maximising the pane does and the only
+ * gesture that has ever been reported to fix it.
+ * -------------------------------------------------------------------------------------- */
+
+/**
+ * Report that bytes have been parsed into this pane's terminal.
+ *
+ * Called from `TerminalPane`'s `term.write` completion callback, beside the credit ack, and
+ * from nowhere else: that callback is the moment xterm has the bytes in its buffer, which is
+ * the only moment at which "and it has not drawn them" is a claim about the renderer rather
+ * than about the transport.
+ */
+export function noteParsed(paneId: string): void {
+  const host = hosts.get(paneId)
+  if (!host) return
+  host.lastParsedAt = now()
+  armStallCheck(host)
+}
+
+/**
+ * Arm one stall check for this host.
+ *
+ * A timer per burst of output rather than a polling interval: output is bursty, and a session
+ * spent reading a file should not carry a heartbeat that walks every host twice a second for
+ * the life of the window. At most one is outstanding — a second frame of the same burst finds
+ * the timer already armed and rides on it.
+ */
+function armStallCheck(host: PaneHost): void {
+  if (host.stallTimer !== undefined) return
+  host.stallTimer = setTimeout(() => {
+    host.stallTimer = undefined
+    checkStall(host)
+  }, STALL_MS)
+}
+
+/**
+ * Whether this host's element has a real box in a document the compositor is drawing.
+ *
+ * `getBoundingClientRect` forces a synchronous layout, which is why it is asked here and not
+ * in the rule: this runs at most once per `STALL_MS` per pane, and only for a pane that has
+ * already gone that long owing a frame. The healthy path never reaches it.
+ */
+function onScreen(host: PaneHost): boolean {
+  if (document.visibilityState === 'hidden') return false
+  if (!host.el.isConnected) return false
+  const box = host.el.getBoundingClientRect()
+  return box.width > 0 && box.height > 0
+}
+
+function stallInput(host: PaneHost, atBottom: boolean): RenderStallInput {
+  return {
+    now: now(),
+    lastParsedAt: host.lastParsedAt ?? null,
+    lastRenderedAt: host.lastRenderedAt ?? null,
+    lastRepairAt: host.lastRepairAt ?? null,
+    mounted: host.mounted,
+    onScreen: onScreen(host),
+    atBottom,
+  }
+}
+
+function checkStall(host: PaneHost): void {
+  const term = host.terminal?.term
+  if (!term || !host.opened) return
+  const buffer = term.buffer.active
+  const input = stallInput(host, buffer.viewportY === buffer.baseY)
+  if (!isRenderStalled(input)) return
+  if (!shouldRepairRender(input)) return
+  host.lastRepairAt = input.now
+  repaintHost(host)
+  // Said out loud, because the repair is otherwise invisible and the bug it repairs was
+  // reported as "it just stops outputting". A line here means a pane genuinely sat on a stale
+  // frame; silence over a long session is the evidence that the renderer is keeping up on its
+  // own, which is what this is supposed to become.
+  void diag
+    .log(
+      `pane ${host.paneId}: terminal parsed bytes but painted no frame for ${STALL_MS}ms while on screen; forcing the renderer back`,
+    )
+    .catch(() => {})
+}
+
+/**
+ * Put a host through a layout change and ask for a full repaint.
+ *
+ * Both halves, and neither is sufficient alone. `term.refresh` while xterm is still paused
+ * does not paint — it records `_needsFullRefresh`, which the intersection callback spends when
+ * it next fires — so it *arms* the repaint. The inset nudge is what makes that callback fire:
+ * the host is `position: absolute; inset: 0` with `overflow: hidden`, so its box is the clip
+ * rect every descendant's intersection is computed against, and moving one edge of it by a
+ * pixel is a genuine layout change that forces WebKit to recompute. One pixel at the bottom
+ * edge for one frame is not visible; a `display: none` frame would be a stronger signal and is
+ * deliberately not used, because it blurs a focused textarea and rule 1 of this module's
+ * header exists to keep panes out of that state.
+ *
+ * Restored to `0px` rather than to `''`. `inset: 0` is a shorthand that sets four longhands,
+ * so clearing `bottom` would leave it `auto` — and an absolutely positioned box with `top: 0`
+ * and `bottom: auto` collapses to its content height, which for a host whose only child is an
+ * absolutely sized terminal is zero. That would turn a repair into the very failure it is
+ * repairing.
+ */
+function repaintHost(host: PaneHost): void {
+  const term = host.terminal?.term
+  if (term) term.refresh(0, term.rows - 1)
+
+  const el = host.el
+  el.style.bottom = '1px'
+  // Two frames, not one. A `requestAnimationFrame` callback runs *before* the rendering
+  // update it belongs to, so restoring in the first one would undo the change before any
+  // intersection was ever computed against it: the observer would see the box it already
+  // believed in and stay silent. The nudge has to survive one whole update to be noticed.
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      el.style.bottom = '0px'
+      const back = hosts.get(host.paneId)?.terminal?.term
+      if (back) back.refresh(0, back.rows - 1)
+    })
+  })
+}
+
+/**
+ * Repaint every mounted terminal when this document becomes visible again.
+ *
+ * The watchdog above can only fire while bytes are still arriving, and the commonest way to
+ * meet this bug is to start something long, go elsewhere, and come back to a run that finished
+ * while the window was hidden. There are no more bytes to notice by then — the pane is simply
+ * showing the frame it was on when the compositor stopped drawing it — so returning to the
+ * window has to be a repair in its own right.
+ *
+ * Registered once per module, not per pane: the event is on the document, and one listener
+ * that walks the mounted hosts is cheaper than one listener per host that all fire together.
+ * Cheap enough to run unconditionally — a repaint of the panes actually on screen is bounded
+ * by `HOST_CAP` and by how many of those are mounted, and it costs one frame of one clipped
+ * pixel each.
+ */
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return
+    for (const host of hosts.values()) {
+      if (!host.mounted || !host.opened) continue
+      host.lastRepairAt = now()
+      repaintHost(host)
+    }
+  })
 }
 
 /**
@@ -472,6 +663,12 @@ function teardown(host: PaneHost): void {
     // the pane, or waited for React to unmount its slot.
     faults.destroyedWhileMounted += 1
     console.error(`[cide] pane ${host.paneId}: host destroyed while mounted`)
+  }
+  // Before the disposers, because one of them takes `onRender` down and a check that fires
+  // afterwards would ask a disposed terminal for its buffer.
+  if (host.stallTimer !== undefined) {
+    clearTimeout(host.stallTimer)
+    host.stallTimer = undefined
   }
   for (const fn of host.cleanup) fn()
   host.cleanup.length = 0

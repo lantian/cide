@@ -829,9 +829,26 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     await paneApi.maximize(project, tab, pane)
     await get().hydrate()
   },
+  /**
+   * The one mutator here that does **not** re-hydrate afterwards, and the reason is the drag.
+   *
+   * Every command that reaches `WorkspaceState::update` already broadcasts
+   * `cide://workspace-changed` to every window *including this one* (`crates/cide-app/src/emit.rs`),
+   * and `applySnapshot` below is what receives it. The `hydrate()` its neighbours add on top is a
+   * second round trip and a second `set({ boot })` — and with no `React.memo` anywhere in this
+   * frontend, each of those is a re-render of the entire tree under `App`.
+   *
+   * Harmless at the end of a click. Not harmless here: this is what `pointerup` calls at the end
+   * of a divider drag, so it was landing two whole-app re-renders — each of which resizes every
+   * pane in every tab — in the frame the user let go of the mouse. That is the visible hitch at
+   * the end of a resize.
+   *
+   * Left in place everywhere else deliberately: the pattern is load-bearing for commands whose
+   * answer is not only the workspace, and rewriting eighteen call sites is not this change's to
+   * make.
+   */
   setRatio: async (project, tab, split, ratio) => {
     await paneApi.setRatio(project, tab, split, ratio)
-    await get().hydrate()
   },
   navigatePane: async (project, tab, pane, direction) => {
     // Two calls because the domain separates "where would focus go" from "move it": the

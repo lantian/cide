@@ -7,13 +7,21 @@
 //! 1. checks the [external-staging guard](crate::changelist),
 //! 2. resolves every selection against the **HEAD → working tree** diff, before touching
 //!    anything,
-//! 3. resets the index to HEAD,
+//! 3. saves whatever the index holds that HEAD does not, then resets the index to HEAD,
 //! 4. writes exactly the selected changes into it,
-//! 5. commits, and re-records the fingerprint.
+//! 5. commits, puts back the saved entries the commit did not consume, and re-records the
+//!    fingerprint.
 //!
 //! Step 3 is what makes "commit one changelist and the other is untouched" true no matter
 //! what the index happened to contain — and it is also why the guard in step 1 exists, since
 //! that reset is precisely the clobber a user's `git add` in a bash pane would suffer.
+//!
+//! The restore in step 5 is what makes that sentence true of the *index* and not only of the
+//! tree. It is not a nicety: for a file that has been `git add`ed but never committed, the
+//! index entry is the whole of what makes it a change, so the reset dropped it back to
+//! untracked — out of `status::repo_changes`'s `live` set, and therefore out of its
+//! changelist, deleted by [`changelist::Sidecar::reconcile`] on the next status walk. See
+//! [`staged_entries`].
 //!
 //! Because the reset lands before the writes, a selection's patch is applied to a pre-image
 //! that is HEAD, which is the side the HEAD→worktree diff was computed against. That
@@ -78,6 +86,18 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
      */
     require_amend_head(&repo, request.amend, request.amend_of.as_deref())?;
 
+    /*
+     * The index entries the rebuild below is about to erase, saved so they can be put back.
+     *
+     * Empty in staging-area mode, where the index is the user's own and nothing resets it.
+     * See `staged_entries` for what this is for; the short version is that "commit one
+     * changelist and the other is untouched" has to be true of the *index* as well as of the
+     * tree, or a file that only exists in the index — a `git add`ed new file — falls back to
+     * untracked when some other changelist is committed and takes its changelist assignment
+     * with it.
+     */
+    let mut saved: Vec<(String, Option<git2::IndexEntry>)> = Vec::new();
+
     let committed: Vec<String> = if sidecar.use_staging_area {
         // Nothing to build: whatever the user staged is what gets committed.
         staged_paths(&repo)?
@@ -109,13 +129,27 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
         if selections.is_empty() && merge_heads.is_empty() && !request.amend {
             return Err(GitError::NothingToCommit);
         }
+        saved = staged_entries(&repo, head_tree.as_ref())?;
         rebuild_index(&repo, head_tree.as_ref(), &selections)?;
         selections.iter().map(|s| s.path.clone()).collect()
     };
+    let consumed: BTreeSet<String> = committed.iter().cloned().collect();
 
     let outcome = match write_commit(&repo, request, &merge_heads, committed.len() as u32) {
         Ok(outcome) => outcome,
         Err(error) => {
+            // Nothing was committed, so the index goes back to what this call found — a
+            // refused commit must not be the thing that stages, or unstages, anything.
+            // `committing_an_empty_changelist_leaves_the_index_alone` pins the case that is
+            // refused *before* the rebuild; this is the same promise for the cases — an
+            // unresolvable identity, a failed write — only discovered after it.
+            //
+            // Guarded on the mode because `saved` is empty in staging-area mode for the good
+            // reason that nothing was rebuilt: rewinding there would reset the index to HEAD
+            // and throw away the staging the user built by hand.
+            if !sidecar.use_staging_area {
+                let _ = rewind_index(&repo, head_tree.as_ref(), &saved);
+            }
             // The index is already whatever `rebuild_index` made it, so the fingerprint from
             // before this call describes an index that no longer exists. Leaving it would
             // raise the external-staging bar on cide's own write.
@@ -128,8 +162,16 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
         repo.cleanup_state().wrap()?;
     }
 
-    // The index now equals the tree that was just committed, so this is the fingerprint the
-    // next commit will compare against.
+    // Put back the staged state of everything this commit did not take. After the commit
+    // object exists, so the tree that was written is unaffected — this is only the index.
+    if let Err(error) = restore_index(&repo, &saved, &consumed) {
+        // The commit has landed. Returning an error now would tell the user it had not, and
+        // send them looking for a commit that is already on the branch.
+        tracing::warn!(%error, "could not restore the index entries this commit did not take");
+    }
+
+    // The index now equals the tree that was just committed, plus whatever was restored over
+    // it, so this is the fingerprint the next commit will compare against.
     changelist::record_index(root, &repo)?;
 
     // The committed paths no longer have changes, so their changelist assignments are dead.
@@ -218,6 +260,107 @@ fn default_selections(
         }
     }
     Ok(out)
+}
+
+/// Everything the index holds that HEAD's tree does not — the staged state a rebuild erases.
+///
+/// One entry per path, `None` where the index had *removed* a path HEAD still has (a staged
+/// deletion), so [`restore_index`] can put an absence back as faithfully as a presence.
+///
+/// # Why a commit has to save this
+///
+/// [`rebuild_index`] resets the index to HEAD before writing the selections, and that reset is
+/// what makes "commit one changelist and the other is untouched" true of the *tree*. It was
+/// not true of the index, and for one class of file the index is the only thing that makes it
+/// a change at all: a new file that has been `git add`ed is tracked solely because it has an
+/// index entry. Committing some other changelist reset that entry away, the file fell back to
+/// `Untracked`, `status::repo_changes` therefore left it out of its `live` set, and
+/// [`changelist::Sidecar::reconcile`] deleted its changelist assignment — so a file the user
+/// had deliberately filed into a list of its own reappeared under `Unversioned Files` after an
+/// unrelated commit, with nothing on screen saying why.
+///
+/// Only the paths that actually differ from HEAD are saved, not the whole index: on a
+/// repository with a hundred thousand tracked files the difference is a handful of entries
+/// against all of them, and this runs on every commit.
+fn staged_entries(
+    repo: &Repository,
+    head_tree: Option<&git2::Tree<'_>>,
+) -> Result<Vec<(String, Option<git2::IndexEntry>)>> {
+    let index = repo.index().wrap()?;
+    let diff = repo
+        .diff_tree_to_index(head_tree, Some(&index), None)
+        .wrap()?;
+    let mut out = Vec::new();
+    for delta in diff.deltas() {
+        let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) else {
+            continue;
+        };
+        let path = path.to_string_lossy().into_owned();
+        let entry = index.get_path(Path::new(&path), 0);
+        out.push((path, entry));
+    }
+    Ok(out)
+}
+
+/// Put the saved entries back, for every path this commit did not consume.
+///
+/// A consumed path is one the commit contains: its index entry now equals the tree that was
+/// just written, which is exactly right — the file is clean, or partially clean where only
+/// some of its lines were taken — and restoring the pre-commit entry over it would re-stage a
+/// change that has already landed.
+///
+/// Everything else goes back byte for byte. The entries are written from memory rather than
+/// re-added from the working tree: `add_path` would stage whatever the file says *now*, which
+/// for a file staged and then edited again is not the content the user had staged.
+fn restore_index(
+    repo: &Repository,
+    saved: &[(String, Option<git2::IndexEntry>)],
+    consumed: &BTreeSet<String>,
+) -> Result<()> {
+    // The overwhelmingly common case is an index that held nothing but what was just
+    // committed, and rewriting the index file for no change is a disk write per commit.
+    if saved.iter().all(|(path, _)| consumed.contains(path)) {
+        return Ok(());
+    }
+    let mut index = repo.index().wrap()?;
+    index.read(true).wrap()?;
+    for (path, entry) in saved {
+        if consumed.contains(path) {
+            continue;
+        }
+        match entry {
+            Some(entry) => index.add(entry).wrap()?,
+            // The index had removed this path. The reset to HEAD put it back, so restoring
+            // the staged deletion means taking it out again.
+            None => index.remove_path(Path::new(path)).wrap()?,
+        }
+    }
+    index.write().wrap()
+}
+
+/// Put the index back exactly as [`commit`] found it: HEAD's tree, plus `saved`.
+///
+/// That composition *is* the pre-commit index, because [`staged_entries`] records precisely
+/// the difference between the two. Used when the commit is refused after [`rebuild_index`]
+/// has already run, where restoring the saved entries alone would not be enough — the rebuild
+/// also *wrote* the selections, and those have to come back out.
+fn rewind_index(
+    repo: &Repository,
+    head_tree: Option<&git2::Tree<'_>>,
+    saved: &[(String, Option<git2::IndexEntry>)],
+) -> Result<()> {
+    let mut index = repo.index().wrap()?;
+    match head_tree {
+        Some(tree) => index.read_tree(tree).wrap()?,
+        None => index.clear().wrap()?,
+    }
+    for (path, entry) in saved {
+        match entry {
+            Some(entry) => index.add(entry).wrap()?,
+            None => index.remove_path(Path::new(path)).wrap()?,
+        }
+    }
+    index.write().wrap()
 }
 
 /// Reset the index to HEAD and write exactly `selections` into it.

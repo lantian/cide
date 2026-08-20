@@ -1271,6 +1271,7 @@ mod tests {
                     deleted: false,
                 })
                 .collect(),
+            created_by: TaskAuthor::User,
             created_unix_ms: 1,
             updated_unix_ms: 2,
         }

@@ -798,7 +798,28 @@ impl PtySession {
     }
 
     /// Resize the PTY (which raises SIGWINCH in the child) and the screen mirror.
+    ///
+    /// A resize to the size the child already has is dropped on the floor, and that guard is
+    /// worth more than its one line suggests. The body below is the expensive one in this file:
+    /// `vt100::Screen::set_size` reflows the whole scrollback, and `cide-app`'s `session_resize`
+    /// runs it **synchronously on the thread that receives IPC messages** — deliberately, because
+    /// the three locks here are atomic only while callers are serialised (see that command's doc
+    /// comment). So a redundant call is not merely wasted work; it is wasted work in front of the
+    /// user's next keystroke.
+    ///
+    /// The frontend already suppresses most of them, but its cache is cleared by four separate
+    /// writers — a pane parking, a pane being released to another window, an attach, a font
+    /// change — so it cannot cover every call, and every window has its own. This is the backstop
+    /// underneath all of them.
+    ///
+    /// It changes nothing for the callers that resize unconditionally. `session_attach` pushes a
+    /// size the child already has, which is exactly the case worth skipping; and the alt-screen
+    /// repaint nudge goes `cols - 1` and then `cols`, so both of its steps genuinely change the
+    /// value and both still land.
     pub fn resize(&self, geometry: Geometry) -> Result<(), PtyError> {
+        if *self.geometry.lock() == geometry {
+            return Ok(());
+        }
         self.master
             .lock()
             .resize(geometry.to_pty_size())
@@ -2303,6 +2324,39 @@ mod tests {
             .expect("resize");
         assert_eq!(session.geometry().cols, 120);
         assert_eq!(session.geometry().rows, 40);
+        session.kill();
+    }
+
+    /// A resize to the size the child already has does nothing, and says so.
+    ///
+    /// Weak by construction, and worth having anyway. What the guard actually buys is the
+    /// *absence* of a scrollback reflow on the IPC thread, and nothing observable from here can
+    /// assert an absence — so this pins the two things that are observable: it still answers
+    /// `Ok`, and it leaves the geometry alone. The argument for the guard is in `resize`'s own
+    /// comment; this is what stops someone deleting the early return as dead code.
+    #[test]
+    fn resizing_to_the_size_it_already_has_is_a_no_op() {
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir())
+            .arg("-c")
+            .arg("sleep 5")
+            .geometry(Geometry::new(80, 24, 8, 17));
+        let session = PtySession::spawn(spec).expect("spawn sh");
+        let before = session.geometry();
+
+        session
+            .resize(Geometry::new(80, 24, 8, 17))
+            .expect("a no-op resize still succeeds");
+        assert_eq!(session.geometry(), before);
+
+        // And the guard is on the *whole* geometry, not on the cell count: a font change moves
+        // the pixel size with the same cols and rows, and a child that queries the cell size for
+        // sixel or pixel mouse reporting has to be told.
+        session
+            .resize(Geometry::new(80, 24, 9, 19))
+            .expect("resize");
+        assert_eq!(session.geometry().cell_width, 9);
+        assert_eq!(session.geometry().cell_height, 19);
+
         session.kill();
     }
 }

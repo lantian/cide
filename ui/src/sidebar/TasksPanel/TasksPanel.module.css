@@ -578,6 +578,21 @@
   color: var(--faint);
 }
 
+/*
+ * Who asked for this task, at the quiet end of the head.
+ *
+ * The same weight as the id it shares the row with — both are unchangeable facts about *which*
+ * task this is, and neither should compete with the title below. Deliberately **not** styled the
+ * way `.logAuthorUser` styles the user's own comments: the accent there exists so a person can
+ * scan a conversation for their own lines, and there is nothing to scan in a single line.
+ */
+.detailCreator {
+  flex: none;
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+  white-space: nowrap;
+}
+
 .field {
   margin-top: 12px;
 }

@@ -86,12 +86,14 @@ Which check covers what you touched:
 | the file tree, fs ops | `check:tree-status`, `check:tree-flicker`, `check:fs-clipboard`, `check:new-entry` |
 | a synthetic tree row — a group, a note, a pin | `check:groups`, `check:notes`, `check:scratch`, `check:tree-drag` |
 | `layout/` — splits, dividers, pane grid | `check:rows` |
+| **a splitter's drag path, `layout/resizeGesture.ts`, or any `ResizeObserver`** | `check:resize` — a drag is smooth only because the expensive reactions to a size change (xterm's `fit()`, a `session_resize` that reflows the scrollback on the IPC thread, a minimap repaint) are deferred to the end of the gesture. Undo that and nothing throws, nothing changes on screen, and the app simply locks up while somebody drags a divider |
 | `editor/` | `check:editor` |
 | menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:tab-overflow`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
 | **any `font-size`, or a box drawn around text** | `check:ui-scale` — chrome type is a closed ladder of `--fs-ui-*` rungs over one `--ui-scale`, and a bare `font-size: <n>px` is a label that silently stops following the UI font size. Looks right at the default, which is where you are working |
 | a new sidebar panel, or anything `App.tsx` renders as one | `check:boundary` — an unwrapped panel takes the **whole window** down when it throws, and the rail's choice is restored on launch, so it stays down |
 | **any `useWorkspace`/`useStore` selector** | `check:selectors` — a selector that *returns* a fresh array or object re-renders for ever and ends at *Maximum update depth exceeded*, which unmounts the whole root. The render checks SSR the pure views, and one server pass runs no updates, so nothing else in the suite can see it |
 | terminal input, session state | `check:input`, `check:exit`, `check:awaiting`, `check:format` |
+| **a pane host's lifecycle, or anything that decides when a terminal paints** | `check:render-stall` — xterm pauses its own renderer when `.xterm-screen` reports non-intersecting and resumes only on the same observer, so a pause with no DOM change on the way out leaves a frozen picture over a live buffer. `layout/paneHosts.ts`'s watchdog is what notices; the guards in `terminal/renderStall.ts` are what keep it from firing on the four states where painting nothing is correct |
 | overlays, pickers, search | `check:picker`, `check:search`, `check:problems` |
 | terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
 | `windows/`, detach and re-dock | `check:detached`, `check:window-controls` |

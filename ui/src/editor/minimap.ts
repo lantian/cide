@@ -40,6 +40,11 @@ import { highlightTree } from '@lezer/highlight'
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from '@codemirror/view'
 import { PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } from './highlight'
 import {
+  cancelResizeSettle,
+  isResizeGesturing,
+  whenResizeSettles,
+} from '@/layout/resizeGesture'
+import {
   LINE_SCAN_LIMIT,
   MINIMAP_WIDTH,
   barRect,
@@ -166,6 +171,7 @@ class Minimap implements PluginValue {
 
   destroy(): void {
     if (this.frame !== 0) cancelAnimationFrame(this.frame)
+    cancelResizeSettle(this)
     this.themeWatch.disconnect()
     this.view.scrollDOM.removeEventListener('scroll', this.onScroll)
     this.canvas.removeEventListener('pointerdown', this.onPointerDown)
@@ -188,6 +194,20 @@ class Minimap implements PluginValue {
 
   private schedule(): void {
     if (this.frame !== 0) return
+    /*
+     * A resize gesture is the one case where a frame is not the right unit.
+     *
+     * `geometryChanged` fires on every frame of a splitter drag, and `draw` reads
+     * `scrollHeight`, `clientHeight` and `devicePixelRatio` and then repaints the whole canvas
+     * — per editor, and `layout/TabContent.module.css` keeps every tab's editors mounted and
+     * laid out at full size. None of those intermediate pictures is looked at: the map is a
+     * picture of a box whose height is still moving. So the work waits for the gesture to end,
+     * keyed on this instance so several updates during the drag still draw once.
+     */
+    if (isResizeGesturing()) {
+      whenResizeSettles(this, () => this.draw())
+      return
+    }
     this.frame = requestAnimationFrame(() => {
       this.frame = 0
       this.draw()

@@ -58,7 +58,6 @@ import {
   checkState,
   diffOpenMode,
   entryStatus,
-  isPartiallyStaged,
   splitPath,
   type CheckState,
   type Row,
@@ -102,8 +101,6 @@ export interface ChangesTreeProps {
   /** `selection`, resolved for the drag — see `rowSelection.ts::carriedIds`. */
   carried: ReadonlySet<string>
   expanded: ReadonlySet<string>
-  /** Ids whose file is only partly staged — what turns a `✓` into a `–`. */
-  partial: ReadonlySet<string>
   /** The row the user is pointing at, by id. Neither a tick nor the selection. */
   current: string | null
   /** Move the cursor and nothing else. What a focus calls. */
@@ -180,7 +177,6 @@ export function ChangesTree({
   selection,
   carried,
   expanded,
-  partial,
   current,
   onCurrent,
   onPress,
@@ -450,7 +446,7 @@ export function ChangesTree({
       onContextMenu={onContextMenu}
     >
       {rows.map((row, index) => {
-        const state = checkState(row, selected, (id) => partial.has(id))
+        const state = checkState(row, selected)
         const open = expanded.has(row.id)
         const isCurrent = index === found
         const isSelected = selection.ids.has(row.id)
@@ -801,13 +797,6 @@ function FileLabel({
       </span>
       {entry.origPath !== null && (
         <span className={styles.dir}>← {splitPath(entry.origPath).name}</span>
-      )}
-      {isPartiallyStaged(entry) && (
-        // Says out loud what the `–` box means for a leaf, which is otherwise the one
-        // tri-state in the tree with no second row to compare against.
-        <span className={styles.partialTag} title="Only part of this file is staged">
-          partial
-        </span>
       )}
     </>
   )

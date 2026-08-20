@@ -1149,6 +1149,7 @@ mod tests {
             status: cide_ipc::TaskStatus::Todo,
             agent: None,
             comments: Vec::new(),
+            created_by: cide_ipc::TaskAuthor::User,
             created_unix_ms: 0,
             updated_unix_ms: 0,
         };

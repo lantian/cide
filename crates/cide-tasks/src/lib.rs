@@ -153,6 +153,14 @@ pub fn validate(file: &TaskFile) -> Result<()> {
     Ok(())
 }
 
+/// The line [`TaskStore::create`] used to open an agent-made task's log with, before
+/// [`Task::created_by`] existed. (M21)
+///
+/// A literal rather than a pattern, because it was a literal: every file that carries it was
+/// written by a build that wrote exactly this string, and matching loosely here could only ever
+/// adopt a *real* comment as a creation record.
+const LEGACY_CREATE_NOTE: &str = "created this task";
+
 /// Make a file that parsed satisfy [`validate`], destroying as little as possible, loudly.
 ///
 /// # Why repair at all, rather than refuse
@@ -225,6 +233,35 @@ fn repair(file: &mut TaskFile) {
                 comment.id =
                     TaskComment::legacy_id(&comment.author, comment.at_unix_ms, &comment.text);
             }
+        }
+        /*
+         * The creator of a task written before `Task::created_by` existed. (M21)
+         *
+         * That build recorded the answer by *seeding the log*: an agent-made task opened with one
+         * comment saying `created this task`, stamped at the same millisecond as the task, and a
+         * user-made one opened with nothing. So the fact is still in the file, and this reads it
+         * back rather than letting every such task decay to `User` — which is what the serde
+         * default gives, and which would credit the user with six subagents' work.
+         *
+         * Three conditions, all three needed. `User` on the left means *either* a file that had no
+         * field or a task genuinely created by the user, and the seeding rule says those two are
+         * the same set — a task this build wrote with a real creator is never overwritten. The
+         * text and the timestamp together are what stop an ordinary comment being adopted: an
+         * agent would have to write those exact three words in the millisecond the task was
+         * created, which is the same shape of coincidence `TaskComment::legacy_id` already accepts.
+         *
+         * Derived rather than defaulted, and derived *in memory*: opening a project does not
+         * rewrite the file, so a newer build reading a teammate's tracker leaves no diff. The next
+         * real mutation persists `created_by` along with everything else, and from then on this
+         * finds nothing to do.
+         */
+        if task.created_by == TaskAuthor::User
+            && let Some(seed) = task.comments.first()
+            && seed.author != TaskAuthor::User
+            && seed.text == LEGACY_CREATE_NOTE
+            && seed.at_unix_ms == task.created_unix_ms
+        {
+            task.created_by = seed.author.clone();
         }
         kept.push(task);
     }
@@ -423,6 +460,23 @@ fn merge_task(mine: &Task, theirs: &Task) -> Task {
     // The creation stamp is the earlier of the two by definition: a task cannot have been created
     // twice, and if the two disagree one of them was hand-edited. The earlier is the safer read.
     winner.created_unix_ms = mine.created_unix_ms.min(theirs.created_unix_ms);
+    /*
+     * The creator does **not** follow the winner, and the rule is directional rather than a tie.
+     *
+     * A task is created once, so the two sides can only disagree about `created_by` for a reason
+     * that is not an edit: one of them passed through a build that did not know the field, or a
+     * hand edit dropped it. Both of those decay to `TaskAuthor::User` — so `User` is the value that
+     * means *nobody recorded one*, and it must never overwrite a side that did. The other
+     * direction cannot lose anything: the only thing it discards is a decay.
+     *
+     * Ties — and the case where both sides name a creator — go to `mine`, which is this
+     * function's standing convention and is stated in its doc.
+     */
+    winner.created_by = if mine.created_by == TaskAuthor::User {
+        theirs.created_by.clone()
+    } else {
+        mine.created_by.clone()
+    };
     // `updated_unix_ms` follows the winner already, but a comment adopted from the loser is itself
     // an update, and a merged task whose stamp predates its own newest comment would lose the next
     // merge it takes part in.
@@ -1019,21 +1073,22 @@ impl TaskStore {
     /// name a project to reach the right store, and it is checked there — carrying it further would
     /// be a second source of truth for the same fact.
     ///
-    /// # Why `author` seeds a comment, and only for an agent
+    /// # `author` is recorded, and no longer seeds a comment (M21)
     ///
-    /// [`Task`] has no `creator` field, deliberately — it is one more field an agent must be taught
-    /// to fill and one more column the panel must draw. But *who asked for this task* is a real
-    /// question when six subagents are writing, and the append-only log is exactly where "who did
-    /// what, when" already lives.
+    /// This used to answer *who asked for this task* by writing one line into the log — `created
+    /// this task`, from the agent or the orchestrator — because [`Task`] had no creator field. It
+    /// has one now, [`Task::created_by`], and that field's doc has the argument for the change.
     ///
-    /// So a task created by an agent or the orchestrator opens its log with one line naming them,
-    /// and a task the user created by hand opens with nothing. The condition is not arbitrary: the
-    /// user was looking at the panel when they made it and already knows: telling them would be one
-    /// line of noise on every hand-made task, in a log that is read.
+    /// The seeding is gone rather than kept beside it. Two records of one fact is a card that
+    /// prints the creator in its head and repeats it as the first line of the conversation
+    /// underneath, and the log is short enough that a redundant line in it is expensive. Files
+    /// written by an older build keep their seeded comment — nothing rewrites them — and [`repair`]
+    /// reads the creator back out of it, so those tasks draw exactly as they always did plus a head
+    /// that now agrees with the log.
     pub fn create(&self, req: &TaskNew, author: TaskAuthor) -> Result<Task> {
         let now = persist::now_ms();
         self.update(move |file| {
-            let mut task = Task {
+            let task = Task {
                 id: next_id(file),
                 // Trimmed, because a title is one line drawn in a 320px panel and trailing space is
                 // invisible there but not in the file's diff.
@@ -1045,19 +1100,14 @@ impl TaskStore {
                 status: req.status.unwrap_or(cide_ipc::TaskStatus::Todo),
                 agent: req.agent.clone(),
                 comments: Vec::new(),
+                // Stamped from the caller's identity, which arrived with the connection rather
+                // than in the payload — the same rule `TaskEdit::Comment` states for a comment's
+                // author, and for the same reason: an agent that could name a creator could name
+                // the user as one.
+                created_by: author,
                 created_unix_ms: now,
                 updated_unix_ms: now,
             };
-            if !matches!(author, TaskAuthor::User) {
-                task.comments.push(TaskComment {
-                    id: CommentId::new(),
-                    author,
-                    text: "created this task".to_string(),
-                    at_unix_ms: now,
-                    edited_at_unix_ms: None,
-                    deleted: false,
-                });
-            }
             // At the end: the array *is* the order, and new work goes at the bottom of the list
             // rather than jumping the queue the user is reading top to bottom.
             file.tasks.push(task.clone());
@@ -1395,6 +1445,7 @@ mod tests {
             status: TaskStatus::Todo,
             agent: None,
             comments: Vec::new(),
+            created_by: TaskAuthor::User,
             created_unix_ms: 1_000,
             updated_unix_ms: updated,
         }
@@ -1809,6 +1860,42 @@ mod tests {
                 theirs: a_file(9, vec![a_task("t-1", "kept", 100)]),
                 check: |out| assert_eq!(titles(out), ["kept", "edited here"]),
             },
+            Case {
+                name: "a recorded creator beats the `User` an absent field decays to",
+                why: "a task is created once, so the sides can only disagree because one of them                       passed through a build that did not know `created_by` — and that decays to                       `User`. Taking the winner's copy would credit the user with an agent's work                       every time the older build happened to hold the newer task",
+                mine: a_file(4, vec![a_task("t-1", "mine, newer", 200)]),
+                theirs: a_file(
+                    4,
+                    vec![Task {
+                        created_by: TaskAuthor::Orchestrator,
+                        ..a_task("t-1", "theirs, older", 100)
+                    }],
+                ),
+                check: |out| {
+                    assert_eq!(
+                        titles(out),
+                        ["mine, newer"],
+                        "the scalar fields still follow the newer side"
+                    );
+                    assert_eq!(out.tasks[0].created_by, TaskAuthor::Orchestrator);
+                },
+            },
+            Case {
+                name: "…and it does not matter which side the decay is on",
+                why: "the rule is directional rather than a tie-break, so swapping the arguments                       must give the same answer; an implementation that read only `mine` would                       pass the row above and fail this one",
+                mine: a_file(
+                    4,
+                    vec![Task {
+                        created_by: TaskAuthor::Orchestrator,
+                        ..a_task("t-1", "mine, older", 100)
+                    }],
+                ),
+                theirs: a_file(4, vec![a_task("t-1", "theirs, newer", 200)]),
+                check: |out| {
+                    assert_eq!(titles(out), ["theirs, newer"]);
+                    assert_eq!(out.tasks[0].created_by, TaskAuthor::Orchestrator);
+                },
+            },
         ];
 
         for case in cases {
@@ -2134,11 +2221,12 @@ mod tests {
         assert_eq!(store.snapshot(), before);
     }
 
+    /// Every task records who asked for it, and nothing is seeded into the log to say so. (M21)
     #[test]
     fn a_task_an_agent_created_says_who_asked_for_it() {
         let dir = TempDir::new("author");
         let store = TaskStore::open(dir.root());
-        let task = store
+        let theirs = store
             .create(
                 &new_task("write the tests"),
                 TaskAuthor::Agent {
@@ -2147,10 +2235,81 @@ mod tests {
                 },
             )
             .expect("create");
-        // `Task` has no `creator` field on purpose, so the append-only log is the only place this
-        // fact can live — and it is the place "who did what, when" already lives.
-        assert_eq!(task.comments.len(), 1);
-        assert!(matches!(task.comments[0].author, TaskAuthor::Agent { .. }));
+        assert_eq!(
+            theirs.created_by,
+            TaskAuthor::Agent {
+                agent: AgentId("qa".into()),
+                label: "QA".into(),
+            }
+        );
+        // The log opens **empty**. It used to open with `created this task`, which is now the head
+        // of the card instead — two records of one fact is a conversation whose first line repeats
+        // what is written above it.
+        assert!(
+            theirs.comments.is_empty(),
+            "the log was seeded: {:?}",
+            theirs.comments
+        );
+
+        // And the user's own tasks say so rather than saying nothing, which is the half the old
+        // arrangement could not express: it inferred "the user" from a *missing* record.
+        let ours = store
+            .create(&new_task("read the tests"), TaskAuthor::User)
+            .expect("create");
+        assert_eq!(ours.created_by, TaskAuthor::User);
+        assert!(ours.comments.is_empty());
+    }
+
+    /// A task written before `Task::created_by` existed keeps its creator, read back out of the
+    /// comment the old build seeded. (M21) See `repair`.
+    #[test]
+    fn the_creator_of_a_task_from_an_older_build_is_recovered_from_its_seeded_comment() {
+        let dir = TempDir::new("legacy-creator");
+        let planted = r#"{"schemaVersion":1,"rev":9,"tasks":[
+                {"id":"t-1","title":"an agent asked for this","body":"","status":"todo",
+                 "agent":null,
+                 "comments":[{"author":{"kind":"agent","agent":"qa","label":"QA"},
+                              "text":"created this task","atUnixMs":1000}],
+                 "createdUnixMs":1000,"updatedUnixMs":1000},
+                {"id":"t-2","title":"the user asked for this","body":"","status":"todo",
+                 "agent":null,"comments":[],"createdUnixMs":2000,"updatedUnixMs":2000},
+                {"id":"t-3","title":"an ordinary comment is not a creation record","body":"",
+                 "status":"todo","agent":null,
+                 "comments":[{"author":{"kind":"orchestrator"},
+                              "text":"created this task","atUnixMs":3001}],
+                 "createdUnixMs":3000,"updatedUnixMs":3001}]}"#;
+        dir.plant(planted);
+        let store = TaskStore::open(dir.root());
+        let list = store.list();
+
+        assert_eq!(
+            list[0].created_by,
+            TaskAuthor::Agent {
+                agent: AgentId("qa".into()),
+                label: "QA".into(),
+            },
+            "the seeded line is the only record of who asked, and it is still in the file"
+        );
+        assert_eq!(
+            list[1].created_by,
+            TaskAuthor::User,
+            "no seeded line meant the user, under the rule that build wrote by"
+        );
+        assert_eq!(
+            list[2].created_by,
+            TaskAuthor::User,
+            "a comment a millisecond after the task is a comment, not the seeding — the timestamp \
+             is what stops an ordinary line being adopted as provenance"
+        );
+
+        // Reading does not rewrite. Deriving the creator happens in memory, so a teammate who
+        // merely opens the project produces no diff in a file their repository tracks; the field
+        // reaches disk with the next real mutation, like every other repair this function makes.
+        assert_eq!(
+            fs::read_to_string(dir.tasks()).expect("read"),
+            planted,
+            "opening a project rewrote a tracked file"
+        );
     }
 
     // --- layers 3 and 4, through a real disk ----------------------------------------------------
@@ -2309,6 +2468,32 @@ mod tests {
             "one-line JSON makes every change a whole-file diff"
         );
         assert!(raw.contains("\"schemaVersion\": 1"));
+    }
+
+    /// A starting status the user chose in the compose dialog is honoured; absence is `Todo`.
+    /// (M21) See `TaskNew::status` for why this is the user's field and not an agent's.
+    #[test]
+    fn a_task_may_be_created_into_a_status_other_than_todo() {
+        let dir = TempDir::new("start-status");
+        let store = TaskStore::open(dir.root());
+
+        let started = store
+            .create(
+                &TaskNew {
+                    status: Some(TaskStatus::Doing),
+                    ..new_task("already under way")
+                },
+                TaskAuthor::User,
+            )
+            .expect("create");
+        assert_eq!(started.status, TaskStatus::Doing);
+
+        // And the default is unchanged for every caller that names none — which is every caller
+        // but the dialog, the MCP path included.
+        let plain = store
+            .create(&new_task("not started"), TaskAuthor::User)
+            .expect("create");
+        assert_eq!(plain.status, TaskStatus::Todo);
     }
 
     /// The debounce is `workspace.json`'s, and a store with nothing owed writes nothing — which is

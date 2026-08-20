@@ -50,6 +50,7 @@ import {
   type ReactNode,
 } from 'react'
 import { collapseRuns, UNCOMMITTED_BUCKET } from '@/editor/blameModel'
+import { cancelResizeSettle, whenResizeSettles } from '@/layout/resizeGesture'
 import {
   getDiffView,
   getServerDiffView,
@@ -495,14 +496,26 @@ export function GitDiffView(props: GitDiffViewProps): ReactNode {
    */
   const [root, setRoot] = useState<HTMLElement | null>(null)
   const [wide, setWide] = useState(true)
+  /** This pane's identity in `resizeGesture`'s queue. An object, so it cannot collide. */
+  const settleKey = useRef({})
   useEffect(() => {
     if (root === null || typeof ResizeObserver === 'undefined') return
+    const key = settleKey.current
     const observer = new ResizeObserver((entries) => {
       const width = entries[0]?.contentRect.width ?? root.clientWidth
-      setWide(width >= DIFF_SPLIT_MIN_PX)
+      /*
+       * Deferred to the end of a resize gesture. Crossing `DIFF_SPLIT_MIN_PX` swaps the whole
+       * body between split and unified — a full re-render and relayout of the diff — and doing
+       * that in the middle of a drag means doing it twice for a pointer that wandered over the
+       * threshold and back. See `@/layout/resizeGesture`.
+       */
+      whenResizeSettles(key, () => setWide(width >= DIFF_SPLIT_MIN_PX))
     })
     observer.observe(root)
-    return () => observer.disconnect()
+    return () => {
+      observer.disconnect()
+      cancelResizeSettle(key)
+    }
   }, [root])
 
   /** What is actually drawn, and whether the preference had to be overruled to get there. */

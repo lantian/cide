@@ -88,6 +88,7 @@ import {
   pruneSelection,
   repoOf,
   selectedFiles,
+  ticksAfterMove,
   toggleRow,
   toggleRows,
   viewOf,
@@ -1327,11 +1328,20 @@ export function useGitPanel(
       // An empty list is what `dropOutcome` returns for a drop onto the list the files are
       // already in. Sending it would be a round trip and a busy line for a no-op.
       if (paths.length === 0) return
+      /*
+       * The ticks follow the files. `model.ts::ticksAfterMove` carries the argument; the part
+       * that belongs here is the *timing*. It is applied before the round trip rather than
+       * after it, because `adopt` keeps every tick whose file is still live — the ids do not
+       * change under a move — so an update afterwards would land one frame late and be visible
+       * as a box that ticks itself off. Nothing in the answer can contradict it either: the
+       * command's whole effect is the assignment this is reacting to.
+       */
+      setSelected((prev) => ticksAfterMove(view, prev, repo, changelist, paths))
       mutate('git changelist move', 'Moving…', (p) =>
         gitApi.changelist.movePaths(p, repo, changelist, paths),
       )
     },
-    [mutate],
+    [mutate, view],
   )
 
   /**
@@ -1361,17 +1371,23 @@ export function useGitPanel(
    * real `git apply --cached`, and for a whole untracked file it does what `git add` does —
    * `assert_matches_git_add` is the test that says so.
    *
-   * # What it costs, per ADR 0004
+   * # What it used to cost
    *
    * The file is now in `.git/index`, and the index is a derived artifact here: committing a
    * *different* changelist runs `rebuild_index`, which resets the index to HEAD and writes
-   * only that list's selections. The newly added file's index entry goes with it, the path is
-   * untracked again, and `reconcile` then drops the changelist assignment it just earned — so
-   * it reappears under `Unversioned Files`. That is the changelists-are-the-truth model doing
-   * exactly what the ADR says it does, not a bug in this path, and it is why the ghost says
-   * *"Add N files to git"* rather than *"track N files"*: the promise made is the one that is
-   * kept. Committing the list the files were filed into commits them, which is the case the
-   * gesture is actually for.
+   * only that list's selections. The newly added file's index entry went with it, the path
+   * was untracked again, and `reconcile` then dropped the changelist assignment it had just
+   * earned — so it reappeared under `Unversioned Files` after a commit that never named it,
+   * with nothing on screen saying why. This comment used to record that as the ADR working as
+   * intended and the reason the ghost says *"Add N files to git"* rather than *"track N
+   * files"*.
+   *
+   * It is fixed in `cide_git::commit`, which now saves the index entries the rebuild is about
+   * to erase and puts back every one the commit did not consume —
+   * `committing_one_changelist_leaves_the_others_staged_files_staged` is the test. A file
+   * dropped here stays added and stays in the list it was dropped on, which is what the
+   * gesture appeared to promise all along. The wording on the ghost is still the honest one:
+   * the thing that happens *is* a `git add`.
    *
    * The staging does **not** raise the external-index guard bar: `stage::stage` ends in
    * `changelist::record_index`, so the fingerprint the guard compares against is cide's own
@@ -1391,6 +1407,10 @@ export function useGitPanel(
   const trackPaths = useCallback(
     (repo: RepoId, changelist: string, paths: string[]) => {
       if (project === null || paths.length === 0) return
+      // The same rule the plain move follows — see `movePaths`. It is not a no-op here even
+      // though these rows arrive unticked: dropping unversioned files onto a changelist the
+      // user has ticked is them saying those files are part of the commit being built.
+      setSelected((prev) => ticksAfterMove(view, prev, repo, changelist, paths))
       void (async () => {
         // One busy line for the whole gesture. It is one operation to the person who dropped
         // the files, and a label that flipped from `Adding to git…` to `Moving…` halfway would
@@ -1431,7 +1451,7 @@ export function useGitPanel(
         await refresh()
       })()
     },
-    [project, note, refresh, adopt, absorb],
+    [project, view, note, refresh, adopt, absorb],
   )
 
   const dismissDialog = useCallback(() => setDialog(null), [])
@@ -1465,11 +1485,11 @@ export function useGitPanel(
         trackPaths(repo, id, [...paths])
         return
       }
-      mutate('git changelist move', 'Moving…', (p) =>
-        gitApi.changelist.movePaths(p, repo, id, [...paths]),
-      )
+      // `movePaths`, not a second `mutate` of the same command: the tick rule lives in there
+      // and a copy of the call here would be a route into filing that quietly kept it.
+      movePaths(repo, id, [...paths])
     },
-    [dialog, mutate, trackPaths],
+    [dialog, movePaths, trackPaths],
   )
 
   /**
@@ -1532,6 +1552,11 @@ export function useGitPanel(
           trackPaths(repo, fresh, [...paths])
           return
         }
+        // A list this gesture has just minted holds nothing, so this clears the ticks — which
+        // is the answer that matches what *New changelist…* over a set of files is for. The
+        // rule is `ticksAfterMove`'s and is applied here rather than inside `movePaths`
+        // because this branch has to await the move to adopt its answer.
+        setSelected((prev) => ticksAfterMove(view, prev, repo, fresh, [...paths]))
         const moved = await guarded('git changelist move', () =>
           gitApi.changelist.movePaths(project, repo, fresh, [...paths]),
         )
@@ -1540,7 +1565,7 @@ export function useGitPanel(
         else adopt(absorb(moved))
       })()
     },
-    [dialog, project, mutate, guarded, refresh, adopt, absorb, note, trackPaths],
+    [dialog, project, view, mutate, guarded, refresh, adopt, absorb, note, trackPaths],
   )
 
   // --- reverting, which is the one thing here with no undo ------------------------------------

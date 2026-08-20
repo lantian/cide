@@ -530,6 +530,155 @@ fn committing_one_changelist_leaves_the_other_untouched() {
     assert_eq!(fixes_view.changes[0].path, "b.txt");
 }
 
+/// The same guarantee for a file whose only existence as a change *is* its index entry.
+///
+/// > *"on commit changes that was moved from Uncommited to custom list goes into Uncommited
+/// > again, but should stay in custom list."*
+///
+/// `commit::rebuild_index` resets the index to HEAD, which is what makes committing one
+/// changelist leave the other's *tree* alone. It used to leave the other's **index** in
+/// pieces, and for a `git add`ed new file the index is the whole of it: the reset dropped
+/// `keep.txt`'s entry, the next status walk reported it `Untracked`, `repo_changes` leaves
+/// untracked paths out of its `live` set, and `Sidecar::reconcile` then deleted the
+/// assignment. A file the user had deliberately filed away came back as an unversioned row
+/// after a commit that never named it.
+///
+/// Both halves are asserted because either alone would pass with the bug half-fixed: the
+/// index entry is what keeps the file tracked, and the sidecar entry is what keeps it in the
+/// list the user put it in.
+#[test]
+fn committing_one_changelist_leaves_the_others_staged_files_staged() {
+    let repo = TempRepo::new("changelists-index");
+    repo.write("a.txt", b"one\n");
+    repo.write("gone.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a.txt", b"changed a\n");
+
+    // A new file added to git but never committed — what `git status` prints as `A `, and
+    // what cide's own `.cide/` files look like in the repository this was reported from.
+    repo.write("keep.txt", b"keep\n");
+    stage::stage(&repo.root, &[selection("keep.txt", Selection::Whole)]).expect("stage");
+    // …and a staged *deletion*, which is the same erasure from the other direction: the
+    // reset to HEAD puts the file back into the index, so restoring it means removing it.
+    std::fs::remove_file(repo.root.join("gone.txt")).expect("remove");
+    stage::stage(&repo.root, &[selection("gone.txt", Selection::Whole)]).expect("stage");
+
+    let held = changelist::update(&repo.root, |data| data.create("Held", "")).unwrap();
+    changelist::update(&repo.root, |data| {
+        data.move_paths(&held, &["keep.txt".to_string(), "gone.txt".to_string()])
+    })
+    .unwrap();
+
+    // The panel sends the ticked paths explicitly; `a.txt` is the only one in `Changes`.
+    commit::commit(
+        &repo.root,
+        &CommitRequest {
+            message: "only a.txt".into(),
+            amend: false,
+            changelist: Some("default".into()),
+            selections: Some(vec![selection("a.txt", Selection::Whole)]),
+            force: false,
+            amend_of: None,
+        },
+    )
+    .expect("commit");
+
+    assert_eq!(
+        repo.git(&["show", "--name-only", "--format=", "HEAD"])
+            .trim(),
+        "a.txt",
+        "the commit took exactly the changelist that was named"
+    );
+    let cached = repo.git(&["diff", "--cached", "--name-only"]);
+    let mut staged: Vec<&str> = cached
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    staged.sort_unstable();
+    assert_eq!(
+        staged,
+        ["gone.txt", "keep.txt"],
+        "a commit of one changelist unstaged files belonging to another"
+    );
+
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    let changes = status::repo_changes(&info, status::StatusRequest::default()).expect("status");
+    assert!(
+        changes.unversioned.is_empty(),
+        "`keep.txt` fell back to an unversioned row: {:?}",
+        changes.unversioned
+    );
+    let list = changes
+        .changelists
+        .iter()
+        .find(|l| l.id == held)
+        .expect("the Held list");
+    let mut still: Vec<&str> = list.changes.iter().map(|c| c.path.as_str()).collect();
+    still.sort_unstable();
+    assert_eq!(
+        still,
+        ["gone.txt", "keep.txt"],
+        "the files stayed in the changelist the user filed them into"
+    );
+    // And the guard must not now accuse the user of staging behind cide's back: the restore
+    // is cide's own write, so the fingerprint recorded after it has to describe it.
+    assert!(!changes.index_changed_externally);
+}
+
+/// A commit that is refused after the rebuild has already run puts the index back.
+///
+/// `committing_an_empty_changelist_leaves_the_index_alone` covers the emptiness that is
+/// answered *before* `rebuild_index`. This is the other half: `write_commit` refuses a commit
+/// whose tree equals HEAD's, and by then the index has been reset. Without the restore, the
+/// user's answer to "nothing to commit" would be a silent `git reset` of everything they had
+/// staged in every other changelist.
+#[test]
+fn a_commit_refused_after_the_rebuild_puts_the_index_back() {
+    let repo = TempRepo::new("refused-rebuild");
+    repo.write("a.txt", b"one\n");
+    repo.commit_all("base");
+    repo.write("a.txt", b"two\n");
+    repo.write("keep.txt", b"keep\n");
+    stage::stage(&repo.root, &[selection("keep.txt", Selection::Whole)]).expect("stage");
+
+    // An identity git cannot resolve, which is what makes `write_commit` fail *after*
+    // `rebuild_index` has already reset the index. Any refusal from there on would do; this
+    // is the one a test can arrange without reaching inside the function.
+    repo.git(&["config", "--unset", "user.email"]);
+    repo.git(&["config", "--unset", "user.name"]);
+
+    let error = commit::commit(
+        &repo.root,
+        &CommitRequest {
+            message: "who am i".into(),
+            amend: false,
+            changelist: Some("default".into()),
+            selections: Some(vec![selection("a.txt", Selection::Whole)]),
+            force: false,
+            amend_of: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, GitError::Git { .. }),
+        "expected the signature to be what failed, got {error:?}"
+    );
+    repo.git(&["config", "user.name", "cide tests"]);
+    repo.git(&["config", "user.email", "tests@cide.invalid"]);
+    assert_eq!(
+        repo.git(&["diff", "--cached", "--name-only"]).trim(),
+        "keep.txt",
+        "a refused commit unstaged a file it never named"
+    );
+    let info = repo_mod::discover(std::slice::from_ref(&repo.root)).remove(0);
+    assert!(
+        !status::repo_changes(&info, status::StatusRequest::default())
+            .unwrap()
+            .index_changed_externally
+    );
+}
+
 /// `rebuild_index` clears the index to HEAD before it knows whether there is anything to
 /// commit, so the emptiness has to be answered first — otherwise clicking Commit on a
 /// changelist that holds nothing silently drops whatever the index was holding.

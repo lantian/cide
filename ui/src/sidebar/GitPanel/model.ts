@@ -524,27 +524,33 @@ export function badgeLabel(count: number | null, digits: string): string | undef
 }
 
 /**
- * The tri-state of one row.
+ * The tri-state of one row: how much of its subtree is ticked.
  *
- * A file is `partial` when it is selected but only some of it is staged, and that partiality
- * has to climb: a group whose only selected file is half-staged is not a group that is fully
- * checked, and drawing it as `✓` would tell the user the commit contains more than it does.
+ * `partial` means *some of these files are ticked*, and nothing else.
+ *
+ * # The second meaning it used to carry, and why it is gone
+ *
+ * A ticked file whose index held only part of it — `staged` and a dirty worktree both — was
+ * drawn `–` as well, and that partiality climbed to every ancestor. So a changelist the user
+ * had ticked whole still read `–`, with no gesture anywhere in the panel that could make it
+ * read `✓`: the box was reporting a property of `.git/index`, not of the ticks, and the ticks
+ * are the only thing a click on it can change.
+ *
+ * It was also a claim about the commit that the commit does not honour. In changelist mode
+ * the index is a derived artifact (ADR 0004): `cide_git::commit` resets it to HEAD and writes
+ * the selections in, so whatever the index happened to hold for a file has no bearing at all
+ * on what gets committed. A ticked file is committed **whole** however it was staged.
+ *
+ * What genuinely does narrow a commit is a hunk selection held by the diff pane, and that has
+ * its own line above the tree — `GitPanel.tsx`'s `gitPartials` note — which can say how many
+ * files it is about and offer to clear them, neither of which a `–` in a 12px box can do.
  */
-export function checkState(
-  row: Row,
-  selected: ReadonlySet<string>,
-  partial: (fileId: string) => boolean,
-): CheckState {
+export function checkState(row: Row, selected: ReadonlySet<string>): CheckState {
   if (row.files.length === 0) return 'unchecked'
   let checked = 0
-  let mixed = false
   for (const id of row.files) {
-    if (selected.has(id)) {
-      checked++
-      if (partial(id)) mixed = true
-    }
+    if (selected.has(id)) checked++
   }
-  if (mixed) return 'partial'
   if (checked === 0) return 'unchecked'
   return checked === row.files.length ? 'checked' : 'partial'
 }
@@ -671,24 +677,6 @@ export function flatFiles(view: StatusView): FileEntry[] {
 /** Every file id in the tree, in row order — what "select all" and a first load use. */
 export function allFiles(view: StatusView): string[] {
   return flatFiles(view).map((e) => e.id)
-}
-
-/**
- * Is only part of this file staged?
- *
- * `staged` says the index differs from HEAD; a worktree side that is not `unmodified` says the
- * working tree differs from the index. Both at once is precisely "some of this file is in the
- * commit and some is not", which is the leaf-level `–` the tri-state exists for. Derived here
- * rather than sent as a flag because it is a fact about the pair `ChangeEntry` already carries,
- * and a second field saying the same thing is a second field that can disagree.
- */
-export function isPartiallyStaged(entry: ChangeEntry): boolean {
-  return entry.staged && entry.worktree !== 'unmodified'
-}
-
-/** The ids whose file is only partly staged. The input to `checkState`'s `partial`. */
-export function partialFiles(view: StatusView): Set<string> {
-  return new Set(flatFiles(view).flatMap((e) => (isPartiallyStaged(e.entry) ? [e.id] : [])))
 }
 
 /** Every collapsible row id: repo rows, groups, and every directory inside them. "Expand all". */
@@ -998,6 +986,53 @@ export function changelistsOf(view: StatusView, repo: RepoId): ChangelistTarget[
 /** One group by its `GroupView.id` — what a revert, a shelve or a group menu acts on. */
 export function groupOf(view: StatusView, repo: RepoId, group: string): GroupView | undefined {
   return repoOf(view, repo)?.groups.find((g) => g.id === group)
+}
+
+/**
+ * What the ticks become when `paths` are filed into `changelist`.
+ *
+ * A tick says "this goes in the next commit"; filing a change into a list says "this belongs
+ * with those, not with these". The two have to agree, and the moved file is the one that
+ * moved, so it adopts the answer its new list is already giving.
+ *
+ * # The bug this is the whole of
+ *
+ * The tick used to simply stay where it was, because a file row's id is its repo and its path
+ * — `fileRowId` — and a move changes neither. So filing a file *out* of the changelist that
+ * was about to be committed left it ticked, and the commit took it anyway. That is the
+ * panel's answer to "commit only the lists I ticked" being "and also the file you just filed
+ * away", and the user cannot see it: the tick is 12px, three rows further down, inside a
+ * changelist whose whole point was to be left alone.
+ *
+ * # Why the destination's state decides, and not the active flag
+ *
+ * Both readings fix the bug above. "Ticked iff the destination is the active list" is the
+ * rule `defaultSelection` uses for a first paint, and it is the wrong rule here: a user who
+ * has ticked a non-active list is building up a commit, and unticking each file as it arrives
+ * would make that gesture undo itself. Reading the destination instead means both intentions
+ * survive — join a list that is going into the commit, or leave one that is not.
+ *
+ * A list that does not exist yet — *New changelist…* mints one and moves in the same gesture —
+ * has nothing ticked and so takes the second answer, which is the one that matches what "move
+ * these somewhere else" is nearly always for.
+ */
+export function ticksAfterMove(
+  view: StatusView,
+  selected: ReadonlySet<string>,
+  repo: RepoId,
+  changelist: string,
+  paths: readonly string[],
+): Set<string> {
+  const group = groupOf(view, repo, `${CHANGELIST_PREFIX}${changelist}`)
+  const joining =
+    group !== undefined && group.entries.some((e) => selected.has(fileRowId(repo, e.path)))
+  const next = new Set(selected)
+  for (const path of paths) {
+    const id = fileRowId(repo, path)
+    if (joining) next.add(id)
+    else next.delete(id)
+  }
+  return next
 }
 
 /*

@@ -59,6 +59,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNo
 import { useContextMenu } from '@/menus'
 import type { Tab, TabId, TabKind } from '@/ipc/client'
 import { useAwaitingInTab } from '@/panes/awaiting'
+import { cancelResizeSettle, whenResizeSettles } from '@/layout/resizeGesture'
 import { awaitingBadge, awaitingHint } from '@/panes/awaitingRule'
 import { overflowEntries, tabMenuEntries } from './menuModel'
 import { clippedTabs, overflowHint } from './tabOverflow'
@@ -171,6 +172,13 @@ export function TabStrip({
    * already there for the context menu, and a ref array would need its own invalidation.
    */
   const overflowAnchor = useRef<HTMLButtonElement | null>(null)
+  /**
+   * This strip's identity in `resizeGesture`'s queue.
+   *
+   * An object rather than a name: the key only has to be unique, and an identity is unique by
+   * construction where a string has to be chosen and could collide with another component's.
+   */
+  const settleKey = useRef({})
   const [hidden, setHidden] = useState<readonly string[]>([])
   const measure = useCallback(() => {
     const box = tablist.current
@@ -214,7 +222,19 @@ export function TabStrip({
   useEffect(() => {
     const box = tablist.current
     if (box === null) return
-    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => measure())
+    /*
+     * Deferred while a splitter is being dragged.
+     *
+     * `measure` reads `offsetLeft` and `offsetWidth` for every tab plus the box's own
+     * `clientWidth`/`scrollLeft` — a forced layout of the strip, immediately after the frame that
+     * changed its width. The answer cannot be *used* mid-drag anyway: the chevron is about where
+     * the tabs ended up, and a drag is by definition still moving them. See
+     * `@/layout/resizeGesture`.
+     */
+    const ro =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => whenResizeSettles(settleKey.current, measure))
     ro?.observe(box)
     /*
      * ...and the box *scrolling* without either changing, which is the same class of miss and
@@ -234,6 +254,7 @@ export function TabStrip({
     box.addEventListener('scroll', onScroll, { passive: true })
     return () => {
       ro?.disconnect()
+      cancelResizeSettle(settleKey.current)
       box.removeEventListener('scroll', onScroll)
     }
   }, [measure])

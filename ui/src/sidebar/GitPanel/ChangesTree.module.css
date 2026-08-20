@@ -346,31 +346,14 @@
 }
 
 /*
- * `14px` leading, for the parity reason above and not for the type: this is a bordered box, so
- * its height is `line-height + 2`, and a 1px border on a half pixel is the one thing in this
- * row that cannot be antialiased away, because both of its edges are horizontal.
- *
- * It was 14, then 13, and is 14 again — each time following the row height rather than
- * changing its mind. In the old 23px row `14` made the box 16, centred at `(23 − 16) / 2 =
- * 3.5`, so it went to 13 for a 15px box and a whole `(23 − 15) / 2 = 4`. The row is 24 now
- * (see `.row` at the top of this file), which wants an *even* box: `(24 − 16) / 2 = 4` from
- * `14`, while `13` would give the 15px box a half-pixel `4.5`.
- *
- * 9.5px of JetBrains Mono needs 12.54px of ascent-plus-descent, so either value clears the
- * type; parity is the only thing deciding between them.
+ * The `partial` tag stood here — a bordered `partial` chip on any file whose index held only
+ * part of it, with three paragraphs working out the leading a 1px border needs to land on a
+ * whole pixel in a 24px row. Both it and the `–` it explained are gone: the index has no say
+ * in this panel's checkboxes any more, and `model.ts::checkState` carries the argument. Kept
+ * as a note rather than deleted silently, because the sums are the expensive part and a chip
+ * that comes back will want them: `14px` leading over a 1px border makes a 16px box, centred
+ * at `(24 − 16) / 2 = 4`, while `13` gives a 15px box a half-pixel `4.5`.
  */
-.partialTag {
-  flex: none;
-  margin-left: 6px;
-  padding: 0 4px;
-  border: 1px solid var(--accent-dim);
-  border-radius: 3px;
-  font-family: var(--font-mono);
-  font-size: var(--fs-ui-9-5);
-  line-height: calc(14px * var(--ui-scale));
-  color: var(--accent);
-}
-
 .empty {
   margin: 0;
   padding: 12px;

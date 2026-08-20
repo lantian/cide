@@ -215,8 +215,42 @@ export interface TaskView {
   agent: string | null
   /** Oldest first on the wire; [`commentOrder`] is the defence against a file that is not. */
   comments: readonly CommentView[]
+  /**
+   * Who asked for this task. Structural restatement of `Task::createdBy`.
+   *
+   * The same three-armed author the log carries, and read the same way — off the enum, never off
+   * a name. The card draws it as [`authorLabel`], so the user's own tasks say *You* whatever an
+   * agent definition has called itself.
+   *
+   * It is not nullable and there is no "unknown" arm: `cide_tasks::repair` recovers the creator
+   * of a task written before the field existed from the comment that build seeded, and anything
+   * it cannot recover is the user — which was that build's rule for what an unseeded log meant.
+   */
+  createdBy: CommentAuthor
   createdMs: number
   updatedMs: number
+}
+
+/**
+ * Who wrote a comment, or who asked for a task, as a word.
+ *
+ * **Read off the author enum and never off a name string**, which is what the wire carries a
+ * three-armed union for. With a string, "is this mine" would be `author === 'you'` against a
+ * value an agent definition is free to claim, and the answer would be wrong in the one case it
+ * matters: a user reading a log back to work out which half of it they said.
+ *
+ * The fallback ladder for an agent — label, then id, then the bare word — is [`agentChip`]'s, and
+ * for its reason: a role renamed or deleted out of `.cide/` must still leave a line attributable
+ * to *something*, because an anonymous assertion in a log is one no reader can weigh.
+ *
+ * Lives here rather than in `TaskDetail.tsx` so `check-agents.mjs` can drive it: *You* is a claim
+ * about the user's own writing, and the card and the creator line have to make it identically.
+ */
+export function authorLabel(author: CommentAuthor): string {
+  if (author.kind === 'user') return 'You'
+  if (author.kind === 'orchestrator') return 'Orchestrator'
+  if (author.label.trim() !== '') return author.label
+  return author.agent.trim() !== '' ? author.agent : 'Agent'
 }
 
 /**
@@ -1131,4 +1165,116 @@ export function assigneeFromDraft(draft: string): string | null {
  */
 export function isFieldEmpty(task: TaskView, field: string): boolean {
   return fieldValue(task, field).trim() === ''
+}
+
+/* ------------------------------------------------------------------ composing a new task */
+
+/**
+ * The new task the user is filling in, before anything has been written. (M21)
+ *
+ * # Why this exists at all
+ *
+ * *New task* used to create the task and then open its card: a row titled `New task` appeared in
+ * `.cide/tasks.json` on the click, and the four fields were edited one at a time afterwards,
+ * each one its own write. Reported as *"i'm expecting that all fields are editable and task
+ * isn't created while not press Create"*, and the report is right about more than taste — that
+ * file is committed and shared with every agent in the project, so a mis-click put a row into
+ * the team's tracker that had to be deleted rather than abandoned, and a run dispatched in
+ * between could read a task whose title was still the placeholder.
+ *
+ * So the draft lives here, in the webview, until Create. Nothing on disk, nothing on the wire,
+ * nothing any other window or agent can see. It is the one piece of task state that is
+ * deliberately **not** in Rust, and it is allowed to be because it does not exist yet.
+ *
+ * `assignee` is the `<select>`'s own value and therefore a string, `''` meaning unassigned — the
+ * same convention [`assigneeFromDraft`] exists to keep on the editing side, and the same
+ * function converts it.
+ */
+export interface TaskDraft {
+  title: string
+  status: TaskStatus
+  assignee: string
+  body: string
+}
+
+/**
+ * What the dialog opens on.
+ *
+ * `todo` and not "the filter the list happens to be on": a status the user did not choose is a
+ * status they will not notice, and this one is written into a committed file. The filter's
+ * interaction with a create is answered by [`filterAfterCreate`] instead, which changes what is
+ * *shown* rather than what is written.
+ */
+export const EMPTY_DRAFT: TaskDraft = { title: '', status: 'todo', assignee: '', body: '' }
+
+/**
+ * May this draft be created?
+ *
+ * The title is the one required field — `TaskNew::title`'s own doc says a task without one is a
+ * row nobody can act on, and `cide_tasks::validate` refuses it — so Create is inert until there
+ * is one. Drawn **disabled** rather than not drawn at all, which is the opposite of the
+ * `ready-queued` rule one panel over and for a reason worth stating: that rule is about a
+ * control that can never work *in this state*, where the state is not the user's to change. This
+ * one becomes live as soon as they type, and a Create button that materialises out of nowhere
+ * mid-word is harder to understand than one that is visibly waiting.
+ */
+export function draftReady(draft: TaskDraft): boolean {
+  return draft.title.trim() !== ''
+}
+
+/**
+ * Has anything been typed into this draft?
+ *
+ * Compared field by field against [`EMPTY_DRAFT`] rather than by identity, because the dialog
+ * rebuilds the object on every keystroke — and typing a character and deleting it again leaves a
+ * draft that is `!==` the constant and means exactly the same thing.
+ *
+ * Whitespace counts as clean for the same reason [`isDirty`] trims: a stray space is not work
+ * worth protecting, and treating it as dirty would make the scrim stop working for no visible
+ * cause.
+ */
+export function draftDirty(draft: TaskDraft): boolean {
+  return (
+    draft.title.trim() !== '' ||
+    draft.body.trim() !== '' ||
+    draft.assignee !== '' ||
+    draft.status !== EMPTY_DRAFT.status
+  )
+}
+
+/**
+ * How the compose dialog was asked to close, and whether it closes. (M21)
+ *
+ * **Cancel, the ✕ and Escape always discard**, which is the whole point of the dialog: the user
+ * asked for a create that does not happen until Create, and a close that quietly wrote one would
+ * be the same defect in a new place. Nothing is committed on the way out, and there is nothing
+ * to commit — the draft never reached Rust.
+ *
+ * **The scrim is refused while the draft is dirty**, and that is the one asymmetry with
+ * [`closeCard`]. There, leaving means keeping what you typed, so a stray click on the scrim
+ * costs nothing. Here leaving means *discarding*, so the same stray click would take a
+ * half-written body with it and there is no undo, no draft on disk and no way to tell it
+ * happened. Three deliberate ways out remain and every one of them is visible or standard —
+ * Cancel, the ✕, Escape — so the cost of ignoring one accidental gesture is a click that does
+ * nothing, and the cost of honouring it is the user's paragraph.
+ */
+export function closeCompose(draft: TaskDraft, cause: CloseCause | 'cancel'): boolean {
+  if (cause === 'dismiss' && draftDirty(draft)) return false
+  return true
+}
+
+/**
+ * The filter to be on once a task has been created into `status`.
+ *
+ * A create the user cannot see reads as a create that did not happen. Filter the list to
+ * `Doing`, create a `Todo` task, and the row lands in a group the screen is not drawing — the
+ * dialog closes, nothing appears, and the only evidence is a file they are not looking at.
+ *
+ * Cleared rather than moved to the new task's status: `All` is the state that shows the new row
+ * **and** everything the user had chosen to look at, where switching the filter to `todo` would
+ * answer one surprise by hiding whatever they were watching. A filter that already admits the
+ * new task is left exactly as it is.
+ */
+export function filterAfterCreate(filter: StatusFilter, status: TaskStatus): StatusFilter {
+  return filter === null || filter === status ? filter : null
 }

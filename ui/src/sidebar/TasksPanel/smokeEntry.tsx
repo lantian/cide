@@ -112,6 +112,14 @@ export interface TasksDigest {
   fieldValues: string[]
   /** Whether the card draws an explicit close control. */
   close: boolean
+  /**
+   * The card's creator line, and the author arm it was drawn from: `<kind>|<text>`.
+   *
+   * The kind is digested beside the words so the check can assert the label was read off the
+   * author enum rather than off a name — `You` is a claim about the *user's* own tasks, and a
+   * creator line that string-matched a role called "you" would print it for an agent's.
+   */
+  creator: string
   /** The ids of list rows marked as the open one. At most one, and only in the list stories. */
   openRows: string[]
   /** Whether the live-run strip is drawn. */
@@ -195,6 +203,9 @@ function digest(story: TasksStoryName | CardStoryName, html: string): TasksDiges
       (value) => `${attr(value, 'data-field')}|${text(value)}`,
     ),
     close: html.includes('data-audit="tasksClose"'),
+    creator: all(html, 'tasksCreator')
+      .map((span) => `${attr(span, 'data-creator')}|${text(span)}`)
+      .join(''),
     openRows: all(html, 'tasksRow')
       .filter((row) => attr(row, 'data-open') === 'true')
       .map((row) => attr(row, 'data-task')),

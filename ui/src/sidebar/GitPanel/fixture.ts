@@ -94,9 +94,10 @@ function branch(head: string, unborn = false): BranchInfo {
  * `Unversioned Files`, `Ignored Files`, and a footer that reads `2 modified`.
  *
  * `Changes` is the active changelist and holds exactly two modified files, one of them
- * partially staged — index *and* worktree both dirty — which is what puts a `–` on the group
- * row rather than a `✓`, so the leaf-level tri-state is visible in the default state and not
- * only under interaction.
+ * partially staged — index *and* worktree both dirty. That file is kept deliberately: it used
+ * to force a `–` onto its own box, its directory row and the group, and `check-git-render`
+ * now pins the opposite from the same data. See `model.ts::checkState` for why the index has
+ * no say in a checkbox that only the ticks can change.
  */
 const CIDE_REPO: RepoChanges = {
   repo: {

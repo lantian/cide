@@ -14,13 +14,29 @@
  * ahead of the model. `SplitTree` re-asserts the template from props on every render it
  * makes while no drag is in flight, which is what puts the two back in agreement.
  *
+ * Two things were still paid per *pointer event* rather than per frame, and WebKitGTK does not
+ * coalesce `pointermove` to frames — a 125 Hz mouse reports 125 times a second. So:
+ *
+ * * The grid's box is measured **once, at `pointerdown`**, rather than on every move. The read
+ *   used to sit immediately after the previous move's style write, which is a forced synchronous
+ *   layout of the whole pane subtree — terminals included — at the mouse's report rate. The only
+ *   thing that can invalidate it mid-drag is the window itself changing size, which a tiling
+ *   window manager can do under a held button, so a `resize` listener lives for the drag.
+ * * The style write is coalesced onto one `requestAnimationFrame`. The arithmetic stays
+ *   synchronous, so `live.current` is always the pointer's real answer and `pointerup` can
+ *   commit without waiting for a frame; only the DOM write waits.
+ *
+ * And the drag is bracketed by `resizeGesture`, which is what stops every terminal in every tab
+ * refitting on every frame of it. See that module — the decision that the terminal grid does not
+ * follow the drag is written down there, not here.
+ *
  * Since M11 the grid this divides holds a whole *chain* — `2n - 1` tracks, one per member
  * with a divider between each pair — so the arithmetic below works in shares rather than in
  * one ratio. The property that buys is exact: `applyDrag` copies every fraction outside the
  * dragged pair bit for bit, so a divider in one row provably cannot move another row's
  * tiles. That used to depend on the tree happening to be shaped as columns.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -31,6 +47,7 @@ import type {
 // with no Rust behind it, which is why nothing here imports the `@/ipc` client itself.
 import type { Axis, SplitId } from '@/ipc/generated'
 import { lockBodyForDrag, unlockBodyAfterDrag } from '@/chrome/dragLock'
+import { beginResizeGesture, endResizeGesture } from './resizeGesture'
 import styles from './SplitTree.module.css'
 
 /**
@@ -153,6 +170,28 @@ export function Splitter({
    * zero-sized rect while a pane is maximized.
    */
   const gutter = useRef(0)
+  /**
+   * The grid's box, measured once at `pointerdown`.
+   *
+   * Measuring it per move is a forced synchronous layout of everything in the grid — including
+   * every terminal's rows — immediately after the previous move wrote a new template, at the
+   * mouse's report rate. Nothing a divider drag itself does can change this box: it redistributes
+   * tracks *inside* it. The one thing that can is the window changing size under a held button,
+   * which a tiling window manager will do, so [`onPointerDown`] watches for that and re-measures.
+   */
+  const box = useRef({ left: 0, top: 0, width: 0, height: 0 })
+  /** Removes the drag-lifetime `resize` listener that keeps [`box`] honest. */
+  const unwatch = useRef<(() => void) | null>(null)
+  /** The pending style write, so a burst of moves paints once. */
+  const frame = useRef<number | null>(null)
+  /**
+   * True while a run of arrow-key nudges is open.
+   *
+   * A held arrow repeats at roughly 30 Hz and each repeat resizes the panes, so key repeat is a
+   * resize gesture in every sense that matters here. Opened on the first nudge and closed by
+   * `flushCommit`, which already runs on keyup, blur and unmount.
+   */
+  const keying = useRef(false)
   /** Pending keyboard commit, so a held arrow key does not commit per repeat. */
   const commitTimer = useRef<number | null>(null)
   useEffect(
@@ -166,26 +205,87 @@ export function Splitter({
     if (!dragging.current) live.current = share
   }, [share])
 
-  const stop = useCallback(
-    (commit: boolean) => {
-      if (!dragging.current) return
-      dragging.current = false
-      setActive(false)
-      onDragActive?.(false)
-      unlockBodyAfterDrag()
-      if (commit) onCommit?.(split, live.current)
-    },
-    [onCommit, onDragActive, split],
-  )
+  /**
+   * Write the divider's current position to the DOM.
+   *
+   * `aria-valuenow` rides along imperatively: reading it from the model prop would make a screen
+   * reader announce the old position for as long as the commit takes, and in a fixture with no
+   * `onCommit` wired it would never change at all — but routing it through state would re-render
+   * mid-gesture, which is the thing being avoided.
+   */
+  const paint = () => {
+    // The aria first, and unconditionally: the tracks need a grid and the announcement does not,
+    // and a fixture rendering this splitter without one must still report where it moved to.
+    selfRef.current?.setAttribute('aria-valuenow', String(Math.round(live.current * 100)))
+    const grid = gridRef.current
+    if (!grid) return
+    applyTracks(grid, axis, applyDrag(fractions, index, live.current))
+  }
+
+  /** Paint at most once per frame, however many pointer events or key repeats arrive. */
+  const schedulePaint = () => {
+    if (frame.current !== null) return
+    frame.current = requestAnimationFrame(() => {
+      frame.current = null
+      paint()
+    })
+  }
+
+  /** Drop a scheduled paint. The caller is about to paint the final position itself. */
+  const cancelPaint = () => {
+    if (frame.current === null) return
+    cancelAnimationFrame(frame.current)
+    frame.current = null
+  }
+
+  /** Undo everything `pointerdown` set up. Safe to call twice; the second call does nothing. */
+  const release = () => {
+    unwatch.current?.()
+    unwatch.current = null
+    unlockBodyAfterDrag()
+    endResizeGesture()
+  }
+
+  const stop = (commit: boolean) => {
+    if (!dragging.current) return
+    dragging.current = false
+    setActive(false)
+    onDragActive?.(false)
+    // The last pointer event may not have been painted yet, and the gesture is over: paint the
+    // position being committed rather than letting a frame land after the model has moved.
+    cancelPaint()
+    paint()
+    release()
+    if (commit) onCommit?.(split, live.current)
+  }
 
   // A splitter can be unmounted mid-drag by a snapshot that removes its split. Without this
-  // the body would keep the selection lock and a resize cursor for the rest of the session.
+  // the body would keep the selection lock and a resize cursor for the rest of the session —
+  // and the resize gesture would stay open, which is worse: every terminal in the window would
+  // stop refitting until `resizeGesture`'s watchdog noticed.
   useEffect(
     () => () => {
-      if (dragging.current) unlockBodyAfterDrag()
+      cancelPaint()
+      if (dragging.current) {
+        dragging.current = false
+        release()
+      }
+      if (keying.current) {
+        keying.current = false
+        endResizeGesture()
+      }
     },
+    // Intentionally empty: this is the unmount path, and the closure only touches refs.
     [],
   )
+
+  /** Re-read the grid's box into [`box`]. */
+  const measureGrid = () => {
+    const grid = gridRef.current
+    if (!grid) return
+    const rect = grid.getBoundingClientRect()
+    box.current = { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+  }
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0 || !gridRef.current) return
@@ -194,10 +294,20 @@ export function Splitter({
     e.currentTarget.setPointerCapture(e.pointerId)
     const self = e.currentTarget.getBoundingClientRect()
     gutter.current = vertical ? self.width : self.height
+    measureGrid()
+    // The one thing that can invalidate the measurement above without this splitter knowing:
+    // a window manager resizing the window while the button is held. Rare, and the failure is
+    // a divider that lands somewhere the pointer is not, so it costs one listener to rule out.
+    const onWindowResize = () => measureGrid()
+    window.addEventListener('resize', onWindowResize)
+    unwatch.current = () => window.removeEventListener('resize', onWindowResize)
     dragging.current = true
     live.current = share
     setActive(true)
     onDragActive?.(true)
+    // Before the first move, so nothing downstream refits on the frames this drag is about to
+    // produce. Paired in `stop` and in the unmount effect.
+    beginResizeGesture()
     // On the body, not the splitter: the pointer spends the whole drag over the panes, and
     // without this the cursor flickers to a text caret every time it crosses one. Through
     // `dragLock` because the selection half of it cannot be written as `style.userSelect` in
@@ -206,10 +316,9 @@ export function Splitter({
   }
 
   const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const grid = gridRef.current
-    if (!dragging.current || !grid) return
-    const box = grid.getBoundingClientRect()
-    const extent = vertical ? box.width : box.height
+    if (!dragging.current) return
+    const { left, top, width, height } = box.current
+    const extent = vertical ? width : height
     // The gutters are fixed tracks, so the `fr` shares divide only what is left of the box.
     const usable = extent - (fractions.length - 1) * gutter.current
     if (usable <= 0 || p <= 0) return
@@ -217,9 +326,11 @@ export function Splitter({
     // space, plus the fixed gutters already crossed.
     const start = fractions.slice(0, index).reduce((s, w) => s + w, 0) * usable
       + index * gutter.current
-    const at = (vertical ? e.clientX - box.left : e.clientY - box.top) - start
+    const at = (vertical ? e.clientX - left : e.clientY - top) - start
+    // Computed now, painted on the next frame: `stop` commits `live.current`, so it must be the
+    // pointer's real answer at all times and not something a dropped frame could round off.
     live.current = clampPair(fractions, index, at / (p * usable))
-    applyTracks(grid, axis, applyDrag(fractions, index, live.current))
+    schedulePaint()
   }
 
   /**
@@ -231,16 +342,19 @@ export function Splitter({
    * `fit()` plus a `session.resize` on each live PTY. The DOM write stays immediate so the
    * divider tracks the key; only the commit waits.
    *
-   * `aria-valuenow` is set imperatively alongside it. Reading it from the model prop would
-   * make a screen reader announce the old position for as long as the commit takes, and in
-   * a fixture with no `onCommit` wired it would never change at all — but routing it
-   * through state would re-render mid-gesture, which is the thing being avoided.
+   * The run of repeats is bracketed as one resize gesture, for the same reason the pointer drag
+   * is: each repeat changes every pane's box, and a refit per repeat is the same storm arriving
+   * through the keyboard. `flushCommit` — already wired to keyup, blur and unmount — closes it.
    */
   const moveTo = (next: number) => {
-    const grid = gridRef.current
+    if (!keying.current) {
+      keying.current = true
+      beginResizeGesture()
+    }
     live.current = clampPair(fractions, index, next)
-    if (grid) applyTracks(grid, axis, applyDrag(fractions, index, live.current))
-    selfRef.current?.setAttribute('aria-valuenow', String(Math.round(live.current * 100)))
+    // The DOM write stays on the next frame rather than inline: 30 Hz of key repeat is still
+    // more writes than there are frames to show them.
+    schedulePaint()
 
     if (commitTimer.current !== null) window.clearTimeout(commitTimer.current)
     commitTimer.current = window.setTimeout(() => {
@@ -251,6 +365,12 @@ export function Splitter({
 
   /** Send a pending keyboard commit immediately, so none is ever dropped. */
   const flushCommit = () => {
+    if (keying.current) {
+      keying.current = false
+      cancelPaint()
+      paint()
+      endResizeGesture()
+    }
     if (commitTimer.current === null) return
     window.clearTimeout(commitTimer.current)
     commitTimer.current = null

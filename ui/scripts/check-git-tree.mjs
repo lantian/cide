@@ -197,7 +197,8 @@ try {
         active: true,
         changes: [
           entry('a.rs', 'unmodified', 'modified', 'default'),
-          // Both sides dirty: partially staged, which is the leaf-level `–`.
+          // Both sides dirty: partially staged. Kept because that used to drag its own box
+          // and every ancestor to `–`; see the tri-state section.
           entry('src/b.rs', 'modified', 'modified', 'default'),
         ],
       },
@@ -448,32 +449,70 @@ try {
 
   // --- tri-state -----------------------------------------------------------------------
 
-  const partial = m.partialFiles(one)
-  eq(
-    [...partial],
-    [m.fileRowId(APP, 'src/b.rs')],
-    'partial is derived from the pair `ChangeEntry` carries — staged AND a dirty worktree — '
-      + 'rather than from a flag the backend does not send',
-  )
   const changes = rows1.find((r) => r.label === 'Changes')
   const none = new Set()
-  eq(m.checkState(changes, none, (id) => partial.has(id)), 'unchecked', 'nothing ticked')
+  eq(m.checkState(changes, none), 'unchecked', 'nothing ticked')
 
   const all = m.toggleRow(changes, none)
   eq(all.size, 2, 'ticking a changelist reaches every file in it')
   eq(
-    m.checkState(changes, all, (id) => partial.has(id)),
-    'partial',
-    'one half-staged file makes the whole group partial, not checked — the group must not '
-      + 'claim to contain more than the commit will',
+    m.checkState(changes, all),
+    'checked',
+    'a changelist ticked whole reads `✓`. One of these two files is staged only in part — '
+      + 'index AND worktree both dirty — and that used to force the group to `–` for ever: a '
+      + 'box reporting a property of `.git/index` that no click on it could change, about an '
+      + 'index `cide_git::commit` resets to HEAD before it writes anything anyway',
   )
   eq(m.toggleRow(changes, all).size, 0, 'a second click clears rather than completing')
 
-  const fixes = rows1.find((r) => r.label === 'fixes')
+  const half = new Set([...all].slice(0, 1))
   eq(
-    m.checkState(fixes, m.toggleRow(fixes, none), () => false),
-    'checked',
-    'a group with every file ticked and no partiality is checked',
+    m.checkState(changes, half),
+    'partial',
+    'and `partial` still means the one thing a click can act on: some of these files are '
+      + 'ticked and some are not',
+  )
+
+  const fixes = rows1.find((r) => r.label === 'fixes')
+  eq(m.checkState(fixes, m.toggleRow(fixes, none)), 'checked', 'every file ticked is checked')
+
+  // --- a tick follows its file into the changelist it was filed into -----------------------
+  //
+  // The defect: a file row's id is repo + path, and filing a change into another changelist
+  // changes neither — so the tick stayed exactly where it was. Filing a file *out* of the
+  // list about to be committed left it ticked, and the commit took it anyway.
+
+  const aId = m.fileRowId(APP, 'a.rs')
+  const cId = m.fileRowId(APP, 'c.rs')
+
+  eq(
+    m.ticksAfterMove(one, all, APP, 'fixes', ['a.rs']).has(aId),
+    false,
+    'filing a ticked file into a list with nothing ticked takes it out of the commit, which '
+      + 'is what moving it there was for',
+  )
+  eq(
+    m.ticksAfterMove(one, new Set([cId]), APP, 'fixes', ['a.rs']).has(aId),
+    true,
+    'and a list the user has already ticked is one they are building a commit out of, so a '
+      + 'file joining it joins the commit — the reason this reads the destination rather than '
+      + 'the active flag',
+  )
+  eq(
+    m.ticksAfterMove(one, all, APP, 'not-a-list-yet', ['a.rs']).has(aId),
+    false,
+    '`New changelist…` mints its list in the same gesture, so the destination does not exist '
+      + 'here yet. It holds nothing, so it takes the same answer as an untouched list',
+  )
+  eq(
+    [...m.ticksAfterMove(one, all, APP, 'fixes', [])].sort(),
+    [...all].sort(),
+    'moving nothing changes nothing',
+  )
+  eq(
+    m.ticksAfterMove(one, all, APP, 'fixes', ['a.rs']).has(m.fileRowId(APP, 'src/b.rs')),
+    true,
+    'and only the files that moved are touched',
   )
 
   // --- Space over a multi-row selection --------------------------------------------------
@@ -707,7 +746,7 @@ try {
       + 'ticked files and a click on it does nothing',
   )
   eq(
-    m.checkState(changesCollapsed, defaults, () => false),
+    m.checkState(changesCollapsed, defaults),
     'checked',
     'and its tri-state is computed over them',
   )

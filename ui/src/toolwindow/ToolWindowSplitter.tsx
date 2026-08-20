@@ -19,13 +19,23 @@
  * the pane tree, every `PaneSlot` — dozens of times in one drag. Nothing between `pointerdown`
  * and `pointerup` touches the store except the `active` flag, which is local to this 6px element.
  *
- * (The `fit()` per move is unavoidable for any splitter that resizes the pane area, and
- * `layout/Splitter.tsx` already pays it. It is bounded: `layout/paneHosts.ts` compares **cell**
- * size and suppresses `session_resize` for sub-cell changes, so a 260→400px drag sends about one
- * resize per row crossed, not one per frame.)
+ * (That paragraph named a cost it then accepted, and the acceptance was wrong. The cell-size
+ * comparison bounds the `session_resize`, not the `fit()` that precedes it — and `fit()` is a
+ * DOM-renderer reflow over 5000 lines of scrollback, run for every pane of *every* tab, since
+ * `layout/TabContent.module.css` lays the hidden ones out at full size too. `@/layout/resizeGesture`
+ * is where that is now dealt with: the drag is bracketed as a gesture and the whole refit happens
+ * once, on release. The decision that the terminal grid does not follow the drag is written down
+ * in that module.)
+ *
+ * The write itself is coalesced onto one `requestAnimationFrame`, and goes through [`writeToken`]
+ * so an unchanged value costs nothing. Both matter more here than the line count suggests: the
+ * token is an inherited custom property on `<html>`, so every write invalidates style for the
+ * whole document, and WebKitGTK reports `pointermove` at the mouse's rate rather than the frame
+ * rate.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { lockBodyForDrag, unlockBodyAfterDrag } from '@/chrome/dragLock'
+import { beginResizeGesture, endResizeGesture } from '@/layout/resizeGesture'
 import { toolWindow as toolWindowApi, windowLabel } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
 import type { ProjectId } from '@/ipc/client'
@@ -101,10 +111,29 @@ function painted(geometry: ToolWindowGeometry): number {
   return clampToolWindowHeight(geometry.height, window.innerHeight, currentUiScale())
 }
 
+/**
+ * What each token was last set to, so an unchanged value costs nothing.
+ *
+ * Keyed by property even though there is exactly one today: the comparison is only sound if it is
+ * per property, and a second token added later would otherwise silently suppress the first.
+ *
+ * It is an inherited custom property on the root element: writing one invalidates style for the
+ * whole document, and most of this document is terminal rows. `paint` runs on every workspace
+ * snapshot and on every frame of a window resize, and in nearly all of those the height has not
+ * moved.
+ */
+const written = new Map<string, string>()
+
+function writeToken(property: string, value: string): void {
+  if (written.get(property) === value) return
+  written.set(property, value)
+  document.documentElement.style.setProperty(property, value)
+}
+
 /** Write the token onto `<html>`. The whole of how the height reaches the screen. */
 function paint(geometry: ToolWindowGeometry): void {
   const [property, value] = heightDeclaration(painted(geometry))
-  document.documentElement.style.setProperty(property, value)
+  writeToken(property, value)
 }
 
 /**
@@ -177,6 +206,10 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
   const live = useRef(held.height)
   const selfRef = useRef<HTMLDivElement>(null)
   const commitTimer = useRef<number | null>(null)
+  /** The pending token write, so a burst of moves paints once. */
+  const frame = useRef<number | null>(null)
+  /** True while a run of arrow-key nudges is open. See `SidebarSplitter`'s twin. */
+  const keying = useRef(false)
 
   /**
    * Adopt the workspace's geometry.
@@ -207,9 +240,18 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
   // and a resize cursor for the rest of the session.
   useEffect(
     () => () => {
+      if (frame.current !== null) cancelAnimationFrame(frame.current)
       if (dragging.current) {
+        dragging.current = false
         gesturing = false
         unlockBodyAfterDrag()
+        // Left open, this would stop every terminal in the window refitting until
+        // `resizeGesture`'s watchdog noticed. Closing the panel can land here mid-drag.
+        endResizeGesture()
+      }
+      if (keying.current) {
+        keying.current = false
+        endResizeGesture()
       }
     },
     [],
@@ -234,17 +276,18 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
     [project, labels, scale],
   )
 
-  const stop = useCallback(
-    (doCommit: boolean) => {
-      if (!dragging.current) return
-      dragging.current = false
-      gesturing = false
-      setActive(false)
-      unlockBodyAfterDrag()
-      if (doCommit) commit(live.current)
-    },
-    [commit],
-  )
+  const stop = (doCommit: boolean) => {
+    if (!dragging.current) return
+    dragging.current = false
+    gesturing = false
+    setActive(false)
+    // The last pointer event may not have been painted yet, and the gesture is over: put the
+    // height being committed on screen rather than letting a frame land after the model moved.
+    settle()
+    unlockBodyAfterDrag()
+    endResizeGesture()
+    if (doCommit) commit(live.current)
+  }
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return
@@ -258,17 +301,43 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
     dragging.current = true
     gesturing = true
     setActive(true)
+    // Before the first move, so nothing downstream refits on the frames this drag is about to
+    // produce. Paired in `stop` and in the unmount effect.
+    beginResizeGesture()
     // On the body, not on this element: the pointer spends the drag over the panes and the panel.
     // Through `dragLock` because the selection half cannot be written as `style.userSelect` in
     // this engine and silently appears to work — see that module.
     lockBodyForDrag('row-resize')
   }
 
-  /** Move the edge. No React, no store, one custom property. */
+  /** Put `live.current` on screen. One custom property, plus the aria the gesture owes. */
+  const paintLive = () => {
+    writeToken(TOOL_TOKEN, `${live.current}px`)
+    selfRef.current?.setAttribute('aria-valuenow', String(live.current))
+  }
+
+  /**
+   * Move the edge. No React, no store, one custom property — on the next frame.
+   *
+   * The height is recorded synchronously and only the write waits, so `stop` can commit
+   * `live.current` without a frame having had to land first.
+   */
   const show = (height: number) => {
     live.current = height
-    document.documentElement.style.setProperty(TOOL_TOKEN, `${height}px`)
-    selfRef.current?.setAttribute('aria-valuenow', String(height))
+    if (frame.current !== null) return
+    frame.current = requestAnimationFrame(() => {
+      frame.current = null
+      paintLive()
+    })
+  }
+
+  /** Drop a scheduled write and put the final position on screen now. */
+  const settle = () => {
+    if (frame.current !== null) {
+      cancelAnimationFrame(frame.current)
+      frame.current = null
+    }
+    paintLive()
   }
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -283,6 +352,10 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
 
   /** Move now, tell the domain shortly — the keyboard half of the same bargain. */
   const moveTo = (height: number) => {
+    if (!keying.current) {
+      keying.current = true
+      beginResizeGesture()
+    }
     show(clampToolWindowHeight(height, window.innerHeight, scale))
     if (commitTimer.current !== null) window.clearTimeout(commitTimer.current)
     commitTimer.current = window.setTimeout(() => {
@@ -293,6 +366,11 @@ export function ToolWindowSplitter({ project }: ToolWindowSplitterProps) {
 
   /** Send a pending keyboard commit immediately, so none is ever dropped to a blur. */
   const flushCommit = () => {
+    if (keying.current) {
+      keying.current = false
+      settle()
+      endResizeGesture()
+    }
     if (commitTimer.current === null) return
     window.clearTimeout(commitTimer.current)
     commitTimer.current = null

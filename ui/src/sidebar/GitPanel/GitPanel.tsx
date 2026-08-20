@@ -40,7 +40,7 @@ import { useFocusRequested } from '@/chrome/focusRequests'
 import { GuardBar } from './GuardBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
-import { allRepos, canCommit, partialFiles, repoOf, summarize } from './model'
+import { allRepos, canCommit, repoOf, summarize } from './model'
 import { useGitDiffTabOpen } from './openDiffTabs'
 import type { GitPanelActions, GitPanelModel } from './useGitPanel'
 import styles from './GitPanel.module.css'
@@ -99,7 +99,6 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
     if (commitFocusWanted) setTab('commit')
   }, [commitFocusWanted])
 
-  const partial = useMemo(() => partialFiles(git.view), [git.view])
   const summary = useMemo(() => summarize(git.picked), [git.picked])
   const hasSelection = git.picked.length > 0
   const repos = useMemo(() => allRepos(git.view), [git.view])
@@ -197,7 +196,6 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
             selection={git.selection}
             carried={git.carried}
             expanded={git.expanded}
-            partial={partial}
             current={git.current}
             onCurrent={git.setCurrent}
             onPress={git.pressRow}

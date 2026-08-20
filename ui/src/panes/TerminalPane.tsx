@@ -10,7 +10,14 @@
  */
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { PaneSlot } from '@/layout/PaneSlot'
-import { forgetSession, getHost, openTerminal, peekHost, setHostBusy } from '@/layout/paneHosts'
+import {
+  forgetSession,
+  getHost,
+  noteParsed,
+  openTerminal,
+  peekHost,
+  setHostBusy,
+} from '@/layout/paneHosts'
 import { setPathLinkEnv } from '@/terminal/pathLinks'
 import { copyTerminalSelection, pasteIntoTerminal } from '@/terminal/clipboard'
 import type { TerminalPaneKind } from '@/terminal/keys'
@@ -808,7 +815,15 @@ export function TerminalPane({
       // arrival would report a speed this renderer cannot sustain and would turn credit
       // control back into no control at all.
       const deliver = (bytes: Uint8Array) => {
-        term.write(bytes, () => paneSession.ack(paneId, id, bytes.byteLength))
+        term.write(bytes, () => {
+          paneSession.ack(paneId, id, bytes.byteLength)
+          // The same moment, told to the render watchdog. The bytes are in xterm's buffer
+          // here; whether they ever reach the screen is a separate question, and the one
+          // `terminal/renderStall.ts` exists to ask — a paused `RenderService` keeps parsing
+          // and acking perfectly while painting nothing, so this callback is the only place
+          // the two claims can be told apart.
+          noteParsed(paneId)
+        })
       }
 
       // Live frames that arrive before the snapshot has been written.
