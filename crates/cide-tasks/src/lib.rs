@@ -1573,6 +1573,7 @@ mod tests {
                     title: "t".into(),
                     body: None,
                     agent: None,
+                    status: None,
                 },
                 TaskAuthor::User,
             )
@@ -2009,6 +2010,7 @@ mod tests {
             title: title.to_string(),
             body: None,
             agent: None,
+            status: None,
         }
     }
 
