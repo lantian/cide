@@ -9,7 +9,7 @@
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   white-space: nowrap;
 }
 
@@ -26,14 +26,14 @@
   flex: 1;
   min-width: 0;
   max-width: 320px;
-  height: 26px;
+  height: calc(26px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
   border-radius: 5px;
   background: var(--panel-2);
   color: var(--text);
   font-family: inherit;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .filter:focus {
@@ -44,13 +44,13 @@
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .table th {
   text-align: left;
   font-weight: 400;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--faint);
@@ -72,7 +72,7 @@
 
 .layer {
   color: var(--faint);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 
 /* A binding the user's own file contributed, so it is visible at a glance what has been
@@ -88,7 +88,7 @@
   background: var(--panel);
   padding: 9px 12px;
   margin-bottom: 8px;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
 }
@@ -98,14 +98,14 @@
 }
 
 .clean {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--green);
   margin-bottom: 18px;
 }
 
 .path {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   margin-top: 16px;
   word-break: break-all;
@@ -115,7 +115,7 @@
    filesystem path — a sentence set that way is unreadable. */
 .footnote {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1.45;
   color: var(--faint);
   margin-top: 6px;
@@ -124,7 +124,7 @@
 /* --- the keymap editor --- */
 
 .rowTitle {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--text);
 }
 
@@ -132,13 +132,13 @@
    the palette shows. A user reading this screen to write the file by hand needs both. */
 .rowId {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   color: var(--faint);
   margin-top: 1px;
 }
 
 .rowNote {
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -150,7 +150,7 @@
 }
 
 .action {
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   padding: 0 8px;
   margin-left: 4px;
   border: 1px solid var(--border);
@@ -158,7 +158,7 @@
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   cursor: pointer;
 }
 
@@ -172,7 +172,7 @@
 }
 
 .primary {
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   padding: 0 10px;
   margin-left: 4px;
   border: 1px solid var(--accent);
@@ -180,7 +180,7 @@
   background: var(--accent);
   color: var(--on-accent);
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   cursor: pointer;
 }
 
@@ -234,7 +234,7 @@
   padding: 9px 14px 7px;
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-ui);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   font-weight: 500;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -250,17 +250,17 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 52px;
+  min-height: calc(52px * var(--ui-scale));
   padding: 10px 14px;
   font-family: var(--font-mono);
-  font-size: 18px;
+  font-size: var(--fs-ui-18);
   color: var(--text);
 }
 
 .hint {
   padding: 0 14px 10px;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1.4;
   color: var(--faint);
 }
@@ -287,19 +287,19 @@
 }
 
 .rungLabel {
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--text);
 }
 
 .rungVar {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   margin-top: 2px;
 }
 
 .rungCost {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
   margin-top: 4px;
@@ -312,5 +312,5 @@
   border-radius: 3px;
   background: var(--sel);
   color: var(--text);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }

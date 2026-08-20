@@ -238,6 +238,205 @@ pub struct Project {
     /// comes back live on the next launch, so a stale value costs the user a Resume splash on
     /// the one pane that should never need one.
     pub primary_session: SessionId,
+    /// The Git tool window across the bottom of this project: whether it is open, how tall, and
+    /// which histories it has tabs for. (M18)
+    ///
+    /// # Why `CURRENT_SCHEMA` does not move for this
+    ///
+    /// Modelled on the note [`Self::tab_mru`] carries, and the argument is the same one three
+    /// times over.
+    ///
+    /// `#[serde(default)]` reads every existing `workspace.json` unchanged — a document written
+    /// before this field gets [`ToolWindowState::default()`], which is a closed panel, which is
+    /// exactly what those documents meant.
+    ///
+    /// The two bumps that *did* happen (1 → 2 and 2 → 3, and 3 → 4 for a different reason again)
+    /// were not about serde either; both were about a **defaulted field whose default might
+    /// later move**, where the movement would silently re-scope a live proxy or stop cide
+    /// writing the user's files. Neither hazard exists here. If the tool window's default height
+    /// changes, an existing user's stored height wins because it is on their disk, and if the
+    /// default `open` ever flips, the worst outcome is a panel that appears once and that the
+    /// user closes with one click. A panel is not a proxy scope and is not autosave.
+    ///
+    /// And a bump is not free in the other direction: it makes an older build's read of a newer
+    /// document *certainly* fatal — `persist::load` quarantines a schema it does not know —
+    /// where an unbumped document with one unknown key is read perfectly by every build that
+    /// predates the key. Downgrading across a bump costs the user their whole layout; downgrading
+    /// across this field costs them nothing at all.
+    #[serde(default)]
+    pub tool_window: ToolWindowState,
+}
+
+/// The shortest the tool window may be stored as, in CSS pixels.
+///
+/// Below this the tab bar and one row of log do not both fit, so the panel is present, costing
+/// its own chrome, and showing nothing.
+pub const TOOL_WINDOW_MIN_HEIGHT: u16 = 120;
+
+/// The tallest, in CSS pixels.
+///
+/// The *stored* ceiling, generous on purpose, and it exists for the same reason
+/// [`crate::settings::SIDEBAR_MAX_WIDTH`] does: to stop a corrupt or hand-edited
+/// `workspace.json` producing a panel taller than any monitor. What actually fits depends on the
+/// window, which Rust cannot see, so the frontend applies a second ceiling against the live
+/// viewport before it paints. A 900px panel restored into a 700px window is therefore safe — it
+/// is clamped on the way to the DOM and the stored value survives for the next time the window
+/// is tall enough to honour it.
+pub const TOOL_WINDOW_MAX_HEIGHT: u16 = 900;
+
+/// The Git tool window's own state, per project. (M18)
+///
+/// Per project and not per window, deliberately. The panel is a view of *this project's*
+/// repositories, and the same project shown in two windows (which `Stacked` mode makes ordinary)
+/// is one set of open histories; keying it by window would mean a user who detaches a tab finds
+/// the panel they were reading empty, and a user who reads a history in two windows has to open
+/// it twice.
+///
+/// It sits in [`Project`] rather than in [`crate::settings::Settings`] for the reason the whole
+/// workspace tree exists: this is *what is open*, not *how the app behaves*. A settings field
+/// would be shared across every project, so opening a second project would inherit the first's
+/// history tabs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ToolWindowState {
+    /// Closed by default. A tool window that opens itself on first launch is a strip of chrome
+    /// the user has to dismiss before they have asked anything of it.
+    pub open: bool,
+    /// Height in CSS pixels, clamped to [`TOOL_WINDOW_MIN_HEIGHT`]..=[`TOOL_WINDOW_MAX_HEIGHT`]
+    /// by [`Self::clamped`].
+    pub height: u16,
+    /// The open Log tabs, in strip order.
+    pub history: Vec<HistoryTab>,
+    /// Which of them is showing. `None` exactly when `history` is empty — the same real,
+    /// non-degenerate empty state [`WindowRole::Shell`]'s `active` models, and for the same
+    /// reason: a bare [`HistoryTabId`] would force an empty panel to name a tab that does not
+    /// exist.
+    pub active: Option<HistoryTabId>,
+    /// The commit list's share of the Log tab, in **per mille** (0–1000). 450 is the default.
+    ///
+    /// # Why an integer and not an `f32`
+    ///
+    /// Two reasons, and the second is the one that would have been discovered later.
+    ///
+    /// A float in a *persisted* document does not round-trip exactly through `serde_json`: a
+    /// value written as `0.45` comes back as the nearest `f32`, is re-serialised, and the
+    /// document's bytes change on a save where nothing moved. That is noise in a file the user
+    /// can diff, and it defeats any equality check on a workspace snapshot.
+    ///
+    /// And an `f32` bars `Eq` from every type that transitively contains it. Nothing breaks
+    /// *today* — [`Workspace`], [`Project`] and [`PaneTree`] already derive only `PartialEq`,
+    /// because [`LayoutNode::Split`]'s `ratio` is an `f32` — but "already poisoned" is a
+    /// property of one field in one place, and it is not a licence for the next one. A panel
+    /// divider is a poor reason to make it two.
+    ///
+    /// Per mille rather than percent because the panel is up to 900px tall and a hundred steps
+    /// over that is a 9px jump, which is plainly visible while dragging.
+    pub log_split: u16,
+    /// Whether the details pane groups its changed files into directories, or lists the paths
+    /// flat. `true` — grouped — by default.
+    ///
+    /// # Why it is stored, and why here
+    ///
+    /// A display toggle that forgets is a control the user has to press again every session, so
+    /// the only question is where it lives. It is on the tool window and not in [`Settings`]
+    /// because it is the same class of thing as `log_split` beside it: a fact about how one
+    /// panel of one project is arranged, not a preference about the application. `Settings` is
+    /// global and rides every `workspace-changed` to every window, which is the right shape for
+    /// a font and the wrong one for a panel's own furniture.
+    ///
+    /// Grouped by default because a commit's files share a prefix far more often than not — one
+    /// feature, one directory — and a flat list of thirty paths that all begin
+    /// `crates/cide-git/src/` spends most of its width saying the same thing. The flat reading
+    /// is what a *rename* wants, since `old → new` across directories is unreadable when the two
+    /// halves are in different subtrees, which is exactly why the choice is offered rather than
+    /// decided.
+    #[serde(default = "files_as_tree_default")]
+    pub files_as_tree: bool,
+}
+
+/// Grouped. A free function because `#[serde(default = …)]` names a path, not an expression, and
+/// `bool::default()` is `false` — the opposite of what this field wants.
+fn files_as_tree_default() -> bool {
+    true
+}
+
+impl Default for ToolWindowState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            height: 260,
+            history: Vec::new(),
+            active: None,
+            log_split: 450,
+            files_as_tree: files_as_tree_default(),
+        }
+    }
+}
+
+impl ToolWindowState {
+    /// The height brought inside [`TOOL_WINDOW_MIN_HEIGHT`]..=[`TOOL_WINDOW_MAX_HEIGHT`] and the
+    /// split inside 0..=1000.
+    ///
+    /// Applied where a patch lands rather than where the workspace is read, mirroring
+    /// [`crate::settings::SidebarSettings::clamped`]: clamping on read means the stored file
+    /// never converges and is re-corrected on every launch for ever, where clamping on write
+    /// fixes it once.
+    #[must_use]
+    pub fn clamped(mut self) -> Self {
+        self.height = self
+            .height
+            .clamp(TOOL_WINDOW_MIN_HEIGHT, TOOL_WINDOW_MAX_HEIGHT);
+        self.log_split = self.log_split.min(1000);
+        // Every tab's own divider too. A hand-edited `workspace.json` can hold any number, and a
+        // History tab whose split is 60000 is a pane grid with one column — the same failure
+        // `log_split` is clamped against, once per tab.
+        for tab in &mut self.history {
+            tab.split = tab.split.map(|s| s.min(1000));
+        }
+        self
+    }
+}
+
+/// One tab of the tool window's Log surface. (M18)
+///
+/// The whole tab and not a `(RepoId, String)` pair, because two tabs on the same file are the
+/// ordinary case — see [`HistoryTabId`]'s own note — so the identity has to be minted rather
+/// than derived from the subject.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HistoryTab {
+    /// This tab's divider, in per mille, or `None` for the kind's default.
+    ///
+    /// # Per tab, not per project (M21)
+    ///
+    /// `ToolWindowState::log_split` is the Log tab's, and a History tab wants a different number
+    /// for a reason that is about the *question* rather than about taste: the Log tab's right
+    /// half is a commit's summary and its file list, which is a narrow column beside a wide list,
+    /// while a History tab's right half is **one file's diff** — the thing the tab was opened to
+    /// read. Fifty-fifty is what that wants, and it is what was asked for.
+    ///
+    /// Sharing one number would make the two fight: dragging the log wide would squeeze every
+    /// history diff, and widening a diff would squeeze the log. `None` rather than a stored 500
+    /// so a tab that has never been dragged follows the default if it ever changes, which is the
+    /// same reason `log_split` is a field and not a literal at the call site.
+    #[serde(default)]
+    pub split: Option<u16>,
+    pub id: HistoryTabId,
+    pub repo: RepoId,
+    /// Repo-relative and slash-separated, the way `cide_ipc::git` spells every path. **Empty
+    /// means the whole repository**, which is the commonest tab of all — an `Option<String>`
+    /// would put a `None` case into every consumer to express a state that is already the
+    /// natural zero of a path filter, and `cide_ipc::history::LogQuery::path` converts the empty
+    /// string to `None` at the one seam that cares.
+    pub path: String,
+    /// What the chip shows: a file name, or the repository's name for a whole-repository tab.
+    ///
+    /// Stored rather than derived, for the reason [`DiffSpec`] gives about titles generally: the
+    /// title is a *label the gesture chose* and it survives a restart, where a derived one would
+    /// change the day the derivation is improved and would silently relabel every saved tab.
+    pub title: String,
 }
 
 /// A project the user opened once, remembered after it closed.
@@ -417,6 +616,46 @@ pub enum TabKind {
         #[serde(default)]
         preview: bool,
     },
+    /// A file as it was at some revision, read-only. (M18)
+    ///
+    /// # Why this is not a [`Self::File`] with a rev on it
+    ///
+    /// A `File` tab is an editable buffer over a path on disk, and every piece of machinery
+    /// hanging off it assumes that: it is `dirty` or it is not, autosave writes it, the LSP
+    /// serves completions into it, `openDiff` can retarget it. **None of that is true of a
+    /// commit's version of a file**, which cannot be saved anywhere, and a `rev: Option<String>`
+    /// on `File` would make every one of those consumers responsible for remembering to check
+    /// it. A separate variant makes "you cannot edit this" a fact of the type rather than a rule
+    /// each reader has to know.
+    ///
+    /// # Why the path is a `String` and not a `PathBuf`
+    ///
+    /// It is **repo-relative**, the way `cide_ipc::git` spells every path — there is no file on
+    /// disk for this tab to point at, and an absolute path here would be a claim that there is.
+    /// [`Self::File`]'s `PathBuf` is absolute precisely because that tab *is* a file on disk.
+    Revision {
+        repo: RepoId,
+        /// Repo-relative, slash-separated.
+        path: String,
+        /// The revision to read the blob at, as a full oid — resolved when the tab was opened
+        /// rather than kept as the revspec the user typed. `HEAD~3` means a different commit
+        /// tomorrow, and a tab restored from `workspace.json` must show the same bytes it showed
+        /// when it was saved.
+        rev: String,
+        /// The revisions this tab was reached *from*, newest last: the trail of "blame the
+        /// parent" and "older revision" hops that led here.
+        ///
+        /// Persisted because it is the only way back. The hops are a walk through history, and a
+        /// user four hops deep who restarts cide would otherwise land on a commit with no
+        /// explanation of how they got there and no route out but the log. A `Vec` and not a
+        /// single `from`, because the gesture is repeatable and each step has to stay
+        /// individually reachable.
+        from: Vec<String>,
+        /// What the tab strip shows — `main.rs @ a1b2c3d`. Stored for the reason [`DiffSpec`]
+        /// gives: a derived title changes the day the derivation is improved and relabels every
+        /// saved tab.
+        title: String,
+    },
     Settings {
         section: SettingsSection,
     },
@@ -438,6 +677,7 @@ impl TabKind {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string_lossy().into_owned()),
             Self::Diff { spec, .. } => spec.title.clone(),
+            Self::Revision { title, .. } => title.clone(),
             Self::Settings { .. } => "Settings".into(),
         }
     }
@@ -513,6 +753,33 @@ pub enum DiffOrigin {
         /// starts, which is all a saved layout has any business remembering.
         side: crate::git::DiffSide,
     },
+    /// Opened from the Git tool window: two revisions of one file. (M18)
+    ///
+    /// A sibling of [`Self::Git`] and not an extension of it, because the two name different
+    /// coordinate systems and only one of them is answerable. `Git`'s `side` picks a pair of
+    /// trees around the *working tree* — HEAD→index, index→workdir — which is the pair a
+    /// selection can be staged from; this one names two frozen revisions, which nothing can be
+    /// staged from at all. Folding the two together would mean a `DiffSide` that had to grow a
+    /// "neither" case, and every consumer of `Git`'s `side` — `cide_git::stage::stage`,
+    /// `unstage`, `commit` — would have to learn to refuse it. A separate variant refuses by
+    /// construction.
+    ///
+    /// Like `Git`, these three fields are the **fetch key** the pane re-reads with, and for the
+    /// reason [`DiffSpec`] states: no diff text may be persisted. Unlike `Git`, the read is
+    /// reproducible — two commits diff to the same bytes for ever — so a restored tab shows
+    /// exactly what it showed when it was saved.
+    GitRevision {
+        repo: RepoId,
+        /// Repo-relative and slash-separated.
+        path: String,
+        /// The two sides. [`crate::history::RevSide::FirstParent`] is the reason these are a
+        /// union rather than a pair of oids: "this commit against its parent" has to still mean
+        /// that after a restart, and freezing the parent's oid into the saved tab survives a
+        /// restart but not a rebase — the frozen oid then names a commit that is no longer an
+        /// ancestor of anything the user can find in their own log.
+        new: crate::history::RevSide,
+        old: crate::history::RevSide,
+    },
     /// Opened by Claude Code's `openDiff` RPC.
     ///
     /// This one **blocks an agent turn**: the CLI will not proceed until the request is
@@ -576,6 +843,38 @@ pub enum SettingsSection {
     /// under a font size makes it undiscoverable. Named for IDEA's own tree node — the sidebar
     /// panel keeps "Problems", so the two surfaces are not both called the same thing.
     Inspections,
+    /// The subagent roles this project and this user define, edited as a form. (M18)
+    ///
+    /// # Why a section, rather than a group under something that exists
+    ///
+    /// The same test [`Self::Files`] passes, applied to a different candidate. `Editor` is "the
+    /// code buffer" and `ClaudeSessions` is the one Claude conversation a project's console
+    /// hosts; a role is neither. It is a *definition* — a system prompt plus the switches that
+    /// make that prompt safe — that cide will spawn an unattended process from, in a git worktree
+    /// of the user's repository. Filing that under a heading about fonts or about a single
+    /// interactive pane makes the one screen that decides what an autonomous process may do the
+    /// hardest thing on the settings tree to find, which is the argument `Inspections` makes
+    /// about a 1–4 GB indexer's switch and it is stronger here.
+    ///
+    /// # Why it is a settings section at all, when a role is a file in the repository
+    ///
+    /// Because "I don't want to configure a yaml, I want a UI for that" is the complaint it
+    /// answers, and the place a person looks for a UI to configure something is Settings. The
+    /// Agents *sidebar panel* is the roster — what roles exist, what is running, what to
+    /// dispatch — and it is deliberately read-only about the definitions, for the reason
+    /// [`crate::AgentDef::system_prompt`] gives: a row is not a surface anybody opened in order
+    /// to edit a committed file. This is the surface they did.
+    ///
+    /// # What it does *not* mean
+    ///
+    /// Unlike every other variant here, this section does not draw
+    /// [`crate::Settings`] and does not write a [`crate::SettingsPatch`]. It edits two
+    /// directories of markdown — `<root>/.cide/agents/` and `$XDG_CONFIG_HOME/cide/agents/` —
+    /// through `agents_save`/`agents_delete`, and one of those is per-project. That asymmetry is
+    /// real and is argued out in [`crate::OrchestrationConfig`]'s doc; it is admitted here so
+    /// that nobody "fixes" it by adding role definitions to `Settings`, which would follow the
+    /// user into every repository they open.
+    Agents,
     Git,
     Terminal,
 }

@@ -57,130 +57,34 @@ impl serde::Serialize for SessionError {
     }
 }
 
-/// Environment every PTY child gets.
+/// Environment every PTY child gets, folded into the spec it will be spawned from.
 ///
-/// `TERM=xterm-256color` rather than plain `xterm` is not cosmetic: with `xterm` the
-/// Claude Code TUI falls back to 8 colours and ASCII box-drawing, and the alternate screen
-/// does not engage. Scrubbing `TMUX` matters for the same reason — its presence triggers
-/// an unconditional 256-colour clamp that visibly desaturates the accent colour.
+/// **The list is composed in [`cide_core::child_env::terminal_child_env`], and its long note is
+/// the one to read**: the ordering of the passes, why `TERM=xterm-256color` and not
+/// `xterm`, why `ANTHROPIC_API_KEY` is deliberately absent, why the `CLAUDE_CODE_*` switches are
+/// folded late, and why `user_env` — alone among them — stops at a shell pane. All of it moved
+/// there in M18 rather than being copied, because a subagent run needs the identical list and
+/// `cide-agents` cannot reach into `cide-app`.
 ///
-/// Deliberately absent: `ANTHROPIC_API_KEY`. It outranks subscription OAuth in the
-/// credential precedence order, so injecting one would silently bill a Console org for a
-/// user on Claude Max. The child inherits its auth by inheriting the environment; cide
-/// never reads `~/.claude/.credentials.json`.
+/// What is left here is the fold, which is exactly the half `cide-core` cannot do: it does not
+/// link `cide-pty`, and must not. `SpawnSpec::apply` is the one implementation of it.
 ///
-/// The proxy variables are **not** here: they are the user's configuration rather than a
-/// constant of the terminal, so they are a second pass — [`apply_proxy`], over the rule in
-/// [`cide_core::proxy`] — applied on top of this one. Nothing about proxying changes the rule
-/// in the paragraph above.
+/// `CARGO_PKG_VERSION` is read *here* and passed in, so `TERM_PROGRAM_VERSION` keeps reporting
+/// the application's version rather than whichever crate happened to compose the list.
 ///
-/// The first pass is [`cide_core::child_env`], which undoes what *our own* launcher did to the
-/// environment before a pane ever sees it. Running from the AppImage, `AppRun` leaves
-/// `PYTHONHOME` pointing inside a bundle that contains no Python, and every stdio MCP server a
-/// pane's `claude` spawns dies on `No module named 'encodings'` before it can speak protocol —
-/// reported by the CLI as `CONNECTION_CLOSED` against a configuration that is perfectly
-/// correct. It runs first so that the explicit settings below are the ones that survive a
-/// collision, and it is a no-op for every non-bundled launch.
-///
-/// # The `CLAUDE_CODE_*` pass, and why it is last
-///
-/// [`cide_core::child_env::claude_env`] turns the user's [`cide_ipc::ClaudeSettings`] into the
-/// same `EnvChange` list, and is folded **after** the constants below so that a switch the user
-/// actually set wins over anything this function assumed. It carries
-/// `CLAUDE_CODE_SCROLL_SPEED`, which used to be a literal `3` here.
-///
-/// The comment that literal carried was wrong, and the correction is the point of this
-/// paragraph. It read *"xterm.js reports one wheel event per notch, unamplified"*. Claude Code's
-/// own renderer heuristic concludes the opposite: it classifies a terminal announcing itself as
-/// `xterm.js` — which cide's XTVERSION reply deliberately does, see `ui/src/terminal/xterm.ts`
-/// — as a wheel **flooder**, and on that branch its unset default is `1` rather than the `3` it
-/// gives other renderers. So this variable was never the amplifier the comment described; it
-/// was cancelling a penalty cide had asked for two files away, and landing back on the ordinary
-/// default. Setting it remains right. The stated reason was not.
-///
-/// What a notch is actually worth is the product of two numbers, and cide only owns one of
-/// them. xterm.js sends **at most one mouse report per DOM wheel event** — `sendEvent` computes
-/// a line count and then discards it — and under a high-resolution wheel on Wayland one notch
-/// arrives as several small deltas, each of which `CoreMouseService.consumeWheelEvent` scales by
-/// `0.3` when `|deltaY| < 50` on the theory that it is a trackpad. Whether this machine's mouse
-/// lands in that regime is not knowable from here, and is not knowable without a wheel and a
-/// window. That is why the number is now the user's: it is the half of the product cide can
-/// move, from a control, without guessing at the other half.
-///
-/// Applied to every pane rather than only to `claude` ones, which is deliberate and matches
-/// what the literal did before. These variables mean nothing to `bash`, and a user who types
-/// `claude` at a shell pane's prompt should get the settings they configured rather than the
-/// defaults of a program cide did not notice starting.
-///
-/// # The user's own variables, and why *those* stop at a shell pane (M16)
-///
-/// [`cide_core::claude_cli::user_env`] is folded last of the three, and only when `is_claude`.
-/// The inconsistency with the paragraph above is deliberate and is written down here so it is
-/// not "fixed" later: the four `CLAUDE_CODE_*` names are inert to `bash` — a shell that
-/// inherits them is a shell that ignores them — while an arbitrary `NODE_OPTIONS`,
-/// `GIT_SSH_COMMAND` or `PATH` from that list is not inert to anything. A field labelled
-/// *the environment claude panes are spawned with* must not quietly become the environment the
-/// user's own shell is spawned with too.
-///
-/// Last of the three so that a variable the user set beats a constant this function assumed —
-/// which is why `TERM`, `COLUMNS`, `LINES` and `TMUX` are on the refusal list rather than left
-/// to be shadowed. Everything applied *after* this function — the proxy pass,
-/// `CLAUDE_CODE_SSE_PORT`, `CIDE_HOOK_SOCK` — is out of the user's reach by construction, which
-/// is the other half of why those names are refused rather than merely discouraged: a value
-/// this list carried for one of them would be overwritten with nothing on screen saying so.
+/// The proxy variables are still a separate pass applied on top of this one — see
+/// [`apply_proxy`] — and everything after that (`CLAUDE_CODE_SSE_PORT`, `CIDE_HOOK_SOCK`) is
+/// added by `session_spawn` itself, in an order that is load-bearing and documented there.
 fn base_env(
     spec: SpawnSpec,
     claude: &cide_ipc::ClaudeSettings,
     user_env: Vec<cide_core::child_env::EnvChange>,
 ) -> SpawnSpec {
-    // Two passes, and the second is M17's. `bundle_scrub` only ever *removes*, so until now a
-    // pane's child got cide's own `PATH` verbatim — which for a Finder-launched `.app` is
-    // launchd's `/usr/bin:/bin:/usr/sbin:/sbin` and contains neither Homebrew nor `~/.local/bin`.
-    // `child_path` appends the directories `toolchain::search_paths` already searches, and it is
-    // built *from* the scrub's `PATH` so nothing the scrub dropped comes back; chained rather
-    // than folded separately so the ordering is visible in one expression.
-    //
-    // This is also what closes the exec gap README records under *Finding `claude` from a
-    // Finder-launched `.app`*: `claude_cli::resolve` validates a bare `claude` against
-    // `search_paths()`, and portable-pty resolves a bare program against the builder's own
-    // `PATH` — so the check and the spawn now consult the same list instead of disagreeing about
-    // a directory and turning a refusal with a remedy in it into an opaque `ENOENT`.
-    //
-    // `user_env` still folds last (below), so a `PATH` a user set in Settings → Claude keeps the
-    // last word over this.
-    let scrub = cide_core::child_env::bundle_scrub();
-    let path = cide_core::child_env::child_path(&scrub);
-    let spec = apply_env_changes(spec, scrub.into_iter().chain(path))
-        .env("TERM", "xterm-256color")
-        .env("COLORTERM", "truecolor")
-        .env("TERM_PROGRAM", "cide")
-        .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        // A terminal that inherits stale COLUMNS/LINES lies to the child about its size
-        // until the first SIGWINCH.
-        .env_remove("COLUMNS")
-        .env_remove("LINES")
-        .env_remove("CI");
-    let spec = apply_env_changes(spec, cide_core::child_env::claude_env(claude));
-    apply_env_changes(spec, user_env)
-}
-
-/// Fold a list of [`cide_core::child_env::EnvChange`]s into a spec.
-///
-/// A separate function only so it can be tested: `bundle_scrub` reads the real process
-/// environment, which a test cannot set up without `unsafe` and a race against every other
-/// thread, but the folding is where an ordering or set-versus-remove mistake would live.
-fn apply_env_changes(
-    spec: SpawnSpec,
-    changes: impl IntoIterator<Item = cide_core::child_env::EnvChange>,
-) -> SpawnSpec {
-    changes
-        .into_iter()
-        .fold(spec, |spec, (name, value)| match value {
-            Some(value) => spec.env(name, value),
-            None => spec.env_remove(name),
-        })
+    spec.apply(cide_core::child_env::terminal_child_env(
+        claude,
+        env!("CARGO_PKG_VERSION"),
+        user_env,
+    ))
 }
 
 /// Which column of [`cide_ipc::ProxyScope`] a pane about to be spawned falls in.
@@ -205,7 +109,7 @@ fn pane_proxy_target(scope: &cide_ipc::ProxyScope, is_claude: bool) -> cide_ipc:
 /// `SpawnSpec`. What is left here is the fold, which is exactly the part `cide-core` cannot
 /// do: it does not link `cide-pty`, and must not.
 fn apply_proxy(spec: SpawnSpec, env: &ProxyEnv) -> SpawnSpec {
-    apply_env_changes(spec, env.changes().to_vec())
+    spec.apply(env.changes().to_vec())
 }
 
 /// One line for the log, with any credentials removed.
@@ -311,6 +215,322 @@ fn hook_settings(theme: cide_ipc::Theme) -> Option<String> {
     serde_json::to_string(&settings).ok()
 }
 
+/// The `cide-hook` binary, if it is where every packaging format this project ships puts it.
+///
+/// Beside `current_exe()`, and **absolute**, which is the whole point: the child's cwd is the
+/// project root and its `PATH` is the user's, so a bare `cide-hook` handed to `--mcp-config`
+/// resolves to nothing and the CLI reports `CONNECTION_CLOSED` from a process three levels below
+/// anything cide logs. `hook_settings` makes the same assumption and performs the same `exists()`
+/// check inline, for the same reason: a path that is merely *predicted* fails inside the child.
+fn cide_hook_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let hook = exe.parent()?.join("cide-hook");
+    hook.exists().then_some(hook)
+}
+
+/// The inline `--mcp-config` JSON attaching cide's own MCP server, or `None` when `cide-hook`
+/// cannot be located.
+///
+/// # An inline string, not a file
+///
+/// `claude --help` documents `--mcp-config <configs...>` as *"Load MCP servers from JSON files or
+/// strings"*, and the string form was verified end to end against the installed CLI — the model
+/// called a probe server's tool. So nothing is written into the user's project and nothing is left
+/// behind if cide is killed, which a temp file would be.
+///
+/// # The name is what the model sees
+///
+/// The CLI namespaces a server's tools as `mcp__<server>__<tool>`, so calling this server `cide`
+/// is what makes the vocabulary arrive as `mcp__cide__cide_task_list`. That is the spelling to use
+/// in an `--allowedTools` line or in prose; the bare `cide_task_list` never appears on the model's
+/// side of the wire.
+///
+/// # `--strict-mcp-config` is deliberately absent
+///
+/// It would drop every MCP server the *user* configured, silently, in exchange for cide's one.
+/// Attaching a tracker is not a reason to take somebody's own tooling away from their session.
+fn agent_mcp_config() -> Option<String> {
+    let hook = cide_hook_binary()?;
+    // Built with serde rather than formatted, so a path containing a quote or a backslash — a
+    // build directory under a name with an apostrophe in it — cannot produce a config the CLI
+    // parses as something else.
+    serde_json::to_string(&serde_json::json!({
+        "mcpServers": {
+            "cide": {
+                "command": hook.to_string_lossy(),
+                // `cide-hook mcp` is the bridge: stdio in, `$CIDE_AGENT_SOCK` out, and no
+                // knowledge of the vocabulary at all. See its module doc.
+                "args": ["mcp"],
+            }
+        }
+    }))
+    .ok()
+}
+
+/// Append cide's `--mcp-config` to a Claude pane's argv, if the injection is still on.
+///
+/// # Why a function rather than four lines at the spawn
+///
+/// `session_spawn` needs an `AppHandle`, a live `AgentRpcServer` and a real PTY, so the gate
+/// inside it cannot be driven by a test — and a gate nothing exercises is one that will be
+/// wrong the first time somebody edits around it. This is the same shape `base_env` has and for
+/// the same reason: the decision is here, the ingredients are handed in.
+///
+/// `config` is a closure and not a value, for the reason the `--settings` block at the spawn
+/// records: `agent_mcp_config` stats `cide-hook` beside the running binary, and a switched-off
+/// injection must not pay that on every spawn — which is why `hook_settings` moved inside its
+/// own gate.
+///
+/// A pane whose user switched this off is **silent** here, exactly as a pane with no
+/// `--settings` is: the toggle in `ClaudeCliSection.tsx` states what it costs, and a warning
+/// per spawn for a setting somebody chose is noise. The `None` arm is not the same thing — no
+/// `cide-hook` beside the running binary is a packaging failure nobody chose, and it is the
+/// only one of the two that gets a line.
+fn with_task_tools(
+    spec: SpawnSpec,
+    inject: &cide_core::claude_cli::Injected,
+    config: impl FnOnce() -> Option<String>,
+) -> SpawnSpec {
+    let Some(flag) = inject.flag(cide_core::claude_cli::Injection::McpConfig) else {
+        return spec;
+    };
+    match config() {
+        Some(json) => spec.arg(flag).arg(json),
+        None => {
+            tracing::warn!("cannot locate cide-hook; this session gets no task tools");
+            spec
+        }
+    }
+}
+
+// ==========================================================================================
+// The roster paragraph: telling a project's primary pane that it is the product owner.
+// ==========================================================================================
+
+/// The flag that cannot coexist with the one this file adds.
+///
+/// Spelled here rather than reached out of `cide_core::claude_cli::WARNED_ARGS`, deliberately.
+/// The *behaviour* — add nothing when the user has set this — must not depend on a table entry
+/// staying put, because deleting the row would silently turn the degradation back into a pane
+/// that fails to start. The row's job is to *explain* the degradation on the Settings screen, and
+/// `the_warned_row_and_this_file_still_describe_the_same_degradation` is what keeps the two
+/// together.
+const APPEND_SYSTEM_PROMPT_FILE: &str = "--append-system-prompt-file";
+
+/// Does the user's launch configuration carry `--append-system-prompt-file`, in either spelling?
+///
+/// # Why this exists, measured
+///
+/// On 2.1.235 the CLI refuses `--append-system-prompt` and `--append-system-prompt-file` together
+/// **outright** — `Error: Cannot use both --append-system-prompt and --append-system-prompt-file.
+/// Please use only one.` — and the pane never starts. `fold_append_system_prompt` cannot repair
+/// it: it folds two occurrences of *one* flag into one, and these are two mutually exclusive
+/// flags with nothing to fold into. So the decision has to be made here, at the call site that
+/// adds the paragraph, and the honest answer is to **degrade rather than refuse**: cide drops its
+/// own paragraph, the user's file is read in full, the pane starts, and the roster still reaches
+/// the model through the tool descriptions (`cide_agents::tools::description`), which are what
+/// actually make it call `cide_agents_list`. Refusing the argument instead would take away a
+/// field that works today to protect an addition of cide's own.
+///
+/// The `=` spelling is split the way `RefusedArg::matches` splits it, and matched on the **whole**
+/// token: a `starts_with` here would also match `--append-system-prompt`, which is the flag this
+/// must not confuse it with.
+fn carries_append_system_prompt_file(args: &[String]) -> bool {
+    args.iter().any(|token| {
+        token
+            .split_once('=')
+            .map_or(token.as_str(), |(name, _)| name)
+            == APPEND_SYSTEM_PROMPT_FILE
+    })
+}
+
+/// The system-prompt paragraph for a project's product-owner pane, or `None`.
+///
+/// `None` for every pane that is not the project's primary Claude pane, and for every project
+/// whose `.cide/config.json` does not say `enabled: true` — which is almost all of them, and is
+/// the default `cide_agents::config`'s module header calls the single most important line in that
+/// crate. A pane that gets no paragraph is a pane whose argv is byte for byte what it was before
+/// M18.
+///
+/// # Namespaced tool names, measured
+///
+/// The names here are `mcp__cide__cide_agent_dispatch`, not `cide_agent_dispatch`. The CLI
+/// namespaces an MCP server's tools as `mcp__<server>__<tool>` — verified end to end against the
+/// installed CLI while `agent_mcp_config` was written — so a paragraph naming the bare form would
+/// be telling the model about tools it cannot see under that name.
+///
+/// # Why the roles are named here at all
+///
+/// `cide_agents_list` answers this better and stays current, and the paragraph is fixed at spawn.
+/// Naming them anyway is what makes the model *ask*: a session told "you have roles" with no
+/// names has no reason to spend a tool call finding out, and this channel is the only one that
+/// arrives before the first turn. The paragraph therefore names the roles **and** the tool that
+/// re-reads them, and says which of the two is current.
+fn orchestrator_paragraph(
+    app: &tauri::AppHandle,
+    registry: &SessionRegistry,
+    project: cide_ipc::ProjectId,
+    resume: Option<SessionId>,
+    forking: bool,
+) -> Option<String> {
+    let state = app.try_state::<crate::workspace_state::WorkspaceState>()?;
+    // One lock acquisition, and the disk read happens after it is released: `WorkspaceState::with`
+    // runs under a non-reentrant lock and `load_project` below opens a directory.
+    let root = state.with(|ws| {
+        if !is_primary_console_spawn(ws, registry, project, resume, forking) {
+            return None;
+        }
+        cide_core::workspace::project(ws, project)
+            .ok()?
+            .roots
+            .first()
+            .map(|root| root.path.clone())
+    })?;
+
+    // Read fresh, here, for `cide_agents`' stated reason: `.cide/*` is committed, so a teammate's
+    // commit or a `git checkout` changes it under a running app and nothing caches it. It costs a
+    // `read_dir`, a handful of small files and one `PATH` walk — on this thread, at most once per
+    // console pane spawn, which is once per launch or restart. `claude_cli::resolve` above already
+    // pays a comparable price on the same thread for the same reason: the alternative is a pane
+    // that starts before cide knows what to tell it.
+    let agents = cide_agents::load_project(&root);
+    if !agents.enabled() {
+        return None;
+    }
+
+    let roles: Vec<&cide_ipc::AgentDef> = agents.catalog.agents.iter().map(|a| &a.def).collect();
+    Some(roster_paragraph(&roles))
+}
+
+/// The paragraph itself, as a pure function of the roles.
+///
+/// Split from [`orchestrator_paragraph`] so the prose — which is a contract with a language model
+/// and the only part of this that can be *wrong* rather than merely absent — is reachable from a
+/// test with no `AppHandle`, no workspace and no `.cide/` directory.
+fn roster_paragraph(roles: &[&cide_ipc::AgentDef]) -> String {
+    let roles = if roles.is_empty() {
+        // Said rather than omitted: a session told it is the product owner and handed no roles
+        // would call `cide_agents_list`, get an empty answer, and have no idea whether that is a
+        // failure or the truth. Naming the file is the only action available.
+        "This project defines no roles yet — they are markdown files at `.cide/agents/<name>.md`, \
+         and only the user can add one — so there is nobody to dispatch to until one appears."
+            .to_string()
+    } else {
+        format!(
+            "The roles it defines right now are {}.",
+            roles
+                .iter()
+                .map(|def| {
+                    let description = one_line(&def.description);
+                    if description.is_empty() {
+                        format!("`{}`", one_line(def.id.as_str()))
+                    } else {
+                        format!("`{}` ({description})", one_line(def.id.as_str()))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    format!(
+        "You are the product owner for this project in cide. You do not have to do everything \
+         yourself: this project has subagents, and you can decompose a goal into tasks, hand each \
+         one to a role, and check the result. {roles} That list was read when this session \
+         started; `mcp__cide__cide_agents_list` is the current one. Dispatch with \
+         `mcp__cide__cide_agent_dispatch`, which takes a role and a task id and returns a run id \
+         immediately without waiting for the run; watch with `mcp__cide__cide_agent_runs`; stop a \
+         run that is going the wrong way with `mcp__cide__cide_agent_stop`; and take a role's \
+         finished work back into this branch with `mcp__cide__cide_agent_integrate`. Track the \
+         work itself with the `mcp__cide__cide_task_*` tools, which read and write this project's \
+         shared task tracker at `.cide/tasks.json`: create the task before you dispatch it, \
+         because a run is pointed at its task and reads the statement of the work from there. A \
+         run reports back only through that tracker, so read a task's comments to find out what \
+         its run did."
+    )
+}
+
+/// Whatever it is handed, on one line, with runs of whitespace collapsed.
+///
+/// A role's description comes out of a committed markdown file, so it can be several lines. This
+/// paragraph is one; the value of flattening is not the CLI's (an argv value may hold newlines
+/// perfectly well) but the reader's — a wrapped sentence in the middle of a system prompt reads
+/// as a new instruction.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Is this spawn the project's product-owner pane — the console's founding [`PaneRole::Primary`]
+/// Claude pane?
+///
+/// # Why this is inferred rather than told
+///
+/// `session_spawn` is handed a program, a cwd, a geometry and a project. **It is never told which
+/// pane it is spawning for**: the binding is made afterwards, by `pane_bind_session`, once the
+/// frontend has the id back. Adding a pane parameter would be a change to `session.spawn`'s
+/// options object in `ui/src/ipc/client.ts` and to every caller of it, which is a wider change
+/// than the paragraph is worth — so this reads the workspace instead, and the reading is written
+/// out here because it is the part a reviewer has to check.
+///
+/// Four rules, each closing a case that is otherwise wrong:
+///
+/// * **A fork is never the console.** `SplitIntent::ForkPrimary` spawns with the console's own
+///   session as `resume` and `fork: true`, so without this the branch pane would be told it is
+///   the product owner — the one false positive that is not merely theoretical.
+/// * The pane is `tabs[0]`'s `PaneRole::Primary` Claude pane, **or the same pane sitting in
+///   `project.detached`** — `detach_pane` removes a pane from its tree, and the console is
+///   exactly the pane somebody tears into its own window to watch a long turn. This is the
+///   lookup `cmd::file`'s default target makes, plus that correction.
+/// * **With a `resume`**, it is the console iff the id being resumed is the one that pane holds.
+///   `pane.conversation` counts as well as `pane.session`, because `restore_for` prefers the
+///   conversation the CLI last reported.
+/// * **Without one**, it is the console iff that pane holds no live child. A fresh console spawn
+///   is either a pane whose session has never existed (first launch) or one whose child was just
+///   killed (`claude.restart`); every *other* Claude pane spawns while the console's own child is
+///   alive, so it answers false.
+///
+/// # The case this is wrong about, stated
+///
+/// A user who splits a **new** Claude pane during the window in which the console has no live
+/// child — between a restart's kill and its respawn, or before the console has spawned at all —
+/// gets the paragraph on that pane. The cost is bounded and one-sided: the paragraph is prose,
+/// the five orchestration tools are scoped by `agent_rpc` against `Project::primary_session` and
+/// **not** by this, so such a pane is told it is the product owner and then finds it has no
+/// dispatch tool. Annoying; not dangerous, and not a second path to a dispatch.
+fn is_primary_console_spawn(
+    ws: &cide_ipc::Workspace,
+    registry: &SessionRegistry,
+    project: cide_ipc::ProjectId,
+    resume: Option<SessionId>,
+    forking: bool,
+) -> bool {
+    use cide_ipc::{PaneKind, PaneRole};
+
+    if forking {
+        return false;
+    }
+    let Ok(project) = cide_core::workspace::project(ws, project) else {
+        return false;
+    };
+    let Some(console) = project
+        .tabs
+        .first()
+        .into_iter()
+        .flat_map(|tab| tab.tree.panes.values())
+        .chain(project.detached.values())
+        .find(|pane| pane.kind == PaneKind::Claude && pane.role == PaneRole::Primary)
+    else {
+        return false;
+    };
+
+    match resume {
+        Some(resume) => console.session == Some(resume) || console.conversation == Some(resume),
+        None => console
+            .session
+            .is_none_or(|held| registry.get(held).is_none_or(|pty| pty.has_exited())),
+    }
+}
+
 /// Convert a wire geometry into the PTY crate's own, which clamps and derives pixel dims.
 fn pty_geometry(g: Geometry) -> PtyGeometry {
     PtyGeometry::new(g.cols, g.rows, g.cell_width, g.cell_height)
@@ -410,7 +630,7 @@ pub async fn session_spawn(
     // A shell pane gets neither half — see `base_env`'s note on why the env stops here, and
     // note that the arguments have nowhere sensible to go either: `--model opus` handed to
     // `bash` is a login shell that fails to start.
-    let plan = if is_claude {
+    let mut plan = if is_claude {
         cide_core::claude_cli::plan_here(&claude_settings.cli)
     } else {
         cide_core::claude_cli::Plan::default()
@@ -445,12 +665,54 @@ pub async fn session_spawn(
         spec.program = configured.to_string();
     }
 
+    // The roster paragraph, for a project's product-owner pane and for nothing else.
+    //
+    // **Folded into `plan.args`, before they are written, and never pushed at the end of the
+    // argv.** Two facts make that the only correct place. `fold_append_system_prompt` rewrites
+    // the user's own vector — a second `--append-system-prompt` occurrence does not error, the
+    // *last* one silently wins and every earlier one is discarded (measured on 2.1.235), so a
+    // raw push here would delete a paragraph the user set in Settings with no error anywhere.
+    // And cide's arguments are appended after the user's, which is what makes cide's the later
+    // occurrence and therefore theirs the one that would vanish. Folding leaves exactly one
+    // occurrence, where the user put it, carrying their text and then cide's.
+    //
+    // The ordering below is untouched: the fold either merges in place or appends to the *user's*
+    // block, and `--append-system-prompt` takes exactly one value, so nothing here can swallow a
+    // token cide writes afterwards.
+    //
+    // Gated on `Injection::McpConfig` as well, because every instruction the paragraph carries is
+    // a call to `mcp__cide__cide_agent*` or `mcp__cide__cide_task_*`. With that injection off
+    // those tools are not attached, and the paragraph would be a system prompt telling a session
+    // to reach for a vocabulary it does not have — the model would try, fail, and have nothing to
+    // say about why. Silent is the right answer: the toggle states what it costs.
+    if is_claude
+        && plan.inject.has(cide_core::claude_cli::Injection::McpConfig)
+        && let Some(project) = project
+        && let Some(paragraph) =
+            orchestrator_paragraph(&app, &registry, project, resume, wants_fork(fork))
+    {
+        if carries_append_system_prompt_file(&plan.args) {
+            // Degrade, do not refuse: the two flags cannot coexist and the CLI refuses the pair
+            // outright, so adding ours would make this pane fail to start. One line, on the one
+            // spawn per project where it can apply — `WARNED_ARGS` carries the user-facing half
+            // of this promise on the Settings screen. See `carries_append_system_prompt_file`.
+            tracing::warn!(
+                "this pane sets {APPEND_SYSTEM_PROMPT_FILE}, which the CLI refuses beside \
+                 --append-system-prompt, so cide is not adding its subagent roster paragraph; \
+                 the roster still reaches the session through the cide_agents_list tool"
+            );
+        } else {
+            cide_core::claude_cli::fold_append_system_prompt(&mut plan.args, &paragraph);
+        }
+    }
+
     // The user's arguments go **first**, before every token cide adds.
     //
     // Not last, and the reason is a variadic flag. `--add-dir`, `--mcp-config`, `--allowedTools`
     // and `--tools` all collect every following token that does not begin with `-`, and every
     // argument cide appends below does begin with one (`--session-id`, `--resume`,
-    // `--fork-session`, `--settings`). So a user flag placed here can never swallow a uuid,
+    // `--fork-session`, `--settings`, `--mcp-config`). So a user flag placed here can never
+    // swallow a uuid,
     // whereas the same flag placed last would swallow whatever cide had already written.
     // `cide_claude::headless::argv` refuses the same wager for the same reason and says so.
     for a in plan.args {
@@ -574,6 +836,42 @@ pub async fn session_spawn(
                 }
             }
         }
+    }
+
+    // The task tools. `CIDE_AGENT_SOCK` names the socket `crate::agent_rpc` bound at startup and
+    // `--mcp-config` attaches the bridge that reaches it, so a pane's own Claude can read and
+    // write `.cide/tasks.json` through `mcp__cide__cide_task_*` rather than by editing the file.
+    //
+    // **Claude panes only**, exactly as the `--settings` block above: a shell has no MCP client to
+    // hand a config to, and a `claude` a user starts by hand inside one would connect with no
+    // `CIDE_SESSION`, resolve to no project, and be served an empty tool list — correct, and not
+    // worth an environment variable per shell.
+    //
+    // **The environment variable is set even when the flag is not written** — because the binary
+    // could not be found, or because the user switched the injection off — deliberately, and for
+    // the reason the hook block gives one scope up: it costs a harness that ignores it nothing,
+    // and a wrapper that ends up exec'ing the real `claude` with an `--mcp-config` of its own
+    // still finds this socket. It is inert on its own; nothing reads it but the bridge, and with
+    // the injection off the bridge is never spawned. `claude_cli::REFUSED_ENV` carries the row
+    // that stops a user's launch configuration pointing it at another cide's socket.
+    //
+    // **Last, so the variadic flag has nothing left to swallow.** `--mcp-config` collects every
+    // following token that does not begin with `-`, which is the same wager `plan.args` refuses by
+    // going first; putting it at the end of the argv means the only token after it is its own
+    // JSON. A reader adding an argument below this line has to think about that.
+    //
+    // **Gated on `Injection::McpConfig`**, which is `INJECTIONS`' fifth row and the toggle on
+    // Settings → Claude sessions. Off, the pane is an ordinary Claude Code pane: it keeps every
+    // MCP server the user configured — cide has never passed `--strict-mcp-config` — and loses
+    // cide's own, so no task tracker and, on the console pane, no subagents. The roster paragraph
+    // above is gated on the same switch, or it would be a system prompt naming tools this session
+    // does not have.
+    if is_claude && let Some(agents) = app.try_state::<crate::agent_rpc::AgentRpcServer>() {
+        spec = spec.env(
+            "CIDE_AGENT_SOCK",
+            agents.socket().to_string_lossy().to_string(),
+        );
+        spec = with_task_tools(spec, &plan.inject, agent_mcp_config);
     }
 
     // What a restored *shell* gets instead of a resume. `resume` on a non-Claude program has
@@ -1144,6 +1442,214 @@ mod tests {
     use super::*;
     use cide_core::claude_cli::Injected;
 
+    // --- the roster paragraph ---------------------------------------------------------------
+
+    fn role(id: &str, description: &str) -> cide_ipc::AgentDef {
+        cide_ipc::AgentDef {
+            id: cide_ipc::AgentId(id.to_string()),
+            label: id.to_string(),
+            harness: cide_ipc::Harness::Claude,
+            description: description.to_string(),
+            system_prompt: "You are …".into(),
+            model: None,
+            unavailable: None,
+            max_concurrent: 1,
+        }
+    }
+
+    #[test]
+    fn the_roster_paragraph_names_the_roles_and_the_namespaced_tools() {
+        let developer = role("developer", "Implements one task\n  end to end.");
+        let qa = role("qa", "");
+        let paragraph = roster_paragraph(&[&developer, &qa]);
+        // Printed on purpose: this is prose handed to a language model, and the assertions below
+        // check fragments of it. `cargo test -p cide-app roster_paragraph -- --nocapture`.
+        eprintln!("{paragraph}");
+
+        assert!(paragraph.starts_with("You are the product owner for this project in cide."));
+        // A description spanning two lines in its markdown file arrives on one.
+        assert!(
+            paragraph.contains("`developer` (Implements one task end to end.), `qa`."),
+            "{paragraph}"
+        );
+        // Measured: the CLI namespaces an MCP server's tools as `mcp__<server>__<tool>`, so the
+        // bare names would be tools the model cannot call.
+        for tool in [
+            "mcp__cide__cide_agents_list",
+            "mcp__cide__cide_agent_dispatch",
+            "mcp__cide__cide_agent_runs",
+            "mcp__cide__cide_agent_stop",
+            "mcp__cide__cide_agent_integrate",
+            "mcp__cide__cide_task_*",
+        ] {
+            assert!(paragraph.contains(tool), "{tool} is not named: {paragraph}");
+        }
+        assert!(
+            !paragraph.contains(" cide_agent_dispatch"),
+            "a bare tool name would be one the model cannot call: {paragraph}"
+        );
+        // The list is fixed at spawn, so it has to say which channel is current.
+        assert!(paragraph.contains("is the current one"), "{paragraph}");
+        // And it must not promise the run will speak up on its own.
+        assert!(
+            paragraph.contains("only through that tracker"),
+            "{paragraph}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_roles_gets_a_paragraph_that_says_so_and_names_the_file() {
+        let paragraph = roster_paragraph(&[]);
+        assert!(paragraph.contains(".cide/agents/<name>.md"), "{paragraph}");
+        assert!(paragraph.contains("nobody to dispatch to"), "{paragraph}");
+    }
+
+    /// The degradation `cide_core::claude_cli::WARNED_ARGS` promises the user, from this side.
+    #[test]
+    fn an_append_system_prompt_file_is_recognised_in_both_spellings() {
+        assert!(carries_append_system_prompt_file(&[
+            "--append-system-prompt-file".into(),
+            "notes.md".into()
+        ]));
+        assert!(carries_append_system_prompt_file(&[
+            "--append-system-prompt-file=notes.md".into()
+        ]));
+        // And the neighbour it must never be confused with, which is the flag cide adds.
+        assert!(!carries_append_system_prompt_file(&[
+            "--append-system-prompt".into(),
+            "hello".into()
+        ]));
+        assert!(!carries_append_system_prompt_file(&[
+            "--append-system-prompt=hello".into()
+        ]));
+        assert!(!carries_append_system_prompt_file(&[
+            "--model".into(),
+            "opus".into()
+        ]));
+    }
+
+    /// The row on the Settings screen and the code in this file are one promise in two places.
+    ///
+    /// `WARNED_ARGS` tells the user, in prose, that cide drops its own paragraph on a pane where
+    /// they have set `--append-system-prompt-file` so the pane still starts. Deleting the row
+    /// would leave the behaviour unexplained; deleting the behaviour would make the row a lie.
+    #[test]
+    fn the_warned_row_still_promises_what_this_file_does() {
+        let row = cide_core::claude_cli::WARNED_ARGS
+            .iter()
+            .find(|entry| entry.flag == APPEND_SYSTEM_PROMPT_FILE)
+            .expect("the row that explains this degradation");
+        assert!(row.takes_value);
+        assert!(
+            row.reason.contains("drops its own paragraph"),
+            "{}",
+            row.reason
+        );
+    }
+
+    /// The measured failure the fold exists for, at this call site.
+    ///
+    /// A second `--append-system-prompt` does not error: the last one silently wins and the
+    /// earlier is discarded. cide's arguments come after the user's, so a raw push here would
+    /// delete a prompt they set in Settings with nothing on screen saying so.
+    #[test]
+    fn the_paragraph_folds_into_the_users_own_append_system_prompt() {
+        let developer = role("developer", "Implements one task end to end.");
+        let paragraph = roster_paragraph(&[&developer]);
+
+        let mut args = vec![
+            "--append-system-prompt".to_string(),
+            "always reply in British English".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        cide_core::claude_cli::fold_append_system_prompt(&mut args, &paragraph);
+
+        assert_eq!(
+            args.iter()
+                .filter(|token| *token == "--append-system-prompt")
+                .count(),
+            1,
+            "exactly one occurrence may reach the child: {args:?}"
+        );
+        assert!(args[1].starts_with("always reply in British English"));
+        assert!(args[1].contains("You are the product owner"));
+        // Nothing else moved: the user's other tokens keep their order and their neighbours.
+        assert_eq!(&args[2..4], ["--model".to_string(), "opus".to_string()]);
+    }
+
+    #[test]
+    fn only_the_consoles_primary_pane_is_the_product_owner() {
+        let mut ws = cide_ipc::Workspace::default();
+        let root = std::env::temp_dir().join(format!("cide-owner-{}", std::process::id()));
+        let project = cide_core::workspace::open_project(&mut ws, vec![root], None).expect("open");
+        let console = ws.projects[&project].primary_session;
+        let registry = SessionRegistry::default();
+
+        // A fresh console spawn: the pane's session has never had a child.
+        assert!(is_primary_console_spawn(
+            &ws, &registry, project, None, false
+        ));
+        // A restore resumes exactly what the pane holds.
+        assert!(is_primary_console_spawn(
+            &ws,
+            &registry,
+            project,
+            Some(console),
+            false
+        ));
+        // Somebody else's conversation is somebody else's pane.
+        assert!(!is_primary_console_spawn(
+            &ws,
+            &registry,
+            project,
+            Some(SessionId::new()),
+            false
+        ));
+        // `SplitIntent::ForkPrimary` resumes the console's own session and branches from it. The
+        // branch is a new pane and must never be told it is the product owner — this is the one
+        // false positive that would happen in ordinary use.
+        assert!(!is_primary_console_spawn(
+            &ws,
+            &registry,
+            project,
+            Some(console),
+            true
+        ));
+        // An unknown project is nobody's console.
+        assert!(!is_primary_console_spawn(
+            &ws,
+            &registry,
+            cide_ipc::ProjectId::new(),
+            None,
+            false
+        ));
+
+        // And while the console's own child is alive, a fresh spawn is some *other* pane: the
+        // console does not spawn twice.
+        let live = PtySession::spawn(
+            SpawnSpec::new("/bin/sh", std::env::temp_dir())
+                .arg("-c")
+                .arg("sleep 30"),
+        )
+        .expect("spawn sh");
+        registry.insert(console, Arc::clone(&live));
+        assert!(!is_primary_console_spawn(
+            &ws, &registry, project, None, false
+        ));
+
+        // Until it is killed, which is what `claude.restart` does before it respawns.
+        live.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while live.exit_status().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(live.exit_status().is_some(), "child was never reaped");
+        assert!(is_primary_console_spawn(
+            &ws, &registry, project, None, false
+        ));
+    }
+
     /// Spawn a shell that ends with `code`, and wait until the reaper has the status.
     ///
     /// Waits on `exit_status()` rather than `has_exited()`, which is the same trap a test in
@@ -1311,13 +1817,10 @@ mod tests {
     /// and nothing would say so.
     #[test]
     fn a_bundle_scrub_reaches_the_spec_as_both_sets_and_removals() {
-        let spec = apply_env_changes(
-            SpawnSpec::new("/bin/sh", std::env::temp_dir()),
-            [
-                ("PYTHONHOME".to_string(), None),
-                ("PATH".to_string(), Some("/usr/bin".to_string())),
-            ],
-        );
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir()).apply([
+            ("PYTHONHOME".to_string(), None),
+            ("PATH".to_string(), Some("/usr/bin".to_string())),
+        ]);
         assert_eq!(value_of(&spec, "PATH"), Some("/usr/bin"));
         assert!(
             spec.env_remove.iter().any(|k| k == "PYTHONHOME"),
@@ -1328,12 +1831,12 @@ mod tests {
 
     /// The scrub and the `PATH` pass reach the spec as one `PATH`, in that order.
     ///
-    /// `base_env` chains them, and a chain is exactly the shape a later edit turns back into two
-    /// folds in the wrong order. Both halves are asserted over synthetic inputs because
-    /// `bundle_scrub` and `child_path` read the real process environment; `cide-core`'s own tests
-    /// own the rules, and what is only checkable here is that the composition survives the trip
-    /// into a `SpawnSpec` — a `SpawnSpec` that carried the scrub's `PATH` and dropped the
-    /// appended one would put the M17 bug straight back with nothing to say so.
+    /// `terminal_child_env` chains them, and a chain is exactly the shape a later edit turns
+    /// back into two folds in the wrong order. Both halves are asserted over synthetic inputs
+    /// because `bundle_scrub` and `child_path` read the real process environment; `cide-core`'s
+    /// own tests own the rules, and what is only checkable here is that the composition survives
+    /// the trip into a `SpawnSpec` — a `SpawnSpec` that carried the scrub's `PATH` and dropped
+    /// the appended one would put the M17 bug straight back with nothing to say so.
     #[test]
     fn the_scrubbed_path_and_the_appended_directories_arrive_as_one_entry() {
         let scrub = vec![("PATH".to_string(), Some("/usr/bin".to_string()))];
@@ -1344,10 +1847,8 @@ mod tests {
             )),
             std::slice::from_ref(&std::path::PathBuf::from("/home/u/go/bin")),
         );
-        let spec = apply_env_changes(
-            SpawnSpec::new("/bin/sh", std::env::temp_dir()),
-            scrub.into_iter().chain(path),
-        );
+        let spec =
+            SpawnSpec::new("/bin/sh", std::env::temp_dir()).apply(scrub.into_iter().chain(path));
         // The *last* one, not the first: `SpawnSpec::env` is an ordered list and
         // `PtySession::spawn` replays it into `CommandBuilder::env`, where a later write wins.
         // `value_of` finds the first, which is the scrub's — so asserting with it here would
@@ -1368,7 +1869,7 @@ mod tests {
     /// Nothing to scrub must mean nothing added, so a non-bundled launch is byte-identical.
     #[test]
     fn an_empty_scrub_leaves_the_spec_alone() {
-        let spec = apply_env_changes(SpawnSpec::new("/bin/sh", std::env::temp_dir()), []);
+        let spec = SpawnSpec::new("/bin/sh", std::env::temp_dir()).apply([]);
         assert!(spec.env.is_empty(), "set {:?}", spec.env);
         assert!(spec.env_remove.is_empty(), "removed {:?}", spec.env_remove);
     }
@@ -1553,6 +2054,94 @@ mod tests {
             value_of(&spec, "MY_MCP_TOKEN"),
             None,
             "an empty plan adds nothing, which is what a shell pane is given"
+        );
+    }
+
+    // --- M18: the task tools, and the switch that declines them ------------------------------
+
+    /// The default: cide writes `--mcp-config` and its JSON, and nothing else.
+    ///
+    /// The spelling comes from `INJECTIONS`, so a rename in Settings moves it; asserted through
+    /// the resolved `Injected` rather than against a literal for exactly that reason.
+    #[test]
+    fn a_pane_carries_the_task_tools_by_default() {
+        let inject = cide_core::claude_cli::plan(&cide_ipc::ClaudeCli::default(), None).inject;
+        let spec = with_task_tools(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &inject,
+            || Some("{\"mcpServers\":{}}".to_string()),
+        );
+        assert_eq!(spec.args, ["--mcp-config", "{\"mcpServers\":{}}"]);
+    }
+
+    /// The switch, and the whole reason it exists: **off, the flag is simply absent**.
+    ///
+    /// Not an empty config, not a `--strict-mcp-config`, not a different server — absent. The
+    /// pane is then an ordinary Claude Code pane that keeps every MCP server the user configured
+    /// and loses cide's own. `CIDE_AGENT_SOCK` stays in the environment either way (see the call
+    /// site): nothing reads it but the bridge, and the bridge is never spawned.
+    #[test]
+    fn switching_the_task_tools_off_writes_no_flag_at_all() {
+        let mut cli = cide_ipc::ClaudeCli::default();
+        cli.inject.mcp_config.enabled = false;
+        let inject = cide_core::claude_cli::plan(&cli, None).inject;
+        let spec = with_task_tools(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &inject,
+            || panic!("a switched-off injection must not even look for cide-hook"),
+        );
+        assert!(spec.args.is_empty(), "{:?}", spec.args);
+    }
+
+    /// A rename reaches the argv, because the flag is read out of the resolved injection rather
+    /// than written as a literal — which is the defect `check:claude-cli` asserts is gone for
+    /// `--settings` and would have to assert again here.
+    #[test]
+    fn a_renamed_task_tools_flag_is_the_one_written() {
+        let mut cli = cide_ipc::ClaudeCli::default();
+        cli.inject.mcp_config.flag = "--mcp".into();
+        let inject = cide_core::claude_cli::plan(&cli, None).inject;
+        let spec = with_task_tools(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &inject,
+            || Some("{}".to_string()),
+        );
+        assert_eq!(spec.args, ["--mcp", "{}"]);
+    }
+
+    /// No `cide-hook` beside the running binary is a packaging failure, not a choice: the flag
+    /// is skipped and the pane still starts, because a session with no task tools works and a
+    /// pane that refuses to open does not.
+    #[test]
+    fn a_missing_bridge_costs_the_tools_and_not_the_pane() {
+        let inject = cide_core::claude_cli::plan(&cide_ipc::ClaudeCli::default(), None).inject;
+        let spec = with_task_tools(
+            SpawnSpec::new("claude", std::env::temp_dir()),
+            &inject,
+            || None,
+        );
+        assert!(spec.args.is_empty(), "{:?}", spec.args);
+    }
+
+    /// The paragraph and the tools are one decision.
+    ///
+    /// The roster paragraph is nothing but instructions to call `mcp__cide__*`, so a pane that
+    /// gets it without the server is a session told to reach for a vocabulary it does not have.
+    /// The spawn gates both on the same injection; this pins the fact the prose depends on it,
+    /// so a future edit that moves the paragraph out from behind the gate has to answer for it.
+    #[test]
+    fn the_roster_paragraph_is_only_worth_sending_with_the_tools_that_back_it() {
+        let paragraph = roster_paragraph(&[]);
+        for tool in ["mcp__cide__cide_agents_list", "mcp__cide__cide_task_"] {
+            assert!(paragraph.contains(tool), "{paragraph}");
+        }
+        let mut cli = cide_ipc::ClaudeCli::default();
+        cli.inject.mcp_config.enabled = false;
+        assert!(
+            !cide_core::claude_cli::plan(&cli, None)
+                .inject
+                .has(cide_core::claude_cli::Injection::McpConfig),
+            "and this is the condition the spawn gates the paragraph on"
         );
     }
 

@@ -59,6 +59,19 @@ fn theme(app: &AppHandle) -> Theme {
         .unwrap_or_default()
 }
 
+/// The saved chrome font size, for the same first-frame reason [`theme`] is read here.
+///
+/// Already inside the band on the way out — `apply_patch` clamps on write — but clamped again
+/// rather than trusted, because this one is read from state that a `workspace.json` a user
+/// edited by hand can reach, and it becomes a divisor in `theme-boot.js`.
+fn ui_font_size(app: &AppHandle) -> f32 {
+    let stored = app
+        .try_state::<WorkspaceState>()
+        .map(|state| state.with(|ws| ws.settings.ui_font_size))
+        .unwrap_or(cide_ipc::DEFAULT_UI_FONT_SIZE);
+    cide_ipc::clamp_ui_font_size(stored)
+}
+
 /// Logical size of the design mock. Used as the first-run default so the app opens at the
 /// geometry the screenshot comparison in M3 is specified against.
 pub const DEFAULT_WIDTH: f64 = 1440.0;
@@ -195,9 +208,15 @@ pub fn create(
         Theme::Dark => "&theme=dark",
         Theme::Light => "&theme=light",
     };
+    // The chrome font size rides along for exactly the reason the theme does, and it is not
+    // cosmetic polish. `installThemeSync` reads the size out of the bootstrap snapshot, and
+    // that snapshot is a round trip — the same round trip that is too slow for the theme. The
+    // theme arriving late is a flash of the wrong palette; this arriving late is a *reflow* of
+    // every row, tab and panel in the window, on every launch, at any size but the default.
+    let ui_param = format!("&ui={}", ui_font_size(app));
     let url = WebviewUrl::App(
         format!(
-            "index.html?window={}{theme_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}{console_bridge}",
+            "index.html?window={}{theme_param}{ui_param}{bench}{audit}{panes}{wins}{input_probe}{renderer}{console_bridge}",
             label.as_str()
         )
         .into(),

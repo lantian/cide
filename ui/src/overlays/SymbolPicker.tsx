@@ -18,6 +18,7 @@ import styles from './Overlay.module.css'
 import { Hint, ModalShell } from './ModalShell'
 import { groupDigits, matchCounter, symbolBadge } from './format'
 import { listAction } from './listKeys'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 
 const ROW_HEIGHT = 26
 /** How often to ask again while the walk is still injecting. Matches `FilePicker`. */
@@ -94,10 +95,14 @@ export function SymbolPicker({ project, onDismiss, onGoTo }: SymbolPickerProps) 
 
   const rows = frame?.items ?? []
   const viewport = useRef<HTMLDivElement>(null)
+  // The chrome scale, for the one measurement CSS never sees: a virtualized row is placed by
+  // an absolute transform off this number. See `settings/useUiScale.ts`.
+  const rowHeight = scaledRow(ROW_HEIGHT, useUiScale())
+
   const virtual = useVirtualizer({
     count: rows.length,
     getScrollElement: () => viewport.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 8,
   })
   useEffect(() => {

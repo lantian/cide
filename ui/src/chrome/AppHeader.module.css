@@ -30,7 +30,7 @@
 
 .light {
   width: 11px;
-  height: 11px;
+  height: calc(11px * var(--ui-scale));
   flex: none;
   border: 0;
   border-radius: 50%;
@@ -114,8 +114,10 @@
  */
 .tab {
   /* The awaiting badge's reserved box. Named here rather than in `.awaiting` because
-     `.tabOpen` has to reach over it too, and two literals that must agree is one too many. */
-  --awaiting-w: 13px;
+     `.tabOpen` has to reach over it too, and two literals that must agree is one too many.
+     Scaled with the chip's height and glyph — see `TabStrip.module.css` for the failure a
+     fixed reserve would reintroduce. */
+  --awaiting-w: calc(13px * var(--ui-scale));
   display: flex;
   align-items: center;
   gap: 9px;
@@ -194,7 +196,7 @@
 
 .dot {
   width: 8px;
-  height: 8px;
+  height: calc(8px * var(--ui-scale));
   flex: none;
   border-radius: 2px;
 }
@@ -245,17 +247,17 @@
 .awaiting {
   flex: none;
   width: var(--awaiting-w);
-  height: 13px;
+  height: calc(13px * var(--ui-scale));
   /* Clip rather than `min-width`: if a fallback font ever makes `9+` wider than the box, a
      clipped `+` is a cosmetic loss where a grown box moves every tab after it. */
   overflow: hidden;
   border-radius: 3px;
   pointer-events: none;
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: var(--fs-ui-9-5);
   font-variant-numeric: tabular-nums;
   font-weight: 400;
-  line-height: 13px;
+  line-height: calc(13px * var(--ui-scale));
   text-align: center;
   letter-spacing: 0;
 }
@@ -280,7 +282,7 @@
 
 .path {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   color: var(--faint);
   font-weight: 400;
 }
@@ -305,7 +307,7 @@
   display: flex;
   align-self: center;
   flex: none;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   margin: 0 10px 0 8px;
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -332,7 +334,7 @@
   border-right: 1px solid var(--border);
   color: var(--dim);
   font-family: inherit;
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   line-height: 1;
   cursor: pointer;
 }
@@ -355,7 +357,7 @@
   border: 0;
   color: var(--faint);
   font-family: inherit;
-  font-size: 9px;
+  font-size: var(--fs-ui-9);
   line-height: 1;
   cursor: pointer;
 }
@@ -385,14 +387,14 @@
   display: flex;
   align-items: center;
   gap: 4px;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   padding: 0 8px;
   border-radius: 4px;
   background: transparent;
   border: 0;
   color: var(--dim);
   font-family: inherit;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   white-space: nowrap;
   cursor: pointer;
 }
@@ -430,7 +432,7 @@
 
 .action {
   width: 26px;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   flex: none;
   display: grid;
   place-items: center;
@@ -439,7 +441,7 @@
   border: 0;
   color: inherit;
   font-family: inherit;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -463,7 +465,7 @@
 
 /* The mock sets this one glyph a pixel larger than its two neighbours. */
 .actionSplit {
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
 }
 
 /* This chrome has no other affordances, so every control has to show where focus is. The

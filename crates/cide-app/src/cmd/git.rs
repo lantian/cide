@@ -32,9 +32,10 @@ use cide_ipc::git::{
     CommitRequest, DiffSide, FetchOutcome, FileDiff, GitError, PathSelection, PushOutcome,
     RepoInfo, ShelfEntry, StashEntry, TreeStatusMap,
 };
-use cide_ipc::{ProjectId, RepoId};
+use cide_ipc::{ProjectId, RepoId, ToolTabId};
 use tauri::State;
 
+use crate::cmd::log::LogRegistry;
 use crate::workspace_state::WorkspaceState;
 
 type Result<T> = std::result::Result<T, GitError>;
@@ -154,6 +155,308 @@ pub async fn git_repos(
 ) -> Result<Vec<RepoInfo>> {
     let roots = roots(&state, project)?;
     blocking(move || Ok(cide_git::repo::discover(&roots))).await
+}
+
+/// Which repository an absolute path belongs to, and its path inside it. (M18)
+///
+/// `None` — **not** an error — for a path no repository in this project contains: a scratch file,
+/// a `~/.cargo/registry` source opened by go-to-definition, a tab left over from another project.
+/// That is the answer that tells the caller to hide the blame gutter and grey the History item,
+/// and making it an error would turn "this file has no history" into a failure the user cannot
+/// act on.
+///
+/// The one seam between the two ways this app spells a path: the editor, the file tree and the
+/// tab strip all hold absolute paths, and everything in `cide_ipc::git` and `cide_ipc::history`
+/// speaks repo-relative ones. In Rust rather than as a prefix comparison in the webview, for the
+/// reason `git_tree_status` gives about joining them: `canonical` resolves symlinks, the frontend
+/// cannot, and a symlinked root compares unequal to the work tree it is actually inside. The
+/// innermost repository wins, so a file in a submodule resolves to the submodule.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_locate(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    path: PathBuf,
+) -> Result<Option<cide_ipc::git::RepoPath>> {
+    let roots = roots(&state, project)?;
+    blocking(move || Ok(cide_git::repo::locate(&roots, &path))).await
+}
+
+/// One page of one repository's log — and, with `query.path` set, one file's history. (M18)
+///
+/// One command rather than two, because the Log tab and a History tab differ by exactly one
+/// field of [`LogQuery`]. The scope travels *inside* the query rather than beside it so there is
+/// one source of truth for "which repositories", and so the resume token's identity hash can
+/// cover it: a token replayed against a different question has to be refused rather than
+/// silently answering the wrong one.
+///
+/// Does not broadcast. A log is a read, and the panel refreshes off the `cide://git-status` that
+/// every mutation already emits, plus `FsChange.git` for a `git commit` run in a bash pane.
+///
+/// # `tab`, and why the walk goes through a registry
+///
+/// The one argument that is not part of the question. It names the tool tab the page is for, and
+/// it exists so that the walk can be **stopped**: `cmd::log::LogRegistry` keys a cancellation flag
+/// by `(project, tab)`, `cide_git::log::log_cancellable` polls it once per commit, and
+/// `git_log_cancel` sets it. Per *tab* and not per project because the Log tab and N History tabs
+/// are live at once in the same panel — see that module's header, which argues the whole shape.
+///
+/// A superseded page comes back `Ok` with [`cide_ipc::history::CommitPage::cancelled`] and the
+/// rows it had, never as an error. Typing into the filter box produces one of these per keystroke,
+/// and the caller's job is to drop it rather than to draw a failure.
+///
+/// The job is claimed **here**, on the caller's thread, and not inside [`blocking`]: a
+/// `git_log_cancel` racing this has to find the job it is meant to stop, and a job created on the
+/// pool would not exist yet for the moments the pool takes to pick the work up — which are exactly
+/// the moments a busy pool has.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_log(
+    state: State<'_, WorkspaceState>,
+    logs: State<'_, LogRegistry>,
+    project: ProjectId,
+    tab: ToolTabId,
+    query: cide_ipc::history::LogQuery,
+) -> Result<cide_ipc::history::CommitPage> {
+    let roots = roots(&state, project)?;
+    let job = logs.job_for(project, tab, &query);
+    // A second handle for the worker. The `State` guard cannot cross into `spawn_blocking` — it
+    // borrows the app — and the walk has to be able to read the flag after this frame is gone,
+    // so what moves is an `Arc`, not a reference.
+    let walking = std::sync::Arc::clone(&job);
+    let page = blocking(move || {
+        // Resolved here rather than in `cide-git`, which knows nothing about projects: the scope
+        // names `RepoId`s and only discovery can turn those into work trees.
+        let all = cide_git::repo::discover(&roots);
+        let wanted: Vec<cide_ipc::git::RepoInfo> = match &query.scope {
+            cide_ipc::history::LogScope::One { repo } => {
+                all.into_iter().filter(|i| i.id == *repo).collect()
+            }
+            cide_ipc::history::LogScope::Merged { repos } if repos.is_empty() => all,
+            cide_ipc::history::LogScope::Merged { repos } => {
+                all.into_iter().filter(|i| repos.contains(&i.id)).collect()
+            }
+        };
+        // An empty scope is "this project has no repository at all", which every caller already
+        // handles through `git_repos` — reporting the named one is the useful half, and for a
+        // merged scope there is no single id to name, so the first requested one stands in.
+        if wanted.is_empty() {
+            let named = match &query.scope {
+                cide_ipc::history::LogScope::One { repo } => Some(*repo),
+                cide_ipc::history::LogScope::Merged { repos } => repos.first().copied(),
+            };
+            return match named {
+                Some(repo) => Err(GitError::NoSuchRepo { repo }),
+                None => Err(GitError::NoSuchProject {
+                    project: project.to_string(),
+                }),
+            };
+        }
+        cide_git::log::log_cancellable(&cide_git::log::LogWalk {
+            repos: &wanted,
+            query: &query,
+            // Borrowed for the length of this walk and never stored on the other side; the
+            // crate holds no state, which is why the flag has to come from here.
+            cancel: walking.cancel_flag(),
+        })
+    })
+    .await;
+    // After the walk, whatever it answered — an error is still a walk that is no longer running,
+    // and leaving its job in the map would make the *next* request's `job_for` cancel a job that
+    // had already stopped and, worse, would hold the query's resume token for ever. Guarded by
+    // `Arc::ptr_eq` inside, so a newer request that replaced this job keeps its own flag.
+    logs.finish(project, tab, &job);
+    page
+}
+
+/// One commit: its full message, and the files it changed against `parent`.
+///
+/// `parent` selects which parent a merge is diffed against; `None` is the first, which is
+/// `git show --first-parent`'s default and IDEA's. A root commit is diffed against the empty
+/// tree, and [`CommitDetail::against`] says which of those happened rather than leaving the pane
+/// to guess.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_commit_detail(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    rev: String,
+    parent: Option<u32>,
+) -> Result<cide_ipc::history::CommitDetail> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::show::detail(&root, &rev, parent, cide_git::show::DetailLimits::default())
+    })
+    .await
+}
+
+/// The `+`/`-` counts a capped [`git_commit_detail`] left uncounted.
+///
+/// Separate and on demand because the cap exists: past `show::MAX_COUNT_FILES` deltas the detail
+/// generates **no patch at all**, so a four-thousand-file merge returns in the time of one
+/// tree-to-tree diff. This is the button that pays for the rest, and it carries a wall-clock
+/// deadline because there is no cancellation — a user who navigates away leaves it running.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_commit_line_counts(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    rev: String,
+    parent: Option<u32>,
+    paths: Vec<String>,
+) -> Result<cide_ipc::history::CommitLineCounts> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::show::line_counts(
+            &root,
+            &rev,
+            parent,
+            &paths,
+            cide_git::show::DetailLimits::default(),
+        )
+    })
+    .await
+}
+
+/// One file's diff between two revisions. (M18)
+///
+/// `new`/`old` are [`RevSide`]s rather than a pair of strings, because there are three things a
+/// side can be and only two of them are a commit: `FirstParent` is what "show me this commit"
+/// means and is legal only as `old`, and `WorkingTree` is legal only as `new` — a diff whose
+/// *old* side moves under it is not a diff of anything.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_diff_revision(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    new: cide_ipc::history::RevSide,
+    old: cide_ipc::history::RevSide,
+) -> Result<cide_ipc::history::RevisionDiff> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::revision::revision_diff(&root, &path, &new, &old)
+    })
+    .await
+}
+
+/// The changed-file list for an arbitrary pair of revisions.
+///
+/// Not a [`ChangesTree`]: that one is about the working tree and carries an index state, a
+/// staged flag and a changelist, none of which a pair of commits has. The first reader of
+/// `entry.staged` off one would get `false` and believe it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_diff_revision_files(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    new: cide_ipc::history::RevSide,
+    old: cide_ipc::history::RevSide,
+) -> Result<cide_ipc::history::RevisionRange> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::revision::range_files(&root, &new, &old)
+    })
+    .await
+}
+
+/// One file's bytes as one commit left them — what a `TabKind::Revision` pane mounts with.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_file_at_revision(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    rev: String,
+) -> Result<cide_ipc::history::RevisionBlob> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::revision::file_at_revision(&root, &path, &rev)
+    })
+    .await
+}
+
+/// Resolve anything `git rev-parse` accepts, so a name the user typed becomes an oid **before**
+/// it is persisted into a tab.
+///
+/// A tab that stored `main` would name a different tree tomorrow, which is precisely the
+/// staleness `DiffSpec` refuses to carry. The picker calls this and stores what it resolved to.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_resolve_rev(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    spec: String,
+) -> Result<cide_ipc::history::ResolvedRev> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::revision::resolve_rev(&root, &spec)
+    })
+    .await
+}
+
+/// Annotate one file, line by line. (M18)
+///
+/// `contents` is the editor's buffer and must be sent **only when the tab is dirty**. Passing it
+/// costs a copy of the file over the IPC wire; omitting it on a dirty tab is worse than stale —
+/// every line after an unsaved insertion is attributed to the commit that wrote whatever used to
+/// be there, and in a gutter sitting flush against live text that is a per-line falsehood rather
+/// than an out-of-date view. `cide_git::blame` reads the working file when this is `None` and
+/// falls back to HEAD when there is none, and says which it did in `BlameFile::source`.
+///
+/// Not cancellable, and the size cap is why. libgit2 exposes no hook inside `git_blame_file` —
+/// no callback, no progress, nothing to poll — so a request already running cannot be stopped by
+/// anything. `cide_git::blame::MAX_BLAME_BYTES` bounds the input instead, which is the honest
+/// version of the same guarantee: the work is bounded even though it cannot be interrupted.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_blame(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    contents: Option<String>,
+    request: cide_ipc::history::BlameRequest,
+) -> Result<cide_ipc::history::BlameFile> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::blame::blame(
+            &root,
+            &path,
+            contents.as_deref().map(str::as_bytes),
+            &request,
+        )
+    })
+    .await
+}
+
+/// The parent of `rev` *as it touched* `path` — what *Annotate previous revision* walks to.
+///
+/// Rust's answer and not a `rev^` the frontend builds. `rev^` is the first parent, which is the
+/// wrong commit for a merge that took the file from its second parent, and it names the *new*
+/// path across a rename — so the next blame would be of a file that does not exist at that commit
+/// and would come back empty with no error at all.
+///
+/// `None` at a root commit and at the commit that introduced the file. That is the end of the
+/// walk, not a failure, and the popup disables its button with that reason.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_blame_parent(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    rev: String,
+) -> Result<Option<cide_ipc::history::BlameParent>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::blame::parent_of(&root, &path, &rev)
+    })
+    .await
 }
 
 /// Per-path status for the file tree, keyed by absolute path.
@@ -882,6 +1185,223 @@ pub async fn git_stash_drop(
         let root = repo_root(&roots, repo)?;
         stash::drop_entry(&root, index)?;
         stash::list(&root)
+    })
+    .await
+}
+
+// --- the commit actions: revert, cherry-pick, reset, tag, detach (M18) ------------------------
+
+/*
+ * These six are the log's right-click menu, and they are the reason `cide-git` grew
+ * `replay.rs`, `reset.rs`, `tag.rs` and `branch::checkout_detached`. That code shipped with 33
+ * differential tests against the real `git` binary and **nothing in the app could call it** —
+ * no command, no client binding, no registry entry. This block is the seam that ends that.
+ *
+ * Three shapes worth naming, because each one differs from the block above it.
+ *
+ * **They answer with an *outcome*, not a [`ChangesTree`].** Every mutation further up returns
+ * the tree because every one of them moves a tri-state checkbox in the commit panel and the
+ * panel would otherwise ask a second time. These do not: the interesting result of a reset is
+ * *what it dropped*, of a replay *which commit it made*, of a tag *whether it moved one that
+ * already existed*. None of that survives being flattened into a status walk. The panel still
+ * gets its tree — through the `refreshed` broadcast below, on `cide://git-status`, which is
+ * the channel the watcher and every other window already listen on.
+ *
+ * **Every mutating one ends with `let _ = refreshed(&app, &roots, project);`.** A reset, a
+ * revert, a cherry-pick and a detach all rewrite the working tree, so every open panel in
+ * every window is looking at a `ChangesTree` describing a repository that no longer exists.
+ * `git_tag_create` calls it too even though it moves no file: a tag changes the ref
+ * decorations the log draws beside a row, and `cide://git-status` is what the log refreshes
+ * off. `let _` and not `?`, for the reason `git_commit` states — the action succeeded, and
+ * failing the call because the *re-read afterwards* failed would report a success as a
+ * failure and leave the caller with no outcome at all.
+ *
+ * **`git_reset_preview` is a read and must not broadcast.** It is its own command rather than
+ * a field of the reset request for the reason `cide_git::reset::preview`'s header gives: the
+ * dialog's Hard row says *"DISCARD 3 changed files"* and **names all three**, and that
+ * sentence has to exist on screen before the user commits to anything. Folding it into the
+ * open of the dialog would mean either performing the reset to find out, or five round trips
+ * that paint five times. It costs two tree diffs, a status walk and a revwalk bounded at
+ * `DROPPED_COMMIT_CAP` — the same order as `git_branch_blockers`, which exists for exactly the
+ * same reason on the branch side.
+ *
+ * **Two of the six are missing on purpose, and neither needs anything here.** *Amend* is
+ * `git_commit` with [`CommitRequest::amend_of`] set to the row's oid: the field is on the wire,
+ * `cide_git::commit::require_amend_head` checks it against the repository rather than against a
+ * list drawn a second ago, and a mismatch is `GitError::NotHead`. *Branch from here* is
+ * `git_branch_create` with the row's oid as `start_point`. A second command for either would be
+ * a second implementation of a guard that already exists.
+ */
+
+/// Apply a commit's patch **inverted** onto `HEAD` — the log's *Revert*.
+///
+/// Not the Git panel's *Rollback*, which throws uncommitted work away; this one makes a new
+/// commit (or, under [`ReplayMode::WorkingTree`], leaves the inverse in the working tree for
+/// the user to look at first). The two words are IDEA's and the ambiguity is real, which is
+/// part of why there is no bare *Revert* row in the command palette.
+///
+/// The interesting failures are all refusals computed **before** anything moves:
+/// `ReplayWouldConflict` names the paths, `MergeNeedsMainline` carries the merge's parents so
+/// the dialog can ask which side to keep, and `EmptyReplay` is git's own *"the previous
+/// cherry-pick is now empty"*. See `cide_git::replay`'s header for why none of them leaves a
+/// `REVERT_HEAD` behind.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_revert(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    request: cide_ipc::history::ReplayRequest,
+) -> Result<cide_ipc::history::ReplayOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = cide_git::replay::revert(&root, &request)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
+    })
+    .await
+}
+
+/// Apply a commit's patch **as it stands** onto `HEAD` — the log's *Cherry-pick*.
+///
+/// One command and not a `ReplayOp` argument on [`git_revert`], even though `cide-git` shares
+/// one implementation behind them. A caller that passed the wrong enum variant would revert
+/// where it meant to cherry-pick and there is no undo for that; two `#[tauri::command]`s make
+/// the mistake unrepresentable on the wire, and cost one line each.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_cherry_pick(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    request: cide_ipc::history::ReplayRequest,
+) -> Result<cide_ipc::history::ReplayOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = cide_git::replay::cherry_pick(&root, &request)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
+    })
+    .await
+}
+
+/// What each kind of reset would discard. **Touches nothing**, and does not broadcast.
+///
+/// The one read in this block, and the confirmation dialog cannot be honest without it: it
+/// carries the dropped commits (capped in Rust), the staged and dirty path lists that Mixed and
+/// Hard respectively cost, whether `use_staging_area` is on — which is what makes a mixed reset
+/// destroy a hand-built `git add -p` selection rather than merely a derived index — and
+/// `commits_gained`, so a reset *forward* is described as what it is instead of as "0 commits
+/// would be undone".
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_reset_preview(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    target: String,
+) -> Result<cide_ipc::history::ResetPreview> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        cide_git::reset::preview(&root, &target)
+    })
+    .await
+}
+
+/// Move `HEAD` — and, per [`ResetKind`], the index and the working tree.
+///
+/// **A `hard` reset destroys uncommitted work.** This handler does not confirm, for
+/// `git_rollback`'s reason: a confirmation the backend cannot show is not a safeguard. What it
+/// does offer is the thing a confirmation cannot — [`ResetRequest::shelve_first`], which
+/// captures the working tree into cide's own shelf *before* the reset and returns the entry, so
+/// the toast can offer *Unshelve* without a second round trip.
+///
+/// `force` proceeds past the external-staging guard (Mixed and Hard take it; Soft is exempt
+/// because it writes no index) and past a dirty tree. It deliberately does **not** proceed past
+/// `operation_in_progress`, and there is no flag that does — see `cide_git::reset`'s header:
+/// a `--hard` during a rebase leaves the todo list pointing at commits nothing can reach.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_reset(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    request: cide_ipc::history::ResetRequest,
+) -> Result<cide_ipc::history::ResetOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = cide_git::reset::reset(&root, &request)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
+    })
+    .await
+}
+
+/// Create — or, with [`TagRequest::force`], move — a tag.
+///
+/// Annotated when `request.message` is `Some`, lightweight when it is `None`; the distinction is
+/// which field is present rather than a `bool` beside an optional message, because `git
+/// describe` and most release tooling ignore lightweight tags and a release marked with the
+/// wrong kind is one the build cannot name.
+///
+/// The refusal carries **where the tag points now**, not merely that the name is taken:
+/// `TagExists { name, oid }` is what lets the dialog ask the question the user is actually
+/// being asked, and `force` is the second click after reading the answer.
+///
+/// Broadcasts even though it moves no file — the log's ref decorations changed. It is also the
+/// one action here allowed to run while an operation is in progress, which
+/// `a_tag_can_still_be_created_during_a_rebase` pins on the `cide-git` side; pushing the tag is
+/// deliberately not part of it.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_tag_create(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    request: cide_ipc::history::TagRequest,
+) -> Result<cide_ipc::history::TagOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = cide_git::tag::create(&root, &request)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
+    })
+    .await
+}
+
+/// Check out a commit, which necessarily detaches `HEAD`.
+///
+/// Separate from [`git_branch_checkout`] and answering [`DetachOutcome`] rather than
+/// [`CheckoutOutcome`], because that type's `branch` field is documented as *the local branch
+/// that is now checked out* and `chrome/branchModel.ts::checkoutNote` puts it straight into
+/// *"Switched to {branch}"* — a short oid there reads as a branch name, and a detached `HEAD`
+/// mistaken for a branch is how a day's commits end up on no ref at all. `DetachOutcome`
+/// carries `previous` instead: the way back, which is the single most useful thing to know
+/// while detached and the thing users least often work out for themselves.
+///
+/// `mode` is the same three-state answer a branch switch takes, and the first attempt is always
+/// `Refuse`: the rejection carries the paths in the way, and `Stash` / `StashAndRestore` are
+/// what the user's answer to that sends back.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_checkout_detached(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    revision: String,
+    mode: CheckoutMode,
+) -> Result<cide_ipc::history::DetachOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = branch::checkout_detached(&root, &revision, mode)?;
+        // The working tree is now some other commit's. Same reason as `git_branch_checkout`.
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
     })
     .await
 }

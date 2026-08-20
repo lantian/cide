@@ -456,3 +456,121 @@ pub fn ipc_degraded(app: &AppHandle, health: &cide_ipc::IpcHealth) {
         tracing::debug!(%error, "ipc-degraded reached no window");
     }
 }
+
+// --- the task tracker (M18) ------------------------------------------------------------
+
+/// One project's `.cide/tasks.json` changed.
+///
+/// # Why this one carries `rev`, when the two events beside it carry none
+///
+/// `git_status` and `diagnostics` deliberately carry no revision, and the argument is the same
+/// for both: they describe something outside the workspace tree, and a revision on them would
+/// make every window re-hydrate its whole workspace because somebody ran `git add`. That
+/// argument does not reach this event, because `rev` here is not being used to order the *tree*
+/// — it is being used to order **this file against itself**.
+///
+/// And it has to be. Every other broadcast in this module describes something with exactly one
+/// writer in one process: the workspace behind a mutex, a `Repository` opened per call, a
+/// language server's publish stream. `.cide/tasks.json` genuinely has several — two cide windows
+/// can both edit it, the project's agents write it through the MCP socket, and a `git pull` or a
+/// teammate can move it on disk with nobody in this process involved at all. So two snapshots
+/// can reach one window in the opposite order to the one they were produced in, and the
+/// receiver's only defence is to keep the highest revision it has seen and drop anything that is
+/// not newer.
+///
+/// That is `cide://workspace-changed`'s situation exactly, so it gets `workspace_changed`'s
+/// answer rather than a new one — carry the revision, carry the whole board, let the receiver
+/// discard what it has already passed.
+///
+/// **This `rev` is the task file's, not the workspace's.** They are unrelated counters over
+/// unrelated files, and feeding this one to `ui/src/store/workspace.ts` — whose `applySnapshot`
+/// drops anything not newer than the workspace revision it holds — would either wedge the
+/// workspace mirror shut or make it accept a stale tree, depending only on which file had seen
+/// more edits. The Tasks panel keeps its own high-water mark.
+///
+/// The whole board rather than a signal to re-ask, on `workspace_changed`'s own argument: it is
+/// a few kilobytes, the emitter has it in hand, and a window that answered by re-fetching would
+/// be reading a file that may have changed again in between.
+pub const TASKS_CHANGED: &str = "cide://tasks-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TasksChanged {
+    project: cide_ipc::ProjectId,
+    /// The task file's revision — see the constant's doc. Present for every board variant,
+    /// including `Absent` and `Unreadable`, which carry none of their own: a snapshot that
+    /// cannot be ordered is a snapshot the receiver cannot safely drop.
+    rev: u64,
+    board: cide_ipc::TaskBoard,
+}
+
+pub fn tasks_changed(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    rev: u64,
+    board: &cide_ipc::TaskBoard,
+) {
+    let payload = TasksChanged {
+        project,
+        rev,
+        board: board.clone(),
+    };
+    if let Err(error) = app.emit(TASKS_CHANGED, payload) {
+        tracing::debug!(%error, "tasks-changed reached no window");
+    }
+}
+
+// --- subagent orchestration (M18) --------------------------------------------------------
+
+/// One project's subagent roster changed — its config, its role definitions, or both.
+///
+/// # Why this one carries no `rev`, when the event directly above it does
+///
+/// `tasks-changed` carries a revision because `.cide/tasks.json` genuinely has several writers:
+/// two cide windows can both edit it, the project's agents write it over the RPC socket, and a
+/// `git pull` can move it with nobody in this process involved. Two snapshots can therefore reach
+/// one window in the opposite order to the one they were produced in, and the receiver's only
+/// defence is a high-water mark.
+///
+/// None of that is true here. A roster is **derived**, not stored: one in-process read of
+/// `.cide/config.json` and `.cide/agents/*.md`, plus a run registry that has exactly one writer
+/// in one process. Every emit is built immediately after the change that caused it, from the
+/// state that change produced, so the last one sent is by construction the newest — there is
+/// nothing for an ordering number to protect. A receiver that dropped a roster for being "older"
+/// would be discarding the only answer it was ever going to get.
+///
+/// A revision would also cost something real. Roster emits track a run's activity — a turn
+/// starting, a tool call, a pause — and `cide://workspace-changed`'s own doc gives the reason
+/// `git_status` and `diagnostics` carry no revision either: a number on this stream would make
+/// every window re-hydrate its whole workspace because an agent started a tool call.
+///
+/// The whole roster rather than a signal to re-ask, on `workspace_changed`'s argument: it is a
+/// few kilobytes, the emitter has it in hand, and a window that answered by re-reading would be
+/// reading files that may have changed again in between.
+///
+/// Not coalesced yet, and it does not need to be: in this slice the only emitter is
+/// `cmd::agents::agents_config_set`, which is a user pressing a switch. The 120 ms coalescing
+/// with a 1 s ceiling that `crate::lsp` uses belongs with the run registry, which is what
+/// produces the once-a-second-per-run churn worth damping.
+pub const AGENTS_CHANGED: &str = "cide://agents-changed";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentsChanged {
+    project: cide_ipc::ProjectId,
+    roster: cide_ipc::AgentRoster,
+}
+
+pub fn agents_changed(
+    app: &AppHandle,
+    project: cide_ipc::ProjectId,
+    roster: &cide_ipc::AgentRoster,
+) {
+    let payload = AgentsChanged {
+        project,
+        roster: roster.clone(),
+    };
+    if let Err(error) = app.emit(AGENTS_CHANGED, payload) {
+        tracing::debug!(%error, "agents-changed reached no window");
+    }
+}

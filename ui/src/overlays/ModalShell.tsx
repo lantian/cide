@@ -8,6 +8,7 @@
  * a component library that renders the rows for us would not.
  */
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import styles from './Overlay.module.css'
 
 export interface ModalShellProps {
@@ -137,6 +138,43 @@ export function ModalShell({
  * would have been three lines and a second definition of what an overlay looks like in this
  * app, which is how the file picker and the confirmation end up 4px apart after someone
  * adjusts one of them.
+ *
+ * # It portals to `document.body`, and that is not decoration
+ *
+ * Reported as "resizer line of git panel is above agent modal", and the numbers say it should
+ * not be: this scrim is `z-index: 60` and the sidebar splitter is `z-index: 1`. `z-index` is
+ * only ever compared *within one stacking context*, and `layout/TabContent.module.css` makes
+ * every tab panel one — `.panel { position: absolute; inset: 0; z-index: 0 }`, `.panelActive
+ * { z-index: 1 }`. A card rendered where it is written from inside a tab therefore resolves
+ * its 60 against its siblings inside that panel and is capped at the panel's own level, so it
+ * paints under anything that is a sibling of the panel. No number fixes that; raising 60 to
+ * 600 only makes the bug depend on which context happens to be topmost where you tested.
+ *
+ * The overlays that never had the problem — the command palette, the file picker — are
+ * mounted by `App.tsx` at top level and were already in the root context. So the portal is
+ * what makes "mounted at App level" and "mounted inside a tab, a pane or a scroller" the same
+ * thing, which is the whole reason it lives here and not at the one call site that reported
+ * it. Three more failure modes come free, and each has already bitten something in this repo:
+ * `position: fixed` resolves against the nearest ancestor with a `transform`, `filter` or
+ * `contain` rather than the viewport; `overflow: hidden` on a pane clips a non-fixed child;
+ * and `TabContent` hides an inactive tab with `visibility: hidden`, which would leave a
+ * still-mounted dialog invisible and still eating keystrokes. `settings/KeymapSection.tsx`
+ * and `menus/ContextMenu.tsx` portal for exactly these reasons and say so.
+ *
+ * **The theme survives**, and that was checked rather than assumed: `public/theme-boot.js`
+ * writes `document.documentElement.dataset.theme`, `styles/tokens.css` defines the palette on
+ * `:root` / `[data-theme='…']`, and `settings/useSettings.ts`'s `paintTheme` writes the same
+ * attribute on `<html>`. `document.body` is inside that subtree, so every `var(--…)` in
+ * `Overlay.module.css` resolves exactly as before. Portalling to anything *above* `<html>`
+ * — the top layer via `<dialog>.showModal()`, say — is the case that would need thought.
+ *
+ * **Bubbling survives too.** React dispatches synthetic events through the *React* tree, not
+ * the DOM tree, so a parent component's `onKeyDown`/`onClick` around an `<OverlayCard>` still
+ * sees events from inside it. The two window-level listeners this app has are unaffected for
+ * their own reasons: `keys/gate.ts` is `window.addEventListener('keydown', …, true)` —
+ * capture, so it runs before the target either way — and `chrome/WindowFrame.tsx`'s document
+ * listeners look for `[data-window-drag="true"]` / `[data-window-button]`, which appear only
+ * on leaf nodes in the header and were never ancestors of a card.
  */
 export function OverlayCard({
   label,
@@ -147,11 +185,12 @@ export function OverlayCard({
   onDismiss: () => void
   children: ReactNode
 }) {
-  return (
+  return createPortal(
     // Click-through to dismiss is on the scrim only; `stopPropagation` on the card keeps a
-    // click inside from closing it. A `<div>` rather than `<dialog>`: `showModal()` moves
-    // the element into the top layer and takes focus itself, which fights the focus rule
-    // in `ModalShell` and puts the overlay outside the token-scoped `data-theme` subtree.
+    // click inside from closing it. A `<div>` rather than `<dialog>`: `showModal()` moves the
+    // element into the top layer and takes focus itself, which fights the focus rule in
+    // `ModalShell` — this component's callers all decide for themselves where focus lands, and
+    // one of them (`settings/AgentsSection.tsx`) has a reason it must not be the first control.
     <div className={styles.scrim} data-audit="overlayScrim" onMouseDown={onDismiss}>
       <div
         className={styles.card}
@@ -163,7 +202,13 @@ export function OverlayCard({
       >
         {children}
       </div>
-    </div>
+    </div>,
+    // No SSR guard, deliberately, and the same call `menus/ContextMenu.tsx` and
+    // `settings/KeymapSection.tsx` make. Nothing in `ui/scripts/check-*-render.mjs` renders a
+    // card — every smoke entry was checked — and a future one that did would fail loudly on
+    // `document is not defined`, which is a better answer than a fallback branch that quietly
+    // renders the dialog back into the capped context this portal exists to escape.
+    document.body,
   )
 }
 

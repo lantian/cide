@@ -17,7 +17,7 @@
 /* 30px, matching the explorer's header so the two sidebars swap without the content
    below them moving by a pixel. */
 .header {
-  height: 30px;
+  height: calc(30px * var(--ui-scale));
   flex: none;
   display: flex;
   align-items: center;
@@ -38,14 +38,14 @@
 }
 
 .segment {
-  height: 18px;
+  height: calc(18px * var(--ui-scale));
   padding: 0 10px;
   border: 0;
   border-radius: 4px;
   background: transparent;
   color: var(--dim);
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   cursor: pointer;
 }
 
@@ -68,7 +68,7 @@
 .branch {
   margin-left: auto;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--purple);
   white-space: nowrap;
   overflow: hidden;
@@ -96,7 +96,7 @@
   background: var(--panel-2);
   border-bottom: 1px solid var(--border-soft);
   color: var(--faint);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   /* A backend error can be long; it must not widen the panel or wrap into three lines. */
   white-space: nowrap;
   overflow: hidden;

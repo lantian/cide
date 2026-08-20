@@ -1,0 +1,24 @@
+[package]
+name = "cide-tasks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The DTOs are the disk format. `.cide/tasks.json` is simultaneously the in-memory domain, the
+# on-disk format and the wire format, so a second copy of `Task` living here would be two
+# definitions that disagree the first time one of them is edited.
+cide-ipc = { workspace = true }
+# `write_atomic`, `Debouncer`, `FileStamp` and `now_ms`. The tracker is written exactly the way
+# `workspace.json` is, and reusing that module is what keeps it true rather than merely claimed.
+cide-core = { workspace = true }
+serde_json = { workspace = true }
+# The store is a mutex around a file, held across a validate-and-bump that several agent threads
+# contend on — the same reason `cide-search` takes it rather than `std::sync`.
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+# No dev-dependencies, deliberately: `cide-core` has none either, and its tests build scratch
+# directories from `std::env::temp_dir()` keyed by pid. Adding a temp-dir crate here would be
+# the workspace's first, for something eight lines already do.

@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 
 use cide_ipc::{
     Axis, DiffOrigin, DiffSpec, Pane, PaneId, PaneKind, PaneRole, Project, ProjectId, ProjectRoot,
-    SessionId, SettingsSection, Side, Tab, TabId, TabKind, UnsavedTab, WindowLabel, WindowMode,
-    WindowRole, Workspace,
+    SessionId, SettingsSection, Side, Tab, TabId, TabKind, ToolWindowState, UnsavedTab,
+    WindowLabel, WindowMode, WindowRole, Workspace,
 };
 use indexmap::IndexMap;
 
@@ -149,6 +149,10 @@ pub fn open_project(
             tab_mru: vec![active_tab],
             detached: IndexMap::new(),
             dock_anchors: IndexMap::new(),
+            // Closed, at the default height, with no history tabs. A new project has nothing
+            // to show in a git log yet and opening one uninvited would resize every pane in
+            // the window on the gesture that was supposed to open a project.
+            tool_window: ToolWindowState::default(),
             primary_session,
         },
     );
@@ -588,18 +592,80 @@ pub fn activate_tab(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Resul
     Ok(())
 }
 
-/// The project's preview diff tab, if it has one.
+/// Which scratch slot a diff tab competes for. (M18)
 ///
-/// At most one exists per project by construction: [`retarget_diff`] is the only thing that
-/// ever sets the flag and it reuses the tab this finds. `find_map` over the strip in order
-/// anyway rather than `debug_assert`ing uniqueness — a `workspace.json` hand-edited or
-/// written by a future version is not a reason to panic, and taking the leftmost is a
-/// defined answer.
-pub fn preview_diff_tab(ws: &Workspace, project: ProjectId) -> Result<Option<TabId>> {
+/// # Why there are two and not one
+///
+/// The preview slot exists so that clicking down a thirty-file changelist produces one tab
+/// rather than thirty — see [`retarget_diff`]. Until M18 one slot was the whole story, because
+/// there was one surface that could ask for a diff.
+///
+/// There are now two, and they are on screen **at the same time**: the git panel's changes
+/// tree in the sidebar, and the log's changed-file list in the tool window. With a single slot
+/// the second surface eats the first one's tab, so a click in the log throws away the working
+/// diff the user was staging from — the mirror image of the thirty-tab report the preview slot
+/// was written to fix, and worse, because what is lost is a tab holding a half-made selection
+/// rather than a tab that should never have existed.
+///
+/// Two slots, one per family. A working-tree diff and a revision diff are different documents
+/// with different affordances (three side buttons and a Stage footer against a read-only pair),
+/// so retargeting one at the other is refused outright; see [`retarget_diff`]'s fourth refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreviewSlot {
+    /// [`DiffOrigin::Git`] — the working tree, the index, and HEAD. The git panel's slot.
+    Working,
+    /// [`DiffOrigin::GitRevision`] — two frozen revisions. The tool window's slot.
+    Revision,
+}
+
+/// Which slot an origin belongs to, or `None` for an origin that has no scratch slot at all.
+///
+/// **Derived, never stored.** A `preview_slot` field on the tab would be a second spelling of a
+/// fact the origin already carries, and the two would disagree the first time a tab was
+/// retargeted across families — which is exactly the case [`retarget_diff`] now refuses, so the
+/// field would be a stored copy of something that cannot legally change. `tab_mru` is the
+/// precedent for adding state to `Project` when it is genuinely new information; this is the
+/// opposite case.
+///
+/// [`DiffOrigin::ClaudeMcp`] is `None` rather than a third variant: that tab is holding an agent
+/// turn open, it is never a preview (nothing opens it as a scratch tab and
+/// [`retarget_diff`] refuses to re-point it), and giving it a slot would invite a future caller
+/// to treat it as reusable.
+pub fn slot_of(origin: &DiffOrigin) -> Option<PreviewSlot> {
+    match origin {
+        DiffOrigin::Git { .. } => Some(PreviewSlot::Working),
+        DiffOrigin::GitRevision { .. } => Some(PreviewSlot::Revision),
+        DiffOrigin::ClaudeMcp { .. } => None,
+    }
+}
+
+/// The project's preview diff tab **for one slot**, if it has one.
+///
+/// At most one exists per project per slot by construction: [`retarget_diff`] is the only thing
+/// that ever sets the flag, it reuses the tab this finds, and it refuses to move a tab between
+/// slots. `find_map` over the strip in order anyway rather than `debug_assert`ing uniqueness — a
+/// `workspace.json` hand-edited or written by a future version is not a reason to panic, and
+/// taking the leftmost is a defined answer.
+///
+/// The `slot` argument is not defaultable and deliberately has no "any" value. A caller that
+/// does not know which family it is opening is a caller that will steal the other one's tab,
+/// which is the whole failure [`PreviewSlot`] exists to prevent; making it say so is what stops
+/// the single-slot behaviour coming back by omission.
+pub fn preview_diff_tab(
+    ws: &Workspace,
+    project: ProjectId,
+    slot: PreviewSlot,
+) -> Result<Option<TabId>> {
     Ok(self::project(ws, project)?
         .tabs
         .iter()
-        .find_map(|t| matches!(&t.kind, TabKind::Diff { preview: true, .. }).then_some(t.id)))
+        .find_map(|t| match &t.kind {
+            TabKind::Diff {
+                spec,
+                preview: true,
+            } if slot_of(&spec.origin) == Some(slot) => Some(t.id),
+            _ => None,
+        }))
 }
 
 /// Point an existing diff tab at a different diff — the mutation behind "change current diff
@@ -613,7 +679,7 @@ pub fn preview_diff_tab(ws: &Workspace, project: ProjectId) -> Result<Option<Tab
 /// gone. Retargeting is one field: the tab, its position, its id and its pane tree all stay,
 /// and only what the panes are *about* changes.
 ///
-/// # Three refusals
+/// # Four refusals
 ///
 /// * Not a diff tab — [`CoreError::Invariant`]. There is no sensible reading of "retarget a
 ///   terminal".
@@ -621,6 +687,18 @@ pub fn preview_diff_tab(ws: &Workspace, project: ProjectId) -> Result<Option<Tab
 ///   of a blocked agent turn: `cide-ide-mcp`'s broker is holding a future that resolves when
 ///   the user answers *this* diff, and re-pointing it at a git file would leave the CLI
 ///   waiting on a question that is no longer on screen.
+/// * **A retarget across families** — [`CoreError::Invariant`]. A [`DiffOrigin::Git`] tab and a
+///   [`DiffOrigin::GitRevision`] tab are not two settings of one pane: the first draws three
+///   side buttons, tick boxes and a Stage/Unstage/Commit footer, the second is read-only,
+///   because there is nothing in the index to stage two 2019 commits into. Re-pointing one at
+///   the other would put a Stage button over a diff of two commits — on the one surface in this
+///   application where a wrong click writes to the index — and the frontend would have to
+///   notice the origin changed under a mounted pane and rebuild itself around a different set
+///   of controls. Refusing here means each family keeps its own scratch tab
+///   ([`PreviewSlot`]) and neither can ever be handed the other's. Asked through [`slot_of`],
+///   so "which family" is derived from the origin at both ends and cannot be stored wrongly;
+///   an origin with no slot at all — `ClaudeMcp`, already refused above — differs from every
+///   slot and is refused here too, which is the safe direction for a variant added later.
 /// * A tab holding unsaved work — [`CoreError::UnsavedChanges`]. Asked through
 ///   [`unsaved_in_tab`], the same query [`close_tab`] uses, and for the same reason: a guard
 ///   that decides "unsaved" its own way is a guard that will one day disagree with the dialog
@@ -651,6 +729,15 @@ pub fn retarget_diff(
     if matches!(current.origin, DiffOrigin::ClaudeMcp { .. }) {
         return Err(CoreError::Invariant(format!(
             "tab {tab} answers a Claude diff request and cannot be retargeted"
+        )));
+    }
+    // The family check. See the fourth refusal above: a working-tree diff and a revision diff
+    // are different documents with different controls, and the slot arithmetic in
+    // [`preview_diff_tab`] only holds because no tab ever crosses.
+    if slot_of(&current.origin) != slot_of(&spec.origin) {
+        return Err(CoreError::Invariant(format!(
+            "tab {tab} shows a diff of a different kind and cannot be retargeted at this one — \
+             a working-tree diff can be staged from and a revision diff cannot"
         )));
     }
     if let Some(unsaved) = unsaved_in_tab(ws, project, tab)? {
@@ -741,6 +828,46 @@ pub fn promote_diff(ws: &mut Workspace, project: ProjectId, tab: TabId) -> Resul
     *preview = false;
     bump(ws);
     Ok(())
+}
+
+/// Normalise the walk that led to a revision tab — [`TabKind::Revision::from`]. (M18)
+///
+/// Pure, and here rather than in `cmd::file` for the reason every other rule in this module is:
+/// what a chain does under a merge cannot be exercised through a `State<WorkspaceState>`, and a
+/// rule that can only be tested at the level of "does the tab open" is a rule that gets tested
+/// once, by hand, on a linear history.
+///
+/// Three things, and each one is a bug it prevents:
+///
+/// * **Newest last**, which is [`TabKind::Revision::from`]'s documented order and therefore the
+///   order already sitting in every `workspace.json` that has one. The pane draws the strip
+///   left to right straight off the slice — `working tree ← from[0] ← … ← from[n-1] ← rev` —
+///   so reversing it here would silently reverse the breadcrumb of a restored tab.
+/// * **`rev` itself is never in it.** The field is the walk that led *here*, so a chain
+///   containing the tab's own revision would draw the current commit twice in its own trail and
+///   give the user a crumb that navigates to the tab they are already in.
+/// * **Each oid at most once, earliest occurrence kept.** This is the one that is not tidiness.
+///   History is a DAG: walking back through a merge and then back again down the other parent
+///   rejoins, and the same commit is reached a second time by a different route. Without this
+///   the chain grows by one entry per lap around a diamond, for ever, in a `Vec<String>` that
+///   `persist` writes to disk on a 500 ms debounce. Keeping the *earliest* occurrence — rather
+///   than moving the oid to the end — is what makes the crumb strip a route the user can retrace
+///   in the order they actually walked it; moving it would rewrite history behind them so that
+///   the trail no longer matches the hops they made.
+///
+/// Deliberately **not** capped. Deduplication already bounds the chain by the number of distinct
+/// revisions that have touched the path, every entry cost the user a deliberate gesture, and a
+/// cap would have to drop the *oldest* hops — which are the ones nearest the working tree and so
+/// the only route back out of a deep walk.
+pub fn revision_chain(rev: &str, from: &[String]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::with_capacity(from.len());
+    for hop in from {
+        if hop == rev || seen.iter().any(|kept| kept == hop) {
+            continue;
+        }
+        seen.push(hop.clone());
+    }
+    seen
 }
 
 /// Move a tab within a project's tab strip.
@@ -3203,6 +3330,41 @@ mod tests {
         );
     }
 
+    /// [`revision_chain`]'s three rules, and the diamond that is the reason for the third. (M18)
+    #[test]
+    fn a_revision_chain_keeps_its_order_drops_its_own_revision_and_never_repeats_one() {
+        let chain = |rev: &str, from: &[&str]| {
+            revision_chain(
+                rev,
+                &from.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            )
+        };
+
+        // Order is untouched: newest last, exactly as the field is documented and as the strip
+        // draws it. This is the ordinary case and it must be the identity.
+        assert_eq!(chain("ccc", &["aaa", "bbb"]), vec!["aaa", "bbb"]);
+        assert_eq!(chain("aaa", &[]), Vec::<String>::new());
+
+        // The tab's own revision is not part of the walk that led to it. Reachable the moment a
+        // user walks back and then forward again through a crumb.
+        assert_eq!(chain("bbb", &["aaa", "bbb"]), vec!["aaa"]);
+
+        // The diamond. `bbb` is reached down one parent of the merge and again down the other;
+        // without the dedupe this chain grows by one entry per lap, on disk.
+        assert_eq!(
+            chain("ddd", &["aaa", "bbb", "ccc", "bbb", "aaa"]),
+            vec!["aaa", "bbb", "ccc"],
+            "and the EARLIEST occurrence is the one kept, so the crumbs stay in the order the \
+             user walked them rather than being reshuffled behind them"
+        );
+
+        // Idempotent: a chain that has already been normalised is its own answer, which is what
+        // makes it safe to run on the `from` of a tab that is being extended.
+        let once = chain("ddd", &["aaa", "bbb", "ccc", "bbb"]);
+        let twice = revision_chain("ddd", &once);
+        assert_eq!(once, twice);
+    }
+
     #[test]
     fn reordering_tabs_moves_the_tab_and_nothing_else() {
         let mut ws = Workspace::default();
@@ -4071,14 +4233,21 @@ mod tests {
     fn the_preview_slot_holds_one_tab_and_promotion_frees_it() {
         let mut ws = Workspace::default();
         let project = open(&mut ws, "/repo");
-        assert_eq!(preview_diff_tab(&ws, project).expect("exists"), None);
+        let working = PreviewSlot::Working;
+        assert_eq!(
+            preview_diff_tab(&ws, project, working).expect("exists"),
+            None
+        );
 
         let (kept, _) = open_diff(&mut ws, project, "src/keep.rs", false);
-        assert_eq!(preview_diff_tab(&ws, project).expect("exists"), None);
+        assert_eq!(
+            preview_diff_tab(&ws, project, working).expect("exists"),
+            None
+        );
 
         let (preview, _) = open_diff(&mut ws, project, "src/scratch.rs", true);
         assert_eq!(
-            preview_diff_tab(&ws, project).expect("exists"),
+            preview_diff_tab(&ws, project, working).expect("exists"),
             Some(preview)
         );
 
@@ -4090,7 +4259,116 @@ mod tests {
         );
 
         promote_diff(&mut ws, project, preview).expect("promotes");
-        assert_eq!(preview_diff_tab(&ws, project).expect("exists"), None);
+        assert_eq!(
+            preview_diff_tab(&ws, project, working).expect("exists"),
+            None
+        );
         assert!(ws.rev > rev);
+    }
+
+    /// The shape `cmd::file::revision_diff_spec` produces, without depending on the app crate.
+    fn revision_spec(path: &str, oid: &str) -> DiffSpec {
+        DiffSpec {
+            title: format!("{path} @ {oid}"),
+            old_path: PathBuf::from(path),
+            new_path: PathBuf::from(path),
+            origin: DiffOrigin::GitRevision {
+                repo: cide_ipc::RepoId::new(),
+                path: path.to_owned(),
+                new: cide_ipc::history::RevSide::Commit {
+                    oid: oid.to_owned(),
+                },
+                old: cide_ipc::history::RevSide::FirstParent,
+            },
+        }
+    }
+
+    /// Two slots, and the git panel's scratch tab is not the tool window's.
+    ///
+    /// The failure this pins is the one that motivated [`PreviewSlot`]: with a single slot, a
+    /// click in the log's file list retargets the tab the user was staging from, and the
+    /// half-made selection in it goes with it.
+    #[test]
+    fn a_revision_preview_and_a_working_preview_are_different_tabs() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (working, _) = open_diff(&mut ws, project, "src/a.rs", true);
+        let spec = revision_spec("src/b.rs", "a1b2c3d");
+        let revision = open_tab(
+            &mut ws,
+            project,
+            TabKind::Diff {
+                spec: spec.clone(),
+                preview: true,
+            },
+            demo_pane(PaneKind::Diff, &spec.title, false),
+        )
+        .expect("opens");
+
+        assert_eq!(
+            preview_diff_tab(&ws, project, PreviewSlot::Working).expect("exists"),
+            Some(working)
+        );
+        assert_eq!(
+            preview_diff_tab(&ws, project, PreviewSlot::Revision).expect("exists"),
+            Some(revision)
+        );
+    }
+
+    /// The fourth refusal: a revision tab is read-only and a working-tree tab has a Stage
+    /// footer, so neither may be re-pointed at the other's kind of diff.
+    #[test]
+    fn a_diff_tab_refuses_to_be_retargeted_across_families() {
+        let mut ws = Workspace::default();
+        let project = open(&mut ws, "/repo");
+        let (working, working_spec) = open_diff(&mut ws, project, "src/a.rs", true);
+        let rev = ws.rev;
+
+        let refused = retarget_diff(&mut ws, project, working, revision_spec("src/b.rs", "dead"));
+        assert!(matches!(refused, Err(CoreError::Invariant(_))));
+        assert_eq!(
+            kind_of(&ws, project, working),
+            TabKind::Diff {
+                spec: working_spec,
+                preview: true
+            },
+            "a refusal changes nothing about the tab"
+        );
+        assert_eq!(ws.rev, rev, "a refusal leaves the revision alone");
+
+        // And the other direction, which is the one that would put a Stage button over two
+        // commits.
+        let spec = revision_spec("src/c.rs", "a1b2c3d");
+        let revision = open_tab(
+            &mut ws,
+            project,
+            TabKind::Diff {
+                spec: spec.clone(),
+                preview: true,
+            },
+            demo_pane(PaneKind::Diff, &spec.title, false),
+        )
+        .expect("opens");
+        assert!(matches!(
+            retarget_diff(&mut ws, project, revision, git_spec("src/d.rs")),
+            Err(CoreError::Invariant(_))
+        ));
+        assert_eq!(
+            kind_of(&ws, project, revision),
+            TabKind::Diff {
+                spec,
+                preview: true
+            }
+        );
+
+        // Within a family it still works, which is the half that must not be broken by the
+        // check above.
+        retarget_diff(
+            &mut ws,
+            project,
+            revision,
+            revision_spec("src/e.rs", "beef123"),
+        )
+        .expect("same family, so it retargets");
     }
 }

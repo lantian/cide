@@ -50,15 +50,46 @@
  * script can compile, and this project has paid for that five times.
  */
 
-/** Every button on the activity rail. `settings` is the one with no panel behind it. */
-export type ActivityView = 'files' | 'git' | 'search' | 'problems' | 'settings'
+/**
+ * Every button on the activity rail. `settings` is the one with no panel behind it.
+ *
+ * `agents` and `tasks` joined in M18 and cost this module exactly two union members. Nothing
+ * below them changed: `PanelView` is `Exclude<…, 'settings'>` and picked both up, and
+ * `selectView`, `showPanel` and `toggleSidebar` are written as rules *over* the type rather
+ * than as a branch per view, so neither of them mentions a view by name. That is the whole
+ * payoff of this module existing, and it is worth stating so the next view added here is
+ * added the same way — a function that grows a `if (next === 'tasks')` arm has stopped being
+ * a rule and has become the ternary in `App.tsx` this file was extracted from.
+ */
+export type ActivityView =
+  | 'files'
+  | 'git'
+  | 'search'
+  | 'problems'
+  | 'agents'
+  | 'tasks'
+  | 'settings'
 
 /** The views that actually draw a sidebar panel — everything a hidden sidebar can restore. */
 export type PanelView = Exclude<ActivityView, 'settings'>
 
 export interface SidebarState {
-  /** What the rail has lit, or `null` for nothing lit and the sidebar hidden. */
-  readonly view: ActivityView | null
+  /**
+   * What the rail has lit, or `null` for nothing lit and the sidebar hidden.
+   *
+   * [`PanelView`] and not [`ActivityView`]: **⚙ is not a state this can be in.** It used to be,
+   * and that was the bug —
+   *
+   * > *"when i click it - it stucks in active state like git panel, but it should - settings
+   * > icon just opens settings tab, no need to stay in active state."*
+   *
+   * Settings is a workspace *tab*. Lighting a rail button for it claimed the sidebar was showing
+   * something it has no panel for, and the button then stayed lit until another one was pressed,
+   * because nothing else could clear a view that draws nothing. Narrowing the type is what makes
+   * that unreachable rather than merely fixed: `isPanelOpen` no longer needs to special-case it
+   * and no future updater can put it back.
+   */
+  readonly view: PanelView | null
   /**
    * The last panel that was actually showing. Never `settings`, never `null`.
    *
@@ -71,23 +102,35 @@ export interface SidebarState {
 /** Files, open — what every shell window has started with since M3. */
 export const SIDEBAR_INITIAL: SidebarState = { view: 'files', last: 'files' }
 
-/** Is a panel on screen? `settings` is not one, and neither is `null`. */
+/**
+ * Is a panel on screen?
+ *
+ * One comparison, because `view` is a [`PanelView`] — every value it can hold draws a panel. It
+ * carried a second test against `'settings'` until that stopped being representable.
+ */
 export function isPanelOpen(state: SidebarState): boolean {
-  return state.view !== null && state.view !== 'settings'
+  return state.view !== null
 }
 
 /**
  * A click on a rail button.
  *
- * The lit one toggles its panel shut — that is the gesture that has existed since M3 and it is
- * kept exactly — and any other switches to it, whether or not the sidebar is currently hidden.
+ * The lit one toggles its panel shut — the gesture that has existed since M3, kept exactly — and
+ * any other switches to it, whether or not the sidebar is currently hidden.
  *
- * ⚙ is the exception and is handled here rather than by an early return at the call site, so
- * that the rule lives where the other two do: it has no panel to hide, and a second click on it
- * is the user asking for that tab back rather than asking for nothing.
+ * **⚙ changes nothing here.** It opens the Settings tab, which the call site does, and the
+ * sidebar is left exactly as it was: whatever panel was showing keeps showing, and no rail
+ * button lights up for it.
+ *
+ * It used to return `{ view: 'settings' }`, on the reasoning that a rail click should always
+ * move the rail. That was wrong twice over — the gear stayed lit with no panel under it until
+ * some other button was pressed, and clicking it hid whatever panel the user had open, which is
+ * a side effect nobody asked a tab-opening button for. Returning the state untouched is also why
+ * this is still a function rather than an early return at the call site: the *rule* is that ⚙ is
+ * orthogonal to the sidebar, and a rule is worth a line here where a check can run it.
  */
 export function selectView(state: SidebarState, next: ActivityView): SidebarState {
-  if (next === 'settings') return { view: 'settings', last: state.last }
+  if (next === 'settings') return state
   if (state.view === next) return { view: null, last: next }
   return { view: next, last: next }
 }

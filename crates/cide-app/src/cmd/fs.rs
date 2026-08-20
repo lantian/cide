@@ -30,6 +30,7 @@ use cide_fs::{FsError, Visibility, ops};
 use cide_ipc::{FsStatus, ProjectId, TreeRow};
 use tauri::{Manager, State};
 
+use crate::cmd::log::LogRegistry;
 use crate::cmd::search::SearchRegistry;
 use crate::files::{FsEvents, FsRegistry};
 use crate::workspace_state::WorkspaceState;
@@ -113,13 +114,27 @@ pub(crate) async fn index_project(
     }
 }
 
-/// Drop a project's index, stop watching it, and stop any search over it. Idempotent.
+/// Drop a project's index, stop watching it, and stop any search or log walk over it. Idempotent.
+///
+/// The log walks are cancelled **here** rather than inside [`close_project`], and the asymmetry
+/// with the searches one line down is worth naming so nobody tidies it away. `close_project` is
+/// the seam `cmd::search`'s own test drives directly, without a Tauri app to hand it a `State`;
+/// widening its signature would rewrite a test that is about something else. The registry is
+/// reached from the one caller that has it, and the ordering argument is unchanged — the flag is
+/// set before the index is torn down, so a walk in flight sees it while it still has a repository
+/// to walk rather than after.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fs_close(
     registry: State<'_, FsRegistry>,
     searches: State<'_, SearchRegistry>,
+    logs: State<'_, LogRegistry>,
     project: ProjectId,
 ) -> Result<bool, FsError> {
+    // A log walk over a closing project is libgit2 reading a history nobody will see the rows
+    // of — the same waste `searches.cancel` exists to stop, on the same disk the teardown below
+    // is competing for. Nothing else sweeps them: without this they run to the end of the page's
+    // scan budget, which on a large repository is the whole point of having a budget.
+    logs.cancel_project(project);
     close_project(&registry, &searches, project).await
 }
 

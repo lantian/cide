@@ -147,6 +147,12 @@ export function stateLabel(state: string): string {
   // is holding the result for the user. `idle` is a session that has not been asked anything.
   if (state === 'awaitingInput') return 'finished, waiting for you'
   if (state === 'idle') return 'idle'
+  // Frozen with `SIGSTOP` by the user's own Pause. It counts as live — `SessionState::is_live`
+  // returns true for it, because a paused session has an unfinished turn by definition or it
+  // would not have been worth pausing — so it reaches this dialog, and the word has to say that
+  // quitting now discards work that is merely stopped rather than gone. "paused" alone would
+  // read as harmless.
+  if (state === 'paused') return 'paused mid-turn'
   return state
 }
 

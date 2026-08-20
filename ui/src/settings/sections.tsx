@@ -1,9 +1,16 @@
 /**
- * The seven sections of the Settings tab, exactly the mock's list and in its order.
+ * The sections of the Settings tab, in `SettingsSection`'s order — which is the mock's for the
+ * seven it drew, plus the ones later milestones added.
  *
- * Each section is a pure function of the settings it renders plus a `patch` callback. None of
- * them reads the store: `SettingsTab` does the wiring, which is what lets the whole screen be
- * driven from a fixture and keeps every section's props visible in one place.
+ * Most sections are a pure function of the settings they render plus a `patch` callback:
+ * `SettingsTab` does the wiring, which is what lets the whole screen be driven from a fixture and
+ * keeps every section's props visible in one place.
+ *
+ * **Two are not, and both are the same exception.** `KeymapSection` and `AgentsSection` render
+ * something that is not in `Settings` at all — the command registry, and this project's role
+ * definition files — so they take no props and fetch their own state. They are the sections whose
+ * subject is not a global preference, and each says so in its own header. Nothing else here may
+ * quietly join them: a section that reads the store is a section the fixture cannot drive.
  *
  * The wording of the toggles is the mock's, with one deliberate exception noted on
  * `keepSessionsOnWindowClose` below.
@@ -32,6 +39,13 @@ import {
   Segmented,
   ToggleRow,
 } from './controls'
+import { AgentsSection } from './AgentsSection'
+// The band, from the module the arithmetic lives in, rather than two literals typed here.
+// `check-ui-scale.mjs` pins that module against Rust's `MIN_UI_FONT_SIZE`/`MAX_UI_FONT_SIZE`,
+// so importing it is what makes this input's clamp the same clamp `settings_set` applies —
+// the editor's and terminal's controls below still spell 6 and 40 out, and that is the older
+// shape rather than the better one.
+import { MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE } from './fontScale'
 import { badge, handshakeNote, sentence } from './cliHandshake'
 import { ClaudeCliSection } from './ClaudeCliSection'
 import { GraphicsLadder } from './GraphicsLadder'
@@ -72,6 +86,19 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     id: 'inspections',
     title: 'Inspections',
     description: 'Which analysers run, and which of their findings you see.',
+  },
+  {
+    // Between Inspections and Git because that is where `SettingsSection::Agents` sits in the
+    // Rust enum, and the nav is that enum's order. It is also the honest place for it: it is
+    // not a page of settings at all — nothing here rides `SettingsPatch` or `workspace.json` —
+    // it is an editor for `.cide/agents/*.md` and their global twins, reached through the
+    // Settings shell because that is where a person looks for *configure the thing*. The
+    // description says so, because a section under Settings that writes files a `git status`
+    // will show is not what the eight rows around it are.
+    id: 'agents',
+    title: 'Agents',
+    description:
+      'The subagent roles this project and you define. Each one is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
   },
   { id: 'git', title: 'Git', description: 'Changelists, staging and the commit tool window.' },
   { id: 'terminal', title: 'Terminal', description: 'Every pane running a shell or a TUI.' },
@@ -119,6 +146,25 @@ function Appearance({ settings, patch, setTheme, openLogDir, logDir }: SectionPr
           hint="Every colour in the app comes from a token, so live terminals repaint with it — no restart, no reload. The titlebar’s toggle sets the same setting."
           control={
             <Segmented label="Theme" value={settings.theme} options={THEMES} onChange={setTheme} />
+          }
+        />
+        <Row
+          label="UI font size"
+          // Named for what it excludes, because the screen already carries two other font
+          // sizes and "which one moves the file tree?" is the question this hint answers.
+          hint="Everything except the editor and the terminal — the file tree, the git panel, Problems, the log, tabs, menus and this screen. The two settings below stay where you put them."
+          control={
+            <NumberField
+              label="UI font size"
+              value={settings.uiFontSize}
+              // Half steps like the two code sizes, even though this default is a whole
+              // number: the scale it drives is fractional (13 → 15 moves a 10.5px label to
+              // 12.1px), so a user chasing a particular size wants the finer notch.
+              step={0.5}
+              min={MIN_UI_FONT_SIZE}
+              max={MAX_UI_FONT_SIZE}
+              onChange={(uiFontSize) => patch({ uiFontSize })}
+            />
           }
         />
       </Group>
@@ -516,6 +562,11 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       return <Files {...props} />
     case 'inspections':
       return <Inspections {...props} />
+    case 'agents':
+      // No props: roles belong to a *project*, and `SectionProps` carries global settings.
+      // The component takes the project from the store the way `KeymapSection` takes the
+      // command registry — see its own header for why that is right here and nowhere else.
+      return <AgentsSection />
     case 'git':
       return <Git />
     case 'terminal':

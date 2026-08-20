@@ -1818,6 +1818,59 @@ try {
       + 'asserted here because the menu route reaches it through different code',
   )
 
+  // --- when Commit can be pressed -----------------------------------------------------------
+  //
+  // One rule with one exception, and the exception is the whole reason it is a function.
+
+  eq(m.canCommit({ picked: 2, reword: false, busy: null }), true, 'ticks commit')
+  eq(
+    m.canCommit({ picked: 0, reword: false, busy: null }),
+    false,
+    'nothing ticked and not a reword is nothing to commit — the ticks are the commit',
+  )
+  eq(
+    m.canCommit({ picked: 0, reword: true, busy: null }),
+    true,
+    'nothing ticked *while amending one named repository* is a reword, which is the commonest '
+      + 'amend there is. It was unreachable from the panel until the button and '
+      + '`cide_git::commit`\'s `NothingToCommit` guard were widened together',
+  )
+  eq(
+    m.canCommit({ picked: 3, reword: false, busy: 'committing' }),
+    false,
+    'and never while one is already in flight — the second click is the one that commits twice',
+  )
+  eq(
+    m.canCommit({ picked: 0, reword: true, busy: 'committing' }),
+    false,
+    '…including on the reword path, which must not be an exception to the busy check as well',
+  )
+
+  // --- a reword mints a unit from no files ----------------------------------------------------
+  //
+  // The other half of the same fact, and the reason `canCommit` takes the conclusion rather than
+  // the parts: `commit` returns early on an empty unit list, so a lit button over zero units is a
+  // click that silently does nothing.
+
+  eq(
+    m.commitUnits(one, new Set(), null),
+    [],
+    'nothing ticked and no repository named yields no units — which is what makes the '
+      + 'multi-root checkbox case a no-op rather than a reword of whichever root sorted first',
+  )
+  eq(
+    m.commitUnits(one, new Set(), APP),
+    [{ repo: APP, paths: [], changelist: null }],
+    'a named repository with nothing ticked is one file-less unit: the reword',
+  )
+  eq(
+    m.commitUnits(one, defaults, APP),
+    m.commitUnits(one, defaults, null),
+    'and an amend that *does* tick something is an ordinary amend — the file-less unit must not '
+      + 'be added alongside real ones, or a monorepo amend would commit in a repo nobody '
+      + 'selected anything in',
+  )
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

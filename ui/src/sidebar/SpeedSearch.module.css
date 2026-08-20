@@ -31,7 +31,7 @@
   background: var(--panel-2);
   box-shadow: var(--shadow);
   font-family: var(--font-ui);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   /* A readout, never a target: a click that landed here instead of on the row underneath would
      move the caret out of the tree and end the search the click was aimed at. */
   pointer-events: none;

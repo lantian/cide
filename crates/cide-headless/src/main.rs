@@ -1,26 +1,35 @@
 //! `cide-headless` — run and inspect a cide workspace without a window.
 //!
-//! Its real job is architectural: this binary links `cide-core`, `cide-ipc` and
-//! `cide-pty` and **must never** be able to link `tauri`. If someone puts domain logic in
-//! the app crate, this stops building — a cheaper guard than a code-review convention.
+//! Its real job is architectural: this binary links `cide-core`, `cide-ipc`, `cide-pty`,
+//! `cide-tasks` and `cide-agents`, and **must never** be able to link `tauri`. If someone puts
+//! domain logic in the app crate, this stops building — a cheaper guard than a code-review
+//! convention.
 //!
 //! `run` spawns a program on a PTY and streams it to stdout, which exercises the spawn
 //! path, the coalescer and the sink trait. The inspection subcommands render the domain as
 //! text: `tree` is how a human checks that a persisted layout is what they think it is,
 //! and how M5's restore work gets debugged.
 //!
+//! `tasks` and `agents` read a project's `.cide/` through the same loaders the panels use, and
+//! their second reason to exist is the paragraph above: M18 added `cide-tasks` and `cide-agents`
+//! and this binary linked neither, so for one milestone the proof covered less than it claimed
+//! to. That is also why neither subcommand prints a value it built itself — a `Debug` of a
+//! hand-constructed roster would link a crate and exercise nothing, and the first `AppHandle` to
+//! appear in either of those two crates has to be able to break this build.
+//!
 //! Every renderer here is a pure `&T -> String`, so the tests assert on the exact output
 //! rather than on the shape of some intermediate structure.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cide_agents::{AgentProblem, Catalog, Isolation, ProjectAgents, Severity, defs};
 use cide_core::layout;
 use cide_ipc::keymap::{Command, KeymapLayer, ResolvedBinding};
 use cide_ipc::workspace::{LayoutNode, PaneTree, Project, Tab, TabKind, WindowRole, Workspace};
-use cide_ipc::{Axis, PaneId, PaneKind, PaneRole, ProjectId};
+use cide_ipc::{Axis, PaneId, PaneKind, PaneRole, ProjectId, Task, TaskFile, TaskStatus};
 use cide_pty::{Geometry, PtySession, Sink, SpawnSpec};
 
 const USAGE: &str = "\
@@ -31,7 +40,9 @@ usage:
   cide-headless tree [--path FILE]        render a persisted workspace as a tree
   cide-headless demo                      render the built-in demo workspace
   cide-headless commands                  list the command registry, grouped
-  cide-headless keymap                    list resolved bindings with their layer";
+  cide-headless keymap                    list resolved bindings with their layer
+  cide-headless tasks <root>              render a project's .cide/tasks.json
+  cide-headless agents <root>             render its subagent roles and config";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +58,8 @@ fn main() {
         "demo" => demo(),
         "commands" => commands(),
         "keymap" => keymap(),
+        "tasks" => tasks(rest),
+        "agents" => agents(rest),
         "help" | "-h" | "--help" => emit(&format!("{USAGE}\n")),
         other => {
             eprintln!("cide-headless: unknown subcommand `{other}`");
@@ -236,6 +249,313 @@ fn render_macos_menu_conflicts() -> String {
         ));
     }
     out
+}
+
+// ------------------------------------------------------------------- tasks, agents
+
+/// The project root a `tasks` or `agents` invocation names.
+///
+/// Required rather than defaulting to the current directory, for the reason `main` refuses a
+/// bare invocation: a guessed root would print somebody's shell cwd as though they had asked
+/// about it, and both of these subcommands answer "there is nothing here" for a directory that
+/// simply is not a project.
+fn project_root(args: &[String], subcommand: &str) -> PathBuf {
+    let [root] = args else {
+        eprintln!("cide-headless: `{subcommand}` takes exactly one project root");
+        usage_and_exit();
+    };
+    // The answer `--path` gives an empty value, for the same reason: `''` is a mistake rather
+    // than a directory, and reporting that the project at the empty string has no tracker sends
+    // the reader looking at their disk instead of at their command line.
+    if root.is_empty() {
+        eprintln!("cide-headless: `{subcommand}` needs a project root");
+        usage_and_exit();
+    }
+    // Taken as written, relative included, exactly as `tree --path` takes it: that resolves
+    // against the shell's cwd, which is what someone typing `agents .` means.
+    let root = PathBuf::from(root);
+    // Refused here rather than left to the loaders, because neither of them can refuse it: both
+    // are documented never to fail, so `cide_tasks::read` answers a missing directory with
+    // `Absent` and `cide_agents::load_project` with an empty roster — and a mistyped path would
+    // render as a real project that happens to have no tracker and no roles.
+    if !root.is_dir() {
+        fail(format!(
+            "{} is not a directory — `{subcommand}` takes a project root",
+            root.display()
+        ));
+    }
+    root
+}
+
+/// Renders a project's task tracker, `<root>/.cide/tasks.json`.
+///
+/// The tracker is a committed file with several writers — two cide windows and every dispatched
+/// agent — and `.cide/` is invisible to cide's own file tree by design, so short of opening it
+/// in another editor this is the only way to read it. That is the same job `tree` does for
+/// `workspace.json`, one crate over.
+fn tasks(args: &[String]) {
+    let root = project_root(args, "tasks");
+    let path = cide_tasks::tasks_path(&root);
+
+    // `cide_tasks::read`, not `TaskStore::open`, for the reason `tree` reads its own bytes rather
+    // than handing the path to `persist::load`: `open` goes through a `load` that moves an
+    // unparseable file aside, and looking at a file must never be the thing that renames it.
+    // `read` promises the opposite in as many words — it never renames anything and never fails —
+    // and it hands back the four states separately, which is exactly what there is to print. A
+    // store would also build a debouncer and a write path that only make sense to a caller that
+    // is going to mutate, and this is a one-shot that never writes.
+    match cide_tasks::read(&path) {
+        cide_tasks::ReadOutcome::Ready { file, .. } => {
+            emit(&format!("{}\n", path.display()));
+            emit(&render_board(&file));
+        }
+        // Not an error, and not a blank screen either: most projects have never had a tracker,
+        // and that has to be a sentence or a reader is left guessing which of "no tasks" and "I
+        // could not read it" they are looking at.
+        cide_tasks::ReadOutcome::Absent => emit(&format!(
+            "{}\nno tracker here — the file is written when the first task is created, and it is \
+             committed with the code\n",
+            path.display()
+        )),
+        // The two unreadable shapes exit non-zero: the invocation was fine and the work was not,
+        // which is what `fail` is for. `conflicted` is carried through because it is the one
+        // distinction that changes what the reader should do next.
+        cide_tasks::ReadOutcome::Refused { error } => fail(format!("{}: {error}", path.display())),
+        cide_tasks::ReadOutcome::Unparseable { error, conflicted } => fail(format!(
+            "{}: {error}{}",
+            path.display(),
+            if conflicted {
+                " — the file still has both sides of a merge in it"
+            } else {
+                ""
+            }
+        )),
+    }
+}
+
+/// Renders a project's subagent roster and the config that decides whether any of it may run.
+///
+/// A definition file with a typo in it is the case this exists for. `cide_agents::defs` answers
+/// one with an `AgentProblem` rather than a refusal, so the role is still in the roster and the
+/// only thing that says why it is greyed is a sentence — which, until now, nothing outside a
+/// running window could print.
+fn agents(args: &[String]) {
+    let root = project_root(args, "agents");
+    // Stat'ed before the load, and only for the sentence in the config block below: `config::load`
+    // answers with the defaults for a file that is absent *and* for one that will not parse.
+    let config_present = matches!(
+        cide_agents::config::config_path(&root).try_exists(),
+        Ok(true)
+    );
+    // `load_project` and not a pair of hand-rolled reads: it is the call `cmd/agents.rs` makes,
+    // against the real directories and the real `installed` probe, so this prints what the panel
+    // would draw rather than a second answer free to drift from it. It is also what puts the real
+    // loader — not a constructed value — inside the no-tauri proof.
+    let roster = cide_agents::load_project(&root);
+    emit(&render_roster(&root, config_present, &roster));
+}
+
+/// Renders a task file: a header, then one row per task in file order.
+///
+/// File order is the panel's order and the order an agent reads, so sorting here — by status,
+/// say — would draw a board that nothing else in the product draws.
+fn render_board(file: &TaskFile) -> String {
+    if file.tasks.is_empty() {
+        // A tracker that exists and holds nothing is a real state — every task done and deleted —
+        // and it is not the state above. An empty table would leave the two indistinguishable.
+        return format!(
+            "rev {}  schema {}  no tasks — the file is here and holds nothing, which is not the \
+             same as a project that never had one\n",
+            file.rev, file.schema_version
+        );
+    }
+
+    let rows: Vec<Row> = file
+        .tasks
+        .iter()
+        .map(|task| Row {
+            label: task.id.to_string(),
+            cells: vec![
+                status_name(task.status).into(),
+                // The role the task is *for*, never who is running it now — see `Task::agent`.
+                task.agent
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                task.title.clone(),
+                comment_count(task),
+            ],
+        })
+        .collect();
+
+    format!(
+        "rev {}  schema {}  {} task(s)\n\n{}",
+        file.rev,
+        file.schema_version,
+        file.tasks.len(),
+        render_rows(&rows)
+    )
+}
+
+/// The `serde` spelling of a status, which is what the file on disk holds.
+fn status_name(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Todo => "todo",
+        TaskStatus::Doing => "doing",
+        TaskStatus::Review => "review",
+        TaskStatus::Done => "done",
+    }
+}
+
+/// `3 comments`, or nothing at all when there are none.
+///
+/// Blank rather than `0 comments`, the way a pane with no session prints no session column: this
+/// column exists so that the tasks carrying a conversation are findable at a glance, and a column
+/// of zeroes is precisely what stops that working.
+fn comment_count(task: &Task) -> String {
+    match task.comments.len() {
+        0 => String::new(),
+        1 => "1 comment".to_string(),
+        n => format!("{n} comments"),
+    }
+}
+
+/// The three blocks of `agents`: the roles, the config, and everything wrong with the files.
+fn render_roster(root: &Path, config_present: bool, roster: &ProjectAgents) -> String {
+    let mut out = render_roles(root, &roster.catalog);
+    out.push('\n');
+    out.push_str(&render_agents_config(root, config_present, roster));
+    out.push('\n');
+    out.push_str(&render_problems(&roster.catalog.problems));
+    out
+}
+
+/// One row per role: name, harness, whether it may be dispatched, and the file it was read from.
+fn render_roles(root: &Path, catalog: &Catalog) -> String {
+    if catalog.agents.is_empty() {
+        // Both directories, because the global one is the half a user forgets they have — and a
+        // project with no roles is far more often a directory that is not where they think.
+        // `global_dir` reads `XDG_CONFIG_HOME`, which makes this the one renderer here that is
+        // not a pure function of its arguments; the sentence is worth nothing without the real
+        // path, and the test asserts against the same call.
+        return format!(
+            "no roles — nothing was read from {} or {}\n",
+            defs::project_dir(root).display(),
+            defs::global_dir().display()
+        );
+    }
+
+    let mut rows = vec![Row::plain(format!("{} role(s)", catalog.agents.len()))];
+    for agent in &catalog.agents {
+        rows.push(Row {
+            label: format!("  {}", agent.def.id),
+            cells: vec![
+                defs::harness_name(agent.def.harness).into(),
+                if agent.is_available() {
+                    "available".into()
+                } else {
+                    "unavailable".to_string()
+                },
+                // The single most useful field for a support question, per its own doc: a role
+                // behaving unexpectedly is nearly always a role read from a file the user forgot.
+                agent.origin.display().to_string(),
+            ],
+        });
+        // The sentence, on a line of its own and as a structural row, so that its length takes no
+        // part in the alignment of every other role. That it is a sentence at all is the whole
+        // point of `AgentDef::unavailable` — a greyed row with nothing saying why is the state
+        // this project has already paid for two dozen times over.
+        if let Some(reason) = &agent.def.unavailable {
+            rows.push(Row::plain(format!("    {reason}")));
+        }
+        // A shadowed definition must never be silent: the user edits the global file, sees nothing
+        // change, and has no way to discover that the project's own copy has been winning.
+        if let Some(shadowed) = &agent.shadows {
+            rows.push(Row::plain(format!("    shadows {}", shadowed.display())));
+        }
+    }
+    render_rows(&rows)
+}
+
+/// The `agents` block of `.cide/config.json`, under the path it was read from.
+///
+/// Keys are spelled as the file spells them rather than prose, because the next thing anyone
+/// reading this does is edit that file.
+fn render_agents_config(root: &Path, present: bool, roster: &ProjectAgents) -> String {
+    // `config::load` answers with the defaults for a file that is absent and for one that will
+    // not parse, and reports the difference only through `tracing`, which this binary installs no
+    // subscriber for. So the two are separated the one way available from out here — does the
+    // file exist — and a file that exists while every value is a default is called out, because
+    // that is exactly what an unparseable config looks like from the outside.
+    let state = if !present {
+        "no file — subagents are off, which is the default"
+    } else if roster.config == cide_agents::CideConfig::default() {
+        "every value below is a default, which is also how an unparseable file reads"
+    } else {
+        "read"
+    };
+    let config = &roster.config.agents;
+    let mut rows = vec![Row::plain(format!(
+        "config  {}  ({state})",
+        cide_agents::config::config_path(root).display()
+    ))];
+    for (key, value) in [
+        ("enabled", roster.enabled().to_string()),
+        ("maxConcurrent", config.max_concurrent.to_string()),
+        ("harness", defs::harness_name(config.harness).to_string()),
+        ("isolation", isolation_name(config.isolation).to_string()),
+        (
+            "allowDangerousPermissions",
+            config.allow_dangerous_permissions.to_string(),
+        ),
+        ("nudgeOrchestrator", config.nudge_orchestrator.to_string()),
+    ] {
+        rows.push(Row {
+            label: format!("  {key}"),
+            cells: vec![value],
+        });
+    }
+    render_rows(&rows)
+}
+
+/// The `serde` spelling of an isolation mode, which is what the file on disk holds.
+fn isolation_name(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::Worktree => "worktree",
+        Isolation::Shared => "shared",
+    }
+}
+
+/// Every finding, with the file and — when the finding has one — the line to open it at.
+fn render_problems(problems: &[AgentProblem]) -> String {
+    if problems.is_empty() {
+        return "no problems in the definition files\n".to_string();
+    }
+    let mut rows = vec![Row::plain(format!("{} problem(s)", problems.len()))];
+    for problem in problems {
+        rows.push(Row {
+            // No line is not a missing line: "these two files declare the same name" belongs to
+            // neither file's line 4, and inventing one would send the reader to an innocent line.
+            label: match problem.line {
+                Some(line) => format!("  {}:{line}", problem.path.display()),
+                None => format!("  {}", problem.path.display()),
+            },
+            cells: vec![
+                severity_name(problem.severity).into(),
+                problem.message.clone(),
+            ],
+        });
+    }
+    render_rows(&rows)
+}
+
+/// Whether a finding stopped something. An unknown tool warns; an unknown permission mode greys
+/// the role, and drawn identically they would be indistinguishable.
+fn severity_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+    }
 }
 
 // ----------------------------------------------------------------------- columns
@@ -615,8 +935,12 @@ fn layer_name(layer: KeymapLayer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cide_ipc::workspace::{Pane, ProjectRoot};
-    use cide_ipc::{SessionId, Side, TabId, WindowLabel};
+    use cide_agents::{AgentsConfig, CideConfig, LoadedAgent};
+    use cide_ipc::workspace::{Pane, ProjectRoot, ToolWindowState};
+    use cide_ipc::{
+        AgentDef, AgentId, Harness, SessionId, Side, TabId, TaskAuthor, TaskComment, TaskId,
+        WindowLabel,
+    };
 
     fn pane(title: &str, kind: PaneKind, role: PaneRole, session: bool) -> Pane {
         Pane {
@@ -674,6 +998,7 @@ mod tests {
             tabs: vec![home, editor],
             detached: Default::default(),
             dock_anchors: Default::default(),
+            tool_window: ToolWindowState::default(),
             primary_session: SessionId::new(),
         };
 
@@ -913,5 +1238,278 @@ mod tests {
             column_of(lines[1], "settings.keymap")
         );
         assert!(out.contains("2 binding(s)"));
+    }
+
+    // ------------------------------------------------------------- tasks and roles
+
+    fn text_lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    fn task(
+        id: &str,
+        title: &str,
+        status: TaskStatus,
+        agent: Option<&str>,
+        comments: usize,
+    ) -> Task {
+        Task {
+            id: TaskId(id.into()),
+            title: title.into(),
+            body: String::new(),
+            status,
+            agent: agent.map(|a| AgentId(a.into())),
+            comments: (0..comments)
+                .map(|i| TaskComment {
+                    // Derived from the index, not minted: this fixture's output is compared
+                    // against a fixed string, and a fresh uuid per run would never match.
+                    id: cide_ipc::CommentId(format!("c-{i}")),
+                    author: TaskAuthor::User,
+                    text: format!("comment {i}"),
+                    at_unix_ms: 1,
+                    edited_at_unix_ms: None,
+                    deleted: false,
+                })
+                .collect(),
+            created_unix_ms: 1,
+            updated_unix_ms: 2,
+        }
+    }
+
+    fn tracker(tasks: Vec<Task>) -> TaskFile {
+        TaskFile {
+            schema_version: TaskFile::CURRENT_SCHEMA,
+            rev: 7,
+            tasks,
+        }
+    }
+
+    #[test]
+    fn a_task_row_carries_its_status_assignee_title_and_comment_count() {
+        let out = render_board(&tracker(vec![
+            task(
+                "t-1",
+                "Wire the dispatch queue",
+                TaskStatus::Doing,
+                Some("developer"),
+                3,
+            ),
+            task("t-2", "Write the panel tests", TaskStatus::Todo, None, 0),
+        ]));
+        let lines = text_lines(&out);
+        assert!(lines[0].contains("rev 7") && lines[0].contains("2 task(s)"));
+
+        let doing = line_with(&lines, "t-1");
+        assert!(doing.contains("doing"));
+        assert!(doing.contains("developer"));
+        assert!(doing.contains("Wire the dispatch queue"));
+        assert!(doing.contains("3 comments"));
+
+        // An unassigned task prints no role and a task with no conversation prints no count —
+        // both blank rather than a placeholder, so the rows that have one stand out.
+        let todo = line_with(&lines, "t-2");
+        assert!(!todo.contains("developer"));
+        assert!(!todo.contains("comment"));
+    }
+
+    #[test]
+    fn a_tracker_with_no_tasks_says_so_rather_than_printing_a_blank() {
+        let out = render_board(&tracker(Vec::new()));
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("no tasks"));
+        // And says which of the two empty states it is.
+        assert!(out.contains("never had one"));
+    }
+
+    #[test]
+    fn a_task_title_cannot_forge_a_row() {
+        // Task titles are model-authored — an agent writes them through `cide_task_create` — so
+        // this is the same defence `escape` gives a pane title, against a writer with more reason
+        // to produce a newline.
+        let out = render_board(&tracker(vec![task(
+            "t-1",
+            "Ship it\nt-9  done  developer  Already finished",
+            TaskStatus::Todo,
+            None,
+            0,
+        )]));
+        let lines = text_lines(&out);
+        assert!(line_with(&lines, "t-9").contains("Ship it\\nt-9"));
+        assert!(
+            !lines.iter().any(|l| l.starts_with("t-9")),
+            "a title must not be able to print a row of its own: {lines:#?}"
+        );
+    }
+
+    fn role(id: &str, unavailable: Option<&str>) -> LoadedAgent {
+        LoadedAgent {
+            def: AgentDef {
+                id: AgentId(id.into()),
+                label: defs::label_from_id(id),
+                harness: Harness::Claude,
+                description: "does the work".into(),
+                system_prompt: "You are a developer.".into(),
+                model: None,
+                unavailable: unavailable.map(str::to_string),
+                max_concurrent: 1,
+            },
+            origin: PathBuf::from(format!("/p/.cide/agents/{id}.md")),
+            shadows: None,
+            tools: Vec::new(),
+            permission_mode: None,
+            effort: None,
+        }
+    }
+
+    fn catalog(agents: Vec<LoadedAgent>) -> Catalog {
+        Catalog {
+            agents,
+            problems: Vec::new(),
+        }
+    }
+
+    fn roster(config: CideConfig) -> ProjectAgents {
+        ProjectAgents {
+            config,
+            catalog: Catalog::default(),
+        }
+    }
+
+    #[test]
+    fn a_role_shows_its_harness_its_file_and_whether_it_can_be_dispatched() {
+        let out = render_roles(
+            Path::new("/p"),
+            &catalog(vec![
+                role("developer", None),
+                role("qa", Some("no “claude” on PATH")),
+            ]),
+        );
+        let lines = text_lines(&out);
+        assert!(lines[0].contains("2 role(s)"));
+
+        let ok = line_with(&lines, "developer");
+        assert!(ok.contains("claude"));
+        assert!(ok.contains("available"));
+        assert!(ok.contains("/p/.cide/agents/developer.md"));
+
+        let greyed = line_with(&lines, "  qa ");
+        assert!(greyed.contains("unavailable"));
+        // The sentence is what makes a greyed row actionable, and it gets its own line.
+        assert!(lines.iter().any(|l| l.trim() == "no “claude” on PATH"));
+    }
+
+    #[test]
+    fn a_long_unavailable_sentence_does_not_shift_the_role_columns() {
+        let short = render_roles(
+            Path::new("/p"),
+            &catalog(vec![role("developer", None), role("qa", None)]),
+        );
+        let long = render_roles(
+            Path::new("/p"),
+            &catalog(vec![
+                role("developer", None),
+                role("qa", Some(&"x".repeat(200))),
+            ]),
+        );
+        let (short, long) = (text_lines(&short), text_lines(&long));
+        assert_eq!(
+            column_of(line_with(&short, "developer"), "claude"),
+            column_of(line_with(&long, "developer"), "claude")
+        );
+    }
+
+    #[test]
+    fn a_shadowed_definition_is_never_silent() {
+        let mut agent = role("developer", None);
+        agent.shadows = Some(PathBuf::from("/home/u/.config/cide/agents/developer.md"));
+        let out = render_roles(Path::new("/p"), &catalog(vec![agent]));
+        assert!(out.contains("shadows /home/u/.config/cide/agents/developer.md"));
+    }
+
+    #[test]
+    fn an_empty_roster_names_both_directories_it_read() {
+        let out = render_roles(Path::new("/p"), &catalog(Vec::new()));
+        assert!(out.contains("/p/.cide/agents"));
+        assert!(out.contains(&defs::global_dir().display().to_string()));
+    }
+
+    #[test]
+    fn the_config_block_tells_an_absent_file_from_one_that_reads_as_defaults() {
+        let root = Path::new("/p");
+
+        let absent = render_agents_config(root, false, &roster(CideConfig::default()));
+        assert!(absent.contains("/p/.cide/config.json"));
+        assert!(absent.contains("no file"));
+        assert!(line_with(&text_lines(&absent), "enabled").contains("false"));
+
+        // The file is there and every value is a default, which is also what a file that would
+        // not parse looks like from out here. Saying so is the only honest answer available.
+        let defaults = render_agents_config(root, true, &roster(CideConfig::default()));
+        assert!(defaults.contains("unparseable"));
+
+        let config = CideConfig {
+            agents: AgentsConfig {
+                enabled: true,
+                ..AgentsConfig::default()
+            },
+            ..CideConfig::default()
+        };
+        let read = render_agents_config(root, true, &roster(config));
+        assert!(!read.contains("unparseable"));
+        assert!(line_with(&text_lines(&read), "enabled").contains("true"));
+    }
+
+    #[test]
+    fn a_problem_carries_its_file_and_the_line_to_open_it_at() {
+        let out = render_problems(&[
+            AgentProblem {
+                path: "/p/.cide/agents/qa.md".into(),
+                line: Some(4),
+                severity: Severity::Error,
+                message: "`permission-mode: yolo` is not a mode".into(),
+            },
+            AgentProblem {
+                path: "/p/.cide/agents".into(),
+                line: None,
+                severity: Severity::Warning,
+                message: "this directory could not be read".into(),
+            },
+        ]);
+        let lines = text_lines(&out);
+        assert!(lines[0].contains("2 problem(s)"));
+
+        let typo = line_with(&lines, "qa.md");
+        assert!(typo.contains("qa.md:4"));
+        assert!(typo.contains("error"));
+
+        // A finding about a whole directory has no line, and none is invented for it.
+        let dir = line_with(&lines, "could not be read");
+        assert!(dir.contains("warning"));
+        assert!(!dir.contains(":4"));
+    }
+
+    #[test]
+    fn a_roster_with_nothing_wrong_with_it_says_that_too() {
+        assert!(render_problems(&[]).contains("no problems"));
+    }
+
+    #[test]
+    fn the_roster_prints_roles_then_config_then_problems() {
+        let out = render_roster(
+            Path::new("/p"),
+            false,
+            &ProjectAgents {
+                config: CideConfig::default(),
+                catalog: catalog(vec![role("developer", None)]),
+            },
+        );
+        let roles = out.find("role(s)").expect("a roles block");
+        let config = out.find("config  ").expect("a config block");
+        let problems = out.find("no problems").expect("a problems block");
+        assert!(roles < config && config < problems, "{out}");
+
+        for line in out.lines() {
+            assert_eq!(line.trim_end(), line, "trailing space in {line:?}");
+        }
     }
 }

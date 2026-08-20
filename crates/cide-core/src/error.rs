@@ -4,7 +4,7 @@
 //! `TabPinned` is a thing the UI reacts to by dimming a close button, and matching on
 //! prose to discover that is how error handling rots.
 
-use cide_ipc::{PaneId, ProjectId, SplitId, TabId, UnsavedTab};
+use cide_ipc::{PaneId, ProjectId, SplitId, TabId, TaskId, UnsavedTab};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -76,6 +76,14 @@ pub enum CoreError {
     NoSuchPane(PaneId),
     #[error("no such split: {0}")]
     NoSuchSplit(SplitId),
+    /// A task id naming nothing in `.cide/tasks.json`.
+    ///
+    /// Its own variant rather than an `Io`, for the reason stated at the top of this module:
+    /// every variant is a tag the frontend branches on, and an agent asking about a task the
+    /// user deleted a moment ago is an ordinary race the panel answers by refreshing — not a
+    /// disk failure, which is what `Io` would have told it.
+    #[error("no such task: {0}")]
+    NoSuchTask(TaskId),
     #[error("no such command: {0}")]
     NoSuchCommand(String),
 

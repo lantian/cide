@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 
+use cide_fs::filter::FilterInput;
 use cide_fs::{
     BuildOptions, Filter, Index, Root, Visibility, WalkItem, WatchConfig, WatchEvent, Watcher,
 };
@@ -282,11 +283,12 @@ impl Indexing {
         // Every visited directory, so that every `.gitignore` under the roots is found — which
         // with *Show ignored files* on includes the ones inside `target/`.
         let dirs = index.dir_paths();
-        let filter = Arc::new(Filter::build(
-            &root_paths,
-            dirs.iter().map(|p| p.as_path()),
-            fs.visibility,
-        ));
+        let filter = Arc::new(Filter::build_with(FilterInput {
+            roots: &root_paths,
+            dirs: &dirs,
+            git_dirs: &git_watch_dirs(&root_paths),
+            visibility: fs.visibility,
+        }));
         // NOT `dirs`. With ignored entries shown the tree holds thousands of directories the
         // watcher must not take a descriptor on — see `cide_fs::filter`'s module note, which
         // owns that trade — and `watch_dirs` is where the two lists are told apart.
@@ -318,6 +320,59 @@ impl Indexing {
         events.status(project, &status);
         status
     }
+}
+
+/// Every git directory the watcher has to cover for these roots.
+///
+/// # Why this join lives in the app
+///
+/// `cide-fs` can resolve a root's `.git` on its own — `cide_fs::filter::git_dir` parses the
+/// `gitdir:` line — and for an ordinary checkout that is the whole answer. It is half of one
+/// for a linked worktree, whose state is split: `HEAD`, `index` and `ORIG_HEAD` sit in
+/// `<common>/worktrees/<name>/`, while `refs/**` and `packed-refs` sit in the common
+/// directory. Watching only the first means a commit in that worktree moves a ref nobody is
+/// watching, so the git panel and the branch readout never hear about it — and cide's own
+/// agent worktrees under `.claude/worktrees/` are exactly that shape.
+///
+/// Answering it properly needs libgit2, and `cide-fs` must not link it: the two crates walk
+/// different things and are testable apart precisely because neither depends on the other.
+/// The app depends on both already, and joining domain crates is what this layer is for — the
+/// same reason the walk's sink is the picker's injector three functions above.
+///
+/// The cost is one `discover` per index. That is the cheapest git question there is (a
+/// `Repository::discover` per root plus a submodule enumeration) and it runs on the blocking
+/// worker that has just walked every inode in the tree.
+///
+/// **A `git init` performed after this runs stays uncovered until the next index.** There is
+/// no repository to discover at this moment and no event that could tell us one appeared —
+/// `.git` is pruned by the walk and refused by the filter. Re-indexing the project is the
+/// recovery, and it is the same recovery as for any other change to the root set.
+fn git_watch_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    // `discover` already deduplicates by canonical work tree, so two roots inside one
+    // repository yield one entry — but a superproject and its submodules yield several, and a
+    // linked worktree contributes a common directory that another root may contribute too.
+    // `Filter::build_with` deduplicates as well; doing it here too costs nothing on a list
+    // this short and keeps the value this function *returns* honest for any future caller.
+    for repo in cide_git::repo::discover(roots) {
+        match cide_git::repo::watch_dirs(&repo.root) {
+            Ok(dirs) => {
+                for dir in dirs {
+                    if !out.contains(&dir) {
+                        out.push(dir);
+                    }
+                }
+            }
+            // A root on an unmounted share, or a repository deleted between `discover` and
+            // here. `discover` swallows the same class of error for the same reason: the
+            // other roots still have working watchers and a project that opens is worth more
+            // than an error page.
+            Err(err) => {
+                tracing::debug!(root = %repo.root.display(), %err, "no watchable git directory");
+            }
+        }
+    }
+    out
 }
 
 /// Clears `ProjectFs::indexing` however the walk ends, including by unwinding.

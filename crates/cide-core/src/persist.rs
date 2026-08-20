@@ -382,6 +382,47 @@ pub fn save_atomic(path: &Path, ws: &Workspace) -> Result<()> {
 /// output at 0644. The mode is the part of this function nobody should be re-deciding, so the
 /// function itself is the thing to reach for rather than the parts of it worth copying.
 pub fn write_atomic(path: &Path, json: &[u8]) -> Result<()> {
+    write_atomic_with_mode(path, json, PRIVATE_MODE)
+}
+
+/// The private mode every file this module owns is written with.
+pub const PRIVATE_MODE: u32 = 0o600;
+
+/// A file the user's *team* reads: `.cide/tasks.json` and its siblings, which are committed.
+pub const SHARED_MODE: u32 = 0o644;
+
+/// [`write_atomic`], with the mode as an argument.
+///
+/// The mode is the one thing about `write_atomic` that is not universal. Everything cide
+/// writes under `$XDG_STATE_HOME` is the user's alone and 0600 is a ceiling on it — the
+/// paragraph above records what it cost to re-decide that once. But M18 put a file *inside the
+/// project*: `.cide/tasks.json` is committed, reviewed in diffs, and read by whichever account
+/// a CI job or a pair-programming session runs as, so 0600 there is not privacy, it is a file
+/// the team cannot read.
+///
+/// Split rather than parameterised-in-place so the default stays a default: `write_atomic` is
+/// still the function to reach for, still 0600, and a caller who wants otherwise has to say so
+/// and name a mode. `cide-tasks` grew its own copy of this dance before this existed, for want
+/// of exactly this argument.
+///
+/// # The mode is a ceiling, never a floor — and that is why nothing forces it
+///
+/// `O_CREAT`'s mode is masked by the process umask, so `.mode(m)` means *"no wider than `m`"*.
+/// An earlier version of this function called `set_permissions` afterwards to defeat that,
+/// reasoning that a `.cide/tasks.json` at 0600 is a file the user's team cannot read. **That was
+/// wrong, and the reasoning inverted.** Under `umask 077` every file that user creates is 0600 —
+/// their editor's, their compiler's, `git`'s own — so a tracker at 0600 is consistent with the
+/// rest of their tree rather than broken, and forcing 0644 would be cide overriding a
+/// system-wide privacy decision it was never asked about. The honest promise for a shared file
+/// is *"no wider than a file the user made themselves"*, which is exactly what the umask already
+/// gives, so the mode is applied only to the **temp** file — where it travels with the inode
+/// through the rename rather than being a second syscall a crash can land between — and never
+/// re-applied afterwards.
+///
+/// The asymmetry with [`PRIVATE_MODE`] is therefore not an inconsistency: 0600 is a ceiling the
+/// umask can only lower, so "never wider than this" holds whatever the user's policy; 0644 is a
+/// ceiling too, and what varies underneath it is the user's business.
+pub fn write_atomic_with_mode(path: &Path, json: &[u8], mode: u32) -> Result<()> {
     let dir = parent_dir(path);
     fs::create_dir_all(dir)?;
 
@@ -390,7 +431,7 @@ pub fn write_atomic(path: &Path, json: &[u8]) -> Result<()> {
     let tmp = temp_path(path);
 
     let write = (|| -> io::Result<()> {
-        let mut file = create_private(&tmp)?;
+        let mut file = create_with_mode(&tmp, mode)?;
         file.write_all(json)?;
         // The rename publishes the new name; without this the bytes behind it may not have
         // reached the disk, and the crash leaves an intact name over empty contents.
@@ -658,21 +699,23 @@ fn abbreviate(path: &Path, home: Option<&Path>) -> String {
 /// finished file exists at 0644, which is exactly the window that matters. It also needs no
 /// migration: a workspace already on disk at 0644 is replaced by this inode on its next save.
 #[cfg(unix)]
-fn create_private(path: &Path) -> io::Result<File> {
+fn create_with_mode(path: &Path, mode: u32) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
-        .open(path)
+        .mode(mode)
+        .open(path)?;
+
+    Ok(file)
 }
 
 /// Whatever the platform's default is. cide is a Linux app; this arm exists so the module
 /// still compiles for anyone building it elsewhere, and claims nothing about permissions.
 #[cfg(not(unix))]
-fn create_private(path: &Path) -> io::Result<File> {
+fn create_with_mode(path: &Path, _mode: u32) -> io::Result<File> {
     File::create(path)
 }
 
@@ -707,7 +750,14 @@ fn sync_dir(dir: &Path) -> Result<()> {
 ///
 /// Best-effort: if the rename fails there is nothing useful left to do but say so, and the
 /// caller still starts from defaults.
-fn quarantine(path: &Path) {
+///
+/// `pub` since M18, for the reason [`write_atomic`] is: `cide-tasks` needs the *same*
+/// `<stem>.corrupt-<n>.<ext>` scheme for `.cide/tasks.json`, and reproducing it there would be
+/// two naming conventions for one concept — the second of which nobody would think to look for
+/// when hunting a file the user has lost. **A caller in a git working tree must check for
+/// conflict markers first**: quarantining a file `git merge` is halfway through renames the
+/// user's merge out from under them, and `TaskBoard::Unreadable` exists to say so instead.
+pub fn quarantine(path: &Path) {
     let Some(target) = free_quarantine_path(path) else {
         tracing::warn!(
             path = %path.display(),
@@ -719,12 +769,12 @@ fn quarantine(path: &Path) {
         Ok(()) => tracing::warn!(
             from = %path.display(),
             to = %target.display(),
-            "moved the unusable workspace file aside"
+            "moved the unusable file aside"
         ),
         Err(error) => tracing::warn!(
             path = %path.display(),
             %error,
-            "could not move the unusable workspace file aside"
+            "could not move the unusable file aside"
         ),
     }
 }
@@ -733,7 +783,7 @@ fn quarantine(path: &Path) {
 ///
 /// Bounded because a directory that somehow holds every name should end the search rather
 /// than spin; by then the user has a larger problem than one more corrupt file.
-fn free_quarantine_path(path: &Path) -> Option<PathBuf> {
+pub fn free_quarantine_path(path: &Path) -> Option<PathBuf> {
     (1..=999u32).map(|n| quarantine_path(path, n)).find(|c| {
         // A path we cannot even stat is treated as taken: overwriting it could destroy an
         // earlier quarantined copy.
@@ -823,7 +873,7 @@ mod tests {
 
     use cide_ipc::{
         Axis, DiffOrigin, DiffSpec, LayoutNode, Pane, PaneKind, PaneRole, PaneTree, Project,
-        ProjectRoot, SettingsSection, Tab, TabKind, WindowRole,
+        ProjectRoot, SettingsSection, Tab, TabKind, ToolWindowState, WindowRole,
     };
     use cide_ipc::{PaneId, ProjectId, SessionId, SplitId, TabId, WindowLabel};
     use indexmap::IndexMap;
@@ -974,6 +1024,7 @@ mod tests {
             tab_mru: vec![active_tab],
             detached: IndexMap::new(),
             dock_anchors: IndexMap::new(),
+            tool_window: ToolWindowState::default(),
             primary_session,
         }
     }
@@ -1644,6 +1695,191 @@ mod tests {
             "a snake_case key means `rename_all_fields` is missing"
         );
         assert_eq!(load(&path), workspace);
+    }
+
+    /// The git tool window's state survives a quit, and is spelled camelCase on the wire. (M18)
+    ///
+    /// Three separate claims, and each has its own way of failing silently.
+    ///
+    /// **It round-trips at all.** `Project::tool_window` is `#[serde(default)]`, which is what
+    /// lets every `workspace.json` written before this field existed still load — and is also
+    /// exactly what would hide a serialisation bug, because a field that fails to *write* reads
+    /// back as the default and looks like a user who had simply never opened the panel.
+    ///
+    /// **`CURRENT_SCHEMA` does not move for it.** The same argument `tab_mru` makes: the two
+    /// bumps that did happen guard a default whose movement would silently re-scope a proxy or
+    /// stop writing the user's files, and a panel the user closes again with one click does not
+    /// qualify. A bump is not free — `migrate` refuses a document from a newer schema, so it
+    /// would quarantine the whole workspace of anyone who ran an older build afterwards.
+    ///
+    /// **The history tab carries a query and nothing else.** No commits, no diffs, no blob text —
+    /// the same rule `DiffSpec` follows, and for the stronger of its two reasons: a saved log
+    /// would be megabytes nobody reads back *and* stale, because the branch moves while the tab
+    /// is open. `HistoryPane` re-runs the query when it mounts.
+    #[test]
+    fn the_tool_window_survives_a_quit_without_moving_the_schema() {
+        let dir = TempDir::new("tool-window");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = fixture();
+        let repo = cide_ipc::RepoId::new();
+        let tab = cide_ipc::HistoryTabId::new();
+        {
+            let project = workspace.projects.values_mut().next().expect("a project");
+            project.tool_window = cide_ipc::ToolWindowState {
+                open: true,
+                height: 320,
+                history: vec![cide_ipc::HistoryTab {
+                    split: None,
+                    id: tab,
+                    repo,
+                    path: "crates/cide-git/src/log.rs".into(),
+                    title: "log.rs".into(),
+                }],
+                active: Some(tab),
+                log_split: 620,
+                // The non-default value, so the round trip proves the field is written and read
+                // rather than being silently re-defaulted on the way back in.
+                files_as_tree: false,
+            };
+        }
+
+        save_atomic(&path, &workspace).expect("save");
+        let raw = fs::read_to_string(&path).expect("read the file back");
+
+        assert!(
+            raw.contains(r#""toolWindow""#) && raw.contains(r#""logSplit""#),
+            "the panel's fields are camelCase on the wire; got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("tool_window") && !raw.contains("log_split"),
+            "a snake_case key means `rename_all` is missing"
+        );
+        assert!(
+            raw.contains(r#""schemaVersion": 4"#),
+            "adding a `#[serde(default)]` field must not move CURRENT_SCHEMA; got:\n{raw}"
+        );
+
+        let back = load(&path);
+        assert_eq!(back, workspace, "every field of the panel comes back");
+
+        let restored = &back
+            .projects
+            .values()
+            .next()
+            .expect("a project")
+            .tool_window;
+        assert_eq!(restored.height, 320);
+        assert_eq!(restored.log_split, 620);
+        assert_eq!(restored.active, Some(tab));
+        assert_eq!(restored.history.len(), 1, "the query, and only the query");
+        assert!(
+            !restored.files_as_tree,
+            "the file-grouping toggle survives, and specifically its NON-default value — a field \
+             that was dropped on save comes back as its `serde(default)`, which for this one is \
+             `true`, so testing the default would pass against a field that is not stored at all"
+        );
+    }
+
+    /// A document written before the toggle existed reads back **grouped**, not flat.
+    ///
+    /// The whole reason `files_as_tree` carries `#[serde(default = "…")]` rather than a bare
+    /// `#[serde(default)]`: `bool`'s default is `false`, so the plain attribute would silently
+    /// flip every existing workspace to the flat listing on the first launch after this shipped.
+    /// That is a migration nobody asked for, performed by an attribute that looks like it does
+    /// nothing.
+    #[test]
+    fn a_workspace_written_before_the_toggle_existed_reads_back_grouped() {
+        let dir = TempDir::new("tool-window-pre-toggle");
+        let path = dir.join("workspace.json");
+
+        let mut workspace = fixture();
+        {
+            let project = workspace.projects.values_mut().next().expect("a project");
+            project.tool_window = cide_ipc::ToolWindowState::default();
+        }
+        save_atomic(&path, &workspace).expect("save");
+
+        // The field removed from the document, which is exactly what an older build wrote.
+        // Through `serde_json` and not by dropping the line: it is the last field of the object,
+        // so deleting the text leaves a trailing comma, and `load` then quarantines the file as
+        // corrupt — which passes an assertion about defaults for entirely the wrong reason.
+        let raw = fs::read_to_string(&path).expect("read");
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let projects = doc
+            .get_mut("projects")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("projects");
+        for (_, project) in projects.iter_mut() {
+            project
+                .get_mut("toolWindow")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("toolWindow")
+                .remove("filesAsTree");
+        }
+        let stripped = serde_json::to_string_pretty(&doc).expect("re-serialise");
+        assert!(
+            !stripped.contains("filesAsTree"),
+            "the fixture really is missing the field"
+        );
+        fs::write(&path, &stripped).expect("write the older shape back");
+
+        let back = load(&path);
+        let restored = &back
+            .projects
+            .values()
+            .next()
+            .expect("a project")
+            .tool_window;
+        assert!(
+            restored.files_as_tree,
+            "an absent `filesAsTree` means grouped. `#[serde(default)]` on a bool would make it \
+             flat and quietly rearrange every panel that already existed"
+        );
+    }
+
+    /// A `workspace.json` written before the panel existed still loads, and gets a closed one.
+    ///
+    /// The whole justification for not bumping `CURRENT_SCHEMA`. If this ever fails, the field is
+    /// missing its `#[serde(default)]` and every existing user's workspace is quarantined on the
+    /// first launch after the upgrade.
+    #[test]
+    fn a_workspace_saved_before_the_tool_window_existed_still_loads() {
+        let dir = TempDir::new("tool-window-absent");
+        let path = dir.join("workspace.json");
+
+        let workspace = fixture();
+        save_atomic(&path, &workspace).expect("save");
+
+        // Strip the field back out, the way a document written by the previous build has it.
+        let raw = fs::read_to_string(&path).expect("read");
+        let mut value: Value = serde_json::from_str(&raw).expect("parse");
+        let projects = value
+            .get_mut("projects")
+            .and_then(Value::as_object_mut)
+            .expect("projects");
+        for project in projects.values_mut() {
+            project
+                .as_object_mut()
+                .expect("a project object")
+                .remove("toolWindow");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&value).expect("render")).expect("write");
+
+        let back = load(&path);
+        let restored = &back
+            .projects
+            .values()
+            .next()
+            .expect("a project")
+            .tool_window;
+        assert!(!restored.open, "a document that never had one opens closed");
+        assert!(restored.history.is_empty());
+        assert_eq!(
+            *restored,
+            cide_ipc::ToolWindowState::default(),
+            "and gets exactly the default rather than a half-built one"
+        );
     }
 
     /// The dirty flag describes a buffer, and buffers do not survive a quit. Restoring one
@@ -2568,5 +2804,61 @@ mod tests {
         }
 
         assert!(debouncer.take());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shared_mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The shared mode is a **ceiling**: asked for, lowered by a restrictive umask, never forced.
+    ///
+    /// Both umasks live in **one** test on purpose, and the reason is worth keeping. `umask(2)` is
+    /// process-global, and `cargo test` runs a crate's tests on a thread pool — so two tests that
+    /// each set it race, and the failure is a mode assertion in whichever one lost, blaming the
+    /// code under test for a value the *other* test wrote. That is exactly what happened when this
+    /// was two tests: the restrictive case read 0644 because the permissive case had already run
+    /// `umask(0o022)` a microsecond earlier.
+    ///
+    /// The pair of assertions is what makes the claim testable at all. The restrictive half alone
+    /// passes for an implementation that ignores its `mode` argument and always writes 0600 — which
+    /// is the shape of the bug — and the permissive half alone passes for one that forces 0644 and
+    /// overrides the user's umask, which is the bug that was actually here first.
+    #[test]
+    fn the_shared_mode_is_a_ceiling_the_umask_may_lower() {
+        let dir = std::env::temp_dir().join(format!("cide-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mode_of = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let restore = unsafe { libc::umask(0o022) };
+
+        let shared = dir.join("tasks.json");
+        write_atomic_with_mode(&shared, b"{}", SHARED_MODE).unwrap();
+        let private = dir.join("workspace.json");
+        write_atomic(&private, b"{}").unwrap();
+        let (open_shared, open_private) = (mode_of(&shared), mode_of(&private));
+
+        unsafe { libc::umask(0o077) };
+        let tight = dir.join("tight.json");
+        write_atomic_with_mode(&tight, b"{}", SHARED_MODE).unwrap();
+        let tight_mode = mode_of(&tight);
+
+        unsafe { libc::umask(restore) };
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            open_shared, 0o644,
+            "an ordinary umask must let the shared mode through"
+        );
+        assert_eq!(
+            open_private, 0o600,
+            "and the private default stays private beside it"
+        );
+        assert_eq!(
+            tight_mode, 0o600,
+            "a restrictive umask lowers it, and cide does not override"
+        );
     }
 }

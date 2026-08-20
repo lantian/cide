@@ -1,0 +1,111 @@
+/*
+ * The git tool window: the bottom panel under the pane grid.
+ *
+ * Its height is `--h-toolwindow`, re-declared on `<html>` by `ToolWindowSplitter.tsx` before the
+ * first render and again on every drag — the same arrangement the sidebar's widths use, and the
+ * reason no component here holds a second copy of the number. `flex: none` because it sits in
+ * `.content`'s column beside a `flex: 1` pane area, which is the child that gives.
+ */
+.toolWindow {
+  flex: none;
+  height: var(--h-toolwindow);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.tabs {
+  height: var(--h-toolwindow-tabs);
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0 4px;
+  background: var(--chrome);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  /* The close button tucks against its tab's right edge rather than floating in the gap. */
+  gap: 2px;
+  padding: 0 2px 0 8px;
+  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  border-bottom: 2px solid transparent;
+}
+
+.tabActive {
+  color: var(--text-hi);
+  border-bottom-color: var(--accent);
+}
+
+.tabButton {
+  background: transparent;
+  border: 0;
+  padding: 0 2px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  /* Long file names truncate rather than pushing the hide button off the row. */
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tabButton:focus-visible,
+.close:focus-visible,
+.hide:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.close,
+.hide {
+  background: transparent;
+  border: 0;
+  padding: 0 4px;
+  color: var(--faint);
+  font: inherit;
+  font-size: var(--fs-ui-10);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.close:hover,
+.hide:hover {
+  color: var(--text);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.hide {
+  font-size: var(--fs-ui-12);
+  align-self: center;
+}
+
+/*
+ * The tab's own scroll container. `min-height: 0` because it is a `flex: 1` child of a column
+ * with a fixed height, and without it a long commit list refuses to shrink below its content and
+ * pushes the panel past `--h-toolwindow` — the same rule `.content` needs for the panel itself.
+ */
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--panel);
+}
+
+/* The honest empty state, until a tab's own view is mounted into the body. */
+.placeholder {
+  padding: 16px;
+  color: var(--dim);
+  font-size: var(--fs-ui-12-5);
+}

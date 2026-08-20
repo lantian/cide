@@ -3,17 +3,21 @@
 /**
  * How wide the user left each sidebar panel.
  *
- * **Two widths, not one.** The mock gives the explorer 252px and the git panel 420px, and
- * that difference is a property of the content, not a stylistic accident: the explorer
- * draws one truncatable name per row, while the git panel draws a path *and* an
- * added/removed figure *and* a stage checkbox on the same line. Sharing a single number
- * would mean every switch between the two views resized the workspace under the user, and
- * whichever panel they had not tuned would be the wrong width — so the resize would feel
+ * **A width per kind of content, not one for the sidebar.** The mock gives the explorer 252px
+ * and the git panel 420px, and that difference is a property of the content, not a stylistic
+ * accident: the explorer draws one truncatable name per row, while the git panel draws a path
+ * *and* an added/removed figure *and* a stage checkbox on the same line. Sharing a single
+ * number would mean every switch between the two views resized the workspace under the user,
+ * and whichever panel they had not tuned would be the wrong width — so the resize would feel
  * like it had been forgotten rather than remembered.
  *
- * Only these two, because only these two are tokens: `--w-sidebar-files` also sizes the
- * search and problems panels (they are the explorer's column with different rows in it),
- * which is a decision `tokens.css` already made and this type follows rather than reopens.
+ * The corollary is that panels whose rows *are* alike share one: [`Self::files_width`] serves
+ * the explorer, search and problems, and [`Self::agents_width`] serves both M18 panels.
+ *
+ * Only these are tokens: `--w-sidebar-files` also sizes the search and problems panels (they
+ * are the explorer's column with different rows in it), and `--w-sidebar-agents` sizes both
+ * M18 panels — which is a decision `tokens.css` already made and this type follows rather than
+ * reopens.
  */
 export type SidebarSettings = { 
 /**
@@ -23,4 +27,33 @@ filesWidth: number,
 /**
  * `--w-sidebar-git`.
  */
-gitWidth: number, };
+gitWidth: number, 
+/**
+ * `--w-sidebar-agents`: the Agents panel, and with it Tasks. (M18)
+ *
+ * # Why `#[serde(default = "…")]` is not optional here
+ *
+ * `SidebarSettings` is a **stored** struct. Every existing user's `workspace.json` was
+ * written before this field existed, and serde refuses a missing non-defaulted field — so
+ * without this attribute the whole `sidebar` object fails to deserialise on the first
+ * launch after the upgrade, and with it every setting in the block. The container's
+ * `#[serde(default)]` does not save it either: that supplies a default for *absent
+ * members* of `Settings`, not for a member of this struct that a present `sidebar` object
+ * happens not to mention. [`crate::Pane::conversation`] already had to learn this, and its
+ * note is the one to read before adding the next stored field anywhere in this crate.
+ *
+ * # Why a third width and not [`Self::files_width`]
+ *
+ * Reusing the explorer's number is the tempting move and it is wrong for the same reason
+ * the git panel does not reuse it: 252px is a column of short filenames, one truncatable
+ * name per row. An Agents row carries a role label, a phase, an elapsed figure **and** a
+ * task title on two lines, and a Tasks row carries an id, a title and an agent chip. Git
+ * got 420 on exactly this argument, and 320 is the same argument at this content's width.
+ *
+ * **One number for both new panels**, though, rather than two. They are two views of one
+ * thing — the panel a user widens to read task titles in Agents is the panel they are
+ * about to read task titles in under Tasks — so a user who drags one and finds the other
+ * unchanged has been made to do the same work twice. That is the reverse of the
+ * files/git split, where the two panels are read for different reasons at different times.
+ */
+agentsWidth: number, };

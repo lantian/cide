@@ -72,6 +72,8 @@ import { ctrlLink, wordTargetAt } from './ctrlLink'
 import { trailNames, type OutlineNode } from './memberNav'
 import { lintRanges, type LintSource } from './lintMap'
 import { lintGutter, setDiagnostics } from '@codemirror/lint'
+import { blameExtension, setBlame } from './blame'
+import type { BlameMarker } from './blameModel'
 import { useSendToClaude } from './useSendToClaude'
 import styles from './EditorSurface.module.css'
 
@@ -98,6 +100,61 @@ export const HIGHLIGHT_LIMIT_BYTES = 1024 * 1024
 export interface EditorSurfaceProps {
   /** Absolute path, used for the status bar's trail and to pick the language. */
   path: string
+  /**
+   * Which **document** this buffer is, for everything keyed per buffer. Defaults to [`path`]. (M18)
+   *
+   * For an editor over a file on disk the two are the same thing, which is why the default exists
+   * and why `panes/EditorPane.tsx` passes nothing. The exception is a buffer showing a file *as
+   * some commit left it*: `panes/RevisionPane.tsx` draws `src/log.rs` at `a1b2c3d`, which is a
+   * different document at the same path, and two documents sharing one registry key is two buffers
+   * fighting over one slot.
+   *
+   * # The one that actually bites is `registerReveal`
+   *
+   * `revealRequest.ts::requestReveal` delivers to *live* receivers and only parks when there are
+   * none. A revision pane registered under the real path therefore makes a search-result click
+   * into that file silently stop moving the caret: the click finds a live receiver, parks nothing,
+   * moves the caret in a read-only buffer of a forty-commit-old version of the file, and the file
+   * tab that opens a moment later is never told. That is exactly the report `revealRequest.ts`
+   * exists to answer, reintroduced by a viewer nobody would think to suspect.
+   *
+   * The other four are hygiene by comparison and are the same mistake: `viewTracker`'s per-file
+   * view memory would remember a revision's scroll as the working file's, `ctrlLink`'s cache would
+   * answer one buffer's Ctrl+hover from another's, `navRecorder` would put Back-stack entries under
+   * the real path, and `claimCaret` would hand every surface that reads the caret a path plus a
+   * line number from a document that no longer exists.
+   *
+   * # What it does not touch, deliberately
+   *
+   * [`path`] keeps every job that is about the *file*: `languageName` and `loadLanguage` (so
+   * `a1b2c3d:src/log.rs` is still Rust), `pathTrail` and the status bar's claim, the find bar, the
+   * context menu and ⌥⏎'s mention. That split is the whole point of the default — a caller that
+   * passes nothing cannot change behaviour, and a caller that passes an identity changes only which
+   * key the registries use. The two exceptions inside that split are argued where they are made:
+   * `claimStatusReadout` below keeps the path, `claimCaret` beside it takes the identity.
+   *
+   * `useCodeMenu` keeps the path too, and one piece of that is a real residue rather than a
+   * decision: `highlightLevel.ts` is a genuine per-path registry, so *Highlighting: syntax only*
+   * chosen in a revision pane records an override against the working file. It is session-only,
+   * never persisted, and the menu is the only way to reach it — but it is the one collision this
+   * prop does not close, and `editor/codeMenu.tsx` takes a single path for five items that all
+   * want the real one.
+   *
+   * # The contract: an identity is fixed for the life of a mount
+   *
+   * The build effect below is keyed on `[path, reloadKey]` and not on this, so an identity that
+   * changed while `path` stayed put would leave the registrations under the *previous* one — live
+   * receivers for a document nobody is showing. Every caller satisfies that structurally rather
+   * than by care: an identity is a pure function of the path, and Rust keys `TabKind::Revision` on
+   * `(repo, path, rev)`, so another revision is another tab and therefore another mount.
+   *
+   * It is a contract rather than a second dependency because that array is the one thing in this
+   * file that must not grow. Everything ever added to it has cost somebody their scrollback, their
+   * undo history or their unsaved edits, `check:blame` and `check:editor` both pin it letter for
+   * letter for that reason, and a caller that really does need a new identity in a live buffer
+   * already has [`reloadKey`], which exists to rebuild the view on purpose.
+   */
+  identity?: string | undefined
   /**
    * The project root the trail is drawn relative to.
    *
@@ -271,6 +328,43 @@ export interface EditorSurfaceProps {
    * this at 500 ms and flushes it on unmount.
    */
   onView?: ((at: FileView) => void) | undefined
+  /**
+   * Who wrote each line, already collapsed into one marker per line. (M18)
+   *
+   * Computed by `panes/EditorPane.tsx` with `blameModel.collapseRuns` and passed **in**, so this
+   * module stays what its header says it is: text in, text out, no IPC. `blameStore.ts` reaches
+   * `client.ts`, and importing it here would make every editor — including the fixtures and the
+   * diff panes — transitively depend on the wire.
+   *
+   * `null` and `[]` are different: `null` is *nothing has been fetched*, `[]` is a run set the
+   * model refused (see `collapseRuns`) or a file with no lines. Neither draws a cell; only
+   * [`blameOn`] decides whether the column is there at all.
+   *
+   * **Not a dependency of the build effect.** Neither is [`blameOn`]. That effect is keyed
+   * `[path, reloadKey]` and rebuilding the `EditorView` costs the undo history, the scroll
+   * position, the selection and any unsaved edits — turning a column on must not do that, and a
+   * refresh of it certainly must not. `check:blame` asserts both names are absent from that array.
+   */
+  blame?: BlameMarker[] | null | undefined
+  /** Whether the column is showing. The gutter's compartment holds the extension only while true. */
+  blameOn?: boolean | undefined
+  /**
+   * A gutter cell, or the card's *Show in log*, was clicked. The argument is a full oid.
+   *
+   * Optional, and absent in a fixture and in a diff pane: an editor with no host to answer this
+   * simply has no click target, which is better than a control that reports a refusal.
+   */
+  onShowCommit?: ((oid: string) => void) | undefined
+  /** The card's *Annotate previous revision*, with the oid the hop starts from. */
+  onAnnotateParent?: ((oid: string) => void) | undefined
+  /**
+   * *Show history for this file*, from the buffer's own context menu. (M18)
+   *
+   * Takes the **absolute** path, which this surface already has. Absent in a window with no tool
+   * window, which disables the item with a reason rather than hiding it — a menu that silently
+   * loses a line reads as a menu that never had it.
+   */
+  onShowHistory?: ((path: string) => void) | undefined
 }
 
 /** `Ln 128, Col 24`, one-based in both, which is what every editor and every stack trace uses. */
@@ -292,6 +386,10 @@ export function cursorLabel(state: EditorState): string {
 
 export function EditorSurface({
   path,
+  // Defaulted from `path` in the pattern itself rather than in a `??` below, so the fallback is
+  // visible at the one place a reader looks for a prop's default and there is no second binding
+  // that could be used by mistake. See the prop's doc comment for the split between the two.
+  identity = path,
   root,
   project,
   doc,
@@ -310,11 +408,18 @@ export function EditorSurface({
   at,
   onView,
   onScreen = true,
+  blame = null,
+  blameOn = false,
+  onShowCommit,
+  onAnnotateParent,
+  onShowHistory,
 }: EditorSurfaceProps): ReactNode {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
   /** The live view's lint compartment, so the push effect can reconfigure it. */
   const lintSlotRef = useRef<Compartment | null>(null)
+  /** The same, for the blame column. (M18) */
+  const blameSlotRef = useRef<Compartment | null>(null)
   /** This buffer's hold on the status bar, for the trail effect below. See `statusReadout.ts`. */
   const slotRef = useRef<ReadoutSlot | null>(null)
 
@@ -358,9 +463,62 @@ export function EditorSurface({
    * debounce last managed to send. Both of those are stale by exactly the amount the user has
    * scrolled since, which on a file they are actively reading is all of it.
    *
-   * Guarded on the path so a *different* file does not inherit this one's line number.
+   * Guarded on the **identity** so a *different* document does not inherit this one's line
+   * number — `viewTracker` below stamps its own key onto every observation it publishes, and the
+   * comparison further down has to ask the same question with the same word. For every editor
+   * over a file that is the path; for a revision buffer it is the thing that stops `src/log.rs`
+   * at `a1b2c3d` from restoring the working file's scroll position.
    */
   const observedRef = useRef<FileView | null>(null)
+
+  /*
+   * The blame column's four moving parts, all in refs and none of them in the build effect's
+   * dependency list — the hazard `autosave` above writes up, with the same fuse. (M18)
+   *
+   * `blameRef`/`blameOnRef` are read once at construction so a view rebuilt by a `reloadKey` bump
+   * comes back with the column already on; the effect further down handles every later change.
+   * The two callbacks are in refs because `EditorPane` rebuilds them per render and they are
+   * captured *inside* the memoised extension below, which must never be rebuilt.
+   */
+  const blameRef = useRef(blame)
+  blameRef.current = blame
+  const blameOnRef = useRef(blameOn)
+  blameOnRef.current = blameOn
+  const showCommitCb = useRef(onShowCommit)
+  showCommitCb.current = onShowCommit
+  const annotateParentCb = useRef(onAnnotateParent)
+  annotateParentCb.current = onAnnotateParent
+
+  /**
+   * The gutter extension, built **once** for the life of this component.
+   *
+   * `Compartment.reconfigure` is given this value, and CodeMirror keeps a `StateField`'s contents
+   * across a reconfigure only while the field is the same object. A fresh `blameExtension(…)` per
+   * render would therefore mint a fresh field, throw away the markers and the `touched` set, and
+   * tear the gutter's DOM down — on every keystroke, since `blame` changes identity whenever the
+   * store answers. Memoised with no dependencies, with the callbacks read through refs, so the
+   * value never changes and reconfiguring with it twice is a no-op.
+   */
+  const blameExt = useMemo(
+    () =>
+      blameExtension({
+        onShowCommit: (oid) => showCommitCb.current?.(oid),
+        /*
+         * Spread in only when the host supplied one. The card draws the second button from the
+         * *presence* of this key, so handing over a closure that quietly calls nothing would put a
+         * button on screen that does nothing — the failure this project has paid for repeatedly.
+         *
+         * The memo therefore keys on the presence and not on the function: the identity of the
+         * callback changes on every render of the pane and must not reach this, but a host that
+         * gains or loses the ability to answer is a real change and is allowed to rebuild it.
+         */
+        ...(onAnnotateParent === undefined
+          ? {}
+          : { onAnnotateParent: (oid: string) => annotateParentCb.current?.(oid) }),
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onAnnotateParent === undefined],
+  )
 
   /*
    * The right-click menu. Reads the view through a getter rather than being handed it, because
@@ -380,6 +538,17 @@ export function EditorSurface({
      * `All problems` while the buffer showed neither.
      */
     defaultLevel: highlight,
+    /*
+     * The two git items. Both are *optional* on `CodeMenuOptions`, so before this line they were
+     * drawn disabled with their own sentences — which is the correct fallback and is exactly why
+     * nothing broke while the two halves of this feature were built separately. Passing them is
+     * what makes them live.
+     *
+     * `blameOn` is a `checked` mark rather than a renamed label: a menu item that renames itself
+     * between openings is one the user has to re-read every time.
+     */
+    blameOn,
+    ...(onShowHistory === undefined ? {} : { onShowHistory }),
   })
 
   /*
@@ -491,6 +660,15 @@ export function EditorSurface({
      * not cost the user their undo stack.
      */
     const lintSlot = new Compartment()
+    /*
+     * The blame column, in a compartment of its own for the same reason. (M18)
+     *
+     * Seeded from a ref rather than from the prop, because this effect is keyed `[path, reloadKey]`
+     * and listing `blameOn` there would rebuild the whole view — undo history, scroll, selection,
+     * unsaved edits — every time the column was toggled. The ref is what makes a `reloadKey` bump
+     * come back with the column still on.
+     */
+    const blameSlot = new Compartment()
     let baseline: EditorState['doc'] | null = null
     /*
      * The status bar's line, claimed once the view exists further down — the update
@@ -665,6 +843,16 @@ export function EditorSurface({
     }
 
     const shared: Extension[] = [
+      /*
+       * **First, before `lineNumbers()`, and that position is the feature.** (M18)
+       *
+       * CodeMirror lays gutters out in extension order — `activeGutters` is a facet and a facet's
+       * inputs keep the order of the extensions that supplied them — so this line is what puts the
+       * annotation column to the *left* of the numbers, where IDEA puts it. Moved below
+       * `lineNumbers()` it still works and is simply in the wrong place, which is the kind of
+       * regression a reader cannot see in a diff; `check:blame` pins it.
+       */
+      blameSlot.of(blameOnRef.current === true ? blameExt : []),
       lineNumbers(),
       highlightActiveLineGutter(),
       highlightActiveLine(),
@@ -683,8 +871,12 @@ export function EditorSurface({
        * `mousedown` that used to sit at this line moved there unchanged, and
        * `clickAddsSelectionRange` moved with it, because a facet override that frees Ctrl is part
        * of the gesture rather than part of the surface.
+       *
+       * `identity` and not `path`: `ctrlLink` caches its answers in a module-level map keyed by
+       * that argument and shared across every mounted editor, so a second buffer over one path
+       * would answer this one's Ctrl+hover from the other's cache. See the prop.
        */
-      ctrlLink(project, path),
+      ctrlLink(project, identity),
       syntaxHighlighting(cideHighlightStyle),
       findExtensions(),
       minimap(),
@@ -696,8 +888,13 @@ export function EditorSurface({
        * Both destinations in one place: the ref that survives a reload of *this* buffer, and
        * the callback the pane debounces into Rust. Two subscribers on the update listener would
        * be two things to keep in step, and the ref is the one that must never be skipped.
+       *
+       * Keyed on `identity`, which is what the observation is stamped with and therefore what the
+       * restore below compares against. It also decides what a host would *store*: a revision
+       * buffer's scroll must not be written into the working file's remembered position, which is
+       * what keying this on the real path would do the first time a pane wired `onView` to one.
        */
-      viewTracker(path, (seen) => {
+      viewTracker(identity, (seen) => {
         observedRef.current = seen
         viewCb.current?.(seen)
       }),
@@ -706,7 +903,7 @@ export function EditorSurface({
        *
        * Beside `viewTracker` because it is the same shape — a `ViewPlugin` watching the same
        * update stream, with every decision in an import-free module a check script runs — and
-       * beside `ctrlLink(project, path)` because it takes the same two arguments for the same
+       * beside `ctrlLink(project, identity)` because it takes the same two arguments for the same
        * reason. The whole rule is `navHistory.ts::recordsClick`; what this line buys is that a
        * click more than half a viewport away, or into another file, is a place Back can return
        * from. Without it the pointer was the one input device that moved the caret and wrote
@@ -715,8 +912,13 @@ export function EditorSurface({
        * Deliberately **not** folded into the update listener below: it must see the caret slot
        * before that listener moves it, and it must not pay for a keystroke. `navRecorder.ts`
        * writes both reasons out.
+       *
+       * `identity`, and it has to be the *same* key `claimCaret` takes further down: `originOf`
+       * decides whether a click came from another document by comparing `focusedCaret().path`
+       * against this argument, so two spellings of one buffer would make every click in it look
+       * like a cross-file jump and put an entry on the Back stack that returns to itself.
        */
-      navRecorder(project, path),
+      navRecorder(project, identity),
       indentUnit.of('    '),
       EditorState.tabSize.of(4),
       languageSlot.of([]),
@@ -970,6 +1172,18 @@ export function EditorSurface({
     baseline = view.state.doc
     viewRef.current = view
     lintSlotRef.current = lintSlot
+    blameSlotRef.current = blameSlot
+    /*
+     * The markers the column was already showing, pushed into the buffer that replaced it.
+     *
+     * The compartment above only decides whether the *gutter* is there; its contents live in a
+     * state field, which a freshly built view creates empty. Without this a reload of an annotated
+     * file — the agent editing it, *Reload from disk* — would come back with an empty column and
+     * no event to fill it, because the effect below is keyed on props that did not change.
+     */
+    if (blameOnRef.current === true) {
+      view.dispatch({ effects: setBlame.of(blameRef.current ?? []) })
+    }
     // Hand the awaitable save outward, so a close confirmation can offer *Save and close*.
     // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
     // that is no longer on screen.
@@ -979,7 +1193,28 @@ export function EditorSurface({
     // and the buffer on screen have exactly the same lifetime. A view that failed to
     // construct returned above and never claims one.
     // `path` and not the trail: the trail may be root-relative, and `chrome/StatusBar.tsx` has to
-    // turn a crumb back into an absolute path to reveal it. `onScreenRef` and not `onScreen`,
+    // turn a crumb back into an absolute path to reveal it.
+    /*
+     * And `path` rather than `identity`, which is the opposite call from `claimCaret` five
+     * statements down. The two are opposite on purpose, and the line between them is that the bar
+     * **describes** the buffer while the caret slot **addresses** it. Three reasons, in the order
+     * that decides it:
+     *
+     * * **This is not a registry.** `statusReadout.ts` keeps claims in a stack and identifies one
+     *   by the claim object — two panes can show one file and both hold a claim — so there is no
+     *   slot here for a second document to collide with and nothing to make unique.
+     * * **The bar answers *what am I looking at*.** For a revision buffer the honest answer is
+     *   `src › log.rs`; the pane's own crumb strip is what says which commit, right above it. The
+     *   workaround this prop replaced had to pass `a1b2c3d:src/log.rs` as the path, and a trail
+     *   reading `a1b2c3d:src › log.rs` was written up as its cost. Passing the identity here would
+     *   keep that cost while pretending to have removed it.
+     * * **`file` is consumed as a path.** `rowPaths::crumbTargets` slices this string into
+     *   ancestor directories and tests each against the reveal roots, so anything that is not a
+     *   path produces nonsense crumbs. A revision pane's path is repo-relative, so no reveal root
+     *   contains it and every crumb still answers `null` — the trail draws inert, which is the
+     *   truth about where those crumbs lead, and it now reads like the file it is showing.
+     */
+    // `onScreenRef` and not `onScreen`,
     // because this effect is keyed on `[path, reloadKey]` and adding the flag to that list would
     // rebuild the whole `EditorView` — scrollback, undo history and unsaved edits — on every tab
     // switch. The flag is only read at this instant; the effect further down handles it moving.
@@ -1010,8 +1245,29 @@ export function EditorSurface({
      * key is thirty a second on the one path this file goes out of its way to keep cheap. And it is
      * `wordTargetAt` — the same normaliser Ctrl+click uses — so the keyboard and the mouse cannot
      * disagree about where a word starts and ends.
+     *
+     * # `identity`, against the readout's `path` — the pair that had to be decided separately
+     *
+     * Everything that reads this slot turns the path back into a **target**, which is the whole
+     * difference from the bar above:
+     *
+     * * `overlays/GoToLine.tsx` reads `focusedCaret().path` and hands it straight to
+     *   `requestReveal`. Under the real path, Ctrl+G inside a revision buffer would move the caret
+     *   in the *working* file whenever a tab for it happens to be open, and park a request that
+     *   ambushes the next one to open when it is not — the same delivery bug this prop exists to
+     *   close, arriving from the other end.
+     * * `navRecorder.originOf` compares this against its own key; see `navRecorder(project,
+     *   identity)` above, which is only right if this line agrees with it.
+     * * ⌥F7 and Ctrl+⌥B send it to a language server reading the file **as it is now**. An
+     *   identity is not a path there, so the request fails and says so — which is the same refusal
+     *   `RevisionPane` already chooses by withholding `project`, and the alternative is a real
+     *   path carrying a line number from a forty-commit-old buffer, which is an answer that is
+     *   confidently wrong rather than absent.
+     *
+     * The cost is that a revision buffer contributes no *useful* path to those three, and that is
+     * correct: there is no place in the working tree that means "line 40 as it was at `a1b2c3d`".
      */
-    caret = claimCaret(path, () => {
+    caret = claimCaret(identity, () => {
       const live = viewRef.current
       if (live === null) return null
       return wordTargetAt(live, live.state.selection.main.head)?.text ?? null
@@ -1064,9 +1320,18 @@ export function EditorSurface({
      * `planRestore`, which refuses outright while a request is parked for this path.
      */
     {
+      // Both questions ask about `identity` rather than `path`, because both are about *this
+      // document*: `viewTracker` stamped the observation with the identity, and the veto has to
+      // name the key `registerReveal` is about to register under — checking one name and
+      // registering another would let a parked reveal be missed here and then delivered a line
+      // later, which is precisely the collision `planRestore` refuses to guess at.
       const remembered =
-        observedRef.current?.path === path ? observedRef.current : (atRef.current ?? null)
-      const plan = planRestore(remembered, view.state.doc.lines, pendingReveals().includes(path))
+        observedRef.current?.path === identity ? observedRef.current : (atRef.current ?? null)
+      const plan = planRestore(
+        remembered,
+        view.state.doc.lines,
+        pendingReveals().includes(identity),
+      )
       if (plan !== null) {
         try {
           const target = view.state.doc.line(plan.line)
@@ -1128,8 +1393,17 @@ export function EditorSurface({
      * it cannot foresee. This runs inside the sidebar's click handler, which has no error
      * boundary over it, so an exception escaping here unmounts the React root and takes every
      * terminal in the window with it. Missing the line is recoverable; that is not.
+     *
+     * # `identity`, and this is the registration the prop was added for
+     *
+     * `requestReveal` delivers to live receivers and only parks when there are none, so a buffer
+     * that is *not* the working file must not be registered under the working file's path. It
+     * would answer a search-result click meant for the real file — moving the caret in a read-only
+     * view of a commit, parking nothing, and leaving the file tab that opens a moment later at
+     * line 1 with no request left to spend. Nothing else in this repository can see that failure,
+     * which is why `check:editor` asserts this argument by name.
      */
-    const stopReveal = registerReveal(path, (target) => {
+    const stopReveal = registerReveal(identity, (target) => {
       try {
         // Every decision is `planReveal`'s, so this handler holds only the two things a headless
         // check could not run anyway: the dispatch and the focus call.
@@ -1165,6 +1439,7 @@ export function EditorSurface({
     return () => {
       viewRef.current = null
       lintSlotRef.current = null
+      blameSlotRef.current = null
       saveHandleCb.current?.(null)
       /*
        * **The single most important line in this feature.**
@@ -1186,7 +1461,11 @@ export function EditorSurface({
       view.destroy()
     }
     // Rebuilt only on a different file or an explicit reload. `doc` is intentionally absent:
-    // see `reloadKey`. `readOnly` is absent because it only ever arrives with a new file.
+    // see `reloadKey`. `readOnly` is absent because it only ever arrives with a new file. And
+    // `identity` is absent although the registrations above are keyed on it: it is a pure function
+    // of the path for every caller, so the two move together, and the prop's doc comment states
+    // that as a contract rather than paying for it with an entry in the one array in this file
+    // whose every addition has cost somebody their unsaved edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, reloadKey])
 
@@ -1278,6 +1557,40 @@ export function EditorSurface({
       console.error('[cide] could not paint diagnostics', error)
     }
   }, [diagnostics, highlight])
+
+  /*
+   * Put the blame column up, and keep it filled. (M18)
+   *
+   * Beside the diagnostics effect and shaped exactly like it, because the two answer the same pair
+   * of questions: *is this gutter here at all* (a compartment) and *what is in it* (a state
+   * field). Two dispatches, not one, and in this order.
+   *
+   * **The clear when `blameOn` is false is load-bearing**, and it is the same trap the lint effect
+   * above records: reconfiguring the compartment away removes the *column* and leaves the field's
+   * contents standing behind it, so the hover card would outlive the gutter it hung off — a card
+   * about a commit, floating over a buffer with no annotation on it and no way to dismiss it. The
+   * lint version of this bug drops the margin marks and keeps the squiggles; this one is worse,
+   * because a tooltip takes the pointer.
+   *
+   * `blame`/`blameOn` appear here and **nowhere near** the build effect's `[path, reloadKey]`.
+   */
+  useEffect(() => {
+    const view = viewRef.current
+    const slot = blameSlotRef.current
+    if (view === null || slot === null) return
+    view.dispatch({ effects: slot.reconfigure(blameOn ? blameExt : []) })
+    /*
+     * Wrapped for the reason the diagnostics dispatch is: this runs inside an effect with no error
+     * boundary above it, and an exception out of `dispatch` unmounts the React root and takes every
+     * terminal in the window with it. `build` in `blame.ts` clips a marker past the end of the
+     * document, so this is for what it cannot foresee.
+     */
+    try {
+      view.dispatch({ effects: setBlame.of(blameOn ? (blame ?? []) : null) })
+    } catch (error) {
+      console.error('[cide] could not paint the blame column', error)
+    }
+  }, [blame, blameOn, blameExt])
 
   /*
    * No breadcrumb bar. `crates › cide-core › src › lib.rs · Rust · UTF-8 · LF · Ln 7, Col 48`

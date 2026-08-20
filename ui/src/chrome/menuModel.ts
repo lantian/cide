@@ -40,6 +40,17 @@ export const PINNED_REASON = 'The project console is pinned'
 export const ONLY_PROJECT = 'This is the only open project'
 export const NO_PROJECT_REASON = 'Open a project first'
 export const MAXIMIZED_REASON = 'A pane is maximized — restore it to add a row'
+/** A tab that is about no file at all — the console, or Settings. */
+export const NOT_A_FILE = 'This tab is not a file'
+/**
+ * A git diff tab, whose path is repo-relative.
+ *
+ * Its own sentence rather than [`NOT_A_FILE`], because a git diff tab plainly *is* about a file
+ * and telling the user it is not would be false. What it lacks is an **absolute** path — see
+ * [`absolutePathOf`].
+ */
+export const RELATIVE_DIFF_PATH =
+  'A diff tab names a path inside a repository, not a file on disk'
 
 // --- recent projects ------------------------------------------------------------------------
 
@@ -188,6 +199,16 @@ export interface TabActions {
   /** Detaches the **active** tab's focused pane. See `TabStripProps.onDetach`. */
   detach?: (() => void) | undefined
   copy?: ((text: string) => void) | undefined
+  /**
+   * *Show history for this file* — opens a tab in the git tool window. (M18)
+   *
+   * Takes an **absolute** path, which is why the item is built from [`absolutePathOf`] and not
+   * from [`pathOf`]: the command resolves it to a repository through `git_locate`, and a
+   * repo-relative string would resolve to nothing.
+   *
+   * Absent in a window with no tool window, which is every detached-pane window.
+   */
+  history?: ((path: string) => void) | undefined
 }
 
 /**
@@ -205,6 +226,35 @@ export function closable(tab: Tab): boolean {
 export function pathOf(tab: Tab): string | null {
   if (tab.kind.kind === 'file') return tab.kind.path
   if (tab.kind.kind === 'diff') return tab.kind.spec.newPath
+  if (tab.kind.kind === 'revision') return tab.kind.path
+  return null
+}
+
+/**
+ * The **absolute** path a tab is about, or `null`.
+ *
+ * [`pathOf`] plus the one test `keys/target.ts::focusedTabPath` documents and this module did
+ * not: `DiffSpec.newPath` is absolute for a `ClaudeMcp` diff, which names files on disk, and
+ * **repo-relative** for a `Git` one, because that is how git spells a path and how the fetch key
+ * spells it. `TabKind::Revision` is repo-relative for the same reason.
+ *
+ * That distinction is not academic and it is already costing something: *Copy path* on a git diff
+ * tab copies `src/main.rs` rather than a path anything can open. Any item that hands a path to a
+ * command — *Show history for this file* is the first — must use this one instead, or it names a
+ * path the backend cannot resolve.
+ *
+ * A leading `/` is the test, which is exactly what `focusedTabPath` uses: cide is Linux-first and
+ * every absolute path it deals in begins with one, while every repo-relative path it deals in is
+ * slash-separated and does *not*.
+ */
+export function absolutePathOf(tab: Tab): string | null {
+  if (tab.kind.kind === 'file') return tab.kind.path
+  if (tab.kind.kind === 'diff') {
+    const path = tab.kind.spec.newPath
+    return path.startsWith('/') ? path : null
+  }
+  // A revision tab's path is always repo-relative — it names a blob in the object database, not
+  // a file on disk, and at an old revision the file may not be on disk at all.
   return null
 }
 
@@ -224,7 +274,7 @@ export function tabMenuEntries(
   activeTab: TabId,
   actions: TabActions,
 ): MenuEntry[] {
-  const { close, closeMany, split, detach, copy } = actions
+  const { close, closeMany, split, detach, copy, history } = actions
   const index = tabs.indexOf(tab)
   const others = tabs.filter((t) => t !== tab && closable(t))
   /*
@@ -242,6 +292,7 @@ export function tabMenuEntries(
   const toLeft = tabs.slice(0, index).filter(closable)
   const toRight = tabs.slice(index + 1).filter(closable)
   const path = pathOf(tab)
+  const absolute = absolutePathOf(tab)
   const active = tab.id === activeTab
   /** Run a bulk close, or say why the line is off. Shared by the three items below. */
   const bulk = (set: readonly Tab[], nothing: string) =>
@@ -302,7 +353,26 @@ export function tabMenuEntries(
       label: 'Copy path',
       ...(path !== null && copy
         ? { run: () => copy(path) }
-        : { disabledReason: path === null ? 'This tab is not a file' : NO_CLIPBOARD }),
+        : { disabledReason: path === null ? NOT_A_FILE : NO_CLIPBOARD }),
+    },
+    {
+      // Carries the command id, so the row draws whatever chord the live keymap has for it —
+      // nothing today, which is correct: this is the same *act* as the palette row, unlike
+      // `mention` above, whose long comment explains why it deliberately carries no chip.
+      id: 'history',
+      label: 'Show history for this file',
+      command: 'git.history.file',
+      ...(absolute !== null && history
+        ? { run: () => history(absolute) }
+        : {
+            disabledReason:
+              // Three ways to be unavailable and three different sentences, because "not
+              // available" tells the user nothing they can act on. The middle one is the
+              // interesting case: a git diff tab *is* about a file, but its path is
+              // repo-relative and naming it to a command that wants a file on disk would be
+              // naming a path that is not a path. See `absolutePathOf`.
+              path === null ? NOT_A_FILE : absolute === null ? RELATIVE_DIFF_PATH : NO_HOST,
+          }),
     },
   ]
 }

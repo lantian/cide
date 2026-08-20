@@ -77,6 +77,9 @@ try {
     NO_RECENTS_REASON,
     ONLY_PROJECT,
     PINNED_REASON,
+    NOT_A_FILE,
+    RELATIVE_DIFF_PATH,
+    absolutePathOf,
     closable,
     overflowEntries,
     pathOf,
@@ -231,11 +234,83 @@ try {
         'detach',
         '--',
         'copy-path',
+        'history',
       ],
-      'the workspace tab menu is the seven items, in three groups, with left before right',
+      'the workspace tab menu is the eight items, in three groups, with left before right',
     )
     item(entries, 'close-right').run()
     eq(bulk.calls, [['t2']], 'Close to the right closes only what follows this tab, in one call')
+
+    // --- Show history for this file (M18) ---------------------------------------------
+    //
+    // The item hands a path to a command that resolves it through `git_locate`, so it must be
+    // an ABSOLUTE one. `pathOf` is not that for every tab, which is the bug these four cases
+    // exist to pin: `DiffSpec.newPath` is absolute for a Claude diff and repo-relative for a
+    // git one, and handing over the relative form would name a path that is not a path.
+    eq(
+      item(entries, 'history').command,
+      'git.history.file',
+      'the item names its command, so the row draws whatever chord the live keymap has',
+    )
+    let asked = null
+    const withHistory = tabMenuEntries(tabs, file, 't1', {
+      history: (path) => {
+        asked = path
+      },
+    })
+    item(withHistory, 'history').run()
+    eq(asked, '/repo/src/main.rs', 'on a file tab it hands over the absolute path')
+
+    // A git diff tab's `newPath` is repo-relative, so the item is refused — and refused with its
+    // own sentence, because "this tab is not a file" would be false: it plainly is about one.
+    const gitDiff = tab('t3', {
+      kind: 'diff',
+      preview: false,
+      spec: {
+        title: 'main.rs — diff',
+        oldPath: 'src/main.rs',
+        newPath: 'src/main.rs',
+        origin: { kind: 'git', repo: 'r1', path: 'src/main.rs', side: 'combined' },
+      },
+    })
+    // A Claude diff names files on disk, so the same item IS live on one. The asymmetry is the
+    // whole point of `absolutePathOf` and it would be invisible without both halves.
+    const claudeDiff = tab('t4', {
+      kind: 'diff',
+      preview: false,
+      spec: {
+        title: 'main.rs',
+        oldPath: '/repo/src/main.rs',
+        newPath: '/repo/src/main.rs',
+        origin: { kind: 'claudeMcp', requestId: 'r' },
+      },
+    })
+    eq(absolutePathOf(file), '/repo/src/main.rs', 'a file tab is already absolute')
+    eq(absolutePathOf(gitDiff), null, 'a git diff tab is not')
+    eq(absolutePathOf(claudeDiff), '/repo/src/main.rs', 'a Claude diff tab is')
+    eq(absolutePathOf(console_), null, 'and a console tab is about nothing at all')
+
+    const act = { history: () => {} }
+    eq(
+      item(tabMenuEntries([gitDiff], gitDiff, 't3', act), 'history').disabledReason,
+      RELATIVE_DIFF_PATH,
+      'a git diff tab refuses with the relative-path sentence, not the not-a-file one',
+    )
+    eq(
+      item(tabMenuEntries([claudeDiff], claudeDiff, 't4', act), 'history').disabledReason,
+      undefined,
+      'and a Claude diff tab, which names a file on disk, is live',
+    )
+    eq(
+      item(tabMenuEntries(tabs, console_, 't0', act), 'history').disabledReason,
+      NOT_A_FILE,
+      'a console tab is about nothing on disk and says so',
+    )
+    eq(
+      item(tabMenuEntries(tabs, file, 't1', {}), 'history').disabledReason,
+      NO_HOST,
+      'and a window with no tool window says that instead',
+    )
 
     bulk.calls.length = 0
     item(entries, 'close-others').run()

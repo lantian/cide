@@ -16,3 +16,10 @@ path = "src/main.rs"
 cide-core = { workspace = true }
 cide-ipc = { workspace = true }
 cide-pty = { workspace = true }
+# M18's two domain crates, here for the reason the comment above gives rather than for the
+# printing. Both arrived without ever being linked by the proof, so the guard covered less than
+# it claimed to for a milestone; `tasks` and `agents` call their real loaders — `cide_tasks::read`
+# and `cide_agents::load_project` — so an `AppHandle` reached for in either crate stops this
+# binary building the same way one in `cide-core` does.
+cide-tasks = { workspace = true }
+cide-agents = { workspace = true }

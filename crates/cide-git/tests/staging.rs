@@ -423,6 +423,7 @@ fn three_of_seven_lines_reach_the_commit() {
             changelist: None,
             selections: Some(vec![selection("f.txt", Selection::Lines { lines: picked })]),
             force: false,
+            amend_of: None,
         },
     )
     .expect("commit");
@@ -461,6 +462,7 @@ fn an_external_git_add_trips_the_guard() {
         changelist: None,
         selections: None,
         force: false,
+        amend_of: None,
     };
     let error = commit::commit(&repo.root, &request).unwrap_err();
     assert!(
@@ -509,6 +511,7 @@ fn committing_one_changelist_leaves_the_other_untouched() {
             changelist: None,
             selections: None,
             force: false,
+            amend_of: None,
         },
     )
     .expect("commit");
@@ -552,6 +555,7 @@ fn committing_an_empty_changelist_leaves_the_index_alone() {
             changelist: None,
             selections: None,
             force: false,
+            amend_of: None,
         },
     )
     .unwrap_err();
@@ -718,6 +722,7 @@ fn filing_an_untracked_path_after_adding_it_sticks() {
             changelist: Some(fixes.clone()),
             selections: None,
             force: false,
+            amend_of: None,
         },
     )
     .expect("commit");

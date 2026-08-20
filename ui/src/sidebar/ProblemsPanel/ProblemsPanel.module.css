@@ -22,14 +22,14 @@
 }
 
 .header {
-  height: 30px;
+  height: calc(30px * var(--ui-scale));
   flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 0 10px;
   border-bottom: 1px solid var(--border-soft);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--dim);
@@ -49,7 +49,7 @@
 .headerMeta {
   flex: none;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
@@ -71,7 +71,7 @@
    paragraphs under it are the reasoning. */
 .claim {
   margin: 0;
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   font-weight: 500;
   color: var(--text-hi);
 }
@@ -92,7 +92,7 @@
 
 .detail {
   margin: 4px 0 0;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   line-height: 1.5;
   color: var(--faint);
 }
@@ -105,7 +105,7 @@
 
 .noteHead {
   margin: 12px 0 0;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
@@ -120,7 +120,7 @@
   /* The marker sits in the padding; 16px keeps the text flush with the paragraphs above so
      the block reads as one column rather than two indents. */
   padding-left: 16px;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   line-height: 1.55;
   color: var(--faint);
 }
@@ -128,7 +128,7 @@
 .note code,
 .list code {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   color: var(--text);
 }
 
@@ -158,7 +158,7 @@
   display: flex;
   align-items: baseline;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
 }
 
@@ -177,7 +177,7 @@
 
 .groupCount {
   flex: none;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   color: var(--faint);
 }
 
@@ -192,7 +192,7 @@
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   text-align: left;
 }
 
@@ -221,7 +221,7 @@
   flex: none;
   width: 12px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 
 .error {
@@ -251,14 +251,14 @@
 .code {
   flex: none;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--fs-ui-10);
   color: var(--faint);
 }
 
 .where {
   flex: none;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--fs-ui-10);
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
@@ -281,7 +281,7 @@
 
 .staleNote {
   margin: 0 0 1px;
-  font-size: 10px;
+  font-size: var(--fs-ui-10);
   line-height: 1.4;
   color: var(--faint);
   font-style: italic;
@@ -317,7 +317,7 @@
 .footerTitle {
   flex: 1;
   min-width: 0;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
@@ -336,7 +336,7 @@
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   cursor: pointer;
 }
 
@@ -369,14 +369,14 @@
 }
 
 .sourceLabel {
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   font-family: var(--font-mono);
   color: var(--text);
 }
 
 .sourceDetail {
   margin: 1px 0 0;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   line-height: 1.45;
   color: var(--faint);
   overflow-wrap: anywhere;
@@ -388,7 +388,7 @@
   flex: none;
   width: 12px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 

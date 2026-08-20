@@ -2,11 +2,11 @@
 import type { ClaudeInjection } from "./ClaudeInjection";
 
 /**
- * The four arguments cide adds to a Claude pane, each independently switchable.
+ * The arguments cide adds to a Claude pane, each independently switchable.
  *
- * Four named fields rather than a map keyed by a string: the set is closed — it is exactly
- * what `cide_core::claude_cli::INJECTIONS` enumerates — and a map would let `workspace.json`
- * name an injection that does not exist, which is a setting wired to nothing.
+ * Named fields rather than a map keyed by a string: the set is closed — it is exactly what
+ * `cide_core::claude_cli::INJECTIONS` enumerates — and a map would let `workspace.json` name
+ * an injection that does not exist, which is a setting wired to nothing.
  *
  * Hand-written `Default` for the same reason [`ClaudeInjection`]'s is; a derived one here
  * would be correct only for as long as that one stays hand-written, which is not a property
@@ -29,4 +29,31 @@ forkSession: ClaudeInjection,
 /**
  * `--settings <inline json>`. Off: **no hooks at all** — see the toggle's own copy.
  */
-settings: ClaudeInjection, };
+settings: ClaudeInjection, 
+/**
+ * `--mcp-config <inline json>` attaching cide's own MCP server: `cide-hook mcp`, a stdio
+ * bridge to the socket named by `$CIDE_AGENT_SOCK`. (M18)
+ *
+ * Off: the pane still works and still gets every MCP server **you** configured — cide has
+ * never passed `--strict-mcp-config`, and this switch does not start. What it loses is
+ * cide's own server: no `mcp__cide__cide_task_*`, so nothing this session does reaches
+ * `.cide/tasks.json`, and on a project's console pane no `mcp__cide__cide_agent*` either,
+ * so subagents cannot be dispatched at all. See the toggle's own copy.
+ *
+ * # This field is absent from every `workspace.json` that exists, and defaults to *on*
+ *
+ * It was added after the injector shipped, so every stored `inject` object on disk names
+ * the four above and not this one. Two things already in this file fill it, and neither is
+ * spare: the container's `#[serde(default)]` supplies a member a *present* object does not
+ * mention, and [`Self::default`] is hand-written so what it supplies cannot become
+ * `bool::default()`. Remove either and every upgraded pane silently loses its task tools —
+ * the pane starts, the tracker is simply empty and `mcp__cide__*` is not a tool the model
+ * has. `an_inject_block_written_before_the_task_tools_switch_still_carries_them` pins the
+ * literal shape that is on disk today, the way
+ * `a_sidebar_written_before_the_agents_panel_existed_still_reads` does next door.
+ *
+ * The default is *on* rather than off for the reason a tracker is a feature rather than an
+ * integration: a user who has never heard of any of this should get the task tools, and
+ * the one who does not want them is the one who will go and find this switch.
+ */
+mcpConfig: ClaudeInjection, };

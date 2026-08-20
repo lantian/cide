@@ -25,9 +25,17 @@
 # parallel run commits six complete copies of the source tree — and git happily lets you.
 /.claude/worktrees/
 
-# Runtime state cide itself writes. None of it belongs in the repo, and
-# workspace.json in particular records absolute paths from one machine.
-/.cide/
+# Agent worktrees, again: `.cide/worktrees/` is one full checkout per agent, and the
+# argument three lines up applies unchanged.
+/.cide/worktrees/
+
+# The rest of `.cide/` is committed on purpose. This line used to read `/.cide/`, on the
+# premise that the directory held "runtime state cide itself writes" — it never did:
+# workspace.json and everything like it live in $XDG_STATE_HOME/cide. `.cide/config.json`,
+# `.cide/agents/*.md` and `.cide/tasks.json` are shared project configuration, hand-edited
+# and reviewed in diffs, so this repository has to be able to commit its own.
+
+# Run logs, wherever they land. (This line kept the heading it used to share.)
 *.log
 
 # OS

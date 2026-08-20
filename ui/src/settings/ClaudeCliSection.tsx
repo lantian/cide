@@ -299,8 +299,9 @@ function InjectionRows({
 /**
  * What each injection is, and what switching it off costs.
  *
- * A table rather than four inline blocks so `check-claude-cli.mjs` can assert on it, and so a
- * fifth injection added in Rust is a missing key here rather than a row with no explanation.
+ * A table rather than a block per row so `check-claude-cli.mjs` can assert on it, and so an
+ * injection added in Rust is a missing key here — a type error — rather than a row with no
+ * explanation under it.
  */
 const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> = {
   sessionId: {
@@ -334,6 +335,25 @@ const INJECTION_COPY: Record<InjectionKey, { title: string; cost: ReactNode }> =
         What makes <em>Split → fork</em> branch a conversation instead of continuing it. Off, a
         fork is an ordinary resume: the new pane continues the same conversation rather than
         branching from it, and both panes append to one transcript.
+      </>
+    ),
+  },
+  mcpConfig: {
+    title: 'Task tools',
+    cost: (
+      <>
+        cide's own MCP server — <code>cide-hook mcp</code>, a bridge to this project's tracker.
+        Off, <strong>this pane cannot see <code>.cide/tasks.json</code></strong>: no{' '}
+        <code>mcp__cide__cide_task_*</code> tools, so a session cannot read the work it was
+        given or write down what it did. On a project's console pane it also costs{' '}
+        <strong>subagents entirely</strong> — <code>mcp__cide__cide_agent_dispatch</code> and
+        the rest arrive through this same server, so nothing can be dispatched, watched,
+        stopped or integrated, and cide stops telling that pane it is the product owner rather
+        than naming tools it does not have. The pane itself is unaffected, and so is{' '}
+        <em>your</em> tooling: every MCP server you configured is still loaded, because cide
+        has never passed <code>--strict-mcp-config</code>. A subagent run keeps its own copy —
+        it reports back only through the tracker, so a run without it would be a run you cannot
+        see.
       </>
     ),
   },

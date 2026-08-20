@@ -31,6 +31,7 @@ import { Hint, ModalShell } from './ModalShell'
 import { basename, matchCounter, symbolBadge } from './format'
 import { listAction } from './listKeys'
 import { searchCommands } from './score'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 
 /** Fixed, so the virtualizer never has to measure. The same height every picker row uses. */
 const ROW_HEIGHT = 26
@@ -111,10 +112,14 @@ export function StructurePicker({ project, onDismiss, onGoTo }: StructurePickerP
   }, [query, caret, all.length])
 
   const viewport = useRef<HTMLDivElement>(null)
+  // The chrome scale, for the one measurement CSS never sees: a virtualized row is placed by
+  // an absolute transform off this number. See `settings/useUiScale.ts`.
+  const rowHeight = scaledRow(ROW_HEIGHT, useUiScale())
+
   const virtual = useVirtualizer({
     count: rows.length,
     getScrollElement: () => viewport.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 8,
   })
   useEffect(() => {

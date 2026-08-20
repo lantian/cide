@@ -73,6 +73,27 @@
   --green: #2f7a3d;
   --purple: #7a3fa8;
   --yellow: #8a5a00;
+  /*
+   * The commit graph's eight lane colours. (M18)
+   *
+   * Eight because `cide_git::lanes::PALETTE` is eight, and the two must agree: a lane's colour is
+   * an *index* on the wire, so a ninth token here would be a colour Rust can never ask for and a
+   * seventh would be one it can. `logModel::laneColor` takes the modulo defensively, because an
+   * undefined custom property paints nothing at all — a missing line reads as a missing branch.
+   *
+   * Chosen for separability rather than for the palette's other jobs: adjacent lanes are the pair
+   * a reader has to tell apart, so these are spread around the wheel instead of being drawn from
+   * the syntax colours, which cluster. They are 2px lines on `--panel`, so the light set is
+   * darkened well past where the same hues sit in the syntax palette.
+   */
+  --lane-0: #1f5fbf;
+  --lane-1: #2f7a3d;
+  --lane-2: #b0532a;
+  --lane-3: #7a3fa8;
+  --lane-4: #0f7a86;
+  --lane-5: #a8324e;
+  --lane-6: #7a6a10;
+  --lane-7: #4a5568;
   --red: #c0332b;
   --cyan: #0f6c7c;
   /*
@@ -201,6 +222,15 @@
   --green: #8fbf7a;
   --purple: #b48ead;
   --yellow: #dfae68;
+  /* The commit graph's eight lanes; see the light block for why there are exactly eight. */
+  --lane-0: #7aa2f7;
+  --lane-1: #8fbf7a;
+  --lane-2: #e0975c;
+  --lane-3: #bb9af7;
+  --lane-4: #5fd4d0;
+  --lane-5: #f07178;
+  --lane-6: #dfae68;
+  --lane-7: #9aa5b8;
   --red: #e06c75;
   --cyan: #6fb3c0;
   /*
@@ -328,12 +358,86 @@
   --fs-term: 12.5px;
   --term-line-height: 1.27;
 
-  /* Fixed chrome heights from the mock. */
-  --h-header: 34px;
+  /*
+   * The chrome's type scale — everything that is not a buffer or a terminal.
+   *
+   * # Why fourteen tokens and one multiplier
+   *
+   * There is no single "UI font size" in this app's design. The mock draws chrome at fourteen
+   * sizes between 8px and 20px, and the *ratios* between them are the design: a tab's label at
+   * 12.5px over its project path at 10.5px is a hierarchy, and `chrome/layoutAudit.ts` measures
+   * four of those numbers against the mock directly. So the setting moves one multiplier and
+   * every size keeps its place, rather than being fourteen settings or one size that flattens
+   * the hierarchy the moment it is touched.
+   *
+   * `--ui-scale` is `settings.uiFontSize / 13`, computed in `settings/fontScale.ts` and written
+   * on `<html>` by `paintUiScale` — and written a whole module graph earlier than that by
+   * `public/theme-boot.js` from `?ui=`, which `windows.rs` bakes in from the saved settings.
+   * The `1` here is the pre-hydration paint and the fallback, exactly as `--fs-code`'s literal
+   * below is. Unitless rather than a length because `calc()` needs a number to multiply by, and
+   * because dividing a length by a length is CSS Values 4 — see `check-css-prefix.mjs` for what
+   * this engine costs when a support table is taken as evidence.
+   *
+   * # Why the number is in the name
+   *
+   * `--fs-ui-11-5` is 11.5px *at the default 13*, not 11.5px. The name is the design size, not
+   * the painted one. That reads wrong for about a second and then earns its keep: the design
+   * number stays greppable, the mock's figures stay visible in every stylesheet that uses one,
+   * and `check-theme.mjs` can still compare two rules' sizes the way it does for the Find
+   * usages heading. A semantic ladder (`--fs-sm`, `--fs-md`) was the alternative and lost —
+   * fourteen sizes do not map onto five names without rounding some of them, and rounding them
+   * is silently redrawing the mock.
+   *
+   * # The set is closed
+   *
+   * These fourteen are exactly the sizes the stylesheets ask for; `check-ui-scale.mjs` asserts
+   * the two sets are equal in both directions and that no bare `font-size: <n>px` survives
+   * outside the code surfaces. That gate is the only thing standing between this and the state
+   * it replaced, which was 405 literals in 51 files agreeing with nothing.
+   *
+   * **Not the same as `--fs-code`.** `--fs-ui-12-5` and `--fs-code` are both 12.5px at their
+   * defaults and follow different settings: the tab strip's 12.5 is this scale's, the editor
+   * buffer's is `settings.editor.fontSize`'s. They look like one number and are two.
+   */
+  --ui-scale: 1;
+  --fs-ui-8: calc(8px * var(--ui-scale));
+  --fs-ui-9: calc(9px * var(--ui-scale));
+  --fs-ui-9-5: calc(9.5px * var(--ui-scale));
+  --fs-ui-10: calc(10px * var(--ui-scale));
+  --fs-ui-10-5: calc(10.5px * var(--ui-scale));
+  --fs-ui-11: calc(11px * var(--ui-scale));
+  --fs-ui-11-5: calc(11.5px * var(--ui-scale));
+  --fs-ui-12: calc(12px * var(--ui-scale));
+  --fs-ui-12-5: calc(12.5px * var(--ui-scale));
+  --fs-ui-13: calc(13px * var(--ui-scale));
+  --fs-ui-14: calc(14px * var(--ui-scale));
+  --fs-ui-15: calc(15px * var(--ui-scale));
+  --fs-ui-18: calc(18px * var(--ui-scale));
+  --fs-ui-20: calc(20px * var(--ui-scale));
+
+  /*
+   * The mock's chrome heights, and which of them follow the chrome's font size.
+   *
+   * Four of the five do, because they are boxes drawn around *text* — the header's project
+   * name, a tab's label, the status bar's line, a pane header's path — and a box that does not
+   * grow with the text inside it clips it. They are `calc(<mock px> * var(--ui-scale))` with
+   * the mock's own number written first, which is the form `check-ui-scale.mjs` requires
+   * everywhere: it keeps the design figure greppable and keeps `check-rows.mjs`'s derivations
+   * able to read it.
+   *
+   * `--h-rail` does not, and it is the exception that says what the rule is. Despite the name
+   * it is the activity rail's *width*, and the rail holds 28x28 SVG icons — no text but a 9px
+   * badge, which has its own box. Scaling it would put 28px icons in a 65px gutter. Icons,
+   * borders and splitter widths are outside this setting; text and the boxes around it are
+   * inside it. `--w-sidebar-*` and `--h-toolwindow` are outside it for a different reason
+   * again: they are *persisted*, dragged by the user and stored in `SidebarSettings` /
+   * `ToolWindowState`, so scaling them would fight the saved value on every launch.
+   */
+  --h-header: calc(34px * var(--ui-scale));
   --h-rail: 42px;
-  --h-tabstrip: 30px;
-  --h-status: 24px;
-  --h-panetitle: 26px;
+  --h-tabstrip: calc(30px * var(--ui-scale));
+  --h-status: calc(24px * var(--ui-scale));
+  --h-panetitle: calc(26px * var(--ui-scale));
   /*
    * The find bar's height, and the one number two stylesheets have to agree on. (M16)
    *
@@ -350,8 +454,15 @@
    * `border-bottom: 1px`. `check:rows` re-derives that sum out of those very rules rather than
    * trusting this comment — the number has to stay big enough to hold the bar, because the
    * panel's `height` is explicit and a bar that outgrew it would be clipped.
+   *
+   * Which is why it is `32 × scale + 1` rather than `33 × scale`. Three of the four parts are
+   * text boxes and follow the chrome size; the fourth is a border and does not. Written as
+   * `33 × scale` the token was correct at the default and wrong everywhere else — and wrong in
+   * the direction that clips, because below 13 the unscaled border makes the parts add up to
+   * *more* than the token. That is the whole failure this token exists to prevent, reintroduced
+   * by a multiplication.
    */
-  --h-findbar: 33px;
+  --h-findbar: calc(32px * var(--ui-scale) + 1px);
   /*
    * The two sidebar widths are the mock's, and they are now *defaults* rather than fixed
    * values: `chrome/SidebarSplitter.tsx` re-declares both on `<html>` from the saved
@@ -368,8 +479,31 @@
    */
   --w-sidebar-files: 252px;
   --w-sidebar-git: 420px;
+  --w-sidebar-agents: 320px;
   --w-minimap: 96px;
   --w-splitter: 6px;
+  /*
+   * The git tool window: the bottom panel holding the commit log and per-file history. (M18)
+   *
+   * A *height*, driven the way the two sidebar widths are — `toolwindow/ToolWindowSplitter.tsx`
+   * re-declares it on `<html>` from the saved state before the first render and again on every
+   * drag, so `ToolWindow.module.css` says `height: var(--h-toolwindow)` and no component holds a
+   * second copy of the number. This literal is what a first launch shows and what
+   * `ToolWindowState::default()` in `crates/cide-ipc/src/workspace.rs` and `TOOL_DEFAULT` in
+   * `toolwindow/toolWindowHeight.ts` both mirror; `ui/scripts/check-toolwindow.mjs` pins the
+   * three copies against each other, because the failure of letting them drift is that the panel
+   * opens at the wrong size once and then never again.
+   *
+   * It is a "tool window" and not a "dock" because *dock* already means re-docking a detached
+   * pane everywhere else in this codebase — `DockAnchor`, `Project::dock_anchors`,
+   * `windows/detachedPane.ts`. Two meanings for one word in one app is how a reader ends up
+   * looking for the wrong thing.
+   */
+  --h-toolwindow: 260px;
+  /* The tool window's own tab row: Log, then one closable tab per file history. */
+  --h-toolwindow-tabs: calc(28px * var(--ui-scale));
+  /* The commit list ⇄ details divider's starting share of the Log tab, as a width. */
+  --w-log-details: 420px;
 }
 
 * {
@@ -393,7 +527,14 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 13px;
+  /*
+   * Through the ladder rather than as a literal, so the handful of controls that say
+   * `font: inherit` instead of a size — `ToolWindow.module.css`'s `.tabButton`,
+   * `LogView.module.css`'s buttons — follow the setting too. This was the app's only base size
+   * and almost nothing inherited from it; now it is one rung of a scale and still the rung the
+   * setting is named after. See the ladder above for why the name carries the design number.
+   */
+  font-size: var(--fs-ui-13);
   /*
    * Never fake a face this app did not bundle.
    *

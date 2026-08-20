@@ -54,6 +54,7 @@ use cide_ipc::git::{
     BranchInfo, BranchList, BranchRef, CheckoutMode, CheckoutOutcome, FetchOutcome, GitError,
     PulledCommit, RepoInfo,
 };
+use cide_ipc::history::DetachOutcome;
 use git2::{BranchType, Commit, Oid, Repository, Status, StatusOptions, Tree};
 
 use crate::{Result, Wrap, push, repo as repo_mod, stash, status};
@@ -154,14 +155,35 @@ pub fn checkout_blockers(root: &Path, revision: &str) -> Result<Vec<String>> {
 }
 
 fn blockers(repo: &Repository, target: &Commit<'_>) -> Result<Vec<String>> {
-    let head_tree = head_tree(repo);
     let target_tree = target.tree().wrap()?;
+    blockers_against_tree(repo, &target_tree)
+}
+
+/// The same question as [`blockers`], asked about a tree instead of a commit.
+///
+/// # Why a tree is the real parameter
+///
+/// [`crate::replay`] composes a revert or a cherry-pick by hand and gets back a **merged tree
+/// that no commit has**. Before it writes that tree over the working directory it has to ask
+/// exactly what a branch switch asks — which local changes would this overwrite — and there is
+/// no commit to hand [`blockers`]. Widening the parameter is what makes that one function
+/// rather than two: the rule below has three clauses, the module header spends a screen
+/// justifying each of them, and a second copy is one edit away from disagreeing with this one
+/// about a case nobody re-derives.
+///
+/// The head tree is looked up here rather than passed in, because "differs from where I am
+/// standing" is part of the rule and not part of the question.
+pub(crate) fn blockers_against_tree(
+    repo: &Repository,
+    target_tree: &Tree<'_>,
+) -> Result<Vec<String>> {
+    let head_tree = head_tree(repo);
 
     // Every path that is not the same on both sides. Both the old and the new name go in, so
     // a rename between the branches blocks on either end.
     let mut differing: BTreeSet<String> = BTreeSet::new();
     let diff = repo
-        .diff_tree_to_tree(head_tree.as_ref(), Some(&target_tree), None)
+        .diff_tree_to_tree(head_tree.as_ref(), Some(target_tree), None)
         .wrap()?;
     for delta in diff.deltas() {
         for file in [delta.old_file(), delta.new_file()] {
@@ -293,41 +315,54 @@ fn resolve<'repo>(repo: &'repo Repository, revision: &str) -> Result<Commit<'rep
         })
 }
 
-/// Switch to `name`, doing what `mode` says about local changes that stand in the way.
-pub fn checkout(root: &Path, name: &str, mode: CheckoutMode) -> Result<CheckoutOutcome> {
-    let repo = repo_mod::open(root)?;
-    // A half-finished merge or rebase has index state that a switch would strand. git refuses
-    // too, and this way the message names the operation instead of libgit2's error class.
-    if let Some(operation) = repo_mod::operation_in_progress(&repo) {
-        return Err(GitError::OperationInProgress { operation });
-    }
-    let target = find(&repo, name)?;
+/// What the stash half of a move ended up doing, in the two fields every outcome reports.
+struct Stashing {
+    /// The stash to tell the user about, already reduced to what an outcome should carry:
+    /// `None` when nothing was in the way, and `None` again when the changes were put back and
+    /// the entry dropped, because there is then no stash left to point anybody at.
+    stashed: Option<String>,
+    restore_failed: Option<String>,
+}
 
-    let in_the_way = blockers(&repo, target.tip())?;
+/// Get `in_the_way` out of the way per `mode`, run `act`, and put the changes back.
+///
+/// # Why this is a function and not two copies
+///
+/// The `apply`-then-`drop`-never-`pop` rule below is the most expensive-to-relearn thing in
+/// this file: it is not an optimisation, it is the difference between "your work is in the
+/// stash" and "your work is gone", and nothing in libgit2's API hints at it. Both
+/// [`checkout`] and [`checkout_detached`] need it, they are the same operation with a
+/// different destination, and a second copy is one edit from silently becoming a `pop`.
+///
+/// `refuse` is a closure rather than a `&str`, because the two callers build
+/// [`GitError::CheckoutWouldOverwrite`] with different things in its `branch` field and the
+/// refusal has to be constructed *before* anything is stashed.
+fn with_stash<T>(
+    root: &Path,
+    mode: CheckoutMode,
+    in_the_way: Vec<String>,
+    message: String,
+    refuse: impl FnOnce(Vec<String>) -> GitError,
+    act: impl FnOnce() -> Result<T>,
+) -> Result<(T, Stashing)> {
     let stashed = if in_the_way.is_empty() {
         None
     } else {
         match mode {
-            CheckoutMode::Refuse => {
-                return Err(GitError::CheckoutWouldOverwrite {
-                    branch: name.to_string(),
-                    paths: in_the_way,
-                });
-            }
+            CheckoutMode::Refuse => return Err(refuse(in_the_way)),
             CheckoutMode::Stash | CheckoutMode::StashAndRestore => {
                 // Untracked files are included, because an untracked file the target tree also
                 // contains is one of the three things that blocks — leaving it behind would
                 // stash the tracked half and then fail on the same switch.
-                let message = format!("cide: switching to {name}");
                 stash::save(root, &message, true)?;
                 Some(message)
             }
         }
     };
 
-    let created_from_remote = switch(&repo, &target)?;
+    let value = act()?;
 
-    // Restore *after* the switch, which is the whole of "smart checkout": the changes land on
+    // Restore *after* the move, which is the whole of "smart checkout": the changes land on
     // the new branch.
     //
     // `apply` then `drop`, never `pop`. libgit2's `stash_pop` drops the entry whenever the
@@ -342,8 +377,8 @@ pub fn checkout(root: &Path, name: &str, mode: CheckoutMode) -> Result<CheckoutO
         match stash::apply(root, 0) {
             Err(error) => restore_failed = Some(error.to_string()),
             Ok(()) => {
-                // A fresh handle: the apply rewrote `.git/index` underneath `repo`, whose
-                // in-memory copy libgit2 would happily keep serving.
+                // A fresh handle: the apply rewrote `.git/index` underneath the caller's
+                // `Repository`, whose in-memory copy libgit2 would happily keep serving.
                 let after = repo_mod::open(root)?;
                 let conflicts = repo_mod::conflicted_paths(&after)?;
                 if conflicts.is_empty() {
@@ -359,17 +394,130 @@ pub fn checkout(root: &Path, name: &str, mode: CheckoutMode) -> Result<CheckoutO
         }
     }
 
+    Ok((
+        value,
+        Stashing {
+            stashed: if mode == CheckoutMode::StashAndRestore && restore_failed.is_none() {
+                // Popped: there is no stash to tell the user about any more.
+                None
+            } else {
+                stashed
+            },
+            restore_failed,
+        },
+    ))
+}
+
+/// Switch to `name`, doing what `mode` says about local changes that stand in the way.
+pub fn checkout(root: &Path, name: &str, mode: CheckoutMode) -> Result<CheckoutOutcome> {
+    let repo = repo_mod::open(root)?;
+    // A half-finished merge or rebase has index state that a switch would strand. git refuses
+    // too, and this way the message names the operation instead of libgit2's error class.
+    if let Some(operation) = repo_mod::operation_in_progress(&repo) {
+        return Err(GitError::OperationInProgress { operation });
+    }
+    let target = find(&repo, name)?;
+
+    let in_the_way = blockers(&repo, target.tip())?;
+    let refused = name.to_string();
+    let (created_from_remote, stashing) = with_stash(
+        root,
+        mode,
+        in_the_way,
+        format!("cide: switching to {name}"),
+        |paths| GitError::CheckoutWouldOverwrite {
+            branch: refused,
+            paths,
+        },
+        || switch(&repo, &target),
+    )?;
+
     Ok(CheckoutOutcome {
         branch: target.local_name().to_string(),
         created_from_remote,
-        stashed: if mode == CheckoutMode::StashAndRestore && restore_failed.is_none() {
-            // Popped: there is no stash to tell the user about any more.
-            None
-        } else {
-            stashed
-        },
-        restore_failed,
+        stashed: stashing.stashed,
+        restore_failed: stashing.restore_failed,
     })
+}
+
+/// Check out a commit, which necessarily detaches `HEAD`.
+///
+/// # Why this is not `checkout` with a flag
+///
+/// [`CheckoutOutcome::branch`] is documented as *"the local branch that is now checked out"*,
+/// and every consumer treats it as one — `ui/src/chrome/branchModel.ts`'s `checkoutNote` puts
+/// it straight into *"Switched to {branch}"*. Putting a short oid there would produce
+/// *"Switched to a1b2c3d4"*, which reads as a branch name, and a detached `HEAD` being
+/// mistaken for a branch is precisely the misunderstanding that ends with a day's commits on
+/// no ref at all. So the outcome is [`DetachOutcome`], whose `previous` field carries the way
+/// back — the single most useful thing to know while detached and the thing users least often
+/// work out for themselves.
+///
+/// An in-progress operation is refused for the same reason [`checkout`] refuses one: this
+/// moves `HEAD`, the index and the working tree, and a rebase's todo list would be left
+/// pointing at a state that no longer exists. (Contrast [`crate::tag`], which writes one ref
+/// and is deliberately allowed mid-rebase, exactly as `git tag` is.)
+pub fn checkout_detached(root: &Path, revision: &str, mode: CheckoutMode) -> Result<DetachOutcome> {
+    let repo = repo_mod::open(root)?;
+    if let Some(operation) = repo_mod::operation_in_progress(&repo) {
+        return Err(GitError::OperationInProgress { operation });
+    }
+
+    // Read *before* anything moves: after the detach, "where was I" is unanswerable. This is
+    // already the branch name, or the short oid when `HEAD` was detached to begin with —
+    // detaching from a detached `HEAD` is a real gesture (walking back through a bisect) and
+    // the way back is still a commit worth naming.
+    let head = status::branch_info(&repo)?;
+    if head.unborn {
+        return Err(GitError::Unborn);
+    }
+    let previous = head.head;
+
+    // `resolve` reports [`GitError::NoSuchBranch`] because it is shared with the branch
+    // selector; here the thing the user clicked is a commit row, and telling them "no branch
+    // named a1b2c3d4" would name the wrong kind of object and send them looking for the wrong
+    // fix. Every failure of `resolve` is "nothing here resolves to a commit", so the mapping
+    // loses nothing.
+    let target = resolve(&repo, revision).map_err(|_| GitError::NoSuchCommit {
+        rev: revision.to_string(),
+    })?;
+    let short = short_oid(target.id());
+    let summary = target.summary().ok().flatten().unwrap_or("").to_string();
+
+    let in_the_way = blockers(&repo, &target)?;
+    let refused = short.clone();
+    let (_, stashing) = with_stash(
+        root,
+        mode,
+        in_the_way,
+        format!("cide: checking out {short}"),
+        // `branch` is the only field the variant has for "what you were moving to", and a
+        // short oid is what the dialog is already showing.
+        |paths| GitError::CheckoutWouldOverwrite {
+            branch: refused,
+            paths,
+        },
+        || detach(&repo, &target),
+    )?;
+
+    Ok(DetachOutcome {
+        head: short,
+        summary,
+        previous,
+        stashed: stashing.stashed,
+        restore_failed: stashing.restore_failed,
+    })
+}
+
+/// Move the working tree onto a commit and point `HEAD` straight at it.
+fn detach(repo: &Repository, target: &Commit<'_>) -> Result<()> {
+    // Tree first, then `HEAD`, for the same reason as [`switch`]: a failure between them must
+    // leave `HEAD` describing what is actually on disk.
+    let mut builder = git2::build::CheckoutBuilder::new();
+    builder.safe();
+    repo.checkout_tree(target.as_object(), Some(&mut builder))
+        .wrap()?;
+    repo.set_head_detached(target.id()).wrap()
 }
 
 /// Move the working tree and `HEAD`. Returns the remote branch a local one was created from.

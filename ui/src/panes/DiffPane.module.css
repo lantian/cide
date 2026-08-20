@@ -58,7 +58,7 @@
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
@@ -94,7 +94,7 @@
 
 .mode {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1;
   padding: 4px 7px;
   border: 1px solid transparent;
@@ -143,7 +143,7 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1;
   padding: 6px 10px;
   border-radius: 4px;
@@ -201,12 +201,12 @@
 
 .oversizeCount {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--text-hi);
 }
 
 .oversizeWhy {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--dim);
   max-width: 46ch;
   line-height: 1.5;
@@ -253,7 +253,7 @@
 
 .body :global(.cm-editor .cm-scroller) {
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   line-height: 1.55;
 }
 
@@ -376,7 +376,7 @@
 
 .chunkButton {
   font-family: var(--font-ui);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   line-height: 1;
   padding: 3px 6px;
   border: 1px solid var(--border);

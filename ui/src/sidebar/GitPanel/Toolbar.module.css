@@ -4,7 +4,7 @@
  * focus ring, so the two surfaces do not read as coming from different applications.
  */
 .bar {
-  height: 28px;
+  height: calc(28px * var(--ui-scale));
   flex: none;
   display: flex;
   align-items: center;
@@ -17,7 +17,7 @@
 
 .button {
   width: 22px;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   flex: none;
   display: grid;
   place-items: center;
@@ -26,7 +26,7 @@
   background: transparent;
   color: inherit;
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   cursor: pointer;
   padding: 0;
 }

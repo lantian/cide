@@ -28,6 +28,7 @@ import {
   type ProjectId,
 } from '@/ipc/client'
 import styles from './Overlay.module.css'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 
 /**
  * The last path component, which is what the row draws large.
@@ -185,11 +186,16 @@ export function FilePicker({ project, onDismiss, onOpen, onOpenInSplit, onMentio
   }, [project, query, libraries])
 
   const hits: PickerRow[] = useMemo(() => frame?.items ?? [], [frame])
+  // The chrome scale, for the one measurement CSS never sees: a virtualized row is placed by
+  // an absolute transform off this number. See `settings/useUiScale.ts`.
+
+  const rowHeight = scaledRow(ROW_HEIGHT, useUiScale())
+
 
   const virtualizer = useVirtualizer({
     count: hits.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 8,
   })
 

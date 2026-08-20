@@ -40,7 +40,7 @@ import { useFocusRequested } from '@/chrome/focusRequests'
 import { GuardBar } from './GuardBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
-import { allRepos, partialFiles, repoOf, summarize } from './model'
+import { allRepos, canCommit, partialFiles, repoOf, summarize } from './model'
 import { useGitDiffTabOpen } from './openDiffTabs'
 import type { GitPanelActions, GitPanelModel } from './useGitPanel'
 import styles from './GitPanel.module.css'
@@ -250,9 +250,18 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
         <CommitBox
           message={git.message}
           amend={git.amend}
+          /* The log's abbreviation, straight through — `null` for the checkbox's own meaning.
+             See `CommitBoxProps.amendOf` for why it is on the label rather than hidden. */
+          amendOf={git.amendOf?.shortOid ?? null}
           summary={summary}
           canAmend={canAmend}
-          canCommit={hasSelection && git.busy === null}
+/* The rule is in `model.ts` so `check:git` can compile and run it — including
+             the reword case, which is the one place Commit is live on an empty selection. */
+          canCommit={canCommit({
+            picked: git.picked.length,
+            reword: git.rewordRepo !== null,
+            busy: git.busy,
+          })}
           busy={git.busy}
           onMessage={git.setMessage}
           onAmend={git.setAmend}
@@ -262,10 +271,14 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
       )}
 
       {/*
-        * Both overlays are mounted by the panel rather than by `App.tsx`, and they portal
-        * nothing: `OverlayCard` renders its own scrim in place. That is what makes every
-        * gesture in this feature reachable with no line in a file this session does not own —
-        * see the note at the foot of `GitPanelHost`.
+        * Both overlays are mounted by the panel rather than by `App.tsx`, and the conclusion
+        * still holds — every gesture in this feature is reachable with no line in a file this
+        * session does not own; see the note at the foot of `GitPanelHost`. The reason changed
+        * in M19: `OverlayCard` now portals its scrim to `document.body` rather than drawing it
+        * in place, because a card rendered inside a tab panel was capped by that panel's own
+        * stacking context (`TabContent.module.css` gives it `z-index: 0/1`) and could not rise
+        * above the sidebar splitter beside it. Mounting here is still right; it is simply no
+        * longer the thing that puts the scrim over the window.
         */}
       {git.dialog !== null && (
         <ChangelistDialog

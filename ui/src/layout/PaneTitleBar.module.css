@@ -427,7 +427,7 @@
   /* A long title clips itself rather than reaching across the pane it is labelling. */
   max-width: 70%;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   pointer-events: none;
 }
 
@@ -626,6 +626,10 @@
  * fill and could spend them.
  */
 .action {
+  /* The floating cluster stays put while the chrome font size moves the panes around it. It is
+     four SVG buttons, not text — and `check:rows` re-derives `--pane-corner` from this width,
+     so a scaled cluster would need the reserve scaled in lockstep for a box that gains nothing
+     by growing. */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -681,7 +685,7 @@
 /* Smaller and dimmer than the glyph it hangs off: it is a hint about the control, not a
    second control. It brightens with its parent because it is inside the button. */
 .caret {
-  font-size: 8px;
+  font-size: var(--fs-ui-8);
   color: var(--faint);
 }
 

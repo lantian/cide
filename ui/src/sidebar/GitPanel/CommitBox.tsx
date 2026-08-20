@@ -26,6 +26,18 @@ export interface CommitBoxProps {
   busy: string | null
   /** No HEAD to amend — an unborn branch. The checkbox is disabled rather than hidden. */
   canAmend: boolean
+  /**
+   * The commit the git log's *Amend…* named, abbreviated — or `null` for the checkbox's own
+   * meaning, which is "amend whatever HEAD is" and is the ordinary case.
+   *
+   * Drawn on the label, not hidden behind the tick. It changes what Commit writes — the oid goes
+   * out as `CommitRequest.amendOf` and `cide_git::commit` refuses if HEAD has moved past it —
+   * and nothing else in the panel would say so, which is the same argument the held-partials
+   * line above the tree makes: an invisible modifier on the button that rewrites history is not
+   * acceptable. It also tells a user who has come back to the panel five minutes later *which*
+   * commit they are about to rewrite, which is the question they will actually have.
+   */
+  amendOf?: string | null | undefined
   onMessage: (text: string) => void
   onAmend: (on: boolean) => void
   onCommit: () => void
@@ -68,7 +80,14 @@ export function CommitBox(props: CommitBoxProps) {
   return (
     <div className={styles.footer} data-audit="gitFooter">
       <div className={styles.top}>
-        <label className={styles.amend}>
+        <label
+          className={styles.amend}
+          /* The full sentence on hover, because the label has ~110px and an oid is not a
+             sentence. `title` and not an `aria-label`: the visible text is already the
+             accessible name and replacing it would hide the oid from a screen reader, which is
+             the one reader that cannot see the row in the log this came from. */
+          {...(props.amendOf ? { title: `Rewrites commit ${props.amendOf} rather than adding one` } : {})}
+        >
           <input
             type="checkbox"
             className={styles.checkbox}
@@ -76,7 +95,10 @@ export function CommitBox(props: CommitBoxProps) {
             disabled={!props.canAmend}
             onChange={(e) => props.onAmend(e.currentTarget.checked)}
           />
-          Amend
+          {/* `Amend a1b2c3d` only while the log named one. Plain `Amend` is not a shorter
+              spelling of the same thing — it means "whatever HEAD is when I press Commit", and
+              the two differ exactly when it matters, which is when HEAD moved underneath. */}
+          {props.amendOf ? `Amend ${props.amendOf}` : 'Amend'}
         </label>
         <span className={styles.summary} id={summaryId} data-audit="gitSummary">
           {props.busy ?? props.summary}

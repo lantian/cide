@@ -11,11 +11,13 @@
  * Nothing in this file calls a `set` between `pointerdown` and `pointerup` except the
  * `active` flag, which is local to this 6px element.
  *
- * Driving the two **tokens** rather than the panels is what makes that possible without
- * touching a panel: `FileTree.module.css`, `GitPanel.module.css`, `SearchPanel.module.css`
- * and `ProblemsPanel.module.css` already say `width: var(--w-sidebar-…)`, so re-declaring
- * the property on `<html>` resizes whichever of them is mounted, with no React involved and
- * no second source of truth for the width.
+ * Driving the **tokens** rather than the panels is what makes that possible without touching
+ * a panel: `FileTree.module.css`, `GitPanel.module.css`, `SearchPanel.module.css` and
+ * `ProblemsPanel.module.css` already say `width: var(--w-sidebar-…)`, so re-declaring the
+ * property on `<html>` resizes whichever of them is mounted, with no React involved and no
+ * second source of truth for the width. M18's Agents and Tasks panels join on the same terms:
+ * one more token, `--w-sidebar-agents`, and nothing else here changes — which is the whole
+ * argument for the token indirection.
  *
  * The decisions — the clamp, the defaults, the cache encoding — are in `./sidebarWidth.ts`,
  * which is import-free so `ui/scripts/check-sidebar.mjs` can compile and assert on it. What
@@ -49,6 +51,19 @@ import styles from './SidebarSplitter.module.css'
  */
 const KEY_STEP = 16
 
+/**
+ * The handle's accessible name, per panel.
+ *
+ * One name per *width*, not per view, which is why `files` is "the sidebar" rather than "the
+ * file tree": that handle sizes the explorer, search and problems alike, and `agents` sizes
+ * Agents and Tasks alike, so a name that promised one view would be wrong in the others.
+ */
+const PANEL_LABEL: Readonly<Record<SidebarPanel, string>> = {
+  files: 'Resize the sidebar',
+  git: 'Resize the git panel',
+  agents: 'Resize the agents panel',
+}
+
 /** Matches `layout/Splitter.tsx`: long enough that key repeat coalesces, short enough to feel instant. */
 const KEY_COMMIT_DELAY = 120
 
@@ -56,10 +71,11 @@ const KEY_COMMIT_DELAY = 120
 //
 // Module scope, not component state, and deliberately: these widths belong to the *window*,
 // not to whichever splitter happens to be mounted. Only one sidebar view is open at a time,
-// so the two splitters are never mounted together — but they hand the width to each other
-// across an unmount every time the user switches views, and a `useState` would reset it.
+// so no two of these splitters are ever mounted together — but they hand the widths to each
+// other across an unmount every time the user switches views, and a `useState` would reset
+// them.
 
-/** What this window has stored for both panels. Not viewport-clamped; see [`painted`]. */
+/** What this window has stored for every panel. Not viewport-clamped; see [`painted`]. */
 let held: SidebarWidths = readCache()
 
 /**
@@ -104,10 +120,11 @@ function painted(widths: SidebarWidths): SidebarWidths {
   return {
     files: clampSidebarWidth(widths.files, available),
     git: clampSidebarWidth(widths.git, available),
+    agents: clampSidebarWidth(widths.agents, available),
   }
 }
 
-/** Write both tokens onto `<html>`. The whole of how a width reaches the screen. */
+/** Write every token onto `<html>`. The whole of how a width reaches the screen. */
 function paint(widths: SidebarWidths): void {
   const root = document.documentElement
   for (const [property, value] of widthDeclarations(painted(widths))) {
@@ -304,7 +321,7 @@ export function SidebarSplitter({ panel }: SidebarSplitterProps) {
     <div
       role="separator"
       aria-orientation="vertical"
-      aria-label={panel === 'git' ? 'Resize the git panel' : 'Resize the sidebar'}
+      aria-label={PANEL_LABEL[panel]}
       aria-valuenow={painted(held)[panel]}
       aria-valuemin={SIDEBAR_MIN}
       aria-valuemax={sidebarCeiling(window.innerWidth)}

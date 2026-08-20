@@ -602,7 +602,23 @@ try {
   {
     const rules = leafRules(readFileSync('src/overlays/Overlay.module.css', 'utf8'))
     const rule = (selector) => rules.find((r) => parts(r.selector).includes(selector))?.body ?? ''
-    const number = (body, prop) => Number(new RegExp(`${prop}:\\s*([0-9.]+)`).exec(body)?.[1])
+    /*
+     * The design size behind a declaration, whether it is a literal or a ladder token.
+     *
+     * Chrome font sizes are `var(--fs-ui-11-5)` since the chrome gained a font-size setting,
+     * and the number in that name *is* the design size — `tokens.css` defines the token as
+     * `calc(11.5px * var(--ui-scale))`. So the comparison below still compares the two numbers
+     * the mock specifies; it just reads them through a name. Kept as a resolver rather than
+     * relaxed to "any number in the value", because `calc(11.5px * var(--ui-scale))` contains
+     * a `1` before it contains an `11.5`.
+     */
+    const number = (body, prop) => {
+      const raw = new RegExp(`${prop}:\\s*([^;]+)`).exec(body)?.[1]?.trim()
+      if (raw === undefined) return NaN
+      const token = /^var\(--fs-ui-([\d-]+)\)$/.exec(raw)
+      if (token) return Number(token[1].replace('-', '.'))
+      return Number(/^([0-9.]+)/.exec(raw)?.[1])
+    }
 
     const head = rule('.usageFileName')
     const code = rule('.usageText')
@@ -669,9 +685,18 @@ try {
   ].map(([file, re]) => [file, Number(re.exec(readFileSync(file, 'utf8'))?.[1])])
   const gitRow = leafRules(readFileSync('src/sidebar/GitPanel/ChangesTree.module.css', 'utf8'))
     .find((r) => parts(r.selector).includes('.row'))
+  /*
+   * Read through the `calc()` the chrome font size wraps every text box in.
+   *
+   * `.row` is `calc(24px * var(--ui-scale))` now, and the 24 is still the design height this
+   * check is about — `check-ui-scale.mjs` is what guarantees the literal stays first inside
+   * the `calc()`, precisely so derivations like this one keep working. The two `ROW_HEIGHT`
+   * constants above are the same design number in JavaScript; they are multiplied by the same
+   * scale at render time in `settings/useUiScale.ts`, so agreeing here is agreeing everywhere.
+   */
   rowHeights.push([
     'src/sidebar/GitPanel/ChangesTree.module.css',
-    Number(/height:\s*(\d+)px/.exec(gitRow?.body ?? '')?.[1]),
+    Number(/height:\s*(?:calc\()?(\d+)px/.exec(gitRow?.body ?? '')?.[1]),
   ])
   for (const [file, height] of rowHeights) {
     ok(Number.isFinite(height), `${file} still states a row height this script can read`)

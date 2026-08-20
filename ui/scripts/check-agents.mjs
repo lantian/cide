@@ -1,0 +1,1500 @@
+/**
+ * Checks `src/sidebar/AgentsPanel/model.ts` and `src/sidebar/TasksPanel/model.ts` — the pure
+ * cores of the two M18 panels — and pins their vocabularies against the Rust that defines them.
+ *
+ * Same shape as `check-problems.mjs` and `check-theme.mjs`, and for the same reason: this
+ * project has no JS test runner, adding one for a handful of pure functions would be a larger
+ * commitment than the code it tests, and both modules are deliberately import-free so the
+ * TypeScript already in `node_modules` can compile them standalone and node can import the
+ * result. If either compile ever needs a tsconfig, something has added an import and the
+ * node-testability of the core has been lost.
+ *
+ * # The three failure classes this makes unrepresentable
+ *
+ * **A vocabulary that drifts from Rust.** `TaskStatus`, `RunState` and `Harness` are enums in
+ * `crates/cide-ipc/src/{tasks,agents}.rs` and frozen lists in TypeScript. `xtask codegen`
+ * regenerates `generated.ts`, but neither model imports it — they restate the shapes
+ * structurally so they can be compiled alone — so nothing else in the build can see a fifth
+ * `TaskStatus` arriving with no glyph, no label, no tone and no group to be drawn in. Adding a
+ * status in Rust fails this check until the panel's tables know it.
+ *
+ * **A table lookup that misses.** `check-problems.mjs`'s `ROGUE` lesson, made structural: a
+ * miss returns `undefined`, or worse a prototype key returns `Object.prototype.constructor` —
+ * a function, which React refuses as a child and which `className` stringifies into the whole
+ * source text of `Object`. So every member of every vocabulary is asserted to yield a non-empty
+ * *string*, and `'constructor'` is pinned as not being a member of either.
+ *
+ * **A control that is greyed with nothing saying why.** `canDispatch` must return exactly one
+ * of a green light and a non-empty sentence — never both, never neither. That is
+ * `Command::unavailable` one layer down and for the identical reason: this project has paid
+ * twenty-four times for a row that is listed and silently inert. The comparison itself
+ * ([`gate`]) is pure and is self-tested below against results with holes punched in them, the
+ * way `check-commands.mjs` self-tests `missing()` — a gate nobody has seen fail is a gate
+ * nobody knows works, and this one asserts the *absence* of something, which is the shape that
+ * passes vacuously when its scan breaks.
+ *
+ * **A subagent with no row.** The panel is now one list of roles, so a run whose role the roster
+ * does not define — somebody deleted `.cide/agents/<id>.md` while it was working — has nowhere
+ * to go unless `sections()` invents a row for it, and a run with no row anywhere is a `claude`
+ * spending the user's quota that they cannot see, open or stop. The same hole opens from the
+ * other side for a phase this build cannot read, which is why `isActivePhase` is the negation of
+ * `isDonePhase` rather than membership of a list. Both are asserted below, in both directions.
+ *
+ * # What this does NOT cover, and nothing here should be read as claiming
+ *
+ *   - that either panel renders. That is `check-agents-render.mjs`'s job, through Vite's SSR
+ *     bundle, and a model can pass every assertion below while the component paints nothing.
+ *   - that `adapt.ts` converts the wire's `bigint` millisecond fields to the `number`s both
+ *     models take. Nothing here imports `generated.ts`; the models are structural restatements
+ *     and `tsc --noEmit` over the real `adapt.ts` is what pins them to it.
+ *   - that the two `cide://` events reach the stores at all.
+ *
+ * Run: `pnpm --dir ui run check:agents`   (or `node ui/scripts/check-agents.mjs`)
+ */
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const UI = resolve(import.meta.dirname, '..')
+const out = mkdtempSync(join(tmpdir(), 'cide-agents-'))
+
+let failed = 0
+const fail = (what, detail) => {
+  failed += 1
+  console.error(`FAIL ${what}${detail === undefined ? '' : `\n  ${detail}`}`)
+}
+const eq = (actual, expected, what) => {
+  const a = JSON.stringify(actual)
+  const b = JSON.stringify(expected)
+  if (a !== b) fail(what, `actual:   ${a}\n  expected: ${b}`)
+}
+const ok = (cond, what) => {
+  if (cond !== true) fail(what)
+}
+
+const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8')
+
+/** Line comments out, block comments out. Every scan below wants code, not prose. */
+const stripComments = (source) =>
+  source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+
+/**
+ * The body of a Rust item, found by its opening line and its `\n}`.
+ *
+ * Lifted from `check-commands.mjs`, which reads `fn build()` the same way. It works on an enum
+ * for the same reason it works on that function: every one of the three enums below has its
+ * closing brace in column zero and every variant payload on one line, so the first `\n}` after
+ * the opening is the end of the item and not the end of a variant.
+ */
+function rustBody(source, opening, what) {
+  const start = source.indexOf(opening)
+  if (start < 0) throw new Error(`could not find ${what}`)
+  const end = source.indexOf('\n}', start)
+  return source.slice(start, end)
+}
+
+/**
+ * The camelCase wire names of a Rust enum's variants.
+ *
+ * Every one of the three enums carries `#[serde(rename_all = "camelCase")]`, and camelCasing a
+ * PascalCase identifier is lowercasing its first letter — `AwaitingPermission` →
+ * `awaitingPermission`, `Todo` → `todo`. A regex rather than a parser, on `check-commands.mjs`'s
+ * argument; the "at least this many" assertion at each call site is what stops a change of shape
+ * from silently matching nothing and passing.
+ */
+function variants(source, opening, what) {
+  const body = stripComments(rustBody(source, opening, what))
+  const inner = body.slice(body.indexOf('{') + 1)
+  return [...inner.matchAll(/^[ \t]+([A-Z][A-Za-z0-9]*)[ \t]*(\{|\(|,|$)/gm)].map(
+    (m) => m[1].charAt(0).toLowerCase() + m[1].slice(1),
+  )
+}
+
+const sorted = (list) => [...list].sort()
+
+try {
+  /*
+   * Both models in one invocation. `tsc` puts each under its own directory in `out` because it
+   * derives the common root from the inputs (`src/sidebar`), which is what keeps two files
+   * called `model.ts` from overwriting each other.
+   */
+  execFileSync(
+    'node',
+    [
+      'node_modules/typescript/bin/tsc',
+      'src/sidebar/AgentsPanel/model.ts',
+      'src/sidebar/TasksPanel/model.ts',
+      '--outDir', out,
+      '--module', 'esnext',
+      '--target', 'es2022',
+      '--moduleResolution', 'bundler',
+      '--strict',
+      '--exactOptionalPropertyTypes',
+      '--noUncheckedIndexedAccess',
+    ],
+    { cwd: UI, stdio: 'inherit' },
+  )
+
+  const agents = await import(`file://${join(out, 'AgentsPanel', 'model.js')}`)
+  const tasks = await import(`file://${join(out, 'TasksPanel', 'model.js')}`)
+
+  const {
+    HARNESSES,
+    RUN_PHASES,
+    WORKING_PHASES: AGENT_WORKING_PHASES,
+    ACTIVE_PHASES,
+    TONES: RUN_TONES,
+    ROSTER_UNKNOWN,
+    RECENT_CAP,
+    RESTING_GLYPH,
+    RESTING_LABEL,
+    ROLE_UNDEFINED,
+    isActivePhase,
+    isRunPhase,
+    phaseGlyph,
+    phaseLabel,
+    phaseTone,
+    canDispatch,
+    canOpen,
+    canPause,
+    occupiedSlots,
+    liveCount,
+    queuedCount,
+    metaFigure: rosterFigure,
+    sections,
+    elapsed,
+    staleTurnLine,
+  } = agents
+
+  const {
+    TASK_STATUSES,
+    GROUP_ORDER,
+    TONES: TASK_TONES,
+    WORKING_PHASES: TASK_WORKING_PHASES,
+    BOARD_UNKNOWN,
+    isTaskStatus,
+    statusGlyph,
+    statusLabel,
+    statusTone,
+    agentChip,
+    groupOf,
+    groups,
+    matchesFilter,
+    listEmpty,
+    armedDelete,
+    openCount,
+    metaFigure: boardFigure,
+    newerBoard,
+    canWrite,
+    commentOrder,
+    TASK_FIELDS,
+    EDITABLE_FIELDS,
+    UNASSIGNED,
+    NO_TITLE,
+    NO_BODY,
+    isTaskField,
+    isEditableField,
+    fieldLabel,
+    fieldValue,
+    isFieldEmpty,
+    restText,
+    assigneeLabel,
+    assigneeFromDraft,
+    assignableRoles,
+    startEdit,
+    isDirty,
+    beginEdit,
+    commitEdit,
+    cancelEdit,
+    closeCard,
+    openTask,
+    activeEdit,
+  } = tasks
+
+  /* == 1 ================================================== the vocabularies match Rust == */
+
+  const tasksRs = read('../../crates/cide-ipc/src/tasks.rs')
+  const agentsRs = read('../../crates/cide-ipc/src/agents.rs')
+
+  const rustStatuses = variants(tasksRs, 'pub enum TaskStatus {', 'TaskStatus')
+  const rustPhases = variants(agentsRs, 'pub enum RunState {', 'RunState')
+  const rustHarnesses = variants(agentsRs, 'pub enum Harness {', 'Harness')
+
+  ok(rustStatuses.length === 4, `read ${rustStatuses.length} TaskStatus variants — the scan still matches`)
+  ok(rustPhases.length === 8, `read ${rustPhases.length} RunState variants — the scan still matches`)
+  ok(rustHarnesses.length === 2, `read ${rustHarnesses.length} Harness variants — the scan still matches`)
+
+  eq(
+    sorted(TASK_STATUSES),
+    sorted(rustStatuses),
+    'TASK_STATUSES is exactly `pub enum TaskStatus` — a status Rust gained and the panel has ' +
+      'not is a task the tracker can hold and never draw',
+  )
+  eq(
+    sorted(RUN_PHASES),
+    sorted(rustPhases),
+    'RUN_PHASES is exactly the tags of `pub enum RunState`',
+  )
+  eq(sorted(HARNESSES), sorted(rustHarnesses), 'HARNESSES is exactly `pub enum Harness`')
+
+  eq(
+    sorted(GROUP_ORDER),
+    sorted(TASK_STATUSES),
+    'GROUP_ORDER is a permutation of TASK_STATUSES — a status the panel never groups is a ' +
+      'task the user cannot see',
+  )
+  eq(
+    GROUP_ORDER.length,
+    TASK_STATUSES.length,
+    'GROUP_ORDER lists each status once (a permutation, not a multiset)',
+  )
+  ok(
+    JSON.stringify(GROUP_ORDER) !== JSON.stringify(TASK_STATUSES),
+    'GROUP_ORDER is a display order and not a copy of the wire order — active groups first',
+  )
+  eq(GROUP_ORDER[0], 'doing', 'the panel opens on what is happening, not on the backlog')
+
+  /*
+   * `TasksPanel` restates `WORKING_PHASES` rather than importing it, because both modules must
+   * stay import-free. This is the seam that keeps the copy honest — and it is why the rename
+   * out of `LIVE_PHASES` had to move all three files at once: this destructures both copies
+   * *by name*, so renaming either one alone fails here rather than passing.
+   */
+  eq(
+    TASK_WORKING_PHASES.filter((p) => !RUN_PHASES.includes(p)),
+    [],
+    "TasksPanel's WORKING_PHASES copy names only phases RunState still has",
+  )
+  eq(
+    sorted(TASK_WORKING_PHASES),
+    sorted(AGENT_WORKING_PHASES),
+    'the two WORKING_PHASES copies agree — otherwise a chip lights for a run the Agents panel ' +
+      'counts as finished, or the reverse',
+  )
+  ok(
+    !AGENT_WORKING_PHASES.includes('queued'),
+    'a queued run holds no slot, so it cannot block the dispatch that would start it',
+  )
+  ok(
+    !AGENT_WORKING_PHASES.includes('idle'),
+    'an idle run handed its turn back and released its slot — it is alive, which is a different ' +
+      'question, and the one this list stopped being named for',
+  )
+  ok(
+    AGENT_WORKING_PHASES.includes('paused'),
+    'a SIGSTOPped run is frozen mid-turn and still holds its worktree and its slot',
+  )
+
+  /* == 2 ============================== every member of every vocabulary has a table entry == */
+
+  let tableEntries = 0
+  const nonEmptyString = (value, what) => {
+    if (typeof value !== 'string' || value.length === 0) {
+      fail(what, `actual: ${JSON.stringify(value)} (${typeof value})`)
+    } else {
+      tableEntries += 1
+    }
+  }
+
+  for (const status of TASK_STATUSES) {
+    nonEmptyString(statusGlyph(status), `statusGlyph(${status}) is a non-empty string`)
+    nonEmptyString(statusLabel(status), `statusLabel(${status}) is a non-empty string`)
+    nonEmptyString(statusTone(status), `statusTone(${status}) is a non-empty string`)
+    ok(TASK_TONES.includes(statusTone(status)), `statusTone(${status}) is a declared tone`)
+  }
+  for (const phase of RUN_PHASES) {
+    nonEmptyString(phaseGlyph(phase), `phaseGlyph(${phase}) is a non-empty string`)
+    nonEmptyString(phaseLabel(phase), `phaseLabel(${phase}) is a non-empty string`)
+    nonEmptyString(phaseTone(phase), `phaseTone(${phase}) is a non-empty string`)
+    ok(RUN_TONES.includes(phaseTone(phase)), `phaseTone(${phase}) is a declared tone`)
+  }
+
+  /*
+   * The rogue keys. `'constructor'` is the one that is not merely absent but *present* on every
+   * object literal's prototype, so a `value in TABLE` membership test would admit it and the
+   * lookup would return a function.
+   */
+  for (const rogue of ['constructor', 'toString', '__proto__', 'hasOwnProperty', '']) {
+    eq(isTaskStatus(rogue), false, `isTaskStatus(${JSON.stringify(rogue)}) === false`)
+    eq(isRunPhase(rogue), false, `isRunPhase(${JSON.stringify(rogue)}) === false`)
+    nonEmptyString(statusGlyph(rogue), `statusGlyph(${JSON.stringify(rogue)}) still renders`)
+    nonEmptyString(statusLabel(rogue), `statusLabel(${JSON.stringify(rogue)}) still renders`)
+    nonEmptyString(statusTone(rogue), `statusTone(${JSON.stringify(rogue)}) still renders`)
+    nonEmptyString(phaseGlyph(rogue), `phaseGlyph(${JSON.stringify(rogue)}) still renders`)
+    nonEmptyString(phaseLabel(rogue), `phaseLabel(${JSON.stringify(rogue)}) still renders`)
+    nonEmptyString(phaseTone(rogue), `phaseTone(${JSON.stringify(rogue)}) still renders`)
+  }
+
+  /* == 3 ========================================================= the dispatchability gate == */
+
+  /**
+   * The comparison, kept pure so it can be tested with a hole punched in its input.
+   *
+   * `exactlyOne` is the whole claim: a role either has a button or has a sentence. Both is a
+   * row that offers a control it will then refuse; neither is a control greyed out with nothing
+   * on screen saying why, which is a dead control wearing grey.
+   */
+  const gate = (result) => {
+    const green = result !== null && result !== undefined && result.ok === true
+    const reason = result === null || result === undefined ? undefined : result.reason
+    const sentence = typeof reason === 'string' && reason.trim() !== ''
+    return { green, sentence, exactlyOne: green !== sentence }
+  }
+
+  {
+    // The check's own test, before it is trusted with the real roster.
+    eq(gate({ ok: true }).exactlyOne, true, 'the gate accepts a green light (self-test)')
+    eq(
+      gate({ ok: false, reason: 'The dispatch queue is paused.' }).exactlyOne,
+      true,
+      'the gate accepts a refusal with a sentence (self-test)',
+    )
+    eq(
+      gate({ ok: false, reason: '' }).exactlyOne,
+      false,
+      'the gate reports a refusal with no sentence — the dead-control state (self-test)',
+    )
+    eq(
+      gate({ ok: false }).exactlyOne,
+      false,
+      'the gate reports a refusal with no reason field at all (self-test)',
+    )
+    eq(
+      gate({ ok: true, reason: 'but also' }).exactlyOne,
+      false,
+      'the gate reports a result that is both (self-test)',
+    )
+  }
+
+  const def = (over) => ({
+    id: 'developer',
+    label: 'Developer',
+    harness: 'claude',
+    description: 'Implements one task end to end.',
+    systemPrompt: 'You are the developer agent.',
+    model: null,
+    unavailable: null,
+    maxConcurrent: 1,
+    ...over,
+  })
+
+  const run = (over) => ({
+    run: 'r1',
+    agent: 'developer',
+    agentLabel: 'Developer',
+    harness: 'claude',
+    session: 's1',
+    phase: 'running',
+    task: 't-14',
+    startedMs: 1_700_000_000_000,
+    pausedSinceMs: null,
+    exitCode: null,
+    failure: null,
+    staleTurn: false,
+    note: null,
+    ...over,
+  })
+
+  /* The fixture, with a hole punched for each refusal the gate is supposed to produce. */
+  const ROLES = [
+    def({ id: 'developer', label: 'Developer', maxConcurrent: 2 }),
+    def({ id: 'qa', label: 'QA', unavailable: 'opencode is not on PATH.', harness: 'opencode' }),
+    def({ id: 'artist', label: 'Artist', maxConcurrent: 0 }),
+    def({ id: 'writer', label: 'Writer', maxConcurrent: 1 }),
+    def({ id: 'blank', label: '', unavailable: '   ' }),
+  ]
+  const RUNS = [
+    run({ run: 'r1', agent: 'writer', phase: 'running', task: 't-14' }),
+    run({ run: 'r2', agent: 'developer', phase: 'queued', session: null, task: 't-15' }),
+    run({ run: 'r3', agent: 'developer', phase: 'awaitingPermission', task: 't-16' }),
+    run({ run: 'r4', agent: 'qa', phase: 'finished', exitCode: 0, task: null, staleTurn: true }),
+    run({ run: 'r5', agent: 'artist', phase: 'failed', failure: 'no worktree', task: 't-99' }),
+  ]
+
+  const READY = { kind: 'ready', agents: ROLES, runs: RUNS, dispatching: true }
+  const PAUSED_QUEUE = { ...READY, dispatching: false }
+  const DISABLED = {
+    kind: 'disabled',
+    hint: 'Subagents are off for this project.',
+    configPath: '/repo/.cide/config.json',
+  }
+  const EMPTY = { kind: 'empty', configPath: '/repo/.cide/config.json' }
+
+  const ROSTERS = [
+    ['ready', READY],
+    ['queue paused', PAUSED_QUEUE],
+    ['disabled', DISABLED],
+    ['empty', EMPTY],
+    ['unknown', ROSTER_UNKNOWN],
+  ]
+
+  let gated = 0
+  for (const [name, roster] of ROSTERS) {
+    for (const role of ROLES) {
+      const result = canDispatch(role, roster)
+      const verdict = gate(result)
+      gated += 1
+      ok(
+        verdict.exactlyOne,
+        `canDispatch(${role.id}, ${name}) returns exactly one of a green light and a ` +
+          `sentence — got ${JSON.stringify(result)}`,
+      )
+      if (result.ok === false) {
+        nonEmptyString(
+          result.reason,
+          `canDispatch(${role.id}, ${name}) refuses with a non-empty reason`,
+        )
+      }
+      if (typeof role.unavailable === 'string' && role.unavailable.trim() !== '') {
+        eq(
+          result.reason,
+          role.unavailable,
+          `canDispatch(${role.id}, ${name}) shows the role's own sentence, verbatim and first`,
+        )
+      }
+      ok(
+        result.ok === false || role.unavailable === null,
+        `canDispatch never green-lights a role carrying an unavailable reason (${role.id})`,
+      )
+    }
+  }
+
+  // ...and the individual refusals are the ones the table says they are.
+  eq(canDispatch(ROLES[0], READY).ok, true, 'a healthy role under a ready roster dispatches')
+  eq(
+    canDispatch(ROLES[1], READY).reason,
+    'opencode is not on PATH.',
+    "the role's own unavailable sentence wins over every other test",
+  )
+  ok(
+    /no concurrency/.test(canDispatch(ROLES[2], READY).reason),
+    'maxConcurrent: 0 refuses with a sentence naming the configuration',
+  )
+  eq(
+    canDispatch(ROLES[3], READY).reason,
+    'Writer already has 1 running.',
+    'a role at its ceiling names the count',
+  )
+  eq(
+    canDispatch(ROLES[0], PAUSED_QUEUE).reason,
+    'The dispatch queue is paused.',
+    'a shut queue refuses every role, including healthy ones',
+  )
+  ok(
+    canDispatch(ROLES[0], ROSTER_UNKNOWN).reason !==
+      canDispatch(ROLES[0], DISABLED).reason,
+    '"nobody has looked" and "off for this project" are different sentences — telling a user a ' +
+      'feature is off when the truth is that cide has not read the file is the confident ' +
+      'empty list in sentence form',
+  )
+  ok(
+    canDispatch(ROLES[4], READY).reason.trim() !== '',
+    'a role whose unavailable marker is blank is still refused, with a sentence of our own',
+  )
+
+  /* == 4 ============================================================ newerBoard is the drop == */
+
+  const task = (over) => ({
+    id: 't-14',
+    title: 'Add the retry bar',
+    body: '',
+    status: 'doing',
+    agent: 'developer',
+    comments: [],
+    createdMs: 1_699_999_000_000,
+    updatedMs: 1_700_000_000_000,
+    ...over,
+  })
+
+  const ready = (rev, list = [task({})]) => ({ kind: 'ready', tasks: list, rev })
+  const UNREADABLE = {
+    kind: 'unreadable',
+    path: '/repo/.cide/tasks.json',
+    error: 'expected value at line 12 column 3',
+  }
+  const ABSENT = { kind: 'absent', hint: 'No tracker here yet.', path: '/repo/.cide/tasks.json' }
+
+  {
+    const current = ready(7)
+    ok(newerBoard(current, ready(8)).rev === 8, 'a higher rev replaces')
+    ok(
+      newerBoard(current, ready(6)) === current,
+      'a lower rev is dropped, returning the identical object so no reader re-renders',
+    )
+    ok(
+      newerBoard(current, ready(7)) === current,
+      'an equal rev is dropped too, and by identity — two windows re-reading one file produce ' +
+        'two equal-rev snapshots and admitting the second repaints a list mid-scroll',
+    )
+    ok(
+      newerBoard(current, UNREADABLE) === UNREADABLE,
+      'a tracker that became unreadable always replaces, whatever the predecessor rev was',
+    )
+    ok(newerBoard(current, ABSENT) === ABSENT, 'so does one that is gone')
+    ok(
+      newerBoard(current, BOARD_UNKNOWN) === BOARD_UNKNOWN,
+      'and so does the boot state, which is not a claim about the file',
+    )
+    ok(
+      newerBoard(UNREADABLE, ready(1)).rev === 1,
+      'a ready board replaces a non-ready one whatever its rev',
+    )
+    ok(
+      newerBoard(current, ready(Number.NaN)) === current,
+      'a rev that cannot be ordered keeps the known-good board rather than replacing it',
+    )
+  }
+
+  eq(canWrite(UNREADABLE), false, 'an unparseable tracker offers nothing that writes')
+  eq(canWrite(BOARD_UNKNOWN), false, 'and neither does a board nobody has read yet')
+  eq(canWrite(ABSENT), true, 'an absent tracker offers New task, which is what creates the file')
+  eq(canWrite(ready(1)), true, 'a ready tracker is writable')
+
+  /* == 5 ==================================================== agentChip survives its inputs == */
+
+  const ref = (over) => ({
+    run: 'r1',
+    task: 't-14',
+    agentLabel: 'Developer',
+    phase: 'running',
+    session: 's1',
+    ...over,
+  })
+  const ROLE_LABELS = { developer: 'Developer', qa: 'QA' }
+
+  let chips = 0
+  const chip = (t, runs, roles, what) => {
+    let result
+    try {
+      result = agentChip(t, runs, roles)
+    } catch (error) {
+      fail(`agentChip does not throw: ${what}`, String(error))
+      return null
+    }
+    chips += 1
+    if (result !== null) {
+      nonEmptyString(result.label, `agentChip label is a non-empty string: ${what}`)
+      ok(
+        result.lit === (result.tone !== 'assigned'),
+        `agentChip's two discriminators agree: ${what}`,
+      )
+    }
+    return result
+  }
+
+  {
+    const live = chip(task({}), [ref({})], ROLE_LABELS, 'a live run on this task')
+    ok(live !== null && live.lit === true, 'a live run wins and is lit')
+    ok(live !== null && live.tone === 'live', 'and carries the live tone')
+
+    const dim = chip(task({}), [], ROLE_LABELS, 'no runs at all')
+    ok(dim !== null && dim.lit === false, 'the assigned role alone is dim')
+    ok(dim !== null && dim.tone === 'assigned', 'and carries the assigned tone')
+    ok(
+      live !== null && dim !== null && live.tone !== dim.tone && live.lit !== dim.lit,
+      'the two renderings differ on both discriminators — a chip that looked the same either ' +
+        'way would claim an exited agent is still working',
+    )
+
+    eq(chip(task({ agent: null }), [], ROLE_LABELS, 'neither'), null, 'neither fact yields no chip')
+
+    // The three shapes that cross a boundary and are routinely a few hundred ms out of date.
+    const orphan = chip(
+      task({ id: 't-77' }),
+      [ref({ task: 't-does-not-exist' })],
+      ROLE_LABELS,
+      'a run naming a task that does not exist',
+    )
+    ok(orphan !== null && orphan.lit === false, 'a run on another task does not light this row')
+
+    chip(
+      task({ agent: 'nobody-defined-this' }),
+      [],
+      ROLE_LABELS,
+      'a task naming a role the roster does not define',
+    )
+    chip(task({}), [ref({ phase: 'teleporting' })], ROLE_LABELS, 'a phase outside RUN_PHASES')
+    chip(task({}), [ref({ phase: 'constructor' })], ROLE_LABELS, 'a prototype key as a phase')
+    chip(task({ agent: 'constructor' }), [], ROLE_LABELS, 'a prototype key as an agent id')
+    chip(task({}), [ref({ agentLabel: '' })], ROLE_LABELS, 'a run with a blank label')
+    chip(task({ agent: null }), [ref({ agentLabel: '' })], {}, 'a blank label and no roles at all')
+
+    const unknownPhase = chip(
+      task({}),
+      [ref({ phase: 'teleporting' })],
+      ROLE_LABELS,
+      'unknown phase, again',
+    )
+    ok(
+      unknownPhase !== null && unknownPhase.lit === false,
+      'a phase this build has never heard of is treated as not-live — the conservative ' +
+        'direction, because the alternative is claiming work is under way on a guess',
+    )
+
+    const awaiting = chip(
+      task({}),
+      [ref({ run: 'r1', phase: 'running' }), ref({ run: 'r2', phase: 'awaitingPermission' })],
+      ROLE_LABELS,
+      'two live runs, one awaiting permission',
+    )
+    ok(
+      awaiting !== null && awaiting.run === 'r2' && awaiting.tone === 'attention',
+      'the run that is a call to action wins over the one that merely came first',
+    )
+  }
+
+  /* == 6 ===================================================== null is not 0, in both panels == */
+
+  eq(occupiedSlots(ROSTER_UNKNOWN), null, 'occupiedSlots is null when nobody has looked')
+  eq(queuedCount(ROSTER_UNKNOWN), null, 'queuedCount is null when nobody has looked')
+  eq(rosterFigure(ROSTER_UNKNOWN), null, 'and the header figure draws nothing at all')
+  eq(occupiedSlots(DISABLED), null, 'a disabled roster carries no runs array, so it counts nothing')
+
+  /*
+   * `liveCount` is the pre-rename spelling, surviving only because `App.tsx` imports it for the
+   * activity rail and that file was not part of the rename. Pinned as the *same function
+   * object*, not merely as an equal answer: an alias that turned into a second implementation
+   * would be two numbers for one question again, which is the failure the rename removed.
+   */
+  ok(liveCount === occupiedSlots, 'liveCount is an alias of occupiedSlots and not a second count')
+
+  const IDLE = { kind: 'ready', agents: ROLES, runs: [], dispatching: true }
+  eq(occupiedSlots(IDLE), 0, 'a ready-but-idle roster is a real, reportable zero')
+  eq(queuedCount(IDLE), 0, 'and so is its queue')
+  eq(rosterFigure(IDLE), '0', 'which the header prints, because something looked')
+  eq(occupiedSlots(READY), 2, 'the fixture has two runs holding a slot')
+  eq(queuedCount(READY), 1, 'and one waiting for one')
+  eq(rosterFigure(READY), '2+1', 'the queue depth rides the figure — a header reading 0 while ' +
+    'runs wait to start is the same quiet lie as an unchecked zero')
+
+  eq(openCount(BOARD_UNKNOWN), null, 'openCount is null when nobody has looked')
+  eq(openCount(UNREADABLE), null, 'and when the file will not parse')
+  eq(openCount(ABSENT), null, 'a project with no tracker has no count, it has no tracker')
+  eq(openCount(ready(1, [])), 0, 'a tracker that exists and is empty is a real zero')
+  eq(boardFigure(BOARD_UNKNOWN), null, 'the header draws nothing until something has looked')
+  eq(boardFigure(ready(1, [])), '0', 'and prints the zero once it has')
+  eq(
+    boardFigure(ready(1, [task({ id: 't-1' }), task({ id: 't-2', status: 'done' })])),
+    '1/2',
+    'open over total, because "how much is left" and "how big is this" are two questions',
+  )
+  /*
+   * And it takes the board and nothing else.
+   *
+   * The header names the **tracker**, not the slice of it the user happens to be reading. A
+   * filtered figure would print `0/1` under the `done` filter over a board with three open
+   * tasks — the "my tasks are gone" conclusion the filter's own empty screen exists to prevent,
+   * relocated into the one line of the panel a user trusts as a fact about the file. The arity
+   * is what makes that structural rather than a convention: there is nowhere to pass a filter.
+   */
+  eq(
+    boardFigure.length,
+    1,
+    'metaFigure takes only the board — the header figure cannot be made to follow the filter',
+  )
+
+  /* == the role rows and the figures, which nothing else can see ============================= */
+
+  {
+    const TITLES = { 't-14': 'Add the retry bar', 't-15': 'Sweep the phase table' }
+    const list = sections(READY, TITLES)
+    eq(
+      list.map((s) => s.kind),
+      ['agents', 'recent'],
+      'the panel is one list of subagents, then what has finished — the five run-centric ' +
+        'groups are gone, and their order was the thing the user could not read',
+    )
+    eq(sections(DISABLED, TITLES), [], 'a non-ready roster draws its designed screen, not a list')
+    eq(sections(ROSTER_UNKNOWN, TITLES), [], 'and so does the boot state')
+
+    const agentsSection = list.find((s) => s.kind === 'agents')
+    const byId = Object.fromEntries(agentsSection.rows.map((row) => [row.def.id, row]))
+
+    /*
+     * **The user's rule, and the reason this file exists at all.**
+     *
+     * A role with nothing active offers no Open — not a disabled one, none: the view derives its
+     * buttons from `runs`, which is empty, so there is no element to disable. `blank` has no run
+     * of any kind in the fixture and `artist` has only a `failed` one, so the two cover both
+     * ways of arriving at "doing nothing": never started, and over.
+     */
+    /*
+     * The two constants are asserted non-empty **before** they are used as expected values.
+     * Comparing a row's glyph against `RESTING_GLYPH` alone proves only that the row reads the
+     * constant: emptying the constant would satisfy the comparison and leave the row's fixed
+     * width dot column collapsed, which reads as a rendering fault rather than as "nothing is
+     * happening". Same trap `phaseGlyph`'s table entries are checked against.
+     */
+    nonEmptyString(RESTING_GLYPH, 'the resting mark is a real glyph, not an empty cell')
+    nonEmptyString(RESTING_LABEL, 'and the resting status is a real word')
+    for (const id of ['blank', 'artist']) {
+      eq(byId[id].runs.length, 0, `${id} has no active run`)
+      eq(byId[id].canOpen, false, `${id} offers no Open — there is nothing of its to look at`)
+      eq(byId[id].glyph, RESTING_GLYPH, `${id} draws the resting mark rather than an empty cell`)
+      eq(byId[id].status, RESTING_LABEL, `${id} says so in words as well as in a glyph`)
+    }
+    ok(
+      byId.artist.runs.length === 0 && READY.runs.some((r) => r.agent === 'artist'),
+      'and `artist` really does have a run in the fixture — a finished one. A role whose runs ' +
+        'have all ended is doing nothing, which is the half of the rule a story with no runs ' +
+        'at all could not have shown',
+    )
+
+    /* The other half: a role that *is* doing something offers it. */
+    eq(byId.writer.runs.length, 1, 'writer has its running run')
+    eq(byId.writer.canOpen, true, 'and offers Open, because that run has a session')
+    eq(byId.writer.status, 'Running', 'with the phase in words on the role row itself')
+    ok(byId.writer.glyph.length > 0, 'and a glyph')
+
+    /*
+     * A role with a run and still no Open, for the *other* reason. `developer`'s queued run has
+     * no session — nothing to mirror — so the row exists, the line is drawn, and the control is
+     * still withheld. Two different causes, one behaviour, and neither is a greyed button.
+     */
+    const dev = byId.developer
+    ok(
+      dev.runs.some((row) => row.run.phase === 'queued' && row.canOpen === false),
+      'a queued run is drawn under its role and offers no Open',
+    )
+
+    /*
+     * **The multi-run summary.** `developer` has a queued run and an `awaitingPermission` one,
+     * so the order is a real choice: the run that is blocked on the user leads, whatever came
+     * first, and the role's one-word summary is that run's.
+     */
+    eq(dev.runs.length, 2, 'both of developer’s active runs are drawn — a run on screen nowhere ' +
+      'is a claude spending the user’s quota that they cannot see, open or stop')
+    eq(
+      dev.runs.map((row) => row.run.run),
+      ['r3', 'r2'],
+      'most demanding first: awaitingPermission is blocked on the user and outranks a queue',
+    )
+    eq(dev.status, 'Awaiting permission', 'and the role summarises itself with that run')
+    eq(dev.canOpen, true, 'the awaiting run has a session, so the role does offer an Open')
+
+    /* Every role is listed, refused ones included, and each carries exactly one of the two. */
+    eq(agentsSection.rows.length, ROLES.length, 'every role is listed, unavailable ones included')
+    ok(
+      agentsSection.rows.every((row) => gate(row.dispatch).exactlyOne),
+      'and every listed role carries exactly one of a button and a sentence',
+    )
+
+    const recent = list.find((s) => s.kind === 'recent')
+    ok(recent?.rows.length === 2, 'the finished and the failed run land in Recent — the only ' +
+      'place a finished transcript is reachable from now the four run sections are gone')
+    ok(
+      (recent?.rows ?? []).every((row) => !dev.runs.includes(row)),
+      'and nothing is in two places at once, which the five-group layout could not promise: a ' +
+        'role with a run appeared under both Running and Roles',
+    )
+
+    /*
+     * A run whose title the board knows shows it; one it does not shows `no task` in dim. The
+     * lookup runs over activity lines now rather than over a Running section.
+     */
+    const withTitle = agentsSection.rows.flatMap((row) => row.runs)
+    ok(
+      withTitle.some((row) => row.taskTitle === 'Add the retry bar'),
+      'a run whose task the board knows shows the title',
+    )
+    ok(
+      withTitle.every((row) => typeof row.glyph === 'string' && row.glyph.length > 0),
+      'every activity line carries a glyph',
+    )
+    const orphaned = sections(READY, {})
+    ok(
+      orphaned
+        .find((s) => s.kind === 'agents')
+        .rows.flatMap((row) => row.runs)
+        .every((row) => row.taskTitle === null),
+      'a title the board does not have is null, and the row draws `no task` in dim',
+    )
+    // ...and a rogue key in the title map must not become a title.
+    const rogueTitles = sections(READY, { 't-14': 'ok' })
+    ok(
+      rogueTitles
+        .find((s) => s.kind === 'recent')
+        .rows.every((row) => row.taskTitle === null || typeof row.taskTitle === 'string'),
+      'the title lookup never hands back a prototype member',
+    )
+
+    /*
+     * ===== A live run of a role nothing defines. ==========================================
+     *
+     * The roster's `agents` come from `.cide/agents/`, the runs come from the registry, and the
+     * two disagree the moment somebody deletes a role file while a run of it is in flight. A
+     * list built only from `agents` would drop that run off the panel while its `claude` kept
+     * working — the failure this repository names most often, reached from a new direction.
+     */
+    const ghost = run({ run: 'g1', agent: 'ghost', agentLabel: 'Ghost', phase: 'running' })
+    const withGhost = sections({ ...READY, runs: [...RUNS, ghost] }, TITLES)
+    const ghostRow = withGhost
+      .find((s) => s.kind === 'agents')
+      .rows.find((row) => row.def.id === 'ghost')
+    /*
+     * `?.` throughout, and that is not defensive style for its own sake: the failure this block
+     * is about *is* the row being missing, so an unguarded read would throw on exactly the input
+     * it exists to catch and take every assertion after it down with it. One `FAIL` line per
+     * claim beats a stack trace that stops the file.
+     */
+    ok(ghostRow !== undefined, 'a run of an undefined role still gets a row, invented from itself')
+    eq(ghostRow?.runs.length, 1, 'carrying the run, so it can be watched')
+    eq(ghostRow?.canOpen, true, 'and opened')
+    eq(ghostRow?.def.label, 'Ghost', 'named by the label the run carried at dispatch')
+    eq(
+      ghostRow?.dispatch.reason,
+      ROLE_UNDEFINED,
+      'and refused a second run with a sentence of its own — there is no definition to run',
+    )
+    eq(
+      withGhost.find((s) => s.kind === 'agents').rows.at(-1)?.def.id,
+      'ghost',
+      'after the defined roles, so an anomaly does not reorder the list a user recognises',
+    )
+
+    /*
+     * A run of an undefined role that has **ended** gets no row: it is in Recent, which draws
+     * the label the run carried and needs no definition at all. A row for it would be a
+     * subagent on screen that does not exist and is not doing anything.
+     */
+    const goneRuns = [...RUNS, run({ run: 'g2', agent: 'ghost', phase: 'finished', exitCode: 0 })]
+    const gone = sections({ ...READY, runs: goneRuns }, TITLES)
+    eq(
+      gone.find((s) => s.kind === 'agents').rows.filter((row) => row.def.id === 'ghost').length,
+      0,
+      'a finished run of a deleted role invents no subagent',
+    )
+    ok(
+      gone.find((s) => s.kind === 'recent').rows.some((row) => row.run.run === 'g2'),
+      'it is in Recent instead, where a run needs no role to be drawn',
+    )
+
+    /*
+     * ===== The phase nobody recognises. ===================================================
+     *
+     * `isActivePhase` is the **negation of `isDonePhase`** and not membership of
+     * `ACTIVE_PHASES`, so a phase from a newer cide is drawn rather than falling between the
+     * two lists and disappearing. It sorts last, so it cannot take over a role's summary from a
+     * run that is genuinely awaiting permission.
+     */
+    eq(isActivePhase('teleporting'), true, 'a phase this build cannot read is still active')
+    eq(isActivePhase('constructor'), true, '...even a prototype key, which is not a phase at all')
+    eq(isActivePhase('finished'), false, 'and the two that really are over are not')
+    eq(isActivePhase('failed'), false, 'neither of them')
+    ok(
+      !ACTIVE_PHASES.includes('finished') && !ACTIVE_PHASES.includes('failed'),
+      'the order list names neither terminal phase — a role whose runs have ended is resting',
+    )
+    for (const phase of ACTIVE_PHASES) {
+      eq(isActivePhase(phase), true, `${phase} is active`)
+      ok(RUN_PHASES.includes(phase), `${phase} is a real phase`)
+    }
+    eq(ACTIVE_PHASES[0], 'awaitingPermission', 'the run blocked on the user leads the order')
+
+    const rogueFirst = sections(
+      {
+        ...READY,
+        agents: [def({ id: 'writer', label: 'Writer' })],
+        runs: [
+          run({ run: 'x1', agent: 'writer', phase: 'teleporting', startedMs: 1 }),
+          run({ run: 'x2', agent: 'writer', phase: 'awaitingPermission', startedMs: 2 }),
+        ],
+      },
+      {},
+    ).find((s) => s.kind === 'agents').rows[0]
+    eq(rogueFirst.runs.length, 2, 'a rogue phase is drawn rather than dropped from the panel')
+    eq(
+      rogueFirst.runs.map((row) => row.run.run),
+      ['x2', 'x1'],
+      'and sorts LAST: a value nothing could parse must not outrank a run that is really ' +
+        'awaiting permission when the role’s one-word summary is decided',
+    )
+    eq(rogueFirst.status, 'Awaiting permission', 'so the summary is the readable run’s')
+    nonEmptyString(rogueFirst.runs[1].glyph, 'the unreadable one still gets a glyph')
+
+    /* The order within one phase is total, so two rows cannot swap places on a re-render. */
+    const tied = sections(
+      {
+        ...READY,
+        agents: [def({ id: 'writer', label: 'Writer' })],
+        runs: [
+          run({ run: 'b', agent: 'writer', phase: 'running', startedMs: 5 }),
+          run({ run: 'a', agent: 'writer', phase: 'running', startedMs: 5 }),
+        ],
+      },
+      {},
+    ).find((s) => s.kind === 'agents').rows[0]
+    eq(
+      tied.runs.map((row) => row.run.run),
+      ['a', 'b'],
+      'two runs sharing a millisecond fall back to the run id — a partial order leaves rows ' +
+        'free to swap places under the pointer',
+    )
+
+    ok(RECENT_CAP === 20, 'RECENT_CAP is 20')
+    const many = {
+      ...READY,
+      runs: Array.from({ length: 40 }, (_, i) =>
+        run({ run: `f${i}`, phase: 'finished', exitCode: 0, startedMs: 1_700_000_000_000 + i }),
+      ),
+    }
+    const capped = sections(many, {}).find((s) => s.kind === 'recent')
+    eq(capped.rows.length, RECENT_CAP, 'Recent is capped')
+    eq(capped.rows[0].run.run, 'f39', 'newest first, so the cap keeps what just happened')
+  }
+
+  eq(elapsed(1000, 1000), '0s', 'elapsed counts from zero')
+  eq(elapsed(1000, 5000), '0s', 'a clock that went backwards yields 0s, never a negative figure')
+  eq(elapsed(59_999, 0), '59s', 'seconds up to the minute')
+  eq(elapsed(60_000, 0), '1m', 'then minutes')
+  eq(elapsed(3_599_000, 0), '59m', 'up to the hour')
+  eq(elapsed(3_600_000, 0), '1h 00m', 'then hours, zero-padded so a column does not jitter')
+  eq(elapsed(3_840_000, 0), '1h 04m', 'and the mock’s own figure')
+  eq(elapsed(Number.NaN, 0), '—', 'a non-finite input prints an em dash, never `NaNs`')
+
+  eq(
+    staleTurnLine(run({ staleTurn: false })),
+    null,
+    'a healthy run says nothing about stale turns',
+  )
+  nonEmptyString(
+    staleTurnLine(run({ staleTurn: true })),
+    'a stale turn carries a sentence the bar can print',
+  )
+  ok(
+    /may/.test(staleTurnLine(run({ staleTurn: true }))),
+    'and it is hedged — cide cannot see the model request, only a process it froze',
+  )
+
+  eq(canOpen(run({ phase: 'queued', session: null })), false, 'a queued run has nothing to open')
+  eq(canOpen(run({ phase: 'queued', session: 's1' })), false, 'nor one whose session is premature')
+  eq(canOpen(run({ phase: 'finished', session: 's1' })), true, 'a finished run still has its screen')
+  eq(canPause(run({ phase: 'running' })), true, 'a running child can be frozen')
+  eq(canPause(run({ phase: 'paused' })), false, 'an already-frozen one draws Resume instead')
+  eq(canPause(run({ phase: 'queued' })), false, 'and a queued one has no child to freeze')
+
+  /* == the grouping and the log ============================================================== */
+
+  {
+    const board = ready(4, [
+      task({ id: 't-1', status: 'todo' }),
+      task({ id: 't-2', status: 'doing' }),
+      task({ id: 't-3', status: 'todo' }),
+      task({ id: 't-4', status: 'review' }),
+    ])
+    const list = groups(board)
+    eq(
+      list.map((g) => g.status),
+      ['doing', 'review', 'todo'],
+      'groups come in GROUP_ORDER, and an empty group is not drawn',
+    )
+    eq(
+      list.find((g) => g.status === 'todo').tasks.map((t) => t.id),
+      ['t-1', 't-3'],
+      'order within a group is the file’s own order — the array *is* the priority',
+    )
+    eq(groups(UNREADABLE), [], 'a non-ready board groups nothing')
+
+    const rogue = groups(ready(1, [task({ id: 't-9', status: 'constructor' })]))
+    eq(
+      rogue.flatMap((g) => g.tasks.map((t) => t.id)),
+      ['t-9'],
+      'a task whose status is unreadable is still drawn — dropping it would delete a row from ' +
+        'a tracker somebody is relying on',
+    )
+    eq(rogue[0].status, 'todo', 'and it lands in the group that claims the least')
+  }
+
+  {
+    const comment = (atMs, text) => ({ author: { kind: 'user' }, text, atMs })
+    const inOrder = task({ comments: [comment(1, 'a'), comment(2, 'b')] })
+    ok(
+      commentOrder(inOrder) === inOrder.comments,
+      'an already-ordered log is returned by identity, so a memoising reader does not rebuild it',
+    )
+    const jumbled = task({ comments: [comment(3, 'c'), comment(1, 'a'), comment(2, 'b')] })
+    eq(
+      commentOrder(jumbled).map((c) => c.text),
+      ['a', 'b', 'c'],
+      'a log a merge interleaved is put back in time order',
+    )
+    eq(commentOrder(task({ comments: [] })).length, 0, 'an empty log is an empty log')
+  }
+
+  /* == the status filter ==================================================================== */
+
+  {
+    const board = ready(4, [
+      task({ id: 't-1', status: 'todo' }),
+      task({ id: 't-2', status: 'doing' }),
+      task({ id: 't-3', status: 'review' }),
+      task({ id: 't-4', status: 'done' }),
+    ])
+    const ids = (list) => list.flatMap((g) => g.tasks.map((t) => t.id))
+
+    eq(
+      ids(groups(board, null)),
+      ['t-2', 't-3', 't-1', 't-4'],
+      'no filter is every task, still in GROUP_ORDER',
+    )
+    eq(
+      ids(groups(board)),
+      ids(groups(board, null)),
+      'and the argument defaults to no filter, so every caller that predates it is unchanged',
+    )
+    eq(
+      groups(board, 'doing').map((g) => g.status),
+      ['doing'],
+      'a filter narrows the tasks and therefore the headings — no empty Review heading over ' +
+        'nothing, because `groups` already omits an empty group',
+    )
+    eq(ids(groups(board, 'doing')), ['t-2'], 'and only the matching task survives')
+    eq(ids(groups(board, 'done')), ['t-4'], 'each of the four is reachable')
+
+    ok(
+      TASK_STATUSES.every((status) => matchesFilter(task({ status }), null)),
+      'a null filter matches every status there is — "all" is the absence of a filter',
+    )
+    eq(matchesFilter(task({ status: 'doing' }), 'todo'), false, 'and a set one excludes')
+    eq(matchesFilter(task({ status: 'todo' }), 'todo'), true, 'as well as includes')
+
+    /*
+     * The rogue status, from the filter's side — and the reason `groupOf` exists as a function
+     * rather than as two copies of the same ternary.
+     */
+    const rogue = task({ id: 't-9', status: 'constructor' })
+    eq(groupOf(rogue), 'todo', 'a status this build cannot read is drawn in Todo')
+    eq(
+      matchesFilter(rogue, 'todo'),
+      true,
+      'and the Todo filter therefore matches it. A filter reading the raw value would hide a ' +
+        'task the unfiltered list had just shown under Todo — the tracker losing a row, ' +
+        'arrived at from the filter’s side',
+    )
+    eq(matchesFilter(rogue, 'doing'), false, 'while every other filter passes over it')
+    eq(ids(groups(ready(1, [rogue]), 'todo')), ['t-9'], 'end to end, through `groups`')
+
+    /*
+     * The two empties, which are two different sentences.
+     */
+    eq(listEmpty(BOARD_UNKNOWN, null), null, 'nobody has looked, so the list is not "empty"')
+    eq(listEmpty(UNREADABLE, 'doing'), null, 'an unparseable file has its own screen')
+    eq(listEmpty(ABSENT, null), null, 'and so does a project with no tracker')
+    eq(listEmpty(ready(1, []), null), 'tracker', 'a read, empty tracker is the screen that existed')
+    eq(
+      listEmpty(ready(1, []), 'doing'),
+      'tracker',
+      'and it stays that screen under a filter — there is nothing there to have been filtered out',
+    )
+    eq(listEmpty(board, null), null, 'a populated board with no filter is not empty at all')
+    eq(listEmpty(board, 'doing'), null, 'nor one whose filter matches something')
+    eq(
+      listEmpty(ready(1, [task({ id: 't-1', status: 'todo' })]), 'done'),
+      'filter',
+      'a filter that matches nothing is its OWN state. Collapsing it into "tracker" would print ' +
+        '"No tasks yet" over a board with tasks in it, which is how a user concludes theirs are gone',
+    )
+    eq(
+      listEmpty(ready(1, [rogue]), 'doing'),
+      'filter',
+      'and the rogue task counts as a task for that purpose, so a board holding only one is ' +
+        'never reported as an empty tracker',
+    )
+  }
+
+  /* == the armed delete ===================================================================== */
+
+  {
+    const board = ready(9, [task({ id: 't-1' }), task({ id: 't-2' })])
+
+    eq(armedDelete(board, null), null, 'nothing armed, nothing to confirm')
+    eq(armedDelete(board, { task: 't-1', rev: 9 }), 't-1', 'an arming on its own board stands')
+    eq(
+      armedDelete(board, { task: 't-1', rev: 8 }),
+      null,
+      'a board that has moved on by one rev disarms it. `.cide/tasks.json` has several writers ' +
+        '— two windows and every dispatched agent — so the screen really can be replaced ' +
+        'between the two clicks, and the second must not land on one the user never saw',
+    )
+    eq(
+      armedDelete(board, { task: 't-1', rev: 10 }),
+      null,
+      'and so does a rev from the future, which an out-of-order snapshot can produce',
+    )
+    eq(
+      armedDelete(board, { task: 't-9', rev: 9 }),
+      null,
+      'a task the board does not hold cannot be confirmed against — somebody else deleted it, ' +
+        'or it came from the project the user just left',
+    )
+    eq(
+      armedDelete(board, { task: 'constructor', rev: 9 }),
+      null,
+      'a prototype key is a task id like any other here: `some()` compares values and never ' +
+        'consults the prototype chain, which is the trap `in` would have walked into',
+    )
+    eq(
+      armedDelete(UNREADABLE, { task: 't-1', rev: 9 }),
+      null,
+      'nothing is armable on a board that is not `ready` — which is `canWrite`’s answer too: a ' +
+        'confirm button over an unparseable tracker offers to write a file the panel has ' +
+        'promised not to touch',
+    )
+    eq(armedDelete(ABSENT, { task: 't-1', rev: 9 }), null, 'or on one with no file behind it')
+    eq(armedDelete(BOARD_UNKNOWN, { task: 't-1', rev: 9 }), null, 'or before anything looked')
+  }
+
+  /* == the card's read/edit posture ========================================================= */
+  //
+  // The card is a modal now, and read-only until a field is put into edit. These are the rules
+  // that make that a behaviour rather than three event handlers that each remember part of it.
+  //
+  // The class of bug they exist to prevent is not a crash. It is a user typing a new title,
+  // reaching for the assignee, and finding the title back the way it was — silent loss of the
+  // one thing on this card the user authored themselves, in a file the whole team commits.
+
+  {
+    let intents = 0
+    /** Every intent goes through here, so the shape is asserted once for all of them. */
+    const drive = (intent, what) => {
+      intents += 1
+      ok(intent !== null && typeof intent === 'object', `${what}: an intent came back`)
+      ok(
+        intent.commit === null ||
+          (isEditableField(intent.commit.field) && typeof intent.commit.value === 'string'),
+        `${what}: the commit names an editable field and carries a string`,
+      )
+      ok(
+        intent.editing === null || isEditableField(intent.editing.field),
+        `${what}: the field left in edit is one that can be edited`,
+      )
+      ok(typeof intent.close === 'boolean', `${what}: says whether the card closes`)
+      return intent
+    }
+
+    /* -- which fields, and the one that is deliberately left out -------------------------- */
+
+    eq(
+      EDITABLE_FIELDS.filter((f) => !TASK_FIELDS.includes(f)),
+      [],
+      'every editable field is one the card draws',
+    )
+    eq(
+      TASK_FIELDS.filter((f) => !EDITABLE_FIELDS.includes(f)),
+      ['status'],
+      'status is the ONE field with no edit affordance, and that is a decision rather than an ' +
+        'omission: its four buttons cannot be changed by a gesture that was not aimed at one of ' +
+        'them, the lit one already IS the read-only rendering, and moving a task along is the ' +
+        'gesture the tracker exists for. Every other field rests as text',
+    )
+    eq(
+      sorted(TASK_FIELDS),
+      sorted(['title', 'status', 'assignee', 'body']),
+      'the card draws four fields — comments are not one of them: the log is append-only and ' +
+        'has no affordance here',
+    )
+    eq(isEditableField('status'), false, 'and the exclusion is what the predicate says too')
+    eq(isEditableField('constructor'), false, 'a prototype key is not a field')
+    eq(isTaskField('constructor'), false, 'in either vocabulary')
+    eq(EDITABLE_FIELDS.length, new Set(EDITABLE_FIELDS).size, 'no field is listed twice')
+
+    for (const field of [...TASK_FIELDS, 'constructor', '']) {
+      nonEmptyString(fieldLabel(field), `fieldLabel(${JSON.stringify(field)}) is a real heading`)
+    }
+
+    /* -- what a field reads as at rest --------------------------------------------------- */
+
+    const T = task({ title: 'Add the retry bar', body: 'A frozen run may have lost its turn.' })
+    const BARE = task({ title: '', body: '', agent: null })
+    const ROLES = { developer: 'Developer', qa: 'QA' }
+
+    for (const [t, label] of [[T, 'a full task'], [BARE, 'an empty one']]) {
+      for (const field of [...TASK_FIELDS, 'constructor']) {
+        nonEmptyString(
+          restText(t, field, ROLES),
+          `restText(${field}) is never empty — ${label}. A row that collapsed to its heading is ` +
+            'indistinguishable on screen from one the card failed to draw',
+        )
+      }
+    }
+
+    eq(restText(T, 'title', ROLES), 'Add the retry bar', 'a title reads as itself')
+    eq(restText(BARE, 'title', ROLES), NO_TITLE, 'and an absent one as a placeholder')
+    eq(restText(BARE, 'body', ROLES), NO_BODY, 'as does an absent body')
+    eq(restText(T, 'assignee', ROLES), 'Developer', 'the assignee reads as the role LABEL')
+    eq(restText(BARE, 'assignee', ROLES), UNASSIGNED, 'and nobody reads as Unassigned')
+    eq(
+      restText(task({ agent: 'ghost' }), 'assignee', ROLES),
+      'ghost',
+      'a role the roster no longer defines still reads as the id it was assigned to. Drawing it ' +
+        'as Unassigned would be the card telling the user their assignment is gone while the ' +
+        'file says otherwise — the roster and the board are two reads of two files',
+    )
+    eq(
+      restText(task({ agent: 'constructor' }), 'assignee', ROLES),
+      'constructor',
+      'and a prototype key is an agent id like any other: the lookup is `Object.hasOwn`, so it ' +
+        'yields the id rather than `Object.prototype.constructor`, which React refuses as a child',
+    )
+    eq(restText(T, 'status', ROLES), statusLabel(T.status), 'status is answered too, in one place')
+    eq(assigneeLabel(null, ROLES), UNASSIGNED, 'the assignee label agrees on nobody')
+    eq(assigneeLabel('   ', ROLES), UNASSIGNED, 'and a blank id is not an assignment')
+
+    eq(isFieldEmpty(BARE, 'title'), true, 'an absent title is empty')
+    eq(isFieldEmpty(T, 'title'), false, 'and a present one is not')
+    eq(
+      isFieldEmpty(task({ title: NO_TITLE }), 'title'),
+      false,
+      'a task whose title IS the placeholder word is not empty — which is why this asks the ' +
+        'value rather than comparing `restText` against the constant it would have returned',
+    )
+    eq(isFieldEmpty(BARE, 'assignee'), true, 'nobody assigned is empty')
+
+    /* -- the editor's value, and the round trip through it -------------------------------- */
+
+    eq(fieldValue(T, 'title'), 'Add the retry bar', 'the editor opens on the value on screen')
+    eq(fieldValue(BARE, 'title'), '', 'verbatim, placeholder or not — the editor edits the value')
+    eq(fieldValue(BARE, 'assignee'), '', 'an unassigned task edits as the empty option')
+    eq(fieldValue(T, 'constructor'), '', 'and an unknown field has no value rather than a function')
+    eq(
+      assigneeFromDraft(fieldValue(BARE, 'assignee')),
+      BARE.agent,
+      'the two halves of the assignee mapping round-trip on an unassigned task. If they did ' +
+        'not, opening the assignee editor and closing it again would write an agent id of the ' +
+        'empty string into a committed file that no roster will ever match',
+    )
+    eq(
+      assigneeFromDraft(fieldValue(T, 'assignee')),
+      T.agent,
+      '...and on an assigned one',
+    )
+
+    eq(
+      assignableRoles(T, ROLES),
+      ['developer', 'qa'],
+      'the assignee editor offers the roster, sorted',
+    )
+    eq(
+      assignableRoles(task({ agent: 'ghost' }), ROLES),
+      ['developer', 'qa', 'ghost'],
+      'with the task’s own role folded in even when the roster has dropped it. A `<select>` ' +
+        'whose value is not among its options silently shows the first one — so this task would ' +
+        'render as assigned to `developer` and reassign itself the moment it was touched',
+    )
+    eq(assignableRoles(BARE, ROLES), ['developer', 'qa'], 'and nothing is folded in for nobody')
+
+    /* -- dirtiness, which every rule below is gated on ----------------------------------- */
+
+    eq(isDirty(T, null), false, 'no edit is not dirty')
+    eq(isDirty(T, startEdit(T, 'title')), false, 'a freshly opened field is not dirty')
+    eq(isDirty(T, { field: 'title', draft: 'Other' }), true, 'a changed draft is')
+    eq(
+      isDirty(BARE, { field: 'assignee', draft: '' }),
+      false,
+      'an unassigned task with the empty option chosen is CLEAN. `null` against `""` is the ' +
+        'comparison that would otherwise write an `Assign(null)` over a `null` on the way out — ' +
+        'bumping `rev` and repainting every window for a change that is not one',
+    )
+    eq(
+      isDirty(T, { field: 'title', draft: `${T.title} ` }),
+      true,
+      'a trailing space is a change. A card that silently declined to save it would be a second, ' +
+        'invisible rule about what the user’s text is',
+    )
+    eq(startEdit(T, 'body').draft, T.body, 'the draft starts at the value, not at empty')
+
+    /* -- the pencil, and the field that is already in edit -------------------------------- */
+
+    {
+      const clean = startEdit(T, 'title')
+      const dirty = { field: 'title', draft: 'Add the retry bar, with a reason' }
+
+      const first = drive(beginEdit(T, null, 'title'), 'opening the first field')
+      eq(first.commit, null, 'opening a field with nothing else in edit writes nothing')
+      eq(first.editing, clean, 'and the editor starts on the value that was on screen')
+      eq(first.close, false, 'the card stays up')
+
+      const swapClean = drive(beginEdit(T, clean, 'body'), 'a second field over a clean one')
+      eq(swapClean.commit, null, 'leaving an UNCHANGED field writes nothing')
+      eq(swapClean.editing.field, 'body', 'and the second field opens')
+
+      const swapDirty = drive(beginEdit(T, dirty, 'body'), 'a second field over a dirty one')
+      eq(
+        swapDirty.commit,
+        { field: 'title', value: dirty.draft },
+        'a second activation COMMITS the field being left. Discarding it silently is the wrong ' +
+          'answer — it is text the user typed, lost to a click on an unrelated row — and asking ' +
+          'would be a confirmation over a dialog. The wire is one variant per field, so there is ' +
+          'no half-done form to hold open',
+      )
+      eq(swapDirty.editing.field, 'body', 'and the second field opens all the same')
+      eq(swapDirty.editing.draft, T.body, 'on its own value, not on the one just committed')
+
+      const again = drive(beginEdit(T, dirty, 'title'), 'the pencil on the field already open')
+      eq(again.commit, null, 'pressing the pencil twice does not commit-and-reopen')
+      ok(again.editing === dirty, '...and keeps the identical draft rather than resetting it')
+
+      const rogue = drive(beginEdit(T, dirty, 'status'), 'the pencil on a field with none')
+      eq(rogue.commit, null, 'a field with no editor changes nothing')
+      ok(
+        rogue.editing === dirty,
+        '...and above all does not close the one that is open. A gesture nobody can name must ' +
+          'not be able to discard a draft',
+      )
+      ok(
+        beginEdit(T, dirty, 'constructor').editing === dirty,
+        'which goes for a prototype key too',
+      )
+    }
+
+    /* -- Save, Cancel, and the two ways of closing ---------------------------------------- */
+
+    {
+      const clean = startEdit(T, 'title')
+      const dirty = { field: 'title', draft: 'A different title' }
+
+      const saved = drive(commitEdit(T, dirty), 'Save on a changed field')
+      eq(saved.commit, { field: 'title', value: 'A different title' }, 'Save writes the draft')
+      eq(saved.editing, null, 'and the field goes back to reading')
+      eq(saved.close, false, 'the card stays up — Save is not a way out of the card')
+
+      const savedClean = drive(commitEdit(T, clean), 'Save on an unchanged field')
+      eq(
+        savedClean.commit,
+        null,
+        'Save on an UNCHANGED field writes nothing. A `SetTitle` carrying the title the task ' +
+          'already has is not a no-op: it bumps `rev`, broadcasts to every window, and puts a ' +
+          'line in the diff of a committed file saying nothing happened',
+      )
+      eq(savedClean.editing, null, 'and it still closes the editor — the user asked it to')
+
+      const cancelled = drive(cancelEdit(), 'Cancel')
+      eq(cancelled.commit, null, 'Cancel writes nothing, by construction')
+      eq(cancelled.editing, null, 'the field goes back to reading')
+      eq(cancelled.close, false, 'and the card stays up')
+
+      const escField = drive(closeCard(T, dirty, 'escape'), 'Escape with a field in edit')
+      eq(escField.close, false, 'Escape is scoped to the INNERMOST thing that is open: with a ' +
+        'field in edit it cancels the field and the card stays up')
+      eq(escField.commit, null, '...writing nothing, which is what makes Escape the safe way out')
+      eq(escField.editing, null, '...and leaving nothing in edit')
+
+      const escCard = drive(closeCard(T, null, 'escape'), 'Escape with nothing in edit')
+      eq(escCard.close, true, 'with no field open, the same key closes the card')
+      eq(escCard.commit, null, 'and still writes nothing')
+
+      const dismissDirty = drive(closeCard(T, dirty, 'dismiss'), 'the scrim over a dirty field')
+      eq(
+        dismissDirty.commit,
+        { field: 'title', value: 'A different title' },
+        'a DELIBERATE close — the scrim, the ✕ — commits the field. Clicking away is leaving, ' +
+          'and leaving a field has meant "keep what I typed" in this panel since the first ' +
+          'version of the card. Escape above is the way to leave without writing',
+      )
+      eq(dismissDirty.close, true, 'and the card closes')
+
+      const dismissClean = drive(closeCard(T, clean, 'dismiss'), 'the scrim over a clean field')
+      eq(dismissClean.commit, null, 'an unchanged field still writes nothing on the way out')
+      eq(dismissClean.close, true, 'and the card still closes')
+
+      const dismissNone = drive(closeCard(T, null, 'dismiss'), 'the ✕ with nothing in edit')
+      eq(dismissNone.commit, null, 'nothing in edit, nothing to write')
+      eq(dismissNone.close, true, 'and the card closes')
+    }
+
+    /* -- the pure gates ------------------------------------------------------------------- */
+
+    {
+      const board = ready(9, [task({ id: 't-1' }), task({ id: 't-2' })])
+      const open = board.tasks[0]
+      const edit = { field: 'title', draft: 'typing' }
+
+      eq(openTask(board, 't-2').id, 't-2', 'the open task is found by id')
+      eq(openTask(board, 't-9'), null, 'an id the board does not hold opens no card')
+      eq(openTask(board, null), null, 'and nothing selected opens none')
+      eq(
+        openTask(board, 'constructor'),
+        null,
+        'a prototype key finds nothing — `find` compares values and never walks the chain',
+      )
+      eq(openTask(UNREADABLE, 't-1'), null, 'an unparseable tracker opens no card at all')
+      eq(openTask(BOARD_UNKNOWN, 't-1'), null, 'nor does one nobody has read')
+
+      ok(activeEdit(board, open, edit) === edit, 'an edit on a task the board holds stands')
+      eq(activeEdit(board, open, null), null, 'nothing in edit stays nothing')
+      eq(activeEdit(board, null, edit), null, 'an edit with no card open is not an edit')
+      eq(
+        activeEdit(board, task({ id: 't-9' }), edit),
+        null,
+        'an edit on a task the board no longer holds is refused — somebody else deleted it, or ' +
+          'it came from the project the user just left. React runs effects after paint, so the ' +
+          'host clearing its state still leaves one frame with a Save button aimed at nothing',
+      )
+      eq(
+        activeEdit(UNREADABLE, open, edit),
+        null,
+        'and nothing is editable over an unparseable tracker — `canWrite`’s answer, arrived at ' +
+          'from the card’s side: an editor there offers to write a file the panel has promised ' +
+          'not to touch',
+      )
+      eq(activeEdit(BOARD_UNKNOWN, open, edit), null, 'or before anything looked')
+      eq(
+        activeEdit(board, open, { field: 'status', draft: 'doing' }),
+        null,
+        'a field with no editor is not in edit however the state got that way',
+      )
+      ok(
+        activeEdit(ready(10, board.tasks), open, edit) === edit,
+        'a NEW rev does not clear an edit, and that is the difference from `armedDelete`. An ' +
+          'arming is a claim about a screen that has been replaced; a draft is the user’s own ' +
+          'sentence, and an agent commenting on the task must not take it away from them',
+      )
+    }
+
+    ok(intents >= 13, `${intents} intents driven — the block above still runs`)
+  }
+
+  // --- 7. the wire loop nothing else closes -------------------------------------------------
+  //
+  // `xtask contract-check` proves `generate_handler!` and `contract/commands.json` agree. Nothing
+  // proves either agrees with `ui/src/ipc/client.ts` — and its own failure message asks for it in
+  // prose ("make sure the frontend client in ui/src/ipc/client.ts moved with it") that no gate
+  // enforces. M18 shipped four `#[tauri::command]`s no caller could reach — registered, in the
+  // contract, unit-tested, clippy-clean, and invocable from nothing — and every existing gate was
+  // satisfied, each for a good reason: `contract-check` detects *drift*, not reachability, and
+  // `check:commands` walks the palette registry, which these had no row in. The opposite error
+  // happened in the same milestone: a command that *was* wired and was the wrong design.
+  //
+  // So: a command the contract lists must be spelled somewhere in the client, and a command the
+  // client invokes must be one the contract lists. Scoped to M18's own prefixes rather than the
+  // whole surface, because `WindowFrame.tsx` is a documented second seam and window controls are
+  // deliberately not commands — widening this is a separate job with its own exceptions to state.
+  const contract = JSON.parse(read('../../contract/commands.json'))
+  const client = read('../src/ipc/client.ts')
+  const MINE = /^(agents?_|tasks?_)/
+
+  let wired = 0
+  for (const name of contract.filter((c) => MINE.test(c))) {
+    ok(client.includes(`'${name}'`), `contract command \`${name}\` is invoked from client.ts`)
+    wired += 1
+  }
+  for (const m of client.matchAll(/invoke<[^>]*>\(\s*'([a-z_]+)'/g)) {
+    const name = m[1]
+    if (!MINE.test(name)) continue
+    ok(contract.includes(name), `client.ts invokes \`${name}\`, which the contract lists`)
+  }
+
+  if (failed > 0) {
+    console.error(`\ncheck-agents: ${failed} failure(s)`)
+    process.exit(1)
+  }
+  console.log(
+    `check-agents: ok (${TASK_STATUSES.length} statuses and ${RUN_PHASES.length} phases pinned ` +
+      `to Rust, ${tableEntries} table entries non-empty, ${gated} role×roster pairs through ` +
+      `the gate, ${chips} agentChip inputs survived, ${wired} commands wired end to end)`,
+  )
+} finally {
+  rmSync(out, { recursive: true, force: true })
+}

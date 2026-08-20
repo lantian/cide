@@ -23,15 +23,45 @@
 
 .title {
   margin: 0 0 6px;
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   font-weight: 600;
   color: var(--text-hi);
 }
 
+/*
+ * The mode picker — `--soft` / `--mixed` / `--hard`, and whatever needs three answers next.
+ *
+ * A row of radios and not a `<select>`: the whole point of the control is that all three modes
+ * and their consequences are visible at once, and a dropdown hides two of the three behind a
+ * click. It sits between the title and the body because the body is *about* the selection.
+ */
+.choices {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0;
+}
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-ui-12-5);
+  color: var(--text);
+  cursor: default;
+}
+
+.choice input {
+  /* `PasteConfirm.module.css` sets the same pair on its checkbox. The engine draws the native
+     control; this is the one property that makes it look like it belongs to this app. */
+  accent-color: var(--accent);
+  margin: 0;
+}
+
 .body {
   margin: 0;
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: var(--fs-ui-12-5);
+  line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
 
@@ -40,7 +70,7 @@
 .list {
   flex: 1;
   min-height: 0;
-  max-height: 260px;
+  max-height: calc(260px * var(--ui-scale));
   overflow-y: auto;
   overflow-x: hidden;
   margin: 0;
@@ -59,14 +89,14 @@
 .mark {
   flex: none;
   width: 10px;
-  font-size: 11px;
-  line-height: 18px;
+  font-size: var(--fs-ui-11);
+  line-height: calc(18px * var(--ui-scale));
   color: var(--red);
 }
 
 .name {
   flex: none;
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   color: var(--text-hi);
 }
 
@@ -78,7 +108,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -92,9 +122,27 @@
   border-top: 1px solid var(--border);
 }
 
+/* Pushed hard left, away from the answers — the same `margin-right: auto` and the same reason
+   as `PasteConfirm.module.css`'s `.applyAll`: an option beside the destructive button is one a
+   click that missed by 4px can untick, and this one is what makes the act recoverable. */
+.option {
+  margin-right: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+  cursor: default;
+}
+
+.option input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
 .button {
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   line-height: 1;
   padding: 7px 13px;
   border-radius: 5px;

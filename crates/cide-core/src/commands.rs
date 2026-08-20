@@ -372,6 +372,12 @@ const GIT: &str = "Git";
 /// Moving around inside the file the caret is in. IDEA's own menu name. (M12)
 const NAVIGATE: &str = "Navigate";
 const VIEW: &str = "View";
+/// Subagents and the project's task tracker. (M18)
+///
+/// Its own group rather than rows under [`CLAUDE`], which is about the pane in front of you —
+/// "Pause subagents" sitting beside "Fork session into new pane" would read as two ways of
+/// doing one thing.
+const AGENTS: &str = "Agents";
 
 /// Build the table. Order here is palette order.
 fn build() -> Vec<Command> {
@@ -580,6 +586,50 @@ fn build() -> Vec<Command> {
         // mention into" — the focused one, or the console.
         Command::new("claude.mention.file", "Mention file in Claude", CLAUDE)
             .when("editorFocused && claudeTarget"),
+        /*
+         * Agents. (M18)
+         *
+         * Three rows. One more is still waiting on something that does not exist yet, so it is
+         * not registered: `task.new` needs the tracker store and the `.cide/tasks.json` write
+         * path. Listing it before its handler exists is precisely the state this table's header
+         * spends a section on — a palette row that is advertised, chosen and silently does
+         * nothing. `check-commands.mjs` makes that unrepresentable: an id here with no `case` in
+         * `ui/src/keys/dispatch.ts` and no `unavailable` reason fails the build, and marking it
+         * `.unavailable("…")` in the meantime would be worse than absence, because a greyed row
+         * promising a feature is a promise the palette keeps showing until somebody removes it.
+         *
+         * `agents.pause` and `agents.resume` were on that waiting list until this slice and are
+         * now the **project scope** of `agents_pause` / `agents_resume` — the nullable-`run`
+         * commands, called with `null`: the queue is shut and every live run is frozen.
+         *
+         * **`agents.resume` is not a convenience, it is the way out.** The project-scope pause
+         * freezes the project's own console session along with the runs, so the pane the user
+         * would reach for is the pane that is stopped. A resume has to be reachable from
+         * somewhere that is not it, and the palette — which is chrome, not a pane — is by
+         * construction somewhere else. The Agents panel header is meant to carry the same pair;
+         * until `AgentsPanelViewProps` grows the props for it (`AgentsPanelHost`'s header names
+         * them), this is the only control that can thaw a frozen console.
+         *
+         * **No new context flag, and that is the load-bearing part.** The obvious clause for
+         * both is `subagentsEnabled`, and it must not exist: whether subagents are on is a fact
+         * only the disk knows (`.cide/config.json` in the project), the workspace mirror cannot
+         * derive it, and a flag the webview cannot supply is false for ever — which is the
+         * `repoOpen` disaster this module's header spends fifty lines on, the one that hid every
+         * git command from the palette while a test asserted the clause. So these rows ask for
+         * `projectOpen`, the strongest claim the webview can make honestly, and the handler asks
+         * `agents_config_get` over IPC and answers with a sentence the user can read.
+         *
+         * **No default binding either.** Every chord worth having is taken — `check:keymap`
+         * would surface a real conflict rather than a hypothetical one — and all three are
+         * palette- and mouse-reachable, which is the standing `claude.restart` already has.
+         */
+        Command::new("agents.pause", "Pause agents", AGENTS)
+            .when("projectOpen")
+            .keywords(&["freeze", "stop", "suspend", "sigstop", "subagents"]),
+        Command::new("agents.resume", "Resume agents", AGENTS)
+            .when("projectOpen")
+            .keywords(&["thaw", "unfreeze", "continue", "sigcont", "subagents"]),
+        Command::new("task.focusBoard", "Go to tasks", AGENTS).when("shellWindow && projectOpen"),
         // Terminal. Splitting one below is offered from any pane — it creates the terminal
         // it splits to — whereas clearing needs a terminal already focused.
         Command::new("terminal.splitBelow", "Split terminal below", TERMINAL).when("paneFocused"),
@@ -787,6 +837,65 @@ fn build() -> Vec<Command> {
                 "needs the Git panel's ticked rows — \"selected\" is that tree's own state, and \
                  nothing outside the panel can read it; stage from the tree or its context menu",
             ),
+        /*
+         * The git tool window — the bottom panel holding the commit log, per-file history and
+         * the blame gutter's click-through — plus the one commit action the palette can name
+         * on its own. (M18)
+         *
+         * Four rows, and deliberately only four. `git.reset`, `git.revert` and `git.cherryPick`
+         * are **not** registered, and that is now a choice about the *palette* rather than about
+         * the backend: all three are live `#[tauri::command]`s (`cmd/git.rs`'s commit-actions
+         * block) over `cide-git` code with 33 differential tests behind it. Each needs a
+         * **commit** the palette cannot name, and unlike `git.stageSelected` there is no honest
+         * default to fall back on — resetting to HEAD is a no-op, and a bare *Revert* sitting in
+         * the palette beside the Git panel's *Rollback* is a genuine ambiguity that IDEA has and
+         * that confuses people. The option that lost was three `.unavailable(…)` rows on
+         * `git.stageSelected`'s pattern; it loses because one live row that opens the log puts
+         * all of them one right-click away, whereas three dead rows are three dead rows. Ids are
+         * API and can be added later; a dead row cannot be taken back.
+         *
+         * `git.tag.new` **is** registered, and the asymmetry is the same argument reaching the
+         * other answer rather than an exception to it. Tagging **HEAD** is a meaningful default
+         * the palette can express: *mark where I am standing* is the common case, `TagRequest`
+         * carries a revspec so `HEAD` needs no row to have been clicked, and the one thing the
+         * gesture genuinely needs — a name — is what its dialog asks for. That is exactly the
+         * shape `git.branch.new` already has one screen up, and what the trailing `…` in both
+         * titles means: the row opens the control that asks rather than guessing.
+         *
+         * `shellWindow` on the first two because a detached-pane window renders no tool window at
+         * all, so revealing into it is revealing into nothing — the same half of the clause
+         * `file.reveal` carries for the Explorer. Not on `git.tag.new`, for `git.blame`'s
+         * reason: its dialog is an overlay, any window can raise one, and a command that works in
+         * a window has to be listable in it.
+         */
+        Command::new("git.log", "Show git log", GIT)
+            .when("shellWindow && projectOpen")
+            .keywords(&["history", "commits", "graph", "revisions"]),
+        // `fileTabActive`, not `editorFocused`: a file tab split with a shell pane is still a
+        // file tab, and this command is about the tab rather than about the focused pane. That
+        // is the distinction `file.reveal`'s comment spells out, derived from the same
+        // `focusedTabPath`.
+        Command::new("git.history.file", "Show history for this file", GIT)
+            .when("shellWindow && projectOpen && fileTabActive")
+            .keywords(&["log", "commits", "revisions", "versions", "annotate"]),
+        // No `shellWindow`, and that asymmetry is deliberate: the gutter is a property of the
+        // *buffer*, a detached-pane window can hold one, and only the click-through to the log
+        // needs the panel. That arm reports rather than the clause hiding the row — a command
+        // that works in a window is a command that must be listable in it.
+        Command::new("git.blame", "Annotate with git blame", GIT)
+            .when("projectOpen && editorFocused")
+            .keywords(&["blame", "annotate", "praise", "who", "gutter", "authors"]),
+        // The tag dialog, defaulting to HEAD — see the block comment above for why this one of
+        // the commit actions earns a palette row and the other three do not.
+        //
+        // No `mark` or `create` in the keywords. `create` is already `git.branch.new`'s, and a
+        // second command answering to it would put two rows under a word that has one obvious
+        // meaning in a git palette; the id carries the word anyway, which is `TIER_ID` — a tier
+        // *above* keywords, so a user typing `create` gets this row regardless and the ranking
+        // is the table's rather than a duplicated keyword's.
+        Command::new("git.tag.new", "Tag commit…", GIT)
+            .when("projectOpen")
+            .keywords(&["tag", "release", "version", "label"]),
         // Navigate — within the file the caret is in. (M12)
         //
         // `editorFocused` and nothing weaker throughout. `editorOpen` would offer a member walk
@@ -1017,6 +1126,22 @@ fn build() -> Vec<Command> {
         Command::new("sidebar.toggle", "Toggle the left panel", VIEW)
             .when("shellWindow")
             .keywords(&["hide", "show", "close", "panel", "explorer", "collapse"]),
+        /*
+         * The git tool window's F4. (M18)
+         *
+         * In `VIEW` and **not** in `GIT`, for two reasons that agree. The test below —
+         * `git_commands_ask_for_a_project_and_nothing_asks_for_the_dead_repo_flag` — walks every
+         * id starting `git.` and requires `projectOpen`, which this one must not carry: hiding a
+         * panel that is open is meaningful whatever the project state, and a toggle that stopped
+         * working when the last project closed would leave the user with a panel they cannot
+         * shut. And it belongs beside `sidebar.toggle` anyway: both are "make this piece of
+         * chrome go away", and a user looking for one will look where the other is.
+         */
+        Command::new("view.toolWindow.toggle", "Toggle the git tool window", VIEW)
+            .when("shellWindow")
+            .keywords(&[
+                "git", "log", "bottom", "panel", "dock", "hide", "show", "collapse",
+            ]),
         // `repoOpen` used to be half of this clause, which is why the palette could not even
         // open the Git sidebar — the row that would have let a user *look* at the repository
         // was hidden by the same permanently-false flag as the commands that act on it.
@@ -1035,6 +1160,31 @@ fn build() -> Vec<Command> {
         Command::new("sidebar.problems", "Show problems sidebar", VIEW)
             .when("shellWindow && projectOpen")
             .keywords(&["diagnostics", "errors", "warnings", "inspections"]),
+        /*
+         * The two M18 panels, beside the other `sidebar.*` rows rather than in the `AGENTS`
+         * group with the commands that act on what they show. (M18)
+         *
+         * Where a *view* lives is a question about the sidebar, and a user looking for "how do I
+         * open that panel" looks where `sidebar.git` and `sidebar.problems` are — the same
+         * argument `view.toolWindow.toggle` above makes for sitting in `VIEW` rather than in
+         * `GIT`. The group a command belongs to is the palette's heading, not a statement about
+         * which subsystem implemented it.
+         *
+         * `shellWindow && projectOpen`, matching `sidebar.git`, `sidebar.search` and
+         * `sidebar.problems` exactly: a detached-pane window has no rail to switch, and both
+         * panels read something scoped to a project — the roster for one, `.cide/tasks.json` for
+         * the other. Note what is *not* in either clause: whether subagents are enabled for this
+         * project. See the `AGENTS` block above for why that flag must never exist, and note
+         * that the Tasks panel would not want it anyway — a tracker is useful on its own, and
+         * gating it would make the first thing a curious user clicks say "turn on a feature you
+         * have not read about".
+         */
+        Command::new("sidebar.agents", "Show agents sidebar", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["subagents", "roles", "dispatch", "workers", "orchestration"]),
+        Command::new("sidebar.tasks", "Show tasks sidebar", VIEW)
+            .when("shellWindow && projectOpen")
+            .keywords(&["todo", "board", "tracker", "backlog"]),
         /*
          * Re-run the analysers. (M18)
          *
@@ -1261,11 +1411,16 @@ mod tests {
     fn groups_are_listed_once_each_in_table_order() {
         // `groups()` derives its order from first appearance in `build()`, so this pins the
         // *table's* order as much as the list — and "Navigate" sits between Git and View because
-        // that is where the M12 block was inserted, not because anything sorted it.
+        // that is where the M12 block was inserted, not because anything sorted it. "Agents"
+        // follows "Claude" for the opposite reason: it was put there on purpose, next to the
+        // group it deliberately is not part of, because a user who has just read "Fork session
+        // into new pane" is one row away from the subagents that are the other way to get work
+        // done in this app.
         assert_eq!(
             groups(),
             vec![
-                "Window", "Project", "Claude", "Terminal", "File", "Git", "Navigate", "View",
+                "Window", "Project", "Claude", "Agents", "Terminal", "File", "Git", "Navigate",
+                "View",
             ]
         );
     }
@@ -1452,9 +1607,16 @@ mod tests {
         assert_eq!(ids(&search("create new branch")), ["git.branch.new"]);
         // Order-independent: the tier is a set of words, not a sequence.
         assert_eq!(ids(&search("branch create")), ["git.branch.new"]);
-        // And on its own, through the keyword tier alone. First rather than only: `create` is
-        // also a subsequence of a couple of unrelated titles, which is the bottom tier doing
-        // exactly its job — the assertion is that a declared keyword outranks an accident.
+        // And on its own, through the keyword tier — `create` is a declared keyword of
+        // `git.branch.new` and a bare subsequence of a couple of unrelated titles, so the
+        // keyword tier is what puts it first.
+        //
+        // The M18 tag command was very nearly `git.tag.create`, and it would have taken this
+        // position: an id *containing* the word scores on [`TIER_ID`], a tier above keywords, so
+        // *Tag commit…* would have led and *New branch…* would have followed. Nobody typing
+        // `create` into this palette means "tag". The id is `git.tag.new` instead — which also
+        // matches `git.branch.new`, so the two commands that make a new ref are named alike.
+        // Ids are API, so this was worth getting right before it shipped rather than after.
         assert_eq!(ids(&search("create"))[0], "git.branch.new");
     }
 

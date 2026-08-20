@@ -21,7 +21,7 @@
 }
 
 .navItem {
-  height: 30px;
+  height: calc(30px * var(--ui-scale));
   flex: none;
   display: flex;
   align-items: center;
@@ -30,7 +30,7 @@
   background: transparent;
   color: var(--dim);
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   text-align: left;
   cursor: pointer;
 }
@@ -62,7 +62,7 @@
 
 .title {
   margin: 0 0 6px;
-  font-size: 20px;
+  font-size: var(--fs-ui-20);
   font-weight: 600;
   color: var(--text-hi);
 }
@@ -70,7 +70,7 @@
 .description {
   margin: 0 0 22px;
   max-width: 620px;
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   line-height: 1.5;
   color: var(--dim);
 }
@@ -80,6 +80,6 @@
 }
 
 .loading {
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--dim);
 }

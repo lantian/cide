@@ -28,7 +28,16 @@ import {
   type ReactNode,
 } from 'react'
 import { EditorSurface, type SaveCause } from '@/editor/EditorSurface'
-import { claude as claudeApi, diag, events, fileChanged, file as fileApi } from '@/ipc/client'
+import {
+  claude as claudeApi,
+  diag,
+  events,
+  fileChanged,
+  file as fileApi,
+  toolWindow as toolWindowApi,
+  history as historyApi,
+  revisionFile,
+} from '@/ipc/client'
 import { registerBuffer, unregisterBuffer } from '@/editor/openBuffers'
 import {
   fetchOutline,
@@ -38,6 +47,17 @@ import {
   symbolsOf,
 } from '@/editor/outlineStore'
 import { closeDoc, openDoc, resetDoc, savedDoc, scheduleDoc } from '@/editor/docSync'
+import {
+  blameState,
+  forgetBlame,
+  isAnnotated,
+  registerDirtyBuffer,
+  revision as blameRevision,
+  subscribe as subscribeBlame,
+  toggleBlame,
+} from '@/editor/blameStore'
+import { collapseRuns } from '@/editor/blameModel'
+import { requestLogReveal } from '@/gitlog/LogTab'
 import type { FileView } from '@/editor/position'
 import { levelFor, subscribeHighlightLevels } from '@/editor/highlightLevel'
 import { basename } from '@/editor/languages'
@@ -109,6 +129,21 @@ type Load =
  * thing that matters is that the last gesture of a burst lands.
  */
 const POSITION_DEBOUNCE_MS = 500
+
+/**
+ * How many editor panes are mounted over each path, so the last one out can drop that file's
+ * annotation. (M18)
+ *
+ * A module-level map for the reason `editor/openBuffers.ts` and `layout/paneHosts.ts` are ones:
+ * the fact is about a *file*, and no component owns a file. It has to be a count and not a flag
+ * because splitting a File tab gives two `EditorPane`s over one path — `blameStore` is keyed per
+ * path on purpose, so both show one column and one toggle moves both — and a plain
+ * `forgetBlame` in the unmount of either would take the surviving pane's column away with it.
+ *
+ * The count is per *webview*: a detached window is a separate JavaScript realm with its own copy
+ * of this module and its own store, which is the same reason `paneHosts.ts` gives for its map.
+ */
+const mountedPanes = new Map<string, number>()
 
 export function EditorPane({
   path,
@@ -226,6 +261,256 @@ export function EditorPane({
    * `readOnly` prop does.
    */
   const writableRef = useRef(true)
+  /**
+   * Reads the buffer as it is *now*. Handed out by `EditorSurface` on every change. (M18)
+   *
+   * A function and not a string, so nothing holds a copy of a document still being typed into —
+   * the contract `blameStore.registerDirtyBuffer` states. `null` until the first edit, which is
+   * exactly the window in which the tab is clean and the store wants nothing.
+   */
+  const readTextRef = useRef<(() => string) | null>(null)
+
+  /*
+   * Who wrote each line — subscribe here, and read the store directly below. (M18)
+   *
+   * `useSyncExternalStore` over `blameStore`, the same shape `outlineStore` is read with a few
+   * lines up and for the same reason: the writers are outside React — the command palette, the key
+   * gate and the editor's own context menu all toggle it, and none of them has a component to call
+   * `setState` on.
+   *
+   * The return value — the store's revision counter — is deliberately not bound. It exists to give
+   * `useSyncExternalStore` a stable snapshot to compare with `Object.is`, which is the trap
+   * `symbolsOf`'s comment above records: returning a `BlameState` object would be a fresh identity
+   * per call and an infinite render loop that unmounts the whole tree. What this line buys is the
+   * re-render; the answers come from `isAnnotated`/`blameState`, which are the store's own
+   * definitions and the only place they should live.
+   */
+  useSyncExternalStore(subscribeBlame, blameRevision, blameRevision)
+  const blameOn = project !== undefined && isAnnotated(project as ProjectId, path)
+  const blameNow = project === undefined ? null : blameState(project as ProjectId, path)
+  /**
+   * The answer itself, or `null`. **Identity-stable across unrelated store writes**, which is why
+   * it is pulled out rather than folded into the memo below: the counter bumps whenever *any*
+   * buffer's annotation moves, and keying the collapse on it would rebuild this file's whole
+   * marker array — and, one effect later, its whole `RangeSet` — because somebody toggled a
+   * column in another tab.
+   */
+  const blameFile = blameNow !== null && blameNow.kind === 'ready' ? blameNow.blame : null
+  /**
+   * One marker per line.
+   *
+   * `Date.now()` is sampled **here**, once per answer, and handed to `collapseRuns` — never read
+   * inside it. That is what makes the model checkable, and it is also what keeps one paint's
+   * buckets consistent: a clock read per line could straddle a bucket edge and tint two lines of
+   * the same run differently. Seconds, because that is the unit the whole blame wire is in.
+   */
+  const blame = useMemo(
+    () => (blameFile === null ? null : collapseRuns(blameFile, Math.floor(Date.now() / 1000))),
+    [blameFile],
+  )
+
+  /**
+   * Say why the column did not appear.
+   *
+   * The toggle is a user gesture — a palette row, a menu item — and a gesture that silently does
+   * nothing is the failure this project has paid for repeatedly. The store's `reason` is already a
+   * sentence written for a person ("This file is not inside any repository in this project."), so
+   * it is shown as it stands.
+   *
+   * Keyed on the reason itself, so it fires once per *transition* rather than once per render.
+   * Two panes over one file both fire, and `notices.admit` collapses them: it drops a notice whose
+   * text is already on screen, so no cross-pane dedupe is needed here.
+   *
+   * `info`, not `error`: "this file is not in a repository" is an answer about the project, not a
+   * failure of anything.
+   */
+  const blameFailure = blameNow !== null && blameNow.kind === 'failed' ? blameNow.reason : null
+  useEffect(() => {
+    if (blameFailure !== null) notify(blameFailure, { kind: 'info' })
+  }, [blameFailure])
+
+  /*
+   * The last pane over this file drops its annotation; the others leave it alone. See `mountedPanes`.
+   *
+   * Keyed on the path and not on the tab, because the store is: the same file open in two panes
+   * shows one column, so "is anybody still looking at this file" is the only question worth
+   * asking here.
+   */
+  useEffect(() => {
+    mountedPanes.set(path, (mountedPanes.get(path) ?? 0) + 1)
+    return () => {
+      const left = (mountedPanes.get(path) ?? 1) - 1
+      if (left > 0) {
+        mountedPanes.set(path, left)
+        return
+      }
+      mountedPanes.delete(path)
+      registerDirtyBuffer(path, null)
+      if (project !== undefined) forgetBlame(project as ProjectId, path)
+    }
+  }, [path, project])
+
+  /**
+   * A reload replaces the buffer, so the column is re-fetched rather than merely cleared.
+   *
+   * `reloadKey` bumps when the agent edits the open file or the user picks *Reload from disk*, and
+   * the bytes the blame was computed against are gone. Clearing alone would be a column that
+   * silently disappears every time Claude touches the file, which reads as the feature breaking;
+   * `forgetBlame` followed by `toggleBlame` is the re-fetch, and it keeps the buffer's own text out
+   * of it — the tab is clean immediately after a reload, so Rust reads the file it can see.
+   *
+   * The first run is skipped: the effect fires on mount, where there is nothing to re-fetch and
+   * `toggleBlame` would turn a column *on* that nobody asked for.
+   */
+  const reloadSeen = useRef(reloadKey)
+  useEffect(() => {
+    if (reloadKey === reloadSeen.current) return
+    reloadSeen.current = reloadKey
+    if (project === undefined) return
+    const id = project as ProjectId
+    if (!isAnnotated(id, path)) return
+    forgetBlame(id, path)
+    toggleBlame(id, path)
+  }, [reloadKey, project, path])
+
+  /**
+   * A gutter cell, or the card's *Show in log*, was clicked.
+   *
+   * Opens the tool window on its Log tab **and selects the commit**, through the reveal seam
+   * `gitlog/LogTab.tsx` exports. Until that seam existed this ended in a notice naming the oid,
+   * because the log kept its selection in component state with no way in — a panel that opens at
+   * HEAD after a click on a line from 2019, saying nothing, is a gesture that looks broken, and
+   * naming the commit at least made it one the user could finish by hand. That notice is gone:
+   * the log now answers all three outcomes itself, including the common one where the commit is
+   * older than the loaded page.
+   *
+   * # Three round trips, in this order, and the order is the point
+   *
+   * `git_locate` first, because the request carries a `RepoId` and this pane holds an absolute
+   * path and nothing else. Resolving it in Rust is the rule `git_locate` exists for: `canonical`
+   * resolves symlinks and the webview cannot, so a prefix test here would be correct until the
+   * first symlinked checkout. It is the same call `onAnnotateParent` below makes, on a gesture
+   * nobody makes twice a second.
+   *
+   * Then the tool window is opened and the Log tab activated, and only **then** is the request
+   * parked. A History tab may be the mounted one at this instant, and it must not consume a
+   * request meant for the Log tab; requesting after `activate` keeps the window between the two
+   * as small as it can be, and `LogTab` refuses to answer on a History tab in any case.
+   *
+   * A file outside every repository resolves to `null` and says so, rather than opening an empty
+   * log: there is no commit to reveal, and the blame column that produced this click cannot exist
+   * for such a file anyway.
+   *
+   * Fire-and-forget with a reported failure, not a swallowed one: this is a click.
+   */
+  const onShowCommit = useCallback(
+    (oid: string) => {
+      if (project === undefined) return
+      const id = project as ProjectId
+      void historyApi
+        .locate(id, path)
+        .then((found) => {
+          if (found === null) {
+            notify('This file is not inside any repository in this project.', { kind: 'info' })
+            return undefined
+          }
+          return toolWindowApi
+            .setLayout(id, { open: true })
+            .then(() => toolWindowApi.activate(id, null))
+            .then(() => {
+              // The file too, so the log's details pane lands on the line's own file rather
+              // than on a commit and forty paths. `found.path` is repo-relative, which is what
+              // `CommitFile.path` is — see `RevealRequest.file`.
+              requestLogReveal(id, found.repo, oid, found.path)
+            })
+        })
+        .catch((error: unknown) => {
+          notify(describe(error), { kind: 'error' })
+        })
+    },
+    [project, path],
+  )
+
+  /**
+   * *Annotate previous revision* — the hop the blame popup's second button makes. (M18)
+   *
+   * It opens a **read-only revision tab** for the file as the parent commit left it, rather than
+   * re-annotating this buffer at that revision. That distinction is the whole design and not a
+   * shortcut: `cide_git::blame::blame_with` documents that `newest` blames the file **as it was
+   * at that revision**, so its runs cover a different line count and would sit one line further
+   * out of step with the text on screen for every line the two versions differ by. Nothing is
+   * worse in a blame gutter than a column that is confidently misaligned.
+   *
+   * # Why this is not the revision *diff* it used to open
+   *
+   * It opened `tab_open_revision_diff` — `parent.rev` against its first parent — for the whole
+   * time `TabKind::Revision` had no pane to render it in, and that was the wrong tab for the
+   * gesture rather than a lesser version of the right one. The button says *annotate the
+   * previous revision*: the user is asking to **read that file**, with the same gutter they were
+   * reading this one with, so they can hop again from a line that is still attributed to a
+   * reformat. A diff answers a different question — *what did this one commit change* — and it
+   * cannot be hopped from at all, because a patch has no lines to blame. Two concrete losses,
+   * both reachable in one click:
+   *
+   * * A commit that did not touch the path answers `NoSuchChange`, so a hop landing on a merge
+   *   or a parent chosen by rename-following showed a refusal where a file was asked for. The
+   *   blob read has no such failure mode — the file is in that tree or it is not.
+   * * `RevSide::FirstParent` is not the parent `git_blame_parent` just resolved. It is *the
+   *   commit's own first parent*, so the diff drawn was `parent.rev` against something the walk
+   *   never chose, which for a merge is the wrong side entirely.
+   *
+   * The revision diff is still exactly right where it is reached from: the tool window's
+   * changed-file list, where a commit is the subject and the file is the detail. Here the file
+   * is the subject.
+   *
+   * `git_blame_parent` answers with the parent that *touched the path*, following a rename at
+   * that boundary — not `rev^`, which is the first parent and is the wrong commit for a merge
+   * that took the file from its second, and which names the *new* path across a rename. `null`
+   * is the end of the walk (a root commit, or the commit that introduced the file), and it is
+   * reported rather than swallowed so the button can say so.
+   *
+   * # The chain this hop starts
+   *
+   * `[oid]` and not `[]`, which is the trail growing by the commit the hop was made *from*. The
+   * user is looking at the working tree and clicked a card about `oid`; the version they are
+   * being shown is the one *before* it, so `oid` is a real waypoint between the two and Back
+   * from the new tab lands on "the revision this line was actually written in" — which is the
+   * next thing anyone asks. An empty chain would be defensible on the grounds that the user
+   * never had a tab open on `oid`, and it loses that hop for nothing: the crumb strip is a route
+   * through history, not a browser history of tabs. Rust normalises what is passed
+   * (`cide_core::workspace::revision_chain`), so a hop that circles back cannot grow it.
+   */
+  const onAnnotateParent = useMemo(() => {
+    if (project === undefined) return null
+    const id = project as ProjectId
+    return (oid: string) => {
+      // `locate` rather than a `repo` held in state: this pane has an absolute path and nothing
+      // else, and resolving it in Rust is the rule `git_locate` exists for — `canonical` resolves
+      // symlinks and the webview cannot, so a prefix test here is correct until the first
+      // symlinked checkout. One round trip on a gesture nobody makes twice a second.
+      void historyApi
+        .locate(id, path)
+        .then((found) => {
+          if (found === null) return undefined
+          return historyApi.blameParent(id, found.repo, found.path, oid).then((parent) => {
+            if (parent === null) {
+              notify('This is where the file was introduced — there is no earlier revision.', {
+                kind: 'info',
+              })
+              return undefined
+            }
+            // `parent.path` and not `found.path`: the parent may spell the file differently, and
+            // the hop is most often taken across exactly the rename that makes the two differ.
+            return revisionFile
+              .openTab(id, found.repo, parent.path, parent.rev, [oid])
+              .then(() => {})
+          })
+        })
+        .catch((error: unknown) => {
+          notify(describe(error), { kind: 'error' })
+        })
+    }
+  }, [project, path])
 
   /**
    * Tell the workspace whether this file has unsaved edits.
@@ -241,13 +526,30 @@ export function EditorPane({
     (dirty: boolean) => {
       if (dirtyRef.current === dirty) return
       dirtyRef.current = dirty
+      /*
+       * Offer — or withdraw — this buffer's text for the next blame. (M18)
+       *
+       * Registered **only while dirty**, which is the store's rule and is what keeps a copy of
+       * every open file off the IPC wire on the common path: a clean tab registers nothing and
+       * Rust reads the file it can already see. A dirty one has to hand its bytes over, because
+       * omitting them attributes every line after an unsaved insertion to the wrong commit — a
+       * per-line falsehood rather than a stale view, which is the distinction
+       * `cmd::git::git_blame` draws.
+       *
+       * Beside the dirty *dot* rather than in an effect of its own, because the two are the same
+       * transition and a second observer of it is a second thing that can be one keystroke behind.
+       * `readTextRef` is already set by the time this runs: `EditorSurface`'s update listener
+       * calls `onDocChanged` before `setDirty`, so the change that makes a tab dirty has handed
+       * over its reader first.
+       */
+      registerDirtyBuffer(path, dirty ? () => readTextRef.current?.() ?? '' : null)
       if (project === undefined || tab === undefined) return
       // Fire-and-forget: the dot is a hint, and a failed report must not interrupt typing.
       // The authoritative answer to "are there unsaved changes" is the buffer itself, which
       // is why nothing here waits for the round trip.
       void fileApi.setDirty(project, tab, dirty).catch(() => {})
     },
-    [project, tab],
+    [path, project, tab],
   )
 
   /**
@@ -652,6 +954,10 @@ export function EditorPane({
           onSaveHandle={registerSaveHandle}
           symbols={outline}
           onDocChanged={(read) => {
+            // The same reader, kept for whoever asks next. `registerDirtyBuffer` above hands out
+            // a closure over this ref rather than over `read` itself, so a blame started ten
+            // minutes into an editing session gets the buffer as it is then. (M18)
+            readTextRef.current = read
             // Debounced in the store, and the text is read when the timer fires — so the popup,
             // the breadcrumb and the member walk follow the buffer rather than the last save.
             if (project !== undefined) scheduleOutline(project as ProjectId, path, read)
@@ -661,6 +967,10 @@ export function EditorPane({
           }}
           diagnostics={diagnostics}
           highlight={level}
+          blame={blame}
+          blameOn={blameOn}
+          onShowCommit={onShowCommit}
+          {...(onAnnotateParent === null ? {} : { onAnnotateParent })}
         />
       </div>
     </div>

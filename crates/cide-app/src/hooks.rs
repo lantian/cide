@@ -270,7 +270,22 @@ fn apply(
                 crate::emit::session_status(app, &session, payload)
             }
             Effect::Tool { session, paths } => crate::emit::session_tool(app, &session, paths),
-            Effect::State { session, state } => crate::emit::session_state(app, &session, state),
+            Effect::State { session, state } => {
+                crate::emit::session_state(app, &session, state);
+                // The one hop into the subagent run registry. A run's child is spawned with
+                // `CIDE_SESSION` set to its own session id, so its frames arrive here like any
+                // pane's and this is where a run learns it has started a turn, finished one, or
+                // hit a permission prompt — no second state machine, no polling.
+                //
+                // **It must stay cheap.** This is the single ordered applier thread, and its
+                // ordering is a correctness requirement (a `PostToolUse` must not land after a
+                // `Stop`), so the hop takes one mutex, maps the frame through the harness and
+                // returns. Everything it may cause — a roster rebuilt off disk, the next queued
+                // run forked — happens on the coalescer's thread or on a task. See
+                // `crate::agents::note_hook`, which also says why the *frame* travels rather than
+                // the `SessionState` beside it.
+                crate::agents::note_hook(app, &session, frame);
+            }
             Effect::Conversation {
                 session,
                 conversation,

@@ -1,7 +1,14 @@
 /**
- * Turning a font size the user chose into the three numbers the code surfaces need.
+ * Turning the font sizes the user chose into the numbers the surfaces actually need.
  *
- * # Why this is not one number
+ * Three settings land here. The editor's and the terminal's become the four code tokens, for
+ * the reason below. The chrome's becomes one unitless multiplier, `--ui-scale`, for a reason
+ * of its own — see [`uiScale`] at the bottom. They are kept in one file because they are one
+ * question ("what does a stored point size mean in CSS?") answered twice, and because both
+ * answers have to stay import-free for `check-fonts.mjs` and `check-ui-scale.mjs` to compile
+ * this module standalone.
+ *
+ * # Why the code half is not one number
  *
  * `tokens.css` ships `--fs-code: 12.5px`, `--lh-code: 21px` and `--term-line-height: 1.27`,
  * and the comment there explains that the last of those **cannot be `calc()`ed**: xterm.js's
@@ -42,6 +49,28 @@ export const GLYPH_BOX_EM = 1.32
 /** What a font size may be set to. Below 6 the UI is unreadable; above 40 one row fills a pane. */
 export const MIN_FONT_SIZE = 6
 export const MAX_FONT_SIZE = 40
+
+/**
+ * The chrome's base size — everything that is not a buffer or a terminal.
+ *
+ * This is `tokens.css`'s `html, body` literal and `--fs-ui-13`, and it is the divisor that
+ * turns the stored point size into `--ui-scale`. Mirrors `DEFAULT_UI_FONT_SIZE` in
+ * `crates/cide-ipc/src/settings.rs` and the `BASE` in `ui/public/theme-boot.js`;
+ * `check-ui-scale.mjs` pins all four, because a disagreement means the first settings write
+ * silently restyles the app — the same failure `check-fonts.mjs` already guards for `--fs-code`.
+ */
+export const UI_BASE_FONT_SIZE = 13
+
+/**
+ * The chrome band, and it is much narrower than the code band above.
+ *
+ * Not a matter of taste. A code size governs one scrolling surface; this multiplies *every*
+ * chrome size at once, from the 8px pin chip to the 34px header. Below 9 that chip is under
+ * 6px of glyph and the tab strip's close buttons stop being hittable; above 20 the header,
+ * tab strip and status bar together take a fifth of a 1080p window before any content.
+ */
+export const MIN_UI_FONT_SIZE = 9
+export const MAX_UI_FONT_SIZE = 20
 
 export interface CodeMetrics {
   /** `--fs-code`, in px. */
@@ -101,4 +130,32 @@ export function fontVariables(
     '--fs-term': `${terminal.fontSize}px`,
     '--term-line-height': `${terminal.termLineHeight}`,
   }
+}
+
+/** Bring a chrome size inside its band. Same `NaN` arm as [`clampFontSize`], for worse stakes. */
+export function clampUiFontSize(size: number): number {
+  if (!Number.isFinite(size)) return UI_BASE_FONT_SIZE
+  return Math.min(MAX_UI_FONT_SIZE, Math.max(MIN_UI_FONT_SIZE, size))
+}
+
+/**
+ * The one number the chrome's whole type scale is built out of.
+ *
+ * `--ui-scale` is a multiplier rather than a size because there is no single chrome size to
+ * set: the app draws at fourteen design sizes between 8px and 20px, and the ratios between
+ * them are the design mock's — `./run.sh --audit-chrome` measures four of them directly. One
+ * multiplier moves all fourteen and keeps every ratio; fourteen independent settings would
+ * not be a setting, it would be a stylesheet.
+ *
+ * Unitless on purpose. `tokens.css` writes `calc(11px * var(--ui-scale))`, with the design
+ * number first, so the number a reader (and five check scripts) want is still written in the
+ * stylesheet. The alternative — storing `--fs-ui-base: 15px` and dividing in CSS — needs
+ * length-by-length division from CSS Values 4, and this app's engine is the one place in this
+ * repo where a support table does not settle the question.
+ *
+ * A guard against a zero base is deliberately absent: `UI_BASE_FONT_SIZE` is a constant in
+ * this file, not an input, and a zero there is a broken build rather than a broken setting.
+ */
+export function uiScale(size: number): number {
+  return clampUiFontSize(size) / UI_BASE_FONT_SIZE
 }

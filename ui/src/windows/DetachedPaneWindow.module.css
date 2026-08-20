@@ -31,7 +31,7 @@
   flex: none;
   max-width: 55%;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--text-hi);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -45,14 +45,14 @@
 
 .redock {
   flex: none;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   padding: 0 10px;
   border-radius: 4px;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--dim);
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   cursor: pointer;
 }
 
@@ -104,6 +104,6 @@
   padding: 18px 20px;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 19px;
+  font-size: var(--fs-ui-12);
+  line-height: calc(19px * var(--ui-scale));
 }

@@ -3,7 +3,7 @@
 /**
  * Lifecycle of a session, driven by Claude Code hooks with a PTY-quiet fallback.
  *
- * "Live session" for the close-confirm setting means `Busy | AwaitingPermission` —
- * not "the process exists", which would warn constantly.
+ * "Live session" for the close-confirm setting means `Busy | AwaitingPermission | Paused` —
+ * not "the process exists", which would warn constantly. See [`SessionState::is_live`].
  */
-export type SessionState = { "state": "spawning" } | { "state": "splash" } | { "state": "idle" } | { "state": "busy" } | { "state": "awaitingPermission" } | { "state": "awaitingInput" } | { "state": "exited", code: number, };
+export type SessionState = { "state": "spawning" } | { "state": "splash" } | { "state": "idle" } | { "state": "busy" } | { "state": "awaitingPermission" } | { "state": "awaitingInput" } | { "state": "paused" } | { "state": "exited", code: number, };

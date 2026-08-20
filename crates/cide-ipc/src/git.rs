@@ -43,6 +43,35 @@ pub struct RepoInfo {
     pub is_submodule: bool,
 }
 
+/// An absolute path resolved to the repository that contains it. (M18)
+///
+/// Absolute in, repo-relative out. Every surface that starts from a *file* — blame on the open
+/// editor, "show history for this file" from the tree, a revision diff opened from a terminal
+/// link — has an absolute path in hand and needs the pair this carries before it can ask
+/// `cide-git` anything, because every other path on this wire is repo-relative.
+///
+/// # Why the arithmetic is in Rust
+///
+/// The same reason [`TreeStatusMap`] gives for going the other way, and it is the reason that
+/// matters more here because this direction is the one that silently produces a *wrong* answer
+/// rather than an untagged row. A prefix comparison in TypeScript is wrong for a symlinked root
+/// (the path the user opened and the path git canonicalised are different strings that name one
+/// directory), wrong for a nested submodule (the innermost repository owns the path, and the
+/// superproject's root is also a prefix of it), and wrong for a path that is inside no
+/// repository at all — which TypeScript would answer by producing a relative path against
+/// whichever root sorted first. Rust knows the project's roots, the work trees above them and
+/// the submodules below them, so it can answer the question or refuse it with
+/// [`GitError::NotARepository`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RepoPath {
+    /// The innermost repository containing the path — the submodule, never its superproject.
+    pub repo: RepoId,
+    /// Repo-relative and slash-separated, the way every other path in this module is spelled.
+    pub path: String,
+}
+
 /// Head, upstream and the divergence counts the status bar shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -379,6 +408,23 @@ pub struct CommitRequest {
     /// Commit even though the index changed outside cide — the "overwrite" half of the
     /// guard bar. Never defaulted to true anywhere.
     pub force: bool,
+    /// The commit the caller believes it is amending. Only meaningful with `amend`. (M18)
+    ///
+    /// `None` keeps the behaviour the commit panel's Amend checkbox has always had — amend
+    /// whatever HEAD is — which is right there, because that checkbox is *about* HEAD and cannot
+    /// name anything else. The **log** can: its menu offers Amend on one row, and between the
+    /// menu opening and the confirm landing a `git commit` in a bash pane can move HEAD out from
+    /// under it. So the oid travels with the request and is checked in `cide_git::commit`,
+    /// against the repository, rather than against a list drawn a second ago.
+    ///
+    /// A mismatch is [`GitError::NotHead`] and never a rewrite: amending anything but HEAD is an
+    /// interactive rebase, and cide has no conflict-resolution surface to finish one — the same
+    /// argument `branch::pull` makes for being fast-forward-only.
+    ///
+    /// `#[serde(default)]` so every caller that predates this field, and every `workspace.json`
+    /// that never carried it, still deserialises.
+    #[serde(default)]
+    pub amend_of: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -819,6 +865,118 @@ pub enum GitError {
         output: String,
     },
 
+    // --- history: the Git tool window (M18) ---
+    //
+    // These live in `GitError` and not in a `HistoryError` beside `cide_ipc::history`, even
+    // though every type they are raised by does. The enum is **one closed list on purpose**: a
+    // panel that has to catch two error unions from the same repository will get the second
+    // one's arms wrong, and it will get them wrong silently, because an unmatched tag falls into
+    // whatever the catch-all prints. Every refusal in the Git tool window is a git refusal, and
+    // the frontend already has exactly one place that turns one of these into a sentence.
+    /// The path is inside a repository but git has never heard of it, so there is no history
+    /// and no blame to show. Distinct from [`Self::NoSuchChange`], which is about a path git
+    /// *does* track that simply has nothing pending.
+    NotTracked {
+        path: String,
+    },
+    /// A revspec resolved to nothing. `rev` is what was asked for, verbatim, because the user
+    /// typed it and the sentence has to quote it back.
+    NoSuchRevision {
+        rev: String,
+    },
+    /// A revspec resolved to an object that is not in this repository, or an oid that is not
+    /// present. Split from [`Self::NoSuchRevision`] because "I cannot parse that" and "that
+    /// commit is not here" send the user to different places — the second is what a shallow
+    /// clone and a pruned branch both produce.
+    NoSuchCommit {
+        rev: String,
+    },
+    /// The blob is past the size cap. Both numbers, because "too large" without them is a
+    /// refusal the user cannot act on and cannot tell apart from a bug.
+    FileTooLarge {
+        path: String,
+        bytes: u64,
+        limit: u64,
+    },
+    /// The operation requires the commit to be `HEAD` and it is not — `HEAD` moved between the
+    /// log row being drawn and the button being pressed, which on a repository someone else is
+    /// pushing to is a matter of seconds. Carries both so the message can say which is which
+    /// rather than "stale".
+    NotHead {
+        oid: String,
+        head: String,
+    },
+    /// A revert or cherry-pick would conflict. **`paths` is the whole point**: cide has no
+    /// conflict-resolution surface yet, so it refuses rather than leaving the tree half-applied
+    /// with no way to finish — and a refusal that does not name the files is one the user cannot
+    /// act on.
+    ReplayWouldConflict {
+        op: crate::history::ReplayOp,
+        oid: String,
+        paths: Vec<String>,
+    },
+    /// Reverting or cherry-picking a merge without saying which parent is the mainline.
+    ///
+    /// Carries the parents themselves rather than only their count, because the question the
+    /// user is being asked is *which side do you want to keep*, and that is unanswerable from a
+    /// number. [`PulledCommit`] is already the four-line summary shape a chooser needs.
+    MergeNeedsMainline {
+        oid: String,
+        parents: Vec<PulledCommit>,
+    },
+    /// A mainline was given for a commit that is not a merge — git's own refusal, kept because
+    /// silently ignoring the argument would make a mis-wired button look like it worked.
+    NotAMerge {
+        oid: String,
+    },
+    /// The replay would produce no change: the patch is already applied (for a cherry-pick) or
+    /// already reverted. Not an error in git's sense, but it must not look like success — an
+    /// empty commit created here is a commit the user has to explain in review.
+    EmptyReplay {
+        op: crate::history::ReplayOp,
+        oid: String,
+    },
+    /// A tag of that name exists. Never forced implicitly: a tag is a published promise about
+    /// which commit a release is, and moving one silently is how two people build different
+    /// `v1.2.0`s. `oid` is where it points now, so the confirmation can say what would be lost.
+    TagExists {
+        name: String,
+        oid: String,
+    },
+    /// `git check-ref-format` would reject it. The tag-name twin of
+    /// [`Self::InvalidBranchName`].
+    InvalidTagName {
+        name: String,
+    },
+    /// A revspec that does not parse. `detail` is libgit2's own complaint, which names the
+    /// character it stopped at and is the only part of this a user can act on.
+    BadRevspec {
+        spec: String,
+        detail: String,
+    },
+    /// A revspec that parses and resolves to something that is not a commit — a tree, a blob, an
+    /// annotated tag pointing at a blob. `kind` is git's own word for what it found, so the
+    /// message can say *`v1.2.0^{tree}` is a tree* rather than "not a commit".
+    NotACommit {
+        spec: String,
+        kind: String,
+    },
+    /// An abbreviated oid that matches more than one object. Its own variant rather than a
+    /// [`Self::BadRevspec`] because the fix is specific and mechanical: type more characters.
+    AmbiguousRev {
+        spec: String,
+    },
+    /// A [`crate::history::LogResume`] token this build cannot use — a version it does not know,
+    /// a fingerprint from a different query, or a frontier naming commits that a rewrite or a
+    /// `gc` has removed.
+    ///
+    /// Carries nothing on purpose. Every field a caller might want here is either already in the
+    /// token they still hold or is an internal detail of the walker, and the only correct
+    /// response is the same in all three cases: restart from [`crate::history::LogCursor::
+    /// Newest`]. A variant that invited a caller to branch on *why* would be inviting a retry
+    /// loop with the same dead token.
+    StaleLogCursor,
+
     Io {
         detail: String,
     },
@@ -831,6 +989,20 @@ pub enum GitError {
         path: String,
         detail: String,
     },
+}
+
+/// The English for a [`crate::history::ReplayOp`], for the two arms of [`GitError`]'s
+/// `Display` that name one.
+///
+/// Here rather than as a method on `ReplayOp`, because `cide-ipc` is wire shapes and the only
+/// prose in it is this `Display` impl — a `fn label()` hanging off the enum would read as a
+/// general-purpose display name and get reached for by a frontend that should be choosing its
+/// own words in its own language file.
+fn replay_verb(op: crate::history::ReplayOp) -> &'static str {
+    match op {
+        crate::history::ReplayOp::Revert => "reverting",
+        crate::history::ReplayOp::CherryPick => "cherry-picking",
+    }
 }
 
 impl std::fmt::Display for GitError {
@@ -888,6 +1060,42 @@ impl std::fmt::Display for GitError {
             Self::NoRemote { name } => write!(f, "no remote named {name}"),
             Self::Fetch { output } => write!(f, "fetch failed: {output}"),
             Self::Push { output } => write!(f, "push failed: {output}"),
+            Self::NotTracked { path } => write!(f, "{path} is not tracked by git"),
+            Self::NoSuchRevision { rev } => write!(f, "no such revision: {rev}"),
+            Self::NoSuchCommit { rev } => write!(f, "no such commit: {rev}"),
+            Self::FileTooLarge { path, bytes, limit } => write!(
+                f,
+                "{path} is {bytes} bytes, over the {limit} byte limit for this view"
+            ),
+            Self::NotHead { oid, head } => {
+                write!(f, "{oid} is no longer HEAD; HEAD is now {head}")
+            }
+            Self::ReplayWouldConflict { op, oid, paths } => write!(
+                f,
+                "{} of {oid} would conflict in {} path(s): {}",
+                replay_verb(*op),
+                paths.len(),
+                paths.join(", ")
+            ),
+            Self::MergeNeedsMainline { oid, parents } => write!(
+                f,
+                "{oid} is a merge of {} parents; say which one to keep",
+                parents.len()
+            ),
+            Self::NotAMerge { oid } => write!(f, "{oid} is not a merge commit"),
+            Self::EmptyReplay { op, oid } => {
+                write!(f, "{} of {oid} would change nothing", replay_verb(*op))
+            }
+            Self::TagExists { name, oid } => {
+                write!(f, "the tag {name} already points at {oid}")
+            }
+            Self::InvalidTagName { name } => write!(f, "{name} is not a valid tag name"),
+            Self::BadRevspec { spec, detail } => write!(f, "{spec} is not a revision: {detail}"),
+            Self::NotACommit { spec, kind } => write!(f, "{spec} is a {kind}, not a commit"),
+            Self::AmbiguousRev { spec } => {
+                write!(f, "{spec} matches more than one object")
+            }
+            Self::StaleLogCursor => f.write_str("this log page cannot be continued"),
             Self::Io { detail } | Self::Git { detail } => f.write_str(detail),
             Self::Sidecar { path, detail } => write!(f, "{path}: {detail}"),
         }

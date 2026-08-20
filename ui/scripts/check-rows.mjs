@@ -547,11 +547,18 @@ try {
   // declarations that actually make the height, so a taller input or a fatter padding fails on
   // this line instead of eating the close button.
   const tokensCss = css('src/styles/tokens.css')
-  const findBarPad = /\.findBar \{[\s\S]*?padding:\s*(\d+)px/.exec(surfaceCss)
-  const findInputH = /\.findInput \{[\s\S]*?height:\s*(\d+)px/.exec(surfaceCss)
-  const findButtonH = /\.findButton \{[\s\S]*?height:\s*(\d+)px/.exec(surfaceCss)
+  // Read through the `calc()` the chrome font size wraps every text box in. Three of the four
+  // parts scale with it and the border does not, which is why the token below is `32 × scale
+  // + 1px` rather than `33 × scale` — see `tokens.css`. The literals are still first inside
+  // each `calc()`, which `check-ui-scale.mjs` is what enforces, so the design arithmetic is
+  // still readable straight out of the stylesheet.
+  const findBarPad = /\.findBar \{[\s\S]*?padding:\s*(?:calc\()?(\d+)px/.exec(surfaceCss)
+  const findInputH = /\.findInput \{[\s\S]*?height:\s*(?:calc\()?(\d+)px/.exec(surfaceCss)
+  const findButtonH = /\.findButton \{[\s\S]*?height:\s*(?:calc\()?(\d+)px/.exec(surfaceCss)
   const panelBorder = /border-bottom:\s*(\d+)px/.exec(panelRule)
-  const findbarToken = /--h-findbar:\s*(\d+)px/.exec(tokensCss)
+  const findbarToken = /--h-findbar:\s*calc\((\d+)px \* var\(--ui-scale\) \+ (\d+)px\)/.exec(
+    tokensCss,
+  )
   ok(
     findBarPad !== null && findInputH !== null && findButtonH !== null && panelBorder !== null
       && findbarToken !== null,
@@ -560,20 +567,30 @@ try {
   )
   if (findBarPad && findInputH && findButtonH && panelBorder && findbarToken) {
     const tallest = Math.max(Number(findInputH[1]), Number(findButtonH[1]))
-    const want = Number(findBarPad[1]) * 2 + tallest + Number(panelBorder[1])
+    const scaled = Number(findBarPad[1]) * 2 + tallest
+    const fixed = Number(panelBorder[1])
     eq(
-      Number(findbarToken[1]),
-      want,
-      '`--h-findbar` is the bar it is measuring: 5px of padding twice, the 22px control that '
-        + 'sets the row height (`box-sizing: border-box`, so 22 is the whole control), and the '
-        + "panel's own 1px border-bottom",
+      [Number(findbarToken[1]), Number(findbarToken[2])],
+      [scaled, fixed],
+      '`--h-findbar` is the bar it is measuring, split the way the chrome font size splits it: '
+        + '5px of padding twice and the 22px control that sets the row height all scale '
+        + '(`box-sizing: border-box`, so 22 is the whole control), and the panel\'s own 1px '
+        + 'border-bottom does not',
     )
     eq(
-      Number(findbarToken[1]),
+      Number(findbarToken[1]) + Number(findbarToken[2]),
       33,
-      'and that sum is 33px. Spelled out as well as derived, because `--pane-corner` agreed '
-        + 'with a wrong derivation for a whole milestone: two ways of being wrong have to '
-        + 'disagree before either is worth trusting',
+      'and that sum is 33px at the default chrome size. Spelled out as well as derived, '
+        + 'because `--pane-corner` agreed with a wrong derivation for a whole milestone: two '
+        + 'ways of being wrong have to disagree before either is worth trusting',
+    )
+    eq(
+      Number(findbarToken[2]),
+      fixed,
+      'the *unscaled* half of the token is exactly the border and nothing else. Written as '
+        + '`33px * var(--ui-scale)` the token was right at the default and short of its own '
+        + 'parts below it — clipping the bar, which is the one failure this derivation exists '
+        + 'to prevent, reintroduced by a multiplication',
     )
   }
 

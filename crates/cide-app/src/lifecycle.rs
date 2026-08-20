@@ -254,6 +254,16 @@ fn run_teardown(app: &AppHandle) {
         positions.write_now();
     }
 
+    // M18: and every open project's task tracker, unconditionally for the same reason and a
+    // stronger one. What is inside the debounce here is not this user's own scroll position but
+    // a comment a subagent wrote as its turn ended, in a file the team commits and reads — the
+    // one thing on this path that another person can be waiting for. `flush_all` reconciles with
+    // whatever is on disk before each write, so a `git pull` that landed while cide was running
+    // is merged rather than overwritten on the way out.
+    if let Some(stores) = app.try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>() {
+        stores.flush_all();
+    }
+
     // Before the children are signalled. A `claude` blocked on `openDiff` has to receive its
     // rejection over a socket that is still open; killing it first would end the turn with a
     // transport error where a plain "the user did not accept it" was available, and killing
@@ -295,6 +305,13 @@ fn run_teardown(app: &AppHandle) {
     if let Some(searches) = app.try_state::<crate::cmd::search::SearchRegistry>() {
         searches.cancel_all();
     }
+    // And every log walk, for the same reason and on the same path. A `cide_git::log` walk is one
+    // thread inside libgit2 that can legitimately be examining half a million commits; it holds
+    // no lock this shutdown needs, but it is disk the dying children are competing for, and the
+    // page it is building is for a window that is closing.
+    if let Some(logs) = app.try_state::<crate::cmd::log::LogRegistry>() {
+        logs.cancel_all();
+    }
 
     let Some(registry) = app.try_state::<SessionRegistry>() else {
         tracing::error!("no session registry during shutdown; children may outlive the app");
@@ -330,6 +347,16 @@ fn run_teardown(app: &AppHandle) {
         .into_iter()
         .filter_map(|id| registry.get(id))
         .collect();
+    // M18: thaw before the ladder, and it is not optional. A `SIGSTOP`ped process does not *act*
+    // on SIGHUP or SIGTERM — they go pending — so a paused session would spend the whole
+    // `hup_grace + term_grace` (2.25 s) doing nothing and then be SIGKILLed, which is precisely
+    // the half-written transcript this module's header says the ladder exists to prevent. It is
+    // also why pause does not survive a restart, stated rather than attempted: the ladder ends
+    // the process either way, and a stopped-then-killed child is just a killed child.
+    if let Some(agents) = app.try_state::<Arc<crate::agents::AgentRegistry>>() {
+        agents.thaw_for_shutdown(&registry);
+    }
+
     // The rung, not a precomputed count, is what the notice reports: a session that goes on
     // the first SIGHUP is never named, and the two rungs that cost real time say why they are
     // costing it. See `rung_line`.
@@ -855,6 +882,12 @@ pub fn install_signal_handlers(app: &AppHandle) {
 pub fn install_signal_handlers(_app: &AppHandle) {}
 
 /// One rung of the shutdown ladder.
+///
+/// **Deliberately no `Stop`/`Cont`**, even though M18's pause sends `SIGSTOP`/`SIGCONT` through
+/// the very same [`deliver`]. Every value of this enum is something [`stop_children`] may hand
+/// to a child on the way out, and a `Rung::Stop` there is worse than meaningless: a frozen child
+/// never exits, so the ladder would spend every grace it has waiting for a process it has just
+/// made incapable of dying. A pause calls [`cide_core::child_env::signal_group`] directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rung {
     /// The terminal hung up. What closing a terminal emulator does, and the gentlest thing
@@ -1005,39 +1038,32 @@ fn wait_for_exit<C: Stoppable>(children: &[C], grace: Duration, poll: Duration) 
     }
 }
 
-/// Send a signal to the child's **process group**, falling back to the process itself.
+/// Turn a rung into a signal number and hand it to the one implementation of "signal a child".
 ///
-/// The group is what matters. `portable-pty` starts the child in a new session, so it leads
-/// a process group holding everything it spawned — a bash tool invocation, an MCP server —
-/// and signalling the leader alone leaves those running with the pty closed under them.
-/// `kill(-pid)` fails when the child never became a group leader, hence the fallback.
+/// The mechanism — the child's process *group*, the `kill(pid)` fallback for a child that never
+/// became a leader, and the refusal of `pid <= 1` — moved to
+/// [`cide_core::child_env::signal_group`] in M18, because pause/resume needs `SIGSTOP`/`SIGCONT`
+/// from `cide-agents` and nothing may depend on `cide-app`. What is left here is the mapping,
+/// which is the only part that is about a *ladder*.
+///
+/// A pause is **not** a rung and must never become one; see [`Rung`] for why.
 #[cfg(unix)]
 fn deliver(pid: u32, rung: Rung) {
-    let signal = match rung {
-        Rung::Hup => libc::SIGHUP,
-        Rung::Term => libc::SIGTERM,
-        Rung::Kill => libc::SIGKILL,
-    };
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    // Negating 0 or 1 turns one signal into a broadcast: `kill(0, …)` hits this process's
-    // own group, and `kill(-1, …)` hits every process this user is allowed to signal.
-    // Neither is ever a pty child, so arriving here with one is a bug to refuse, not obey.
-    if pid <= 1 {
-        return;
-    }
-    // SAFETY: `kill` takes two integers and touches no memory owned by this process.
-    unsafe {
-        if libc::kill(-pid, signal) == -1 {
-            libc::kill(pid, signal);
-        }
-    }
+    cide_core::child_env::signal_group(
+        pid,
+        match rung {
+            Rung::Hup => libc::SIGHUP,
+            Rung::Term => libc::SIGTERM,
+            Rung::Kill => libc::SIGKILL,
+        },
+    );
 }
 
 /// No-op off unix, which makes the whole ladder one off unix. That matches
 /// [`install_signal_handlers`]: Linux is the supported target, and a Windows build would
-/// need a job object rather than a translation of `kill(2)`.
+/// need a job object rather than a translation of `kill(2)`. The signal *numbers* are why the
+/// arm is here as well as in `signal_group`: `libc::SIGHUP` and friends do not exist to be
+/// matched on when `libc` is not linked.
 #[cfg(not(unix))]
 fn deliver(_pid: u32, _rung: Rung) {}
 

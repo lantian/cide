@@ -25,7 +25,16 @@ import type { Theme } from "./Theme";
  * with the workspace only when the user happened to use the right one. The radio cards call
  * `window.set_mode`.
  */
-export type SettingsPatch = { theme?: Theme, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
+export type SettingsPatch = { theme?: Theme, 
+/**
+ * The chrome's base point size. See [`crate::settings::Settings::ui_font_size`].
+ *
+ * A scalar, so unlike the two code font sizes it can be sent on its own. Clamped where
+ * this lands (`cmd::settings::apply_patch`) rather than on read, so a hand-edited
+ * `workspace.json` cannot hand CSS a `NaN` multiplier — see
+ * [`crate::settings::clamp_ui_font_size`] for what that would paint.
+ */
+uiFontSize?: number, eachProjectKeepsClaudeTab?: boolean, reopenLastProject?: boolean, keepSessionsOnWindowClose?: boolean, confirmCloseWithLiveSession?: boolean, editor?: EditorSettings, terminal?: TerminalSettings, graphics?: GraphicsSettings, claude?: ClaudeSettings, 
 /**
  * Proxy configuration. Sent whole like every other group, which for this one also means
  * the URLs — credentials included — cross the IPC boundary on every keystroke-debounced

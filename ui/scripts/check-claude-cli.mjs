@@ -132,6 +132,7 @@ try {
       resume: { enabled: true, flag: '' },
       forkSession: { enabled: true, flag: '' },
       settings: { enabled: true, flag: '' },
+      mcpConfig: { enabled: true, flag: '' },
       ...inject,
     },
   })
@@ -281,7 +282,7 @@ try {
         + 'claude at another editor or at no hook socket at all, with nothing on screen saying so',
     )
   }
-  for (const flag of ['--session-id', '--resume', '--fork-session', '--settings']) {
+  for (const flag of ['--session-id', '--resume', '--fork-session', '--settings', '--mcp-config']) {
     ok(
       REFUSED_ARGS.some((e) => e.flag === flag),
       `${flag} is refused — it duplicates an argument cide passes itself, and the duplicate `
@@ -310,17 +311,17 @@ try {
   // =====================================================================================
 
   const rustInject = rustInjections()
-  ok(rustInject != null && rustInject.length === 4, 'INJECTIONS is readable out of claude_cli.rs')
+  ok(rustInject != null && rustInject.length === 5, 'INJECTIONS is readable out of claude_cli.rs')
   eq(
     (rustInject ?? []).map((e) => [e.key, e.defaultFlag]),
     INJECTIONS.map((e) => [e.key, e.defaultFlag]),
-    'the screen and the spawn inject the same four arguments, spelled the same way. Disagree '
+    'the screen and the spawn inject the same arguments, spelled the same way. Disagree '
       + 'here and the screen strikes out a flag the user is now entitled to pass, or draws as '
       + 'fine one the spawn will drop',
   )
   eq(
     (rustInject ?? []).map((e) => e.defaultFlag),
-    ['--session-id', '--resume', '--fork-session', '--settings'],
+    ['--session-id', '--resume', '--fork-session', '--settings', '--mcp-config'],
     'and the shipped spellings are still what cide has always passed. The default is the whole '
       + 'safety property of this feature: a user who never opens the screen sees no change',
   )
@@ -328,7 +329,7 @@ try {
   // **The upgrade trap, from this side.** `ClaudeInjection`'s `Default` is hand-written in
   // `cide-ipc` because `bool::default()` is `false` and `ClaudeCli` carries a container-level
   // `#[serde(default)]`: derive it and every `workspace.json` already on disk — which is every
-  // one of them — loads with all four injections OFF. No hooks and no resume, for every user,
+  // one of them — loads with every injection OFF. No hooks and no resume, for every user,
   // on the launch after an upgrade, from a screen they never opened. `cide-ipc`'s own test is
   // the guard; this is the second pair of eyes, because the failure has no runtime symptom.
   {
@@ -381,6 +382,14 @@ try {
   eq(argFate('--resume', without('sessionId')), 'refused')
   eq(argFate('--bare', without('sessionId')), 'refused')
   eq(argFate('--settings', without('settings')), 'accepted', 'the hooks payload is the user’s now')
+  eq(argFate('--mcp-config', config()), 'refused', 'cide attaches its own MCP server')
+  eq(
+    argFate('--mcp-config', without('mcpConfig')),
+    'accepted',
+    'and with cide’s own switched off the flag is the user’s to pass — a switch that took the '
+      + 'task tools away and then forbade the replacement would be the worst of both',
+  )
+  eq(argFate('--settings', without('mcpConfig')), 'refused', 'and only that one moved')
   eq(argFate('--session-id', without('settings')), 'refused', 'and only that one moved')
 
   // A rename moves the refusal with it, in both directions.
@@ -516,9 +525,17 @@ try {
       ours.includes('--settings') && !theirs.includes('--settings'),
       `${shape}: the hook settings are cide's`,
     )
-    for (const flag of ['--session-id', '--resume', '--fork-session']) {
+    for (const flag of ['--session-id', '--resume', '--fork-session', '--mcp-config']) {
       ok(!theirs.includes(flag), `${shape}: ${flag} is never attributed to the user`)
     }
+    const tokens = resolvedArgv(config(['--model', 'opus']), shape)
+    eq(
+      tokens[tokens.length - 2],
+      '--mcp-config',
+      `${shape}: the task tools are written LAST. --mcp-config <configs...> is variadic and `
+        + 'collects every following non-flag token, so anywhere but the end it swallows a token '
+        + 'cide wrote — and this readout is the only place a user can see that it did not',
+    )
   }
   // ...and the binary is the program the user configured, not the literal word.
   eq(
@@ -568,6 +585,16 @@ try {
       !resolvedArgv(spelled('settings', '--config'), shape).includes('--settings'),
       `${shape}: and not under its old one as well`,
     )
+    ok(
+      !resolvedArgv(without('mcpConfig'), shape).includes('--mcp-config'),
+      `${shape}: no --mcp-config once the task tools are switched off — the pane keeps every `
+        + 'MCP server the USER configured (cide never passes --strict-mcp-config) and loses '
+        + 'cide’s own, so no task tracker and, on the console pane, no subagents at all',
+    )
+    ok(
+      resolvedArgv(without('mcpConfig'), shape).includes('--settings'),
+      `${shape}: and the hooks are untouched by it — two switches, two costs`,
+    )
   }
 
   // **The shape 2.1.227 rejects, reached through the new door.** A fork with `--fork-session`
@@ -599,6 +626,7 @@ try {
       resume: { enabled: false, flag: '' },
       forkSession: { enabled: false, flag: '' },
       settings: { enabled: false, flag: '' },
+      mcpConfig: { enabled: false, flag: '' },
     }), 'fork'),
     ['claude'],
     'everything off is the bare binary: what a harness that is not Claude Code gets, which is '
@@ -694,6 +722,27 @@ try {
     ok(
       /conversation\(\s*minted,\s*resume,\s*wants_fork\(fork\),\s*&plan\.inject/.test(session),
       'and the conversation arguments are built from it too, not from three literals',
+    )
+
+    // The fifth injection, from the same side and for the same reason. It was appended under a
+    // hardcoded `--mcp-config` with no switch at all until the row existed.
+    ok(
+      /Injection::McpConfig/.test(session),
+      'the task tools are gated on their injection. A literal here would be an --mcp-config the '
+        + 'switch cannot turn off and the rename cannot move, while the screen drew both',
+    )
+    ok(
+      !/spec\.arg\("--mcp-config"\)/.test(session),
+      'and not attached under a hardcoded flag either',
+    )
+    const mcpArg = session.indexOf('with_task_tools(spec')
+    ok(mcpArg >= 0, 'the fold is readable')
+    ok(
+      userArgs < mcpArg && settingsArg < mcpArg,
+      'and it is folded LAST, after the user’s arguments and after --settings. --mcp-config '
+        + '<configs...> is variadic: anywhere else in the argv it swallows the next token cide '
+        + 'wrote, which for the hook payload is several kilobytes of JSON silently becoming an '
+        + 'MCP configuration',
     )
   }
 
@@ -813,6 +862,24 @@ try {
     ok(
       /CIDE_SESSION/.test(sessionCopy),
       '...and that the busy/idle chrome is NOT the casualty, because it routes on CIDE_SESSION',
+    )
+    // `mcpConfig:` sits between `forkSession:` and `settings:` in the table, so this slice is
+    // bounded on both sides and the assertions below cannot be satisfied by a neighbour's prose.
+    const mcpCopy = copy.slice(copy.indexOf('mcpConfig:'), copy.indexOf('settings:'))
+    ok(mcpCopy.length > 200, 'the task-tools row has copy at all')
+    for (const word of ['task', 'subagent', 'dispatch']) {
+      ok(
+        new RegExp(word, 'i').test(mcpCopy),
+        `the --mcp-config row names what it costs: ${word}. Off, this pane cannot read or write `
+          + '.cide/tasks.json and a console pane cannot dispatch anything — two features that '
+          + 'simply stop, with nothing on screen connecting them to this switch',
+      )
+    }
+    ok(
+      /strict-mcp-config/.test(mcpCopy),
+      '...and it says what it does NOT cost: your own MCP servers are still loaded, because cide '
+        + 'has never passed --strict-mcp-config. Without that sentence the switch reads as “turn '
+        + 'off MCP”, which is the one thing it does not do',
     )
     const settingsCopy = copy.slice(copy.indexOf('settings:'))
     for (const word of ['token', 'close', 'reload', 'notification', 'theme']) {

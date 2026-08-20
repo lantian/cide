@@ -240,6 +240,50 @@ export function missing(commands, handled) {
 
 {
   /*
+   * ...and the same defect once more, in the shape it took in M18.
+   *
+   * `git.tag.new` reaches its dialog through `openTagDialog`, and the only thing that mounts one
+   * is `gitlog/LogTab.tsx` — which mounts only while the git tool window is **open**, and it is
+   * not on a fresh launch, because the panel's open flag starts false on purpose. So a command
+   * the palette lists whenever a project is open reported "nothing in this window can ask what to
+   * call the tag" in the *default* state, every single time.
+   *
+   * The fix has two halves and this asserts both, because either alone is still broken: the
+   * request **parks** when nothing can draw it (`dispatch.ts`'s `parkedTag`, drained by
+   * `registerTagDialog`), and the case then **reveals the tool window** so that something mounts
+   * and drains it. Parking without revealing is a question nobody ever sees; revealing without
+   * parking is a race against the mount.
+   */
+  const tag = HANDLERS.find((h) => h.id === 'git.tag.new')
+  ok(tag !== undefined, 'git.tag.new still has a case in dispatch.ts')
+  if (tag) {
+    ok(
+      /openTagDialog\(/.test(tag.body),
+      'git.tag.new still goes through the openTagDialog seam rather than reaching for a dialog ' +
+        'it cannot import',
+    )
+    ok(
+      /toolWindowApi\s*\n?\s*\.setLayout\(/.test(tag.body) || /setLayout\(/.test(tag.body),
+      'git.tag.new reveals the tool window when the request parks — the only thing that mounts ' +
+        'the dialog is the log, and a parked request nothing ever drains is a command that ' +
+        'silently does nothing',
+    )
+  }
+  ok(
+    /export function openTagDialog[\s\S]{0,400}?parkedTag = \{/.test(dispatchTs),
+    'openTagDialog still *assigns* parkedTag when nothing is mounted, rather than dropping the ' +
+      'request. Asserted over the function body and not merely on the declaration: a `let ' +
+      'parkedTag` that nothing ever writes to is exactly the bug this replaced',
+  )
+  ok(
+    /export function registerTagDialog[\s\S]{0,600}?parkedTag = null/.test(dispatchTs),
+    '...and registerTagDialog drains the park on mount, which is what turns a parked request ' +
+      'into a visible dialog',
+  )
+}
+
+{
+  /*
    * ...and a `case` that shows the user the thing they asked for but leaves the keyboard
    * somewhere else is three quarters of a dispatcher. Same defect again, one layer further out.
    *

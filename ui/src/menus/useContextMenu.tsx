@@ -242,7 +242,16 @@ export function useContextMenu(options: UseContextMenuOptions): ContextMenuHandl
     isOpen: open !== null,
     menu:
       open === null ? null : (
-        <ContextMenu label={label} entries={open.entries} at={open.at} onClose={close} />
+        <ContextMenu
+          label={label}
+          entries={open.entries}
+          at={open.at}
+          onClose={close}
+          // Handed down because a submenu's rows do not exist yet: they are built when the
+          // submenu is hovered, so `ContextMenu` resolves those itself and would otherwise
+          // drop every keychip in them. See `MenuItem.submenu` for why they are built late.
+          chipFor={chipFor}
+        />
       ),
   }
 }

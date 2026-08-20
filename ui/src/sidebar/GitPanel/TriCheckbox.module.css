@@ -22,7 +22,7 @@
  */
 .box {
   width: 12px;
-  height: 12px;
+  height: calc(12px * var(--ui-scale));
   flex: none;
   display: flex;
   align-items: center;
@@ -54,7 +54,7 @@
 .box[data-state='checked']::after {
   content: '';
   width: 3px;
-  height: 6px;
+  height: calc(6px * var(--ui-scale));
   border: solid currentColor;
   border-width: 0 1.5px 1.5px 0;
   transform: translateY(-1px) rotate(45deg);
@@ -65,7 +65,7 @@
 .box[data-state='partial']::after {
   content: '';
   width: 6px;
-  height: 2px;
+  height: calc(2px * var(--ui-scale));
   background: currentColor;
 }
 

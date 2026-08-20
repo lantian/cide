@@ -42,6 +42,14 @@ pub struct SettingsPatch {
     // "explicitly cleared" at the only layer where a human writes it.
     #[ts(optional)]
     pub theme: Option<Theme>,
+    /// The chrome's base point size. See [`crate::settings::Settings::ui_font_size`].
+    ///
+    /// A scalar, so unlike the two code font sizes it can be sent on its own. Clamped where
+    /// this lands (`cmd::settings::apply_patch`) rather than on read, so a hand-edited
+    /// `workspace.json` cannot hand CSS a `NaN` multiplier — see
+    /// [`crate::settings::clamp_ui_font_size`] for what that would paint.
+    #[ts(optional)]
+    pub ui_font_size: Option<f32>,
     #[ts(optional)]
     pub each_project_keeps_claude_tab: Option<bool>,
     #[ts(optional)]

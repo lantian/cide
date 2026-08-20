@@ -23,7 +23,7 @@
   background: var(--panel);
   border-top: 1px solid var(--border);
   box-shadow: var(--shadow);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--text);
 }
 
@@ -42,7 +42,7 @@
 .detail {
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 
 .dismiss {
@@ -53,7 +53,7 @@
   background: var(--chrome);
   color: var(--dim);
   font: inherit;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   cursor: pointer;
 }
 

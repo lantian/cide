@@ -73,8 +73,8 @@
   background: var(--panel-2);
   border-top: 1px solid var(--border);
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 19px;
+  font-size: var(--fs-ui-12);
+  line-height: calc(19px * var(--ui-scale));
   color: var(--dim);
 }
 

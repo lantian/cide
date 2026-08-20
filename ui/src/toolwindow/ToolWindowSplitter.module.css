@@ -1,0 +1,63 @@
+/*
+ * The tool window's drag edge — the horizontal twin of `chrome/SidebarSplitter.module.css`.
+ *
+ * Sized off `--w-splitter` used as a *height*, so it is the same 6px gutter the pane grid and the
+ * sidebar use: this is one resize system, and an edge that was 4px here while a pane divider was
+ * 6px would read as two. A real flex item rather than an absolutely positioned overlay, for the
+ * reason `SplitTree.module.css` gives — a track that *is* the gap needs no compensating margin
+ * and cannot overlap a terminal's hit area. It is also why `toolWindowHeight.ts` subtracts these
+ * six pixels from the ceiling.
+ */
+.splitter {
+  flex: none;
+  height: var(--w-splitter);
+  /*
+   * The workspace's colour, not the gutter's. The panel already draws a 1px `--border` on its top
+   * edge; a second 6px bar above it would be a band the design does not have, and it would be at
+   * its most obvious in the light theme. So the strip reads as the bottom-most 6px of the pane
+   * area until it is pointed at, and the seam stays the panel's own border.
+   */
+  background: var(--panel-2);
+  cursor: row-resize;
+  position: relative;
+  /*
+   * Above the workspace, or half the widened hit area above is dead: panes are
+   * `position: relative`, so anything after this in DOM order paints over a non-positioned
+   * neighbour. The same measurement the pane dividers record.
+   */
+  z-index: 1;
+  -webkit-user-select: none;
+  user-select: none;
+  /* Pointer capture on a touch screen only works if the browser is not busy scrolling. */
+  touch-action: none;
+}
+
+/*
+ * The visible track is 6px; a 6px pointer target is a poor one. This widens it to 11px without
+ * moving anything — the pseudo-element is out of flow, so it costs no layout and cannot change
+ * the panel's height.
+ *
+ * Asymmetric on purpose: 3px up into the pane area, but only 2px down over the panel, so the grab
+ * area stops short of the panel's own 1px border and of its tab row's hit targets.
+ */
+.splitter::before {
+  content: '';
+  position: absolute;
+  inset: -3px 0 -2px 0;
+}
+
+/*
+ * Both themes come from tokens, so neither is a special case. `--accent-dim` on hover is the same
+ * feedback a pane divider gives; the full `--accent` is reserved for focus, where it has to be
+ * legible against `--panel-2` in the white theme as well as the dark one.
+ */
+.splitter:hover,
+.splitterActive {
+  background: var(--accent-dim);
+}
+
+/* It is in the tab order — a real `separator` with arrow keys — so focus must show. */
+.splitter:focus-visible {
+  background: var(--accent);
+  outline: none;
+}

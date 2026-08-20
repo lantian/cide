@@ -7,6 +7,37 @@
  * is the half that cannot be tested.
  *
  * Callers do not normally render this. `useContextMenu` does, and hands back the node.
+ *
+ * # Submenus, and why there is exactly one level of them
+ *
+ * A row carrying `MenuItem.submenu` opens a second box beside itself. That box is rendered by
+ * *this* component, into the same portal, and a `submenu` on one of its own rows is ignored.
+ *
+ * The alternative — `ContextMenu` rendering a nested `ContextMenu` — reads better and is
+ * wrong here for a concrete reason: the dismissal listeners are `window`-level and ask "is the
+ * pointer inside my box". A nested instance would answer that question for its own box only,
+ * so a click in the submenu would land outside the parent's, close the parent, and unmount the
+ * submenu underneath the click. Owning both boxes is what lets one `inside()` cover both — see
+ * the effect below, which is the whole reason this file grew rather than gained a sibling.
+ *
+ * One level is a decision, not a limit reached by accident. Nothing in this app has wanted two,
+ * and each further level is another placement pass, another focus chain and another dismissal
+ * rule that no check script in this repo can drive, because there is no DOM in the harness.
+ *
+ * ## What the submenu deliberately does not have: a safe triangle
+ *
+ * Moving the pointer onto another row closes the open submenu immediately. Desktop toolkits
+ * soften that with a "safe triangle" — a few hundred milliseconds during which a pointer
+ * heading towards the submenu may cross other rows without dismissing it — and this has none.
+ *
+ * That is a real cost and it is bounded: the submenu opens flush against the parent menu's
+ * right edge and level with its row, so the direct path is horizontal and crosses nothing. A
+ * diagonal path across the row below does close it, and the fix is to move sideways first.
+ * The alternative was a timer, a hover intent and a geometry test in a component whose whole
+ * design principle is that anything with a rule in it lives in `model.ts` where a check can run
+ * it — and none of that could be checked here, because there is no pointer in the harness
+ * either. If it becomes annoying in use, the triangle test is a pure function of two rects and
+ * a point and belongs beside `placeSubmenu`.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -15,6 +46,9 @@ import {
   activeItem,
   moveFocus,
   placeMenu,
+  placeSubmenu,
+  resolveMenu,
+  type MenuEntry,
   type Placement,
   type ResolvedEntry,
 } from './model'
@@ -26,6 +60,15 @@ export interface ContextMenuProps {
   /** Window coordinates of the pointer, or of the anchor for a keyboard invocation. */
   at: { x: number; y: number }
   onClose: () => void
+  /**
+   * The keychip source, for rows built *after* the menu opened — that is, submenu rows.
+   *
+   * `useContextMenu` resolves the top level itself and hands the result down already
+   * resolved; a submenu's entries do not exist until it is hovered, so this component has to
+   * resolve those, and a resolution without `chipFor` silently drops every shortcut hint in
+   * the submenu. Optional because a fixture with no keymap should look like one.
+   */
+  chipFor?: ((command: string) => string | null) | undefined
 }
 
 /**
@@ -52,11 +95,41 @@ function menuRoot(): HTMLElement {
   return created
 }
 
-export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): React.ReactNode {
+/** An open submenu: whose row it belongs to, what is in it, and where that row is. */
+interface OpenSubmenu {
+  /** The parent row's index into `entries`. Identity for the placement, and the focus return. */
+  readonly index: number
+  readonly entries: readonly ResolvedEntry[]
+  /** The parent row's box at the moment it opened, in window coordinates. */
+  readonly anchor: { left: number; right: number; top: number; bottom: number }
+}
+
+export function ContextMenu({
+  label,
+  entries,
+  at,
+  onClose,
+  chipFor,
+}: ContextMenuProps): React.ReactNode {
   const box = useRef<HTMLDivElement>(null)
   const items = useRef(new Map<number, HTMLButtonElement>())
   const [placement, setPlacement] = useState<Placement | null>(null)
   const [active, setActive] = useState<number | null>(null)
+
+  const subBox = useRef<HTMLDivElement>(null)
+  const subItems = useRef(new Map<number, HTMLButtonElement>())
+  const [submenu, setSubmenu] = useState<OpenSubmenu | null>(null)
+  /*
+   * The submenu's placement, tagged with the row it was computed for.
+   *
+   * A bare `Placement | null` would be applied to the *next* submenu for the one frame between
+   * that submenu rendering and the layout effect re-measuring it — the box would paint beside
+   * the previous row and jump. Tagging it means a placement that does not belong to the open
+   * submenu reads as "not measured yet", which is already the state that hides the box.
+   */
+  const [subPlacement, setSubPlacement] = useState<{ index: number; at: Placement } | null>(null)
+  /** The focused submenu row, or `null` when the submenu was opened by hover and not entered. */
+  const [subActive, setSubActive] = useState<number | null>(null)
 
   /*
    * Measure then place, in a layout effect so the browser never paints the intermediate.
@@ -77,6 +150,28 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
       ),
     )
   }, [at, entries])
+
+  /*
+   * The same, for the submenu, against its parent *row* rather than the pointer.
+   *
+   * `placeSubmenu` and not `placeMenu`: a submenu that runs out of room flips round its row to
+   * `left - width`, where a pointer menu flips through the pointer to `x - width`. The second
+   * sum would lay the submenu over the parent menu and hide the row the user is hovering.
+   */
+  useLayoutEffect(() => {
+    if (submenu === null) return
+    const el = subBox.current
+    if (el === null) return
+    const rect = el.getBoundingClientRect()
+    setSubPlacement({
+      index: submenu.index,
+      at: placeSubmenu(
+        submenu.anchor,
+        { width: rect.width, height: rect.height },
+        { width: window.innerWidth, height: window.innerHeight },
+      ),
+    })
+  }, [submenu])
 
   /*
    * The menu takes focus so the arrows are its own. Item 0 is *not* pre-selected: a menu that
@@ -110,7 +205,10 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
   }, [placement === null])
 
   useEffect(() => {
-    if (active === null) return
+    // While the keyboard is inside the submenu the parent's highlighted row must keep its
+    // ring but must **not** take focus back, or every ArrowDown in the submenu would be read
+    // by the parent list instead.
+    if (active === null || subActive !== null) return
     // `preventScroll`, and the menu is the one surface where that is not merely hygiene: the
     // box is `overflow-y: auto` under a computed `maxHeight`, so arrowing to an item below the
     // fold scrolls it — and the `scroll` capture listener below would then dismiss the menu
@@ -120,7 +218,62 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
     if (item === undefined) return
     item.focus({ preventScroll: true })
     item.scrollIntoView({ block: 'nearest' })
-  }, [active])
+  }, [active, subActive])
+
+  useEffect(() => {
+    if (subActive === null) return
+    const item = subItems.current.get(subActive)
+    if (item === undefined) return
+    item.focus({ preventScroll: true })
+    item.scrollIntoView({ block: 'nearest' })
+  }, [subActive])
+
+  /** Close the submenu and put the keyboard back on the row it came out of. */
+  const closeSubmenu = useCallback(() => {
+    setSubmenu(null)
+    setSubActive(null)
+  }, [])
+
+  /**
+   * Open the list hanging off row `index`, building it now.
+   *
+   * Built at open time rather than at the parent's — see `MenuItem.submenu`. The one caller
+   * lists live Claude sessions by the names their user gave them, and those names arrive from
+   * Rust asynchronously; a list snapshotted when the parent menu opened would be one round
+   * trip stale, which for a menu of conversations to type into is the wrong conversation.
+   *
+   * An empty result opens nothing. A submenu box with no rows in it says the feature is broken
+   * rather than that it has nothing to offer, which is the same argument `useContextMenu`'s
+   * `isEmptyMenu` guard makes about the top level.
+   */
+  const openSubmenu = useCallback(
+    (index: number, row: HTMLElement, build: () => readonly MenuEntry[], enter = false) => {
+      const resolved = resolveMenu(build(), chipFor === undefined ? {} : { chipFor })
+      if (!resolved.some((e) => e.kind === 'item')) {
+        closeSubmenu()
+        return
+      }
+      const rect = row.getBoundingClientRect()
+      setSubmenu({
+        index,
+        entries: resolved,
+        anchor: { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom },
+      })
+      /*
+       * `enter` is the difference between the mouse route and the keyboard one, and it is not
+       * cosmetic. A hover must leave the keyboard on the parent row: the pointer opened the
+       * box, and stealing focus into it would mean the user's next ArrowDown walks a list they
+       * were not looking at. A key that opens the box is a statement that the keyboard is
+       * going there, so it lands on the first row and the next ArrowDown continues inside.
+       *
+       * Computed from `resolved` rather than from `submenu.entries`, because the state this
+       * call sets is not readable until the next render — and a `setSubActive` that read it
+       * would land on whatever the *previous* submenu had.
+       */
+      setSubActive(enter ? moveFocus(resolved, null, 'first') : null)
+    },
+    [chipFor, closeSubmenu],
+  )
 
   const run = useCallback(
     (index: number) => {
@@ -132,6 +285,19 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
       item.run?.()
     },
     [entries, onClose],
+  )
+
+  const runSub = useCallback(
+    (index: number) => {
+      if (submenu === null) return
+      const item = activeItem(submenu.entries, index)
+      if (item === null) return
+      // The whole menu goes, not just the submenu: the user has chosen, and leaving the parent
+      // standing over whatever the choice opened is the same trap `run` closes first for.
+      onClose()
+      item.run?.()
+    },
+    [submenu, onClose],
   )
 
   /*
@@ -147,8 +313,11 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
    */
   useEffect(() => {
     const inside = (target: EventTarget | null): boolean => {
-      const el = box.current
-      return el !== null && target instanceof Node && el.contains(target)
+      if (!(target instanceof Node)) return false
+      // Both boxes, because the submenu is a portal *sibling* of the main one rather than a
+      // descendant of it. Asking only the main box would make every click on a submenu row an
+      // outside click: the menu would close before the row's own handler ran.
+      return box.current?.contains(target) === true || subBox.current?.contains(target) === true
     }
     const onPointerDown = (ev: PointerEvent) => {
       if (inside(ev.target)) return
@@ -181,10 +350,28 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
     }
   }, [onClose])
 
+  /**
+   * Open row `index`'s submenu and put the keyboard in it, or report that it has none.
+   *
+   * Shared by Enter and ArrowRight so the two cannot drift: both mean "go into this list",
+   * and the `false` is what lets Enter fall through to running an ordinary row while
+   * ArrowRight leaves the event alone for anything else that wants it.
+   */
+  const enterSubmenu = (index: number): boolean => {
+    const entry = activeItem(entries, index)
+    const row = items.current.get(index)
+    if (entry === null || entry.submenu === null || row === undefined) return false
+    openSubmenu(index, row, entry.submenu, true)
+    return true
+  }
+
   const onKeyDown = (ev: React.KeyboardEvent<HTMLDivElement>) => {
     const move = (motion: 'next' | 'prev' | 'first' | 'last') => {
       ev.preventDefault()
       ev.stopPropagation()
+      // Arrowing off the parent row abandons the submenu it opened; leaving it standing beside
+      // a row three lines up is a box pointing at nothing.
+      closeSubmenu()
       setActive((current) => moveFocus(entries, current, motion))
     }
     switch (ev.key) {
@@ -206,93 +393,257 @@ export function ContextMenu({ label, entries, at, onClose }: ContextMenuProps): 
       case 'Tab':
         return move(ev.shiftKey ? 'prev' : 'next')
       case 'Enter':
-      case ' ':
+      case ' ': {
         ev.preventDefault()
         ev.stopPropagation()
-        if (active !== null) run(active)
+        if (active === null) return
+        // Enter on a parent row opens its list rather than doing nothing — `run` is null for
+        // those by construction, so without this the key would be dead on exactly the rows a
+        // keyboard user most needs it on.
+        const opened = enterSubmenu(active)
+        if (!opened) run(active)
         return
-      // Left/right are submenu keys elsewhere; there are no submenus here, and closing on
-      // Left is what every menu that lacks them does.
+      }
+      /*
+       * The submenu keys. Right opens and enters, Left closes — which is the convention every
+       * desktop menu follows, and it is why this file's old comment said "there are no
+       * submenus here, and closing on Left is what every menu that lacks them does".
+       *
+       * Left still closes the whole menu on a row that has no submenu open, because that is
+       * what it did before and there is nothing else for it to mean at the top level.
+       */
+      case 'ArrowRight': {
+        if (active === null) return
+        if (!enterSubmenu(active)) return
+        ev.preventDefault()
+        ev.stopPropagation()
+        return
+      }
       case 'ArrowLeft':
         ev.preventDefault()
         ev.stopPropagation()
+        if (submenu !== null) return closeSubmenu()
         return onClose()
       default:
         return
     }
   }
 
-  const hasToggle = entries.some((e) => e.kind === 'item' && e.checked !== null)
-
-  return createPortal(
-    <div
-      ref={box}
-      className={placement === null ? `${styles.menu} ${styles.measuring}` : styles.menu}
-      style={
-        placement === null
-          ? undefined
-          : { left: placement.x, top: placement.y, maxHeight: placement.maxHeight }
-      }
-      role="menu"
-      aria-label={label}
-      aria-orientation="vertical"
-      tabIndex={-1}
-      data-audit="contextMenu"
-      data-flipped-x={placement?.flippedX === true ? 'true' : 'false'}
-      data-flipped-y={placement?.flippedY === true ? 'true' : 'false'}
-      onKeyDown={onKeyDown}
-      // The menu is our menu; a right-click *on* it must not summon a second one, and must
-      // not reach the surface underneath either.
-      onContextMenu={(ev) => {
+  /**
+   * The submenu's own key handling.
+   *
+   * A separate handler rather than a branch inside `onKeyDown`, because the submenu box is a
+   * portal *sibling* of the main one: a keypress on a submenu row never bubbles to the main
+   * box's `onKeyDown` at all, so a branch there would be unreachable.
+   */
+  const onSubKeyDown = (ev: React.KeyboardEvent<HTMLDivElement>) => {
+    if (submenu === null) return
+    const move = (motion: 'next' | 'prev' | 'first' | 'last') => {
+      ev.preventDefault()
+      ev.stopPropagation()
+      setSubActive((current) => moveFocus(submenu.entries, current, motion))
+    }
+    switch (ev.key) {
+      case 'Escape':
         ev.preventDefault()
         ev.stopPropagation()
-      }}
-    >
-      {entries.map((entry, index) =>
-        entry.kind === 'separator' ? (
-          <div key={entry.id} className={styles.separator} role="separator" />
-        ) : (
-          <button
-            key={entry.id}
-            type="button"
-            ref={(el) => {
-              if (el === null) items.current.delete(index)
-              else items.current.set(index, el)
-            }}
-            className={[
-              styles.item,
-              entry.enabled ? '' : styles.disabled,
-              entry.danger ? styles.danger : '',
-              active === index ? styles.active : '',
-            ]
-              .filter((c) => c !== '')
-              .join(' ')}
-            role={entry.checked === null ? 'menuitem' : 'menuitemcheckbox'}
-            aria-checked={entry.checked === null ? undefined : entry.checked}
-            tabIndex={-1}
-            // Not the `disabled` attribute: a disabled <button> takes no pointer events, so
-            // its `title` never appears and the reason becomes unreadable on hover.
-            aria-disabled={entry.enabled ? undefined : true}
-            data-item={entry.id}
-            data-enabled={entry.enabled ? 'true' : 'false'}
-            title={entry.reason ?? undefined}
-            onClick={() => run(index)}
-            // Hover moves the keyboard cursor too, so arrowing after reaching for the mouse
-            // continues from where the eye is rather than from where the keyboard was.
-            onPointerEnter={() => entry.enabled && setActive(index)}
-          >
-            {hasToggle && (
-              <span className={styles.check} aria-hidden="true">
-                {entry.checked === true ? '✓' : ''}
-              </span>
-            )}
-            <span className={styles.label}>{entry.label}</span>
-            {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
-            {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
-          </button>
-        ),
+        return onClose()
+      case 'ArrowDown':
+        return move('next')
+      case 'ArrowUp':
+        return move('prev')
+      case 'Home':
+        return move('first')
+      case 'End':
+        return move('last')
+      case 'Tab':
+        return move(ev.shiftKey ? 'prev' : 'next')
+      case 'ArrowLeft':
+        ev.preventDefault()
+        ev.stopPropagation()
+        return closeSubmenu()
+      case 'Enter':
+      case ' ':
+        ev.preventDefault()
+        ev.stopPropagation()
+        if (subActive !== null) runSub(subActive)
+        return
+      default:
+        return
+    }
+  }
+
+  const hasToggle = entries.some((e) => e.kind === 'item' && e.checked !== null)
+  const subHasToggle =
+    submenu !== null && submenu.entries.some((e) => e.kind === 'item' && e.checked !== null)
+  const subAt =
+    submenu !== null && subPlacement?.index === submenu.index ? subPlacement.at : null
+
+  return createPortal(
+    <>
+      <div
+        ref={box}
+        className={placement === null ? `${styles.menu} ${styles.measuring}` : styles.menu}
+        style={
+          placement === null
+            ? undefined
+            : { left: placement.x, top: placement.y, maxHeight: placement.maxHeight }
+        }
+        role="menu"
+        aria-label={label}
+        aria-orientation="vertical"
+        tabIndex={-1}
+        data-audit="contextMenu"
+        data-flipped-x={placement?.flippedX === true ? 'true' : 'false'}
+        data-flipped-y={placement?.flippedY === true ? 'true' : 'false'}
+        onKeyDown={onKeyDown}
+        // The menu is our menu; a right-click *on* it must not summon a second one, and must
+        // not reach the surface underneath either.
+        onContextMenu={(ev) => {
+          ev.preventDefault()
+          ev.stopPropagation()
+        }}
+      >
+        {entries.map((entry, index) =>
+          entry.kind === 'separator' ? (
+            <div key={entry.id} className={styles.separator} role="separator" />
+          ) : (
+            <button
+              key={entry.id}
+              type="button"
+              ref={(el) => {
+                if (el === null) items.current.delete(index)
+                else items.current.set(index, el)
+              }}
+              className={[
+                styles.item,
+                entry.enabled ? '' : styles.disabled,
+                entry.danger ? styles.danger : '',
+                active === index ? styles.active : '',
+              ]
+                .filter((c) => c !== '')
+                .join(' ')}
+              role={entry.checked === null ? 'menuitem' : 'menuitemcheckbox'}
+              aria-checked={entry.checked === null ? undefined : entry.checked}
+              aria-haspopup={entry.submenu === null ? undefined : 'menu'}
+              aria-expanded={entry.submenu === null ? undefined : submenu?.index === index}
+              tabIndex={-1}
+              // Not the `disabled` attribute: a disabled <button> takes no pointer events, so
+              // its `title` never appears and the reason becomes unreadable on hover.
+              aria-disabled={entry.enabled ? undefined : true}
+              data-item={entry.id}
+              data-enabled={entry.enabled ? 'true' : 'false'}
+              data-submenu={entry.submenu === null ? undefined : 'true'}
+              title={entry.reason ?? undefined}
+              onClick={(ev) => {
+                // A parent row opens its list and does nothing else. Clicking it must not also
+                // dismiss the menu, which is what `run`'s `onClose` would do.
+                if (entry.submenu !== null) {
+                  return openSubmenu(index, ev.currentTarget, entry.submenu)
+                }
+                run(index)
+              }}
+              // Hover moves the keyboard cursor too, so arrowing after reaching for the mouse
+              // continues from where the eye is rather than from where the keyboard was.
+              //
+              // And hover is the gesture the user asked for here: moving onto *Send … to
+              // Claude* shows the sessions without a click. Moving onto any other row closes
+              // whatever was open, so a submenu never outlives the row it belongs to.
+              onPointerEnter={(ev) => {
+                if (entry.enabled) setActive(index)
+                if (entry.enabled && entry.submenu !== null) {
+                  openSubmenu(index, ev.currentTarget, entry.submenu)
+                } else if (submenu !== null) {
+                  // Including for a *disabled* row, which is why this is not inside the
+                  // `enabled` guard: a submenu left standing beside a row the pointer has
+                  // moved off is a box pointing at nothing, and the greyed rows are exactly
+                  // the ones a pointer crosses on the way past.
+                  closeSubmenu()
+                }
+              }}
+            >
+              {hasToggle && (
+                <span className={styles.check} aria-hidden="true">
+                  {entry.checked === true ? '✓' : ''}
+                </span>
+              )}
+              <span className={styles.label}>{entry.label}</span>
+              {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
+              {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
+              {entry.submenu !== null && (
+                <span className={styles.chevron} aria-hidden="true">
+                  ›
+                </span>
+              )}
+            </button>
+          ),
+        )}
+      </div>
+
+      {submenu !== null && (
+        <div
+          ref={subBox}
+          className={subAt === null ? `${styles.menu} ${styles.measuring}` : styles.menu}
+          style={
+            subAt === null
+              ? undefined
+              : { left: subAt.x, top: subAt.y, maxHeight: subAt.maxHeight }
+          }
+          role="menu"
+          aria-label={`${label} submenu`}
+          aria-orientation="vertical"
+          tabIndex={-1}
+          data-audit="contextSubmenu"
+          data-flipped-x={subAt?.flippedX === true ? 'true' : 'false'}
+          onKeyDown={onSubKeyDown}
+          onContextMenu={(ev) => {
+            ev.preventDefault()
+            ev.stopPropagation()
+          }}
+        >
+          {submenu.entries.map((entry, index) =>
+            entry.kind === 'separator' ? (
+              <div key={entry.id} className={styles.separator} role="separator" />
+            ) : (
+              <button
+                key={entry.id}
+                type="button"
+                ref={(el) => {
+                  if (el === null) subItems.current.delete(index)
+                  else subItems.current.set(index, el)
+                }}
+                className={[
+                  styles.item,
+                  entry.enabled ? '' : styles.disabled,
+                  entry.danger ? styles.danger : '',
+                  subActive === index ? styles.active : '',
+                ]
+                  .filter((c) => c !== '')
+                  .join(' ')}
+                role={entry.checked === null ? 'menuitem' : 'menuitemcheckbox'}
+                aria-checked={entry.checked === null ? undefined : entry.checked}
+                tabIndex={-1}
+                aria-disabled={entry.enabled ? undefined : true}
+                data-item={entry.id}
+                data-enabled={entry.enabled ? 'true' : 'false'}
+                title={entry.reason ?? undefined}
+                onClick={() => runSub(index)}
+                onPointerEnter={() => entry.enabled && setSubActive(index)}
+              >
+                {subHasToggle && (
+                  <span className={styles.check} aria-hidden="true">
+                    {entry.checked === true ? '✓' : ''}
+                  </span>
+                )}
+                <span className={styles.label}>{entry.label}</span>
+                {entry.reason !== null && <span className={styles.reason}>{entry.reason}</span>}
+                {entry.hint !== null && <span className={styles.hint}>{entry.hint}</span>}
+              </button>
+            ),
+          )}
+        </div>
       )}
-    </div>,
+    </>,
     menuRoot(),
   )
 }

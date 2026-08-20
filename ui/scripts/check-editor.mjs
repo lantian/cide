@@ -147,6 +147,10 @@ try {
       'src/editor/streamGrammar.ts',
       'src/editor/sendToClaude.ts',
       'src/editor/revealTarget.ts',
+      // M19, section 20: which conversation *Send this to Claude ▸* offers, and in what order.
+      // Import-free for the same reason its two neighbours above are — the part with numbers
+      // in it is the part a user catches being wrong at a glance.
+      'src/editor/claudeSessions.ts',
       'src/editor/statusReadout.ts',
       // M12. All three are import-free for exactly this reason.
       'src/editor/lintMap.ts',
@@ -215,6 +219,7 @@ try {
   const geo = load('minimapGeometry.js')
   const send = load('sendToClaude.js')
   const revealPlan = load('revealTarget.js')
+  const { claudeSessions } = load('claudeSessions.js')
   const readout = load('statusReadout.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
@@ -2069,7 +2074,52 @@ try {
     )
 
     const menuSrc = readFileSync('src/editor/codeMenu.tsx', 'utf8')
-    ok(/toClaude\.send\(/.test(menuSrc), 'the context-menu item is wired to the send')
+    /*
+     * The menu row is a **submenu** since M19 and no longer sends by itself, so the old pin —
+     * `toClaude.send(` anywhere in the file — is written out here rather than deleted: it was
+     * the assertion that caught the original report ("the item did nothing"), and what
+     * replaces it has to catch the same class of failure through the new shape.
+     *
+     * Three things, and each is a way the feature could ship looking complete and be dead:
+     * the row has to *offer* a list, the list has to be built from the sessions, and picking
+     * one has to send to *that pane*.
+     */
+    ok(
+      /submenu:/.test(menuSrc),
+      'the mention row carries a submenu — the whole of what was asked for is that hovering '
+        + 'it offers a choice of conversation rather than sending straight away',
+    )
+    ok(
+      /toClaude\.sessions\(\)/.test(menuSrc),
+      'and builds its rows from `sessions()`, which is what makes them the project’s live '
+        + 'Claude panes rather than a hardcoded one',
+    )
+    ok(
+      /toClaude\.sendTo\(live, path, session\.pane\)/.test(menuSrc),
+      'and each row sends to ITS OWN pane. A row that called `send()` would list five '
+        + 'conversations and deliver every one of them to the same place — the exact shape of '
+        + 'silent inertness this pin was written for',
+    )
+    ok(
+      /toClaude\.refresh\(\)/.test(menuSrc),
+      'and the names are refreshed as the parent menu is built, which is the round trip the '
+        + 'submenu’s labels are waiting on. Without it the list is whatever was read the last '
+        + 'time something happened to ask, which for a fresh window is nothing at all',
+    )
+
+    const hookExact = readFileSync('src/editor/useSendToClaude.ts', 'utf8')
+    ok(
+      /deliver\(view, path, pane, true\)/.test(hookExact),
+      '`sendTo` is an EXACT send: the user read `2: git-details` and chose it, so Rust must '
+        + 'address that pane and refuse rather than reroute. A chosen destination silently '
+        + 'delivered elsewhere is the one genuinely harmful outcome this gesture has',
+    )
+    ok(
+      /deliver\(view, path, null, false\)/.test(hookExact),
+      'while the automatic route still guesses and still lets Rust improve on the guess — the '
+        + 'two gestures share one delivery so the reveal and the reporting cannot drift apart',
+    )
+
     ok(
       // Anchored to the start of a line, because the file *discusses* the command at length
       // in a comment and the discussion is the reason it is gone.
@@ -2164,9 +2214,13 @@ try {
         'otherwise have done it, leaving the keyboard pointed at the previous pane',
     )
     ok(
-      /ctrlLink\(project, path\)/.test(strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))),
+      /ctrlLink\(project, identity\)/.test(
+        strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8')),
+      ),
       'and EditorSurface installs the extension — a gesture nothing mounts is the defect this ' +
-        'project ships most often',
+        'project ships most often. `identity` and not `path` since M18: the cache behind this ' +
+        'gesture is a module-level map shared by every mounted editor, so a second buffer over ' +
+        'one path would answer this one\'s Ctrl+hover from the other\'s answers',
     )
 
     const surfaceSrc = readFileSync('src/editor/EditorSurface.tsx', 'utf8')
@@ -4307,9 +4361,11 @@ try {
     /* The producer, the restore, and the two props that carry them. */
     const surfaceSrc = stripJs(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
     ok(
-      /viewTracker\(path, \(seen\) => \{/.test(surfaceSrc),
+      /viewTracker\(identity, \(seen\) => \{/.test(surfaceSrc),
       'EditorSurface installs the view tracker — an editor that never reports its position ' +
-        'leaves the whole feature storing nothing, and every assertion above still passes',
+        'leaves the whole feature storing nothing, and every assertion above still passes. ' +
+        'Keyed on the identity since M18, which is also what decides what a host STORES: a ' +
+        'revision buffer\'s scroll must not be written into the working file\'s position',
     )
     ok(
       /observedRef\.current = seen/.test(surfaceSrc),
@@ -4318,11 +4374,13 @@ try {
         'whatever the 500 ms debounce last managed to send',
     )
     ok(
-      /planRestore\(remembered, view\.state\.doc\.lines, pendingReveals\(\)\.includes\(path\)\)/.test(
+      /planRestore\(\s*remembered,\s*view\.state\.doc\.lines,\s*pendingReveals\(\)\.includes\(identity\),?\s*\)/.test(
         surfaceSrc,
       ),
       'the restore consults planRestore, and hands it the parked-reveal answer — the veto is ' +
-        'the rule that keeps Go to definition outranking a remembered position',
+        'the rule that keeps Go to definition outranking a remembered position. It asks about ' +
+        'the IDENTITY, which is the key `registerReveal` registers under a few lines later: ' +
+        'asking under one name and registering under another would put the two back out of step',
     )
     ok(
       surfaceSrc.indexOf('planRestore(') < surfaceSrc.indexOf('registerReveal('),
@@ -4351,8 +4409,11 @@ try {
      */
     {
       ok(
-        /navRecorder\(project, path\),/.test(surfaceSrc),
-        'EditorSurface mounts the click recorder — this project\'s most-repeated defect is a ' +
+        /navRecorder\(project, identity\),/.test(surfaceSrc),
+        'EditorSurface mounts the click recorder, keyed on the same identity `claimCaret` takes ' +
+          '— `originOf` compares the two, so a buffer spelled one way here and another way ' +
+          'there makes every click in it look like a cross-file jump. This project\'s ' +
+          'most-repeated defect is a ' +
           'feature built complete and reachable from nothing, and an unmounted extension is ' +
           'exactly that: every assertion about `recordsClick` above still passes',
       )
@@ -5339,6 +5400,505 @@ try {
       + 'repository can see that. This one ships with an assertion that it is wired')
     ok(/checked=\{editor\.autosave\}/.test(sections) && /autosave: v/.test(sections),
       'and it is offered in Settings ▸ Editor, in both directions')
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 15. The revision pane: a file as one commit left it
+  // ---------------------------------------------------------------------------------------
+
+  /*
+   * `TabKind::Revision` shipped as a persisted enum variant that nothing created and nothing
+   * rendered, beside a `git_file_at_revision` command with zero callers — the state this file's
+   * header calls this project's signature defect, in its purest form. Every assertion below is
+   * about a *wire* rather than a function, for that reason: there is nothing here a unit test
+   * could have failed on, because every piece was individually correct and none of them was
+   * connected to any other.
+   *
+   * The three that would each restore the original bug on their own are the dispatch in
+   * `PaneBody`, the fetch in the pane, and the re-pointed hop in `EditorPane`. The rest are the
+   * decisions that are invisible from a screenshot: that the tab carries identity and never
+   * content, that the read-only buffer cannot collide with the real file's per-path registries,
+   * and that walking Back truncates the trail instead of extending it.
+   */
+  {
+    const strip = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+    const revPane = strip(readFileSync('src/panes/RevisionPane.tsx', 'utf8'))
+    const paneBody = strip(readFileSync('src/panes/PaneBody.tsx', 'utf8'))
+    const editorPane = strip(readFileSync('src/panes/EditorPane.tsx', 'utf8'))
+    const client = strip(readFileSync('src/ipc/client.ts', 'utf8'))
+    const surfaceSrc = strip(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+
+    /* ------------------------------------------------- the pane exists and is dispatched to */
+
+    ok(
+      /export function RevisionPane\(/.test(revPane),
+      'there is a `RevisionPane`. `TabKind::Revision` was persisted, closable, titled, drawn in '
+        + 'the tab strip and remembered by the reopen stack, with no component anywhere that '
+        + 'could render one',
+    )
+    ok(
+      /import \{ RevisionPane \} from '\.\/RevisionPane'/.test(paneBody)
+        && /<RevisionPane/.test(paneBody),
+      'and `PaneBody` renders it. A tab kind with no branch here falls through to '
+        + '`TerminalPane`, which is not a blank pane but a *spawn*',
+    )
+    ok(
+      /tab\.kind\.kind === 'revision'/.test(paneBody),
+      'dispatched on the tab kind the mirror reports — `App.tsx` computes `diff` and `editor` '
+        + 'from `tab.kind` and has no third prop, so the pane finds its own tab the way '
+        + '`panes/diffTabs.ts` does',
+    )
+    ok(
+      /if \(revision && pane\.kind === 'editor' && project\)/.test(paneBody),
+      "…and on the PANE kind as well. `default_intent` gives a revision tab "
+        + '`SplitIntent::NewClaude`, so splitting one produces a Claude pane — without this test '
+        + 'that pane would draw a second read-only buffer and the agent would talk into nothing. '
+        + 'It is the same rule the file branch above it states at length',
+    )
+    ok(
+      paneBody.indexOf('<RevisionPane') < paneBody.indexOf('<ResumeSplash'),
+      'and the branch is before the Resume splash, with the other document branches: a '
+        + 'restored workspace must never offer to resume a document',
+    )
+
+    /* --------------------------------------------------- identity in, content over the wire */
+
+    ok(
+      /gitLog\s*\.?\s*\n?\s*\.fileAt\(/.test(revPane) || /gitLog\.fileAt\(/.test(revPane),
+      'the pane fetches its bytes through `gitLog.fileAt` when it mounts. That command had '
+        + 'ZERO callers — it was written for this pane and then nothing was written to call it',
+    )
+    ok(
+      /useEffect\(\(\) => \{[\s\S]{0,600}?fileAt\(/.test(revPane),
+      '…in an effect keyed on the identity, so a tab restored from `workspace.json` reads the '
+        + 'blob rather than carrying it',
+    )
+    {
+      const element = /<RevisionPane([\s\S]*?)\/>/.exec(paneBody)?.[1] ?? ''
+      ok(element !== '', 'the `<RevisionPane/>` element is there to inspect')
+      ok(
+        /repo=\{revision\.repo\}/.test(element)
+          && /path=\{revision\.path\}/.test(element)
+          && /rev=\{revision\.rev\}/.test(element)
+          && /from=\{revision\.from\}/.test(element),
+        'and it is handed the tab\'s identity — repo, path, rev and the trail — and nothing else. '
+          + 'This is `DiffSpec`\'s rule: the tab is persisted, so text passed through it would be '
+          + 'text written to `workspace.json`',
+      )
+      ok(
+        !/(text|doc|blob|contents)=\{/.test(element),
+        '…and specifically no text, no doc and no blob. A saved layout holding file contents is '
+          + 'the failure `DiffSpec` spends a paragraph on',
+      )
+    }
+
+    /* -------------------------------------------------------- the surface, and its identity */
+
+    const surface = /<EditorSurface([\s\S]*?)\/>/.exec(revPane)?.[1] ?? ''
+    ok(surface !== '', 'the pane mounts an `EditorSurface`')
+    ok(
+      /\breadOnly\b/.test(surface),
+      'read-only. A commit cannot be written to, and `shouldAutosave` refuses a read-only '
+        + 'buffer — which is what keeps a timer from trying',
+    )
+    ok(
+      !/onSave=/.test(surface) && !/autosave=/.test(surface),
+      '…and no `onSave` and no `autosave` are wired at all, so the refusal is structural rather '
+        + 'than a flag somebody could flip',
+    )
+
+    /*
+     * The collision, and the prop that closes it. (M18)
+     *
+     * `EditorSurface` keys its per-buffer registrations on `path`, and `registerReveal` is the one
+     * that bites: `requestReveal` delivers to live receivers and only parks when there are none,
+     * so a revision pane registered under the real path makes a search-result click into that
+     * file stop moving the caret — it parks nothing, opens a file tab, and the new editor is
+     * never told.
+     *
+     * This section used to accept *either* shape: the surface growing an `identity` prop, or the
+     * pane keeping the real path out of the surface entirely by passing `a1b2c3d:src/log.rs` as
+     * the path. The prop has landed, so the fallback is gone — accepting a workaround after its
+     * replacement exists is how the workaround comes back.
+     */
+    ok(/identity\?: string/.test(surfaceSrc), '`EditorSurface` declares an `identity` prop')
+    ok(
+      /^\s*identity = path,$/m.test(surfaceSrc),
+      '…DEFAULTED TO `path`, in the destructuring pattern. The default is what makes the prop '
+        + 'invisible to every existing caller — `EditorPane` passes a path and nothing else, and '
+        + '`identity === path` is the previous behaviour letter for letter — so `tsc` alone '
+        + 'proves no current call site changed. A required prop would have been a second thing '
+        + 'every call site has to get right',
+    )
+    ok(
+      /registerReveal\(identity/.test(surfaceSrc),
+      '…and the reveal registry is keyed on it. A prop that exists and does not reach '
+        + '`registerReveal` is the collision with a name on it: `requestReveal` would still '
+        + 'find this buffer live under the real path and a search click would stop working',
+    )
+    ok(
+      /pendingReveals\(\)\.includes\(identity\)/.test(surfaceSrc),
+      '…and so is the veto that asks whether a reveal is parked for this buffer. Asking under '
+        + 'one name and registering under another would let the remembered position win over a '
+        + 'request that is about to be delivered, which is the ordering `planRestore` exists to '
+        + 'decide rather than leave to line numbers',
+    )
+    ok(
+      /viewTracker\(identity/.test(surfaceSrc)
+        && /ctrlLink\(project, identity/.test(surfaceSrc)
+        && /navRecorder\(project, identity/.test(surfaceSrc),
+      '…and so are the per-file view memory, the go-to-definition cache and the mouse\'s '
+        + 'Back-stack recorder, or each of them answers for two buffers at once',
+    )
+    ok(
+      /claimCaret\(identity/.test(surfaceSrc) && /claimStatusReadout\(\s*path,/.test(surfaceSrc),
+      'AND THE PAIR THAT SPLITS: the caret slot takes the identity, the status readout keeps the '
+        + 'path. Opposite on purpose — one ADDRESSES the buffer and the other DESCRIBES it. Go to '
+        + 'line hands `focusedCaret().path` straight to `requestReveal` and `navRecorder` '
+        + 'compares against it, so a real path there would move the caret in the working file; '
+        + 'the bar is a claim stack rather than a registry, has nothing to collide with, and its '
+        + '`file` is sliced into crumbs by `rowPaths::crumbTargets`, which needs a path',
+    )
+
+    /*
+     * The sweep, and it is worth more than every assertion above it.
+     *
+     * Each of those names one call. This asks the question they are all instances of — *is any
+     * per-document registration still keyed on the bare path* — so a sixth registry added next
+     * year, or a merge that resurrects one of these lines from the other side, fails here rather
+     * than shipping a buffer that quietly answers for another one. The failure it guards is
+     * invisible on screen and invisible in review: everything still works, except that a click
+     * somewhere else in the app stops moving a caret.
+     *
+     * Two halves, and the second is what stops the first from passing vacuously: nothing in the
+     * group takes `path`, and every one of them is still there taking `identity`. Deleting a
+     * registration would otherwise be a way to satisfy a sweep.
+     */
+    const KEYED_ON_IDENTITY = [
+      'registerReveal',
+      'viewTracker',
+      'ctrlLink',
+      'navRecorder',
+      'claimCaret',
+    ]
+    const takes = (fn, arg) =>
+      new RegExp(`\\b${fn}\\(\\s*(?:project,\\s*)?${arg}\\b`).test(surfaceSrc)
+    eq(
+      KEYED_ON_IDENTITY.filter((fn) => takes(fn, 'path')),
+      [],
+      'NO PER-DOCUMENT REGISTRATION IN `EditorSurface` STILL KEYS ON THE BARE `path`. The '
+        + 'registries are shared module-level maps, so one buffer registered under another\'s key '
+        + 'is two documents in one slot — and the reveal case turns that into a search click that '
+        + 'silently stops working',
+    )
+    eq(
+      KEYED_ON_IDENTITY.filter((fn) => !takes(fn, 'identity')),
+      [],
+      '…and every one of them is still called, with the identity. Without this half the sweep '
+        + 'above would be satisfied by deleting a registration, which is a worse outcome than '
+        + 'the one it is checking for',
+    )
+
+    /* ------------------------------------------------------ and the pane passes both of them */
+
+    ok(
+      /path=\{path\}/.test(surface) && /identity=\{identity\}/.test(surface),
+      'the pane passes BOTH: the real path, so `languageName`, `loadLanguage`, the status-bar '
+        + 'trail and the find bar behave like every other buffer, and the identity, so nothing '
+        + 'it registers can be mistaken for the working file',
+    )
+    ok(
+      /const identity = useMemo\(\(\) => `\$\{shortRev\(rev\)\}:\$\{path\}`/.test(revPane),
+      "…spelled `a1b2c3d:src/log.rs`, which is git's own name for the object and cannot equal a "
+        + 'real path here, because every real path is absolute. That is what makes the collision '
+        + 'impossible rather than unlikely',
+    )
+    ok(
+      !/virtualPath/.test(revPane),
+      'and the virtual path is GONE rather than left beside the prop. It cost a status-bar trail '
+        + 'reading `a1b2c3d:src › log.rs`, which was written up as the workaround\'s price; two '
+        + 'ways to spell one buffer\'s identity is how the one with a price comes back',
+    )
+    ok(
+      !/project=\{project\}/.test(surface),
+      'and `project` is withheld, which turns Ctrl+click and the mouse Back-recorder off. Go to '
+        + 'definition sends a line number to a server reading the file AS IT IS NOW, so a '
+        + 'position taken from a forty-commit-old buffer names a different symbol — the same '
+        + 'confidently-wrong failure `onAnnotateParent` refuses for the blame gutter, except '
+        + 'that this one moves the user',
+    )
+
+    /* ---------------------------------------------------------------- three states, three sentences */
+
+    ok(
+      /load\.blob\.binary && \(/.test(revPane) && /is binary at \{shortRev\(rev\)\}/.test(revPane),
+      'a binary blob says so and draws no buffer. `RevisionBlob.text` is empty for one, so an '
+        + 'editor here would be a blank buffer claiming the file was empty at that commit — a '
+        + 'false statement rather than a missing one',
+    )
+    ok(
+      /load\.blob\.truncated && \(/.test(revPane)
+        && /Showing the first part of a \{humanBytes\(load\.blob\.bytes\)\} file/.test(revPane),
+      'a truncated blob names the REAL size and still draws the text. `RevisionBlob.bytes` '
+        + 'carries the full length for exactly this: the top of an eight-megabyte file is still '
+        + 'what the reader came for, and a bottom that is not the bottom must not pass for one',
+    )
+    ok(
+      /load\.kind === 'ready' && !load\.blob\.binary/.test(revPane),
+      '…and the ordinary state is the third branch rather than one message with the details '
+        + 'swapped in. They are different facts and the reader acts on each differently',
+    )
+    ok(
+      /load\.kind === 'failed'/.test(revPane),
+      'and a read that failed — `NotTracked` for a path a rename means did not exist at that '
+        + 'commit — is a fourth, legible state rather than an empty buffer',
+    )
+
+    /* --------------------------------------------------------------------- the crumb strip */
+
+    ok(
+      /'working tree'/.test(revPane),
+      'the trail starts at `working tree`, which is where every walk starts and the one crumb '
+        + 'that is not a revision',
+    )
+    ok(
+      /from\.map\(\(oid, index\) => \(\{[\s\S]{0,200}?from: from\.slice\(0, index\)/.test(revPane),
+      'and each oid re-opens the walk TRUNCATED at that point. Passing the whole chain would '
+        + 'make walking Back lengthen the very trail it is walking out of, one entry per press',
+    )
+    ok(
+      /\{ rev, from \}/.test(revPane),
+      '…while the current crumb passes its own `(rev, from)`, which Rust answers by activating '
+        + 'this tab — a click that goes nowhere rather than a control that reports a refusal',
+    )
+    ok(
+      /const goBack = useCallback/.test(revPane)
+        && /from\.slice\(0, from\.length - 1\)/.test(revPane),
+      'and ⌫ Back is the same walk one step: the last hop, with the chain cut before it',
+    )
+    ok(
+      /data-pane-strip="fluid"/.test(revPane),
+      'the strip declares itself fluid, so the pane frame keeps its floating ⊞ ⛶ ⧉ × cluster '
+        + 'where it is instead of stepping down past a find bar that is no longer the topmost '
+        + 'strip — and the stylesheet reserves the band horizontally, which is what stops '
+        + '`⌫ Back` from answering the ×\'s click',
+    )
+    ok(
+      /var\(--pane-corner-clear/.test(readFileSync('src/panes/RevisionPane.module.css', 'utf8')),
+      '…and that reservation is `--pane-corner-clear`, the SUM, not bare `--pane-corner`. The '
+        + 'conflict bar shipped wired to the wrong one of those two and both of its buttons were '
+        + 'drawn inside a live control box',
+    )
+
+    /* ------------------------------------------------- the hop that finally has somewhere to go */
+
+    ok(
+      /revisionFile\s*\n?\s*\.openTab\(id, found\.repo, parent\.path, parent\.rev, \[oid\]\)/.test(
+        editorPane,
+      ),
+      '*Annotate previous revision* opens a REVISION tab, not a revision diff. The button asks '
+        + 'to read the file as the parent left it — with a gutter, so the user can hop again — '
+        + 'and a patch has no lines to blame. It also could not answer at all when the parent '
+        + 'did not touch the path: `git_diff_revision` reports `NoSuchChange` where a file was '
+        + 'asked for',
+    )
+    ok(
+      !/revisionDiff\.openTab/.test(editorPane),
+      '…and the old call is gone rather than left beside it. Two routes out of one button is '
+        + 'how the wrong one comes back',
+    )
+    ok(
+      /parent\.path/.test(editorPane),
+      'and the hop uses the parent\'s OWN spelling of the path. `BlameParent.path` exists '
+        + 'because the hop is most often taken across exactly the rename that makes the two '
+        + 'differ, which is when reusing the current path is most wrong',
+    )
+
+    /* -------------------------------------------------------------------------- the wire */
+
+    ok(
+      /invoke<TabId>\('tab_open_revision', \{ project, repo, path, rev, from \}\)/.test(client),
+      '`revisionFile.openTab` names the command Rust registers. `client.ts` is the frontend\'s '
+        + 'only seam to `invoke`, which is what keeps the surface greppable',
+    )
+    ok(
+      !/tab_retarget_revision'/.test(client),
+      'and there is no retarget half. A revision tab has no preview slot — `PreviewSlot` is '
+        + 'derived from a `DiffOrigin`, which this kind does not have — so a scratch one is '
+        + 'unrepresentable rather than unimplemented',
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 20. Which Claude the selection can be sent to — the submenu's rows (M19)
+  // ---------------------------------------------------------------------------------------
+  //
+  // > *"we should show all session that is opened for current project with naming like
+  // > `1: <session-name>` — where 1 is number of the panel/session"*
+  //
+  // Two halves, and only one of them is cide's. The order and the numbering come from the
+  // workspace tree; the names come from the CLI's own files, through `claude_session_names`,
+  // and are legitimately absent. What is driven here is every way those two can meet.
+
+  {
+    const pane = (id, kind, extra = {}) => ({
+      id,
+      kind,
+      title: `cide : ${kind}`,
+      ...extra,
+    })
+    const leaf = (id) => ({ kind: 'leaf', pane: id })
+    const split = (a, b) => ({ kind: 'split', a, b })
+
+    /*
+     * A console tab whose panes were created in an order that is NOT their layout order.
+     *
+     * This is the discriminating fixture and it is the whole reason the walk exists: `panes`
+     * is insertion-ordered on the wire, so splitting the *first* pane in a tab appends the new
+     * one to the map and puts it in the middle of the screen. `right` is second on screen and
+     * third in the map. A numbering read off the map would disagree with the layout for every
+     * user who has ever split a pane anywhere but at the right-hand edge.
+     */
+    const project = {
+      tabs: [
+        {
+          id: 't0',
+          tree: {
+            root: split(leaf('a'), split(leaf('b'), leaf('c'))),
+            panes: {
+              a: pane('a', 'claude', { session: 's-a' }),
+              c: pane('c', 'claude', { session: 's-c' }),
+              b: pane('b', 'claude', { session: 's-b', conversation: 'conv-b' }),
+            },
+          },
+        },
+        {
+          id: 't1',
+          tree: {
+            root: split(leaf('d'), leaf('e')),
+            panes: {
+              d: pane('d', 'editor'),
+              e: pane('e', 'claude', { session: 's-e' }),
+            },
+          },
+        },
+      ],
+      detached: { f: pane('f', 'claude', { session: 's-f' }) },
+    }
+
+    const names = {
+      's-a': 'agents',
+      // Filed under the *conversation*, which is where the CLI puts it after a `/clear` —
+      // `s-b` is the id cide spawned the pane under and is not where the name lives.
+      'conv-b': 'git-details',
+      's-c': 'refactor',
+      // A name for a session no pane in this project holds. It must not appear anywhere.
+      's-zzz': 'someone else’s project',
+    }
+
+    const rows = claudeSessions(project, names)
+
+    eq(
+      rows.map((r) => r.pane),
+      ['a', 'b', 'c', 'e', 'f'],
+      'reading order — a split’s `a` half (its left or top) before its `b`, tabs in strip '
+        + 'order, detached panes last — and NOT the insertion order of the `panes` map, which '
+        + 'puts `c` before `b` because `b` was created by a later split',
+    )
+    eq(
+      rows.map((r) => r.index),
+      [1, 2, 3, 4, 5],
+      'numbered 1..N across the whole project, with no holes: the number is a position the '
+        + 'user can count on screen, not an id',
+    )
+    eq(
+      rows.map((r) => r.label),
+      [
+        '1: agents',
+        '2: git-details',
+        '3: refactor',
+        '4: cide : claude',
+        '5: cide : claude',
+      ],
+      'the label is `N: name`, and a conversation nobody has named falls back to the pane’s '
+        + 'own title rather than to a gap — a row a user cannot identify is worse than one '
+        + 'identified coarsely',
+    )
+    eq(
+      rows.find((r) => r.pane === 'b').name,
+      'git-details',
+      'the CONVERSATION is consulted before the session: after a `/clear` the CLI files its '
+        + 'record under the new id, so looking only at `session` silently loses the name for '
+        + 'exactly the panes that have been used longest',
+    )
+    eq(
+      rows.filter((r) => r.name === null).map((r) => r.pane),
+      ['e', 'f'],
+      'and an absent name is `null`, not `\'\'` — "nobody named this" and "somebody named it '
+        + 'empty" are different facts, and only the first may fall back to a title',
+    )
+    ok(
+      !rows.some((r) => r.label.includes('someone else')),
+      'a name for a conversation no pane here holds matches nothing: the map is the whole '
+        + 'machine on purpose, and the pane ids cide minted are what narrow it',
+    )
+    eq(
+      rows.map((r) => r.title),
+      ['cide : claude', 'cide : claude', 'cide : claude', 'cide : claude', 'cide : claude'],
+      'the pane’s own title is carried too, so a caller naming the destination in a sentence '
+        + 'does not have to go back to the mirror for it at a different instant',
+    )
+    eq(
+      claudeSessions({ tabs: [], detached: {} }, names),
+      [],
+      'a project with no tabs at all lists nothing rather than failing — which is what the '
+        + 'menu’s `disabledReason` is for, and why this must not throw on the way there',
+    )
+    eq(
+      claudeSessions(
+        {
+          tabs: [{ id: 't', tree: { root: leaf('x'), panes: { x: pane('x', 'terminal') } } }],
+          detached: {},
+        },
+        names,
+      ),
+      [],
+      'and a project whose only panes are terminals and editors lists nothing: `kind` is the '
+        + 'filter, so a shell pane can never be offered a mention it cannot receive',
+    )
+    eq(
+      claudeSessions(project, {}).map((r) => r.label),
+      [
+        '1: cide : claude',
+        '2: cide : claude',
+        '3: cide : claude',
+        '4: cide : claude',
+        '5: cide : claude',
+      ],
+      'with no names at all — no `~/.claude`, a relocated CLAUDE_CONFIG_DIR, a fetch that has '
+        + 'not landed yet — every row still lists and still sends. The labels are worse; the '
+        + 'feature is not missing',
+    )
+    eq(
+      claudeSessions(
+        {
+          tabs: [
+            {
+              id: 't',
+              tree: { root: leaf('p'), panes: { p: pane('p', 'claude', { session: null }) } },
+            },
+          ],
+          detached: {},
+        },
+        names,
+      ).map((r) => [r.index, r.name]),
+      [[1, null]],
+      'a Claude pane with no session id — a resume splash with no process behind it — still '
+        + 'gets a row and a number. Skipping it would put holes in a numbering the user is '
+        + 'counting off the screen, and whether a pane’s `claude` is on the IDE server is not '
+        + 'something this webview can see anyway: the send reports that, with a sentence',
+    )
   }
 
   if (failed > 0) {

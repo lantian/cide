@@ -7,7 +7,7 @@
  *
  * `bool::default()` is `false`. [`ClaudeCli`] carries a container-level `#[serde(default)]`,
  * so a *derived* `Default` here would make every `workspace.json` written before this field
- * existed — which is every one of them — deserialize with **all four injections off**. Every
+ * existed — which is every one of them — deserialize with **every injection off**. Every
  * user's hooks and resume would die on the launch after an upgrade, from a screen they never
  * opened, with no runtime symptom pointing at it: the pane starts fine and simply reports
  * nothing. `ProxyScope` carries the same hand-written `Default` for the same class of bug.

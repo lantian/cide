@@ -68,7 +68,7 @@ use crate::child_env::EnvChange;
 
 /// One argument **cide itself** puts on a Claude pane's command line.
 ///
-/// # Why four toggles with a spelling, rather than a harness profile
+/// # Why a toggle each, with a spelling, rather than a harness profile
 ///
 /// The need this answers was reported as *"need to be able to rename arguments or even
 /// disable, in case i want to run another harness instead of claude code, for example opencode
@@ -84,10 +84,11 @@ use crate::child_env::EnvChange;
 ///   reload, the finished-turn notification and the CLI's own theme — in order to drop a single
 ///   flag. Hooks are by far the expensive half of what cide injects, and forcing them off to
 ///   fix an unrelated flag is a trade nobody would choose. The stored shape below would migrate
-///   to a profile cleanly if the four-row screen ever proves confusing; the reverse is not true.
+///   to a profile cleanly if the row-per-flag screen ever proves confusing; the reverse is not
+///   true.
 /// * **Toggles with no rename.** Satisfies the letter of the report, which led with "disable".
-///   Rejected because once the injected set is a *table* rather than four string literals in
-///   two functions, the spelling is one more column of that table and needs no new mechanism —
+///   Rejected because once the injected set is a *table* rather than a string literal per flag
+///   in two functions, the spelling is one more column of that table and needs no new mechanism —
 ///   and because refusing a rename would be arbitrary beside [`cide_ipc::ClaudeCli::binary`],
 ///   which already lets the user substitute the *program*. If the rename inputs turn out to be
 ///   a footgun they can be dropped without touching the toggles.
@@ -115,6 +116,9 @@ pub enum Injection {
     /// `--settings <inline json>`: the hook payload, and therefore everything cide knows about
     /// what a pane's agent is doing.
     Settings,
+    /// `--mcp-config <inline json>`: cide's own MCP server, `cide-hook mcp`, bridging the pane's
+    /// agent to `$CIDE_AGENT_SOCK` — the task tools, and on a console pane the subagent tools.
+    McpConfig,
 }
 
 /// One row of [`INJECTIONS`]: what cide adds, how it spells it, and where the user's
@@ -129,7 +133,7 @@ pub struct InjectionSpec {
     /// What crosses the wire, and therefore what a Settings row is keyed by — a discarded
     /// rename's sentence is looked up under this, not under the flag, because the flag it was
     /// looked up by is the one that was thrown away. `check-claude-cli.mjs` asserts these are
-    /// the same four names the screen uses; a typo here is a sentence that never appears.
+    /// the same names the screen uses; a typo here is a sentence that never appears.
     pub key: &'static str,
     /// Which field of [`cide_ipc::ClaudeInjections`] configures this one.
     ///
@@ -140,12 +144,35 @@ pub struct InjectionSpec {
     pub of: fn(&ClaudeInjections) -> &ClaudeInjection,
 }
 
-/// Everything cide puts on a Claude pane's command line that the user did not type.
+/// Everything cide puts on a Claude pane's command line **that the user can switch off**, and
+/// since M18 that is again the whole list.
 ///
-/// The list is closed and it is this one. `cide_claude::conversation` emits the first three and
-/// `cmd::session.rs` the fourth; nothing else adds an argument to a pane, and the headless
-/// one-shot lane (`cide_claude::headless::argv`) is deliberately not here — see its own note
-/// and the sentence the Settings screen carries about it.
+/// `cide_claude::conversation` emits the first three, and `cmd::session.rs` the last two. The
+/// headless one-shot lane (`cide_claude::headless::argv`) is deliberately not here — see its own
+/// note and the sentence the Settings screen carries about it.
+///
+/// # The fifth row, and why it was owed
+///
+/// M18 attached cide's own MCP server to every Claude pane — `--mcp-config <inline json>` naming
+/// `cide-hook mcp`, a stdio bridge to the socket in `$CIDE_AGENT_SOCK`, which is how a pane's
+/// agent reads and writes this project's `.cide/tasks.json` through `mcp__cide__cide_task_*`
+/// rather than by editing the file behind cide's back, and how a console pane reaches the
+/// `mcp__cide__cide_agent*` tools at all. It shipped with no row here, because a fifth row is a
+/// fifth field on [`cide_ipc::ClaudeInjections`] and therefore a wire-shape change: the stored
+/// struct, the generated bindings, the Settings screen and `check:claude-cli` move together. It
+/// is inline JSON and not a file, so nothing is written into the user's project either way.
+///
+/// It earns a row rather than being unconditional because switching it off is a coherent thing
+/// to want and costs something a user can be told: the pane works, the session keeps every MCP
+/// server the *user* configured (cide has never passed `--strict-mcp-config`), and what goes is
+/// the tracker — plus, on the console pane, the ability to dispatch a subagent at all.
+///
+/// **Two lanes are deliberately not gated by it.** `cide_agents::harness::claude` attaches its
+/// own bridge to a *subagent run* unconditionally: a run reports back only through the tracker,
+/// so a run without it would be a run nobody can see, which is not the same trade as a pane
+/// whose author asked for a plain Claude Code. And a run is not a pane — nothing about it is
+/// spawned from this screen's argv. `cide_claude::headless::argv` is out for the reason it
+/// already gives.
 pub const INJECTIONS: &[InjectionSpec] = &[
     InjectionSpec {
         injection: Injection::SessionId,
@@ -170,6 +197,15 @@ pub const INJECTIONS: &[InjectionSpec] = &[
         key: "settings",
         default_flag: "--settings",
         of: |inject| &inject.settings,
+    },
+    // Last, and `cmd::session.rs` writes it last too, which is not cosmetic: `--mcp-config
+    // <configs...>` is variadic and collects every following token that does not begin with
+    // `-`, so the only token that may follow it is its own JSON.
+    InjectionSpec {
+        injection: Injection::McpConfig,
+        key: "mcpConfig",
+        default_flag: "--mcp-config",
+        of: |inject| &inject.mcp_config,
     },
 ];
 
@@ -273,8 +309,8 @@ const OVERRIDE_COLLIDES: &str = "Two of the arguments cide adds cannot be spelle
 /// comes back on is worth one line rather than a silent surprise later.
 ///
 /// The [`Judged::index`] on a note is the row's position in [`INJECTIONS`], not a position in
-/// anything the user typed — these four rows are a fixed table, and the screen finds its row
-/// by injection rather than by text.
+/// anything the user typed — these rows are a fixed table, and the screen finds its row by
+/// injection rather than by text.
 pub fn injected(cli: &ClaudeCli) -> (Injected, Vec<Judged>) {
     let cfg = &cli.inject;
     let mut notes: Vec<Judged> = Vec::new();
@@ -362,10 +398,10 @@ pub fn injected(cli: &ClaudeCli) -> (Injected, Vec<Judged>) {
 /// renamed upstream stops being refused, which degrades to today's behaviour — the user gets
 /// what they asked for and the pane breaks — rather than to a refusal of something harmless.
 ///
-/// # Four of the seven are conditional, and three are not
+/// # Five of the eight are conditional, and three are not
 ///
 /// [`RefusedArg::because`] carries that distinction, and it is the whole reason the injection
-/// switches are safe to have. Four entries here exist *because cide passes the flag*; the
+/// switches are safe to have. Five entries here exist *because cide passes the flag*; the
 /// moment it stops, the refusal has to lift or the screen would disable a feature and then
 /// forbid the replacement. Three — `--bare`, `--print` and `--continue` — are about the flag
 /// itself or about a combination, and `--continue` is the one worth reading twice: it is
@@ -429,6 +465,27 @@ pub const REFUSED_ARGS: &[RefusedArg] = &[
         because: Some(Injection::Settings),
     },
     RefusedArg {
+        flag: "--mcp-config",
+        aliases: &[],
+        // Variadic — `--mcp-config <configs...>` — so the value rule here is the same judgement
+        // `user_args` records for `--resume`: refusing the flag swallows ONE following non-flag
+        // token, and a user who wrote two configurations loses the flag, loses the first, and
+        // keeps the second as a positional. The readout is what makes that survivable: the
+        // surviving row is printed in the resolved argv where it can be seen and deleted.
+        takes_value: true,
+        reason: "cide passes this itself, attaching its own `cide` server: the cide-hook \
+                 mcp bridge that gives this pane the mcp__cide__cide_task_* tools, and on a \
+                 project's console pane the mcp__cide__cide_agent* ones. It is variadic \
+                 (--mcp-config <configs...>) and collects every following token that does not \
+                 begin with `-`, which is why cide writes its own LAST, where the only token \
+                 after it is its own JSON; yours would be written first, so it swallows the \
+                 rest of your arguments instead. Put your own servers in .mcp.json or \
+                 ~/.claude.json, neither of which cide edits — or switch cide's injection off \
+                 in Settings, which lifts this refusal and costs you the task tracker and, on \
+                 the console pane, subagents.",
+        because: Some(Injection::McpConfig),
+    },
+    RefusedArg {
         flag: "--bare",
         aliases: &[],
         takes_value: false,
@@ -454,17 +511,54 @@ pub const REFUSED_ARGS: &[RefusedArg] = &[
 /// `--safe-mode` disables hooks the way `--bare` does, and unlike `--bare` it leaves
 /// authentication alone and exists precisely to be reached for when a configuration is broken —
 /// so refusing it would take away a troubleshooting tool to protect a status line.
-pub const WARNED_ARGS: &[RefusedArg] = &[RefusedArg {
-    flag: "--safe-mode",
-    aliases: &[],
-    takes_value: false,
-    reason: "Starts with hooks disabled, so this pane reports no session state: the status bar \
-             shows no token figures and the close confirmation cannot tell a busy agent from an \
-             idle one. The pane itself works.",
-    // Nothing cide injects is implicated: this is a flag whose *effect* overlaps the hooks,
-    // not a duplicate of one cide passes, so it is warned however the injections are set.
-    because: None,
-}];
+///
+/// `--append-system-prompt-file` is that same line drawn from the other side, and it is the
+/// sharper case: it costs nothing at all on its own, and what it collides with is not the CLI
+/// and not another flag of the user's but **a paragraph cide adds**. Refusing it would take a
+/// working field away to protect cide's own addition, which is the wrong way round.
+pub const WARNED_ARGS: &[RefusedArg] = &[
+    RefusedArg {
+        flag: "--safe-mode",
+        aliases: &[],
+        takes_value: false,
+        reason: "Starts with hooks disabled, so this pane reports no session state: the status \
+                 bar shows no token figures and the close confirmation cannot tell a busy agent \
+                 from an idle one. The pane itself works.",
+        // Nothing cide injects is implicated: this is a flag whose *effect* overlaps the hooks,
+        // not a duplicate of one cide passes, so it is warned however the injections are set.
+        because: None,
+    },
+    RefusedArg {
+        flag: "--append-system-prompt-file",
+        aliases: &[],
+        takes_value: true,
+        reason: "Works perfectly on its own, and cannot be combined with the \
+                 --append-system-prompt cide adds to a project's primary pane: the CLI refuses \
+                 the pair outright — “Cannot use both --append-system-prompt and \
+                 --append-system-prompt-file. Please use only one.”, measured on 2.1.235 — and \
+                 a pane that gets both never starts. Your file is not the thing that gives way: \
+                 cide drops its own paragraph on such a pane, so the pane starts and your file \
+                 is read in full, and the subagent roster that paragraph carries reaches the \
+                 model through the tool descriptions instead. The only cost is that it arrives \
+                 slightly weaker.",
+        // Warned and not refused, and the line this table's own header draws — "whether the
+        // user could plausibly mean it" — is what puts it on this side. The flag is legitimate,
+        // it is inert on every pane cide adds no paragraph to, and it is the user's decision;
+        // the conflict is entirely with cide's own addition.
+        //
+        // [`fold_append_system_prompt`] repairs the neighbouring case and cannot repair this
+        // one: it folds the user's text and cide's into ONE occurrence of ONE flag, and these
+        // are two mutually exclusive flags — there is nothing to fold into. So the repair has
+        // to happen at the call site that adds the roster paragraph, by adding nothing when
+        // this flag is present, and this row is what tells the user why the roster is weaker
+        // on that pane rather than leaving them to notice.
+        //
+        // `because: None` for the same reason `--safe-mode` carries it: what this collides with
+        // is a paragraph, not one of the arguments [`INJECTIONS`] can switch off, so no
+        // toggle on the Settings screen lifts it.
+        because: None,
+    },
+];
 
 /// One entry of [`REFUSED_ARGS`] or [`WARNED_ARGS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,6 +662,17 @@ pub const REFUSED_ENV: &[(&str, &str)] = &[
     (
         "CIDE_HOOK_SOCK",
         "cide's own hook socket. A pane that cannot reach it reports no session state at all.",
+    ),
+    (
+        "CIDE_AGENT_SOCK",
+        "cide's own task socket, one per running cide: it is how this pane's claude reaches \
+         *this* project's task tracker, through cide-hook mcp. A value set here would point the \
+         task tools at another cide instance's socket, so an agent would read and write a \
+         different project's .cide/tasks.json — data crossing between projects rather than a \
+         feature that fails, and it would surface as your tracker quietly containing somebody \
+         else's work. Nothing is broken today: the spawn sets this variable after this list is \
+         applied and the last write of a name is the one the child gets, so what this row adds \
+         is the sentence on this screen rather than a correct socket.",
     ),
     (
         "TERM",
@@ -977,6 +1082,180 @@ pub fn plan_here(cli: &ClaudeCli) -> Plan {
 }
 
 // ==========================================================================================
+// The one argument cide adds that the user is also allowed to pass.
+// ==========================================================================================
+
+/// The flag [`fold_append_system_prompt`] is about, spelled once: two spellings is one scan
+/// that misses an occurrence and a second one written beside it.
+///
+/// Read out of `claude --help` on 2.1.235 — `--append-system-prompt <prompt>  Append a system
+/// prompt to the default system prompt` — rather than remembered, which is the standard
+/// [`REFUSED_ARGS`] sets.
+const APPEND_SYSTEM_PROMPT: &str = "--append-system-prompt";
+
+/// Fold cide's own `--append-system-prompt` into the user's, so exactly one reaches the child.
+///
+/// # The measurement
+///
+/// On 2.1.235 a second occurrence does not error: the **last one silently wins** and every
+/// earlier one is discarded — no warning, no log line, no non-zero exit. Verified positionally
+/// rather than by content, by running the pair twice with the two values reversed and watching
+/// which sentinel came back:
+///
+/// ```text
+/// claude -p --tools "" --append-system-prompt 'always BEGIN every reply with ALPHA' \
+///                      --append-system-prompt 'always END every reply with OMEGA' 'Say middle.'
+/// → "middle\n\nOMEGA"     # ALPHA gone; swapped, it is OMEGA that goes and ALPHA that survives
+/// ```
+///
+/// # Why a fold and not a [`WARNED_ARGS`] row
+///
+/// `cmd::session.rs` writes the user's tokens **first** and everything cide adds after them,
+/// and that order is load-bearing: `--add-dir`, `--mcp-config`, `--allowedTools` and `--tools`
+/// are variadic, so a user flag placed last would swallow cide's uuid. It follows that the
+/// moment cide passes an `--append-system-prompt` of its own, cide's is the later one — and by
+/// the rule above the user's is the one that vanishes. A field that works today would quietly
+/// stop working, with nothing on screen saying so.
+///
+/// A `WARNED_ARGS` entry was the other option and it loses twice. A warning is a sentence on a
+/// screen the user has to go and read, which is not a fix for a prompt that disappears; and it
+/// would be *wrong* on every pane where cide adds no paragraph, because there the user's flag
+/// works perfectly. Every other row of those tables is about a token cide cannot honour. This
+/// one it can.
+///
+/// # The rule
+///
+/// The user's text goes first and cide's second, separated by a blank line, because cide's
+/// paragraph is an instruction about tools that should read as an addition to whatever the
+/// user set rather than a preamble to it.
+///
+/// With more than one user occurrence the value that survives is the **last** one's, which
+/// deliberately reproduces the CLI's own last-wins rule rather than inventing a different one:
+/// folding all of them would hand the model text the CLI would have thrown away, and keeping
+/// the first would silently swap which of two sentences the user is reading back. The earlier
+/// occurrences are dropped so that exactly one reaches the child — leaving them would work,
+/// since the CLI discards them anyway, but an argv nobody can read back is how the next person
+/// ends up re-deriving this whole comment.
+///
+/// Nothing else moves: the surviving occurrence stays where the user put it, in the spelling
+/// they wrote, and no other token changes position relative to its neighbours.
+///
+/// # What the parsing had to match, and it is not this file's other rule
+///
+/// Both spellings the CLI accepts are handled — `--append-system-prompt VALUE` as two tokens
+/// and `--append-system-prompt=VALUE` as one; the `=` form was probed and is parsed as the
+/// option, not left as a positional.
+///
+/// The two-token form takes the next token **unconditionally, flag-looking or not**. That is
+/// measured, and it is the opposite of [`user_args`]'s swallowing rule, which stops at a token
+/// beginning with `-`: `--append-system-prompt --append-system-prompt-file notes.txt` does not
+/// raise the CLI's own "cannot use both" error, because there is no second option there at all
+/// — the literal string `--append-system-prompt-file` became the prompt. A fold that stopped
+/// at `-` would therefore change what the child is told, which is the one thing this must not
+/// do.
+///
+/// A trailing occurrence with no value is the exception, and the CLI rejects it outright
+/// (`error: option '--append-system-prompt <prompt>' argument missing`). It is folded as an
+/// empty user value, so the pane starts with cide's paragraph alone. That is a repair, chosen
+/// because the alternative is worse: leaving a dangling flag in front of cide's would make
+/// cide's own flag *name* be read as the user's prompt.
+///
+/// An `ours` that is blank folds nothing at all and leaves the vector alone — a project with
+/// no subagents configured has no roster paragraph, and an empty flag would be two more tokens
+/// in every argv for nothing.
+///
+/// # Two neighbours this deliberately leaves alone
+///
+/// * **`--system-prompt`** *replaces* the default system prompt instead of appending to it, so
+///   a user who sets one has made a much larger decision than an append. Silently folding
+///   something into it would edit a prompt they wrote deliberately — and it is not necessary,
+///   because cide's paragraph still arrives as its own `--append-system-prompt` beside it,
+///   which is exactly the arrangement they asked for.
+/// * **`--append-system-prompt-file`** is a different option and cannot be folded from here
+///   without reading a file this function has no business touching. What makes leaving it
+///   acceptable is that it is not silent: giving both is refused by the CLI, loudly and before
+///   any turn — `Error: Cannot use both --append-system-prompt and --append-system-prompt-file.
+///   Please use only one.` (measured). A pane that dies with that sentence in its own
+///   transcript is a bug report that writes itself; a prompt that vanishes is not.
+pub fn fold_append_system_prompt(args: &mut Vec<String>, ours: &str) {
+    if ours.trim().is_empty() {
+        return;
+    }
+
+    // Every occurrence as (index of the flag token, how many tokens it owns, its value),
+    // collected in one pass before anything is edited. Rewriting while scanning would renumber
+    // the indices under the loop, which is the ordinary way this shape of code drops the wrong
+    // duplicate.
+    let mut found: Vec<(usize, usize, String)> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        // The same whole-token, `=`-splitting match the refusal table uses, rather than a
+        // second parser: a `starts_with` here would fold `--append-system-prompt-file`, which
+        // is the option this must not touch.
+        if !RefusedArg::matches_as(APPEND_SYSTEM_PROMPT, &args[index]) {
+            index += 1;
+            continue;
+        }
+        match args[index].split_once('=') {
+            // `--append-system-prompt=…` carries its own value and owns exactly one token.
+            Some((_, value)) => {
+                found.push((index, 1, value.to_string()));
+                index += 1;
+            }
+            None => match args.get(index + 1) {
+                // The next token, whatever it looks like. See this function's own note: the
+                // CLI does not stop at a `-` here, so neither may this.
+                Some(value) => {
+                    found.push((index, 2, value.clone()));
+                    index += 2;
+                }
+                // Nothing follows — the shape the CLI rejects as `argument missing`.
+                None => {
+                    found.push((index, 1, String::new()));
+                    index += 1;
+                }
+            },
+        }
+    }
+
+    let Some((index, width, theirs)) = found.pop() else {
+        // Nothing of the user's to fold into: cide's is simply appended, which is what a spawn
+        // site would have written before this function existed.
+        args.push(APPEND_SYSTEM_PROMPT.to_string());
+        args.push(ours.to_string());
+        return;
+    };
+
+    // The user's text verbatim — never trimmed or normalised, for the reason `Judged::text`
+    // gives — with cide's paragraph after it and a blank line between. A value that is only
+    // whitespace contributes nothing but would push cide's paragraph off the top of the
+    // prompt, so it is treated as the empty one.
+    let folded = if theirs.trim().is_empty() {
+        ours.to_string()
+    } else {
+        format!("{theirs}\n\n{ours}")
+    };
+    // Written back in the spelling the surviving occurrence used, so a user reading their argv
+    // back recognises the row they typed.
+    let replacement = if width == 1 && args[index].contains('=') {
+        vec![format!("{APPEND_SYSTEM_PROMPT}={folded}")]
+    } else {
+        vec![APPEND_SYSTEM_PROMPT.to_string(), folded]
+    };
+    // `splice` applies when the iterator it returns is dropped, at the end of this statement.
+    // Only indices at or after `index` move, which is what leaves the earlier ranges below
+    // still valid.
+    args.splice(index..index + width, replacement);
+
+    // Then the occurrences the CLI itself would have discarded. Back to front, because every
+    // removal renumbers everything after it and the ranges were measured against the original
+    // vector.
+    for (index, width, _) in found.into_iter().rev() {
+        args.drain(index..index + width);
+    }
+}
+
+// ==========================================================================================
 // The binary.
 // ==========================================================================================
 
@@ -1119,6 +1398,7 @@ mod tests {
             Injection::Resume => &mut cli.inject.resume,
             Injection::ForkSession => &mut cli.inject.fork_session,
             Injection::Settings => &mut cli.inject.settings,
+            Injection::McpConfig => &mut cli.inject.mcp_config,
         }
     }
 
@@ -1150,7 +1430,13 @@ mod tests {
                 .iter()
                 .map(|(_, flag)| flag)
                 .collect::<Vec<&str>>(),
-            ["--session-id", "--resume", "--fork-session", "--settings"],
+            [
+                "--session-id",
+                "--resume",
+                "--fork-session",
+                "--settings",
+                "--mcp-config"
+            ],
             "the default configuration spells cide's own arguments exactly as it always has"
         );
         assert_eq!(ClaudeSettings::default().cli.binary, "claude");
@@ -1327,7 +1613,13 @@ mod tests {
         assert_eq!(inject, Injected::defaults());
         assert_eq!(
             flags(&ClaudeCli::default()),
-            ["--session-id", "--resume", "--fork-session", "--settings"]
+            [
+                "--session-id",
+                "--resume",
+                "--fork-session",
+                "--settings",
+                "--mcp-config"
+            ]
         );
         for spec in INJECTIONS {
             assert!(
@@ -1362,7 +1654,34 @@ mod tests {
         assert_eq!(inject.flag(Injection::Settings), None);
         assert!(!inject.has(Injection::Settings));
         assert_eq!(inject.flag(Injection::SessionId), Some("--session-id"));
-        assert_eq!(flags(&without(Injection::Settings)).len(), 3);
+        assert_eq!(flags(&without(Injection::Settings)).len(), 4);
+    }
+
+    /// The task-tools switch, which is the one whose default is the feature. (M18)
+    ///
+    /// On, cide writes `--mcp-config` and a user's own copy is refused; off, cide writes none
+    /// and the flag becomes the user's to pass. Both halves, because the pair is the property
+    /// the injection switches exist for — a screen that disables a feature and then forbids the
+    /// replacement is the failure `RefusedArg::because` was added to prevent.
+    #[test]
+    fn the_task_tools_are_injected_by_default_and_the_switch_lifts_its_own_refusal() {
+        let on = injected(&ClaudeCli::default()).0;
+        assert_eq!(on.flag(Injection::McpConfig), Some("--mcp-config"));
+        assert!(
+            arg_verdict("--mcp-config", &on).is_refused(),
+            "cide passes one; a second is the user's own servers or cide's, not both"
+        );
+
+        let off = injected(&without(Injection::McpConfig)).0;
+        assert_eq!(off.flag(Injection::McpConfig), None);
+        assert!(
+            !arg_verdict("--mcp-config", &off).is_refused(),
+            "with cide's own gone the flag is the user's to pass, or the switch would take the \
+             tools away and then forbid the replacement"
+        );
+        // …and nothing else moved.
+        assert_eq!(off.flag(Injection::Settings), Some("--settings"));
+        assert!(arg_verdict("--settings", &off).is_refused());
     }
 
     /// A rename on a switched-off injection still gets its note, because the only way to
@@ -1494,6 +1813,181 @@ mod tests {
         assert!(!notes[0].verdict.is_refused());
     }
 
+    /// Warned, not refused, and therefore **still passed** — which is the half that matters.
+    /// The CLI refuses this flag beside the `--append-system-prompt` cide adds, so a pane that
+    /// got both would die at spawn; the answer is that cide's own paragraph gives way, not the
+    /// user's file, and `fold_append_system_prompt` cannot fold two mutually exclusive flags
+    /// into one. See the row's own note.
+    #[test]
+    fn append_system_prompt_file_is_warned_and_still_reaches_the_child() {
+        assert!(matches!(
+            arg_verdict("--append-system-prompt-file", &Injected::defaults()),
+            Verdict::Warned(_)
+        ));
+        let plan = plan(
+            &cli(&["--append-system-prompt-file", "notes.md"], &[]),
+            None,
+        );
+        assert_eq!(
+            plan.args,
+            ["--append-system-prompt-file", "notes.md"],
+            "the flag and its file survive; refusing them would take a working field away to \
+             protect a paragraph cide invented"
+        );
+        assert!(
+            matches!(plan.arg_notes[0].verdict, Verdict::Warned(_)),
+            "and the screen says what it costs"
+        );
+        assert_eq!(
+            plan.arg_notes[1].verdict,
+            Verdict::Accepted,
+            "a warned flag swallows nothing, so its value is judged on its own"
+        );
+        assert_eq!(plan.refusals().count(), 0);
+        // The neighbouring flag is a strict prefix of this one, so a `starts_with` in either
+        // table would drag it in — and it is the flag the fold is entirely about.
+        assert_eq!(
+            arg_verdict("--append-system-prompt", &Injected::defaults()),
+            Verdict::Accepted
+        );
+    }
+
+    /// A pane whose user asked for nothing of their own: cide's paragraph is simply added.
+    #[test]
+    fn cides_system_prompt_is_appended_when_the_user_passes_none() {
+        let mut args = ["--model", "opus"].map(String::from).to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(
+            args,
+            ["--model", "opus", "--append-system-prompt", "roster"]
+        );
+    }
+
+    /// The regression this function exists for. cide's arguments go *after* the user's, so
+    /// without the fold the CLI's last-wins rule throws the user's away in silence.
+    #[test]
+    fn a_users_append_system_prompt_is_folded_and_not_discarded() {
+        let mut args = ["--append-system-prompt", "be terse"]
+            .map(String::from)
+            .to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(args, ["--append-system-prompt", "be terse\n\nroster"]);
+    }
+
+    #[test]
+    fn the_equals_form_is_folded_in_the_spelling_it_was_written_in() {
+        let mut args = ["--append-system-prompt=be terse"]
+            .map(String::from)
+            .to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(args, ["--append-system-prompt=be terse\n\nroster"]);
+    }
+
+    /// Two of the user's own. The CLI would keep the last and silently drop the first, and the
+    /// fold reproduces that rather than inventing a rule of its own.
+    #[test]
+    fn two_user_occurrences_fold_the_one_the_cli_would_have_kept() {
+        let mut args = [
+            "--append-system-prompt",
+            "first",
+            "--append-system-prompt=second",
+        ]
+        .map(String::from)
+        .to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(args, ["--append-system-prompt=second\n\nroster"]);
+        assert_eq!(
+            args.iter()
+                .filter(|token| RefusedArg::matches_as(APPEND_SYSTEM_PROMPT, token))
+                .count(),
+            1,
+            "exactly one occurrence may reach the child"
+        );
+    }
+
+    /// Everything else keeps its neighbours and its order, including the variadic `--add-dir`
+    /// whose tokens are the reason cide's arguments go last in the first place.
+    #[test]
+    fn folding_moves_no_other_argument() {
+        let mut args = [
+            "--model",
+            "opus",
+            "--append-system-prompt",
+            "first",
+            "--add-dir",
+            "/srv/notes",
+            "--append-system-prompt",
+            "second",
+            "--permission-mode",
+            "plan",
+        ]
+        .map(String::from)
+        .to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(
+            args,
+            [
+                "--model",
+                "opus",
+                "--add-dir",
+                "/srv/notes",
+                "--append-system-prompt",
+                "second\n\nroster",
+                "--permission-mode",
+                "plan",
+            ]
+        );
+    }
+
+    /// A project with no subagents configured has no roster paragraph, and an empty flag would
+    /// be two more tokens in every argv for nothing.
+    #[test]
+    fn a_blank_paragraph_of_cides_own_folds_nothing() {
+        let mut args = ["--append-system-prompt", "be terse"]
+            .map(String::from)
+            .to_vec();
+        fold_append_system_prompt(&mut args, "   ");
+        assert_eq!(args, ["--append-system-prompt", "be terse"]);
+    }
+
+    /// The CLI rejects a trailing occurrence outright — `option '--append-system-prompt
+    /// <prompt>' argument missing`. Folded as an empty user value, because leaving the dangling
+    /// flag in front of cide's would make cide's own flag be read as the user's prompt.
+    #[test]
+    fn a_dangling_flag_takes_cides_paragraph_as_its_value() {
+        let mut args = ["--model", "opus", "--append-system-prompt"]
+            .map(String::from)
+            .to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(
+            args,
+            ["--model", "opus", "--append-system-prompt", "roster"]
+        );
+    }
+
+    /// The token after the flag is its value even when it looks like a flag, which is the CLI's
+    /// own parse — measured — and the opposite of `user_args`'s swallowing rule. Also the proof
+    /// that `--append-system-prompt-file` is never matched as this flag by a prefix.
+    #[test]
+    fn the_value_after_the_flag_is_taken_whatever_it_looks_like() {
+        let mut args = [
+            "--append-system-prompt",
+            "--append-system-prompt-file",
+            "notes.txt",
+        ]
+        .map(String::from)
+        .to_vec();
+        fold_append_system_prompt(&mut args, "roster");
+        assert_eq!(
+            args,
+            [
+                "--append-system-prompt",
+                "--append-system-prompt-file\n\nroster",
+                "notes.txt",
+            ]
+        );
+    }
+
     #[test]
     fn the_credential_names_are_refused_in_any_case() {
         for name in [
@@ -1523,6 +2017,7 @@ mod tests {
         for name in [
             "CLAUDE_CODE_SSE_PORT",
             "CIDE_HOOK_SOCK",
+            "CIDE_AGENT_SOCK",
             "TERM",
             "COLUMNS",
             "LINES",
@@ -1534,6 +2029,27 @@ mod tests {
         ] {
             assert!(env_verdict(name, "1", None).is_refused(), "{name}");
         }
+    }
+
+    /// The one in that list whose failure is a *crossing* rather than a breakage: an agent
+    /// pointed at another cide's socket reads and writes a different project's
+    /// `.cide/tasks.json`. Asserted through `plan` and not only `env_verdict`, because what
+    /// matters is that the pair never reaches the child's environment at all.
+    #[test]
+    fn the_task_socket_cannot_be_pointed_at_another_cide() {
+        let plan = plan(
+            &cli(
+                &[],
+                &[("CIDE_AGENT_SOCK", "/run/user/1000/cide/other.sock")],
+            ),
+            None,
+        );
+        assert!(
+            plan.env.is_empty(),
+            "a crossed tracker is worse than no tracker"
+        );
+        assert!(plan.env_notes[0].verdict.is_refused());
+        assert_eq!(plan.refusals().count(), 1);
     }
 
     #[test]
@@ -1757,7 +2273,7 @@ mod tests {
     /// broke it.
     #[test]
     fn the_tables_are_not_empty() {
-        assert!(REFUSED_ARGS.len() >= 7);
+        assert!(REFUSED_ARGS.len() >= 8);
         assert!(REFUSED_ENV.len() >= 10);
         assert!(!WARNED_ARGS.is_empty());
         assert!(!WARNED_ENV.is_empty());

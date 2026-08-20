@@ -1,4 +1,5 @@
 [
+  "cide://agents-changed",
   "cide://close-blocked",
   "cide://diagnostics",
   "cide://fs-changed",
@@ -11,5 +12,6 @@
   "cide://session-state",
   "cide://session-status",
   "cide://session-tool",
+  "cide://tasks-changed",
   "cide://workspace-changed"
 ]

@@ -21,6 +21,31 @@ pub struct Settings {
     pub window_mode: WindowMode,
     pub theme: Theme,
 
+    /// Point size for everything that is **not** a buffer or a terminal.
+    ///
+    /// Beside `theme` rather than in a group of its own, and for the same reason `theme` is a
+    /// scalar: it is one number that repaints the whole window, and a one-field group would
+    /// buy nothing but a type. [`SettingsPatch`](crate::SettingsPatch) patches per top-level
+    /// field, so a scalar also means this is the one font size a caller can move without
+    /// first holding the whole group it lives in — the hazard `ui/src/editor/diffViewMode.ts`
+    /// works around for [`EditorSettings`].
+    ///
+    /// It is a *base*, not the size of any particular label. The chrome draws at fourteen
+    /// design sizes between 8px and 20px, and this number scales all of them proportionally
+    /// through one multiplier — `--ui-scale` in `tokens.css`, which is this over
+    /// [`DEFAULT_UI_FONT_SIZE`]. So at 15 the file tree's 13px rows are 15px and its 10.5px
+    /// path labels are 12.1px; the ratios the design mock specifies are preserved, which is
+    /// what `./run.sh --audit-chrome` measures.
+    ///
+    /// Deliberately *not* named `zoom` and deliberately not a percentage. Icons, borders and
+    /// splitter widths do not follow it, so it is not a zoom level, and calling it one would
+    /// promise a uniform scaling this does not do.
+    ///
+    /// `f32` for [`EditorSettings::font_size`]'s reason — the Settings control steps by half a
+    /// pixel and an integer would snap it. Clamped where a patch lands: see
+    /// [`clamp_ui_font_size`].
+    pub ui_font_size: f32,
+
     /// "Each project keeps its own Claude tab — pinned, cannot be closed, only its panes
     /// can." Off would mean a project with no console tab, which the rest of the model
     /// does not currently allow; the toggle exists in the mock and is honoured as
@@ -71,6 +96,7 @@ impl Default for Settings {
         Self {
             window_mode: WindowMode::default(),
             theme: Theme::default(),
+            ui_font_size: DEFAULT_UI_FONT_SIZE,
             each_project_keeps_claude_tab: true,
             reopen_last_project: true,
             keep_sessions_on_window_close: true,
@@ -177,17 +203,21 @@ pub const SIDEBAR_MAX_WIDTH: u16 = 640;
 
 /// How wide the user left each sidebar panel.
 ///
-/// **Two widths, not one.** The mock gives the explorer 252px and the git panel 420px, and
-/// that difference is a property of the content, not a stylistic accident: the explorer
-/// draws one truncatable name per row, while the git panel draws a path *and* an
-/// added/removed figure *and* a stage checkbox on the same line. Sharing a single number
-/// would mean every switch between the two views resized the workspace under the user, and
-/// whichever panel they had not tuned would be the wrong width — so the resize would feel
+/// **A width per kind of content, not one for the sidebar.** The mock gives the explorer 252px
+/// and the git panel 420px, and that difference is a property of the content, not a stylistic
+/// accident: the explorer draws one truncatable name per row, while the git panel draws a path
+/// *and* an added/removed figure *and* a stage checkbox on the same line. Sharing a single
+/// number would mean every switch between the two views resized the workspace under the user,
+/// and whichever panel they had not tuned would be the wrong width — so the resize would feel
 /// like it had been forgotten rather than remembered.
 ///
-/// Only these two, because only these two are tokens: `--w-sidebar-files` also sizes the
-/// search and problems panels (they are the explorer's column with different rows in it),
-/// which is a decision `tokens.css` already made and this type follows rather than reopens.
+/// The corollary is that panels whose rows *are* alike share one: [`Self::files_width`] serves
+/// the explorer, search and problems, and [`Self::agents_width`] serves both M18 panels.
+///
+/// Only these are tokens: `--w-sidebar-files` also sizes the search and problems panels (they
+/// are the explorer's column with different rows in it), and `--w-sidebar-agents` sizes both
+/// M18 panels — which is a decision `tokens.css` already made and this type follows rather than
+/// reopens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", default)]
 #[ts(export)]
@@ -196,22 +226,57 @@ pub struct SidebarSettings {
     pub files_width: u16,
     /// `--w-sidebar-git`.
     pub git_width: u16,
+    /// `--w-sidebar-agents`: the Agents panel, and with it Tasks. (M18)
+    ///
+    /// # Why `#[serde(default = "…")]` is not optional here
+    ///
+    /// `SidebarSettings` is a **stored** struct. Every existing user's `workspace.json` was
+    /// written before this field existed, and serde refuses a missing non-defaulted field — so
+    /// without this attribute the whole `sidebar` object fails to deserialise on the first
+    /// launch after the upgrade, and with it every setting in the block. The container's
+    /// `#[serde(default)]` does not save it either: that supplies a default for *absent
+    /// members* of `Settings`, not for a member of this struct that a present `sidebar` object
+    /// happens not to mention. [`crate::Pane::conversation`] already had to learn this, and its
+    /// note is the one to read before adding the next stored field anywhere in this crate.
+    ///
+    /// # Why a third width and not [`Self::files_width`]
+    ///
+    /// Reusing the explorer's number is the tempting move and it is wrong for the same reason
+    /// the git panel does not reuse it: 252px is a column of short filenames, one truncatable
+    /// name per row. An Agents row carries a role label, a phase, an elapsed figure **and** a
+    /// task title on two lines, and a Tasks row carries an id, a title and an agent chip. Git
+    /// got 420 on exactly this argument, and 320 is the same argument at this content's width.
+    ///
+    /// **One number for both new panels**, though, rather than two. They are two views of one
+    /// thing — the panel a user widens to read task titles in Agents is the panel they are
+    /// about to read task titles in under Tasks — so a user who drags one and finds the other
+    /// unchanged has been made to do the same work twice. That is the reverse of the
+    /// files/git split, where the two panels are read for different reasons at different times.
+    #[serde(default = "default_agents_width")]
+    pub agents_width: u16,
+}
+
+/// `serde(default)` for [`SidebarSettings::agents_width`]. A bare literal is not a path serde
+/// accepts, which is why this exists rather than the number appearing inline.
+fn default_agents_width() -> u16 {
+    320
 }
 
 impl Default for SidebarSettings {
-    /// The mock's two widths, which are also the two literals `tokens.css` ships as the
-    /// token values — a fresh workspace and a workspace whose settings failed to load look
+    /// The mock's widths, which are also the literals `tokens.css` ships as the token
+    /// values — a fresh workspace and a workspace whose settings failed to load look
     /// identical, which is the point.
     fn default() -> Self {
         Self {
             files_width: 252,
             git_width: 420,
+            agents_width: default_agents_width(),
         }
     }
 }
 
 impl SidebarSettings {
-    /// Both widths brought inside [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`].
+    /// Every width brought inside [`SIDEBAR_MIN_WIDTH`]..=[`SIDEBAR_MAX_WIDTH`].
     ///
     /// Applied where a patch lands rather than where the workspace is read, so the stored
     /// file converges on a legal value instead of being re-clamped forever on every load.
@@ -220,6 +285,9 @@ impl SidebarSettings {
         Self {
             files_width: self.files_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
             git_width: self.git_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
+            agents_width: self
+                .agents_width
+                .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
         }
     }
 }
@@ -271,6 +339,44 @@ pub fn clamp_font_size(size: f32) -> f32 {
         return DEFAULT_CODE_FONT_SIZE;
     }
     size.clamp(MIN_CODE_FONT_SIZE, MAX_CODE_FONT_SIZE)
+}
+
+/// The chrome's base size, and the one everything that is not a buffer or a terminal follows.
+///
+/// This is the literal `tokens.css` has always carried on `html, body`, so the default is the
+/// size the app already drew before there was a setting — which is why [`Settings`] can take
+/// this field on `#[serde(default)]` with no `persist.rs` migration behind it. A defaulted
+/// field is an *inference* whenever the default is a behaviour (see [`EditorSettings::autosave`]
+/// for the case that needed writing down); here the default is the status quo, so an existing
+/// workspace that has never seen this field renders exactly as it did.
+///
+/// The other three copies of this number are `UI_BASE_FONT_SIZE` in `ui/src/settings/fontScale.ts`,
+/// `--fs-ui-13` in `ui/src/styles/tokens.css`, and the divisor in `ui/public/theme-boot.js`.
+/// `check-ui-scale.mjs` pins all four together, for [`DEFAULT_CODE_FONT_SIZE`]'s reason: a
+/// mismatch means the first settings write silently restyles the app.
+pub const DEFAULT_UI_FONT_SIZE: f32 = 13.0;
+
+/// The band the chrome size is held inside, and it is much narrower than the code band.
+///
+/// Not 6..=40, because the two are not the same kind of number. A code size governs one
+/// surface that scrolls; this one multiplies *every* chrome size at once, including the 8px
+/// pin chip and the 34px header. Below 9 that chip is under 6px of glyph and the tab strip's
+/// close buttons are not hittable; above 20 the header alone is over 52px and the header,
+/// tab strip and status bar together take a fifth of a 1080p window before any content.
+pub const MIN_UI_FONT_SIZE: f32 = 9.0;
+pub const MAX_UI_FONT_SIZE: f32 = 20.0;
+
+/// Bring a chrome size inside the band. Same shape, and same `NaN` arm, as [`clamp_font_size`].
+///
+/// The `NaN` arm matters more here than there: this number reaches CSS as a *divisor*, and a
+/// `NaN` scale makes every `calc()` in the ladder invalid, which drops the declaration and
+/// leaves 405 rules with no `font-size` at all — a whole window of UA-default serif.
+#[must_use]
+pub fn clamp_ui_font_size(size: f32) -> f32 {
+    if !size.is_finite() {
+        return DEFAULT_UI_FONT_SIZE;
+    }
+    size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -533,7 +639,7 @@ pub struct ClaudeCli {
 ///
 /// `bool::default()` is `false`. [`ClaudeCli`] carries a container-level `#[serde(default)]`,
 /// so a *derived* `Default` here would make every `workspace.json` written before this field
-/// existed — which is every one of them — deserialize with **all four injections off**. Every
+/// existed — which is every one of them — deserialize with **every injection off**. Every
 /// user's hooks and resume would die on the launch after an upgrade, from a screen they never
 /// opened, with no runtime symptom pointing at it: the pane starts fine and simply reports
 /// nothing. `ProxyScope` carries the same hand-written `Default` for the same class of bug.
@@ -575,11 +681,11 @@ impl Default for ClaudeInjection {
     }
 }
 
-/// The four arguments cide adds to a Claude pane, each independently switchable.
+/// The arguments cide adds to a Claude pane, each independently switchable.
 ///
-/// Four named fields rather than a map keyed by a string: the set is closed — it is exactly
-/// what `cide_core::claude_cli::INJECTIONS` enumerates — and a map would let `workspace.json`
-/// name an injection that does not exist, which is a setting wired to nothing.
+/// Named fields rather than a map keyed by a string: the set is closed — it is exactly what
+/// `cide_core::claude_cli::INJECTIONS` enumerates — and a map would let `workspace.json` name
+/// an injection that does not exist, which is a setting wired to nothing.
 ///
 /// Hand-written `Default` for the same reason [`ClaudeInjection`]'s is; a derived one here
 /// would be correct only for as long as that one stays hand-written, which is not a property
@@ -597,6 +703,31 @@ pub struct ClaudeInjections {
     pub fork_session: ClaudeInjection,
     /// `--settings <inline json>`. Off: **no hooks at all** — see the toggle's own copy.
     pub settings: ClaudeInjection,
+    /// `--mcp-config <inline json>` attaching cide's own MCP server: `cide-hook mcp`, a stdio
+    /// bridge to the socket named by `$CIDE_AGENT_SOCK`. (M18)
+    ///
+    /// Off: the pane still works and still gets every MCP server **you** configured — cide has
+    /// never passed `--strict-mcp-config`, and this switch does not start. What it loses is
+    /// cide's own server: no `mcp__cide__cide_task_*`, so nothing this session does reaches
+    /// `.cide/tasks.json`, and on a project's console pane no `mcp__cide__cide_agent*` either,
+    /// so subagents cannot be dispatched at all. See the toggle's own copy.
+    ///
+    /// # This field is absent from every `workspace.json` that exists, and defaults to *on*
+    ///
+    /// It was added after the injector shipped, so every stored `inject` object on disk names
+    /// the four above and not this one. Two things already in this file fill it, and neither is
+    /// spare: the container's `#[serde(default)]` supplies a member a *present* object does not
+    /// mention, and [`Self::default`] is hand-written so what it supplies cannot become
+    /// `bool::default()`. Remove either and every upgraded pane silently loses its task tools —
+    /// the pane starts, the tracker is simply empty and `mcp__cide__*` is not a tool the model
+    /// has. `an_inject_block_written_before_the_task_tools_switch_still_carries_them` pins the
+    /// literal shape that is on disk today, the way
+    /// `a_sidebar_written_before_the_agents_panel_existed_still_reads` does next door.
+    ///
+    /// The default is *on* rather than off for the reason a tracker is a feature rather than an
+    /// integration: a user who has never heard of any of this should get the task tools, and
+    /// the one who does not want them is the one who will go and find this switch.
+    pub mcp_config: ClaudeInjection,
 }
 
 // Clippy is right that this is `#[derive(Default)]` *today*, and wrong about what that costs.
@@ -613,6 +744,7 @@ impl Default for ClaudeInjections {
             resume: ClaudeInjection::default(),
             fork_session: ClaudeInjection::default(),
             settings: ClaudeInjection::default(),
+            mcp_config: ClaudeInjection::default(),
         }
     }
 }
@@ -624,8 +756,8 @@ impl Default for ClaudeCli {
             binary: "claude".to_string(),
             args: Vec::new(),
             env: Vec::new(),
-            // All four on: the argv a pane is spawned with is byte-for-byte what it was before
-            // these switches existed. See `ClaudeInjection`'s note.
+            // All of them on: the argv a pane is spawned with is byte-for-byte what it was
+            // before these switches existed. See `ClaudeInjection`'s note.
             inject: ClaudeInjections::default(),
         }
     }
@@ -1352,6 +1484,7 @@ mod tests {
             sidebar: SidebarSettings {
                 files_width: 300,
                 git_width: 500,
+                agents_width: 340,
             },
             ..Settings::default()
         };
@@ -1406,8 +1539,8 @@ mod tests {
     ///
     /// Every `workspace.json` on disk predates `ClaudeCli::inject`. `ClaudeCli` carries a
     /// container-level `#[serde(default)]`, so a *derived* `Default` on [`ClaudeInjection`] —
-    /// where `bool::default()` is `false` — would load every one of those files with all four
-    /// injections off: no `--settings` and therefore **no hooks at all**, and no `--session-id`
+    /// where `bool::default()` is `false` — would load every one of those files with every
+    /// injection off: no `--settings` and therefore **no hooks at all**, and no `--session-id`
     /// and therefore no resume, for every user, on the launch after an upgrade, from a screen
     /// they never opened. There is no runtime symptom pointing at it; the pane starts fine and
     /// simply reports nothing.
@@ -1424,6 +1557,7 @@ mod tests {
             &cli.inject.resume,
             &cli.inject.fork_session,
             &cli.inject.settings,
+            &cli.inject.mcp_config,
         ] {
             assert!(injection.enabled, "an upgrade must change nothing");
             assert_eq!(injection.flag, "", "and the spelling is still cide's own");
@@ -1437,17 +1571,50 @@ mod tests {
         assert!(settings.claude.cli.inject.settings.enabled);
     }
 
+    /// Every `inject` block on disk today, read by this build. (M18)
+    ///
+    /// The sibling of `a_sidebar_written_before_the_agents_panel_existed_still_reads`, and the
+    /// same class of regression: `mcpConfig` was added after the injector shipped, so every
+    /// stored `inject` object names the four keys below and not the fifth. Two things fill it —
+    /// the container's `#[serde(default)]` and `ClaudeInjections`' hand-written `Default` — and
+    /// this pins the literal old shape rather than trusting that both stay put. Break either and
+    /// an upgrade silently costs every pane its task tools: the pane starts, `.cide/tasks.json`
+    /// stops being written, and `mcp__cide__*` is simply not a tool the model has.
+    #[test]
+    fn an_inject_block_written_before_the_task_tools_switch_still_carries_them() {
+        // An M18-era value, exactly as that build wrote it: the four keys it knew about, with
+        // one of them switched off so the block is not merely the default by another name.
+        let old = r#"{"binary":"claude","args":[],"env":[],"inject":{
+            "sessionId":{"enabled":true,"flag":""},
+            "resume":{"enabled":true,"flag":""},
+            "forkSession":{"enabled":false,"flag":""},
+            "settings":{"enabled":true,"flag":"--config"}}}"#;
+        let cli: ClaudeCli = serde_json::from_str(old).expect("pre-task-tools inject block");
+        assert!(!cli.inject.fork_session.enabled, "the block still read");
+        assert_eq!(cli.inject.settings.flag, "--config");
+        assert!(
+            cli.inject.mcp_config.enabled,
+            "the task tools are the feature; an upgrade must not take them away"
+        );
+        assert_eq!(cli.inject.mcp_config.flag, "", "at cide's own spelling");
+    }
+
     /// One toggle set does not turn the others off, which is what a hand-written `Default` on
     /// the *container* is for: `#[serde(default)]` fills a missing field from
     /// `ClaudeInjections::default()`, not from `ClaudeInjection`'s derive.
+    ///
+    /// This is also the mechanism the newest field leans on, proved on a field that has been
+    /// there since M16: four of the five keys are absent from the object below and every one of
+    /// them comes back on.
     #[test]
-    fn one_named_injection_leaves_the_other_three_alone() {
+    fn one_named_injection_leaves_the_others_alone() {
         let json = r#"{"inject":{"settings":{"enabled":false}}}"#;
         let cli: ClaudeCli = serde_json::from_str(json).expect("partial inject");
         assert!(!cli.inject.settings.enabled);
         assert!(cli.inject.session_id.enabled);
         assert!(cli.inject.resume.enabled);
         assert!(cli.inject.fork_session.enabled);
+        assert!(cli.inject.mcp_config.enabled);
         // …and a toggle with no spelling beside it is still the default spelling.
         assert_eq!(cli.inject.session_id.flag, "");
     }
@@ -1458,12 +1625,14 @@ mod tests {
         let mut cli = ClaudeCli::default();
         cli.inject.fork_session.flag = "--branch".into();
         cli.inject.session_id.enabled = false;
+        cli.inject.mcp_config.enabled = false;
         let json = serde_json::to_string(&cli).expect("serializes");
         assert!(
             json.contains(r#""forkSession":{"enabled":true,"flag":"--branch"}"#),
             "{json}"
         );
         assert!(json.contains(r#""sessionId":{"enabled":false"#), "{json}");
+        assert!(json.contains(r#""mcpConfig":{"enabled":false"#), "{json}");
         assert_eq!(serde_json::from_str::<ClaudeCli>(&json).unwrap(), cli);
     }
 
@@ -1608,26 +1777,46 @@ mod tests {
 
     /// Half a `sidebar` object, which is what a hand-edited file tends to look like.
     #[test]
-    fn one_named_width_leaves_the_other_at_its_default() {
+    fn one_named_width_leaves_the_others_at_their_defaults() {
         let partial = r#"{"sidebar":{"gitWidth":500}}"#;
         let settings: Settings = serde_json::from_str(partial).expect("partial sidebar");
         assert_eq!(settings.sidebar.git_width, 500);
         assert_eq!(settings.sidebar.files_width, 252);
+        assert_eq!(settings.sidebar.agents_width, 320);
+    }
+
+    /// Every `workspace.json` on disk today, read by this build. (M18)
+    ///
+    /// The regression this guards is total rather than cosmetic: without
+    /// `#[serde(default = "default_agents_width")]` a `sidebar` object that names both of the
+    /// widths it knows about and not the third is a *missing field* error, the whole `sidebar`
+    /// member fails, and the first launch after the upgrade loses the block. A test naming the
+    /// literal old shape is the only thing that keeps the next stored field from repeating it.
+    #[test]
+    fn a_sidebar_written_before_the_agents_panel_existed_still_reads() {
+        let old = r#"{"sidebar":{"filesWidth":300,"gitWidth":500}}"#;
+        let settings: Settings = serde_json::from_str(old).expect("pre-M18 sidebar");
+        assert_eq!(settings.sidebar.files_width, 300);
+        assert_eq!(settings.sidebar.git_width, 500);
+        assert_eq!(settings.sidebar.agents_width, 320);
     }
 
     #[test]
-    fn clamping_pulls_both_widths_inside_the_band_and_leaves_legal_ones_alone() {
+    fn clamping_pulls_every_width_inside_the_band_and_leaves_legal_ones_alone() {
         let clamped = SidebarSettings {
             files_width: 4,
             git_width: 9_000,
+            agents_width: 0,
         }
         .clamped();
         assert_eq!(clamped.files_width, SIDEBAR_MIN_WIDTH);
         assert_eq!(clamped.git_width, SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamped.agents_width, SIDEBAR_MIN_WIDTH);
 
         let legal = SidebarSettings {
             files_width: 300,
             git_width: 500,
+            agents_width: 340,
         };
         assert_eq!(legal.clamped(), legal);
         // The defaults are inside the band, or a first launch would move the panel itself.
@@ -1694,5 +1883,89 @@ mod font_size_tests {
         let back: Settings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.editor.font_size, 13.5);
         assert_eq!(back.terminal.font_size, DEFAULT_CODE_FONT_SIZE);
+    }
+
+    /// The chrome's default is the size the chrome already drew.
+    ///
+    /// That equality is what lets [`Settings`] take this field on `#[serde(default)]` with no
+    /// migration: a workspace written before the field existed deserializes to the number
+    /// `tokens.css` had hard-coded on `html, body` all along, so nothing on screen moves.
+    #[test]
+    fn the_chrome_defaults_to_the_size_it_already_drew() {
+        assert_eq!(Settings::default().ui_font_size, DEFAULT_UI_FONT_SIZE);
+        assert_eq!(
+            DEFAULT_UI_FONT_SIZE, 13.0,
+            "`tokens.css`'s `html, body` base"
+        );
+    }
+
+    /// The chrome band is deliberately narrower than the code band, and stays that way.
+    ///
+    /// Pinned as an inequality rather than as two literals because the *relationship* is the
+    /// decision: one number here multiplies every chrome size at once, so it cannot be given
+    /// the latitude a single scrolling surface gets. Widening this band to the code band is
+    /// the change that would make the 8px pin chip disappear and the header eat the window.
+    #[test]
+    fn the_chrome_band_is_narrower_than_the_code_band() {
+        // `const` blocks, so the four facts are checked when the crate compiles and this test
+        // is only where they are written down. Clippy asks for it and is right to: an
+        // `assert!` over two constants cannot fail at run time, so as a run-time assertion it
+        // reads like a check and is a comment.
+        const {
+            assert!(MIN_UI_FONT_SIZE > MIN_CODE_FONT_SIZE);
+            assert!(MAX_UI_FONT_SIZE < MAX_CODE_FONT_SIZE);
+            assert!(MIN_UI_FONT_SIZE <= DEFAULT_UI_FONT_SIZE);
+            assert!(DEFAULT_UI_FONT_SIZE <= MAX_UI_FONT_SIZE);
+        }
+    }
+
+    /// A hand-edited settings file cannot hand CSS a multiplier that erases the chrome.
+    ///
+    /// The `NaN` arm is the one with teeth. This value becomes a divisor in `--ui-scale`, and
+    /// an invalid `calc()` is not a wrong size — the engine *drops the declaration*, so all
+    /// 405 chrome rules lose their `font-size` together and the window paints in the UA's
+    /// default serif at its default size.
+    #[test]
+    fn a_scale_that_would_erase_the_chrome_is_refused() {
+        assert_eq!(clamp_ui_font_size(0.0), MIN_UI_FONT_SIZE);
+        assert_eq!(clamp_ui_font_size(-12.0), MIN_UI_FONT_SIZE);
+        assert_eq!(clamp_ui_font_size(1_000.0), MAX_UI_FONT_SIZE);
+        assert_eq!(clamp_ui_font_size(f32::NAN), DEFAULT_UI_FONT_SIZE);
+        assert_eq!(clamp_ui_font_size(f32::INFINITY), DEFAULT_UI_FONT_SIZE);
+    }
+
+    /// The chrome size is a scalar, so it moves without carrying a group along with it.
+    ///
+    /// The point of the field's placement beside `theme`: patching it leaves the two code
+    /// sizes exactly where they were. A group would have forced the caller to hold and resend
+    /// them, which is the hazard `ui/src/editor/diffViewMode.ts` exists to work around.
+    #[test]
+    fn a_chrome_size_survives_serde_without_disturbing_the_code_sizes() {
+        let settings = Settings {
+            ui_font_size: 15.5,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.ui_font_size, 15.5);
+        assert_eq!(back.editor.font_size, DEFAULT_CODE_FONT_SIZE);
+        assert_eq!(back.terminal.font_size, DEFAULT_CODE_FONT_SIZE);
+    }
+
+    /// A workspace written before this field existed still deserializes, and to the old look.
+    ///
+    /// The whole justification for no `persist.rs` migration, asserted rather than asserted in
+    /// prose: `#[serde(default)]` on `Settings` fills the gap, and the value it fills it with
+    /// is the one that was hard-coded in the stylesheet.
+    #[test]
+    fn settings_written_before_the_field_existed_load_unchanged() {
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("settings is an object")
+            .remove("uiFontSize")
+            .expect("the field is there to remove");
+        let back: Settings = serde_json::from_value(value).expect("deserialize without the field");
+        assert_eq!(back.ui_font_size, DEFAULT_UI_FONT_SIZE);
     }
 }

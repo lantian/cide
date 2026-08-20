@@ -9,6 +9,8 @@ members = [
     "crates/cide-git",
     "crates/cide-fs",
     "crates/cide-search",
+    "crates/cide-tasks",
+    "crates/cide-agents",
     "crates/cide-lang",
     "crates/cide-lsp",
     "crates/cide-deps",
@@ -19,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -41,6 +43,8 @@ cide-ide-mcp = { path = "crates/cide-ide-mcp" }
 cide-git = { path = "crates/cide-git" }
 cide-fs = { path = "crates/cide-fs" }
 cide-search = { path = "crates/cide-search" }
+cide-tasks = { path = "crates/cide-tasks" }
+cide-agents = { path = "crates/cide-agents" }
 cide-lang = { path = "crates/cide-lang" }
 cide-lsp = { path = "crates/cide-lsp" }
 cide-deps = { path = "crates/cide-deps" }

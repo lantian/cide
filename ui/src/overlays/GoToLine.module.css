@@ -54,7 +54,7 @@
   padding: 9px 14px 7px;
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-ui);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   font-weight: 500;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -71,7 +71,7 @@
 .input {
   flex: 1;
   min-width: 0;
-  height: 26px;
+  height: calc(26px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 3px;
@@ -80,7 +80,7 @@
   /* Mono, and `tabular-nums`, because the content is a number the user is comparing with the
      line count in the note underneath. */
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   font-variant-numeric: tabular-nums;
 }
 
@@ -91,14 +91,14 @@
 
 .button {
   flex: none;
-  height: 26px;
+  height: calc(26px * var(--ui-scale));
   padding: 0 12px;
   border: 1px solid var(--accent);
   border-radius: 3px;
   background: var(--accent);
   color: var(--on-accent);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -124,10 +124,10 @@
  * shrinks under the pointer is how a click aimed at `Go` lands on nothing.
  */
 .note {
-  min-height: 16px;
+  min-height: calc(16px * var(--ui-scale));
   padding: 6px 14px 12px;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1.35;
   color: var(--faint);
 }

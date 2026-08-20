@@ -12,6 +12,7 @@
 import { rememberSpawnPlan } from '@/layout/spawnPlans'
 import { reconcile, restack } from '@/keys/switcher'
 import { windowProjectsOf } from '@/keys/target'
+import { useMemo } from 'react'
 import { create } from 'zustand'
 import { destroyHost, peekHost, releaseHost } from '@/layout/paneHosts'
 import { requestCloseConfirm } from '@/chrome/closeConfirmStore'
@@ -808,7 +809,15 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
     //    per closed pane, and WebKitGTK caps concurrent contexts at roughly 8-16 — a
     //    session spent splitting and closing would stop painting. Detaching a pane into its
     //    own window is the opposite case and uses `releaseHost`, which keeps both.
-    const session = peekHost(pane)?.sessionId
+    //
+    //    The child is a separate question from the host, and the two answers differ for a
+    //    pane that adopted a session it did not spawn — a `claude.mirror`, and every
+    //    subagent run opened into a pane. That pane closes its *view*; the child belongs to
+    //    the pane being mirrored and is not ours to kill. `destroyHost` still runs
+    //    unconditionally, because this pane genuinely is finished, and clearing the ledger's
+    //    session id is what stops a late async continuation resurrecting it.
+    const host = peekHost(pane)
+    const session = host?.mirrored === true ? undefined : host?.sessionId
     destroyHost(pane)
     if (session) await sessionApi.kill(session)
   },
@@ -895,9 +904,26 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
   toggleTheme: () => set((s) => ({ theme: s.theme === 'dark' ? 'light' : 'dark' })),
 }))
 
-/** Projects in header-tab order. */
+/** A stable empty list, so a bootless window does not hand React a new array every read. */
+const NO_PROJECTS: Project[] = []
+
+/**
+ * Projects in header-tab order.
+ *
+ * The `useMemo` is load-bearing and this function is the reason the rule is written down here.
+ * A zustand selector runs on every store read and `useSyncExternalStore` compares the result
+ * with `Object.is`, so `useWorkspace((s) => Object.values(...))` returns a fresh array every
+ * time, React concludes the snapshot changed, re-renders, reads again — and stops only at
+ * *Maximum update depth exceeded*, which unmounts the whole root.
+ *
+ * This one never fired because nothing calls it. `ToolWindowSplitter` wrote the same line and
+ * did fire, and because it renders exactly when the tool window is open — a flag persisted on
+ * `Project` — it emptied the window on every launch. `check:selectors` now refuses the shape in
+ * either place, so neither the live copy nor the dormant one can come back.
+ */
 export function useProjects(): Project[] {
-  return useWorkspace((s) => (s.boot ? Object.values(s.boot.workspace.projects) : []))
+  const projects = useWorkspace((s) => s.boot?.workspace.projects)
+  return useMemo(() => (projects ? Object.values(projects) : NO_PROJECTS), [projects])
 }
 
 /** The project this window is currently showing, if any. */

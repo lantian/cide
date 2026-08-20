@@ -139,10 +139,26 @@ eq(
 
 const sessionCode = strip(sessionRs)
 
+// M18 split this door in two. The composition of a child's environment moved out of
+// `cmd/session.rs` and into `cide_core::child_env::terminal_child_env`, so that a subagent run —
+// which has no pane and so never reaches `session_spawn` — is built from the identical list
+// rather than from a second copy that drifts. The chain is now
+// `base_env` -> `terminal_child_env` -> `claude_env`, and **both** links have to be asserted:
+// checking only the first would pass for a `terminal_child_env` that had quietly stopped folding
+// the settings in, which is the very inertness this section exists to catch.
 ok(
-  /claude_env\s*\(/.test(sessionCode),
-  '`cmd/session.rs` folds `cide_core::child_env::claude_env` into the spec it spawns from — '
-    + 'without this call the whole struct is inert again, and every assertion above still passes',
+  /terminal_child_env\s*\(/.test(sessionCode),
+  '`cmd/session.rs` folds `cide_core::child_env::terminal_child_env` — which composes '
+    + '`claude_env` — into the spec it spawns from. Without this call the whole struct is inert '
+    + 'again, and every assertion above still passes',
+)
+
+const composed = strip(withoutTests(childEnvRs)).split('pub fn terminal_child_env')[1] ?? ''
+
+ok(
+  /claude_env\s*\(/.test(composed),
+  '`terminal_child_env` still folds `claude_env` into the list it returns — the second half of '
+    + 'the same door, now that the composition lives one crate over from the spawn site',
 )
 
 ok(

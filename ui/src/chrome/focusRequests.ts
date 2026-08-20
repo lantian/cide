@@ -43,6 +43,17 @@
  * Transient window chrome, so a store of its own rather than anything in `store/workspace.ts`
  * — that one mirrors Rust-owned durable state and this must never be persisted. It is also
  * per-window by construction, which is right: each Tauri window has its own caret.
+ *
+ * # Its sibling: `chrome/panelRequests.ts`
+ *
+ * Everything above assumes the panel is *already being revealed* by the same caller in the same
+ * tick — which was true while the only callers were `keys/dispatch.ts` arms holding a
+ * `showSidebar` closure. `panelRequests.ts` is the half that reveals, for a caller that has no
+ * such closure (the git log's *Amend…*, four levels below `App` in another subtree), and it
+ * carries a payload where this one carries only a name. Its header sets out why the two are not
+ * one module; the short version is that a focus request is answered by an element and a reveal
+ * request can only be answered by the shell, and that this one has no TTL precisely because its
+ * requests are one render old and an amend's are two.
  */
 import { create } from 'zustand'
 

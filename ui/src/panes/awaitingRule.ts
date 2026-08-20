@@ -43,6 +43,7 @@ export type SessionPhase =
   | 'busy'
   | 'awaitingPermission'
   | 'awaitingInput'
+  | 'paused'
   | 'exited'
 
 /** What is remembered about one session. */
@@ -70,6 +71,12 @@ export const UNSEEN: Track = { ranATurn: false, awaiting: false, gone: false }
  *   `Idle` means "finished".
  * * `Spawning` / `Splash` — the session has not started; a splash is waiting for a click, but
  *   it is a control the user is already looking at rather than news to carry to the task bar.
+ * * `Paused` — frozen by the user, mid-turn, with `SIGSTOP`. Deliberately **not** awaiting, on
+ *   the same argument as `Splash`: the user is the one who froze it, so it is a state they are
+ *   already looking at rather than news to carry to the task bar. Telling somebody "1 session is
+ *   waiting for you" about the session they just paused is the noise this module exists to
+ *   prevent. `ranATurn` survives the freeze — a paused turn is an unfinished turn, not an
+ *   un-run one, so the `Idle` that follows a resume still means "finished".
  * * `Exited` — nothing is waiting for anybody. Reported so the caller drops the entry rather
  *   than leaving a dead session counted for the life of the window.
  */
@@ -87,6 +94,7 @@ export function onState(track: Track, phase: SessionPhase): Track {
       return { ranATurn: track.ranATurn, awaiting: track.ranATurn, gone: false }
     case 'spawning':
     case 'splash':
+    case 'paused':
       return { ranATurn: track.ranATurn, awaiting: false, gone: false }
     case 'exited':
       return { ranATurn: track.ranATurn, awaiting: false, gone: true }

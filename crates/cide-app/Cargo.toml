@@ -30,6 +30,14 @@ cide-lsp = { workspace = true }
 # M13: what a project depends on, for the External Libraries group. Spawns `cargo` and `go`
 # and parses their answers; see `crate::libraries` for the thread it must run on.
 cide-deps = { workspace = true }
+# M18: `.cide/tasks.json`. The store is the single owning actor for a project's tracker; this
+# crate supplies the thread it deliberately does not own and the `AppHandle` it must not know
+# about. See `crate::tasks_state`.
+cide-tasks = { workspace = true }
+# M18: the `cide_task_*` MCP vocabulary — names, schemas and handlers over a `TaskSink`. This
+# crate supplies the socket (`crate::agent_rpc`) and the sink; the vocabulary itself has exactly
+# one definition and is not in the `cide-hook` bridge, which is a dumb pipe.
+cide-agents = { workspace = true }
 
 tauri = { workspace = true }
 tauri-plugin-clipboard-manager = { workspace = true }

@@ -32,7 +32,7 @@ import {
 } from '@/ipc/client'
 import { useWorkspace, type Theme } from '@/store/workspace'
 import { liveHosts } from '@/layout/paneHosts'
-import { fontVariables } from './fontScale'
+import { fontVariables, uiScale } from './fontScale'
 import { refont, retheme } from '@/terminal/xterm'
 import { asThemeName, DEFAULT_THEME, otherTheme, themeToAdopt } from './theme'
 
@@ -183,6 +183,30 @@ function paintFonts(editorSize: number, terminalSize: number): void {
 }
 
 /**
+ * Write the one multiplier the whole chrome is built out of.
+ *
+ * Separate from [`paintFonts`] rather than a fifth entry in `fontVariables`, and the split is
+ * load-bearing twice over. `check-fonts.mjs` pins that function's key set to exactly the four
+ * code tokens, which is what stops a fifth one being added without a reader. And `paintFonts`
+ * ends in `refont`, which walks every live terminal — a chrome size has nothing to say to a
+ * terminal, so folding it in would drop and rebuild xterm's character atlas in every open pane
+ * every time somebody nudges the file tree's size.
+ *
+ * Nothing to repaint imperatively on this side: unlike the terminal, every chrome surface
+ * reads its size through the cascade, so writing the property *is* the update. That is the
+ * whole reason the sweep put 405 literals behind tokens instead of leaving them alone.
+ *
+ * Guarded on the resolved string for [`paintFonts`]'s reason — this listener sees every
+ * snapshot, and almost none of them are font changes.
+ */
+function paintUiScale(size: number): void {
+  const root = document.documentElement
+  const value = String(uiScale(size))
+  if (root.style.getPropertyValue('--ui-scale') === value) return
+  root.style.setProperty('--ui-scale', value)
+}
+
+/**
  * Follow the theme in the workspace mirror, and repaint this window whenever it moves.
  *
  * The other half of the same bug, and the one the user is reporting: "switching theme isn't
@@ -230,7 +254,15 @@ export function installThemeSync(): () => void {
   useWorkspace.getState().setTheme(start)
   paintTheme(start)
   const bootSettings = useWorkspace.getState().boot?.workspace.settings
-  if (bootSettings) paintFonts(bootSettings.editor.fontSize, bootSettings.terminal.fontSize)
+  if (bootSettings) {
+    paintFonts(bootSettings.editor.fontSize, bootSettings.terminal.fontSize)
+    // Usually a no-op, and that is the point: `public/theme-boot.js` has already written this
+    // from `?ui=` while the parser was above <body>, so the first frame was drawn at the right
+    // scale. This is the same value arriving through the supported path, and the guard above
+    // means it costs one string compare. It is not redundant — the audit entry points and any
+    // window opened without the parameter reach here and nowhere else.
+    paintUiScale(bootSettings.uiFontSize)
+  }
 
   const unsubscribe = useWorkspace.subscribe((state, previous) => {
     const adopt = themeToAdopt(
@@ -246,7 +278,10 @@ export function installThemeSync(): () => void {
     }
     paintTheme(state.theme)
     const settings = state.boot?.workspace.settings
-    if (settings) paintFonts(settings.editor.fontSize, settings.terminal.fontSize)
+    if (settings) {
+      paintFonts(settings.editor.fontSize, settings.terminal.fontSize)
+      paintUiScale(settings.uiFontSize)
+    }
   })
 
   themeSyncInstalled = () => {

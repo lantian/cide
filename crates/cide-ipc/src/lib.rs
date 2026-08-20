@@ -9,6 +9,16 @@
 
 pub mod git;
 pub mod headless;
+// The Git tool window: the commit log and its graph, one commit's contents, revisions, blame and
+// the commit-level actions. (M18)
+//
+// Its own module beside `git` rather than a section of it, and its header argues the split at
+// length: everything in `git` is organised around a selection that can go stale, and nothing here
+// can. Not re-exported at the crate root, on the same rule `git` follows — these names are spelled
+// `cide_ipc::history::CommitRow` so the wire's two git vocabularies stay greppable apart. A `///`
+// on the `mod` line would resolve this module's own intra-doc links in *this* file's scope, which
+// is how the four `unresolved link to LogQuery::limit` warnings appeared and then went away.
+pub mod history;
 pub mod ids;
 /// Image documents. Identity only — never the pixels; the module header says why.
 pub mod image;
@@ -27,20 +37,22 @@ pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
 pub use positions::ViewPosition;
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
-    DEFAULT_CODE_FONT_SIZE, EditorSettings, ExplorerSettings, GraphicsSettings, HighlightLevel,
-    InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS, MIN_CODE_FONT_SIZE,
-    MIN_PUSH_DEBOUNCE_MS, ProxyMode, ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH,
-    SIDEBAR_MIN_WIDTH, Settings, SeverityFilter, SidebarSettings, TerminalRenderer,
-    TerminalSettings, clamp_font_size, normalize_proxy_url, redact_proxy_url,
+    DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings,
+    GraphicsSettings, HighlightLevel, InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS,
+    MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, ProxyMode,
+    ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings,
+    SeverityFilter, SidebarSettings, TerminalRenderer, TerminalSettings, clamp_font_size,
+    clamp_ui_font_size, normalize_proxy_url, redact_proxy_url,
 };
 pub use settings_ops::{
     GraphicsRung, GraphicsStatus, KeymapConflict, KeymapEditResult, KeymapProblem, KeymapReport,
     SettingsPatch,
 };
 pub use workspace::{
-    DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, LayoutNode, MAX_RATIO,
-    MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry, RecentProject, SettingsSection,
-    Tab, TabKind, WindowRole, Workspace,
+    DiffAnswer, DiffOrigin, DiffSpec, Direction, DockAnchor, DockSibling, HistoryTab, LayoutNode,
+    MAX_RATIO, MIN_RATIO, Pane, PaneTree, Project, ProjectRoot, RecentEntry, RecentProject,
+    SettingsSection, TOOL_WINDOW_MAX_HEIGHT, TOOL_WINDOW_MIN_HEIGHT, Tab, TabKind, ToolWindowState,
+    WindowRole, Workspace,
 };
 
 // --- M8: file tree, watcher, pickers ---
@@ -71,6 +83,24 @@ pub use diagnostics::{
 };
 pub use symbols::{
     FileOutline, Symbol, SymbolFrame, SymbolIndexStatus, SymbolKind, SymbolRow, SymbolSpan,
+};
+
+// --- M18: subagent orchestration and the task tracker ---
+//
+// Two modules for the same reason `symbols` and `diagnostics` are two: they answer to different
+// producers and neither needs the other's types. `agents` is a process supervisor's view — roles,
+// runs, a queue; `tasks` is a committed JSON file in the user's repository. The only thing they
+// share is the cross-link, and it is one id each way (`AgentRun::task`, `Task::agent`), carried
+// as an id precisely so `cide-agents` never has to hold a `Task`.
+pub mod agents;
+pub mod tasks;
+
+pub use agents::{
+    AgentDef, AgentRoster, AgentRun, DispatchRequest, Harness, OrchestrationConfig,
+    OrchestrationPatch, RunState,
+};
+pub use tasks::{
+    Task, TaskAuthor, TaskBoard, TaskComment, TaskEdit, TaskFile, TaskNew, TaskStatus,
 };
 
 use serde::{Deserialize, Serialize};
@@ -265,8 +295,8 @@ pub enum SplitIntent {
 
 /// Lifecycle of a session, driven by Claude Code hooks with a PTY-quiet fallback.
 ///
-/// "Live session" for the close-confirm setting means `Busy | AwaitingPermission` —
-/// not "the process exists", which would warn constantly.
+/// "Live session" for the close-confirm setting means `Busy | AwaitingPermission | Paused` —
+/// not "the process exists", which would warn constantly. See [`SessionState::is_live`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
     rename_all = "camelCase",
@@ -281,7 +311,37 @@ pub enum SessionState {
     Busy,
     AwaitingPermission,
     AwaitingInput,
-    Exited { code: i32 },
+    /// `SIGSTOP`ped by cide, and not doing anything until a resume sends `SIGCONT`. (M18)
+    ///
+    /// # Why there is no payload, when the registry plainly knows more
+    ///
+    /// The frontend needs exactly **one** fact from the wire here — *this is frozen* — and it
+    /// needs it for two jobs: draw the badge, and refuse keystrokes into a pane whose child
+    /// cannot read them. Neither job can be done better by knowing what the session was doing
+    /// before the freeze.
+    ///
+    /// What a pane actually wants next is the **post-thaw** state, and that is not something a
+    /// payload here could carry honestly: it arrives as its own `cide://session-state` on
+    /// resume, after the `SIGCONT`, which is the only moment anybody knows it. So a
+    /// `Paused { was: … }` would put a value on the wire that no consumer may act on — a
+    /// frontend that redrew from `was` would be redrawing from a state the child has already
+    /// left, and a frontend that ignored it would be carrying a field for nothing.
+    ///
+    /// The pre-freeze state *is* remembered, in `cide_app::agents::AgentRegistry`, in Rust,
+    /// beside the `paused_at` it is compared against — because the one decision that reads it
+    /// (was this freeze long enough to have killed an in-flight model request?) is taken there
+    /// and nowhere else.
+    ///
+    /// # Not persisted, and pause does not survive a restart
+    ///
+    /// This enum appears in events and in [`SessionSummary`] and in no `Workspace` field, so
+    /// this variant moves no schema version. It could not be persisted usefully in any case:
+    /// the shutdown ladder ends every child, and a stopped-then-killed child is just a killed
+    /// child.
+    Paused,
+    Exited {
+        code: i32,
+    },
 }
 
 /// What the registry can still say about a session whose pane was not there to hear it die.
@@ -323,8 +383,22 @@ pub enum SessionExit {
 
 impl SessionState {
     /// Whether closing this session should prompt for confirmation.
+    ///
+    /// [`Self::Paused`] answers **true**, which is the one arm worth arguing. A session is only
+    /// worth freezing if it had an unfinished turn — nobody pauses an idle prompt — so a paused
+    /// session is by construction one the user would mind losing, and `is_live`'s whole job is
+    /// "would you mind losing this". Quitting over a freeze is also strictly worse than quitting
+    /// over a busy session: the turn is not merely interrupted, it is interrupted in a state the
+    /// user deliberately parked and expects to come back to.
+    ///
+    /// The one production caller is `cide_app::hooks::live_in`, behind `HookServer::live_sessions`
+    /// and the close confirm in `cmd::app::live_sessions`; the rest are tests in
+    /// `cide_claude::state`. Its map is written only by `hooks::decide` from hook frames, and no
+    /// hook frame reports a pause — so the map goes on holding the *pre-freeze* state across a
+    /// freeze, which is already the right answer for the close confirm. This arm is what keeps
+    /// that answer right if the freeze ever does reach that map.
     pub fn is_live(self) -> bool {
-        matches!(self, Self::Busy | Self::AwaitingPermission)
+        matches!(self, Self::Busy | Self::AwaitingPermission | Self::Paused)
     }
 }
 

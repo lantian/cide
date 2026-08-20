@@ -16,7 +16,25 @@
   right: 12px;
   /* Clear of the status bar rather than a magic number: the token is the bar's own height. */
   bottom: calc(var(--h-status) + 12px);
-  z-index: 40;
+  /*
+   * **Above every overlay**, and that is a correction rather than a preference. (M21)
+   *
+   * This was 40, under the overlay scrim's 60 — so a command that failed while a dialog was
+   * open reported into a layer the dialog was painting over, and the gesture presented exactly
+   * as a control wired to nothing, which is the failure this component exists to prevent. It
+   * was reported as "the Delete button in a task's comment does nothing".
+   *
+   * The general rule, which is why this sits above the context menu (80) as well: a toast is
+   * the outcome of the gesture the user has just made, and every layer above it — the scrim
+   * (60), the switcher (70), a menu (80) — is a surface that gesture can be made *from*. A
+   * report nobody can see is the same thing as no report. Only `WindowFrame`'s resize edges
+   * (1000) stay higher, because losing the ability to resize the window is worse.
+   *
+   * DOM order is no longer enough on its own: `OverlayCard` portals to `document.body`, which
+   * appends it after the React root, so a card is a *later* sibling than this stack however
+   * late in the tree `App.tsx` renders it.
+   */
+  z-index: 90;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -65,7 +83,7 @@
 .text {
   margin: 0;
   color: var(--text);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   line-height: 1.45;
   /* A message from Rust can carry a path with no spaces in it. */
   overflow-wrap: anywhere;
@@ -74,7 +92,7 @@
 .hint {
   margin: 0;
   color: var(--dim);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -92,7 +110,7 @@
 
 .summary {
   color: var(--dim);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   line-height: 1.45;
   cursor: pointer;
   /* The marker is the affordance; without a list-style reset Chromium draws a bullet too. */
@@ -126,12 +144,12 @@
   padding: 0;
   color: var(--dim);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1.5;
   /* Wrapped, not clipped: a commit subject is prose and the toast is 420px wide. */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 160px;
+  max-height: calc(160px * var(--ui-scale));
   overflow-y: auto;
 }
 
@@ -170,7 +188,7 @@
   border: 0;
   background: transparent;
   color: var(--faint);
-  font-size: 15px;
+  font-size: var(--fs-ui-15);
   line-height: 1;
   padding: 2px 4px;
   cursor: pointer;

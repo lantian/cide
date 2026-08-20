@@ -31,3 +31,31 @@ pub mod search;
 // tree-sitter and a Claude one-shot. A file has both, and that is not a reason to share a module.
 pub mod diagnostics;
 pub mod symbols;
+
+// --- M18: the git tool window ---
+// The bottom panel's own state — open, height, which tabs. Separate from `git` because nothing
+// here touches a repository: `git` answers about commits and working trees, this answers about a
+// strip of chrome, and the only thing they share is the word "git" in the feature's name.
+pub mod toolwindow;
+
+// --- M18: the task tracker ---
+// `.cide/tasks.json`, the committed file the product-owner session and its subagents exchange
+// state through. Its own module for the reason `toolwindow` is separate from `git`: nothing here
+// touches a repository, and the only thing it shares with `project` is that both name a project.
+pub mod tasks;
+
+// --- M18: subagent orchestration ---
+// `.cide/config.json` and `.cide/agents/*.md`: the roles a project defines and the per-project
+// switch that says whether it may run them. Its own module rather than rows in `project` for the
+// reason `tasks` is separate too — nothing here touches the workspace tree, and the only thing it
+// shares with `project` is that both name a project. `cide-agents` holds every rule; these three
+// handlers resolve a root, call it, and hand back what it said.
+pub mod agents;
+
+// --- M20: cancelling a log walk ---
+// The registry of in-flight log walks, keyed by tool tab, and the one command that stops one.
+// Deliberately *not* rows in `git`: everything there is stateless by that module's own first
+// rule — "There is no `GitState` and nothing is managed" — and this is the one piece of git
+// machinery that has to be managed, because a flag nobody holds is a flag nobody can set.
+// `git_log` itself stays beside its siblings in `git` and borrows a flag from here.
+pub mod log;

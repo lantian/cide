@@ -36,6 +36,7 @@ import { matchCounter } from './format'
 import { listAction } from './listKeys'
 import { fileCount, filterUsages, usagesLabel, usagesStatus } from './usagesModel'
 import { cancelUsages, useUsages } from './usagesStore'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 
 const ROW_HEIGHT = 30
 const HEADER_HEIGHT = 22
@@ -125,10 +126,16 @@ export function UsagesPopup({ onDismiss, onGoTo }: UsagesPopupProps) {
   useEffect(() => cancelUsages, [])
 
   const viewport = useRef<HTMLDivElement>(null)
+  // The chrome scale, for the one measurement CSS never sees: a virtualized row is placed by
+  // an absolute transform off these numbers. Both rows scale, and by the same multiplier, so
+  // the heading stays the taller of the two at every size. See `settings/useUiScale.ts`.
+  const scale = useUiScale()
+  const headerHeight = scaledRow(HEADER_HEIGHT, scale)
+  const rowHeight = scaledRow(ROW_HEIGHT, scale)
   const virtual = useVirtualizer({
     count: grouped.length,
     getScrollElement: () => viewport.current,
-    estimateSize: (index) => (grouped[index]?.kind === 'file' ? HEADER_HEIGHT : ROW_HEIGHT),
+    estimateSize: (index) => (grouped[index]?.kind === 'file' ? headerHeight : rowHeight),
     overscan: 8,
   })
   useEffect(() => {

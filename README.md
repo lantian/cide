@@ -788,6 +788,771 @@ tab strip's right-click menu: a menu item that cannot be honestly disabled — t
 webview — and that silently does nothing is the surface where silence is worst, so the two routes
 are the chord and the palette.
 
+## Closing a mirror pane no longer kills the conversation it was mirroring (M18)
+
+**It did, and it had since mirrors shipped.** `TerminalPane`'s mirror branch adopts the id of the
+session it is mirroring — that is the whole of a mirror, a second sink on a child that already
+exists — and `closePane` ended with `const session = peekHost(pane)?.sessionId; destroyHost(pane);
+if (session) await sessionApi.kill(session)`. From the host map the two panes were
+indistinguishable, so closing the copy killed the original's child, mid-turn, with no message
+anywhere. Found by reading the pane-host ledger while planning M18's subagent panes, which open a
+headless run into a pane by exactly this mechanism: "I closed the window I was watching it in"
+would have terminated the run.
+
+The fix is one field. `PaneHost.mirrored` means "this pane did not spawn what it holds", set beside
+the id in the mirror branch, carried through the eviction ledger alongside the id it qualifies —
+otherwise an evicted mirror pane comes back holding somebody else's session and no longer knowing
+it — and cleared by `forgetSession`, because a restarted pane owns its new child. `closePane` reads
+it and skips the kill; `destroyHost` still runs unconditionally, because the pane genuinely is
+finished and clearing the ledger's id is what stops a late async continuation resurrecting it.
+Detach and re-dock never needed it: they use `releaseHost`, which keeps the terminal, the buffer
+and the id and kills nothing.
+
+**Not verified on screen.** Nothing in `ui/scripts/` mounts React against a live backend — the
+checks compile modules standalone or SSR them — so no gate observes a mirror pane being closed
+with a child still running. This is argued from the two call sites and from the fact that they are
+the only two, not from having watched the conversation survive.
+
+## `.cide/`, a task tracker Claude can call, and subagents that actually run (M18)
+
+M18 set out to turn the pinned Claude session into a **product owner**: decompose a goal into tasks,
+hand each to a role-specialised subagent, watch the tasks resolve, validate, dispatch the next
+round. That loop is now built end to end. A project opts in by writing `.cide/config.json`, defines
+its roles as markdown files beside it, and the session in the console tab is told at spawn what it
+has and handed eleven MCP tools to act with — six over the shared task tracker and five over the
+agents themselves. A dispatch mints a run, takes a concurrency slot, ensures that role's git
+worktree and starts a real `claude` inside it that no pane is showing; when the run hands its turn
+back, one line is typed into the product owner's own terminal saying so. Everything a run is made of
+is machinery that already existed: `SpawnSpec` → `PtySession` → `SessionRegistry` →
+`lifecycle::watch_for_exit`, the same four steps a pane takes.
+
+What has **not** happened is the last hop. **No subagent in this tree has ever been dispatched
+against a real `claude`** — that needs a GUI and a person, and nobody has sat in front of one. Every
+seam short of it is exercised, including the MCP server against a real unix socket with the real
+bridge's header pinned as a test constant, and pause is exercised against a real stopped child; the
+hop from a Dispatch button to a role editing files in a worktree is argued from those pieces and not
+observed. The *Not done* subsection below is written with the same care as the rest of this section,
+because that sentence is not the only one of its kind.
+
+### `.cide/` is committed, and deliberately invisible to the file tree
+
+Four things live there and only the last is ignored: `config.json` (the per-project orchestration
+switch), `agents/<name>.md` (role definitions), `tasks.json` (the tracker) and `worktrees/` (one
+checkout per agent). `.gitignore` used to ignore `/.cide/` wholesale, on the premise — written into
+the line's own comment — that the directory held "runtime state cide itself writes". It never did:
+`workspace.json` and everything like it live in `$XDG_STATE_HOME/cide`. That line is now the same
+split `.claude/` already uses, ignoring `.cide/worktrees/` and committing the rest, with a comment
+naming what changed, so this repository can commit its own task file.
+
+**`enabled` is false in the absence of `config.json`**, which is the property everything else hangs
+off: a project that has never heard of this feature cannot spawn anything after an upgrade. Every
+read path in `cide_agents::config` funnels a missing, unreadable, truncated or unparseable file to
+`AgentsConfig::default`, so reading cannot fail — and the *direction* of that failure is the point.
+Guessing `true` on a file cide could not parse means unattended `claude` processes editing
+somebody's repository and spending their quota; guessing `false` means a button does not work until
+they read a `tracing::warn!` naming the file and the serde error. Nothing is mirrored into
+`Workspace` either — this is committed configuration a teammate's commit or a `git checkout` can
+change under the running app, and cide's own state file holding a stale copy of something git owns
+is a bug with no upper bound on how long it lasts. So the file is re-read at every point that acts
+on it, which costs a `read_dir` and a handful of small files.
+
+**Three of the file's fields are deliberately not on the wire**, and `OrchestrationConfig` carries
+the other three. `isolation` and `allow_dangerous_permissions` are dispatch-time facts with nothing
+for a roster row to draw, and widening the DTO to carry them would put switches the panel cannot
+render into the panel's vocabulary. The third is `nudge_orchestrator`, and it deserves its own
+sentence: **it is the one that types into the user's own console.** It ships `true`, because the
+loop it closes is the feature M18 was asked for and a loop whose last step is *and then the user
+happens to notice* is not a loop — so the key is the way out, not the way in. Keeping it off the
+wire means no webview gesture can turn it on, and no round trip through the panel can silently reset
+a `false` somebody hand-edited; `AgentsConfig::apply` touches none of the three, and `write`
+preserves what it did not change. It is also read fresh at the moment of each nudge rather than
+cached at dispatch, because a `git checkout` can switch it off under a run that is already going and
+a cached copy would go on typing into somebody who had already said no.
+
+**A role definition is Markdown with restricted front matter, and that is the one place cide breaks
+its own all-JSON rule.** The body *is* a system prompt: a multi-paragraph document a human writes,
+rewrites, and their team reviews in a pull request. A system prompt inside a JSON string is one line
+with `\n` between every sentence — decisively unreviewable in a diff, where a two-word change to
+paragraph four shows up as the whole prompt replaced. The parser in `cide_agents::defs` is
+hand-rolled, in `claude_cli`'s tradition, for three reasons in the order that decided it:
+`serde_yaml` is deprecated; a full YAML parser is an enormous surface for eight flat scalars (block
+scalars, anchors, merge keys, `NO` being a country); and a restricted grammar can name the file *and
+the line*, which a YAML error generally cannot. What it does not understand it **refuses** rather
+than ignores — indentation, block sequences, tags and flow mappings each get their own sentence —
+because silently accepting a line the parser did not read means the file says one thing, the running
+agent does another, and nothing connects the two. Every finding is an `AgentProblem { path, line,
+message }` and a broken file never stops the others loading, which matters more here than in
+`Filter::build` or `persist::load`: these files are edited by hand *and by models*, so one of them
+being mid-edit is the directory's normal state.
+
+**The tree cannot see any of it, and that is a four-way decision rather than a boolean.**
+`cide_fs::filter` grew a fourth verdict, `Verdict::WatchOnly`, for exactly this directory:
+`Filter::admits` says no, `Filter::watchable` says yes, and no other pair of answers is right. The
+watcher has to report it — without `<root>/.cide` on `watched_paths` a teammate's `git pull` would
+be invisible, because `admits` rejects a dot-prefixed component *before* any gitignore matcher runs
+— while more than the file tree consults `admits`: `cmd::search` puts every content-search candidate
+through it, `files`' symbol walk asks it, and `Index::rescan_dir`/`graft_subtree` ask it. Had
+`.cide/` taken the git paths' `Verdict::Always` instead, task titles, task comments and agent system
+prompts would have become `Ctrl+Shift+F` hits inside files the tree does not draw. The git half of
+the list is told apart by a flag on the entry rather than by its name, so a write to
+`.cide/tasks.json` does not raise `FsChange::git` and the branch readout does not refresh because
+somebody ticked a task.
+
+### The tracker is one file with one writer
+
+`crates/cide-tasks` owns `.cide/tasks.json` and is the only thing in the process allowed to write
+it. Three classes of writer read it — the primary session, every subagent it dispatches, and the
+user through the panel — and that is not a lost-update problem for exactly one reason: **agents
+never write the file.** They call `cide_task_*` MCP tools, those arrive over the agent-RPC socket,
+and the app funnels every one into `TaskStore::update`, which mirrors `WorkspaceState::update` line
+for line — snapshot, run the closure, validate, roll back on `Err` *or* on failed validation, bump
+`rev`, `note_change`. The MCP-tool decision and the single-file decision are the same decision from
+two sides: the moment an agent could `Edit .cide/tasks.json` directly, this crate would need real
+file locking and the merge below would stop being a rare repair and become the hot path.
+
+Four layers, and the third is the one a single actor cannot solve. A loader that repairs and never
+fails, so a broken tracker is not a project that will not open. A `FileStamp` re-`stat`ed before
+every write, because a `git pull`, a teammate's commit or a hand edit moves the file underneath:
+when the stamp has moved the store re-reads and merges by rule — per task the higher
+`updated_unix_ms` wins, tasks only on disk are adopted, tasks only in memory are re-added, comments
+union — and `merge` is a pure function over two `TaskFile`s with a table-driven test precisely
+because it is the most likely place in the feature for a bug to live. Refusing the write would
+silently lose an agent's comment; last-writer-wins on the whole file would delete three tasks a `git
+pull` had just added. Then debounce and an atomic publish, as `workspace.json`, differing in exactly
+one respect and duplicated because of it. `persist::write_atomic` creates at 0600 deliberately — its
+doc records the `screens.json`-at-0644 incident that put it there, and `workspace.json` can hold a
+proxy password — but the tracker is **committed and shared**, so on a checkout two developers use,
+0600 means the file exists and cannot be read and the failure looks like a missing feature rather
+than a permission problem. `cide_tasks::write_shared` is therefore one line — `persist::write_atomic_with_mode(path, json,
+persist::SHARED_MODE)` — over the same sibling-temp, `sync_all`, rename, directory-`fsync` dance
+`write_atomic` performs at `PRIVATE_MODE`. The consolidation this paragraph used to flag as owed is
+done; what survives it is the distinction between the two modes, which is not cosmetic. Neither is
+a floor: the mode is passed to `create`, so the umask masks it, and 0644 here means "no wider than a
+file the user created themselves" rather than "world-readable whatever your umask says" — the right
+promise about something that lands in a repository, and the reason forcing the bits with
+`set_permissions` afterwards was tried and reverted.
+
+**A project that never used the tracker gets no tracker file.** `write_now` is the unconditional
+write — project close and quit call it, so a change made in the last 500 ms is not lost to a
+debounce that never elapsed — and it wrote an empty `{"schemaVersion":1,"rev":0,"tasks":[]}` into
+every project that had merely been *opened*. A tracked file appearing in `git status` because a
+panel was mounted is the same surprise the `absent` screen's own hint exists to prevent one step
+earlier: *"Creating the first task writes a new file, which is committed with your code."* The guard
+is two conditions and both are load-bearing — no tasks in memory **and** no file on disk. Dropping
+the second would refuse to persist the deletion of the last task, which is a delete that does not
+delete; dropping the first would refuse the write that creates the file for the first task. A file
+that already exists is left alone: this stops one being created, it does not remove one.
+
+The store owns no thread; `TasksStores::start_flusher` in `cide-app` does the ticking, modelled on
+`PositionsState::start_flusher`, which exists because there is no app tick to hang it on. That tick
+is also what notices a `git pull` moving the file under an open panel and broadcasts the merged
+board. It is wired into `project_open`, `project_close`, `lifecycle::shutdown` **and the `setup`
+restore loop** — that last is not optional, and `lib.rs` documents the identical omission twice for
+two earlier registries, where a restoring launch came up with a whole feature missing and nothing
+failing.
+
+The shapes are cut down on purpose. `TaskStatus` is four states; `Blocked` lost because it is a
+*reason*, not a place, and every tracker that ships it accumulates tasks parked there for weeks with
+nothing saying why — a blocked task is `Todo` with a comment, which is a shape an agent can actually
+write. `TaskId` is a short string, `t-17`, minted from the file's own high-water mark, because
+agents quote ids **inside prompts and comments**, where a uuid costs tokens, gets truncated by a
+model that is paraphrasing, and cannot be matched back. `TaskComment` is append-only, and there is
+no wire shape that could edit one: `TaskEdit` has a `Comment` variant and no `EditComment` or
+`DeleteComment`. That single restriction is what makes the tracker a channel *between* agents rather
+than a scratchpad — an editable comment is one an agent can quietly rewrite after the fact, and
+neither the user reading the panel nor the next agent reading the task would have any way to tell.
+`task_delete` exists as a *user* command and is deliberately not a tool.
+
+### Eleven tools, and the scope is the socket rather than the prompt
+
+`cide_agents::tools` defines all of them once, in a module that is pure — names, schemas and
+handlers over a `TaskSink`/`AgentSink`, with no socket and no filesystem in it. `tool::ALL` is the
+six task tools (`cide_task_list`, `_get`, `_create`, `_update`, `_comment`, `_assign`);
+`tool::ORCHESTRATION` is the five that drive the agents (`cide_agents_list`, `cide_agent_dispatch`,
+`cide_agent_runs`, `cide_agent_stop`, `cide_agent_integrate`); `tool::EVERY` is the eleven, written
+out by hand rather than concatenated so that a name lands in exactly one family on purpose. They
+reach a child through three pieces. `crates/cide-app/src/agent_rpc.rs` binds one listener per
+process at `$XDG_RUNTIME_DIR/cide-agents-<pid>.sock`, 0600, unlinked on drop. `cide-hook` gained an
+`mcp` subcommand that is a **dumb pipe**: it proxies `initialize` and `tools/list` as well as calls,
+so the vocabulary has exactly one definition and a `cide-hook` left over from an older install
+cannot advertise a tool this build removed. And both spawn sites — `cmd::session` for a pane and
+`ClaudeHarness::spawn_spec` for a run — attach it with `--mcp-config` carrying inline JSON built by
+`serde_json` rather than formatted, so a worktree path with an apostrophe in it cannot produce a
+config the CLI parses as something else.
+
+**The scoping is structural, not prompted.** Before any JSON-RPC the bridge writes one header line
+naming `CIDE_RUN` and `CIDE_SESSION` **read from its own environment** — the `spawned_as` rule, and
+the reason it matters is that a caller who could name its own identity could sign a comment as the
+user, or dispatch as though it were the product owner. `agent_rpc::resolve` asks the run question
+*first* and the primary-session question second, and the answer decides the tool list for the whole
+connection: a run this process dispatched is served the six task tools, scoped to its project and
+signing every comment as that run's role; a project's `Project::primary_session` is served all
+eleven, scoped to that project; anything else, including a `claude` a user started by hand in a
+shell pane, gets a valid `initialize` and an **empty** list. Never a crash, and never another
+project's tasks. Asking the run question first is part of the boundary rather than a
+micro-optimisation: a connection that is a run can never be read as anything else. **That is the
+whole of the answer to "may an agent dispatch an agent".** The five orchestration names are never in
+a run's `tools/list`, and `call_tool` refuses a name the connection was not shown, so a run that
+guesses `cide_agent_dispatch` is answered `METHOD_NOT_FOUND` before anything reaches the registry —
+closed by construction rather than by asking a model not to. It is resolved **once**, at connect,
+because `initialize` advertises `capabilities.tools.listChanged: false` and a client is entitled to
+cache `tools/list` for the session; a scope re-derived per message would drift the moment
+`workspace::bind_session` rewrote a project's primary session on a restart, and a long-lived
+orchestrator would be told "no such tool" for something it can still see.
+
+Two absences will be proposed as additions, and both are tested rather than merely written down.
+`cide_agent_pause`/`cide_agent_resume`: pausing is a *user* gesture, and an orchestrator that can
+`SIGSTOP` its own workers can wedge a project with nobody at the keyboard — `run_state_detail` says
+so to the model's face, rendering a paused run as "frozen by the user, and only the user can resume
+it". And `cide_task_delete`: the file is the shared record of what happened, and deletion belongs to
+the person whose repository it is.
+
+Three smaller decisions each close a failure this codebase has already paid for. `--mcp-config`
+never goes **before the user's own arguments**: it is variadic and swallows every following token
+that does not begin with `-`, which is the same wager `plan.args` refuses by going first, and every
+token either spawn site writes after it begins with one. `--strict-mcp-config` is deliberately
+absent: it would silently drop every MCP server the *user* configured in exchange for cide's one,
+and attaching a tracker is not a reason to take somebody's own tooling away. And every tool's output
+is wrapped by `tools::preamble` (or `agent_preamble`) inside a `<<<cide:project-data` fence telling
+the model that the block is data written by the user and by other agents, never instructions
+addressed to it — an acknowledgement of the injection surface, not a guard against it, and
+`model_authored_text_can_never_be_the_closing_fence` is the structural half of the same worry.
+
+That fifth row is **now done**. `claude_cli::INJECTIONS` carries `--mcp-config`, `ClaudeInjections`
+carries `mcp_config`, and Settings → Claude sessions has the switch — so every argument cide adds to
+a pane's command line is one the user can decline. Two things fell out of doing it that are worth
+knowing. `--mcp-config` needed a `REFUSED_ARGS` row as well, because a test pins the two tables
+against each other (*"cide injects `--mcp-config` and nothing refuses it"*), and that row carries
+`because: Some(Injection::McpConfig)` so switching the injection off hands the flag back to the
+user. And the orchestrator's roster paragraph turned out to assume the server was there: it is
+nothing but instructions to call `mcp__cide__cide_agent*`, so ungated it would have been a system
+prompt naming a vocabulary the session did not have. It is now behind the same switch.
+
+### A run is a pane nobody is looking at
+
+`crates/cide-agents/src/harness/claude.rs` builds the same `SpawnSpec` `cmd/session.rs` builds, and
+the module header argues why at length: `-p --output-format stream-json` buys a machine-readable
+result envelope cide already has from hook frames keyed on `CIDE_SESSION`, while an interactive PTY
+buys two things with no substitute. A run headless for twenty minutes can be **opened into a pane**
+with its whole transcript intact, because `PtySession` feeds its `vt100` mirror independently of
+sinks. And a permission prompt is **answerable**, because there is a terminal for the answer to be
+typed into; under `-p` a run either has `bypassPermissions` or it dies. So `AgentRegistry::start`
+goes `harness.spawn_spec` → `PtySession::spawn` → `watch_for_exit` and `on_exit` → `SessionRegistry`
+insert, in that order, with the watchers registered *before* the insert. **There is no second
+process-hosting path**, which is exactly what makes the SIGHUP/SIGTERM/SIGKILL ladder, the orphan
+arming and the close confirm cover a subagent for free, with no second implementation of any of
+them. `LiveRun` therefore holds a `SessionId` and not an `Arc<PtySession>`: the registry is where a
+child lives, and a second owner would be a second answer to "is it still running".
+
+Liveness is likewise free and there is **no second state machine**. `Harness::observe` maps a hook
+frame through `cide_claude::next_state` and `is_permission_request` — the same two calls
+`hooks::decide` makes for a pane — so a run's phase dot moves for the same reason a pane's does. Two
+rules the trait states and the implementation keeps: a `Paused` run is never moved by an
+observation, because the freeze is a fact cide asserted with a signal and a frame already in flight
+must not thaw the row; and a late frame must not resurrect a finished run, with `Observation::Exit`
+the sole exception because it is the only observation carrying ground truth about the child.
+
+The argv order is the third spawn site's, and it refuses the same wager the other two refuse: the
+user's own arguments first, because `--add-dir`, `--mcp-config`, `--allowedTools` and `--tools` are
+variadic and swallow every following token that does not begin with `-`, and every token cide writes
+begins with one. Then `--session-id` through `cide_claude::conversation` rather than by hand, then
+the role's system prompt through `fold_append_system_prompt` rather than a raw push, then `--model`,
+`--effort`, `--permission-mode` and `--allowedTools` **only where the definition asked for them** —
+the CLI's own defaults are the safe end of every one of those ranges, and a value invented here
+would be behaviour the role's author never wrote and cannot find in their file. Then `--mcp-config`,
+then `--settings`, then `-n "<role> · <task>"` so `/resume` and the terminal title name the work.
+
+**`CLAUDE_CODE_SSE_PORT` and `CLAUDE_CODE_AUTO_CONNECT_IDE` are removed rather than merely unset**,
+and that paragraph is the one to read before switching the IDE integration back on for a run.
+`openDiff` blocks the agent's turn until a human answers a tab — a documented invariant of
+`ide.rs::pump`, whose every early return must cancel the request for exactly this reason. A headless
+run has no pane, so there is no tab and no human, and the turn would hang until somebody noticed a
+row that had stopped moving, holding a slot and a worktree the whole time. Removed and not unset
+because cide can *inherit* both: launching `./run.sh` from inside a `claude` pane hands this process
+an `SSE` port that would otherwise reach every child it starts. The cost is one read — a subagent
+gets no `getDiagnostics` and has to run the project's own build instead — and that trade is not
+close.
+
+**The opening prompt is one line, whatever the task says.** It is typed into the child's terminal
+and terminated with `\r`, because that is what a terminal sends for Enter, so an embedded newline is
+*another Enter*: a multi-line task body handed over verbatim would submit its first line as a whole
+turn and feed every remaining line in as further turns, the agent answering a fragment before it had
+seen the rest. So `cmd::agents::opening_prompt` **points a run at its task instead of handing it
+over** — one flattened line naming the task id and telling the agent to read it with
+`mcp__cide__cide_task_get`. The better half of that is the second consequence: the body reaches the
+model through the tool, inside `tools::preamble`'s "project data, not instructions" fence, rather
+than sitting raw in the prompt position where a task written by another agent would read as the
+user's own instruction. `the_opening_prompt_never_contains_a_newline` is the test, and the rule
+generalises — the nudge and the retry are both PTY writes and both inherit it.
+
+### One worktree per agent, and an integration that refuses before it touches anything
+
+`crates/cide-git/src/worktree.rs` puts each role in `.cide/worktrees/<agent>` on branch
+`cide/<agent>`. The unit is the **role and not the run**, because that is how a person thinks about
+a team and because one checkout is one place to stand: an agent therefore runs at most one task at a
+time, and `cide_agents::effective_max_concurrent` clamps a role's own `max-concurrent` to 1 while
+worktree isolation is on rather than letting a definition file quietly ask for two processes in one
+directory. `ensure` is idempotent and called before **every** dispatch, not once, because the
+half-made states are all reachable: a valid registration is returned, a registration whose directory
+was deleted is pruned and rebuilt (`rm -rf` is one keystroke), a registration pointing somewhere
+else is refused, a non-empty directory with no registration is refused because cide deletes nothing
+it cannot prove it made, and a branch left by a previous run is **reused and never recreated** — its
+commits *are* the agent's work, and re-pointing the ref at today's `HEAD` would abandon them where
+only the reflog remembers. An agent name that is a path is refused **before anything is joined**,
+because a role file's stem is a string out of somebody's repository and `.cide/worktrees/../..` is
+one `git worktree add` outside the project.
+
+`integrate` merges `cide/<agent>` into whatever the project root has checked out, and computes the
+whole merge **in memory** first: `merge_commits` produces an index nothing on disk has seen, and
+`Index::has_conflicts` is asked before a single file is written. A conflict returns
+`Integration::Conflicts { paths }` **having changed nothing** — auto-merging when a task turns
+`Done` was the tempting wrong move, because a conflict would then surface as a broken checkout the
+user did not ask for with no task explaining it. A refusal they can read beats a working tree they
+have to repair.
+
+**A project that is not a git repository is refused with the reason and the way out.**
+`cmd::agents::worktree_refusal` names the root, says cide cannot give an agent its own worktree
+there, and offers both exits — `git init`, or `"isolation": "shared"` in `.cide/config.json` — and
+it is checked in two places: at `agents_config_set`, so enabling fails loudly rather than silently
+falling back to a shared tree, and in the panel's `disabled_hint`, so the sentence is on screen
+before the button is pressed. A silent fallback is how two agents clobber one file with nobody told.
+Two consequences are written down rather than discovered: `claude` files its transcript under the
+directory it started in, so a run's cwd *is* its resume identity and normalising it would orphan
+every transcript the role had accumulated; and paths an agent prints are outside the project root,
+so `terminal_open_path`'s containment gate asks about them, which is correct behaviour and not a
+bug.
+
+### The slot is taken at admission, and that is the whole of finding 9
+
+`AgentRegistry` holds `runs`, a `VecDeque` per `(project, agent)`, and two counters — `agent_slots`
+and `project_slots`. A pass over the queues (`admit_a_pass`) considers only the **front** of each
+agent's queue, which is what makes an agent serial structurally rather than as a property that falls
+out of an iteration order somebody could change; the fronts are then ordered by a monotone `seq`, so
+admission is FIFO across roles as well as within one. `take_admissions` repeats the pass until one
+admits nothing, so a role under `Isolation::Shared` with room for three gets all three in one call.
+
+The interesting decision is that the slot is a **latch on the run** (`LiveRun::slot`) rather than a
+count derived from the current phases, and the reason is a real window rather than a
+micro-optimisation. `SessionStart` reaches `SessionState::Idle`, so a freshly spawned run reports
+idle for the milliseconds between its child checking in and its opening prompt being processed. A
+registry that recomputed "how many runs are working" from the phase would see that gap and admit a
+second run of the same role — into the same worktree, since worktrees are per agent. So the slot is
+taken at admission and released on the **edge** `Running | AwaitingPermission → Idle`, or on
+`Finished`/`Failed`; `Starting → Idle` is deliberately not that edge, and
+`the_idle_a_starting_child_reports_releases_nothing` is what keeps it closed. `agent_limit` and
+`project_limit` are recorded on the run at dispatch for the same class of reason: a config edited
+mid-queue must not release a slot that was never taken.
+
+That leaves one thing true and worth naming: an `Idle` run has given its slot back but its `claude`
+is still sitting in the role's only checkout. `idle_children_of` winds those down **at the moment
+the checkout is next needed** and not on a timer, so an idle run that nothing is queued behind stays
+open to be read.
+
+**`RunState` gained `Idle` because `Finished { code: 0 }` was a lie.** The mapping this variant
+replaced wrote an exit status for a process that had not exited, and the number it wrote was
+byte-identical to a clean exit — so every later reader of `code` was reading a zero no child
+produced. The motive behind the old mapping was sound and is preserved: a run left `Running` at an
+idle prompt holds its slot and its worktree until the child dies, and the queue stalls with nothing
+on screen explaining it. What it got wrong was conflating "this run has stopped working" with "this
+child is gone", and only the second licenses a `code`. `Observation::Exit` is now the sole producer
+of `Finished`, so a code appears exactly when the reaper has one.
+
+### The roster paragraph, and the flag that would have stopped the pane starting
+
+A project's primary console pane is told what it is. `cmd::session::orchestrator_paragraph` gates on
+`is_primary_console_spawn` and on `enabled`, reads `.cide/` fresh on the spawn thread, and hands
+`roster_paragraph` the roles; a pane that is not a project's product owner, or whose project never
+opted in, gets an argv byte for byte what it was before M18. The paragraph names the roles **and**
+the tool that re-reads them, and says which of the two is current: `cide_agents_list` is better and
+stays live, but a session told "you have roles" with no names has no reason to spend a tool call
+finding out, and this is the only channel that arrives before the first turn. Every tool it names is
+spelled `mcp__cide__cide_agent_dispatch` and not `cide_agent_dispatch`, because the CLI namespaces
+an MCP server's tools as `mcp__<server>__<tool>` — measured, not assumed — and a paragraph naming
+the bare form would be describing tools the model cannot see under that name. An empty roster is
+*said* rather than omitted, naming `.cide/agents/<name>.md` and that only the user can add one,
+because a session handed nothing would call the tool, get an empty answer and have no way to tell a
+failure from the truth.
+
+It is folded in with `fold_append_system_prompt` and never pushed, since a second
+`--append-system-prompt` silently deletes the first. And it is **skipped entirely** when the user's
+own launch configuration carries `--append-system-prompt-file`, which is finding 5 and the reason
+`carries_append_system_prompt_file` exists as a whole-token check at this call site rather than as a
+table lookup. The CLI refuses the two flags together outright, so adding ours would stop the pane
+starting — a regression M18 would introduce into a field that works today.
+`fold_append_system_prompt` cannot repair it: it folds two occurrences of *one* flag, and these are
+two mutually exclusive flags with nothing to fold into. So the call site degrades rather than
+refuses — cide adds nothing, the user's file is read in full, the pane starts, and the roster
+reaches the model through the tool descriptions, which are what actually make it call
+`cide_agents_list` — and one `tracing::warn!` says so. The `WARNED_ARGS` row that promises this on
+the Settings screen and the condition here are kept together by
+`the_warned_row_and_this_file_still_describe_the_same_degradation`, because the behaviour must not
+depend on a table entry staying put: deleting the row would silently turn the degradation back into
+a pane that fails to start.
+
+### The nudge: one line typed into somebody's own conversation
+
+A run reports back only through `.cide/tasks.json`, and there is **no out-of-band channel into a
+running `claude`** — nothing that can hand a live session a message which is not a keystroke. So
+when a run hands its turn back, `agent_rpc::note_run_idle` fires on exactly the edge that released
+the slot, and one line is written into the project's primary session's PTY, through the same
+`Harness::deliver` a dispatch uses and therefore ending in `\r` with no newline in it. Three
+constraints, each a bug if dropped. It is **coalesced** — a 2 s trailing window with a 10 s ceiling
+— or six agents finishing together type six prompts and get six answers. It fires **only when the
+orchestrator is `Idle | AwaitingInput`**, checked *after* the burst settles rather than before,
+because the two seconds a burst spends settling are two seconds in which the product owner may have
+started a turn of its own; a busy owner means the nudge is **dropped and never queued**. And it is
+behind `nudge_orchestrator`, read off disk at the moment of each nudge.
+
+### Pause and resume, and the SIGCONT the shutdown ladder needed
+
+`cide_core::child_env::signal_group` was extracted out of `lifecycle::deliver` for this: pause needs
+`SIGSTOP`/`SIGCONT` from a crate that may not depend on `cide-app`. `deliver` keeps only the
+`Rung`→signal-number mapping, and `Rung` deliberately did **not** grow `Stop`/`Cont`, because it is
+one rung of the shutdown ladder and such a variant could be handed to `stop_children`. The **group**
+is the point: `SIGSTOP` to the leader alone leaves the agent's `bash` invocations and its stdio MCP
+servers running while the model process is frozen, and `signal_group` keeps `deliver`'s two rules —
+`kill(-pid)` with a `kill(pid)` fallback, and a refusal for `pid <= 1`, because negating that turns
+one signal into a broadcast.
+
+**The order is load-bearing and it is mark-before-signal.** `take_freezes` does the whole of the
+mark first — the project goes into `paused_projects`, each run records its pre-freeze state and
+takes `RunState::Paused { since_unix_ms }` — and only then does anything get signalled.
+Freeze-then-mark leaves a window in which the queue writes a prompt into a stopped child's PTY,
+where it *succeeds* into the kernel buffer and is read on resume, out of order with whatever the
+model was mid-turn on. `the_queue_is_shut_before_any_child_is_signalled` pins it. Resume mirrors it:
+`plan_thaws` reads, `SIGCONT` goes out, `finish_thaws` clears the marks and restores each run's
+remembered state, and the post-thaw phase is then re-read from the hook server rather than
+fabricated.
+
+**`SessionState::Paused` carries no payload**, because the frontend needs one fact from the wire —
+this is frozen — and not the pre-freeze state, which is remembered in Rust where it is used.
+`is_live()` answers **true** for it: nobody pauses an idle prompt, so a paused session is by
+construction one the user would mind losing, and quitting over a freeze is strictly worse than
+quitting over a busy session because the turn was parked deliberately.
+
+**A frozen turn that may have timed out is a suspicion, offered and never acted on.** cide cannot
+see the model request; it sees a process that was stopped and continued. A run is at risk only if
+its pre-freeze state was `Running | AwaitingPermission` and the freeze lasted `STALE_FREEZE_MS` (60
+s); after `SIGCONT` a `THAW_WATCH` of 20 s looks for any evidence of life — a hook frame, or a byte
+of PTY output through a sink that detaches itself — and only silence raises `AgentRun.stale_turn`.
+It is **a field on the run and not an event**, because a window opened after the resume has no
+history to derive it from and would show nothing where another window shows a warning. `retry_turn`
+spends quota and clears it; `ack_stale_turn` clears it and spends nothing. Automatic re-dispatch was
+never on the table: it would double-bill a turn that in fact survived.
+
+**And the shutdown interaction, which would otherwise ship broken.** A `SIGSTOP`ped process does not
+act on `SIGHUP` or `SIGTERM` — they go pending — so `stop_children` would spend `hup_grace +
+term_grace`, 2.25 s, doing nothing and then `SIGKILL`, and a `SIGKILL`ed `claude` leaves the
+half-written transcript the ladder exists to prevent. `AgentRegistry::thaw_for_shutdown` drains
+every frozen session and `SIGCONT`s it, and `lifecycle.rs` calls it immediately before the ladder
+runs. `a_shutdown_thaws_before_it_signals` is the test. Pause does not survive a restart, and that
+is stated rather than attempted.
+
+### Opening a run into a pane, and the second door on the mirror bug
+
+Opening a headless run is `SplitIntent::Mirror` — a second sink on a session that already exists,
+which is what a mirror has always been — and `PaneKind` stays `claude`. An `agent` kind would need
+arms in six modules to express a fact the run already carries, and would silently flip
+`claudePaneFocused` to false, taking `claude.fork`, `claude.mirror` and `claude.restart` away from a
+pane where they all still make sense.
+
+The gesture lives in `ui/src/sidebar/AgentsPanel/openRun.ts` and issues **no `invoke` at all**: it
+re-checks `canOpen` (the roster can move between paint and click), reveals an existing pane if one
+already shows that session, and otherwise calls `addRow` on the pinned console tab with `{ kind:
+'mirror', session }`. That it is a frontend gesture is the fix for finding 10, which is the second
+door on the bug the section above this one records. `PaneHost.mirrored` — the flag that stops
+`closePane` killing a session a pane does not own — is set in `TerminalPane`'s **spawn-plan**
+branch, the one reached when `takeSpawnPlan(paneId)` answers. A pane created by a Tauri command
+arrives over `cide://workspace-changed` instead, so `takeSpawnPlan` never runs, the flag is never
+set, and the pane adopts its session through the `sessionIsLive` path — and **closing that pane
+kills the child**, which for an agent run means closing the window you were watching it in silently
+terminates it mid-turn. So `agent_open_pane` was written, found to open exactly that door, and
+**deleted**: from `generate_handler!`, from `contract/commands.json`, and from `client.ts`, where
+the space it occupied now carries the note saying why there is no wrapper. `addRow` calls
+`rememberSpawnPlan` *before* `hydrate()` — an ordering its own comment calls load-bearing — which
+makes the flag correct by construction rather than by a second ownership signal.
+
+The general rule that leaves, and it is worth more than the command that was deleted: **any future
+route that hands an existing `SessionId` to a new pane must go through the spawn-plan path, or carry
+ownership some other way it can defend.** "Mark every adopted session as mirrored" is *not* that
+answer — a re-docked detached pane also adopts through `sessionIsLive` and genuinely does own its
+child, so marking it would leak the process instead of killing it. The two cases differ only in how
+the pane came to exist, which is exactly what the spawn plan records. Two behavioural details of the
+deleted command are kept here in case anyone revives it: it appended the row at the *bottom* of the
+console rather than directly after the console pane's row, and it validated the caller's
+`WindowLabel` — a validation the frontend path gets for free by resolving the console from this
+window's own mirror.
+
+### Three things measured against the real CLI, which is why they are written here
+
+These were run against the installed `claude` 2.x on this machine rather than remembered, and each
+of them will go stale.
+
+**`--mcp-config` accepts an inline JSON string, end to end.** `--help` documents *"Load MCP servers
+from JSON files or strings"*, and the string form was verified by passing a minimal stdio probe
+server and watching the model actually call its tool — the sentinel came back in the transcript.
+That is the linchpin of the whole design: no file is written into the user's project and nothing is
+left behind if cide is killed. Tools arrive **namespaced** as `mcp__<server>__<tool>`, so calling
+the server `cide` is what makes the vocabulary land as `mcp__cide__cide_task_list`; the bare
+`cide_task_list` never appears on the model's side of the wire, and that is the spelling an
+`--allowedTools` line has to use. Also learned, and worth knowing before somebody wastes an hour on
+it: `claude mcp list` ignores the global `--mcp-config` and reports the user's own configured
+servers instead, so it is not a usable probe — only a real turn is.
+
+**Two `--append-system-prompt` flags do not error; the first is silently dropped.** Verified
+*positional* rather than content-dependent by reversing the two values and watching which token
+survived. No error, no warning, no log line. Because cide appends its own arguments **after** the
+user's — the ordering that is load-bearing for the variadic flags — a roster paragraph pushed raw
+would take a user's own prompt away with nothing on screen saying so.
+`cide_core::claude_cli::fold_append_system_prompt` is the answer: it concatenates the user's text
+and cide's into one value, user's first with a blank line between, and emits exactly one occurrence.
+A `WARNED_ARGS` row was the alternative and loses twice — a warning the user has to read is not a
+fix for a prompt that vanishes. Two measured details shape the parser. It matches whole tokens
+through `RefusedArg::matches_as` rather than by prefix, because a `starts_with` would fold
+`--append-system-prompt-file`; and the two-token form takes the next token **unconditionally**, so
+`--append-system-prompt --append-system-prompt-file notes.txt` makes the literal string
+`--append-system-prompt-file` the prompt with no error — the opposite of the `!starts_with('-')`
+swallowing rule `user_args` applies, so a fold that stopped at `-` would silently change what the
+child is told.
+
+**`--append-system-prompt` and `--append-system-prompt-file` are mutually exclusive.** Measured on
+2.1.235: passing both is refused outright with `Error: Cannot use both --append-system-prompt and
+--append-system-prompt-file. Please use only one.` So there is nothing to fold into, and the fold
+deliberately leaves the file form alone. What makes that acceptable is that it is *loud*: a pane
+that dies with that sentence in its own transcript is a bug report that writes itself, where a
+prompt that vanishes is not. The call site that adds the roster paragraph degrades instead, and a
+test holds that call site and the `WARNED_ARGS` row that explains it to the same story — a row
+promising behaviour the code does not have is worse than no row, because a user who reads it
+concludes their file is safe.
+
+### The panels and the gates
+
+Both panels ship whole and both are mounted: `App.tsx` renders `AgentsPanel` and `TasksPanel`, feeds
+the activity rail a live count and an `awaitingPermission` badge, and holds the
+`cide://agents-changed` and `cide://tasks-changed` subscriptions **itself** rather than inside
+either panel, because the rail badges must stay live while the sidebar is shut and a subscription
+inside a panel goes stale the moment the panel unmounts. The two events differ deliberately.
+`agents-changed` carries the whole roster and **no `rev`**: it is derived from one in-process
+registry with one writer, so the last emit is by construction the newest, and a revision here would
+make every window rehydrate its workspace because an agent started a tool call — it is coalesced in
+Rust at 120 ms with a 1 s ceiling instead. `tasks-changed` carries a `rev`, because
+`.cide/tasks.json` genuinely has several writers — two cide windows and the agents — so a snapshot
+can arrive out of order and the receiver must drop anything older.
+
+The Tasks panel does **not** depend on subagents being enabled, which is stated in three files so
+nobody "fixes" it: a committed task list is useful on its own, orchestration is off by default, and
+gating the tracker would make the first thing a curious user clicks say "turn on a feature you have
+not read about". Its board carries a **fourth** `unknown` arm the plan did not have, and so does the
+roster: both reach their stores through `pendingCommand` with a `null` fallback, so there is a real
+interval in which nobody has looked, and with three states the panel would spend that interval
+rendering "No task tracker in this project" — a confident claim about somebody's repository, one
+frame before the truth arrives. The wire enums keep three arms, because this is a frontend fact
+about whether a round trip finished, not something the backend can report. `newerBoard` is the
+rev-drop rule as a pure function and returns the **identical object** when it drops a snapshot, so a
+store reader does not re-render. `agentChip` has three renderings for three facts — a live run lit
+with its phase dot, an assigned role dim, nothing at all — because a chip that looked the same
+either way would say an exited agent is still working. Comments are never rendered as markup: they
+are model-authored, and rendering model-authored markup inside the IDE's own chrome is an injection
+surface bought for nothing at this width. The Agents panel's disabled state is designed rather than
+defaulted, printing the full `.cide/config.json` path *before* the enable button, because a feature
+toggle that quietly adds a committed file is a surprise commit.
+
+`check:agents` compiles both panels' import-free `model.ts` standalone with the TypeScript in
+`node_modules` and pins the failure classes. It slices `TaskStatus`, `RunState` and `Harness` out of
+`crates/cide-ipc/src/{tasks,agents}.rs` as source text and asserts each equals the model's frozen
+list as a set, so **adding a status in Rust fails the build until the panel's tables know it**; it
+pins the two copies of `LIVE_PHASES` equal, with `queued` out and `paused` in. Every member of every
+vocabulary must yield a non-empty *string* — `check-problems.mjs`'s `ROGUE` lesson made structural,
+where a table miss returns `undefined` and a prototype key returns `Object.prototype.constructor`, a
+function React refuses as a child and `className` stringifies into the whole source of `Object` —
+and `'constructor'`, `'toString'`, `'__proto__'` and `''` are each pinned as non-members. And
+`canDispatch` must return **exactly one** of a green light and a non-empty sentence, never both and
+never neither; it has two non-ready sentences rather than one, because saying `OFF_FOR_THIS_PROJECT`
+when the truth is `ROSTER_NOT_READ` is the confident-empty-list failure in sentence form.
+`check:agents-render` SSRs both panels through Vite and digests every story: `ready-queued` renders
+**zero** Open elements rather than a disabled one, the stale-turn bar carries exactly `Retry turn`
+then `Leave it`, `unreadable` offers only Reveal and Retry and zero writing controls, a live-run
+chip uses a different class set from an assigned-role one, and `unclassed === 0` everywhere — which
+is the only thing in the build that can see a `styles.typo`, since a CSS module is `Record<string,
+string>`, so it type-checks, evaluates to `undefined`, and React drops the attribute in silence.
+
+**Two things that shipped on screen and were invisible to every gate**, both found from one
+report — *"the Delete button on a task's comment does nothing"*. The per-comment Edit and Delete are
+drawn only when their handlers are passed, which is the right rule and left a hole: **no story
+passed either**, so the render gate digested a comment log with no controls on it while the running
+app drew two on every line. They are in the fixture now and the check counts them, including the
+*rows* that hold them — because the second half of the report was the layout, and the layout is the
+likelier cause. Both controls were spliced into the comment's head beside the timestamp, as a pair
+of 40x13 targets 4px apart, revealed only on hover, at the end of a line the eye is reading rather
+than aiming at. They now sit on their own right-aligned row under the comment, at rest rather than
+on hover: the hover rule was argued for a 320px sidebar drawing four comments at once, and the card
+has been a 620px modal since the read-only posture landed.
+
+The other half is the one that made *any* of this present as silence. `Failures` — the toasts that
+exist precisely so a rejected command is not indistinguishable from a control wired to nothing — was
+`z-index: 40`, under the overlay scrim's `60`. So a command that failed **while a dialog was open**
+reported into a layer the dialog was painting over: the toast rendered, behind the veil, greyed. It
+is `90` now, above the switcher and the context menu as well, on the general rule that every layer
+above a report is a surface the reported-on gesture can be made *from*. `check:picker` compares the
+two literals rather than pinning either, because the numbers may move and their order may not — and
+nothing else in the suite can see it, since no check mounts a dialog and a toast together and
+neither `tsc` nor `vite build` has an opinion about paint order. Worth noting for the next reader:
+`App.tsx` renders `<Failures />` last in the tree and used to say that was what put it on top. It is
+not, and has not been since `OverlayCard` started portalling to `document.body` — a portalled dialog
+is a later sibling than anything the React root contains, whatever order it is written in.
+
+### Not done, and it is still a long list
+
+**No subagent has ever run against a real `claude` in this tree.** That is the single most important
+sentence in this section. Every seam short of the last hop is tested — argv construction against a
+real `SpawnSpec` with no `claude` on `PATH`, the worktree against real repositories in `/tmp`, the
+hook-driven state machine, the MCP server against a real unix socket with the real `cide-hook mcp`
+header captured verbatim as `A_REAL_HEADER`, a run's connection being refused `cide_agent_dispatch`,
+a real stopped child making no progress until it is continued, a real child's exit finishing its run
+— and the hop from a Dispatch button to a role editing files in a worktree needs a GUI and has not
+been performed. There is still no `crates/cide-agents/tests/real_mcp.rs`: the `#[ignore]`d real-CLI
+test that would spawn a `claude` with the inline config and assert `mcp__cide__cide_task_list` was
+actually called is the gate on this whole design, and it has not been written.
+
+**The reported comment delete was not reproduced, and the honest state of it is written here rather
+than closed.** The chain was measured end to end after the report: a real click dispatched at the
+button's own centre through a real DOM reaches the handler (nothing covers it, and it is not
+obscured by anything at that point); the host, the store and `client.ts` emit
+`task_edit { edit: { kind: 'deleteComment', id } }` verbatim; that exact JSON deserialises into
+`TaskEdit::DeleteComment`; and `TaskStore::edit` applied to a copy of the very file the user
+reported against tombstones the comment and clears its text. So the wiring is right in this tree and
+the failure was not seen. What *was* found is why it would have looked like silence either way — the
+toast layer under the scrim, above — and a layout that made the control easy to miss. Both are
+fixed; if it recurs, the reason now reaches the screen.
+
+**Pause and resume were built and reachable from nothing, and that is case #21.** They are wired
+now; what is worth recording is that no gate caught it. The four commands were registered, in the contract, unit-tested and
+clippy-clean, and *nothing could invoke them*: no wrapper in `client.ts`, no handler passed to the
+panel, no palette row. `contract-check` compares `generate_handler!` against `contract/*.json`, so it
+saw no drift; `check:commands` walks `cide_core::commands`, which these had no row in. A command
+wired to nothing satisfied every check in the repository. They now have wrappers, per-run controls,
+a project-scope pair in the panel header, and `agents.pause`/`agents.resume` in the palette — and
+`check:agents` grew the assertion that closes the class: every `agents_*`/`task*_` entry in
+`contract/commands.json` must appear as a literal in `client.ts`, and every `invoke` in `client.ts`
+must name one the contract lists.
+
+**`cide_agent_integrate` is a gesture as well as a tool now.** `agents_integrate` merges
+`cide/<role>` into the branch the user has checked out, and the Roles section offers it per role,
+confirm-on-second-click — `TaskDetail`'s delete pattern, chosen for the same reason: the act is
+recoverable (the agent's branch keeps its commits, and `worktree::integrate` refuses without writing
+a byte when it would conflict), so a modal is heavier than it is worth and a single bare click is
+lighter. On conflict the paths reach the user through the notice's foldable `detail`, because a
+refusal reported without them is a dead end.
+
+**`OpencodeHarness` exists now**, and both halves of what was owed came with it. The role's system
+prompt travels in `OPENCODE_CONFIG_CONTENT` — a whole configuration, agent definition and cide's own
+MCP server included, with no file written into the user's project and nothing left behind if cide is
+killed — because opencode has no `--append-system-prompt`. `Delivery::Respawn` is implemented rather
+than refused: `opencode run` is one turn per process, so a follow-up is a new child with
+`--session <captured>` in the same worktree, keeping the same `RunId`, the same slot and the same
+checkout, with the rebind done *before* the old child is killed so the stale exit belongs to no run.
+`defs::implemented` needed no edit — it asks `harness::for_kind`, so the registry entry answered for
+it — and the earlier sharp edge is gone with it: a role naming opencode on a machine that has the
+binary is now dispatchable, and on one that does not it is greyed with the PATH sentence rather than
+cutting a worktree first and failing in `start_child`.
+
+Three things about that harness were measured rather than assumed, and two of them corrected a
+design. **`sessionID` is on every event including the first**, which deleted the three-step
+id-capture ladder the plan assumed and makes runs resumable from the first line. **Not every
+`step_finish` is the turn** — a turn with tool calls emits several, the intermediate ones carrying
+`reason: "tool-calls"`, and reading those as the boundary would release the run's slot mid-turn and
+start the next queued run of that role into the same checkout; only a `step_finish` with any other
+reason answers `RunState::Idle`. And **the inline agent's `prompt` does reach the model**, which had
+been recorded as unconfirmed on the strength of a probe that told a role to answer only `ZETA` and
+watched it answer the question instead. That probe could not tell delivery from compliance, so it
+measured neither; a prompt carrying facts the model could not otherwise know came back verbatim, and
+`opencode agent list` shows the inline role registered. An `#[ignore]`d test pins that against the
+installed binary and needs no account, network or quota, which makes it the cheap check to re-run
+when the schema moves.
+
+The liveness story is the one real asymmetry with claude, and it is structural: no hook cide can
+install reaches this CLI, so `CIDE_SESSION` buys nothing and is not set. The `--format json` stream
+is the only channel, which is why `AgentRegistry::watch_stream` attaches a sink for a
+`SessionBinding::Harness` run and claude runs attach nothing. Writing that turned up a trap worth
+knowing repo-wide: **a sink must never call back into its own session from `deliver`**, because
+`broadcast` walks the sink list under its own mutex and `parking_lot::Mutex` is not reentrant — the
+coalescer parks, and every terminal in the process stops painting with no panic and no log line.
+`PtySession::ack` is the one that gets reached for, since a sink consuming bytes is exactly the
+thing that wants to return credit. The contract now says so on `Sink` itself, where the next
+implementer will look, rather than only at the call site that learned it.
+
+**Nothing in `ui/scripts/` mounts React against a live backend**, and this feature adds no
+exception. That the panels repaint on `cide://agents-changed` and `cide://tasks-changed` is argued
+from the call sites — the two subscriptions in `App.tsx` and the stores' `adopt` — and from the fact
+that they are the only ones, not from having watched a second window's board move. The same holds
+for Rust's 120 ms coalescing actually holding on screen, for two windows racing the tracker
+(`newerBoard`'s drop rule is pure and checked, the interleaving is not and cannot be from here), and
+for the two rail glyphs rendering on a target machine's fonts, which no check can see. Nor has a
+mirrored subagent's transcript been watched *paint* — real PTY, real xterm, real WebGL. Only
+`--audit-panes` touches that machinery and it still knows nothing about agents; adding an agent-pane
+cycle to it is worth doing and is not claimed until then.
+
+**Agents are now prevented from editing `tasks.json` behind the store's back**, and the enforcement
+is a `PreToolUse` deny in `cide-hook` rather than anything in `cide-tasks`. The single-writer
+property — one process holding the only writer — was a convention until this landed: the
+stamp-checked merge *recovers* from a direct write, but recovery on a 500 ms debounce is not
+prevention, and an edit that lands between a read and a write is still lost work.
+
+The deny is local and needs no socket, which is what lets it keep `cide-hook`'s standing rule that
+every failure is `exit 0`: the payload already carries the tool name, the `file_path` and the
+session's `cwd`, so the decision is made from stdin and printed on stdout while the reporting half
+still goes to the socket and forgets. The path is **resolved** before it is compared — an absolute
+path, a `..`-relative one from a subdirectory, and a `.` component all reach the same file and are
+all caught, where a string compare would have been a hole. Exactly one file is covered:
+`.cide/agents/*.md` and `.cide/config.json` are the user's to hand-edit, and denying more would be
+cide claiming a directory it only owns part of. And the refusal **names the alternative** —
+`mcp__cide__cide_task_update`, `cide_task_comment`, `cide_task_assign` — because a refusal that does
+not is one an agent simply retries.
+
+The other half the plan named is there too: `harness::TRACKER_PREAMBLE`, one definition folded into
+the role's system prompt by both harnesses — claude through a second `fold_append_system_prompt`
+(so the argv still carries exactly one flag, and the user's own text still comes first), opencode
+into its inline `agent.prompt`. It is gated on `hook_bin`, because a prompt naming tools the session
+does not have is the bug the orchestrator's roster paragraph had to fix. A test runs both harnesses
+and compares the two values, since one paragraph reaching two binaries through completely different
+machinery is the only property worth pinning — a role told different things about concurrency
+depending on which CLI ran it is this whole rule failing in miniature.
+
+The fence is what *holds*; the preamble only saves a turn. Without it an agent learns the rule by
+being refused, which burns a turn and leaves a transcript in which it tried the obvious thing and was
+slapped. The paragraph's last sentence is the load-bearing one and is not about writing at all — it
+says the task's comments are how a run reports back, because whoever dispatched it reads the task and
+not the transcript, and a run that finishes without leaving one has reported nothing.
+(`tools::preamble` is a different thing — it fences *tool output* against injection.)
+
+**`.cide/` cannot be opened from the file tree**, by design and not by omission:
+`Verdict::WatchOnly` means the tree does not draw it, `Ctrl+Shift+F` does not search it, and the
+symbol walk skips it, so a user who wants to read `tasks.json` or edit a role file has to reach it
+from outside cide — or, for a task, through the panel. Whether it should be visible — behind a
+default-on setting, the way *Show hidden files* works — is an open question and nothing has been
+built for it. What *did* land is the other half: `cide-headless tasks <root>` and
+`cide-headless agents <root>`, which read the tracker and the merged roster through the real
+loaders, so both new crates are now linked by the binary that must never be able to link a webview
+and the no-tauri proof covers them. It is also the only way to see a role file's problems — its
+file and its line — without a GUI, which is worth more than it sounds for a directory the file tree
+refuses to show.
+
+**`LIVE_PHASES` is `WORKING_PHASES` now**, and the rename was the smaller half. The name said "the
+child exists", the doc said "how many agents are working", and what it selected was "holds a queue
+slot and its role's worktree" — three meanings that agree only for `running`. `idle` is out (turn
+handed back, slot released, child alive) and `paused` is in (frozen mid-turn, still holding both),
+which is exactly where the three came apart. All three files moved together, as they had to:
+`AgentsPanel/model.ts` defines it, `TasksPanel/model.ts` keeps a deliberate second copy (both stay
+import-free so `check-agents.mjs` can compile them standalone), and the check destructures both *by
+name* to pin them equal.
+
+**Both consolidations that were owed are done**:
+`cide_tasks::write_shared` is now one line over `persist::write_atomic_with_mode`, and
+`claude_cli::INJECTIONS` has its fifth row, so nothing cide adds to a pane's command line is beyond
+the user's reach any more. What is *not* symmetric, deliberately: a **subagent run** still gets
+`--mcp-config` unconditionally, because a run reports back only through the tracker and one without
+it is a run nobody can see.
+
 ## Scrolling a Claude session (M16), and what is not done
 
 **The scrolling belongs to Claude Code, not to cide.** A Claude pane runs on the alternate
@@ -2754,6 +3519,392 @@ reads the header and says so, rather than mounting a pane that draws nothing. `t
 `jxl` and `svgz` are deliberately absent from the extension table: WebKitGTK either cannot decode
 them or decodes them only in some builds, and a format that works on one machine and not another
 is worse than one that works nowhere — a refusal from Rust is at least readable.
+## The git tool window: log, graph, file history and blame (M19)
+
+A bottom panel — IDEA's *Git* tool window — opened from a new button pinned to the foot of the
+activity rail. It holds a **Log** tab and one closable **History** tab per file, and it brings a
+**blame** gutter to the editor. `cide-git` had shipped the whole *commit* half of git since M10
+and none of the *investigate* half: the only `Revwalk` in the workspace was private, capped at ten
+commits, and existed to populate a pull toast.
+
+### `git2::Revwalk` could not be used, and that is the load-bearing finding
+
+The obvious implementation is `Revwalk` with `Sort::TIME` and a page limit. It does not stream.
+`revwalk.c:762` is `if (walk->sorting != GIT_SORT_NONE) walk->limited = 1;`, and `:660` then runs
+`limit_list` — a `while (list)` loop draining the **entire reachable set**, inside the first
+`next()`. Only `Sort::NONE` streams, and its order is documented as arbitrary. So a scan budget
+over a `Revwalk` would bound our loop and nothing else.
+
+`crates/cide-git/src/log.rs` therefore drives its own walk from an explicit `BinaryHeap` frontier.
+The performance is not the reason — this repository is 242 commits, where `limit_list` costs
+nothing. The *features* are: a serialisable frontier is what lets graph lanes continue across a
+page boundary without recolouring rows already on screen, a per-frontier-entry tracked path is
+what makes `--follow` coherent through a merge, and one shared heap is what makes a merged
+multi-root log a k-way merge rather than a second algorithm. The oracle is the real `git` binary —
+the emitted oid list is asserted equal to `git log --format=%H` under each mode, which is the
+discipline `patch_props.rs` already sets for the other dangerous code in that crate.
+
+### Paging is a cursor, and `budget` is not the end of history
+
+A parent is pushed with `key = min(committer_time(parent), key(child))`, so the popped key
+sequence is non-increasing *by construction* and keyset paging is exact. Every page reports why it
+stopped, and the six reasons are all reachable in the UI. **`Budget` — the walk inspected its
+whole allowance without filling the page, which on a filtered search over a deep history is the
+expected outcome — renders as "Searched 20,000 commits — keep looking?" and not as an end of
+list.** A list that drew it as the end would silently lose the answer the user was looking for.
+
+### What the graph does and does not draw
+
+Lanes are never compacted: a freed column is reused by the next new lane rather than shifting its
+neighbours left, which is what collapses a crossing line to "enters and leaves in the same column"
+and makes every row self-contained. Colour is a property of the lane instance, not of the column,
+and **first arrival wins** — re-pointing a lane when the mainline child turns up would recolour
+rows already on screen. The property that makes it verifiable: a history walked in one page of 500
+and in five of 100 produces byte-identical rows, checked over 40 seeds × 4 caps × 4 page sizes.
+
+The graph is **off**, with the reason said out loud, whenever the row set is not closed under a
+parent function: an author or text filter (as IDEA does — inventing a "nearest surviving ancestor"
+edge would assert a reachability nothing checked), a merged multi-root scope, and full-history
+mode. A path filter under the default simplification *keeps* its graph, because there the parents
+are rewritten — which is why `git log --graph -- path` works at all.
+
+### Blame, and the two things libgit2 does not do
+
+`BlameOptions`' four `track_copies_*` setters are **inert**: `blame.h:36-64` marks every one of
+them *"not yet implemented and reserved for future use"*, so calling them costs nothing and does
+nothing — the exact shape of the dead `repoOpen` flag. `git blame -M`/`-C` therefore shells out to
+the binary, as an explicit request variant rather than a flag, and reports what it *actually* ran
+in `BlameFile::follow` rather than what was asked for. Whole-file rename following is free the
+other way: `blame_git.c:470` runs `find_similar` with `GIT_DIFF_FIND_RENAMES` unconditionally.
+
+The payload is runs plus a deduplicated commit table — a 5000-line file is ~800 runs and ~300
+commits, about 60 KB instead of 500 KB per line — and the table is built with **no `find_commit`
+at all**, from the hunk's own signature. `check_runs` asserts the runs are ascending, gapless and
+cover every line, on **every** route: a run set with a hole paints a gutter that is silently one
+line off for everything below it, and every line still carries a label, so nothing downstream can
+notice.
+
+A dirty tab hands its text over so the answer is right from the first frame; live edits after that
+are mapped through CodeMirror's own `tr.changes` rather than re-fetched, and any line a change
+touches is drawn uncommitted whatever marker it still carries — an edited line's anchor survives,
+and keeping the previous author's name on it is a per-line falsehood rather than a stale view.
+
+### The commit actions refuse rather than force
+
+Revert, cherry-pick, reset (soft/mixed/hard), amend, tag and branch-from-here. Three of the six
+needed no new backend at all — `branch::create` already took a start point, `commit::commit`
+already amended and already kept the original author.
+
+libgit2's *stateful* `Repository::revert`/`cherrypick` are deliberately not used: they write
+`REVERT_HEAD`, set `RepositoryState` and leave the repository half-finished, at which point
+`repo::operation_in_progress` starts refusing every other action in the crate from a panel that
+has no *Continue* button. Instead `cherrypick_commit`/`revert_commit` are asked for their
+**in-memory index**, which writes nothing at all — so "would this conflict, and where" is answered
+before anything moves, and a conflict is reported with its paths. `nothing_leaves_a_sequencer_state_behind`
+asserts it after every successful action.
+
+Reset re-records the index fingerprint on **both** the success and the failure path, because
+`git_reset` writes `.git/index` for mixed and hard and a stale fingerprint would make the very
+next commit refuse with `IndexChangedExternally` — pointing at cide's own act. The guard fires for
+mixed and hard and not for soft, and in `use_staging_area` mode it cannot fire at all, which is
+correct because there the index is the user's; the dialog's Mixed wording differs per mode for
+exactly that reason. Amend carries the oid it believes it is amending, checked against the
+repository rather than against the row the menu was drawn on, because a `git commit` in a bash
+pane can move HEAD in between.
+
+The three reset kinds, revert and cherry-pick are compared against the real `git` binary over
+randomised working trees — HEAD, `ls-files --stage` and a hash of the whole worktree, byte for
+byte, a thousand cases clean.
+
+### Reading a commit: a range, a file as it was, and blame in the diff
+
+Ctrl+click a second row and the details pane becomes a range — `Comparing d4e5f60 … a1b2c3d`,
+the changed files with their `+41 −9`, and a **⇄ Swap**. Which end is newer is decided by the
+log's own order and not by click order, so clicking bottom-then-top does not invert the diff;
+Swap therefore cannot be an exchange of the two slots, because the re-sort would undo it and the
+button would visibly do nothing. It records a flip instead, and any gesture that changes *which*
+commits are selected clears it — a flip carried onto a new pair would silently invert a diff
+nobody flipped. *Compare with…* resolves a typed name through `git rev-parse` and stores the oid
+it resolved to, because a tab holding `main` would name a different tree tomorrow.
+
+**A file as one commit left it** is its own read-only tab (`log.rs @ a1b2c3d`) with a breadcrumb
+back through the revisions that led there — `working tree ← a1b2c3d ← d4e5f6a`, each crumb
+truncating the chain rather than growing it. *Annotate previous revision* lands here rather than
+on a diff, which is what the button means: `blame_with`'s `newest` blames the file **as it was at
+that revision**, so the point of the hop is to read that file with its own gutter. The diff it
+used to open was worse in two concrete ways — `git_diff_revision` answers `NoSuchChange` when the
+parent did not touch the path, so a hop through a merge showed a *refusal* where a file was asked
+for, and its old side was the parent's own first parent rather than anything the walk chose.
+
+The pane keeps `path` as the real path — so the language detection, the find bar and the status
+trail are all unchanged — and hands `EditorSurface` a separate **`identity`**, git's own name for
+the object: `a1b2c3d:src/log.rs`, exactly what `git show` takes. That is what keys
+`registerReveal`, `viewTracker`, `ctrlLink`, `navRecorder` and `claimCaret`. `registerReveal` is
+the one that made it necessary rather than tidy: it delivers to live receivers and only parks when
+there are none, so a second buffer registered under the real path made a search-result click into
+that file silently stop moving the caret. `claimStatusReadout` deliberately keeps the real path,
+because the status bar is about the file the user is looking at rather than about which registry
+slot it occupies.
+
+The prop defaults to `path`, so no existing caller changed and `tsc` proves it. The build effect's
+key stays `[path, reloadKey]` and must: an identity is contracted to be fixed for the life of a
+mount, which every caller satisfies structurally rather than by care — Rust keys
+`TabKind::Revision` on `(repo, path, rev)`, so another revision is another tab and therefore
+another mount. Everything ever added to that array has cost somebody their scrollback, their undo
+history or their unsaved edits, and `check:editor` and `check:blame` both pin it letter for letter.
+
+The pane also withholds `project`, which turns off Ctrl+click — go-to-definition sends a line
+number to a server reading the file *as it is now*, and a position from a forty-commit-old buffer
+names a different symbol.
+
+The git diff pane has a **blame column** too, on the new side, off by default and toggled per tab.
+
+### The actions are reachable, and every refusal is a sentence
+
+Right-clicking a commit offers Revert, Cherry-pick, *Reset here…*, *Tag…*, *New branch from
+here…*, a detached checkout and *Copy revision number*. Reset opens the three-mode dialog with the
+files it would discard **named**, not counted, and a shelve-first box checked by default — the
+recoverable answer should be the one a reflexive Enter produces, which is the same instinct that
+puts focus on Cancel. A merge revert that arrives without a mainline opens a picker built from the
+parents the refusal carried, rather than guessing 1. A detached checkout is attempted with
+`mode: 'refuse'` first, always, and only offers to stash once git has said what is in the way.
+
+Every one of the fifteen new `GitError` variants has a sentence in `branchModel::explain`, and
+`check:log-actions` drives all fifteen with real `{kind, detail}` objects, asserting that none of
+them falls back to the bare tag and that each differs from the same error with its detail stripped.
+A `GitError` is an object, so `String(error)` is `[object Object]` — the bug `check:branches` was
+written for, one surface over.
+
+### *Amend…* reaches the commit box, and a reword is one of the things it can do
+
+The act is `git_commit` with `CommitRequest.amendOf` set, but the *control* is the Git panel's
+commit box — it owns the message, the ticked paths and the Amend checkbox — and a second amend
+implementation would be a second place where "the original author is kept" can stop being true.
+So the log's *Amend…* does not amend. It fetches the message and parks it through
+`ui/src/chrome/panelRequests.ts`, which reveals a panel from outside React: `App.tsx` fills the one
+slot, `keys/dispatch.ts` no longer carries a `showSidebar` closure, and every reveal in the app now
+goes through it. The panel comes up with **Amend ticked**, the message prefilled from
+`CommitDetail.message` whole (body included), and the oid on the wire — so `require_amend_head`
+refuses rather than rewriting the wrong commit when HEAD moved between the menu opening and the
+confirm. The parked request expires after ten seconds (`AMEND_TTL_MS`), because a prefill that
+fires minutes after the click names a commit that may no longer be the tip.
+
+A box that already holds a draft is **not** overwritten. `planAmend` opens the house
+`ConfirmDestructive` naming both messages — the draft that would go and the commit's that would
+replace it — and Cancel drops the whole request rather than ticking Amend and leaving the draft,
+which would arm a rewrite of HEAD with a message written for something else. The draft is quoted in
+the *body* and `files` is empty, because the dialog runs each file entry through `basename`, and a
+draft reading `fix: handle a/b paths` would be drawn as the file `b paths` in the directory
+`fix: handle a` — the dialog misquoting the text it is asking permission to destroy.
+
+**A reword — an amend whose only change is the message — turned out to be blocked in three
+places, each of which looks like the whole fix on its own.** Nothing is ticked in that case, so:
+`cide_git::commit`'s `selections.is_empty()` guard answered `NothingToCommit`; the Commit button
+was disabled; and `commitUnits` yielded no units, which `commit` returns early on. Fix only the
+first and the button stays dead. Fix the first two and the button lights up on a click that
+silently does nothing — the worst of the three states, because it is the one that looks like it
+worked.
+
+The Rust guard is **widened, not deleted**. What it is actually for is refusing an *ordinary*
+commit of an empty changelist **before** `rebuild_index` clears the index to HEAD rather than
+after, having already destroyed it; `an_ordinary_commit_with_nothing_selected_is_still_refused`
+pins that, and fails if the amend term becomes an unconditional skip. The reword is then right by
+construction — `rebuild_index` with no selections leaves the index at HEAD's tree and `head.amend`
+writes it under a new message, so unstaged edits and untracked files survive, asserted.
+
+The two frontend halves read **one** value, `useGitPanel::rewordRepo`, rather than each deriving
+"is this a reword" for itself: `model.ts::canCommit` lights the button from it and `commitUnits`
+mints the file-less unit from it. Two derivations of one fact disagree eventually, and the way
+they disagree here is exactly the silent no-op above. It is non-null only when a repository is
+**named** — `amendOf.repo` from the log, or the sole root of a single-root project — because the
+bare Amend checkbox means "HEAD", and in a monorepo there are several HEADs with no honest way to
+pick one; a reword of an unnamed repository would rewrite whichever root sorted first. The unborn
+check is against that named repository and not `canAmend`'s "some repository has a HEAD", which is
+the right question for the checkbox and the wrong one here. Both rules live in `model.ts` so
+`check:git` can compile and run them, including the case where an amend *does* tick something and
+must not also pick up a unit for a repository nobody selected in.
+
+### Two watcher bugs found on the way, and fixed
+
+Neither was caused by this work. `refs/heads` was watched **non-recursively**, so a commit on a
+branch whose name contains a slash — `feature/login` — produced no event: it lives in
+`.git/refs/heads/feature/`, which nothing watched. It appeared to work in the session that created
+the branch, because the watcher picks up newly-created directories, and stopped silently after a
+restart. And a **linked worktree** was only half-watched: `HEAD` and `index` are per-worktree while
+`refs/**` and `packed-refs` live in the common dir, so a ref change in one was invisible — which
+matters here, because agent worktrees live in `.claude/worktrees/`. `refs` is now recursive,
+`packed-refs`/`ORIG_HEAD`/`FETCH_HEAD` are watched, and `repo::watch_dirs` returns both directories.
+
+A `GIT_NEVER` guard landed with them, before anything needed it: `is_git_path` is a `starts_with`
+over the watched list, so the moment a whole gitdir joins that list `.git/objects/**` becomes
+admissible and a fetch's 256 fanout directories each get an inotify watch — the exhaustion
+`watch.rs`'s header exists to prevent.
+
+**No new event, and no new watcher.** `FsChange.git` already existed, already covered `HEAD`, the
+index and the refs, and already rode `cide://fs-changed`; it simply had no consumer that read it.
+The log and the blame gutter are its first.
+
+### Full width, and a refresh that does not throw the page away
+
+The panel is a **sibling of `.body`**, not a child of `.content`. `.body` is the horizontal row —
+rail, sidebar, splitter, panes — so anything inside it is bounded by the column it sits in; placed
+between that row and the status bar, the panel runs the whole window width with the rail and the
+sidebar ending above it. That is IDEA's default. The first version put it inside `.content` so the
+sidebar would keep its full height, which is IDEA's *widescreen* variant — an option there, and
+not what was wanted here.
+
+**A refresh keeps what is on screen.** The fetch effect fires for two reasons that want opposite
+treatment: a new question — another project, scope, path or filter — must throw the old answer
+away, because it is about something else; a refresh is the same question asked again, and
+clearing there is what made the panel appear to flicker and lose its selection about once a
+second. It now compares a `questionKey` against the last one and only resets on a genuine change.
+`logStatus` already had the other half — *Reading the log…* is reachable only when `rows === 0` —
+so a soft reload is invisible until it lands and then swaps in one paint, and React reconciles an
+unchanged row to nothing.
+
+The selection is kept across it and pruned afterwards rather than dropped up front: an amend or a
+rebase does replace the oid, so a row that is gone is deselected once the new page is in, each end
+of a pair independently, with a collapse onto the surviving end rather than a range with one side.
+
+Why it fired so often is worth recording, because it is a case of a guard being defeated by the
+workload it was written for. `gitRefsMoved` exists so that a `git add` does not restart a frontier
+walk — but it returns true for any **truncated** burst, since a dropped path list cannot be shown
+not to contain a ref. A tree with several agents writing to it never goes quiet, so `cide-fs`
+flushes on `max_wait`, every burst is truncated, and the predicate says yes every time. The
+coalescing window went from 120 ms to 500 ms with that written down; a commit typed into a bash
+pane now appears an eighth of a second later, which is not perceptible, and the walk it triggers
+is cancelled the moment anything supersedes it.
+
+### A superseded walk stops, and a cancelled page is not an error
+
+Typing in the filter box starts a walk per keystroke. `LogRegistry` in `cide-app` is
+`SearchRegistry` again — the same two load-bearing details copied with their comments, a separate
+compare and insert so two windows asking the same question join one job, and the old job cancelled
+only *after* the new one has replaced it — but keyed `(ProjectId, ToolTabId)` rather than per
+project, because the Log tab and any number of History tabs are live at once and one job per
+project would make opening a History tab cancel the Log's walk.
+
+The seam into `cide-git` is a borrowed `&AtomicBool`, which is `cide_search::content`'s choice for
+the same reason: a `&dyn Fn() -> bool` would need `Send + Sync` threaded through every frame of the
+walk and buys nothing a flag does not already give. `log()` keeps its old signature and wraps
+`log_cancellable` over a **local** flag — not a `static`, which would be one stray store away from
+stopping every uncancellable walk in the process. The poll is the first statement of the loop body,
+before the budget check and before the heap pop, so nothing expensive runs after the flag is seen.
+
+It is threaded through `seek` as well, and that is the half worth naming: `MAX_SEEK` is twice
+`SCAN_MAX`, so the cursor path is the longest loop in the module and a cancel that could not reach
+it would be a control that does nothing for exactly the request that runs longest. Its `false`
+therefore had to stop meaning two things — the `CursorLost` arm is now guarded on the flag, because
+without that, typing a character during a reveal would tell the caller its cursor was gone and send
+the list back to the top of history.
+
+**A cancelled page resolves, with `cancelled: true` and the rows the walk had reached.** Painting a
+supersession as a failure is how a fast typist gets a wall of toasts; the rows are correct as far as
+they go and there is nothing to act on. The generation counter the caller already keeps stays the
+authority on *which* answer to paint — `cancelled` is the backend agreeing, and is what makes the
+abandoned walk stop costing anything.
+
+Two things cancel: the next `page` for the same tab, and `git_log_cancel`. The command is **not**
+`async` and not on the blocking pool, which is `diagnostics_usages_cancel`'s argument — queueing a
+cancel behind the very walk it is cancelling makes it arrive after the answer. It fires from the
+tab's close button, from `LogTab`'s unmount (hiding the panel, switching tabs, switching project and
+closing the window all unmount without closing anything), from `fs_close` beside the existing
+`searches.cancel`, and from `lifecycle::shutdown`. The unmount cleanup is deliberately its own
+effect with an empty dependency list rather than the fetch effect's cleanup: the latter would fire
+on every keystroke, racing a cancel against the `page` that was about to supersede the walk anyway.
+
+**Blame cannot be cancelled at all**, and says so rather than being given a control that does
+nothing — libgit2 exposes no hook inside `git_blame_file`. `MAX_BLAME_BYTES` is the honest version
+of that bound.
+
+### Not done
+
+- **Only *Tag…* has a palette row.** *Revert*, *Cherry-pick* and *Reset here…* each need a commit
+  the palette cannot name, and unlike `git.stageSelected` there is no honest default — resetting
+  to HEAD is a no-op, and a bare *Revert* in the palette beside the Git panel's *Rollback* is a
+  real ambiguity that IDEA has and that confuses people. All three are one right-click away in the
+  log; four dead palette rows would have been four dead rows. Ids are API and can be added later.
+- **No merged multi-root graph**, and no true topological order or `--simplify-merges`: both need
+  the whole graph before the first row, which is incompatible with paging by construction.
+- **Blame is not offered on the old side of a diff**, in the split view's left column, or in the
+  `@codemirror/merge` pane that answers Claude. The git diff pane *does* have the column, on the
+  new side, off by default and toggled per tab — a working diff blames the working file, a
+  historical one blames `new_rev`. The old side stays refused because it is a different document
+  and needs a second walk at `old_rev` for a column nobody reads while staging, and the merge pane
+  stays refused because its unit is the whole file rather than the line. The **staged** side is
+  refused too, and for a harder reason: its new text is the index, `cide_git::blame` can only
+  produce a commit, the working file or a supplied buffer, and blaming the working file instead
+  would be wrong by a line or two on exactly the files that have unstaged changes on top —
+  silently, with every row still carrying a plausible oid.
+- **The diff pane keeps its own blame state** rather than using `editor/blameStore.ts`, and the
+  reason is the store's key: `toggleBlame` resolves a repository through `git_locate` and so needs
+  an **absolute** path, while a diff tab holds a repo-relative one and a `RepoId` — and the key has
+  no room for the revision a historical diff blames at. One file annotated at HEAD in an editor and
+  at `a1b2c3d` in a revision tab would be one entry with two meanings. The part that must not
+  diverge — `collapseRuns`, which decides what is drawable and how old a line is — is shared.
+- **The tool window is not drawn in a detached-pane window**, which is what keeps a project's panel
+  from being shared between two windows.
+- **Nothing here has been confirmed on screen.** Same reason as M14, M15 and M16 — KDE will not
+  raise a shell-launched window. The coverage that does exist is `check:toolwindow`, `check:log`,
+  `check:log-render`, `check:blame`, `check:diff-render`, `check:commands`, `check:menu-model`,
+  `check:log-actions`, `check:toolwindow-render`, and 308 tests in `cide-git`, of which the reset,
+  revert and cherry-pick suites are differential against the real `git` binary over a thousand
+  randomised working trees. What that coverage cannot speak to is whether any of it is legible on
+  screen.
+
+## Sending a selection to a named conversation (M19), and what is not done
+
+Right-click in a code pane and *Send lines 12–20 to Claude* is no longer a button. It is a row
+with a `›` on it, and hovering it opens the project's Claude conversations:
+
+```
+Send lines 12–20 to Claude      ›   │ 1: agents
+                                    │ 2: git-details
+                                    │ 3: claude-code-ide-rust
+                                    │ 4: cide : claude
+```
+
+The number is the **position** of the pane, counted the way it is drawn — tabs left to right,
+and inside each tab the split tree in reading order, detached panes last. It renumbers when a
+pane closes, which is why it is only ever shown: the row carries the `PaneId`, and the number
+carries nothing.
+
+The name is the CLI's, not cide's. `/rename` in Claude Code writes it into
+`~/.claude/sessions/<pid>.json` beside the `sessionId`, `cide-claude`'s `roster` module reads
+that directory, and `claude_session_names` puts it on the wire. A conversation nobody has named
+falls back to the pane's own title — `4:` above — which in practice makes the list say which
+panes have a live `claude` behind them, because a record only exists while one is running.
+
+Picking a row **@-mentions the range into that conversation and takes you there**: the tab is
+activated, the pane focused, the terminal scrolled to the bottom and given the keyboard. Nothing
+is submitted. The mention is the first half of a question and typing the second half is the next
+act, which is the whole reason focus moves at all.
+
+### What is not done, and what it cost
+
+- **Nothing here has been confirmed on screen**, for the standing reason — KDE will not raise a
+  shell-launched window. The submenu's *decisions* are covered (`check:menus` resolves parents,
+  refuses to let one both open a list and run, and drives `placeSubmenu`'s flip; `check:editor`
+  drives the ordering, the numbering and every way a name can be absent). What no check in this
+  repo can speak to is whether the box lands beside the row, because there is no DOM in the
+  harness.
+- **The automatic destination left the mouse route.** A parent row cannot also be a button — one
+  click, two meanings, and one of them unreachable — so *whichever Claude can receive*, which is
+  what the row used to do, is now `Alt-Enter` in the buffer and the palette's
+  `claude.mention.file`, and nothing else. Picking a row is an **exact** send: it addresses that
+  pane and refuses if its `claude` is not on cide's IDE server, rather than quietly delivering
+  the lines to a different conversation.
+- **The names are fetched, not pushed, and can be one gesture stale.** There is no event: a
+  `/rename` is typed into a CLI that tells cide nothing. The refresh happens as the parent menu
+  is built and the submenu is built later, when the row is hovered, so an ordinary open has the
+  answer in hand — but a submenu hovered in the same few milliseconds shows the previous one.
+  Only the labels are affected; the row still sends where it says it does.
+- **`~/.claude/sessions/` is an internal Claude Code detail**, like the transcript path
+  `lifecycle::transcript_exists` depends on, and is treated the same way: read-only, never
+  written or swept, `CLAUDE_CONFIG_DIR` honoured, and every way of being wrong answers *no name*.
+  A CLI release that moves or renames that directory costs the submenu its labels and costs the
+  feature nothing.
+
 ## Opening a file a pane printed, including one outside the project
 
 Ctrl+click a path in any terminal pane and it opens as a tab, at the line and column the
@@ -2821,6 +3972,74 @@ while mounted, and that no terminal lost its element. A failure names the cycle 
 Current result: `PASS — 103 panes, no terminal re-opened beyond its eviction allowance, no
 host destroyed while mounted`.
 
+## The chrome font size (M19)
+
+The app had two font-size settings and both were for code — the editor's buffer and the
+terminal's cell. Everything else was a pixel literal: **405 `font-size` declarations across 51
+stylesheets**, with no `em`, no `rem`, no `%` and no `inherit` anywhere in `ui/src`. The only
+base was `html, body { font-size: 13px }` in `tokens.css`, and almost nothing inherited from
+it. So there was no token to redirect — a setting for the file tree, the git panel, Problems,
+the log, the tabs and the menus could only be built by rewriting all 405 onto one.
+
+`Settings → Appearance → UI font size` is that setting. It stores a point size (default **13**,
+band **9–20**, half-pixel steps) and everything else is derived from one unitless multiplier,
+`--ui-scale`, written on `<html>`.
+
+**Why a multiplier and not a size.** There is no single chrome size in the design. The mock
+draws at fourteen sizes between 8px and 20px and the *ratios* between them are the design — a
+tab's 12.5px label over its 10.5px path is a hierarchy, and the chrome audit below measures four
+of those numbers directly. One multiplier moves all fourteen and keeps every ratio. `tokens.css`
+carries the ladder, each rung `calc(<design>px * var(--ui-scale))`, and the number in the token's
+name is the design size rather than the painted one.
+
+**What scales and what does not.** Text, and the boxes drawn around text: row heights, the
+header, tab strip, status bar, pane title and find bar tokens, and pixel line-heights. Not
+icons — `--h-rail` and the 28px and 16px icon boxes stay put, because an SVG does not grow with
+a type scale. Not borders. Not the sidebar widths or the tool window height, which are dragged
+by the user and persisted, and would fight the saved value.
+
+**The three things that CSS could not reach**, each of which would have been a silent half-fix:
+
+- **Seven virtualized lists** — the file tree, the search panel and five pickers — take their
+  row height as a number handed to `estimateSize`, which places rows with an absolute transform.
+  CSS never sees it. Left alone they would have kept 24px rows under grown text, clipping the
+  names and making the scrollbar lie about the list's length. `settings/useUiScale.ts` is the
+  hook they read.
+- **The tool window's ceiling** subtracts the header, tab strip and status bar to decide how
+  much room the panes keep. Those three now scale, so a flat sum would let the panel take 22px
+  it does not have at 17px — out of `MIN_PANES`, on tall windows only.
+- **`--h-findbar`** is derived from the bar's own parts, and three of the four scale while the
+  border does not. It is `calc(32px * var(--ui-scale) + 1px)` for that reason; written as
+  `33px * var(--ui-scale)` it was right at the default and *short of its own parts* below it,
+  which clips the bar — the one failure that derivation exists to prevent.
+
+**The first frame.** The size rides in on the URL as `&ui=`, baked in by `windows.rs` and read
+by `public/theme-boot.js` in `<head>`, exactly as `&theme=` is. Not polish: `installThemeSync`
+reads the size out of the bootstrap snapshot, and that is a round trip — the same round trip
+that is too slow for the theme. A late theme is a flash of the wrong palette; a late size is a
+reflow of every row, tab and panel in the window, on every launch at any size but the default.
+
+**`check:ui-scale` is the fence around the sweep.** A rewrite of 405 declarations is not the
+risky part; the next stylesheet is — one `font-size: 12px` written in good faith, a label that
+silently stops following the setting, and nothing looking wrong at the default, which is where
+every author works. The gate asserts that no bare pixel font size survives outside the code
+surfaces, that every `--ui-scale` `calc()` is written literal-first (five other check scripts
+read design numbers straight out of the stylesheets), that the ladder and its readers are the
+same set in both directions, and that the four copies of the base size — Rust, `fontScale.ts`,
+`tokens.css`, `theme-boot.js` — agree. They are four because none can import another.
+
+**The editor and the terminal are untouched.** `--fs-code`, `--lh-code`, `--fs-term` and
+`--term-line-height` ship as flat literals with no `--ui-scale` term, and `.cm-scroller` reads
+only `--fs-code`. Two declarations moved the other way while the sweep was in the file: the
+gutter's line numbers and its lint marker were literal `11px`, so they had never grown with
+`editor.fontSize` either. They are `calc(var(--fs-code) * 0.88)` now — the same ratio, applied
+at every editor size.
+
+**What is not verified.** The chrome side was checked in the running app at 13 and at 18 against
+an identical layout. The editor and terminal staying put was checked in the shipped CSS bundle
+and by the gates, not on screen: switching tabs needs input injection this desktop has no tool
+for. The chrome audit below has not been re-run to a clean result since the sweep.
+
 ## The chrome audit
 
 M3's stated acceptance criterion is a screenshot diff against the design mock at 1440x900 in
@@ -2854,6 +4073,7 @@ crates/
   cide-claude/     Spawning and supervising `claude`: env, hooks, resume/fork.   (M7)
   cide-ide-mcp/    The Claude Code IDE-integration MCP server.                   (M6)
   cide-git/        Multi-root git, hunk/line staging, changelists, shelf.        (M10)
+                   Log, graph lanes, history, blame, and the commit actions.     (M19)
   cide-fs/         Gitignore-aware indexing and watching.                        (M8)
   cide-search/     Fuzzy pickers behind a Matcher trait.                         (M8)
   cide-lang/       tree-sitter: what a Rust or Go file declares.                 (M12)
@@ -2861,13 +4081,16 @@ crates/
   cide-deps/       What a project depends on, and where its source is unpacked.   (M13)
   cide-hook/       Second binary: bridges a Claude hook to the running IDE.      (M7)
   cide-headless/   Third binary: proves the core links without tauri.
+                   `tree|commands|keymap|tasks|agents`.
 ui/                React 19 + Vite 8 frontend. One document per window.
 docs/adr/          Decisions that would otherwise be refactored away.
 ```
 
-`cide-headless` is load-bearing architecture, not a demo: it links `cide-core`, `cide-ipc`
-and `cide-pty` and must never be able to link `tauri`. If domain logic leaks into the app
-crate, it stops building — cheaper than a code-review convention.
+`cide-headless` is load-bearing architecture, not a demo: it links `cide-core`, `cide-ipc`,
+`cide-pty`, `cide-tasks` and `cide-agents`, and must never be able to link `tauri`. If domain
+logic leaks into the app crate, it stops building — cheaper than a code-review convention. Every
+crate it links is a crate the rule is enforced on, which is why M18's two were added to it rather
+than left to a reviewer's memory.
 
 ## Three decisions that shape everything
 

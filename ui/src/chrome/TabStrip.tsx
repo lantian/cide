@@ -71,6 +71,15 @@ export interface TabStripProps {
   onActivate?: ((id: TabId) => void) | undefined
   onClose?: ((id: TabId) => void) | undefined
   /**
+   * *Show history for this file* — opens a tab in the git tool window. (M18)
+   *
+   * Takes an **absolute** path; `menuModel::absolutePathOf` decides whether the item is offered
+   * at all, because a git diff tab's path is repo-relative and would name nothing the backend
+   * can resolve. Absent in a window with no tool window, which disables the item with a reason
+   * rather than hiding it.
+   */
+  onShowHistory?: ((path: string) => void) | undefined
+  /**
    * Close several tabs as one gesture — the menu's *Close others* / *to the left* / *to the
    * right*.
    *
@@ -133,6 +142,7 @@ export function TabStrip({
   onSplit,
   onDetach,
   onReorder,
+  onShowHistory,
 }: TabStripProps) {
   const tablist = useRef<HTMLDivElement | null>(null)
   const drag = useTabDrag({
@@ -267,6 +277,7 @@ export function TabStrip({
         split: onSplit,
         detach: onDetach,
         ...(clipboard ? { copy: (text: string) => void clipboard.writeText(text) } : {}),
+        ...(onShowHistory ? { history: onShowHistory } : {}),
       })
     },
   })
@@ -569,6 +580,33 @@ function viewFor(kind: TabKind): TabView {
         closable: true,
         dirty: false,
         hint: `${kind.spec.oldPath} → ${kind.spec.newPath}`,
+        audit: 'fileTab',
+      }
+    }
+
+    case 'revision': {
+      // A file as one commit left it. Borrows the file shape and its badge from the path, for the
+      // same reason the diff tab does: `log.rs @ a1b2c3d` should sit next to `log.rs` under the
+      // same RS mark rather than inventing a fifth tab silhouette for a read-only buffer.
+      //
+      // Never dirty, and that is a fact about the tab rather than a default: the bytes come from
+      // the object database, a commit is immutable, and there is nothing to save. `title` is
+      // built in Rust (`basename @ short oid`) so the strip and the reopen stack cannot disagree
+      // about what the tab is called.
+      const badge = badgeFor(kind.path)
+      return {
+        shape: styles.shapeFile,
+        body: (
+          <>
+            <span className={`${styles.badge} ${badge.tone}`} data-audit="fileTabBadge">
+              {badge.label}
+            </span>
+            <span>{kind.title}</span>
+          </>
+        ),
+        closable: true,
+        dirty: false,
+        hint: `${kind.path} at ${kind.rev}`,
         audit: 'fileTab',
       }
     }

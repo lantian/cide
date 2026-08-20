@@ -103,6 +103,23 @@ fn open_project_here(
         crate::ide::link_diagnostics(app, id);
     }
 
+    // M18: and the project's task tracker, on the same trigger and idempotent for the same
+    // reason. Opened here rather than when the Tasks panel is first shown, because the store is
+    // what the flusher ticks: a subagent can start writing tasks over the MCP socket long before
+    // anybody opens the panel, and a tracker nothing is ticking is a debounce that never fires.
+    if let Some(stores) = app.try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>() {
+        // Read in its own borrow rather than reusing the `roots` above: this one wants the
+        // *first* root, because one project has one tracker. See `TasksStores::ensure`.
+        let root = state.with(|ws| {
+            workspace::project(ws, id)
+                .ok()
+                .and_then(|p| p.roots.first().map(|r| r.path.clone()))
+        });
+        if let Some(root) = root {
+            stores.ensure(id, &root);
+        }
+    }
+
     // Recorded here rather than in `cide_core::workspace::open_project`, because the domain
     // function is also how a *restore* re-opens everything in `workspace.json` at launch, and
     // a restore must not reorder the list — every launch would otherwise rewrite the recents
@@ -559,6 +576,14 @@ pub fn project_close(
         diagnostics.close(project);
     }
 
+    // And its task tracker, which is written on the way out rather than merely dropped: a task
+    // created a moment before the project was closed is inside the 500 ms debounce, and a store
+    // that goes away without a final write takes it with it. `close` does both — see
+    // `TasksStores::close` for why the merged board is logged rather than broadcast.
+    if let Some(stores) = app.try_state::<std::sync::Arc<crate::tasks_state::TasksStores>>() {
+        stores.close(project);
+    }
+
     // And its Ctrl+Shift+T records. They name a `ProjectId` nothing can resolve any more, and
     // reopening the same directory mints a *new* id — so left here they would be unreachable
     // rather than merely stale, sitting in a 16-deep stack and pushing live records out of it.
@@ -993,6 +1018,30 @@ fn same_tab(open: &TabKind, wanted: &TabKind) -> bool {
                         repo: rb, path: pb, ..
                     },
                 ) => ra == rb && pa == pb,
+                // A revision diff is keyed on **all four** fields, unlike the working-tree one
+                // above, which deliberately leaves the side out. A working diff tab *switches
+                // sides in place*, so the side is a mode of one tab; a revision pair **is** the
+                // tab's identity, and two comparisons of one file are two different documents.
+                // Without this arm the `_` below answered `false` for every pair of revision
+                // tabs, so Ctrl+Shift+T on a closed one reopened a duplicate beside the original.
+                (
+                    cide_ipc::DiffOrigin::GitRevision {
+                        repo: ra,
+                        path: pa,
+                        new: na,
+                        old: oa,
+                    },
+                    cide_ipc::DiffOrigin::GitRevision {
+                        repo: rb,
+                        path: pb,
+                        new: nb,
+                        old: ob,
+                    },
+                ) => ra == rb && pa == pb && na == nb && oa == ob,
+                // A `ClaudeMcp` diff answers a *blocked agent turn* through a `request_id` that
+                // is dead the moment the turn ends, so reopening one could only ever produce a
+                // tab waiting on a future nobody will resolve. Never the same tab as anything,
+                // including itself.
                 _ => false,
             }
         }

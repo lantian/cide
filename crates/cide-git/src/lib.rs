@@ -53,23 +53,33 @@
 //! something always does. Opening costs a few hundred microseconds; a stale index costs the
 //! user their work.
 
+pub mod blame;
 pub mod branch;
 pub mod changelist;
 pub mod commit;
 pub mod diff;
+pub mod lanes;
+pub mod log;
 pub mod patch;
 pub mod push;
+pub mod replay;
 pub mod repo;
+pub mod reset;
+pub mod revision;
 pub mod shelf;
+pub mod show;
 pub mod sidecar;
 pub mod stage;
 pub mod stash;
 pub mod status;
+pub mod tag;
 pub mod tree_status;
+pub mod worktree;
 
 use cide_ipc::git::GitError;
 
 pub use cide_ipc::git::Selection;
+pub use worktree::{AgentWorktree, Integration};
 
 pub type Result<T> = std::result::Result<T, GitError>;
 

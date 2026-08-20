@@ -78,11 +78,19 @@ Which check covers what you touched:
 | --- | --- |
 | `keys/`, a default binding, `cide-core::commands` | `check:keys`, `check:commands`, `check:switcher` |
 | `sidebar/GitPanel/`, `cide-git` | `check:git`, `check:render`, `check:diff`, `check:diff-render`, `check:branches` |
+| `toolwindow/`, the activity rail, the bottom panel | `check:toolwindow`, `check:toolwindow-render`, `check:sidebar`, `check:menus` |
+| `gitlog/`, `cide-git`'s `log`/`lanes`/`show`/`revision` | `check:log`, `check:log-render`, `check:diff-render` |
+| blame — `editor/blame*`, `cide-git::blame` | `check:blame`, `check:editor` |
+| the task tracker, `.cide/`, agent definitions — `cide-tasks`, `cide-agents`, `sidebar/TasksPanel/`, `sidebar/AgentsPanel/` | `check:agents`, `check:agents-render`, `check:sidebar`, `check:commands` |
+| the commit actions — `cide-git`'s `replay`/`reset`/`tag`, `chrome/logActions.ts` | `check:log-actions`, plus `cargo test -p cide-git --test commit_actions` (differential against the real `git`) |
 | the file tree, fs ops | `check:tree-status`, `check:tree-flicker`, `check:fs-clipboard`, `check:new-entry` |
 | a synthetic tree row — a group, a note, a pin | `check:groups`, `check:notes`, `check:scratch`, `check:tree-drag` |
 | `layout/` — splits, dividers, pane grid | `check:rows` |
 | `editor/` | `check:editor` |
 | menus, header, chrome, settings | `check:menus`, `check:menu-model`, `check:tab-overflow`, `check:sidebar`, `check:theme`, `check:fonts`, `check:proxy` |
+| **any `font-size`, or a box drawn around text** | `check:ui-scale` — chrome type is a closed ladder of `--fs-ui-*` rungs over one `--ui-scale`, and a bare `font-size: <n>px` is a label that silently stops following the UI font size. Looks right at the default, which is where you are working |
+| a new sidebar panel, or anything `App.tsx` renders as one | `check:boundary` — an unwrapped panel takes the **whole window** down when it throws, and the rail's choice is restored on launch, so it stays down |
+| **any `useWorkspace`/`useStore` selector** | `check:selectors` — a selector that *returns* a fresh array or object re-renders for ever and ends at *Maximum update depth exceeded*, which unmounts the whole root. The render checks SSR the pure views, and one server pass runs no updates, so nothing else in the suite can see it |
 | terminal input, session state | `check:input`, `check:exit`, `check:awaiting`, `check:format` |
 | overlays, pickers, search | `check:picker`, `check:search`, `check:problems` |
 | terminal file links, `cmd/file.rs`'s refusals | `check:paths`, `check:outside-open` |
@@ -95,7 +103,8 @@ Which check covers what you touched:
 ### The rule that shapes the crate graph
 
 **Only `cide-app` may depend on tauri.** `cide-headless` is the standing proof: it links
-`cide-core`, `cide-ipc` and `cide-pty` and renders a live session to stdout with zero Tauri;
+`cide-core`, `cide-ipc`, `cide-pty`, `cide-tasks` and `cide-agents` and renders a live session,
+a task board and an agent roster to stdout with zero Tauri;
 if it stops compiling, domain logic leaked into the app crate. A CI job enumerates every
 workspace member with `cargo tree` and fails on `tauri|wry|tao`. Reaching for an `AppHandle`
 inside domain logic is the signal that the logic is in the wrong crate.
@@ -108,12 +117,16 @@ crates/
   cide-pty/       PTY sessions: spawn, coalescing, backpressure, vt100 mirror.
   cide-claude/    spawning and supervising `claude`: env, hooks, resume/fork, headless one-shots.
   cide-ide-mcp/   the Claude Code IDE-integration MCP server (openDiff, getDiagnostics, openFile).
-  cide-git/       multi-root git, hunk/line staging, changelists, shelf.
+  cide-git/       multi-root git, hunk/line staging, changelists, shelf; and the read-only
+                  half — log, graph lanes, file history, blame — plus the commit actions.
   cide-fs/        gitignore-aware indexing and watching.   cide-search/  fuzzy + content search.
+  cide-tasks/     `.cide/tasks.json`: one owning store, a repairing loader, a stale-file merge.
+  cide-agents/    `.cide/` roles and config, and the `cide_task_*` MCP vocabulary. Spawns nothing yet.
   cide-lang/      tree-sitter over Rust and Go: what a file declares. No tauri, no cide-fs.
   cide-lsp/       an LSP *client* — rust-analyzer and gopls. Threads, not tokio (see its lib.rs).
   cide-hook/      second binary: bridges a Claude hook to the running IDE over a unix socket.
-  cide-headless/  third binary: proves the core links without tauri (`cide-headless tree|commands|keymap`).
+  cide-headless/  third binary: proves the core links without tauri
+                  (`cide-headless tree|commands|keymap|tasks|agents`).
 ```
 
 `docs/adr/` records the decisions that a refactor would otherwise undo — read 0001 (no

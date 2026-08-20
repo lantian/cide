@@ -39,7 +39,7 @@
   flex: 1;
   min-width: 0;
   margin: 0 0 6px;
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   font-weight: 600;
   color: var(--text-hi);
 }
@@ -49,14 +49,14 @@
 .progress {
   flex: none;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
 .body {
   margin: 0;
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: var(--fs-ui-12-5);
+  line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
 
@@ -69,7 +69,7 @@
   white-space: nowrap;
   text-overflow: ellipsis;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -82,7 +82,7 @@
 .list {
   flex: 1;
   min-height: 0;
-  max-height: 200px;
+  max-height: calc(200px * var(--ui-scale));
   overflow-y: auto;
   overflow-x: hidden;
   margin: 0;
@@ -92,7 +92,7 @@
 
 .groupLabel {
   padding: 8px 18px 4px;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--faint);
@@ -111,8 +111,8 @@
 .mark {
   flex: none;
   width: 10px;
-  font-size: 10px;
-  line-height: 18px;
+  font-size: var(--fs-ui-10);
+  line-height: calc(18px * var(--ui-scale));
   color: var(--red);
 }
 
@@ -122,13 +122,13 @@
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--text-hi);
 }
 
 .more {
   padding-left: 37px;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--faint);
 }
 
@@ -149,7 +149,7 @@
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--dim);
   cursor: default;
 }
@@ -161,7 +161,7 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   line-height: 1;
   padding: 7px 13px;
   border-radius: 5px;
@@ -218,7 +218,7 @@
   flex: none;
   margin: 0;
   padding: 0 18px 14px;
-  font-size: 11.5px;
-  line-height: 16px;
+  font-size: var(--fs-ui-11-5);
+  line-height: calc(16px * var(--ui-scale));
   color: var(--faint);
 }

@@ -431,25 +431,74 @@ fn sessions_of(ws: &Workspace, role: &WindowRole) -> BTreeSet<SessionId> {
 }
 
 /// What goes in a window's title bar, before the awaiting badge.
+///
+/// **`project - subject`**, and it is one sentence for all three roles: *which* project this
+/// window is showing, then *what* of it. The reported bug was that a task bar entry said
+/// nothing but `cide`, which is both halves of this missing at once — a stacked shell fell
+/// back to the application's name because it held more than one project, and no role has ever
+/// named the thing on screen.
+///
+/// A hyphen and not the em dash [`windows::title_with`] joins the awaiting badge with. The two
+/// joins are different depths of the same string — `Awaiting: 1 — atlas - Cargo.toml` reads as
+/// a badge, a place, and a thing in it — and spelling both the same way would make the badge
+/// look like a third peer.
 fn title_for(ws: &Workspace, role: &WindowRole) -> String {
     match role {
-        WindowRole::Shell { projects, .. } => shell_title(ws, projects),
+        // `active`, not `projects`. The projects a shell *holds* is the wrong question for a
+        // title: in `Stacked` mode that is every open project, so the old `[only] => name`
+        // match fell through to the app's name for anyone with two projects open — which is
+        // most of the time, and is exactly the "just prints cide" that was reported. `active`
+        // is the header tab the user is looking at, and it is `None` only for an empty frame.
+        WindowRole::Shell { active, .. } => shell_title(ws, *active),
         // Derived from the workspace on every retitle rather than remembered from the detach.
         // The pane's title is not immutable — `claude : bash` becomes `claude : claude` when a
         // pane's kind changes — and a remembered string would go stale with nothing to correct
         // it.
+        //
+        // Not run through `named` with the project, unlike the two roles around it: a pane
+        // title is minted as `{project} : {kind}` by `cide_core::workspace` (see the `format!`
+        // beside `Pane`'s construction), so it already carries the project and prefixing it
+        // again would title the window `atlas - atlas : claude`.
         WindowRole::DetachedPane { project, pane, .. } => workspace::project(ws, *project)
             .ok()
             .and_then(|p| p.detached.get(pane))
             .map(|p| p.title.clone())
             .unwrap_or_else(|| "cide".to_string()),
-        // Nothing creates one of these yet (see `window_close`), and a `Tab` carries no title
-        // of its own — the strip labels it from its `kind`. The project name is the honest
-        // answer until there is a gesture that makes one.
-        WindowRole::DetachedTab { project, .. } => workspace::project(ws, *project)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|_| "cide".to_string()),
+        // Nothing creates one of these yet (see `window_close`). It gets the same sentence the
+        // shell does rather than the bare project name it used to get: a `Tab` carries no title
+        // field, but `TabKind::title` is what the strip labels it with, and a torn-out tab has
+        // no strip at all — its own titlebar is the only thing left that can say what it is.
+        WindowRole::DetachedTab { project, tab } => match workspace::project(ws, *project) {
+            Ok(p) => named(
+                &p.name,
+                workspace::tab(ws, *project, *tab).ok().map(subject),
+            ),
+            Err(_) => "cide".to_string(),
+        },
     }
+}
+
+/// Join a project name to what the window is showing of it, if anything.
+///
+/// The `None` arm is not dead: a project with no reachable active tab is a tree
+/// `cide_core::workspace::validate` should have refused, and a title is the wrong place to
+/// discover that. The project name alone is still a true and useful thing to say, which is
+/// what the old titles said in every case.
+fn named(project: &str, subject: Option<String>) -> String {
+    match subject {
+        Some(subject) => format!("{project} - {subject}"),
+        None => project.to_string(),
+    }
+}
+
+/// What one tab is called, for a reader who cannot see the tab strip.
+///
+/// [`cide_ipc::TabKind::title`] and nothing else, deliberately — it is what the strip draws, so
+/// the task bar and the strip cannot drift into two names for one tab. That gives `Claude` for
+/// the pinned console, the *file name* (never the path) for a file, `Settings`, and the stored
+/// titles a diff and a revision tab already carry.
+fn subject(tab: &cide_ipc::Tab) -> String {
+    tab.kind.title()
 }
 
 /// Bring the window showing one pane to the front, and say which window that was.
@@ -659,7 +708,7 @@ pub fn intercept_close(app: &AppHandle, label: &WindowLabel) -> bool {
 pub(crate) fn reconcile(app: &AppHandle, state: &WorkspaceState) -> Result<(), CoreError> {
     let ws = state.snapshot();
     for (label, role) in &ws.windows {
-        let WindowRole::Shell { projects, .. } = role else {
+        let WindowRole::Shell { active, .. } = role else {
             continue;
         };
         if app.get_webview_window(label.as_str()).is_some() {
@@ -667,7 +716,7 @@ pub(crate) fn reconcile(app: &AppHandle, state: &WorkspaceState) -> Result<(), C
         }
         // Reported rather than logged: half a flip is worse than none, and at this point
         // nothing has been destroyed, so the caller still has every window it started with.
-        windows::create(app, label, &shell_title(&ws, projects), None)
+        windows::create(app, label, &shell_title(&ws, *active), None)
             .map_err(|e| CoreError::Io(format!("could not open window {label}: {e}")))?;
     }
 
@@ -712,18 +761,28 @@ fn quit(app: &AppHandle) {
     }
 }
 
-/// What goes in a shell window's title bar.
+/// What goes in a shell window's title bar: the active project, then its active tab.
 ///
-/// The project's name when the window is one project, the app's name when it holds them
-/// all. We draw our own titlebar, so this string is only ever seen in task switchers and
-/// window lists — the one place our header does not reach.
-fn shell_title(ws: &Workspace, projects: &[ProjectId]) -> String {
-    match projects {
-        [only] => workspace::project(ws, *only)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|_| "cide".to_string()),
-        _ => "cide".to_string(),
-    }
+/// We draw our own titlebar, so this string is only ever seen in task switchers, window lists
+/// and the task bar — the one place our header does not reach, and therefore the one place
+/// where a user with three windows open has nothing else to tell them apart. That is the whole
+/// argument for naming the tab as well as the project: `atlas` and `atlas` are two entries a
+/// task switcher cannot distinguish, where `atlas - Cargo.toml` and `atlas - Claude` are.
+///
+/// `active` is `None` exactly when the window holds no projects — the empty frame with a `+`
+/// in its header that `WindowRole::Shell` documents as a real state — and the application's
+/// own name is the only honest thing to call a window that is showing nothing.
+fn shell_title(ws: &Workspace, active: Option<ProjectId>) -> String {
+    let Some(id) = active else {
+        return "cide".to_string();
+    };
+    let Ok(project) = workspace::project(ws, id) else {
+        return "cide".to_string();
+    };
+    named(
+        &project.name,
+        workspace::tab(ws, id, project.active_tab).ok().map(subject),
+    )
 }
 
 /// Whether a Tauri window label is one this app minted.
@@ -748,14 +807,52 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_holding_one_project_is_titled_after_it() {
+    fn a_shell_names_its_project_and_then_the_tab_it_is_showing() {
         let mut ws = Workspace::default();
         let id = workspace::open_project(&mut ws, vec!["/home/dev/work/atlas".into()], None)
             .expect("a rooted project opens");
 
-        assert_eq!(shell_title(&ws, &[id]), "atlas");
+        // A fresh project's active tab is the pinned console, which the strip calls `Claude`.
+        assert_eq!(shell_title(&ws, Some(id)), "atlas - Claude");
         // An empty shell is the frame with a `+` in its header, not an error.
-        assert_eq!(shell_title(&ws, &[]), "cide");
+        assert_eq!(shell_title(&ws, None), "cide");
+    }
+
+    /// The half a task switcher is actually read for: two windows on one project, and the
+    /// only thing that can tell them apart is what each is showing.
+    #[test]
+    fn the_active_tab_is_what_distinguishes_two_windows_on_one_project() {
+        let mut ws = Workspace::default();
+        let id = workspace::open_project(&mut ws, vec!["/home/dev/work/atlas".into()], None)
+            .expect("a rooted project opens");
+
+        let editor = workspace::open_tab(
+            &mut ws,
+            id,
+            cide_ipc::TabKind::File {
+                path: "/home/dev/work/atlas/Cargo.toml".into(),
+                dirty: false,
+            },
+            cide_ipc::Pane {
+                id: cide_ipc::PaneId::new(),
+                kind: cide_ipc::PaneKind::Editor,
+                role: cide_ipc::PaneRole::Auxiliary,
+                session: None,
+                conversation: None,
+                title: "Cargo.toml".into(),
+            },
+        )
+        .expect("a file tab opens");
+
+        // The file *name*, never the path: this string is read in a task switcher, where
+        // `/home/dev/work/atlas/Cargo.toml` would spend its whole width on the prefix the
+        // project name to its left has already said.
+        assert_eq!(shell_title(&ws, Some(id)), "atlas - Cargo.toml");
+
+        let console = workspace::project(&ws, id).expect("exists").tabs[0].id;
+        workspace::activate_tab(&mut ws, id, console).expect("the console is a live tab");
+        assert_eq!(shell_title(&ws, Some(id)), "atlas - Claude");
+        assert_ne!(editor, console, "the two tabs are distinct");
     }
 
     /// The question the user's wording leaves open: which sessions count toward *this*
@@ -957,12 +1054,35 @@ mod tests {
         );
     }
 
+    /// The reported bug, as a test.
+    ///
+    /// `Stacked` is the default window mode, so *every* project after the first lands in the
+    /// same shell — and the rule this replaces was "one project, use its name; otherwise the
+    /// app's name". That made `cide` the title of the only window most users ever have, which
+    /// is the whole of "window title shouldn't just print cide". The window is showing one
+    /// project at a time and `active` is which; the rest are header tabs, not what is on
+    /// screen.
     #[test]
-    fn a_shell_holding_several_projects_is_titled_after_the_app() {
+    fn a_shell_holding_several_projects_is_titled_after_the_active_one() {
         let mut ws = Workspace::default();
-        let a = workspace::open_project(&mut ws, vec!["/home/dev/a".into()], None).expect("opens");
+        workspace::open_project(&mut ws, vec!["/home/dev/a".into()], None).expect("opens");
         let b = workspace::open_project(&mut ws, vec!["/home/dev/b".into()], None).expect("opens");
 
-        assert_eq!(shell_title(&ws, &[a, b]), "cide");
+        let shell = ws
+            .windows
+            .iter()
+            .find_map(|(l, r)| matches!(r, WindowRole::Shell { .. }).then(|| l.clone()))
+            .expect("a fresh workspace names a shell");
+
+        // `rebuild_windows` keeps whichever project was active across an open, so the window
+        // is still showing the first one — and says so, where before it said `cide`.
+        assert_eq!(title_for(&ws, &ws.windows[&shell].clone()), "a - Claude");
+
+        workspace::activate_project(&mut ws, b);
+        assert_eq!(
+            title_for(&ws, &ws.windows[&shell].clone()),
+            "b - Claude",
+            "clicking a header tab renames the window, because that is what changed on screen"
+        );
     }
 }

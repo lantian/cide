@@ -37,6 +37,7 @@ export {
   isInertMenu,
   moveFocus,
   placeMenu,
+  placeSubmenu,
   resolveMenu,
   wantsNativeMenu,
 } from './model'
@@ -49,6 +50,7 @@ export type {
   MenuSeparator,
   Placement,
   Point,
+  Rect,
   ResolveOptions,
   ResolvedEntry,
   ResolvedItem,

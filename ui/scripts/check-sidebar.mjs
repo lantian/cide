@@ -58,6 +58,13 @@ try {
       // with cases in it, and a rule that lives in a React state updater is a rule no check
       // script can run. Both files are import-free precisely so this one `tsc` can take them.
       'src/chrome/sidebarView.ts',
+      // The third, and the same argument once more. `panelRequests.ts` is how anything outside
+      // React reveals a panel, and its rules are a TTL, a claimed-once request and a refusal to
+      // overwrite a commit message somebody is halfway through — the last of which is the only
+      // thing in this flow with no undo. It imports one *type* from `sidebarView.ts`, which is
+      // compiled in this same invocation and elided from the output, so node can still load the
+      // emitted JavaScript with no resolver.
+      'src/chrome/panelRequests.ts',
       '--outDir', out,
       '--module', 'esnext',
       '--target', 'es2022',
@@ -143,21 +150,28 @@ try {
    *  - `last` must never become `settings`, or "bring back the last panel" brings back a state
    *    with nothing in it and F4 stops being a toggle at all.
    */
-  ok(!isPanelOpen({ view: 'settings', last: 'git' }), 'the settings view is not a panel')
-  eq(
-    toggleSidebar({ view: 'settings', last: 'git' }),
-    { view: 'git', last: 'git' },
-    'F4 from the settings view opens the last real panel',
-  )
   eq(
     selectView({ view: 'files', last: 'files' }, 'settings'),
-    { view: 'settings', last: 'files' },
-    'and choosing ⚙ remembers the panel it replaced',
+    { view: 'files', last: 'files' },
+    '⚙ changes the sidebar not at all: it opens a workspace TAB, so the panel that was showing '
+      + 'keeps showing and no rail button lights up for it. It used to return `view: settings`, '
+      + 'which left the gear lit with nothing under it until another button was pressed — '
+      + 'reported as "it stucks in active state"',
+  )
+  eq(
+    selectView({ view: null, last: 'git' }, 'settings'),
+    { view: null, last: 'git' },
+    '…and a hidden sidebar stays hidden, rather than the gear making something appear',
+  )
+  ok(
+    selectView({ view: 'files', last: 'files' }, 'settings').view !== 'settings',
+    '…so the state that produced the stuck button is not reachable from a rail click. The type '
+      + 'says so too — `SidebarState.view` is a `PanelView` — and this is the runtime half',
   )
   for (const from of [
     { view: 'files', last: 'files' },
     { view: null, last: 'search' },
-    { view: 'settings', last: 'problems' },
+    { view: null, last: 'problems' },
   ]) {
     let start = from
     for (const step of [
@@ -178,6 +192,225 @@ try {
   }
 
   ok(!isPanelOpen({ view: null, last: 'files' }), 'and a hidden sidebar is not open')
+
+  // --- reaching a panel from outside React -------------------------------------------------
+  //
+  // `chrome/panelRequests.ts`. Revealing a panel used to be a `useState` setter threaded into
+  // `keys/dispatch.ts` as a prop, which meant that anything that was neither the dispatcher nor a
+  // descendant of `App` could not reveal one at all — and the git log's *Amend…*, whose entire
+  // job is to put the user in front of the commit box, shipped **listed and disabled** for
+  // exactly that reason. Everything below is what replaced it.
+  //
+  // Every assertion here is a rule that would otherwise live inside a React effect, which is the
+  // one place in this codebase no check script can reach. Three of them describe things that go
+  // wrong *silently*: a request nobody drains, a request that fires minutes after the click it
+  // answers, and a request that throws away a commit message the user was writing.
+
+  const pr = await import(`file://${join(out, 'panelRequests.js')}`)
+
+  {
+    pr.__resetPanelRequests()
+    const seen = []
+
+    // 1. No host: a detached-pane window has no sidebar and never will. The refusal is the whole
+    //    value of the slot being fillable — without it the caller parks a request nobody can
+    //    answer and reports success, which is the silent no-op the seam exists to remove.
+    ok(!pr.panelHostPresent(), 'a window that registered nothing has no panel host')
+    eq(pr.requestPanel('git'), false, 'and `requestPanel` refuses rather than parking')
+    eq(
+      pr.requestAmend({ project: 'p', repo: 'r', oid: 'a'.repeat(40), shortOid: 'aaaaaaa', message: 'm' }),
+      false,
+      'and so does an amend — nothing is parked for a panel that cannot exist',
+    )
+    ok(!pr.amendPending(), 'nothing was parked')
+
+    // 2. With a host, the request lands, once, with the view it named.
+    pr.registerPanelHost((view) => seen.push(view))
+    ok(pr.panelHostPresent(), 'registering fills the slot')
+    eq(pr.requestPanel('search'), true, 'and the request lands')
+    eq(seen, ['search'], 'with the view it named, exactly once')
+    eq(pr.requestPanel('git'), true)
+    eq(seen, ['search', 'git'], 'a second request reveals again — this is not a toggle')
+
+    // 3. Unregistering is not optional: a root that went away must stop receiving.
+    pr.registerPanelHost(null)
+    eq(pr.requestPanel('files'), false, 'unregistering empties the slot')
+    eq(seen, ['search', 'git'], 'and a dead host is not called')
+  }
+
+  {
+    // --- the amend request: parked, revealed, claimed once -----------------------------------
+    pr.__resetPanelRequests()
+    const seen = []
+    let woke = 0
+    pr.registerPanelHost((view) => seen.push(view))
+    const stop = pr.subscribeAmendRequest(() => {
+      woke++
+    })
+
+    const request = {
+      project: 'proj-1',
+      repo: 'repo-1',
+      oid: 'a1b2c3d4'.repeat(5),
+      shortOid: 'a1b2c3d',
+      message: 'fix: the thing\n\nand why',
+    }
+    eq(pr.requestAmend(request, 1000), true, 'an amend is accepted when there is a panel host')
+    eq(seen, ['git'], 'and reveals the Git panel — the item is useless without the panel showing')
+    ok(pr.amendPending(), 'the payload is parked for a panel that has not mounted yet')
+    ok(woke > 0, 'and subscribers are told, so a panel that IS already mounted hears about it')
+
+    // Claimed, not observed. The Git panel unmounts every time the user clicks another icon in
+    // the activity rail; a request that survived its claim would mean that merely *looking* at
+    // the panel later ticked Amend and replaced whatever was in the box.
+    eq(pr.claimAmend(1200), request, 'the first claim gets the whole request back, verbatim')
+    ok(!pr.amendPending(), 'and it is spent')
+    eq(pr.claimAmend(1200), null, 'a second claim gets nothing — this is the rail-click bug')
+
+    // The message is carried whole, body included. `CommitDetail.message` is the full message on
+    // purpose (`show.rs` says why), and an amend that dropped the body would rewrite history by
+    // deletion — silently, because the box is the only place it would have shown.
+    ok(
+      request.message.includes('\n\nand why'),
+      'the request carries the full message rather than a summary line',
+    )
+
+    // The TTL. Without it a request parked for a panel the user never opened fires minutes later
+    // when they open that panel for something else — and by then the oid names a commit that may
+    // no longer be the tip.
+    pr.requestAmend(request, 1000)
+    eq(
+      pr.claimAmend(1000 + pr.AMEND_TTL_MS + 1),
+      null,
+      'a request older than AMEND_TTL_MS is not honoured',
+    )
+    ok(!pr.amendPending(), '…and is spent by being looked at, not left for the next mount')
+    pr.requestAmend(request, 1000)
+    eq(pr.claimAmend(1000 + pr.AMEND_TTL_MS), request, 'the deadline itself is still inside')
+
+    stop()
+    const before = woke
+    pr.requestAmend(request, 2000)
+    eq(woke, before, 'the unsubscriber actually unsubscribes')
+    pr.claimAmend(2000)
+  }
+
+  {
+    // --- the draft, which is the one thing here with no undo ----------------------------------
+    //
+    // `planAmend` decides what happens when the commit box already holds a message. Appending
+    // would produce a commit with two subject lines — an invisible corruption traded for a
+    // visible loss. Refusing would make the user clear the box by hand and come back to the log
+    // to repeat a gesture the app has already understood. So it asks, through the house
+    // `ConfirmDestructive`, and Cancel drops the whole request rather than arming a rewrite of
+    // HEAD with a message written for something else.
+    const request = {
+      project: 'proj-1',
+      repo: 'repo-1',
+      oid: 'b'.repeat(40),
+      shortOid: 'b1b2b3b',
+      message: 'feat: the committed subject',
+    }
+
+    eq(pr.planAmend('', request), { kind: 'adopt' }, 'an empty box is filled in silently')
+    eq(
+      pr.planAmend('   \n  ', request),
+      { kind: 'adopt' },
+      'and so is one holding only the whitespace a stray keystroke left — stopping to ask about ' +
+        'that is how a user learns to click through this dialog without reading it',
+    )
+
+    const plan = pr.planAmend('wip: half a thought about a/b paths', request)
+    eq(plan.kind, 'confirm', 'a real draft asks first')
+    ok(
+      plan.body.includes('wip: half a thought about a/b paths'),
+      'and names the draft that would be lost — rule 1 of ConfirmDestructive, in the body ' +
+        'because the file list runs every entry through basename/dirname and would draw this ' +
+        'draft as the file `b paths` in the directory `wip: half a thought about a`',
+    )
+    ok(
+      plan.body.includes(request.message),
+      '…and names what would replace it, which the user cannot see yet',
+    )
+    ok(
+      plan.body.includes(request.shortOid) && plan.confirmLabel.includes(request.shortOid),
+      '…and names the commit, in the log’s own abbreviation rather than a second spelling',
+    )
+    ok(
+      /Cancel/.test(plan.body),
+      '…and says what Cancel does, because Cancel here drops the request rather than merely ' +
+        'closing the dialog',
+    )
+
+    // The quote is a phrase inside a sentence, so a message with paragraphs in it must not
+    // arrive as two sentences jammed together — a `\n` renders as nothing at all in a <p>.
+    eq(
+      pr.quoteDraft('subject\n\nbody line one\nbody line two'),
+      'subject body line one body line two',
+      'newlines and runs of spaces collapse to one space',
+    )
+    const long = 'x'.repeat(pr.QUOTE_LIMIT + 40)
+    eq(pr.quoteDraft(long).length, pr.QUOTE_LIMIT, 'a long message is capped')
+    ok(pr.quoteDraft(long).endsWith('…'), '…and says so with an ellipsis')
+    eq(
+      pr.quoteDraft('x'.repeat(pr.QUOTE_LIMIT)),
+      'x'.repeat(pr.QUOTE_LIMIT),
+      'a message exactly at the limit is quoted whole — git’s own wall is 72 columns, so ' +
+        'the ordinary subject line arrives untrimmed',
+    )
+
+    pr.__resetPanelRequests()
+  }
+
+  // --- and the callers, which is what stops all of the above from being decoration ----------
+  //
+  // Source assertions. They prove the chain is spelled out, not that a click travels it — the
+  // same thing `check-git-tree.mjs` says about its own.
+  {
+    const dispatch = readFileSync('src/keys/dispatch.ts', 'utf8')
+    ok(
+      !/deps\.showSidebar/.test(dispatch) && !/showSidebar\??:/.test(dispatch),
+      '`DispatchDeps` no longer carries a `showSidebar` closure: one way to reveal a panel, not ' +
+        'two. Two would be two sets of preconditions to keep in step, and the log’s Amend ' +
+        'could reach neither',
+    )
+    ok(
+      /case 'git\.commit': \{[\s\S]{0,2000}?if \(!requestPanel\('git'\)\) return unmet\(/.test(dispatch),
+      'and `git.commit` reveals through the seam, still reporting when the window has no sidebar',
+    )
+    const app = readFileSync('src/App.tsx', 'utf8')
+    ok(
+      /registerPanelHost\(\(view\) => setSidebar\(\(s\) => showPanel\(s, view\)\)\)/.test(app)
+        && /return \(\) => registerPanelHost\(null\)/.test(app),
+      'App fills the slot with the same `showPanel` every other reveal goes through, and empties ' +
+        'it on unmount — a root that went away while registered leaves `requestPanel` calling ' +
+        'into a dead React tree',
+    )
+    ok(
+      /if \(paneWindow\) return\s*\n\s*registerPanelHost\(/.test(app),
+      '…and a detached-pane window registers nothing, so the dispatcher reports rather than ' +
+        'moving a `useState` nothing draws',
+    )
+    const hook = readFileSync('src/sidebar/GitPanel/useGitPanel.ts', 'utf8')
+    ok(
+      /amendOf: amend && amendOf\?\.repo === unit\.repo \? amendOf\.oid : null/.test(hook),
+      '`CommitRequest.amendOf` carries the oid the log named, and only to the repository it ' +
+        'named it in. Without it `require_amend_head` has nothing to check and a HEAD that moved ' +
+        'between the menu and the button is a silent rewrite of the wrong commit',
+    )
+    ok(
+      /requestFocus\('commitMessage'\)/.test(hook),
+      'adopting an amend also asks for the commit box — `CommitBox` is mounted under the Commit ' +
+        'tab only, so an amend adopted while the panel is on Shelf would fill a box nobody can ' +
+        'see, which is the "listed and does nothing" state the item was disabled to avoid',
+    )
+    ok(
+      /const detail = explain\(e\)/.test(hook),
+      '…and the refusal is a sentence: every `cmd/git.rs` command rejects with a serialised ' +
+        '`GitError`, so `String(e)` is `[object Object]` — including for the `notHead` this ' +
+        'whole path exists to provoke',
+    )
+  }
 
   // --- the clamp -------------------------------------------------------------------------
 
@@ -224,30 +457,48 @@ try {
     'a drag on a narrow window stops where the workspace floor is, not at 640',
   )
 
-  // The reason there are two stored widths at all: one panel's drag must not move the other.
+  // The reason there is a width *per panel* at all: one panel's drag must not move another's.
   eq(
-    withPanel({ files: 252, git: 420 }, 'files', 300),
-    { files: 300, git: 420 },
-    'resizing the explorer leaves the git width where the user left it',
+    withPanel({ files: 252, git: 420, agents: 320 }, 'files', 300),
+    { files: 300, git: 420, agents: 320 },
+    'resizing the explorer leaves the other widths where the user left them',
   )
   eq(
-    withPanel({ files: 252, git: 420 }, 'git', 500),
-    { files: 252, git: 500 },
+    withPanel({ files: 252, git: 420, agents: 320 }, 'git', 500),
+    { files: 252, git: 500, agents: 320 },
     'and resizing the git panel leaves the explorer alone',
+  )
+  eq(
+    withPanel({ files: 252, git: 420, agents: 320 }, 'agents', 500),
+    { files: 252, git: 420, agents: 500 },
+    'and so does resizing Agents — the M18 pair has its own number, not the explorer\'s',
+  )
+  // The clamp is shared, deliberately: `SidebarSettings::clamped()` in Rust applies one band
+  // to every field, so a third width with a band of its own would be a width Rust silently
+  // moved on the next snapshot.
+  eq(
+    withPanel({ files: 252, git: 420, agents: 320 }, 'agents', 9000),
+    { files: 252, git: 420, agents: SIDEBAR_MAX },
+    'the agents width clamps to the same ceiling as the other two',
+  )
+  eq(
+    withPanel({ files: 252, git: 420, agents: 320 }, 'agents', 10),
+    { files: 252, git: 420, agents: SIDEBAR_MIN },
+    'and to the same floor',
   )
 
   // --- the persistence round trip --------------------------------------------------------
 
-  const widths = { files: 300, git: 500 }
+  const widths = { files: 300, git: 500, agents: 360 }
   eq(decodeWidths(encodeWidths(widths)), widths, 'a width survives encode → decode unchanged')
   eq(
-    decodeWidths(encodeWidths({ files: SIDEBAR_MIN, git: SIDEBAR_MAX })),
-    { files: SIDEBAR_MIN, git: SIDEBAR_MAX },
+    decodeWidths(encodeWidths({ files: SIDEBAR_MIN, git: SIDEBAR_MAX, agents: SIDEBAR_MAX })),
+    { files: SIDEBAR_MIN, git: SIDEBAR_MAX, agents: SIDEBAR_MAX },
     'and so do both ends of the band — a clamp on the way back must not move a legal value',
   )
   eq(
     JSON.parse(encodeWidths(widths)),
-    { filesWidth: 300, gitWidth: 500 },
+    { filesWidth: 300, gitWidth: 500, agentsWidth: 360 },
     'the cache is written under the same wire names Rust stores, so the two can be compared by eye',
   )
 
@@ -257,19 +508,46 @@ try {
   eq(decodeWidths('[1,2]'), SIDEBAR_DEFAULT, 'nor must a value of the wrong shape')
   eq(decodeWidths('"252"'), SIDEBAR_DEFAULT, 'nor a bare string')
   eq(
-    decodeWidths('{"filesWidth":"300","gitWidth":500}'),
-    { files: SIDEBAR_DEFAULT.files, git: 500 },
-    'a field of the wrong type falls back on its own without taking the other with it',
+    decodeWidths('{"filesWidth":"300","gitWidth":500,"agentsWidth":360}'),
+    { files: SIDEBAR_DEFAULT.files, git: 500, agents: 360 },
+    'a field of the wrong type falls back on its own without taking the others with it',
   )
   eq(
-    decodeWidths('{"gitWidth":500}'),
-    { files: SIDEBAR_DEFAULT.files, git: 500 },
+    decodeWidths('{"gitWidth":500,"agentsWidth":360}'),
+    { files: SIDEBAR_DEFAULT.files, git: 500, agents: 360 },
     'a missing field takes its default — the shape a cache written by an older build has',
   )
   eq(
-    decodeWidths('{"filesWidth":9000,"gitWidth":1}'),
-    { files: SIDEBAR_MAX, git: SIDEBAR_MIN },
-    'a cache edited by hand is clamped rather than trusted',
+    decodeWidths('{"filesWidth":9000,"gitWidth":1,"agentsWidth":9000}'),
+    { files: SIDEBAR_MAX, git: SIDEBAR_MIN, agents: SIDEBAR_MAX },
+    'a cache edited by hand is clamped rather than trusted, and by the same band for every panel',
+  )
+
+  /*
+   * The upgrade every existing user takes, and the reason it needs an assertion of its own.
+   *
+   * The cache line is versionless — deliberately, because it is a hint — so the *only* copy of
+   * it any pre-M18 install has is this two-width object, and it is read on the very first
+   * frame of the first launch after the upgrade, before Rust has answered `app.get_bootstrap`.
+   * A missing `agentsWidth` that came back `undefined` or `NaN` would be written straight into
+   * `--w-sidebar-agents`, and an invalid custom property is not an error anywhere: the browser
+   * drops the declaration, the panel is drawn at whatever the cascade had or at nothing, and
+   * no console says why. So the field must degrade to the default instead.
+   */
+  const preM18 = '{"filesWidth":300,"gitWidth":500}'
+  eq(
+    decodeWidths(preM18),
+    { files: 300, git: 500, agents: SIDEBAR_DEFAULT.agents },
+    'a cache written before the agents width existed keeps its two widths and defaults the third',
+  )
+  ok(
+    Number.isFinite(decodeWidths(preM18).agents),
+    'and the third is a real number — NaN here is a `NaNpx` declaration the browser silently drops',
+  )
+  ok(
+    decodeWidths(preM18).agents === SIDEBAR_DEFAULT.agents,
+    `…specifically ${SIDEBAR_DEFAULT.agents}, the token's value, so the first frame after an ` +
+      `upgrade is the width a fresh install would show`,
   )
 
   eq(
@@ -278,18 +556,30 @@ try {
     'a window that has not heard from Rust yet shows the defaults, not zero',
   )
   eq(
-    widthsFromSettings({ filesWidth: 9000, gitWidth: 1 }),
-    { files: SIDEBAR_MAX, git: SIDEBAR_MIN },
-    'and a hand-edited workspace.json is clamped on the way in',
+    widthsFromSettings({ filesWidth: 9000, gitWidth: 1, agentsWidth: 9000 }),
+    { files: SIDEBAR_MAX, git: SIDEBAR_MIN, agents: SIDEBAR_MAX },
+    'and a hand-edited workspace.json is clamped on the way in, every field by the same band',
   )
-  eq(toStored(widths), { filesWidth: 300, gitWidth: 500 }, 'the patch shape matches SettingsPatch')
+  eq(
+    toStored(widths),
+    { filesWidth: 300, gitWidth: 500, agentsWidth: 360 },
+    'the patch shape matches SettingsPatch',
+  )
   eq(
     widthDeclarations(widths),
     [
       ['--w-sidebar-files', '300px'],
       ['--w-sidebar-git', '500px'],
+      ['--w-sidebar-agents', '360px'],
     ],
     'the declarations carry units — a unitless custom property is silently invalid in a width',
+  )
+  // Every panel has to reach the DOM, or a width is stored, clamped and never drawn.
+  eq(
+    widthDeclarations(widths).map(([property]) => property),
+    Object.values(SIDEBAR_TOKEN),
+    'and there is one declaration per token — a panel missing from `widthDeclarations` is a ' +
+      'width the drag stores and the paint never applies',
   )
 
   ok(SIDEBAR_CACHE_KEY.startsWith('cide.'), 'the cache key is namespaced to this app')
@@ -298,6 +588,19 @@ try {
   //
   // Every one of these is a copy that cannot be removed: CSS cannot import from TypeScript,
   // and Rust cannot import from either. So they are pinned instead.
+
+  eq(
+    Object.keys(SIDEBAR_TOKEN),
+    ['files', 'git', 'agents'],
+    'the panels that own a width: the explorer (with search and problems), git, and M18\'s ' +
+      'Agents (with Tasks) — three widths for five-plus views, because a shared column keeps ' +
+      'a shared number',
+  )
+  eq(
+    Object.keys(SIDEBAR_DEFAULT),
+    Object.keys(SIDEBAR_TOKEN),
+    'and every one of them has a default, or a panel opens at no width at all',
+  )
 
   const tokens = readFileSync('src/styles/tokens.css', 'utf8')
   for (const [panel, token] of Object.entries(SIDEBAR_TOKEN)) {
@@ -347,6 +650,23 @@ try {
     rustDefaults ? { files: Number(rustDefaults[1]), git: Number(rustDefaults[2]) } : null,
     { files: SIDEBAR_DEFAULT.files, git: SIDEBAR_DEFAULT.git },
     'SidebarSettings::default() is the same pair of widths as the tokens and SIDEBAR_DEFAULT',
+  )
+  // The agents default is a `fn` rather than a literal in the struct, because serde needs a
+  // path — so it is read from there, and both of its uses are pinned below.
+  eq(
+    Number(/fn default_agents_width\(\)\s*->\s*u16\s*\{\s*(\d+)/.exec(rust)?.[1] ?? null),
+    SIDEBAR_DEFAULT.agents,
+    'and default_agents_width() is the third — the token, SIDEBAR_DEFAULT.agents and Rust agree',
+  )
+  ok(
+    /agents_width:\s*default_agents_width\(\)/.test(rust),
+    'SidebarSettings::default() uses that fn rather than a second copy of the number',
+  )
+  ok(
+    /#\[serde\(default\s*=\s*"default_agents_width"\)\]/.test(rust),
+    'and agents_width carries #[serde(default = …)], without which every pre-M18 ' +
+      'workspace.json fails to deserialise its whole `sidebar` block on the first launch ' +
+      'after the upgrade — the Rust half of the same degradation `decodeWidths` does for the cache',
   )
 
   const windowsRs = readFileSync('../crates/cide-app/src/windows.rs', 'utf8')

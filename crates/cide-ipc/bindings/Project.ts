@@ -7,6 +7,7 @@ import type { ProjectRoot } from "./ProjectRoot";
 import type { SessionId } from "./SessionId";
 import type { Tab } from "./Tab";
 import type { TabId } from "./TabId";
+import type { ToolWindowState } from "./ToolWindowState";
 
 /**
  * One opened project: a header tab, or a whole window in `PerProject` mode.
@@ -104,4 +105,32 @@ dockAnchors: { [key in PaneId]: DockAnchor },
  * comes back live on the next launch, so a stale value costs the user a Resume splash on
  * the one pane that should never need one.
  */
-primarySession: SessionId, };
+primarySession: SessionId, 
+/**
+ * The Git tool window across the bottom of this project: whether it is open, how tall, and
+ * which histories it has tabs for. (M18)
+ *
+ * # Why `CURRENT_SCHEMA` does not move for this
+ *
+ * Modelled on the note [`Self::tab_mru`] carries, and the argument is the same one three
+ * times over.
+ *
+ * `#[serde(default)]` reads every existing `workspace.json` unchanged — a document written
+ * before this field gets [`ToolWindowState::default()`], which is a closed panel, which is
+ * exactly what those documents meant.
+ *
+ * The two bumps that *did* happen (1 → 2 and 2 → 3, and 3 → 4 for a different reason again)
+ * were not about serde either; both were about a **defaulted field whose default might
+ * later move**, where the movement would silently re-scope a live proxy or stop cide
+ * writing the user's files. Neither hazard exists here. If the tool window's default height
+ * changes, an existing user's stored height wins because it is on their disk, and if the
+ * default `open` ever flips, the worst outcome is a panel that appears once and that the
+ * user closes with one click. A panel is not a proxy scope and is not autosave.
+ *
+ * And a bump is not free in the other direction: it makes an older build's read of a newer
+ * document *certainly* fatal — `persist::load` quarantines a schema it does not know —
+ * where an unbumped document with one unknown key is read perfectly by every build that
+ * predates the key. Downgrading across a bump costs the user their whole layout; downgrading
+ * across this field costs them nothing at all.
+ */
+toolWindow: ToolWindowState, };

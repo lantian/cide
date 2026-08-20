@@ -3,6 +3,14 @@
 //! This crate is glue. It owns window creation, the command surface and process
 //! lifecycle; everything else lives in a domain crate that does not link a webview.
 
+// M18: the `$CIDE_AGENT_SOCK` server — the task tools a dispatched agent and the project's own
+// orchestrator reach over a unix socket, scoped from the connection's header line.
+pub mod agent_rpc;
+// M18: the run registry — the queue, the slots and every dispatched subagent run. The spawn
+// itself is the ordinary session path (`SpawnSpec` -> `PtySession` -> `SessionRegistry`), which
+// is what makes the shutdown ladder and the orphan sweep cover runs with no second
+// implementation of either.
+pub mod agents;
 pub mod closed_tabs;
 pub mod cmd;
 pub mod emit;
@@ -25,6 +33,8 @@ pub mod scratches;
 pub mod srcgrep;
 pub mod state;
 pub mod symbols;
+// M18: one `.cide/tasks.json` store per open project, and the thread that ticks them.
+pub mod tasks_state;
 pub mod windows;
 pub mod workspace_state;
 
@@ -220,11 +230,32 @@ pub fn run() {
     // so that `search.query` resolves its state and answers `NoIndex` rather than failing to
     // resolve at all.
     builder = builder.manage(cmd::search::SearchRegistry::default());
+    // M20. Empty until a tool tab asks for a page of log, and managed from the start for the
+    // reason the one above is: `git_log` claims its job before it dispatches the walk, so a
+    // command that could not resolve this state would fail outright — and `git_log_cancel` would
+    // fail on the very path whose whole job is to stop a walk that is already running.
+    builder = builder.manage(cmd::log::LogRegistry::default());
     // M12. Empty until a project opens, and managed from the start for the same reason as the two
     // above: `diagnostics.get` must resolve its state and answer `unavailable` with a sentence
     // rather than failing to resolve at all — a panel that cannot reach its state looks exactly
     // like a workspace with no problems.
     builder = builder.manage(lsp::DiagnosticsRegistry::default());
+    // M18. Empty until a project opens, and managed from the start for the reason the three
+    // above are: `tasks_board` must resolve its state and answer with a `TaskBoard` — which has a
+    // word for every one of "no tracker", "an empty tracker" and "a tracker that will not parse"
+    // — rather than failing to resolve at all, which the panel could only draw as a blank list.
+    //
+    // Behind an `Arc` because the flusher thread outlives the call that starts it; Tauri's
+    // `State` hands out a reference, which a `thread::spawn` cannot keep.
+    builder = builder.manage(std::sync::Arc::new(tasks_state::TasksStores::default()));
+    // M18. Empty until something is dispatched, and managed from the start for the same reason:
+    // `agents_roster` reads it on every call, and a command that cannot resolve its state fails
+    // rather than answering "nothing is running", which is what an empty registry already says.
+    //
+    // Behind an `Arc` because the coalescer's flusher thread and every `on_exit` callback outlive
+    // the call that registered them; Tauri's `State` hands out a reference, which a
+    // `thread::spawn` cannot keep.
+    builder = builder.manage(std::sync::Arc::new(agents::AgentRegistry::default()));
     // `ide` is deliberately *not* managed here. It is a `PendingIdeServers`, whose one method
     // ensures every restored project's server and registers the state together — so it has to
     // wait for `setup`, where the restored workspace exists to be offered. Registering it here
@@ -260,6 +291,17 @@ pub fn run() {
             cmd::diag::diag_log,
             cmd::git::git_status,
             cmd::git::git_repos,
+            cmd::git::git_locate,
+            cmd::git::git_blame,
+            cmd::git::git_blame_parent,
+            cmd::git::git_log,
+            cmd::log::git_log_cancel,
+            cmd::git::git_commit_detail,
+            cmd::git::git_commit_line_counts,
+            cmd::git::git_diff_revision,
+            cmd::git::git_diff_revision_files,
+            cmd::git::git_file_at_revision,
+            cmd::git::git_resolve_rev,
             cmd::git::git_tree_status,
             cmd::git::git_branch_info,
             cmd::git::git_branch_list,
@@ -294,8 +336,20 @@ pub fn run() {
             cmd::git::git_stash_pop,
             cmd::git::git_stash_apply,
             cmd::git::git_stash_drop,
+            // The commit actions — the log's right-click menu. `git_reset_preview` is the
+            // read that has to answer before the confirmation dialog can be honest; the other
+            // five mutate and each broadcasts `cide://git-status`. Amend and *branch from
+            // here* are absent on purpose: they are `git_commit` with `amendOf` and
+            // `git_branch_create` with a `startPoint`. See `cmd/git.rs`'s block header.
+            cmd::git::git_revert,
+            cmd::git::git_cherry_pick,
+            cmd::git::git_reset_preview,
+            cmd::git::git_reset,
+            cmd::git::git_tag_create,
+            cmd::git::git_checkout_detached,
             cmd::file::claude_selection_changed,
             cmd::file::claude_send_lines,
+            cmd::file::claude_session_names,
             cmd::file::file_read,
             cmd::file::image_read,
             cmd::file::file_write,
@@ -306,6 +360,9 @@ pub fn run() {
             cmd::file::terminal_open_path,
             cmd::file::tab_open_diff,
             cmd::file::tab_retarget_diff,
+            cmd::file::tab_open_revision_diff,
+            cmd::file::tab_retarget_revision_diff,
+            cmd::file::tab_open_revision,
             cmd::file::tab_set_dirty,
             cmd::lifecycle::app_restore_plan,
             cmd::pane::pane_split,
@@ -411,6 +468,30 @@ pub fn run() {
             cmd::diagnostics::diagnostics_implementations,
             cmd::diagnostics::diagnostics_refresh,
             cmd::diagnostics::diagnostics_restart,
+            // --- M18: the git tool window ---
+            cmd::toolwindow::tool_window_set_layout,
+            cmd::toolwindow::tool_window_activate,
+            cmd::toolwindow::tool_window_open_history,
+            cmd::toolwindow::tool_window_close_history,
+            // --- M18: the task tracker ---
+            cmd::tasks::tasks_board,
+            cmd::tasks::task_new,
+            cmd::tasks::task_edit,
+            cmd::tasks::task_delete,
+            // --- M18: subagent orchestration ---
+            cmd::agents::agents_roster,
+            cmd::agents::agents_config_get,
+            cmd::agents::agents_config_set,
+            cmd::agents::agents_dispatch,
+            cmd::agents::agents_stop,
+            cmd::agents::agents_pause,
+            cmd::agents::agents_resume,
+            cmd::agents::agents_retry_turn,
+            cmd::agents::agents_ack_stale_turn,
+            cmd::agents::agents_integrate,
+            cmd::agents::agents_draft,
+            cmd::agents::agents_save,
+            cmd::agents::agents_delete,
         ])
         .on_window_event(|window, event| {
             match event {
@@ -492,6 +573,13 @@ pub fn run() {
             app.state::<std::sync::Arc<positions_state::PositionsState>>()
                 .start_flusher();
 
+            // And the task trackers'. Same shape, same reason, and one more of its own: this is
+            // the only store in the process whose file has writers cide does not control, so its
+            // tick is also what notices a `git pull` moving `.cide/tasks.json` under an open
+            // panel and broadcasts the merged board. See `tasks_state`.
+            app.state::<std::sync::Arc<tasks_state::TasksStores>>()
+                .start_flusher(app.handle().clone());
+
             // Before the listener binds, so a `SIGKILL`ed previous run's socket is gone
             // rather than accumulating one file per hard kill for the life of the account.
             // Keyed on pid liveness and refuses anything it cannot establish as dead — see
@@ -513,6 +601,26 @@ pub fn run() {
                 // this degrades rather than refusing to launch.
                 Err(error) => {
                     tracing::error!(%error, "no hook socket; sessions will report no state")
+                }
+            }
+
+            // And the agent-RPC socket, beside it and for the identical ordering reason: a child
+            // that starts without `CIDE_AGENT_SOCK` in its environment can never be told where
+            // the task tools are, because `--mcp-config` is read at exec and the bridge reads the
+            // variable once, on connect.
+            //
+            // A *separate* socket from the one above rather than a second vocabulary on it — the
+            // hook socket is write-and-forget and strictly serialised, this one is a
+            // request/response conversation that does file I/O. See `agent_rpc`'s header.
+            match agent_rpc::AgentRpcServer::start(app.handle().clone()) {
+                Ok(server) => {
+                    app.manage(server);
+                }
+                // Costs every session its `cide_task_*` tools; costs nothing else. The bridge is
+                // written to degrade into a valid MCP server with an empty tool list when it
+                // cannot connect, precisely so that this failure is not a broken `claude`.
+                Err(error) => {
+                    tracing::error!(%error, "no agent rpc socket; sessions get no task tools")
                 }
             }
 
@@ -554,6 +662,33 @@ pub fn run() {
                     for (project, roots) in ide::servable_projects(&ws) {
                         registry.ensure(app.handle(), project, roots);
                         ide::link_diagnostics(app.handle(), project);
+                    }
+                }
+            }
+
+            // And one task tracker per restored project — the *third* registry to need this line,
+            // written here because the two blocks above are each a record of what happens without
+            // it: a registry reachable only from `project_open` is a registry every restoring
+            // launch comes up without, and in all three cases the absence has no symptom of its
+            // own. A project with no store here would have a Tasks panel that works (the commands
+            // `ensure` for themselves) and a flusher that watches nothing — so an agent's comment
+            // or a teammate's `git pull` would sit unwritten and unseen until the next mutation,
+            // which is precisely the class of failure that has no error message.
+            //
+            // `servable_projects` rather than a walk of its own, for the reason its doc gives
+            // about the language servers: every one of these features needs "every project the
+            // restored workspace holds", and two walks of one tree are two chances for a project
+            // to get one half and not the other. Its 32-project cap costs nothing here — the
+            // commands `ensure` on their own — beyond the tick, which the next `project_open`
+            // restores.
+            {
+                let ws = app.state::<WorkspaceState>().snapshot();
+                let stores = app.state::<std::sync::Arc<tasks_state::TasksStores>>();
+                for (project, roots) in ide::servable_projects(&ws) {
+                    // `roots[0]`: one project, one tracker. A project with no roots fails
+                    // validation, so this only ever skips a file we could not have named.
+                    if let Some(root) = roots.first() {
+                        stores.ensure(project, root);
                     }
                 }
             }

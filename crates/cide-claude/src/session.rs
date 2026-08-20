@@ -141,7 +141,7 @@ mod tests {
     use super::*;
     use cide_ipc::ClaudeCli;
 
-    /// What the shipped configuration resolves to: all four, spelled as they always were.
+    /// What the shipped configuration resolves to: every one, spelled as it always was.
     fn all() -> Injected {
         Injected::defaults()
     }
@@ -156,6 +156,10 @@ mod tests {
             Injection::Resume => cli.inject.resume.enabled = false,
             Injection::ForkSession => cli.inject.fork_session.enabled = false,
             Injection::Settings => cli.inject.settings.enabled = false,
+            // Nothing in this module writes it — `cmd::session.rs` appends `--mcp-config` after
+            // everything `conversation` returns — but the match is exhaustive on purpose, so a
+            // new injection cannot be added without a reader passing through here.
+            Injection::McpConfig => cli.inject.mcp_config.enabled = false,
         }
         cide_core::claude_cli::injected(&cli).0
     }

@@ -100,7 +100,13 @@ import {
 } from '@/ipc/client'
 import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+// The sentence, not a second copy of it. `NO_HOST` is user-visible prose that now appears on
+// four surfaces — the tab strip's *Show history for this file*, this panel's, and the two
+// header menus — and four literals is how one of them comes to say something slightly
+// different. `menuModel.ts` imports only types, so taking a constant from it drags in nothing.
+import { NO_HOST } from '@/chrome/menuModel'
 import { useWorkspace } from '@/store/workspace'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 import styles from './FileTree.module.css'
 
 /**
@@ -118,6 +124,12 @@ import styles from './FileTree.module.css'
  * to centre on a whole pixel *in a row of this parity*. Changing this to an odd number
  * without revisiting the icon box puts every icon in all three lists back on a half-pixel
  * grid — see that file, which exists because of exactly that bug.
+ *
+ * It is the *design* height, at the default chrome font size, and the rendered one is
+ * `scaledRow(ROW_HEIGHT, useUiScale())` — the same relationship `--fs-ui-13` has to 13px.
+ * `check:theme` still compares this literal against `ChangesTree.module.css`'s, which is the
+ * design number written in CSS, so the three lists agree at the design size and therefore at
+ * every size, since one multiplier moves all of them.
  */
 const ROW_HEIGHT = 24
 
@@ -248,9 +260,33 @@ export interface FileTreeProps {
    * only thing that would have — see the menu below.
    */
   onOpenPin?: ((id: string) => void) | undefined
+  /**
+   * *Show File History* — opens a tab in the git tool window. The argument is **absolute**. (M18)
+   *
+   * The host routes it to `runCommand('git.history.file', { path })` and to nothing else, which
+   * is the `file.reveal` precedent: that command already owns every precondition — is this a
+   * shell window, does the project hold a repository, which repository is this path in — and a
+   * second copy of them in this panel is a second copy that stops matching. It also means the
+   * tree, the tab strip, the git panel and the editor menu all reach one handler, so *Show file
+   * history* cannot come to mean four slightly different things.
+   *
+   * Absolute because that is what the command wants: `git_locate` resolves it to
+   * `(repo, repo-relative)` in Rust, and the tree deals in absolute paths already.
+   *
+   * Optional for the reason `onOpenToSide` is — a window with no tool window (every
+   * detached-pane window) must not have this panel pretend otherwise, and the item is then drawn
+   * disabled with the reason on it.
+   */
+  onShowHistory?: ((path: string) => void) | undefined
 }
 
-export function FileTree({ project, onOpen, onOpenToSide, onOpenPin }: FileTreeProps) {
+export function FileTree({
+  project,
+  onOpen,
+  onOpenToSide,
+  onOpenPin,
+  onShowHistory,
+}: FileTreeProps) {
   const count = useFileTree((s) => s.count)
   const chunks = useFileTree((s) => s.chunks)
   const degraded = useFileTree((s) => s.degraded)
@@ -689,10 +725,20 @@ export function FileTree({ project, onOpen, onOpenToSide, onOpenPin }: FileTreeP
     [draftAt],
   )
 
+  /*
+   * The row height in the chrome scale, because this list is the one place a row height is
+   * *not* a CSS declaration — see `settings/useUiScale.ts`. The virtualizer places every row
+   * with an absolute transform off this number and sizes the scroll spacer from it, so left at
+   * a literal it would keep 24px rows under text the setting had grown, clipping the names and
+   * making the scrollbar lie about the length of the tree.
+   */
+  const scale = useUiScale()
+  const rowHeight = scaledRow(ROW_HEIGHT, scale)
+
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 12,
   })
 
@@ -1747,6 +1793,50 @@ export function FileTree({ project, onOpen, onOpenToSide, onOpenPin }: FileTreeP
                   'cide opens a file manager only on paths inside the project',
               }),
         },
+        {
+          /*
+           * *Show File History*. (M18)
+           *
+           * Carries the command id, so the row draws whatever chord the live keymap has for it
+           * — nothing today, which is correct: this is the same *act* as the palette row and as
+           * the tab strip's item, and a chip must come from the resolved keymap or not at all.
+           *
+           * The row that was clicked, never the selection, and for the same reason *Reveal in
+           * File Manager* above takes it: a history tab is about one file, and opening five of
+           * them from one gesture is not what anyone means.
+           *
+           * **An untracked file is deliberately NOT disabled**, and the temptation is real —
+           * `treeStatus` already has a letter for it and testing it here is one line. It is
+           * wrong for two reasons that compound. Whether a path has history is a fact about the
+           * *repository*, not about the working tree: a file untracked today may have been
+           * tracked and deleted last week, and `git log -- <path>` answers for both. And the
+           * letter is a rollup cache with no invalidation for that question — nothing
+           * recomputes it when history changes, only when the working tree does. So the item
+           * would be greyed with a guessed reason that is sometimes false and never rechecked,
+           * which is the `repoOpen` mistake in miniature: a control disabled by a flag nobody
+           * maintains, telling the user something the app does not actually know. The item runs
+           * instead, and the empty state says *"Nothing in this repository's history touches
+           * …"*, which is the true answer and is computed at the moment it is shown.
+           */
+          id: 'history',
+          label: 'Show File History',
+          command: 'git.history.file',
+          ...(!row.isDir && rowRefusal === null && onShowHistory !== undefined
+            ? { run: () => onShowHistory(row.path) }
+            : {
+                // Three ways to be unavailable and three different sentences, because "not
+                // available" tells the user nothing they can act on — the same discipline the
+                // tab strip's copy of this item follows. The directory case is the one worth
+                // wording carefully: a folder *does* have a history in git's sense, and the
+                // tool window's tabs are per file, so the sentence says where to click instead
+                // rather than claiming there is nothing there.
+                disabledReason: row.isDir
+                  ? 'A directory has no file history — open a file inside it'
+                  : rowRefusal !== null
+                    ? 'This file is outside the project, so it is in no repository cide has opened'
+                    : NO_HOST,
+              }),
+        },
         /*
          * The two that copy *names* rather than files, and they follow the selection: with
          * four rows highlighted, a *Copy Paths* that handed over one of them would be a menu
@@ -1993,8 +2083,8 @@ export function FileTree({ project, onOpen, onOpenToSide, onOpenPin }: FileTreeP
               directory={draft.directory}
               depth={draft.depth}
               iconTheme={iconTheme}
-              top={draftAt * ROW_HEIGHT}
-              height={ROW_HEIGHT}
+              top={draftAt * rowHeight}
+              height={rowHeight}
               value={draftName}
               onChange={setDraftName}
               onCommit={commitDraft}
@@ -2087,9 +2177,11 @@ export function FileTree({ project, onOpen, onOpenToSide, onOpenPin }: FileTreeP
         * Mounted by the panel that owns the gesture rather than by the shell: it is opened only
         * by a Ctrl+V or a *Paste* menu item in this tree, its state has exactly this panel's
         * lifetime, and putting it here is what makes the feature reachable without an `App.tsx`
-        * edit. `OverlayCard`'s scrim is `position: fixed`, so it covers the window from here
-        * exactly as it would from the root — and being a sibling of the scroller rather than a
-        * child keeps it out of the `role="tree"` subtree.
+        * edit. `OverlayCard` portals its scrim to `document.body` (M19), so it covers the window
+        * from here exactly as it would from the root — and being a sibling of the scroller rather
+        * than a child keeps it out of the `role="tree"` subtree. Before the portal the scrim was
+        * merely `position: fixed`, which is enough here but was not inside a tab panel, whose
+        * `z-index` capped it.
         *
         * Nothing has been written when this is on screen; see `pasteConfirmModel.ts`.
         */}

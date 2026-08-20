@@ -299,6 +299,34 @@ impl SpawnSpec {
         self
     }
 
+    /// Fold a list of environment *changes* — `(name, Some(value))` sets, `(name, None)`
+    /// removes — into this spec.
+    ///
+    /// The shape is `cide_core::child_env::EnvChange`, spelled structurally because
+    /// `cide-pty` does not depend on `cide-core` and must not: the dependency runs the other
+    /// way, and the domain crate is what composes these lists.
+    ///
+    /// That split is the whole reason this method exists. `cide-core` owns the *rules* about
+    /// what a child's environment must be — the bundle scrub, the `PATH` append, the
+    /// `CLAUDE_CODE_*` switches, the terminal constants — and hands back one ordered list,
+    /// because it cannot see [`SpawnSpec`]. Folding that list is the half only this crate can
+    /// do. Keeping the fold here means every spawn site that takes a composed list folds it
+    /// the same way, instead of each one reimplementing the two-arm `match` and one of them
+    /// eventually dropping the removal arm — which would leave a variable the rule said must
+    /// go sitting in the child, with nothing anywhere to say so.
+    ///
+    /// Order is preserved into [`SpawnSpec::env`] and [`SpawnSpec::env_remove`], which are
+    /// separate lists: removals are applied to the inherited environment first, then the sets,
+    /// so a set and a removal of the same name do not race on their position in this list.
+    pub fn apply(self, changes: impl IntoIterator<Item = (String, Option<String>)>) -> Self {
+        changes
+            .into_iter()
+            .fold(self, |spec, (name, value)| match value {
+                Some(value) => spec.env(name, value),
+                None => spec.env_remove(name),
+            })
+    }
+
     pub fn geometry(mut self, g: Geometry) -> Self {
         self.geometry = g;
         self
@@ -320,6 +348,24 @@ impl SpawnSpec {
 ///
 /// Implemented over a Tauri `Channel` in the app crate, and over a plain channel in tests
 /// and in `cide-headless`. Returning `false` means the sink is gone and should be dropped.
+///
+/// # `deliver` runs with the sink list locked, so it must never re-enter this session
+///
+/// `PtySession::broadcast` (private, below) walks the registered sinks under their own mutex
+/// and calls
+/// `deliver` from inside that walk. `parking_lot::Mutex` is **not reentrant**, so calling
+/// anything on the same [`PtySession`] from within `deliver` parks the caller for ever — and
+/// the caller is the coalescer thread, which is the single thread every byte of every session
+/// in the process flows through. The symptom is that **every terminal in the application stops
+/// painting**, with no panic, no log line and no error anywhere: the one failure mode in this
+/// crate that reports nothing at all.
+///
+/// [`PtySession::ack`] is the one that gets reached for, because a sink that consumes bytes is
+/// exactly the thing that wants to return credit — M18's agent stream sink did precisely this
+/// and wedged the coalescer. Acknowledge from **another thread** instead. Not acknowledging at
+/// all is not the escape either: the sink chokes at its credit limit and starts receiving
+/// rendered screens in place of the byte stream, which silently corrupts any consumer that is
+/// parsing rather than painting.
 pub trait Sink: Send + Sync + 'static {
     fn deliver(&self, bytes: &[u8]) -> bool;
 }

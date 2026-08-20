@@ -1,0 +1,584 @@
+/*
+ * Settings → Agents: the role list and the definition form.
+ *
+ * Every colour is a token from `styles/tokens.css`, so both themes follow with no media query —
+ * the rule `ProxySection.module.css` and `ClaudeCliSection.module.css` both state at their top.
+ * The field vocabulary (`.field`, `.fieldLabel`, `.input`, `.fieldHint`) is deliberately the same
+ * as those two files': all three sections live on one screen, and a third subtly different text
+ * input is the kind of drift a reader notices and cannot name.
+ */
+
+/* --- the role list --- */
+
+.split {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.listEmpty {
+  padding: 12px 2px;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.listActions {
+  display: flex;
+  gap: 8px;
+}
+
+/*
+ * One definition file.
+ *
+ * It was a single full-width `<button>` that swapped the inline form. It is a `<li>` now, because
+ * the row carries two actions and a `<button>` cannot contain a `<button>` — and because a row
+ * that is not itself a control is free to say more than a click target should: two badges, a
+ * status word, and Rust's sentence when there is one.
+ */
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+}
+
+.row:hover {
+  background: var(--chrome);
+}
+
+.rowBody {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Never wraps under the text: the two actions keep the same place on every row, so a Delete is
+   always where the last one was and never where the previous row's Edit just was. */
+.rowActions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rowActive {
+  background: var(--chrome-hi);
+  border-color: var(--border);
+}
+
+/*
+ * A role whose file exists but which nothing will ever run, because this project defines one of
+ * the same name and a project role wins whole-file.
+ *
+ * Dimmed and *not* hidden, for the reason a struck-out argument is not hidden one section up: it
+ * is still the user's file, they can still edit it, and it becomes live again the moment the
+ * project's role is deleted. The word "shadowed" on the row is what carries the meaning — the
+ * dimming alone would read as "disabled", which is a different and wrong claim.
+ */
+.rowShadowed .rowName {
+  color: var(--dim);
+}
+
+.rowHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rowName {
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+}
+
+.rowFile {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+  line-height: 1.45;
+  color: var(--faint);
+}
+
+/*
+ * Why a dispatch of this name would not run, in `AgentDef::unavailable`'s own words.
+ *
+ * `--red` rather than `--dim`, and never a bare greyed row: that field's doc is explicit that a
+ * role which cannot run is drawn greyed **with the sentence**, because a greyed row saying
+ * nothing is a role the user cannot fix. It is the same claim `.error` makes for a refused save,
+ * one screen out, so it wears the same colour.
+ */
+.rowBlocked {
+  display: block;
+  margin-top: 3px;
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.4;
+  color: var(--red);
+}
+
+/* Which directory the file is in — the whole of what scope means, so it is on every row. */
+.badge {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: var(--fs-ui-10-5);
+  line-height: 1.5;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badgeGlobal {
+  border-color: var(--border-soft);
+  color: var(--faint);
+}
+
+/*
+ * Ready / Shadowed / Cannot run — the third thing every row says.
+ *
+ * A word on every row rather than a mark on the bad ones, because "this role is fine" is an
+ * answer the user came for: a list where only problems are labelled makes an unlabelled row mean
+ * *either* healthy or not-yet-checked. `usability` in `agentsDraft.ts` is what decides, and it
+ * returns exactly one of the three.
+ */
+.status {
+  flex: none;
+  margin-left: auto;
+  font-size: var(--fs-ui-11);
+  color: var(--faint);
+}
+
+.statusBlocked {
+  color: var(--red);
+}
+
+/* The row's own two buttons. Smaller than the form's, because they sit inside a list row. */
+.act {
+  height: calc(22px * var(--ui-scale));
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-11-5);
+  cursor: pointer;
+}
+
+.act:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.act:disabled {
+  color: var(--faint);
+  border-color: var(--border-soft);
+  cursor: default;
+}
+
+/*
+ * The *armed* delete, and only the armed one.
+ *
+ * Red arrives on the second click, never the first — a Delete that is already red before it has
+ * asked anything is a button people learn to click past, which is the note the form's own danger
+ * button carried before Delete moved out here.
+ */
+.actDanger {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.actDanger:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--chrome-hi);
+}
+
+/* --- the form --- */
+
+.field {
+  display: block;
+  padding: 11px 0;
+}
+
+.fieldLabel {
+  display: block;
+  font-size: var(--fs-ui-13);
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.fieldHint {
+  display: block;
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--dim);
+  margin-top: 5px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  height: calc(26px * var(--ui-scale));
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  /* A role name is a file stem and a branch segment; a tool name and a model alias are machine
+     strings. Mono, like every path and counter in this app. */
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+}
+
+.input::placeholder {
+  color: var(--faint);
+}
+
+.input:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+.inputNarrow {
+  width: 92px;
+}
+
+.select {
+  display: block;
+  height: calc(26px * var(--ui-scale));
+  min-width: 220px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+}
+
+.select:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+/*
+ * The system prompt.
+ *
+ * The one control on this screen that is a document rather than a value, and it is given the room
+ * to be one: a single-line box for a system prompt is exactly what sends a user back to their
+ * text editor, which is the complaint this whole section answers. `resize: vertical` because a
+ * long prompt is normal and the section scrolls anyway.
+ *
+ * Both spellings of `user-select`, in that order. WebKitGTK 2.52.3 drops the unprefixed property
+ * outright, and the app root sets `user-select: none`; a prompt a user cannot select is a prompt
+ * they cannot copy out of the form they wrote it in. `check:css-prefix` is the gate on the pair.
+ */
+.prompt {
+  display: block;
+  width: 100%;
+  min-height: calc(320px * var(--ui-scale));
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.55;
+  resize: vertical;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.prompt::placeholder {
+  color: var(--faint);
+}
+
+.prompt:focus {
+  outline: 0;
+  border-color: var(--accent);
+}
+
+/*
+ * One refusal, under the box it is about.
+ *
+ * `--red` and not `--dim`: unlike `ClaudeCliSection`'s `.why`, which explains a value that was
+ * stored anyway, this is the reason **nothing was written**, and it is the answer to a button the
+ * user just pressed. The field it sits under is the only thing that says which box it means, so
+ * it never moves out of one.
+ */
+.error {
+  margin: 6px 0 0;
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--red);
+}
+
+/* --- suggestions that are only suggestions --- */
+
+.suggest {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.suggestRow {
+  display: flex;
+  gap: 6px;
+}
+
+.chip {
+  height: calc(24px * var(--ui-scale));
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.chipOn {
+  background: var(--chrome-hi);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* --- the tool list --- */
+
+.tools {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.toolRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.toolRow .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.add {
+  align-self: flex-start;
+  height: calc(24px * var(--ui-scale));
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.add:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.remove {
+  flex: none;
+  width: 24px;
+  height: calc(26px * var(--ui-scale));
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--faint);
+  font-size: var(--fs-ui-14);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.remove:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* --- the dialog --- */
+
+/*
+ * The form as a modal.
+ *
+ * `OverlayCard` supplies the scrim, the 620px card, the ground, the border, the radius and the
+ * shadow — every number in `Overlay.module.css` and none of them repeated here. What this owns is
+ * the three-band layout inside that card: a head that does not move, a body that scrolls, and a
+ * foot that does not. The card is already capped at the window height, so without the middle band
+ * scrolling on its own, a Save under a 320px system prompt would be a Save the user has to hunt
+ * for — or, past a certain window height, one clipped away entirely.
+ *
+ * `min-height: 0` on the body is what makes that work at all: a flex item's default
+ * `min-height: auto` refuses to shrink below its content, so the body would push the foot out of
+ * the card instead of scrolling.
+ */
+.dialog {
+  display: flex;
+  flex-direction: column;
+  /*
+   * `flex: 1 1 auto`, not `flex: 1`. This is the card's only child and the card is a column flex
+   * box whose height comes from its content up to a `max-height`; a `flex-basis: 0` — which is
+   * what the `flex: 1` shorthand means — would make that content contribute nothing to the
+   * card's own height and collapse it. `auto` keeps the basis at the content size and still
+   * lets the item shrink once the cap bites.
+   *
+   * `min-height: 0` is the half that makes the shrink legal: a flex item's default
+   * `min-height: auto` refuses to go below its content, so without it the body would push the
+   * footer out through the bottom of the card instead of scrolling.
+   */
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.dialogHead {
+  flex: none;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.dialogTitle {
+  margin: 0;
+  font-size: var(--fs-ui-15);
+  color: var(--text-hi);
+}
+
+.dialogSub {
+  margin: 5px 0 0;
+  font-size: var(--fs-ui-12);
+  line-height: 1.45;
+  color: var(--dim);
+}
+
+.dialogBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* No bottom padding: the last `Group` brings its own 28px margin, and two of them stack. */
+  padding: 14px 18px 0;
+}
+
+.dialogFoot {
+  flex: none;
+  padding: 12px 18px 14px;
+  border-top: 1px solid var(--border);
+}
+
+/*
+ * Buttons right, state left.
+ *
+ * `justify-content: flex-end` with an `auto` margin on the one text item, rather than a spacer
+ * element: the footer has two arrangements — Cancel/Save, and the discard confirm — and both put
+ * a sentence on the left and the answers on the right, so the rule belongs to the row.
+ */
+.footRow {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/*
+ * The discard question, in the footer that is asking it.
+ *
+ * Accent, not red. It is a question, and the red in this file means "this destroys work" — which
+ * is what the button beside it says, once.
+ */
+.leaving {
+  margin-right: auto;
+  font-size: var(--fs-ui-12);
+  line-height: 1.4;
+  color: var(--accent);
+}
+
+/* Red text on the quiet button, for the answer that throws the writing away. The accent-filled
+   button next to it is *Keep editing*, so a reflexive Enter keeps the work — `ConfirmDestructive`
+   rule 3, with the safe answer being "stay" rather than "cancel". */
+.dangerText {
+  color: var(--red);
+}
+
+.dangerText:hover {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+/* --- save, and the state of the form --- */
+
+.save {
+  height: calc(26px * var(--ui-scale));
+  padding: 0 14px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.save:disabled {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--faint);
+  cursor: default;
+}
+
+.quiet {
+  height: calc(26px * var(--ui-scale));
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-12);
+  cursor: pointer;
+}
+
+.quiet:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/*
+ * The unsaved marker.
+ *
+ * Loud enough to be seen without being an error, because it is the only thing on the screen that
+ * says the file on disk is not what the boxes show — and because leaving this tab is the one way
+ * to lose an edit that the form itself cannot intercept.
+ */
+.dirty {
+  /* Left, with the answers pushed to the right of it — see `.footRow`. */
+  margin-right: auto;
+  font-size: var(--fs-ui-12);
+  color: var(--accent);
+}
+
+.wrote {
+  margin: 10px 0 6px;
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}

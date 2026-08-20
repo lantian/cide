@@ -54,8 +54,39 @@ export interface MenuItem {
   readonly danger?: boolean | undefined
   /** Set (either way) ⇒ the item is a toggle and gets a check gutter. */
   readonly checked?: boolean | undefined
-  /** Absent ⇒ disabled. See [`NO_ACTION_REASON`]. */
+  /** Absent ⇒ disabled, *unless* [`submenu`] is present. See [`NO_ACTION_REASON`]. */
   readonly run?: (() => void) | undefined
+  /**
+   * The item opens a submenu instead of doing something. One level deep, and no deeper.
+   *
+   * # Why a thunk and not an array
+   *
+   * A submenu is opened by a hover, which is at minimum a couple of hundred milliseconds after
+   * the parent menu opened, and the one caller that needs this — the code pane's *Send … to
+   * Claude ▸* — is listing **live Claude sessions with the names their user gave them**. Those
+   * names are read off disk by Rust and arrive asynchronously; a snapshot taken when the parent
+   * menu was built would show a list one round trip stale, which for a menu of conversations to
+   * type into is the difference between naming the right one and naming the one before it.
+   *
+   * So the array is built when the submenu opens, not when its parent does. That is also the
+   * rule `useContextMenu`'s `items` already follows one level up, for the same reason it states
+   * there: nothing is computed until the gesture happens, so nothing can be stale.
+   *
+   * # Why one level
+   *
+   * Nothing in this app has ever wanted two, and each extra level is a placement pass, a focus
+   * chain and a dismissal rule that no check script can drive without a DOM. `ContextMenu`
+   * renders exactly one submenu box and ignores a `submenu` inside one; if a second level is
+   * ever genuinely needed, that box is where the recursion goes, not here.
+   *
+   * # `run` is ignored when this is set
+   *
+   * A row cannot both open a list and do a thing — the click that would fire it is the same
+   * click that opens the submenu, so one of the two would be unreachable by mouse. The parent
+   * row opens the submenu and nothing else; [`resolveMenu`] drops any `run` beside it rather
+   * than leaving a caller to find out which one won.
+   */
+  readonly submenu?: (() => readonly MenuEntry[]) | undefined
 }
 
 export type MenuEntry = MenuItem | MenuSeparator
@@ -77,6 +108,15 @@ export interface ResolvedItem {
   /** `null` when the item is not a toggle, so "unchecked" and "not a toggle" stay distinct. */
   readonly checked: boolean | null
   readonly run: (() => void) | null
+  /**
+   * Builds the submenu's entries when it opens, or `null` for an ordinary row.
+   *
+   * Never both this and [`run`]: a row is one or the other, and `resolveMenu` is what makes
+   * that true rather than the caller. A disabled parent carries `null` here for the same
+   * reason a disabled item carries a `null` `run` — an enablement a caller ignores must not
+   * leave a live handle behind.
+   */
+  readonly submenu: (() => readonly MenuEntry[]) | null
 }
 
 export interface ResolvedSeparator {
@@ -135,7 +175,10 @@ export function resolveMenu(
       pendingSeparator = false
     }
 
-    const reason = entry.disabledReason ?? (entry.run === undefined ? NO_ACTION_REASON : null)
+    // A submenu is an action for this purpose: the row does something when it is clicked —
+    // it opens a list — so it is not the wired-to-nothing shape `NO_ACTION_REASON` names.
+    const inert = entry.run === undefined && entry.submenu === undefined
+    const reason = entry.disabledReason ?? (inert ? NO_ACTION_REASON : null)
     const enabled = reason === null
     out.push({
       kind: 'item',
@@ -148,7 +191,10 @@ export function resolveMenu(
       hint: enabled && entry.command !== undefined && chipFor ? chipFor(entry.command) : null,
       danger: entry.danger === true,
       checked: entry.checked === undefined ? null : entry.checked,
-      run: enabled ? (entry.run ?? null) : null,
+      // A parent never runs. See `MenuItem.submenu`: the click that would fire it is the click
+      // that opens the list, so shipping both would make one of the two unreachable by mouse.
+      run: enabled && entry.submenu === undefined ? (entry.run ?? null) : null,
+      submenu: enabled ? (entry.submenu ?? null) : null,
     })
   }
 
@@ -268,6 +314,64 @@ export function placeMenu(
  */
 function clamp(value: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(value, hi))
+}
+
+/** The parent row a submenu hangs off, in window coordinates. A `DOMRect` is assignable. */
+export interface Rect {
+  readonly left: number
+  readonly right: number
+  readonly top: number
+  readonly bottom: number
+}
+
+/**
+ * Where a submenu goes: beside its parent row, not under the pointer.
+ *
+ * # Why this is not `placeMenu` with a cleverer anchor
+ *
+ * `placeMenu` flips a box **through** its anchor — the anchor is a pointer, and a pointer has
+ * no width, so `x - width` is the correct leftward placement. A submenu's anchor is a *row*,
+ * and flipping through its right edge would lay the submenu straight over the parent menu it
+ * came out of: the user would lose the row they are hovering, which is the one thing that has
+ * to stay visible while a submenu is open. The flip has to go round the row, from `rect.right`
+ * to `rect.left - width`, and that is a different sum from the one `placeMenu` does.
+ *
+ * The rest follows the same rules as `placeMenu` and for the same reasons: flip only when the
+ * other side is genuinely roomier (so the ordinary case stays "open rightwards"), clamp
+ * afterwards for the window that can hold neither, and bill `maxHeight` from the placed `y`
+ * rather than from the anchor, so a box the clamp has already moved up is not told it has less
+ * room than it was given.
+ *
+ * Vertically the box's top starts level with the row's top rather than its bottom, so the
+ * first submenu item sits beside the row that opened it. That is what makes a diagonal mouse
+ * path from row to submenu work at all, and it is what every desktop menu does.
+ */
+export function placeSubmenu(
+  anchor: Rect,
+  size: Size,
+  viewport: Size,
+  margin: number = MENU_MARGIN,
+): Placement {
+  const spaceRight = viewport.width - margin - anchor.right
+  const spaceLeft = anchor.left - margin
+  const flippedX = size.width > spaceRight && spaceLeft > spaceRight
+  const x = clamp(
+    flippedX ? anchor.left - size.width : anchor.right,
+    margin,
+    viewport.width - margin - size.width,
+  )
+
+  const y = clamp(anchor.top, margin, viewport.height - margin - size.height)
+  return {
+    x,
+    y,
+    flippedX,
+    // A submenu is never "flipped up": its top edge is placed, then clamped, so the box grows
+    // downwards from wherever it landed. The field is on `Placement` for `placeMenu`'s sake
+    // and is reported honestly rather than left to a caller to interpret.
+    flippedY: false,
+    maxHeight: Math.max(0, viewport.height - margin - y),
+  }
 }
 
 /**

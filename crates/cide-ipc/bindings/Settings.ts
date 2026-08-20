@@ -16,6 +16,32 @@ export type Settings = {
  */
 windowMode: WindowMode, theme: Theme, 
 /**
+ * Point size for everything that is **not** a buffer or a terminal.
+ *
+ * Beside `theme` rather than in a group of its own, and for the same reason `theme` is a
+ * scalar: it is one number that repaints the whole window, and a one-field group would
+ * buy nothing but a type. [`SettingsPatch`](crate::SettingsPatch) patches per top-level
+ * field, so a scalar also means this is the one font size a caller can move without
+ * first holding the whole group it lives in — the hazard `ui/src/editor/diffViewMode.ts`
+ * works around for [`EditorSettings`].
+ *
+ * It is a *base*, not the size of any particular label. The chrome draws at fourteen
+ * design sizes between 8px and 20px, and this number scales all of them proportionally
+ * through one multiplier — `--ui-scale` in `tokens.css`, which is this over
+ * [`DEFAULT_UI_FONT_SIZE`]. So at 15 the file tree's 13px rows are 15px and its 10.5px
+ * path labels are 12.1px; the ratios the design mock specifies are preserved, which is
+ * what `./run.sh --audit-chrome` measures.
+ *
+ * Deliberately *not* named `zoom` and deliberately not a percentage. Icons, borders and
+ * splitter widths do not follow it, so it is not a zoom level, and calling it one would
+ * promise a uniform scaling this does not do.
+ *
+ * `f32` for [`EditorSettings::font_size`]'s reason — the Settings control steps by half a
+ * pixel and an integer would snap it. Clamped where a patch lands: see
+ * [`clamp_ui_font_size`].
+ */
+uiFontSize: number, 
+/**
  * "Each project keeps its own Claude tab — pinned, cannot be closed, only its panes
  * can." Off would mean a project with no console tab, which the rest of the model
  * does not currently allow; the toggle exists in the mock and is honoured as

@@ -8,7 +8,8 @@
  *
  * The design mock's idle Claude pane is the reference for everything above the control: the
  * accent tile, the name with its dim version, the model line and the cwd, all in the mono
- * stack at the mock's 12/19. What replaces the mock's prompt box is the one thing this
+ * stack at the mock's 12/19, which it reads through `--fs-ui-12` and `--ui-scale` so the
+ * chrome font size moves it. What replaces the mock's prompt box is the one thing this
  * surface does.
  *
  * Styling is inline rather than a CSS module because the hover lift is the only state and a
@@ -61,8 +62,12 @@ const rootStyle: CSSProperties = {
   padding: '18px 20px',
   background: 'var(--panel-2)',
   fontFamily: 'var(--font-mono)',
-  fontSize: 12,
-  lineHeight: '19px',
+  // Through the ladder, not as `12`, so this follows the chrome font size like everything
+  // else that is not a buffer or a terminal. A number here is a raw px value React writes
+  // straight into `style`, which is the one form the setting cannot reach — and this splash
+  // fills a whole pane, so it is the last surface that should stay behind.
+  fontSize: 'var(--fs-ui-12)',
+  lineHeight: 'calc(19px * var(--ui-scale))',
   color: 'var(--dim)',
   // A pane can be short; the splash scrolls rather than clipping the resume control, which
   // is the only thing here the user can act on.

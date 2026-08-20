@@ -132,6 +132,43 @@ export function gitTreeClick({ gesture, expandable, diffOpen }: GitTreeClick): R
   return diffOpen ? SELECT_OPEN : SELECT
 }
 
+export interface LogFileClick {
+  readonly gesture: Gesture
+  /** A directory heading in the grouped listing. File rows are the leaves. */
+  readonly expandable: boolean
+}
+
+/**
+ * The git tool window's changed-file list. (M21)
+ *
+ * > *"One click - selection, double click - open diff."*
+ * > *"Still on one click it opens diff"*
+ *
+ * **Unconditional, unlike [`gitTreeClick`]** — and the difference is the point rather than an
+ * oversight, so it is written down here where both rules are visible at once.
+ *
+ * `gitTreeClick` opens on a single click whenever a diff is already on screen, because the git
+ * *commit* panel is a working surface: the user is reading down a list of their own changes with
+ * the diff pane beside them, and clicking the next file is how you read the next diff. The log's
+ * details pane is a *reading* surface. Its list is a fact about a commit that has already
+ * happened, the diff opens as a **tab** rather than into a pane that is already there, and the
+ * user reaches the list to find one file among many. Under the conditional rule the first
+ * double-click opened a tab and every single click afterwards silently replaced it, so arrowing
+ * down the list to look for something kept throwing diffs into the editor.
+ *
+ * That was reported twice. The second report is the one that settled it: the rule was not
+ * misconfigured, it was the wrong rule for this surface.
+ *
+ * A directory heading folds on a single click and does nothing on the second — the same shape
+ * every expandable row in this application has, and for the same reason the header gives: the
+ * first half of a double-click has already folded it, and folding again would put it straight
+ * back.
+ */
+export function logFileClick({ gesture, expandable }: LogFileClick): RowAction {
+  if (expandable) return gesture === 'single' ? SELECT_TOGGLE : NOTHING
+  return gesture === 'single' ? SELECT : SELECT_OPEN
+}
+
 export interface SearchClick {
   readonly gesture: Gesture
   /** A file heading, or one matching line under it. */

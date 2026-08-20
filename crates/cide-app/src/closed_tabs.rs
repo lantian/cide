@@ -183,7 +183,14 @@ fn remembered(kind: &TabKind) -> bool {
         TabKind::Diff { spec, .. } => {
             !matches!(spec.origin, cide_ipc::DiffOrigin::ClaudeMcp { .. })
         }
-        TabKind::ClaudeFull { .. } | TabKind::File { .. } | TabKind::Settings { .. } => true,
+        // A revision tab is remembered like any other document. It is a *query* — a file as one
+        // commit left it — so reopening it costs one `git_file_at_revision` and lands on exactly
+        // the same bytes, because a commit is immutable. That immutability is what makes it
+        // safer to reopen than a working-tree diff, which the arm above already remembers.
+        TabKind::ClaudeFull { .. }
+        | TabKind::File { .. }
+        | TabKind::Revision { .. }
+        | TabKind::Settings { .. } => true,
     }
 }
 

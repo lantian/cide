@@ -77,7 +77,7 @@
   box-shadow: var(--shadow);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   overflow: hidden;
 }
 
@@ -128,7 +128,7 @@
   margin-left: 6px;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
 }
 
 .head {
@@ -146,7 +146,7 @@
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
 }
 
 .search:focus {
@@ -174,7 +174,7 @@
   padding: 4px 10px;
   background: var(--panel-2);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--text);
   cursor: pointer;
 }
@@ -221,7 +221,7 @@
 .section {
   padding: 8px 12px 4px;
   color: var(--faint);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -294,14 +294,14 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .counts {
   flex: none;
   color: var(--dim);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   font-variant-numeric: tabular-nums;
 }
 
@@ -313,7 +313,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--faint);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
 }
 
 .more {
@@ -323,7 +323,7 @@
   background: transparent;
   padding: 0 10px;
   color: var(--dim);
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   line-height: 1;
   cursor: pointer;
 }
@@ -347,7 +347,7 @@
   background: var(--panel);
   padding: 3px 8px;
   font-family: var(--font-ui);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--text);
   cursor: pointer;
 }
@@ -374,7 +374,7 @@
 
 .panelTitle {
   margin: 0 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   font-weight: var(--w-bold);
   color: var(--text-hi);
 }
@@ -382,7 +382,7 @@
 .panelBody {
   margin: 8px 0 0;
   color: var(--dim);
-  line-height: 17px;
+  line-height: calc(17px * var(--ui-scale));
 }
 
 /*
@@ -393,14 +393,14 @@
 .paths {
   margin: 8px 0 0;
   padding: 8px;
-  max-height: 160px;
+  max-height: calc(160px * var(--ui-scale));
   overflow-y: auto;
   list-style: none;
   background: var(--panel-2);
   border: 1px solid var(--border-soft);
   border-radius: 4px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--text);
   /* Paths are the one thing here worth copying out. */
   -webkit-user-select: text;
@@ -431,9 +431,9 @@
   border-top: 1px solid var(--border-soft);
   background: var(--panel-2);
   color: var(--dim);
-  font-size: 11.5px;
-  line-height: 16px;
-  max-height: 88px;
+  font-size: var(--fs-ui-11-5);
+  line-height: calc(16px * var(--ui-scale));
+  max-height: calc(88px * var(--ui-scale));
   overflow-y: auto;
   white-space: pre-wrap;
   -webkit-user-select: text;

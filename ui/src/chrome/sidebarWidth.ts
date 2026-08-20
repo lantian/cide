@@ -1,6 +1,6 @@
 /**
  * The parts of "resize the left panel and remember it" that are decisions rather than side
- * effects: the clamp, the two tokens, and the boot cache's encoding.
+ * effects: the clamp, the three tokens, and the boot cache's encoding.
  *
  * Split out of `SidebarSplitter.tsx` for the same reason `settings/theme.ts` is split out of
  * `useSettings.ts` — there is no JS test runner in this project and the app must never be
@@ -16,8 +16,12 @@
  * called with the real one, so a rename on the Rust side still fails the build.
  */
 
-/** The two panels that own a width. See [`SIDEBAR_TOKEN`] for why there are only two. */
-export type SidebarPanel = 'files' | 'git'
+/**
+ * The panels that own a width — fewer than there are sidebar *views*, because a width is
+ * shared by every view that is the same column with different rows in it. See
+ * [`SIDEBAR_TOKEN`] for which views share which, and why.
+ */
+export type SidebarPanel = 'files' | 'git' | 'agents'
 
 /**
  * Which custom property each panel's width is stored in.
@@ -33,21 +37,34 @@ export type SidebarPanel = 'files' | 'git'
  * before this change and followed rather than reopened: those panels are the explorer's
  * column with different rows in it, and a user who widens the tree to read long paths means
  * the same thing when they widen the search results.
+ *
+ * `--w-sidebar-agents` sizes Agents *and* Tasks for the same reason and on purpose (M18):
+ * they are two views of one thing, so a user who widens Agents to read a task title would
+ * otherwise have to do the identical drag again the moment they switch to Tasks. That is the
+ * reverse of the files/git split, where the two panels are read for different reasons at
+ * different times and so keep separate numbers. `SidebarSettings` in
+ * `crates/cide-ipc/src/settings.rs` makes the same call, in the same words, over `agents_width`.
  */
 export const SIDEBAR_TOKEN: Readonly<Record<SidebarPanel, string>> = {
   files: '--w-sidebar-files',
   git: '--w-sidebar-git',
+  agents: '--w-sidebar-agents',
 }
 
 /**
  * The mock's widths, which are also the literals `tokens.css` ships and `SidebarSettings`'
- * `Default` impl in `crates/cide-ipc/src/settings.rs`. Three copies of two numbers, pinned
+ * `Default` impl in `crates/cide-ipc/src/settings.rs`. Three copies of three numbers, pinned
  * against each other by `check-sidebar.mjs`, because the failure of letting them drift is
  * that the panel moves on first launch and then never again.
+ *
+ * 320 for agents on the argument git got 420 on: an Agents row carries a role, a phase, an
+ * elapsed figure and a task title, and a Tasks row an id, a title and an agent chip, so the
+ * explorer's 252px column of single truncatable filenames is the wrong size for both.
  */
 export const SIDEBAR_DEFAULT: Readonly<Record<SidebarPanel, number>> = {
   files: 252,
   git: 420,
+  agents: 320,
 }
 
 /**
@@ -95,10 +112,11 @@ export const SPLITTER_WIDTH = 6
  */
 export const MIN_WORKSPACE = 360
 
-/** Both widths, in CSS pixels. */
+/** Every panel's width, in CSS pixels. */
 export interface SidebarWidths {
   files: number
   git: number
+  agents: number
 }
 
 /**
@@ -107,6 +125,14 @@ export interface SidebarWidths {
 export interface StoredSidebar {
   filesWidth: number
   gitWidth: number
+  /**
+   * Added in M18, and non-optional here on purpose: Rust gives it a `serde` default so an
+   * older `workspace.json` still loads, which means every snapshot this module is ever handed
+   * has the field. Typing it optional would push a `| undefined` through
+   * [`widthsFromSettings`] for a case that cannot reach it. The genuinely fieldless input is
+   * the boot cache, and [`decodeWidths`] takes a `Partial<StoredSidebar>` for exactly that.
+   */
+  agentsWidth: number
 }
 
 /**
@@ -175,12 +201,13 @@ export function widthsFromSettings(sidebar: StoredSidebar | null | undefined): S
   return {
     files: clampSidebarWidth(sidebar.filesWidth),
     git: clampSidebarWidth(sidebar.gitWidth),
+    agents: clampSidebarWidth(sidebar.agentsWidth),
   }
 }
 
-/** The patch shape, for `settings.set({ sidebar })`. Both widths, per the patch-per-field rule. */
+/** The patch shape, for `settings.set({ sidebar })`. Every width, per the patch-per-field rule. */
 export function toStored(widths: SidebarWidths): StoredSidebar {
-  return { filesWidth: widths.files, gitWidth: widths.git }
+  return { filesWidth: widths.files, gitWidth: widths.git, agentsWidth: widths.agents }
 }
 
 /**
@@ -193,6 +220,7 @@ export function widthDeclarations(widths: SidebarWidths): [property: string, val
   return [
     [SIDEBAR_TOKEN.files, `${widths.files}px`],
     [SIDEBAR_TOKEN.git, `${widths.git}px`],
+    [SIDEBAR_TOKEN.agents, `${widths.agents}px`],
   ]
 }
 
@@ -248,10 +276,21 @@ export function decodeWidths(raw: string | null | undefined): SidebarWidths {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (typeof parsed !== 'object' || parsed === null) return { ...SIDEBAR_DEFAULT }
-    const { filesWidth, gitWidth } = parsed as Partial<StoredSidebar>
+    const { filesWidth, gitWidth, agentsWidth } = parsed as Partial<StoredSidebar>
     return {
       files: typeof filesWidth === 'number' ? clampSidebarWidth(filesWidth) : SIDEBAR_DEFAULT.files,
       git: typeof gitWidth === 'number' ? clampSidebarWidth(gitWidth) : SIDEBAR_DEFAULT.git,
+      // `Partial`, and the `typeof` guard rather than a destructuring default, because this
+      // line has no version in it and never will: every cache written before M18 holds two
+      // widths and no `agentsWidth`, and every existing user's first launch after the upgrade
+      // reads one. The guard is the whole upgrade path. Without it the field is `undefined`,
+      // the clamp turns it into `NaN` — `Number.isFinite` catches that one, but a
+      // `${undefined}px` written straight into a custom property would not be caught anywhere
+      // — and an invalid declaration is not an error in CSS: the browser drops it, the panel
+      // gets whatever the cascade had or no width at all, and nothing says so. So a missing
+      // field reads as 320, one frame before the snapshot from Rust replaces it anyway.
+      agents:
+        typeof agentsWidth === 'number' ? clampSidebarWidth(agentsWidth) : SIDEBAR_DEFAULT.agents,
     }
   } catch {
     // A half-written or hand-edited line must not stop the app from booting.

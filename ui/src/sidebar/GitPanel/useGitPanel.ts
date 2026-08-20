@@ -47,6 +47,16 @@ import {
   type RepoId,
 } from '@/ipc/client'
 import { noteChangeCount } from '@/chrome/gitCountStore'
+import { explain } from '@/chrome/branchModel'
+import { requestFocus } from '@/chrome/focusRequests'
+import {
+  amendPending,
+  amendPendingServer,
+  claimAmend,
+  planAmend,
+  subscribeAmendRequest,
+  type AmendRequest,
+} from '@/chrome/panelRequests'
 import { diffPaneAvailable } from './diffHost'
 import {
   clearAllPartials,
@@ -153,6 +163,22 @@ const TRACK_NOTE = 'git add and file'
 /** Coalescing window for refresh bursts. One edit reports several paths. */
 const REFRESH_DEBOUNCE_MS = 60
 
+/**
+ * The commit an amend is aimed at, once something has named one.
+ *
+ * The repository travels with the oid because a workspace has several and a commit is only the
+ * tip of one of them. `commit` walks its `CommitUnit`s repo by repo and sends the oid **only**
+ * to the repository it came from; the others get `null` and keep the checkbox's own
+ * amend-whatever-HEAD-is meaning, which is the honest answer for a repo nobody named a commit in.
+ */
+export interface AmendTarget {
+  repo: RepoId
+  /** The full oid — what goes on the wire as `CommitRequest.amendOf`. */
+  oid: string
+  /** The log's abbreviation, for the checkbox label and the confirmation. */
+  shortOid: string
+}
+
 export interface GitPanelModel {
   view: StatusView
   rows: Row[]
@@ -195,6 +221,30 @@ export interface GitPanelModel {
   diverged: RepoId[]
   message: string
   amend: boolean
+  /**
+   * The commit the *log* asked to amend, or `null` for the checkbox's own meaning.
+   *
+   * `null` is the ordinary state and it is not a missing value: the Amend checkbox is a
+   * statement about HEAD, whatever HEAD happens to be when Commit is pressed, and that is the
+   * only thing it can be — the panel is drawn from a status walk and has no commit list to name
+   * a row in. The log does have one, so its *Amend…* arrives with an oid, and from then until
+   * the box is committed or the tick is cleared this commit is the one being rewritten.
+   *
+   * Surfaced on the model, and drawn on the checkbox, for the reason the partial-selection
+   * warning is drawn: it changes what the Commit button writes and nothing else in the panel
+   * would show it. A hidden modifier on the button that rewrites history is not acceptable.
+   */
+  amendOf: AmendTarget | null
+  /**
+   * The repository Commit would reword, or `null` if this click is not a reword.
+   *
+   * Non-null means: Amend is ticked, nothing is selected, one repository is named, and its HEAD
+   * exists. It is the single answer behind both halves of the reword — `model.ts::canCommit`
+   * lights the button from it and `commitUnits` mints the file-less unit from it — because two
+   * derivations of one fact disagree eventually, and the way they disagree here is a live
+   * button that commits nothing.
+   */
+  rewordRepo: RepoId | null
   /**
    * IDEA's "use Git staging area instead" mode — the toolbar's ◉ toggle.
    *
@@ -407,6 +457,7 @@ export function useGitPanel(
   const [busy, setBusy] = useState<string | null>(null)
   const [message, setMessage] = useState('')
   const [amend, setAmendFlag] = useState(false)
+  const [amendOf, setAmendOf] = useState<AmendTarget | null>(null)
   const [dialog, setDialog] = useState<ChangelistDialogState | null>(null)
   const [confirm, setConfirm] = useState<ConfirmState | null>(null)
   /** Repos where the user answered the guard bar. Cleared when the divergence clears. */
@@ -443,6 +494,18 @@ export function useGitPanel(
    */
   const viewRef = useRef(view)
   viewRef.current = view
+
+  /**
+   * What is in the commit box, for the amend effect below.
+   *
+   * Through a ref for the same reason `viewRef` exists, one failure sharper: the effect that
+   * claims an amend request has to know whether the user has a draft, and putting `message` in
+   * its dependency array would re-run it on **every keystroke** in the box. It would early-return
+   * each time — there is nothing pending — but a per-keystroke effect over a module store is the
+   * kind of thing that stops being harmless the moment somebody adds a second statement to it.
+   */
+  const messageRef = useRef(message)
+  messageRef.current = message
 
   /**
    * Staging-area mode, as every repository in the workspace reports it.
@@ -502,7 +565,23 @@ export function useGitPanel(
         note(what, null)
         return value
       } catch (e) {
-        const detail = e instanceof Error ? e.message : String(e)
+        /*
+         * Through `explain`, not `String(e)`.
+         *
+         * Every command in `cmd/git.rs` returns `Result<_, GitError>`, so what arrives here is
+         * the *serialised tagged object* and not an `Error`: `String({kind: 'notHead', …})` is
+         * `[object Object]`, which is how a panel ends up reporting nothing at all in the one
+         * place it had something to say. That is the bug `check:branches` was written for, one
+         * surface over, and this panel had it on every git call it makes.
+         *
+         * It matters most for the arm this line was changed for. `require_amend_head` refuses an
+         * amend whose target is no longer the tip, and `notHead`'s sentence names the commit that
+         * *is* — "a1b2c3d is not the last commit — e5f6a7b is" — which is the whole difference
+         * between a refusal the user can act on and a panel that says `[object Object]` under a
+         * ticked Amend box. `explain` falls back to `error.message`/`String(error)` for anything
+         * that is not a recognisable wire error, so nothing that used to read well reads worse.
+         */
+        const detail = explain(e)
         note(what, `${what} unavailable — ${detail}`)
         // Also to the app's stderr: the panel shows one line, and the reason a command is
         // missing is usually longer than one line.
@@ -792,18 +871,169 @@ export function useGitPanel(
   )
 
   /**
-   * Ticking `Amend` does not prefill the message.
+   * Ticking `Amend` **by hand** does not prefill the message, and clears any commit the log
+   * named.
    *
-   * It used to, from a `headMessage` field the panel invented; `RepoChanges` carries no such
-   * thing and inventing one here would mean a second round trip per repo on every refresh for
-   * a string that is only read when a checkbox is ticked. The box is left alone rather than
-   * filled with a guess — `git commit --amend` keeps the old message when none is given, so
-   * an empty box amends without rewriting the subject.
+   * The prefill half is unchanged and the argument for it is unchanged: it used to fill the box
+   * from a `headMessage` field the panel invented; `RepoChanges` carries no such thing and
+   * inventing one here would mean a second round trip per repo on every refresh for a string
+   * that is only read when a checkbox is ticked. The box is left alone rather than filled with a
+   * guess — `git commit --amend` keeps the old message when none is given, so an empty box
+   * amends without rewriting the subject.
+   *
+   * The second half is new and it is a safeguard rather than tidiness. `amendOf` is set only by
+   * the git log's *Amend…*, which names one commit; the moment the user touches this checkbox
+   * themselves they have gone back to the panel's own meaning — amend whatever HEAD is — and a
+   * leftover oid would either send a guard value for a commit nobody named or, worse, survive an
+   * untick and a re-tick and arm a rewrite of a commit the user had just cancelled out of.
+   * Cleared on **both** edges for that reason: unticking abandons the request, and re-ticking is
+   * a fresh statement about HEAD.
    */
-  const setAmend = useCallback((on: boolean) => setAmendFlag(on), [])
+  const setAmend = useCallback((on: boolean) => {
+    setAmendFlag(on)
+    setAmendOf(null)
+  }, [])
+
+  /**
+   * Adopt an amend request: tick the box, fill it in, and remember which commit.
+   *
+   * All three together, always. Two of the three is the half-finished control the log's item was
+   * disabled rather than become — ticking Amend without the message rewrites HEAD's subject with
+   * whatever happens to be in the box, and filling the message without the tick writes a *new*
+   * commit carrying the old one's words.
+   */
+  const adoptAmend = useCallback(
+    (request: AmendRequest) => {
+      setMessage(request.message)
+      setAmendFlag(true)
+      // `as RepoId` because `panelRequests.ts` is import-free — it cannot name the alias, and
+      // says so. The two are the same type today (`export type RepoId = string`); the cast is
+      // the one documented place where that equivalence is relied on, so a `RepoId` that ever
+      // becomes a branded type fails here rather than silently everywhere.
+      setAmendOf({ repo: request.repo as RepoId, oid: request.oid, shortOid: request.shortOid })
+      /*
+       * And bring the commit box into view.
+       *
+       * Not a flourish, and not only the caret. `CommitBox` is mounted **under the Commit tab
+       * only**, so an amend adopted while the panel is on Shelf would fill a message box nobody
+       * can see — the item would appear to do nothing, which is the state it was disabled to
+       * avoid. `GitPanel.tsx` watches this same request and switches the tab; `CommitBox`
+       * consumes it one render later. `git.commit` asks for the identical thing for the
+       * identical reason.
+       */
+      requestFocus('commitMessage')
+    },
+    [],
+  )
+
+  /**
+   * The git log asked for an amend. (M19)
+   *
+   * `chrome/panelRequests.ts` parks the request and reveals this panel; this is the far end. The
+   * store is read through `useSyncExternalStore` rather than a prop because the two ends are in
+   * different subtrees of one window — the log is a tool window at the bottom, this is the
+   * sidebar — and the nearest common React ancestor is the shell itself. Same shape and same
+   * reason as `partialStore` above.
+   *
+   * A boolean snapshot, claimed inside the effect. The value is never rendered: it is read,
+   * decided upon and spent, and a claim is the only thing that stops a request from firing again
+   * on an unrelated mount later. The panel unmounts every time the user clicks another icon in
+   * the activity rail, and a flag that survived would mean that merely *looking* at this panel
+   * ticked Amend and replaced whatever was in the box.
+   *
+   * Four ways this ends, and only the first is the happy one:
+   *
+   *   * the box is empty — adopt, silently. The user asked for this by name;
+   *   * the box holds a draft — ask, through the panel's own `ConfirmDestructive`. `planAmend`
+   *     owns that decision and the sentence, so a check script can run it;
+   *   * the request names another project — refuse on the panel's one dim line. Not silence: the
+   *     user made a gesture in the log and something has to answer it;
+   *   * the claim comes back `null` — expired, or already spent by an earlier run of this same
+   *     effect under StrictMode. Silent, and that is the one case where silence is right: there
+   *     is no gesture behind it to answer.
+   */
+  const amendWanted = useSyncExternalStore(
+    subscribeAmendRequest,
+    amendPending,
+    // The panel is server-rendered by `check:render`; React refuses a store read there without
+    // this third argument, exactly as it does for the partials above.
+    amendPendingServer,
+  )
+  useEffect(() => {
+    if (!amendWanted) return
+    const request = claimAmend()
+    // Stale, or claimed by an earlier run of this effect. `claimAmend` spends an expired request
+    // rather than leaving it for the next mount to examine — see its header — so `null` here is
+    // ordinary and not an error worth a line on the panel.
+    if (request === null) return
+    if (project === null || request.project !== project) {
+      /*
+       * A request about a project this panel is not showing.
+       *
+       * Possible with two projects open: the sidebar follows the active project and a log tool
+       * window belongs to the one it was opened in. Refused rather than adopted, because
+       * prefilling a commit message from a repository that is not on screen would arm a rewrite
+       * of a HEAD the user cannot see — and refused *out loud*, because the alternative is the
+       * menu item doing nothing at all, which is the state it was disabled to avoid.
+       */
+      note('git amend', 'Amend is for another project — open its window to amend that commit.')
+      return
+    }
+    // A previous refusal is answered by this request. `note` only lets the operation that wrote
+    // the line clear it, so without this the sentence above would be the one thing in the panel
+    // with no way out: nothing else is keyed `git amend`, so no later success would ever wipe it.
+    note('git amend', null)
+    const plan = planAmend(messageRef.current, request)
+    if (plan.kind === 'adopt') {
+      adoptAmend(request)
+      return
+    }
+    setConfirm({
+      title: plan.title,
+      body: plan.body,
+      /*
+       * Empty, and this is the one caller of `ConfirmDestructive` where that is right.
+       *
+       * Rule 1 of that component is "name what would be lost, every path, not a count" — and
+       * what would be lost here is not a path. The list runs every entry through
+       * `basename`/`dirname`, so a draft reading `fix: handle a/b paths` would be drawn as the
+       * file `b paths` in the directory `fix: handle a`: the dialog misquoting the very text it
+       * is asking permission to destroy. So the draft is named in the body instead, quoted whole
+       * where it fits, which keeps the rule and drops only the formatting.
+       */
+      files: [],
+      confirmLabel: plan.confirmLabel,
+      run: () => adoptAmend(request),
+    })
+  }, [amendWanted, project, adoptAmend, note])
+
+  /**
+   * Which repository a reword is about, or `null` if this is not one.
+   *
+   * `amendOf.repo` when the log named a commit — the route this exists for. Otherwise the bare
+   * Amend checkbox, which means "HEAD", and only answers in a single-root project: with several
+   * roots there are several HEADs and picking one would rewrite whichever sorted first. In that
+   * case it stays `null`, `units` stays empty and Commit does nothing — which is why
+   * `model.ts::canCommit` is not the only gate, and why this is computed beside it rather than
+   * inside it.
+   */
+  const rewordRepo = useMemo(() => {
+    if (!amend) return null
+    const all = allRepos(view)
+    const named = amendOf !== null ? amendOf.repo : all.length === 1 ? (all[0]?.id ?? null) : null
+    if (named === null) return null
+    // An unborn branch has no commit to reword. Checked against the *named* repository rather
+    // than `canAmend`'s "some repository has a HEAD", which is the right question for the
+    // checkbox and the wrong one here: in a monorepo with one fresh root, `canAmend` is true
+    // while the root being reworded may be the empty one.
+    return all.some((r) => r.id === named && !r.branch.unborn) ? named : null
+  }, [amend, amendOf, view])
 
   /** The ticks, split by repo, with the changelist named when they all came from one. */
-  const units = useMemo(() => commitUnits(view, selected), [view, selected])
+  const units = useMemo(
+    () => commitUnits(view, selected, rewordRepo),
+    [view, selected, rewordRepo],
+  )
 
   /** Repos whose index moved under us and whose bar has not been answered yet. */
   const diverged = useMemo(
@@ -842,6 +1072,27 @@ export function useGitPanel(
             gitApi.commit(project, unit.repo, {
               message,
               amend,
+              /*
+               * The commit the log named, for the repository it named it in — and `null`
+               * everywhere else.
+               *
+               * `null` used to be unconditional here, with a comment saying this checkbox is
+               * *about* HEAD and cannot name anything else. That was true of the checkbox and
+               * has stopped being true of one path into it: the git log's *Amend…* is drawn on
+               * a row, so it does name a commit, and it arrives through
+               * `chrome/panelRequests.ts` with the oid. Sending it is not a formality —
+               * `cide_git::commit::require_amend_head` refuses anything but the tip with
+               * `GitError::NotHead`, and HEAD moves: another window commits, or a `git commit`
+               * is typed into a bash pane, between the menu opening and Commit being pressed.
+               * Without the oid that becomes a silent rewrite of the wrong commit.
+               *
+               * Per repository, because a `CommitUnit` is per repository and an oid is the tip
+               * of exactly one of them. A monorepo commit that amends across two roots sends
+               * the oid to the root it came from and `null` to the others, which is the
+               * checkbox's own meaning and the only honest answer for a repo nobody named a
+               * commit in.
+               */
+              amendOf: amend && amendOf?.repo === unit.repo ? amendOf.oid : null,
               changelist: unit.changelist,
               // The whole file, unless the diff pane left a partial selection for it. This
               // is the one line that makes per-hunk staging reach a commit; `commitSelections`
@@ -874,11 +1125,16 @@ export function useGitPanel(
         if (allOk) {
           setMessage('')
           setAmendFlag(false)
+          // With the tick. The commit the log named no longer exists under that oid — an amend
+          // writes a new object — so keeping it would arm the *next* commit against a target
+          // that is already gone, and `require_amend_head` would refuse it with a sentence
+          // about a commit the user has forgotten asking about.
+          setAmendOf(null)
         }
         await refresh()
       })()
     },
-    [project, units, view, diverged, message, amend, guarded, note, refresh],
+    [project, units, view, diverged, message, amend, amendOf, guarded, note, refresh],
   )
 
   const unstage = useCallback(() => {
@@ -1658,6 +1914,9 @@ export function useGitPanel(
     diverged,
     message,
     amend,
+    /** Non-null exactly when Commit would reword — see the `useMemo` that computes it. */
+    rewordRepo,
+    amendOf,
     stagingArea,
     partials,
     story: story !== null,

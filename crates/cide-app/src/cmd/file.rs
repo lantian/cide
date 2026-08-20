@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 
 use cide_core::document;
 use cide_core::workspace;
+use cide_core::workspace::PreviewSlot;
 use cide_core::{CoreError, Result};
 use cide_ipc::git::DiffSide;
+use cide_ipc::history::RevSide;
 use cide_ipc::{
     ClaudeSendTarget, DiffOrigin, DiffSpec, FileDoc, Pane, PaneId, PaneKind, PaneRole, ProjectId,
     ReopenedFile, RepoId, TabId, TabKind,
@@ -724,7 +726,7 @@ fn retarget_git_diff(
     }
 
     let spec = git_diff_spec(repo, path, side, old_path);
-    if let Some(id) = workspace::preview_diff_tab(ws, project)? {
+    if let Some(id) = workspace::preview_diff_tab(ws, project, PreviewSlot::Working)? {
         workspace::retarget_diff(ws, project, id, spec)?;
         workspace::activate_tab(ws, project, id)?;
         return Ok(id);
@@ -739,6 +741,401 @@ fn retarget_git_diff(
             preview: true,
         },
         diff_pane(title),
+    )
+}
+
+// --- the revision diff (M18) ------------------------------------------------------------
+//
+// The same pair of gestures over a different pair of trees. Everything below mirrors the four
+// functions above line for line, and where it deliberately does not — `shows_revision_diff`'s
+// key — the difference is written down at the site.
+
+/// How one side of a revision pair is spelled in a tab title.
+///
+/// Seven characters of the oid, which is what `git log --oneline` shows and what every other
+/// short oid in this application is cut to. The two non-commit sides get a word rather than a
+/// sentinel: a title reading `main.rs @ 0000000` would name a commit that does not exist, and
+/// the user cannot tell an invented oid from a real one by looking.
+fn rev_label(side: &RevSide) -> String {
+    match side {
+        // `chars().take(7)` and not `[..7]`: an oid is hex so the two agree today, but slicing a
+        // `String` by byte index panics on a non-ASCII boundary, and this value arrives from the
+        // frontend. A short input is returned whole rather than padded.
+        RevSide::Commit { oid } => oid.chars().take(7).collect(),
+        RevSide::FirstParent => "parent".to_owned(),
+        RevSide::WorkingTree => "working tree".to_owned(),
+    }
+}
+
+/// The tab a revision diff opens as, given its fetch key.
+///
+/// Split out of the command for the reason [`git_diff_spec`] is — it can then be tested without
+/// a `WorkspaceState`, and it is the one place that decides what the tab is *called*.
+///
+/// The title names the **new** side: `main.rs @ a1b2c3d`. That is the revision the user asked to
+/// look at, and it is what makes two history entries for one file distinguishable in the strip,
+/// which a title naming only the file would not be. The old side is deliberately not in it — a
+/// strip is 160px per tab and `main.rs @ a1b2c3d ← 9f8e7d6` is a string nobody can read at that
+/// width; the pane's header carries the pair in full.
+///
+/// `old_path` is git's pre-image path — set for a rename, absent otherwise — and the pair is
+/// display only, exactly as in [`git_diff_spec`]. Both sides stay **repo-relative**, matching the
+/// fetch key.
+fn revision_diff_spec(
+    repo: RepoId,
+    path: &str,
+    new: RevSide,
+    old: RevSide,
+    old_path: Option<String>,
+) -> DiffSpec {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    DiffSpec {
+        title: format!("{name} @ {}", rev_label(&new)),
+        old_path: PathBuf::from(old_path.unwrap_or_else(|| path.to_owned())),
+        new_path: PathBuf::from(path),
+        origin: DiffOrigin::GitRevision {
+            repo,
+            path: path.to_owned(),
+            new,
+            old,
+        },
+    }
+}
+
+/// Whether an open tab is already showing this exact comparison.
+///
+/// Keyed on **all four** of `(repo, path, new, old)`, and the asymmetry with
+/// [`shows_git_diff`] — which deliberately leaves the side out — is the whole point rather than
+/// an oversight.
+///
+/// A `Git` tab *switches sides in place*: the pane draws three buttons, and clicking one
+/// re-reads the same file against a different pair of trees and clears the selection. The side
+/// is therefore a **mode of one tab**, and keying on it would answer a second double-click with
+/// a second tab over the same file — the duplicate-tab problem `tab_open_file` exists to avoid.
+///
+/// A `GitRevision` tab has no such control, because there is no such gesture: the pair **is**
+/// the tab's identity. `main.rs` at `a1b2c3d` against its parent and `main.rs` at `a1b2c3d`
+/// against `9f8e7d6` are two different documents that happen to share a file name, and a user
+/// who opens both wants both — collapsing them onto one tab would silently discard the
+/// comparison they asked for and replace it with one they did not.
+fn shows_revision_diff(
+    kind: &TabKind,
+    repo: RepoId,
+    path: &str,
+    new: &RevSide,
+    old: &RevSide,
+) -> bool {
+    matches!(
+        kind,
+        TabKind::Diff { spec, .. } if matches!(
+            &spec.origin,
+            DiffOrigin::GitRevision { repo: r, path: p, new: n, old: o }
+                if *r == repo && p == path && n == new && o == old
+        )
+    )
+}
+
+/// Open a read-only diff of one file between two revisions, or activate the one already
+/// showing it — the *double-click* half. (M18)
+///
+/// [`tab_open_diff`]'s twin, and every argument in that function's header applies here
+/// unchanged: no diff text is accepted, because [`DiffSpec`] is persisted to `workspace.json`
+/// and a saved diff is a lie; the pane re-reads through `git_diff_revision` with the key; and
+/// nothing here touches the disk, so it is not `async`.
+///
+/// One thing is *better* here than for a working-tree diff, and it is worth stating because it
+/// is the reason a revision tab can be restored with confidence: the read is **reproducible**.
+/// Two commits diff to the same bytes for ever, so a tab saved at 10:00 and restored at 14:00
+/// shows exactly what it showed. The one exception is a [`RevSide::WorkingTree`] side, which is
+/// why that is a variant a caller can match on rather than a magic oid.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_open_revision_diff(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    new: RevSide,
+    old: RevSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    state.update(|ws| {
+        open_revision_diff(
+            ws,
+            project,
+            repo,
+            &path,
+            new.clone(),
+            old.clone(),
+            old_path.clone(),
+        )
+    })
+}
+
+/// [`tab_open_revision_diff`] without Tauri. See [`open_git_diff`] for why it is split out.
+#[allow(clippy::too_many_arguments)]
+fn open_revision_diff(
+    ws: &mut cide_ipc::Workspace,
+    project: ProjectId,
+    repo: RepoId,
+    path: &str,
+    new: RevSide,
+    old: RevSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    let existing = workspace::project(ws, project)?
+        .tabs
+        .iter()
+        .find(|t| shows_revision_diff(&t.kind, repo, path, &new, &old))
+        .map(|t| t.id);
+    if let Some(id) = existing {
+        workspace::promote_diff(ws, project, id)?;
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let spec = revision_diff_spec(repo, path, new, old, old_path);
+    let title = spec.title.clone();
+    workspace::open_tab(
+        ws,
+        project,
+        TabKind::Diff {
+            spec,
+            preview: false,
+        },
+        diff_pane(title),
+    )
+}
+
+/// Point the tool window's preview diff tab at this comparison — the *single-click* half. (M18)
+///
+/// [`tab_retarget_diff`]'s twin, with the same three outcomes in the same order: a tab already
+/// showing this comparison wins, then the preview tab, then a new preview tab. Walking a
+/// commit's forty changed files with single clicks therefore costs one tab, not forty.
+///
+/// **A different scratch slot from the git panel's**, which is the part that is not merely a
+/// copy. Both lists are on screen at once — the changes tree in the sidebar and the log's file
+/// list in the tool window — so a shared slot would make a click in one throw away the other's
+/// tab. See [`cide_core::workspace::PreviewSlot`], and the fourth refusal in
+/// `cide_core::workspace::retarget_diff` which makes the two slots disjoint by construction.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_retarget_revision_diff(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    new: RevSide,
+    old: RevSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    state.update(|ws| {
+        retarget_revision_diff(
+            ws,
+            project,
+            repo,
+            &path,
+            new.clone(),
+            old.clone(),
+            old_path.clone(),
+        )
+    })
+}
+
+/// [`tab_retarget_revision_diff`] without Tauri. See [`open_git_diff`] for why it is split out.
+#[allow(clippy::too_many_arguments)]
+fn retarget_revision_diff(
+    ws: &mut cide_ipc::Workspace,
+    project: ProjectId,
+    repo: RepoId,
+    path: &str,
+    new: RevSide,
+    old: RevSide,
+    old_path: Option<String>,
+) -> Result<TabId> {
+    let showing = workspace::project(ws, project)?
+        .tabs
+        .iter()
+        .find(|t| shows_revision_diff(&t.kind, repo, path, &new, &old))
+        .map(|t| t.id);
+    if let Some(id) = showing {
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let spec = revision_diff_spec(repo, path, new, old, old_path);
+    if let Some(id) = workspace::preview_diff_tab(ws, project, PreviewSlot::Revision)? {
+        workspace::retarget_diff(ws, project, id, spec)?;
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let title = spec.title.clone();
+    workspace::open_tab(
+        ws,
+        project,
+        TabKind::Diff {
+            spec,
+            preview: true,
+        },
+        diff_pane(title),
+    )
+}
+
+// --- the revision tab (M18) --------------------------------------------------------------
+//
+// A *file* at one commit, read-only — not a comparison. The pair above answers "what changed
+// here"; this answers "what did this file look like then", which is the question the blame
+// gutter's second button actually asks and the one `cide_git::blame::blame_with` documents its
+// `newest` argument as being about.
+//
+// Everything below mirrors `tab_open_diff` line for line, minus the preview slot: there is no
+// single-click gesture that mints one of these, so there is nothing to retarget and no scratch
+// tab to promote. Where the key deliberately differs from both of the pairs above —
+// `shows_revision` — the difference is written down at the site.
+
+/// How a revision tab is labelled: `log.rs @ a1b2c3d`.
+///
+/// The same seven characters and the same ` @ ` as [`revision_diff_spec`], deliberately: the two
+/// kinds of tab sit in one strip, side by side, and a user cannot be asked to learn two
+/// spellings of "this file at this commit". `chars().take(7)` and not `[..7]` for the reason
+/// [`rev_label`] gives — an oid is hex so the two agree today, but slicing a `String` by byte
+/// index panics on a non-ASCII boundary and this value arrives from the frontend. A short input
+/// is returned whole rather than padded.
+///
+/// **Stored on the tab rather than derived at render time**, which is [`DiffSpec`]'s rule and is
+/// worth repeating because the cost is invisible: a derived title changes the day the derivation
+/// is improved and silently relabels every saved tab in every `workspace.json` on disk.
+fn revision_title(path: &str, rev: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    format!("{name} @ {}", rev.chars().take(7).collect::<String>())
+}
+
+/// The pane a revision tab opens with.
+///
+/// [`PaneKind::Editor`] and not [`PaneKind::Diff`], because what it renders *is* an editor —
+/// `RevisionPane` mounts `EditorSurface` with `readOnly`, so the buffer keeps Ctrl+F, folding,
+/// syntax highlighting and the find bar. The kind is read in three places and all three want
+/// that answer: `PaneBody` dispatches on it, `keys/context.ts` derives the `editorFocused`
+/// context flag from it (which is what puts the editor's own commands in the palette), and
+/// `windows/detachedPane.ts` reads it to know this pane runs no child and must never be handed
+/// to `TerminalPane`.
+///
+/// It costs nothing on the other side: `close_pane`'s unsaved-changes guard consults
+/// `unsaved_in_tab`, which only ever answers for a [`TabKind::File`], so an editor pane over a
+/// tab that cannot be dirty is refused nothing. `cmd::settings` already opens its tab with an
+/// editor pane over a kind with no path at all, for the same reason.
+fn revision_pane(title: String) -> Pane {
+    Pane {
+        id: PaneId::new(),
+        kind: PaneKind::Editor,
+        // Auxiliary like every pane a tab is opened with: nothing here holds a conversation, so
+        // there is nothing about it that must not be closed.
+        role: PaneRole::Auxiliary,
+        // No process, ever. A commit's bytes are a document.
+        session: None,
+        conversation: None,
+        title,
+    }
+}
+
+/// Whether an open tab is already showing this file at this revision.
+///
+/// Keyed on `(repo, path, rev)` and **deliberately not on `from`**, which is the one interesting
+/// decision in this whole block.
+///
+/// `from` is the *route* the user took to get here — the trail of blame-the-parent hops — and two
+/// walks that arrive at `a1b2c3d` by different routes are looking at the same bytes of the same
+/// file. Keying on the route would answer the second walk with a second tab titled exactly like
+/// the first, over identical content, which is the duplicate-tab problem `tab_open_file` exists
+/// to avoid, with the added insult that the two are indistinguishable in the strip.
+///
+/// **The chain of the tab that already exists wins**, and that follows from the same reasoning
+/// rather than being a separate rule. The existing tab's crumb strip is a route the user has
+/// already walked and can see; replacing it with the newer arrival's route would rewrite a trail
+/// under them — the crumbs they used to get somewhere would silently become crumbs they never
+/// walked, and Back would lead out through a history they do not remember. The first route there
+/// is the one they can retrace, so it is the one that is kept.
+///
+/// This is the mirror image of [`shows_revision_diff`]'s asymmetry with [`shows_git_diff`], and
+/// for the mirror-image reason: there, the pair of revisions *is* the document, so it belongs in
+/// the key; here, the route is not part of the document at all.
+fn shows_revision(kind: &TabKind, repo: RepoId, path: &str, rev: &str) -> bool {
+    matches!(
+        kind,
+        TabKind::Revision {
+            repo: r,
+            path: p,
+            rev: v,
+            ..
+        } if *r == repo && p == path && v == rev
+    )
+}
+
+/// Open a read-only tab showing one file as one commit left it, or activate the one already
+/// showing it. (M18)
+///
+/// [`tab_open_diff`]'s cousin, and its header's arguments hold here unchanged: **no text is
+/// accepted**, because `TabKind::Revision` is persisted inside `Workspace` and
+/// `cide-core::persist` debounces that to `workspace.json` — a blob passed in here would be a
+/// blob written to disk. The pane calls `git_file_at_revision` with `(repo, path, rev)` when it
+/// mounts, exactly as a git diff calls `git_diff_file` with its key. And nothing here touches
+/// the disk, so this is deliberately *not* `async`; the blocking object-database read happens in
+/// `git_file_at_revision`, which is already on `spawn_blocking`.
+///
+/// One thing is *better* here than for a working-tree diff and it is why a revision tab can be
+/// restored with confidence: the read is **reproducible**. A commit is immutable, so a tab saved
+/// at 10:00 and restored at 14:00 shows the same bytes — which is also why `rev` must already be
+/// a full oid by the time it reaches this function. `HEAD~3` names a different commit tomorrow;
+/// `git_resolve_rev` is what callers put in front of anything a user typed.
+///
+/// `from` is the walk that led here — see [`cide_core::workspace::revision_chain`], which is
+/// where the three rules about it live and where the merge that would otherwise grow it without
+/// bound is written up.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_open_revision(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    rev: String,
+    from: Vec<String>,
+) -> Result<TabId> {
+    state.update(|ws| open_revision(ws, project, repo, &path, &rev, &from))
+}
+
+/// [`tab_open_revision`] without Tauri. See [`open_git_diff`] for why it is split out.
+fn open_revision(
+    ws: &mut cide_ipc::Workspace,
+    project: ProjectId,
+    repo: RepoId,
+    path: &str,
+    rev: &str,
+    from: &[String],
+) -> Result<TabId> {
+    let existing = workspace::project(ws, project)?
+        .tabs
+        .iter()
+        .find(|t| shows_revision(&t.kind, repo, path, rev))
+        .map(|t| t.id);
+    if let Some(id) = existing {
+        // Activated and nothing else. No `promote_diff` — this is not a diff tab and that call
+        // would report it as one — and, more importantly, no rewrite of `from`: see
+        // `shows_revision` for why the chain the tab already has is the one that stands.
+        workspace::activate_tab(ws, project, id)?;
+        return Ok(id);
+    }
+
+    let title = revision_title(path, rev);
+    workspace::open_tab(
+        ws,
+        project,
+        TabKind::Revision {
+            repo,
+            path: path.to_owned(),
+            rev: rev.to_owned(),
+            from: workspace::revision_chain(rev, from),
+            title: title.clone(),
+        },
+        revision_pane(title),
     )
 }
 
@@ -1323,6 +1720,11 @@ impl serde::Serialize for ClaudeSendError {
 /// can receive it. [`mention_candidates`] is the ordering and states the reasoning; the answer
 /// says which pane was used and whether that was the asked-for one.
 ///
+/// **Unless `exact`**, which turns the preference into an address. It is set by the editor
+/// menu's per-session rows — the ones that read `2: git-details` — where the pane is not a
+/// guess the router may improve on but a conversation the user picked by name. See the
+/// comment on the routing below, which is where the argument for each half is written out.
+///
 /// # Why a fallback is safe here, and would not be elsewhere
 ///
 /// An `at_mentioned` **is not a turn**. It types `@path#L10-20` into a prompt box; nothing is
@@ -1359,10 +1761,11 @@ impl serde::Serialize for ClaudeSendError {
 /// `file_write` above are the commands that touch a disk and they are the ones that go through
 /// the pool.
 #[tauri::command(rename_all = "camelCase")]
-// Eight, and every one of them is a value the webview has to send: two managed-state handles,
-// the project, the pane, the path, the text and a line range. A Tauri command's arguments are
-// its wire shape, so grouping them into a struct would be a DTO to keep in step with the
-// frontend for no gain — the same call `pane_split` and `session_spawn` beside it make.
+// Nine, and every one of them is a value the webview has to send: two managed-state handles,
+// the project, the pane, the path, the text, a line range and whether the pane was chosen by
+// name. A Tauri command's arguments are its wire shape, so grouping them into a struct would
+// be a DTO to keep in step with the frontend for no gain — the same call `pane_split` and
+// `session_spawn` beside it make.
 #[allow(clippy::too_many_arguments)]
 pub fn claude_send_lines(
     app: tauri::AppHandle,
@@ -1373,6 +1776,7 @@ pub fn claude_send_lines(
     text: String,
     line_start: Option<u32>,
     line_end: Option<u32>,
+    exact: bool,
 ) -> std::result::Result<ClaudeSendTarget, ClaudeSendError> {
     let servers = app
         .try_state::<crate::ide::IdeServers>()
@@ -1405,13 +1809,33 @@ pub fn claude_send_lines(
         .into_iter()
         .collect();
 
-    // The asked-for pane when nothing is reachable, so the error names the pane the user
-    // actually aimed at and the server's own dropped-notification log line says the same
-    // thing. `at_mentioned` below then produces the connection count that decides the wording.
-    let target = mention_candidates(&ws, project, pane)
-        .into_iter()
-        .find(|candidate| reachable.contains(&candidate.to_string()))
-        .unwrap_or(pane);
+    /*
+     * The asked-for pane when nothing is reachable, so the error names the pane the user
+     * actually aimed at and the server's own dropped-notification log line says the same
+     * thing. `at_mentioned` below then produces the connection count that decides the wording.
+     *
+     * `exact` collapses the list to that one pane, and it is the whole difference between the
+     * two gestures that reach this command. ⌥⏎ and the editor menu's parent row *guess* a
+     * destination — `useMentionTarget` picks the focused Claude pane or the console's — so a
+     * guess that cannot receive should be corrected rather than refused, which is what the
+     * ordering in `mention_candidates` is for. The menu's per-session rows do not guess: the
+     * user read `2: git-details` and chose it. Rerouting *that* to a different conversation
+     * would answer a question nobody asked, and the fallback's own justification above ("the
+     * asked-for pane always wins when it can receive; the fallback only fires where today's
+     * behaviour is a hard error") stops holding the moment the pane is a stated choice.
+     *
+     * A refusal is the honest answer there, and it is an actionable one: `NotConnected` says
+     * to run `/ide` in the pane that was meant, which for a pane sitting at a resume splash is
+     * exactly what has to happen before it can ever receive.
+     */
+    let target = if exact {
+        pane
+    } else {
+        mention_candidates(&ws, project, pane)
+            .into_iter()
+            .find(|candidate| reachable.contains(&candidate.to_string()))
+            .unwrap_or(pane)
+    };
 
     match servers.at_mentioned(
         project,
@@ -1436,6 +1860,43 @@ pub fn claude_send_lines(
             fallback: target != pane,
         }),
     }
+}
+
+/// What the user has named each running conversation, keyed by the id cide addresses it under.
+///
+/// The labels behind the editor menu's *Send … to Claude ▸* submenu. Every Claude pane in a
+/// project carries the same `Pane::title` — `cide : claude` — so a submenu built from titles
+/// alone offers four identical lines; this is the one fact that tells them apart, and it is a
+/// fact only the CLI holds. [`cide_claude::roster`] is the reader and its module doc is where
+/// the bargain with an undocumented directory is written down.
+///
+/// # Why the whole machine rather than this project's sessions
+///
+/// The caller matches by conversation id against `Pane::conversation ?? Pane::session`, both of
+/// which cide minted itself, so a name for a conversation in another project simply never
+/// matches anything and costs a map entry. Filtering here would mean answering for symlinked
+/// roots, multi-root projects and a session started in a subdirectory — three ways to lose a
+/// name the user can see in their own terminal, in exchange for nothing.
+///
+/// # Why it is polled rather than pushed
+///
+/// There is no event: `/rename` is typed into a CLI that tells cide nothing, and the only
+/// signal is a file rewritten under `~/.claude/sessions`. A watcher on that directory would
+/// fire on every status change of every session on the machine — the records carry a `status`
+/// and it moves several times a turn — to keep a string that is read at most once per context
+/// menu. So the frontend asks when it is about to need the answer; see
+/// `ui/src/editor/claudeNames.ts`, which owns the refresh policy and says what it costs.
+///
+/// # Not `spawn_blocking`
+///
+/// It reads a directory of small files — eight of them on the machine this was written on, one
+/// `read_dir` and a `read_to_string` each. That is the same order of I/O as `file_position`
+/// above, which is also synchronous, and an order less than `file_read`, which is not. The
+/// call is made from a context menu opening, so a hop onto the pool would cost more in
+/// scheduling than the read costs in total.
+#[tauri::command(rename_all = "camelCase")]
+pub fn claude_session_names() -> std::collections::HashMap<String, String> {
+    cide_claude::roster::names()
 }
 
 #[cfg(test)]
@@ -1595,7 +2056,12 @@ mod tests {
             .filter_map(|t| match &t.kind {
                 TabKind::Diff { spec, preview } => match &spec.origin {
                     DiffOrigin::Git { path, .. } => Some((path.clone(), *preview)),
-                    DiffOrigin::ClaudeMcp { .. } => None,
+                    // Neither of these is a *working-tree* diff, which is the only thing the
+                    // preview-slot rule this helper drives is about. A revision diff has its own
+                    // preview slot for exactly that reason — see `PreviewSlot` — so counting one
+                    // here would make the working-tree assertions below fail whenever a commit's
+                    // file list happened to be open beside them.
+                    DiffOrigin::GitRevision { .. } | DiffOrigin::ClaudeMcp { .. } => None,
                 },
                 _ => None,
             })
@@ -1723,7 +2189,7 @@ mod tests {
             "the preview tab still holds what it held — and is still where it was opened,              immediately right of the console"
         );
         assert_eq!(
-            workspace::preview_diff_tab(&ws, project).expect("exists"),
+            workspace::preview_diff_tab(&ws, project, PreviewSlot::Working).expect("exists"),
             Some(preview)
         );
     }
@@ -1745,7 +2211,7 @@ mod tests {
         assert_eq!(promoted, preview, "no second tab over the same file");
         assert_eq!(diff_tabs(&ws, project), vec![("src/a.rs".into(), false)]);
         assert_eq!(
-            workspace::preview_diff_tab(&ws, project).expect("exists"),
+            workspace::preview_diff_tab(&ws, project, PreviewSlot::Working).expect("exists"),
             None
         );
 
@@ -1758,6 +2224,464 @@ mod tests {
         assert_eq!(
             diff_tabs(&ws, project),
             vec![("src/b.rs".into(), true), ("src/a.rs".into(), false)]
+        );
+    }
+
+    // --- the revision diff (M18) ------------------------------------------------------
+
+    fn at(oid: &str) -> RevSide {
+        RevSide::Commit {
+            oid: oid.to_owned(),
+        }
+    }
+
+    /// Every revision diff tab in strip order, as (title, preview).
+    ///
+    /// Keyed on the *title* rather than the path, because the title is where the pair shows up
+    /// and the pair is the identity here — two rows reading `main.rs` would tell the reader of
+    /// a failure nothing about which comparison was lost.
+    fn revision_tabs(ws: &cide_ipc::Workspace, project: ProjectId) -> Vec<(String, bool)> {
+        workspace::project(ws, project)
+            .expect("exists")
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Diff { spec, preview } => match &spec.origin {
+                    DiffOrigin::GitRevision { .. } => Some((spec.title.clone(), *preview)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The title is the file plus the revision it is being read at, which is what makes two
+    /// history entries for one file two distinguishable rows in the strip.
+    #[test]
+    fn a_revision_tab_is_titled_by_its_new_side() {
+        let repo = RepoId::new();
+        let spec = revision_diff_spec(
+            repo,
+            "src/main.rs",
+            at("a1b2c3d4e5f6"),
+            RevSide::FirstParent,
+            None,
+        );
+        assert_eq!(spec.title, "main.rs @ a1b2c3d");
+
+        // The two sides that are not commits get a word. An invented `0000000` would name a
+        // commit that does not exist and read exactly like one that does.
+        let parent =
+            revision_diff_spec(repo, "src/main.rs", RevSide::FirstParent, at("dead"), None);
+        assert_eq!(parent.title, "main.rs @ parent");
+        let dirty = revision_diff_spec(repo, "src/main.rs", RevSide::WorkingTree, at("dead"), None);
+        assert_eq!(dirty.title, "main.rs @ working tree");
+    }
+
+    /// The asymmetry with [`shows_git_diff`], pinned: the **pair** is a revision tab's
+    /// identity, so changing either side names a different document.
+    #[test]
+    fn reuse_of_a_revision_tab_is_keyed_on_all_four_of_repo_path_and_the_two_sides() {
+        let repo = RepoId::new();
+        let other = RepoId::new();
+        let tab = TabKind::Diff {
+            spec: revision_diff_spec(repo, "src/main.rs", at("aaa"), at("bbb"), None),
+            preview: false,
+        };
+
+        assert!(shows_revision_diff(
+            &tab,
+            repo,
+            "src/main.rs",
+            &at("aaa"),
+            &at("bbb")
+        ));
+        assert!(!shows_revision_diff(
+            &tab,
+            other,
+            "src/main.rs",
+            &at("aaa"),
+            &at("bbb")
+        ));
+        assert!(!shows_revision_diff(
+            &tab,
+            repo,
+            "src/other.rs",
+            &at("aaa"),
+            &at("bbb")
+        ));
+        // The two that a working-tree diff would deliberately ignore.
+        assert!(!shows_revision_diff(
+            &tab,
+            repo,
+            "src/main.rs",
+            &at("ccc"),
+            &at("bbb")
+        ));
+        assert!(!shows_revision_diff(
+            &tab,
+            repo,
+            "src/main.rs",
+            &at("aaa"),
+            &RevSide::FirstParent
+        ));
+
+        // And a working-tree diff over the same file is not this tab at all.
+        let working = TabKind::Diff {
+            spec: git_diff_spec(repo, "src/main.rs", DiffSide::Combined, None),
+            preview: false,
+        };
+        assert!(!shows_revision_diff(
+            &working,
+            repo,
+            "src/main.rs",
+            &at("aaa"),
+            &at("bbb")
+        ));
+        assert!(!shows_git_diff(&tab, repo, "src/main.rs"));
+    }
+
+    /// Two comparisons of one file are two tabs, and opening the same one twice is one.
+    #[test]
+    fn two_comparisons_of_one_file_are_two_tabs() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+
+        let first = open_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/main.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("opens");
+        let second = open_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/main.rs",
+            at("a1b2c3d"),
+            at("9f8e7d6"),
+            None,
+        )
+        .expect("opens");
+        assert_ne!(
+            first, second,
+            "a different old side is a different document"
+        );
+
+        let again = open_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/main.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("activates");
+        assert_eq!(again, first, "the same pair is the same tab");
+        assert_eq!(revision_tabs(&ws, project).len(), 2);
+    }
+
+    // --- the revision tab (M18) -----------------------------------------------------------
+
+    /// Every revision tab in strip order, as (title, rev, chain).
+    fn revision_file_tabs(
+        ws: &cide_ipc::Workspace,
+        project: ProjectId,
+    ) -> Vec<(String, String, Vec<String>)> {
+        workspace::project(ws, project)
+            .expect("exists")
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Revision {
+                    title, rev, from, ..
+                } => Some((title.clone(), rev.clone(), from.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The title is the file plus the commit, spelled the way `revision_diff_spec` spells it —
+    /// so `log.rs @ a1b2c3d` and a revision *diff* of the same file sit next to each other in
+    /// the strip under one convention rather than two.
+    #[test]
+    fn a_revision_tab_is_titled_file_at_short_oid() {
+        assert_eq!(
+            revision_title("crates/cide-git/src/log.rs", "a1b2c3d4e5f60718"),
+            "log.rs @ a1b2c3d"
+        );
+        // A path with no directory, and an oid shorter than the cut. Neither is reachable from
+        // the product today; both are reachable from the wire, and `[..7]` would panic on the
+        // second.
+        assert_eq!(revision_title("README.md", "abc"), "README.md @ abc");
+    }
+
+    /// **The rule this tab exists to get right**: the key is the document, not the route.
+    ///
+    /// Two walks that arrive at one commit of one file are looking at the same bytes, so the
+    /// second finds the first — and the chain the first tab was opened with survives, because
+    /// that is the trail the user can actually see and retrace.
+    #[test]
+    fn one_revision_of_one_file_is_one_tab_however_the_user_walked_there() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+
+        let first = open_revision(
+            &mut ws,
+            project,
+            repo,
+            "src/main.rs",
+            "a1b2c3d",
+            &["9f8e7d6".to_string()],
+        )
+        .expect("opens");
+
+        // The same file at the same commit, reached down a different branch of the DAG.
+        let again = open_revision(
+            &mut ws,
+            project,
+            repo,
+            "src/main.rs",
+            "a1b2c3d",
+            &["deadbee".to_string(), "cafe123".to_string()],
+        )
+        .expect("activates");
+
+        assert_eq!(again, first, "the route is not part of the tab's identity");
+        assert_eq!(
+            revision_file_tabs(&ws, project),
+            vec![(
+                "main.rs @ a1b2c3d".to_string(),
+                "a1b2c3d".to_string(),
+                vec!["9f8e7d6".to_string()],
+            )],
+            "and the chain of the tab that already exists wins — the second walk must not \
+             rewrite a trail the user has already been shown"
+        );
+
+        // The three things that *are* the identity, each on its own.
+        let other_rev =
+            open_revision(&mut ws, project, repo, "src/main.rs", "9f8e7d6", &[]).expect("opens");
+        let other_path =
+            open_revision(&mut ws, project, repo, "src/lib.rs", "a1b2c3d", &[]).expect("opens");
+        let other_repo = open_revision(
+            &mut ws,
+            project,
+            RepoId::new(),
+            "src/main.rs",
+            "a1b2c3d",
+            &[],
+        )
+        .expect("opens");
+        assert_eq!(
+            [first, other_rev, other_path, other_repo]
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(revision_file_tabs(&ws, project).len(), 4);
+    }
+
+    /// The chain reaches the tab normalised, so a walk round a merge cannot grow `workspace.json`
+    /// and the tab's own revision never appears in its own trail.
+    #[test]
+    fn the_chain_a_revision_tab_is_opened_with_is_normalised() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+        open_revision(
+            &mut ws,
+            project,
+            repo,
+            "src/main.rs",
+            "ccc",
+            &[
+                "aaa".to_string(),
+                "bbb".to_string(),
+                "aaa".to_string(),
+                "ccc".to_string(),
+            ],
+        )
+        .expect("opens");
+
+        assert_eq!(
+            revision_file_tabs(&ws, project)
+                .into_iter()
+                .map(|(_, _, from)| from)
+                .collect::<Vec<_>>(),
+            vec![vec!["aaa".to_string(), "bbb".to_string()]]
+        );
+    }
+
+    /// A revision tab is not a diff tab and must not be found by the diff lookups — otherwise a
+    /// single click in the git panel would retarget a read-only buffer over a commit.
+    #[test]
+    fn a_revision_tab_is_invisible_to_the_diff_lookups() {
+        let repo = RepoId::new();
+        let tab = TabKind::Revision {
+            repo,
+            path: "src/main.rs".into(),
+            rev: "a1b2c3d".into(),
+            from: Vec::new(),
+            title: "main.rs @ a1b2c3d".into(),
+        };
+        assert!(shows_revision(&tab, repo, "src/main.rs", "a1b2c3d"));
+        assert!(!shows_git_diff(&tab, repo, "src/main.rs"));
+        assert!(!shows_revision_diff(
+            &tab,
+            repo,
+            "src/main.rs",
+            &at("a1b2c3d"),
+            &RevSide::FirstParent
+        ));
+
+        // And the converse: a revision *diff* over the same file at the same commit is a
+        // different document and does not answer for this one.
+        let diff = TabKind::Diff {
+            spec: revision_diff_spec(
+                repo,
+                "src/main.rs",
+                at("a1b2c3d"),
+                RevSide::FirstParent,
+                None,
+            ),
+            preview: false,
+        };
+        assert!(!shows_revision(&diff, repo, "src/main.rs", "a1b2c3d"));
+    }
+
+    /// Forty single clicks down a commit's file list leave one tab, exactly as they do in the
+    /// git panel — the same rule, over the tool window's own scratch slot.
+    #[test]
+    fn forty_single_clicks_in_the_log_leave_one_revision_tab() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+
+        for i in 0..40 {
+            retarget_revision_diff(
+                &mut ws,
+                project,
+                repo,
+                &format!("src/file{i}.rs"),
+                at("a1b2c3d"),
+                RevSide::FirstParent,
+                None,
+            )
+            .expect("retargets");
+        }
+
+        assert_eq!(
+            revision_tabs(&ws, project),
+            vec![("file39.rs @ a1b2c3d".into(), true)]
+        );
+    }
+
+    /// **The report this whole slot split exists for.**
+    ///
+    /// The git panel's scratch tab and the tool window's are on screen at once. With one slot,
+    /// clicking a file in the log retargets the tab the user was staging from and the
+    /// half-made selection in it is gone. Two tabs, and neither ever becomes the other.
+    #[test]
+    fn clicking_in_the_log_does_not_eat_the_diff_being_staged_from() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+
+        let staging =
+            retarget_git_diff(&mut ws, project, repo, "src/a.rs", DiffSide::Unstaged, None)
+                .expect("retargets");
+        let history = retarget_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/b.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("retargets");
+
+        assert_ne!(staging, history);
+        assert_eq!(diff_tabs(&ws, project), vec![("src/a.rs".into(), true)]);
+        assert_eq!(
+            revision_tabs(&ws, project),
+            vec![("b.rs @ a1b2c3d".into(), true)]
+        );
+
+        // And each goes on reusing its own slot rather than the other's.
+        retarget_git_diff(&mut ws, project, repo, "src/c.rs", DiffSide::Unstaged, None)
+            .expect("retargets");
+        retarget_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/d.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("retargets");
+        assert_eq!(diff_tabs(&ws, project), vec![("src/c.rs".into(), true)]);
+        assert_eq!(
+            revision_tabs(&ws, project),
+            vec![("d.rs @ a1b2c3d".into(), true)]
+        );
+    }
+
+    /// Double-click promotes the tool window's scratch tab, and the next single click opens a
+    /// new one rather than eating what was just kept — `tab_open_diff`'s rule, unchanged.
+    #[test]
+    fn double_clicking_a_revision_preview_promotes_it() {
+        let (mut ws, project) = bare();
+        let repo = RepoId::new();
+        let preview = retarget_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/a.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("retargets");
+
+        let promoted = open_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/a.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("opens");
+
+        assert_eq!(promoted, preview, "no second tab over the same comparison");
+        assert_eq!(
+            revision_tabs(&ws, project),
+            vec![("a.rs @ a1b2c3d".into(), false)]
+        );
+
+        retarget_revision_diff(
+            &mut ws,
+            project,
+            repo,
+            "src/b.rs",
+            at("a1b2c3d"),
+            RevSide::FirstParent,
+            None,
+        )
+        .expect("retargets");
+        assert_eq!(
+            revision_tabs(&ws, project),
+            vec![
+                ("b.rs @ a1b2c3d".into(), true),
+                ("a.rs @ a1b2c3d".into(), false),
+            ]
         );
     }
 

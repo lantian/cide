@@ -50,7 +50,7 @@
  * height here silently un-does all three.
  */
 .row {
-  height: 24px;
+  height: calc(24px * var(--ui-scale));
   display: flex;
   align-items: center;
   gap: 6px;
@@ -174,13 +174,13 @@
 
 [aria-expanded='false'] > .twisty:not(:empty)::before {
   width: 5px;
-  height: 6px;
+  height: calc(6px * var(--ui-scale));
   clip-path: polygon(0 0, 0 100%, 100% 50%);
 }
 
 [aria-expanded='true'] > .twisty:not(:empty)::before {
   width: 7px;
-  height: 4px;
+  height: calc(4px * var(--ui-scale));
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
@@ -214,7 +214,7 @@
 
 .groupName {
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -249,7 +249,7 @@
   padding-left: 8px;
   flex: none;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--faint);
 }
 
@@ -267,7 +267,7 @@
      names, not columns, and the two trees must not disagree about what a filename looks
      like when they sit in the same 42px rail one click apart. */
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--text);
   flex: 0 1 auto;
   min-width: 0;
@@ -337,7 +337,7 @@
  */
 .dir {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--faint);
   flex: 0 100 auto;
   min-width: 0;
@@ -366,8 +366,8 @@
   border: 1px solid var(--accent-dim);
   border-radius: 3px;
   font-family: var(--font-mono);
-  font-size: 9.5px;
-  line-height: 14px;
+  font-size: var(--fs-ui-9-5);
+  line-height: calc(14px * var(--ui-scale));
   color: var(--accent);
 }
 
@@ -375,7 +375,7 @@
   margin: 0;
   padding: 12px;
   color: var(--faint);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 /*
@@ -389,7 +389,7 @@
 .dirName {
   /* A directory is a name like any other — same face as `.fileName`, one step up the tree. */
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--dim);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -499,7 +499,7 @@
   /* The placeholder stands in for a row, so it is measured like one; a mono ghost that
      resolves into a proportional name reflows the tree as it loads. */
   font-family: var(--font-ui);
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -508,7 +508,7 @@
 
 .ghostHint {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
 }
 

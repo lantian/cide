@@ -64,6 +64,16 @@ export interface ExplorerProps {
    * somebody binds later, rather than three call sites with three copies of the preconditions.
    */
   onOpenPin?: ((id: string) => void) | undefined
+  /**
+   * *Show File History* on a tree row — the tool window's per-file tab. (M18)
+   *
+   * Passed straight through to `FileTree`, which owns the enablement; this panel only carries
+   * it. Routed by the host through the **command**, exactly as [`onSelectOpened`] and
+   * [`onOpenPin`] are and for the identical reason: four surfaces now offer this act, and four
+   * copies of its preconditions is four chances for one of them to drift. See the prop's
+   * documentation in `FileTree.tsx`.
+   */
+  onShowHistory?: ((path: string) => void) | undefined
 }
 
 export function Explorer({
@@ -73,6 +83,7 @@ export function Explorer({
   openedFile = null,
   onSelectOpened,
   onOpenPin,
+  onShowHistory,
 }: ExplorerProps) {
   const count = useFileTree((s) => s.count)
   const truncated = useGitStatus((s) => s.status.truncated)
@@ -266,6 +277,7 @@ export function Explorer({
         onOpen={onOpenFile}
         onOpenToSide={onOpenFileToSide}
         onOpenPin={onOpenPin}
+        onShowHistory={onShowHistory}
       />
     </div>
   )

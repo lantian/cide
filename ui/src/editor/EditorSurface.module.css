@@ -171,7 +171,22 @@
   color: var(--faint);
   border-right: none;
   font-family: var(--font-mono);
-  font-size: 11px;
+  /*
+   * The code scale, not the chrome's, and a ratio rather than a literal.
+   *
+   * A line number is not chrome standing beside the buffer — it is a row *of* the buffer, on
+   * the buffer's own baseline grid (`line-height: inherit` from `.cm-scroller`'s `--lh-code`).
+   * If it followed the chrome setting, raising the editor's font would leave the numbers
+   * behind and raising the UI font would push them off the leading they share with the text
+   * they label.
+   *
+   * 0.88 is the shipped 11px over the mock's 12.5px code size, kept as the ratio so it holds
+   * at every editor size. Written as a literal, the column silently failed to grow with
+   * `editor.fontSize` at all — the numbers stayed 11px in a 20px buffer. That was true before
+   * this line was touched; it is fixed here because the sweep had to make a decision about
+   * this declaration either way, and "leave the bug in place" is also a decision.
+   */
+  font-size: calc(var(--fs-code) * 0.88);
 }
 
 /*
@@ -208,6 +223,157 @@
 .body :global(.cm-activeLineGutter) {
   background: var(--sel);
   color: var(--dim);
+}
+
+/* --- the blame column (M18) ------------------------------------------------------------- *
+ *
+ * `blame.ts` puts this gutter FIRST in the extension array, so it sits left of the numbers where
+ * IDEA puts it. Everything below is the paint; every decision about *what* is painted is
+ * `blameModel.ts`, which `check:blame` compiles and drives.
+ *
+ * ## The width is stated here and in one other place
+ *
+ * `22ch` is `BLAME_LABEL_CHARS`, and `check:blame` pins the two together. `ch` resolves against
+ * this element's own font, which is the 11px mono `.cm-gutters` sets above — so the column is
+ * exactly as wide as the longest label the model can produce, and a label can never be clipped by
+ * the column that was sized for it.
+ *
+ * ## Why the reservation grows rather than being shared
+ *
+ * `.cm-lineNumbers` is `flex: 1` of `.cm-gutters`' `min-width`, so a second gutter beside it takes
+ * its width *out of the numbers' share* and shifts every line number left the moment the column
+ * appears. That is the bug the 70px comment above records for the lint gutter, and this is the
+ * same fix: the container's reservation grows by exactly the new column, so the numbers do not
+ * move. `:has()` rather than a permanent reservation, because an unannotated buffer must not pay
+ * 22 characters of margin for a column that is not there.
+ */
+
+.body :global(.cm-gutters:has(.cm-blame)) {
+  min-width: calc(70px + 22ch + 16px);
+}
+
+.body :global(.cm-blame) {
+  /* Fixed, not `flex: 1` — see above. The 16px is the cell's own padding, below. */
+  flex: none;
+  width: calc(22ch + 16px);
+  /*
+   * A hairline, so the annotation reads as a margin against the file rather than as part of it.
+   * `--border-soft` and not `--border`: this line runs the full height of every annotated buffer,
+   * and at `--border`'s weight it competes with the pane's own edges.
+   */
+  border-right: 1px solid var(--border-soft);
+}
+
+.body :global(.cm-blame .cm-gutterElement) {
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 8px;
+  text-align: left;
+  /*
+   * Never wrap. A gutter element's height is set from the *text line* it sits beside, so a label
+   * that wrapped would overflow its own row and slide the column out of step with the buffer for
+   * the rest of the file.
+   */
+  white-space: nowrap;
+}
+
+.body :global(.cm-blame .cm-blame-label) {
+  color: var(--faint);
+}
+
+/*
+ * A committed cell is a click target — it opens the commit in the log. An uncommitted or freshly
+ * edited one is not, and says so with the cursor rather than by reporting a refusal after the
+ * click; `blame.ts`'s handler returns `false` for exactly the same two cases.
+ */
+.body :global(.cm-blame .cm-gutterElement.cm-blame-cell:not(.cm-blame-uncommitted)) {
+  cursor: pointer;
+}
+
+/*
+ * The age ramp: six steps, older = stronger, matching `blameModel.AGE_BUCKETS`' five boundaries.
+ *
+ * ## Why this is `color-mix()` over `--blue` and not six tokens of its own
+ *
+ * `tokens.css` is owned elsewhere and adding to it is a change to a file every surface reads, so
+ * the ramp is derived here from a token that already exists in both palettes. It is not a
+ * placeholder: a mix against `--blue` is theme-correct by construction — the light palette's blue
+ * is pitched dark enough to read as text on white and the dark palette's light enough to read on
+ * `--panel`, so the same percentages give a tint that darkens the light theme and lightens the
+ * dark one, which is what "stronger" has to mean in both. Six literal colours would need writing
+ * twice and keeping in step.
+ *
+ * Blue rather than the accent family: `--sel` and `--accent` are this app's *action* colours (the
+ * active line is `--sel` two rules up), and a whole column tinted with them would read as
+ * selected. Blue is the one hue in this palette that means neither "selected" nor "wrong".
+ *
+ * Older is stronger, which is the direction the milestone asks for — the eye is drawn to the
+ * settled parts of the file rather than to the churn, and the churn is where the *labels* are
+ * densest anyway, so the two cues do not stack.
+ */
+.body :global(.cm-blame .cm-blame-age-0) {
+  background: color-mix(in srgb, var(--blue) 4%, transparent);
+}
+.body :global(.cm-blame .cm-blame-age-1) {
+  background: color-mix(in srgb, var(--blue) 7%, transparent);
+}
+.body :global(.cm-blame .cm-blame-age-2) {
+  background: color-mix(in srgb, var(--blue) 11%, transparent);
+}
+.body :global(.cm-blame .cm-blame-age-3) {
+  background: color-mix(in srgb, var(--blue) 15%, transparent);
+}
+.body :global(.cm-blame .cm-blame-age-4) {
+  background: color-mix(in srgb, var(--blue) 20%, transparent);
+}
+.body :global(.cm-blame .cm-blame-age-5) {
+  background: color-mix(in srgb, var(--blue) 26%, transparent);
+}
+
+/*
+ * Not in the ramp at all, and deliberately a different hue: an uncommitted line is not "very new",
+ * it is *not in history*, and putting it at one end of the age scale would invite it to be read as
+ * a step on that scale. The accent family is what this app uses for "yours, live, unsaved".
+ */
+.body :global(.cm-blame .cm-blame-uncommitted) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/*
+ * A line this editing session has touched, drawn uncommitted whatever marker it still carries.
+ *
+ * Three classes deep so it beats every `.cm-blame-age-N` rule above regardless of source order:
+ * the override has to win, and relying on the cascade's tie-break would make a later reordering of
+ * this file a silent per-line falsehood. `blame.ts`' header has the whole argument for why the
+ * override is a class rather than a rewritten marker.
+ *
+ * `visibility: hidden` and not `display: none` on the label, for the reason `layout/paneHosts.ts`
+ * gives about hidden tabs: the element keeps its box, so the cell's height and the row it is
+ * beside stay in step. The label is blanked rather than replaced with the word "Uncommitted"
+ * because the touched set moves on every keystroke, and a label that appeared and vanished as the
+ * run boundaries shifted under the caret would be motion in the corner of the eye for no
+ * information — the tint already says the line is yours.
+ */
+.body :global(.cm-blame .cm-gutterElement.cm-blame-touched) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.body :global(.cm-blame .cm-blame-touched .cm-blame-label) {
+  visibility: hidden;
+}
+
+/*
+ * The hover card's frame. The card itself is `BlamePopup.module.css`; this is CodeMirror's own
+ * `.cm-tooltip` wrapper, which ships a light-grey border and background from its base theme.
+ * Styled from the same tokens as the lint tooltip further down, so a diagnostic popover and this
+ * read as one surface.
+ */
+.body :global(.cm-tooltip.cm-blame-popup) {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: var(--shadow);
+  color: var(--text);
 }
 
 /* --- syntax --------------------------------------------------------------------------- */
@@ -455,9 +621,17 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 8px;
+  /*
+   * The vertical padding scales and the horizontal does not, which looks arbitrary and is not.
+   * `--h-findbar` is *derived* from this number — `check:rows` re-adds `padding × 2 + the
+   * tallest control + the panel's border` and fails if the token disagrees — and the panel's
+   * height is explicit, so a bar whose parts outgrow the token is not a bar that spills, it is
+   * one that silently clips. Vertical is therefore load-bearing arithmetic; horizontal is
+   * whitespace beside a control that is already as wide as its text.
+   */
+  padding: calc(5px * var(--ui-scale)) 8px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   /* Contained rather than spilling. The panel above is exactly `--h-findbar` tall and stops at
      the minimap, so this is what keeps a squeezed bar inside those bounds instead of pushing its
      own border out from under itself — and, below the width its own controls need, what clips
@@ -468,14 +642,14 @@
 .findInput {
   flex: 1;
   min-width: 0;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   padding: 0 7px;
   border: 1px solid var(--border);
   border-radius: 3px;
   background: var(--panel-2);
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
 }
 
 .findInput:focus {
@@ -500,14 +674,14 @@
 .findButton {
   flex: none;
   min-width: 22px;
-  height: 22px;
+  height: calc(22px * var(--ui-scale));
   padding: 0 5px;
   border: 1px solid transparent;
   border-radius: 3px;
   background: transparent;
   color: var(--dim);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   line-height: 1;
   cursor: pointer;
 }
@@ -579,7 +753,10 @@
   width: 14px;
   background-image: none;
   font-family: var(--font-mono);
-  font-size: 11px;
+  /* The gutter's size, for the gutter's reason: this glyph sits in the number column and the
+     rule below puts it on the numbers' baseline. Two sizes there is a marker half a pixel off
+     the digit beside it. */
+  font-size: calc(var(--fs-code) * 0.88);
   /* Matches `.cm-lineNumbers`' own line box, so a marked line's glyph sits on the number's
      baseline rather than half a pixel above it. */
   line-height: inherit;
@@ -617,7 +794,7 @@
   box-shadow: var(--shadow);
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   max-width: 420px;
   padding: 2px;
 }
@@ -647,6 +824,6 @@
 .body :global(.cm-diagnosticSource) {
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   padding-left: 6px;
 }

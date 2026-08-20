@@ -17,7 +17,21 @@
   color: var(--dim);
 }
 
+/*
+ * The tablist wrapper, which exists so the rail's tool-window toggle can sit outside it.
+ *
+ * `display: contents` removes this box from layout entirely and promotes its children back to
+ * flex items of `.rail`, so the width, the padding, the 2px gap and the chrome audit's
+ * sibling-gap measurement are all unchanged from before it existed. It carries the
+ * `role="tablist"` and nothing else.
+ */
+.tabs {
+  display: contents;
+}
+
 .item {
+  /* Fixed, like the rail that holds it: 28px of SVG in a 42px `--h-rail` gutter, none of which
+     is text. The badge below is the one thing here that carries a glyph, and it scales. */
   width: 28px;
   height: 28px;
   /* A column flex item shrinks by default; the spacer's zero basis means a short window
@@ -48,7 +62,28 @@
   color: var(--accent);
 }
 
-/* The glyphs are the only affordance in this rail, so focus has to be visible. Drawn
+/*
+ * There is no `.glyph` rule here any more, and the note is the point.
+ *
+ * Every rail button used to hold a Unicode character in a span carrying `display: block;
+ * line-height: 1`. That rule existed because a span's default line box is built from the metrics
+ * of **whichever face fontconfig handed the character**, not from the character: four of the
+ * seven rail glyphs (⌕ ⚑ ⌬ ⚙) resolved on this host to a Noto Symbols face whose hhea ascent and
+ * descent sum to 2.05em, so at 17px `place-items: center` centred a 35px line box inside a 28px
+ * button and the ink landed 4.5–5.5px below the middle of its own hover background. `line-height:
+ * 1` made the centred thing the em box, and fixed it.
+ *
+ * The rail now draws stroked SVG paths (`ActivityRail.tsx`, which carries the measurements and
+ * why the marks changed): a 20px box, blockified as a grid item and centred by `.item`'s own
+ * `place-items: center`, with no line box, no face to choose and no per-character size.
+ *
+ * That is worth recording rather than quietly deleting, because it names a class of bug this
+ * stylesheet can no longer have — and because putting *any* character back into a rail button
+ * brings all of it back, including the per-face vertical drift, which nothing in `ui/scripts/`
+ * can see.
+ */
+
+/* The icons are the only affordance in this rail, so focus has to be visible. Drawn
    inside the 28px box, matching the header and tab strip, so it cannot widen the rail. */
 .item:focus-visible {
   outline: 1px solid var(--accent);
@@ -89,16 +124,16 @@
   top: 0;
   right: -2px;
   min-width: 18px;
-  height: 14px;
+  height: calc(14px * var(--ui-scale));
   padding: 0 3px;
   box-sizing: border-box;
   border-radius: 7px;
   background: var(--accent);
   color: var(--on-accent);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: var(--fs-ui-9);
   /* The line box is the pill: matching `height` centres the digits with no flex container. */
-  line-height: 14px;
+  line-height: calc(14px * var(--ui-scale));
   text-align: center;
   /* Digits are the whole content, so a tracked-out font would shift the box between 9 and 10
      changed files. Monospace plus zero tracking keeps one- and two-digit pills stable. */
@@ -106,7 +141,7 @@
 }
 
 /*
- * The ⚑ badge, when the project has errors. (M12)
+ * The Problems badge, when the project has errors. (M12)
  *
  * A colour override and nothing else: it inherits every dimension from `.badge` above, so the
  * geometry `CIDE_AUDIT=1` measures is the same pill whichever view is carrying it. `--red` is the

@@ -46,7 +46,7 @@
  * is why `GitDiffPane` keeps its `visible` prop — a host outside the shell's tab stack must
  * say so — and why nothing here tries to guess a window role.
  */
-import type { RepoId, TabId, TabKind } from '@/ipc/generated'
+import type { RepoId, RevSide, TabId, TabKind } from '@/ipc/generated'
 
 /**
  * The part of a `Project` this needs.
@@ -66,6 +66,46 @@ export function showsGitDiff(kind: TabKind, repo: RepoId, path: string): boolean
     kind.spec.origin.kind === 'git' &&
     kind.spec.origin.repo === repo &&
     kind.spec.origin.path === path
+  )
+}
+
+/**
+ * Whether two `RevSide`s name the same thing.
+ *
+ * By hand rather than by `JSON.stringify`, which would answer `false` for two equal `commit`
+ * sides whose keys happened to be serialised in a different order — not a hypothetical here,
+ * since one side of any comparison is built by this webview and the other arrives off
+ * `workspace.json` through serde.
+ */
+function sameSide(a: RevSide, b: RevSide): boolean {
+  if (a.kind !== b.kind) return false
+  return a.kind !== 'commit' || a.oid === (b as { oid: string }).oid
+}
+
+/**
+ * Whether a tab is this exact revision comparison. Mirrors `cmd::file::shows_revision_diff`.
+ *
+ * Keyed on **all four** of `(repo, path, new, old)`, unlike {@link showsGitDiff} — which
+ * deliberately leaves the side out because a working-tree tab *switches sides in place*, so the
+ * side is a mode of one tab. A revision pair has no such control and is the tab's identity
+ * instead: `main.rs` at `a1b2c3d` against its parent and the same file at `a1b2c3d` against
+ * `9f8e7d6` are two different documents. Keep this and the Rust function in step; a mirror that
+ * drifts is a pane that decides it is hidden when it is not, and stops following its own file.
+ */
+export function showsRevisionDiff(
+  kind: TabKind,
+  repo: RepoId,
+  path: string,
+  next: RevSide,
+  prev: RevSide,
+): boolean {
+  return (
+    kind.kind === 'diff' &&
+    kind.spec.origin.kind === 'gitRevision' &&
+    kind.spec.origin.repo === repo &&
+    kind.spec.origin.path === path &&
+    sameSide(kind.spec.origin.new, next) &&
+    sameSide(kind.spec.origin.old, prev)
   )
 }
 

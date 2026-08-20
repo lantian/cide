@@ -131,6 +131,7 @@ fn reindex_open_projects(app: &AppHandle, visibility: cide_fs::Visibility) {
 fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     let SettingsPatch {
         theme,
+        ui_font_size,
         each_project_keeps_claude_tab,
         reopen_last_project,
         keep_sessions_on_window_close,
@@ -150,6 +151,13 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // springs back on the next snapshot. This way the compiler names the omission.
     if let Some(v) = theme {
         settings.theme = v;
+    }
+    // Clamped for the two code sizes' reason below, and one more of its own: this number is a
+    // *divisor* by the time CSS sees it, so a `NaN` does not merely paint something odd — it
+    // invalidates every `calc()` in the size ladder at once, and an invalid `calc()` drops the
+    // declaration. That is 405 rules with no `font-size` and a window of UA-default serif.
+    if let Some(v) = ui_font_size {
+        settings.ui_font_size = cide_ipc::clamp_ui_font_size(v);
     }
     if let Some(v) = each_project_keeps_claude_tab {
         settings.each_project_keeps_claude_tab = v;
@@ -1387,6 +1395,10 @@ mod tests {
                 sidebar: Some(SidebarSettings {
                     files_width: 5_000,
                     git_width: 500,
+                    // Spread rather than a literal: `SidebarSettings` gained `agents_width`
+                    // in M18 and will gain the next panel's width too, and a test that has to
+                    // be edited for every new panel is a test that will be edited carelessly.
+                    ..SidebarSettings::default()
                 }),
                 ..SettingsPatch::default()
             },

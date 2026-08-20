@@ -36,6 +36,10 @@
 
 .icon {
   flex: none;
+  /* An SVG, so fixed while the row around it follows the chrome font size. It sits inline with
+     a name that grows, which does leave the icon looking smaller at the top of the band — the
+     alternative is scaling a glyph drawn on a 16px grid, and a blurred icon reads worse than a
+     small one. */
   width: 16px;
   height: 16px;
   object-fit: contain;

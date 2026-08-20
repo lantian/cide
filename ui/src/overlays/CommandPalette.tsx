@@ -36,6 +36,7 @@ import type { KeyContext } from '@/keys/keymap'
 import type { Keymap } from '@/keys/keymap'
 import type { Command } from '@/ipc/client'
 import styles from './Overlay.module.css'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 
 const ROW_HEIGHT = 26
 
@@ -85,11 +86,16 @@ export function CommandPalette({
     [commands, merged],
   )
   const rows = useMemo(() => searchCommands(applicable, query), [applicable, query])
+  // The chrome scale, for the one measurement CSS never sees: a virtualized row is placed by
+  // an absolute transform off this number. See `settings/useUiScale.ts`.
+
+  const rowHeight = scaledRow(ROW_HEIGHT, useUiScale())
+
 
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 8,
   })
 

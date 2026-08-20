@@ -1,0 +1,74 @@
+/*
+ * The blame card. (M19)
+ *
+ * Styled from the same tokens as `overlays/Overlay.module.css`' card and the lint tooltip in
+ * `EditorSurface.module.css`, so a diagnostic popover, a picker and this read as one surface.
+ * The chrome around it — the border, the shadow and the reset of CodeMirror's own `.cm-tooltip`
+ * ground — is in `EditorSurface.module.css`, because the element that carries `.cm-tooltip` is
+ * created by the library and is the parent of this one.
+ */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Wide enough for a full subject line without wrapping in the common case, and capped so a
+     500-character commit message from a squash does not become a card the width of the window. */
+  max-width: 440px;
+  min-width: 220px;
+  padding: 8px 10px;
+}
+
+/*
+ * The heading: `a1b2c3d Fix the parser`. Mono and stated, not inherited.
+ *
+ * Mono because the leading seven characters are a hash — a column of glyphs a reader compares
+ * against another hash — and a proportional `1` beside a proportional `l` is exactly the pair
+ * that comparison turns on. The family is written here rather than left to inherit from
+ * `.cm-gutters`' mono, which is the mistake `check:theme`'s family sweep exists to catch: the day
+ * the tooltip stops being a descendant of the gutter, an inherited face changes silently.
+ */
+.head {
+  color: var(--text-hi);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  font-weight: var(--w-bold);
+  /* The subject can be long; it wraps rather than being clipped, because the card exists
+     precisely to show what the 22-character cell could not. */
+  overflow-wrap: anywhere;
+}
+
+/* Author, address, date, the rename hop, the caveats — one shape for all of them. */
+.row {
+  color: var(--dim);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.action {
+  background: var(--chrome);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11);
+  padding: 3px 8px;
+}
+
+.action:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

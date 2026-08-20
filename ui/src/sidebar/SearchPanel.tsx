@@ -49,6 +49,7 @@ import type { ProjectId } from '@/ipc/client'
 import { FileIcon, useIconTheme, type IconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
 import styles from './SearchPanel.module.css'
+import { scaledRow, useUiScale } from '@/settings/useUiScale'
 
 /**
  * 24px rows — the same as the file tree's, and for the same reason.
@@ -272,10 +273,14 @@ function Results({
    * milliseconds. See `rowKey`.
    */
   const [selected, setSelected] = useState<string | null>(null)
+  // The chrome scale, for the one measurement CSS never sees: a virtualized row is placed by
+  // an absolute transform off this number. See `settings/useUiScale.ts`.
+  const rowHeight = scaledRow(ROW_HEIGHT, useUiScale())
+
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: () => rowHeight,
     overscan: 12,
   })
 

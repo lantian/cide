@@ -28,7 +28,7 @@
 
 .title {
   margin: 0 0 6px;
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   font-weight: 600;
   color: var(--text-hi);
 }
@@ -42,8 +42,8 @@
 
 .body {
   margin: 0;
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: var(--fs-ui-12-5);
+  line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
 
@@ -55,7 +55,7 @@
  */
 .paths {
   flex: none;
-  max-height: 132px;
+  max-height: calc(132px * var(--ui-scale));
   overflow-y: auto;
   overflow-x: hidden;
   margin: 0;
@@ -70,7 +70,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
 }
 
@@ -85,14 +85,14 @@
 .input {
   flex: 1;
   min-width: 0;
-  height: 28px;
+  height: calc(28px * var(--ui-scale));
   padding: 0 9px;
   border: 1px solid var(--border);
   border-radius: 5px;
   background: var(--panel-2);
   color: var(--text-hi);
   font-family: inherit;
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
 }
 
 .input::placeholder {
@@ -109,7 +109,7 @@
   flex: none;
   margin: 0;
   padding: 0 18px 10px;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--yellow);
 }
 
@@ -117,7 +117,7 @@
 .list {
   flex: 1;
   min-height: 0;
-  max-height: 220px;
+  max-height: calc(220px * var(--ui-scale));
   overflow-y: auto;
   overflow-x: hidden;
   margin: 0;
@@ -136,7 +136,7 @@
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   text-align: left;
   cursor: default;
 }
@@ -167,7 +167,7 @@
   white-space: nowrap;
   text-align: right;
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   color: var(--faint);
 }
 
@@ -175,7 +175,7 @@
    looks clickable. */
 .existing {
   padding: 3px 18px;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--faint);
 }
 
@@ -191,7 +191,7 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   line-height: 1;
   padding: 7px 13px;
   border-radius: 5px;

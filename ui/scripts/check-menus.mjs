@@ -66,6 +66,7 @@ try {
     isInertMenu,
     moveFocus,
     placeMenu,
+    placeSubmenu,
     resolveMenu,
     wantsNativeMenu,
   } = await import(`file://${join(out, 'model.js')}`)
@@ -213,6 +214,78 @@ try {
   eq(isInertMenu(menu), false, 'and a menu with one live line is not inert')
 
   // =====================================================================================
+  // 1b. Submenus — a row that opens a list instead of doing something
+  // =====================================================================================
+  //
+  // The editor's *Send this to Claude ▸* is the only caller, and what it lists is the
+  // project's Claude conversations by the names their user gave them. The three things that
+  // can go wrong here are all decisions, so all three are decided in `model.ts`: a parent must
+  // not be treated as wired-to-nothing, a parent must not also fire a `run`, and a disabled
+  // parent must not hand out a live builder.
+
+  let built = 0
+  const rows = () => {
+    built++
+    return [
+      { id: 'one', label: '1: agents', run: noop },
+      { id: 'two', label: '2: git-details', run: noop },
+    ]
+  }
+
+  const withSub = resolveMenu(
+    [
+      { id: 'send', label: 'Send line 12 to Claude', submenu: rows },
+      { id: 'off', label: 'Send this file to Claude', disabledReason: 'No Claude here', submenu: rows },
+      { id: 'both', label: 'Confused', submenu: rows, run: () => { fired = 'both' } },
+    ],
+    { chipFor },
+  )
+
+  eq(
+    withSub.find((e) => e.id === 'send').enabled,
+    true,
+    'a row with a submenu and no `run` is NOT the wired-to-nothing shape `NO_ACTION_REASON` '
+      + 'names — it does something when clicked, namely open a list',
+  )
+  eq(
+    withSub.find((e) => e.id === 'send').run,
+    null,
+    'and it never runs: one click cannot mean two things, so the list wins and the caller '
+      + 'cannot leave a second meaning half-wired',
+  )
+  ok(
+    typeof withSub.find((e) => e.id === 'send').submenu === 'function',
+    'the builder survives resolution as a function, so the rows are built when the submenu '
+      + 'opens rather than when its parent did — which is what keeps a list of live sessions '
+      + 'from being a snapshot of the moment the menu was right-clicked',
+  )
+  eq(
+    built,
+    0,
+    'and resolving the parent has not called it: a submenu nobody hovers costs nothing, and '
+      + 'a builder that ran at parent-resolve time would be exactly the stale snapshot',
+  )
+  eq(
+    withSub.find((e) => e.id === 'both').run,
+    null,
+    'a caller that supplies both gets the submenu and no handler — stated rather than left '
+      + 'to whichever the component happens to check first',
+  )
+  eq(
+    [withSub.find((e) => e.id === 'off').enabled, withSub.find((e) => e.id === 'off').submenu],
+    [false, null],
+    'a disabled parent hands out no builder, for the reason a disabled item hands out no '
+      + '`run`: an enablement the caller ignores must not leave a live handle behind',
+  )
+  eq(
+    resolveMenu(rows(), { chipFor }).map((e) => e.label),
+    ['1: agents', '2: git-details'],
+    'and the rows themselves resolve like any other menu — one model, one set of rules, so '
+      + 'a submenu cannot grow its own idea of what disabled means',
+  )
+  eq(built, 1, 'that last call is the only one this section made')
+
+  // =====================================================================================
   // 2. Geometry — the flip, in a window that is not the screen
   // =====================================================================================
 
@@ -355,6 +428,70 @@ try {
     anchorToRect({ left: 40, bottom: 66 }),
     { x: 40, y: 66 },
     'a keyboard-invoked menu hangs off the element’s bottom-left, having no pointer to sit at',
+  )
+
+  // --- and a submenu, which hangs off a row rather than a point ---------------------------
+  //
+  // The distinction is the whole reason this is not `placeMenu` with a cleverer anchor: a
+  // pointer has no width, so `placeMenu` flips *through* its anchor; a row does, and flipping
+  // through its right edge would lay the submenu over the parent menu and hide the row the
+  // user is hovering.
+
+  const row = { left: 100, right: 200, top: 100, bottom: 126 }
+  const sub = placeSubmenu(row, box, win)
+  eq(
+    [sub.x, sub.y, sub.flippedX, sub.flippedY],
+    [200, 100, false, false],
+    'with room to the right it opens at the row’s right edge, top-aligned with the row, so '
+      + 'the first submenu item sits beside the row that opened it',
+  )
+  eq(sub.maxHeight, 192, 'and budgets from where it landed to the bottom margin: 300 - 8 - 100')
+
+  const tight = placeSubmenu({ left: 200, right: 380, top: 100, bottom: 126 }, box, win)
+  eq(
+    [tight.x, tight.flippedX],
+    [20, true],
+    'with 32px to the right and 192 to the left it flips round the row to `left - width` — '
+      + '200 - 180 — rather than through `right - width`, which would be 200 and would sit '
+      + 'exactly on top of the parent menu',
+  )
+  const low = placeSubmenu({ left: 100, right: 200, top: 290, bottom: 300 }, box, win)
+  eq(
+    [low.y, low.flippedY, low.maxHeight],
+    [172, false, 120],
+    'a row near the bottom pulls its submenu up until the box fits — 300 - 8 - 120 — rather '
+      + 'than flipping it, because a submenu grows downwards from a placed top edge and there '
+      + 'is nothing for a flip to mean',
+  )
+  const huge = placeSubmenu(row, { width: 180, height: 900 }, win)
+  eq(
+    [huge.y, huge.maxHeight],
+    [8, 284],
+    'a submenu taller than the window pins to the top margin and scrolls inside the window '
+      + 'less both margins, exactly as a top-level menu does',
+  )
+  const noRoom = placeSubmenu({ left: 8, right: 20, top: 100, bottom: 126 }, { width: 900, height: 120 }, win)
+  eq(
+    [noRoom.x, noRoom.flippedX],
+    [8, false],
+    'and a submenu wider than the window pins to the left margin — the inverted clamp keeps '
+      + 'the readable end, the same choice `placeMenu` makes',
+  )
+  /*
+   * The one case that overlaps the parent, recorded rather than pretended away. A row whose
+   * right edge leaves less room than the submenu needs, on a side that is still roomier than
+   * the other, is placed rightwards and then clamped back off the margin — which lands it on
+   * top of the row it came from. This is a 420px-wide detached-pane window with a 180px
+   * submenu; on any ordinary window it does not arise, and the alternatives are worse: flip
+   * anyway (over the parent, on the side with *less* room) or paint off the window edge.
+   */
+  const squeezed = placeSubmenu({ left: 100, right: 280, top: 100, bottom: 126 }, box, win)
+  eq(
+    [squeezed.x, squeezed.flippedX],
+    [232, false],
+    'and when neither side can hold it the box is pinned to the right margin, overlapping '
+      + 'the row — the honest last resort, since 420px of window cannot show a 180px row and '
+      + 'a 180px submenu side by side',
   )
 
   // =====================================================================================
@@ -639,7 +776,7 @@ try {
   // worth: they prove the imports and the tokens are there, not that a pixel moved.
 
   const component = readFileSync('src/menus/ContextMenu.tsx', 'utf8')
-  for (const fn of ['placeMenu', 'moveFocus', 'activeItem']) {
+  for (const fn of ['placeMenu', 'placeSubmenu', 'moveFocus', 'activeItem']) {
     ok(
       new RegExp(`\\b${fn}\\(`).test(component),
       `ContextMenu.tsx calls \`${fn}\` — a box that placed itself would pass everything above `
@@ -650,6 +787,26 @@ try {
     /createPortal\(/.test(component),
     'and renders through a portal, without which a menu in an `overflow: hidden` pane — '
       + 'which is most panes here — is clipped by it',
+  )
+
+  /*
+   * The submenu box is the *same* component's, in the *same* portal, and the dismissal check
+   * asks about both boxes. This is the one submenu rule that cannot be moved into `model.ts`,
+   * and getting it wrong is not subtle: a nested `ContextMenu` would answer "is the pointer
+   * inside my box" for its own box only, so the first click on a submenu row would read as an
+   * outside click on the parent, close it, and unmount the row under the pointer.
+   */
+  ok(
+    /box\.current\?\.contains\(target\) === true \|\| subBox\.current\?\.contains\(target\) === true/
+      .test(component),
+    'the dismissal check covers the submenu box as well as the main one — the submenu is a '
+      + 'portal *sibling*, so asking only the main box makes every click on a submenu row an '
+      + 'outside click that closes the menu before the row can run',
+  )
+  ok(
+    /aria-haspopup=/.test(component) && /aria-expanded=/.test(component),
+    'and a parent row says it has a popup and whether it is open, which is the only signal a '
+      + 'screen reader gets that the row is not an ordinary one',
   )
   // `includes("'blur'")` was not enough: deleting the `addEventListener` leaves the matching
   // `removeEventListener` behind, and the grep passed over a menu that never dismissed on
@@ -701,8 +858,22 @@ try {
   // `:root` is light, deliberately — see the header of tokens.css.
   const light = blockOf(':root,')
   const dark = blockOf("[data-theme='dark']")
+  /*
+   * Tokens that are measurements rather than colours, and therefore live in the second,
+   * theme-independent `:root` block — a light and a dark theme have no separate opinion about
+   * a font stack or a type scale. `--shadow` is in the set and is deliberately *not* exempt
+   * below: it is a colour wearing a dimension's name, and the two themes really do differ.
+   *
+   * The chrome type scale joins them as a family rather than as fourteen entries: `--ui-scale`
+   * is the chrome font size's multiplier and `--fs-ui-<n>` are the rungs built out of it, all
+   * declared once beside `--font-ui`. Matched by shape so a new rung does not have to be added
+   * here as well as to `tokens.css` — `check-ui-scale.mjs` is what holds that ladder to its
+   * readers, and it is the script that would notice a rung nobody uses.
+   */
   const dimensions = new Set(['--font-ui', '--font-mono', '--shadow'])
+  const scaleToken = (token) => token === '--ui-scale' || token.startsWith('--fs-ui-')
   for (const token of used) {
+    if (scaleToken(token)) continue
     if (dimensions.has(token) && token !== '--shadow') continue
     ok(light.includes(`${token}:`), `${token} is defined in the light theme, which is default`)
     ok(dark.includes(`${token}:`), `${token} is defined in the dark theme`)

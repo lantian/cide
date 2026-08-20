@@ -408,6 +408,48 @@ pub fn file_diff(repo: &Repository, path: &str, request: DiffRequest) -> Result<
     Ok(raw_files(&diff)?.into_iter().find(|f| f.path == path))
 }
 
+/// The frontend's view of one file's hunks, on their own.
+///
+/// Split out of [`view`] so the revision surface can share the mapping. [`FileDiff`] wraps
+/// these in `side`, `rev` and `partial_ok`, and all three are meaningless for a diff of two
+/// committed trees: there is no working-tree side to name, nothing for the `rev` check to
+/// refuse a stale [`cide_ipc::git::Selection`] against, and no staging operation the answer
+/// could ever feed. So the revision path wants the hunks and none of the wrapper.
+///
+/// Extracted rather than copied, and the difference matters: the `LineOrigin` translation and
+/// the [`strip_newline`] rule are the two places a second copy would drift, and it would drift
+/// on the read-only surface — the one nobody is staging from, so the one where a wrong line
+/// number produces no visible failure until somebody trusts it.
+pub fn hunk_views(file: &RawFile) -> Vec<DiffHunkView> {
+    file.hunks
+        .iter()
+        .enumerate()
+        .map(|(index, hunk)| DiffHunkView {
+            index: index as u32,
+            header: String::from_utf8_lossy(strip_newline(&hunk.header)).into_owned(),
+            old_start: hunk.old_start,
+            old_lines: hunk.old_lines,
+            new_start: hunk.new_start,
+            new_lines: hunk.new_lines,
+            lines: hunk
+                .lines
+                .iter()
+                .map(|line| DiffLineView {
+                    origin: match line.origin {
+                        b'+' => LineOrigin::Addition,
+                        b'-' => LineOrigin::Deletion,
+                        _ => LineOrigin::Context,
+                    },
+                    content: String::from_utf8_lossy(strip_newline(&line.content)).into_owned(),
+                    old_lineno: line.old_lineno,
+                    new_lineno: line.new_lineno,
+                    no_newline: line.eofnl.is_some(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// The frontend's view of a file diff.
 pub fn view(file: &RawFile, side: DiffSide) -> FileDiff {
     FileDiff {
@@ -418,34 +460,7 @@ pub fn view(file: &RawFile, side: DiffSide) -> FileDiff {
         binary: file.binary,
         old_mode: file.old_mode,
         new_mode: file.new_mode,
-        hunks: file
-            .hunks
-            .iter()
-            .enumerate()
-            .map(|(index, hunk)| DiffHunkView {
-                index: index as u32,
-                header: String::from_utf8_lossy(strip_newline(&hunk.header)).into_owned(),
-                old_start: hunk.old_start,
-                old_lines: hunk.old_lines,
-                new_start: hunk.new_start,
-                new_lines: hunk.new_lines,
-                lines: hunk
-                    .lines
-                    .iter()
-                    .map(|line| DiffLineView {
-                        origin: match line.origin {
-                            b'+' => LineOrigin::Addition,
-                            b'-' => LineOrigin::Deletion,
-                            _ => LineOrigin::Context,
-                        },
-                        content: String::from_utf8_lossy(strip_newline(&line.content)).into_owned(),
-                        old_lineno: line.old_lineno,
-                        new_lineno: line.new_lineno,
-                        no_newline: line.eofnl.is_some(),
-                    })
-                    .collect(),
-            })
-            .collect(),
+        hunks: hunk_views(file),
         rev: file.rev(),
         partial_ok: file.partial_refusal().is_none(),
     }

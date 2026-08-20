@@ -711,7 +711,16 @@ export function TerminalPane({
       // No process at all. A mirror is a second sink on a session that already exists, so
       // adopting the id is the whole operation — spawning here would start a rival child
       // and the two panes would diverge instead of showing one conversation.
-      if (!getHost(paneId).sessionId) getHost(paneId).sessionId = plan.session
+      //
+      // `mirrored` is set beside the id and means "this pane did not spawn what it holds".
+      // `closePane` is the one reader: without it, closing this pane kills the child in the
+      // pane being mirrored, because the two panes are indistinguishable from the host map.
+      // Set under the same guard as the id, so StrictMode's second mount — which finds the
+      // plan already taken and the id already there — cannot disagree with the first.
+      if (!getHost(paneId).sessionId) {
+        getHost(paneId).sessionId = plan.session
+        getHost(paneId).mirrored = true
+      }
     } else if (plan?.kind === 'forkPrimary' && primaryRef.current) {
       spec.resume = primaryRef.current
       spec.fork = true

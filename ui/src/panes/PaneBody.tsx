@@ -21,9 +21,53 @@ import { EditorPane } from './EditorPane'
 import { ImagePane } from './ImagePane'
 import { imageKindFor } from './imageKinds'
 import { ClaudeDiffPane } from './ClaudeDiffPane'
+// Not lazy-loaded, for the reason `ImagePane` below is not: a pane that renders nothing for a
+// frame while a chunk arrives is a pane the layout measures at zero.
+import { GitDiffPane } from './GitDiffPane'
+import { RevisionPane } from './RevisionPane'
 import { ResumeSplash } from '@/windows/ResumeSplash'
 import { paneSessionId } from '@/layout/paneHosts'
-import type { DiffSpec, Pane, PaneRestore } from '@/ipc/client'
+import { useWorkspace } from '@/store/workspace'
+import type { Bootstrap, DiffSpec, Pane, PaneId, PaneRestore, TabKind } from '@/ipc/client'
+
+/** The `TabKind::Revision` arm, so the lookup below and the pane agree about its shape. */
+type RevisionTab = Extract<TabKind, { kind: 'revision' }>
+
+/**
+ * The revision tab this pane belongs to, or `null`.
+ *
+ * # Why this is read off the mirror instead of being passed in
+ *
+ * Every other document branch below is told what its tab is: `App.tsx` computes `diff` and
+ * `editor` from `tab.kind` and hands them down. That is one shape, and a `revision` prop beside
+ * them would be the obvious third — except that it would work in `App.tsx`'s call site and
+ * nowhere else, and it is not the only reason to prefer this.
+ *
+ * `panes/diffTabs.ts` already established the pattern and its header carries the argument in
+ * full: a pane that can answer a question about its own tab out of the `Workspace` that
+ * `cide://workspace-changed` delivers to *every* window does not depend on one host remembering
+ * to thread a prop through. This project's most repeated defect is a prop that stops one
+ * component short — `check:editor` asserts that `onScreen` is passed on in two files for exactly
+ * that reason — and a tab kind that silently renders as a terminal is that defect with a spawn
+ * on the end of it.
+ *
+ * A `find` over a handful of tabs per render, on a component that already re-renders on every
+ * snapshot because `App.tsx` maps the whole tree. The alternative — a `panes` index keyed by
+ * `PaneId` — would be a second structure to keep in step with the tree that already holds one.
+ */
+function revisionTabFor(
+  boot: Bootstrap | null,
+  project: string | undefined,
+  pane: PaneId,
+): RevisionTab | null {
+  if (boot === null || project === undefined) return null
+  const tabs = boot.workspace.projects[project]?.tabs
+  if (tabs === undefined) return null
+  for (const tab of tabs) {
+    if (tab.kind.kind === 'revision' && pane in tab.tree.panes) return tab.kind
+  }
+  return null
+}
 
 export interface PaneBodyProps {
   /** The project this pane belongs to, so its child reaches the right IDE server. */
@@ -134,6 +178,21 @@ export function PaneBody({
   )
   const [resumed, setResumed] = useState(false)
 
+  /*
+   * Is this pane's tab a `TabKind::Revision`? (M18)
+   *
+   * A hook, so it belongs up here with the other two rather than beside the branch that uses it
+   * — see the paragraph above about hook order, which is the rule that makes this placement
+   * non-negotiable rather than tidy.
+   *
+   * The selector returns the tab's `kind` object, which is reference-stable within a snapshot
+   * and replaced wholesale by the next one; that costs nothing, because `App.tsx` maps the whole
+   * pane tree off the same snapshot and this component re-renders with it either way. What it
+   * must not do is build a new object per call — zustand compares with `Object.is` — so the
+   * lookup returns the mirror's own value or `null` and never a wrapper.
+   */
+  const revision = useWorkspace((s) => revisionTabFor(s.boot, project, pane.id))
+
   // A file is a document too: no session, no spawn, nothing to resume. (M9)
   //
   // Dispatched on the PANE kind, not the tab kind. Splitting a File tab creates a Claude
@@ -172,6 +231,67 @@ export function PaneBody({
         project={project}
         tab={editor.tab}
         onScreen={onScreen}
+      />
+    )
+  }
+
+  /*
+   * A file as one commit left it — `TabKind::Revision`. (M18)
+   *
+   * Keyed on the **pane** kind as well as the tab, exactly like the file branch above and for
+   * exactly its reason: `cmd::pane::default_intent` gives every non-console tab
+   * `SplitIntent::NewClaude`, so splitting a revision tab produces a `PaneKind::Claude` pane
+   * bound to a live conversation. Without the `pane.kind` test that pane would render a *second*
+   * read-only buffer over the same blob instead of the terminal it is, and the agent's output
+   * would go nowhere visible.
+   *
+   * Before the `held` splash, with the other document branches, and for the reason the revision
+   * diff below states: a document must never be offered a Resume.
+   *
+   * `project` is required by the guard rather than defaulted, because every call this pane makes
+   * — `gitLog.fileAt`, `git.repos`, `revisionFile.openTab`, `file.open` — takes a `ProjectId`.
+   * A revision tab outside a project is unreachable (a `RepoId` only exists inside one), so this
+   * is a type narrowing rather than a case with behaviour behind it.
+   */
+  if (revision && pane.kind === 'editor' && project) {
+    return (
+      <RevisionPane
+        project={project}
+        repo={revision.repo}
+        path={revision.path}
+        rev={revision.rev}
+        from={revision.from}
+        onScreen={onScreen}
+      />
+    )
+  }
+
+  /*
+   * A revision diff — two frozen commits of one file — is a document too. (M18)
+   *
+   * Handled **here** rather than in `App.tsx`'s fork, which is where a working-tree git diff is
+   * intercepted with the note *"a git diff replaces the pane rather than living in one"*. That
+   * is the right treatment for the panel's diff, whose Stage footer and side switcher want the
+   * whole tab. This one is read-only and has neither, so it is content like the Claude diff
+   * below it and belongs in a pane — which also means a revision diff can be split beside a
+   * terminal, and torn into its own window, without the tab-level fork having to learn about
+   * detached panes.
+   *
+   * Before the `held` splash, with the other document branches, and that ordering is
+   * load-bearing rather than tidy: `restore` is `undefined` for a diff pane (`lifecycle::
+   * entry_for` plans an entry only for a Claude or Shell pane), but a restored workspace that
+   * ever did plan one would otherwise offer to *resume* a document.
+   */
+  if (diff && diff.origin.kind === 'gitRevision' && project) {
+    // `visible` is spread rather than passed, because `exactOptionalPropertyTypes` makes an
+    // explicit `undefined` a different thing from an absent prop — and absent is what makes the
+    // pane work the answer out of the workspace mirror instead of being told. See
+    // `GitDiffPaneProps.visible`.
+    return (
+      <GitDiffPane
+        project={project}
+        spec={diff}
+        {...(onScreen === undefined ? {} : { visible: onScreen })}
       />
     )
   }

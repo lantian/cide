@@ -35,7 +35,10 @@ import { useCallback } from 'react'
 import type { FileDiff, ProjectId, RepoId } from '@/ipc/client'
 import { useIconTheme } from '@/icons'
 import { useContextMenu, type MenuEntry } from '@/menus'
+// The wording, not a fifth copy of it — see the note on the same import in `FileTree.tsx`.
+import { NO_HOST } from '@/chrome/menuModel'
 import { copyText } from '../copyText'
+import { repoRoot } from './repoRoots'
 import { GitPanelView } from './GitPanel'
 import { useGitPanel } from './useGitPanel'
 import { DEFAULT_CHANGELIST, changelistIdOf, groupOf, type Row } from './model'
@@ -52,9 +55,21 @@ export interface GitPanelProps {
    * `showDiff` in `useGitPanel`. Passing it takes the payload directly and opens no tab.
    */
   onOpenDiff?: ((diff: FileDiff, repo: RepoId) => void) | undefined
+  /**
+   * *Show File History* on a file row — the tool window's per-file tab. (M18)
+   *
+   * Takes an **absolute** path, like every other caller of `git.history.file`, which is why the
+   * menu item below joins the row's path to its repository root before calling this. Routed by
+   * the host through `runCommand('git.history.file', …)` — the `file.reveal` precedent: one
+   * handler, one copy of the preconditions, four surfaces.
+   *
+   * Optional for the reason `onOpenDiff` is: a window with no tool window must not have this
+   * panel pretend otherwise, and the item is drawn disabled with the reason on it.
+   */
+  onShowHistory?: ((path: string) => void) | undefined
 }
 
-export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
+export function GitPanel({ project, onOpenDiff, onShowHistory }: GitPanelProps) {
   const git = useGitPanel(project, { onOpenDiff })
   const iconTheme = useIconTheme()
 
@@ -106,6 +121,8 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
        * all-untracked or none-untracked and this one flag answers for the whole set.
        */
       const untracked = row.groupKind === 'unversioned'
+      /** This repository's work tree, for the one item below that needs an absolute path. */
+      const root = repoRoot(row.repo)
 
       const entries: MenuEntry[] = [
         {
@@ -181,6 +198,40 @@ export function GitPanel({ project, onOpenDiff }: GitPanelProps) {
         },
         { kind: 'separator' },
         { id: 'diff', label: 'Show Diff', run: () => git.openDiff(row) },
+        {
+          /*
+           * *Show File History*, beside *Show Diff* because they are the two read-only
+           * questions about this row: what changed here now, and what changed here before.
+           *
+           * **The path has to be joined here**, and this is the only one of the four surfaces
+           * that offering this item where that is true. This panel's rows carry a
+           * *repo-relative* path plus a `RepoId`, because that is how git spells a path and how
+           * every command in `cide_ipc::git` takes one. Every other surface — the tab strip, the
+           * file tree, the editor — hands over an absolute path, `git.history.file` resolves it
+           * through `git_locate`, and the tool window keys its tabs by the absolute path so that
+           * the four routes land on **one** tab rather than four. Sending `src/main.rs` from
+           * here would either resolve to nothing or, worse, open a second tab for a file that
+           * already has one.
+           *
+           * `repoRoot` comes from the registry `GitDiffPane` already uses: every `ChangesTree`
+           * this window sees carries `RepoInfo.root`, so the answer is noted in passing and
+           * costs no round trip. It is `null` only before any tree has arrived — which cannot
+           * happen while this menu is open, since the rows it is drawn over came from a tree —
+           * but the type says it can, and inventing a root to satisfy it would be a guess about
+           * where a repository is.
+           */
+          id: 'history',
+          label: 'Show File History',
+          command: 'git.history.file',
+          ...(root !== null && onShowHistory !== undefined
+            ? { run: () => onShowHistory(`${root.replace(/\/+$/, '')}/${path}`) }
+            : {
+                disabledReason:
+                  root === null
+                    ? "This repository's root has not been read yet — refresh the panel"
+                    : NO_HOST,
+              }),
+        },
         { id: 'copyPath', label: 'Copy Path', run: () => void copyText(path) },
       ]
       return entries

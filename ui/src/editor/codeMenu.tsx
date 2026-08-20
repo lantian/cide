@@ -10,7 +10,8 @@
  * # What is here and what is deliberately not
  *
  * Undo / Redo, Cut / Copy / Paste, Select all, Find, Go to definition, and *@-mention the
- * selection*.
+ * selection* — which is the one row here that is not a row: it opens a submenu of the project's
+ * Claude conversations, so the mention can be aimed at one by name. See the item itself.
  *
  * **Undo and Redo were reachable from the keyboard and from nothing else.** `history()` and
  * `historyKeymap` have been in `EditorSurface` since M9, so Ctrl+Z, Ctrl+Y and Ctrl+Shift+Z all
@@ -51,19 +52,23 @@
  * exactly why the menu can do this and the palette cannot.
  *
  * *Send lines to Claude* used to be the exception — it carried `command: 'claude.mention.file'`
- * and drew that command's chip. It no longer does, and the reason is worth reading before
- * putting it back: **that command is registered and dispatched by nobody.** `App.tsx`'s
- * `runCommand` has no case for it and falls through to `diag.log('command not handled by this
- * window')`, and `cide-core::commands` gates it `.when("claudePaneFocused")` — which is exactly
- * inverted for a gesture whose whole premise is that an *editor* is focused. A chip advertising
- * a shortcut for a dead command is a worse lie than no chip. See `useSendToClaude.ts`, which
- * binds `Alt-Enter` inside the editor so the keyboard route works without either fix.
+ * and drew that command's chip. It no longer does. The original reason has since been repaired
+ * elsewhere (that command was dispatched by nobody and gated `claudePaneFocused`; the arm now
+ * exists in `keys/dispatch.ts` and the clause is `editorFocused && claudeTarget`), and the
+ * reason it still carries no chip is a different one, written out on the item: the command
+ * mentions the focused file whole at a destination the app picks, and this row opens a list of
+ * conversations for the range under the caret. Two different acts. `Alt-Enter` in the buffer is
+ * bound in `EditorSurface` and is the keyboard route to the *automatic* destination.
  */
 import { redo, redoDepth, selectAll, undo, undoDepth } from '@codemirror/commands'
 import { openSearchPanel } from '@codemirror/search'
 import type { EditorView } from '@codemirror/view'
 import { useContextMenu, type ContextMenuHandle, type MenuEntry } from '@/menus'
 import { copyUnavailable, pasteUnavailable, readClipboard, writeClipboard } from './clipboard'
+// The store's own toggle, not a second implementation of it. It owns the fetch, the 2 MiB cap,
+// the dirty-buffer contents and the latest-wins slot; a menu item that re-derived any of that
+// would be a second answer to "is this file annotated" for the same buffer.
+import { toggleBlame } from './blameStore'
 import { levelFor, setLevel } from './highlightLevel'
 import { goToDefinition } from './goToDefinition'
 import { findUsages } from './codeIntel'
@@ -98,6 +103,40 @@ export interface CodeMenuOptions {
    * and says so rather than guessing.
    */
   project?: string | undefined
+  /**
+   * Whether the blame gutter is currently on for this buffer. (M18)
+   *
+   * A **fact**, not a label: the item below is a `checked` toggle, so it reads *Annotate with git
+   * blame* both ways and the tick says which. The alternative — renaming the item to *Remove
+   * annotations* when it is on — was rejected for the reason IDEA's own Annotate is a checkbox: a
+   * menu whose items rename themselves between openings is one the user has to re-read every
+   * time, and the two names would be one more pair of strings to keep in step.
+   *
+   * Passed in rather than read from `blameStore` here, so this module goes on taking everything
+   * it needs as arguments — the same rule `path`, `project` and `defaultLevel` already follow.
+   * Defaults to `false`, so a host that has not wired it yet draws an unticked toggle rather
+   * than failing to compile.
+   */
+  blameOn?: boolean | undefined
+  /**
+   * *Show history for this file* — the tool window's per-file tab. (M18)
+   *
+   * A callback and not a direct call, because this module cannot reach the command layer: the
+   * dispatcher is built in `App.tsx` and there is no global instance to look one up in (that is
+   * deliberate — see `keys/dispatch.ts::createDispatcher`). The host wires it to
+   * `runCommand('git.history.file', { path })` and to nothing else, which is the `file.reveal`
+   * precedent: one handler owns "is this a shell window, does the project hold a repository,
+   * which repository is this path in", and the tab strip, the file tree and the git panel all
+   * reach the same one.
+   *
+   * Reaching for `history.locate` + `toolWindow.openHistory` here instead would be a fourth copy
+   * of those preconditions in the one surface that cannot see whether the window even has a tool
+   * window.
+   *
+   * Optional: without it the item is drawn disabled with the reason on it, which is the honest
+   * shape for a detached-pane window.
+   */
+  onShowHistory?: ((path: string) => void) | undefined
 }
 
 /** The selected text, and where it is. Empty `text` means the caret is just sitting somewhere. */
@@ -132,6 +171,8 @@ export function useCodeMenu({
   readOnly,
   defaultLevel = 'all',
   project,
+  blameOn = false,
+  onShowHistory,
 }: CodeMenuOptions): ContextMenuHandle {
   const toClaude = useSendToClaude()
 
@@ -174,6 +215,22 @@ export function useCodeMenu({
       if (live === null) return []
       const sel = selection(live)
       const hasSelection = sel.text.length > 0
+
+      /*
+       * Ask Rust for the `/rename` names now, while the *parent* menu is being built.
+       *
+       * The submenu that shows them is built later — `MenuItem.submenu` is a thunk the menu
+       * calls when the row is hovered — so this round trip has the whole of that gap to land
+       * in, which for a human moving a pointer is several hundred milliseconds against one
+       * IPC call and a read of eight small files. Fire and forget: a refresh that fails costs
+       * the submenu its labels and nothing else, and `claudeNames.ts` says why that is a log
+       * line rather than a toast.
+       *
+       * Doing it here rather than in an effect is deliberate. An effect would have to fire on
+       * something, and the only honest trigger for "a name the user typed into another program
+       * changed" is "somebody is about to look at it" — which is this, exactly.
+       */
+      toClaude.refresh()
 
       /*
        * One sentence, reused. "Select some text first" is the honest reason for four items and
@@ -360,6 +417,84 @@ export function useCodeMenu({
         },
         { kind: 'separator' },
         /*
+         * The two git questions about *this file*, as their own group between the two symbol
+         * questions above and the reading-mode ones below. (M18)
+         *
+         * They belong together and away from both neighbours: `Go to definition` and
+         * `Find usages` are about the symbol under the caret, these two are about the buffer as
+         * a whole, and the highlighting items are about how it is painted. IDEA groups them the
+         * same way, and it is the grouping that makes a fourteen-item menu readable at all.
+         */
+        {
+          id: 'blame',
+          label: 'Annotate with git blame',
+          command: 'git.blame',
+          /*
+           * A **toggle**, not a pair of items that rename themselves. `checked` puts a tick in
+           * the gutter `menus/model.ts` reserves for exactly this, so the row reads the same
+           * both ways and the state is a glance rather than a re-read. See the `blameOn` option.
+           *
+           * Routed to `toggleBlame` directly rather than to the command, and this is the one
+           * new item in M18 that does **not** go through `runCommand` — deliberately, and the
+           * reason is that there is nothing for a command to add here. `git.blame`'s dispatch
+           * arm is three lines: resolve the focused file's path, resolve the active project,
+           * call `toggleBlame`. This menu already has both in hand — `path` is the buffer's own
+           * and is *better* than the focused-tab guess the command has to make — so routing
+           * through the registry would replace two known values with two re-derived ones. The
+           * command id is still named above, so the row draws whatever chord the keymap has for
+           * it (nothing today: the gate is a window *capture* listener, so every chord it claims
+           * is taken from every terminal pane in every window, and IDEA ships Annotate unbound
+           * too).
+           *
+           * `disabledReason` must **not** be set alongside `run` — `menus/model.ts` resolves
+           * `run: enabled ? (entry.run ?? null) : null`, so an item carrying both looks wired
+           * and is dead. The two items above say the same thing; this is the third, and it is
+           * repeated rather than referenced because the failure is silent and the fix is local.
+           */
+          checked: blameOn,
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is no repository to annotate from'
+              : undefined,
+          run:
+            project === undefined
+              ? undefined
+              : () => {
+                  // `project` is a `ProjectId`; the option is typed `string` for the reason
+                  // `goToDefinition`'s call two items up takes one — see that option's note.
+                  toggleBlame(project, path)
+                },
+        },
+        {
+          id: 'history',
+          label: 'Show history for this file',
+          command: 'git.history.file',
+          /*
+           * The same act as the palette row and as the tab strip's item, so it carries the
+           * command id and draws whatever chord the live keymap has for it.
+           *
+           * Two ways to be unavailable and two sentences. The project one is this menu's
+           * standing answer for "there is nothing to resolve against"; the host one is the
+           * detached-pane window, which has no tool window for the tab to open in — and that is
+           * a different fact from having no project, so it gets different words.
+           *
+           * `disabledReason` and `run` are again mutually exclusive; see the item above.
+           */
+          disabledReason:
+            project === undefined
+              ? 'This editor is not part of a project, so there is no history to show'
+              : onShowHistory === undefined
+                ? 'This window has no tool window for a history tab'
+                : undefined,
+          run:
+            project === undefined || onShowHistory === undefined
+              ? undefined
+              : () => {
+                  onShowHistory(path)
+                },
+        },
+        { kind: 'separator' },
+        /*
          * IDEA's highlighting-level widget, as three checked items.
          *
          * Not a submenu: `MenuItem` has none, and adding submenu support to the whole menu system
@@ -383,7 +518,27 @@ export function useCodeMenu({
           id: 'mention',
           label: sendLabel(toClaude.range(live)),
           /*
-           * **Still no `command`, and the reason has changed — which is why the old one is
+           * **A submenu since M19, and the row itself no longer sends.**
+           *
+           * > *"this should be not just a button, but element with inner elements — when
+           * > hovering I should be able to select to which claude session send this"*
+           *
+           * The rows are every Claude pane in the project, numbered the way the user sees them
+           * and named the way the user named them — `2: git-details`, from `/rename`. See
+           * `claudeSessions.ts` for the ordering and `claudeNames.ts` for where a name comes
+           * from. Picking one is an **exact** send: the pane is a stated choice rather than a
+           * guess, so `claude_send_lines` addresses it and refuses instead of rerouting.
+           *
+           * What that costs, stated because it is a real loss: the *automatic* destination —
+           * focused Claude pane, else the console, rerouted by Rust to whichever can actually
+           * receive — is now reachable from `Alt-Enter` in the buffer and not from this menu.
+           * A parent row cannot also be a button (`MenuItem.submenu` says why: one click, two
+           * meanings, and one of them unreachable by mouse), and given the choice between
+           * "which conversation?" and "any conversation" on the mouse route, the user asked
+           * for the first. The rows that *are* named are exactly the ones with a live `claude`
+           * behind them, which is the same information the automatic route was using.
+           *
+           * **Still no `command`, and the reason has changed twice — which is why both are
            * written out rather than deleted.**
            *
            * It used to be that `claude.mention.file` was dispatched by nothing and gated
@@ -393,19 +548,27 @@ export function useCodeMenu({
            * `editorFocused && claudeTarget`.
            *
            * What has not changed is that they are not the same act. The registry command
-           * mentions the *focused file*, whole — it is dispatched with no editor in hand and
-           * cannot see a selection. This item mentions the range under the caret. Wiring the
-           * chip on would advertise a shortcut that quietly drops the user's selection, which
-           * is a worse lie than no chip. `Alt-Enter` in the buffer is the keyboard half of
-           * *this* item and is bound in `EditorSurface`.
+           * mentions the *focused file*, whole, at whatever destination the app picks — it is
+           * dispatched with no editor in hand and cannot see a selection, let alone a chosen
+           * session. This row opens a list of conversations for the range under the caret.
+           * A chip here would advertise a shortcut that drops both the selection and the
+           * choice, which is a worse lie than no chip.
            */
           disabledReason: toClaude.unavailable ?? undefined,
-          run:
+          submenu:
             toClaude.unavailable !== null
               ? undefined
-              : () => {
-                  toClaude.send(live, path)
-                },
+              : () =>
+                  toClaude.sessions().map((session) => ({
+                    // The pane id, not the position: `2` renumbers the moment a pane closes,
+                    // and a React key that moves between renders is a row that loses its
+                    // hover in the middle of being clicked.
+                    id: `mention:${session.pane}`,
+                    label: session.label,
+                    run: () => {
+                      toClaude.sendTo(live, path, session.pane)
+                    },
+                  })),
         },
       ]
     },

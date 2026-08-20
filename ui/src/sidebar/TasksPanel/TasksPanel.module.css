@@ -1,0 +1,957 @@
+/*
+ * The Tasks panel. (M18)
+ *
+ * Sized from `--w-sidebar-agents`, the same token the Agents panel takes: the two are mutually
+ * exclusive sidebar views and the pane grid beside them must not move by a pixel when the rail
+ * swaps one for the other. The header is the explorer's 30px / 10.5px / uppercase for the same
+ * reason, one axis over.
+ *
+ * The detail view is a **modal**, and this paragraph used to say the opposite. It replaced the
+ * list in place, on the argument that a dialog over a 320px sidebar is a dialog the activity
+ * rail can hide behind — which the `OverlayCard` portal answers: the card is mounted beside the
+ * list and rendered into `document.body`, so it is centred over the window rather than over the
+ * sidebar, and the list stays on screen behind the scrim.
+ *
+ * What survives from that decision is the shape of this file: the card's own rules below own no
+ * overlay, no scrim and no z-index. Those belong to `overlays/Overlay.module.css`, which is the
+ * one definition of what a dialog looks like in this app.
+ *
+ * Every colour is a token, so both themes work with no second rule in this file.
+ */
+
+.panel {
+  width: var(--w-sidebar-agents);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.header {
+  height: calc(30px * var(--ui-scale));
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+  /* Written twice: WebKitGTK 2.52 drops the unprefixed property. See `check-css-prefix.mjs`. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.headerTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.headerMeta {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px 12px 16px;
+  /* Task bodies and comments are the content of this panel and have to be quotable; the chrome
+     around them sets `user-select: none` globally. Both spellings, as above. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.claim {
+  margin: 0;
+  font-size: var(--fs-ui-12-5);
+  font-weight: 500;
+  color: var(--text-hi);
+}
+
+/* An unreadable tracker is the one state here that is genuinely wrong, so it is the one that
+   takes a colour. `absent` is dim: no file is not a fault. */
+.claimError {
+  color: var(--red);
+}
+
+.claimQuiet {
+  color: var(--dim);
+}
+
+.detail {
+  margin: 6px 0 0;
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.5;
+  color: var(--faint);
+}
+
+.warn {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 3px;
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.path {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-10-5);
+  color: var(--text-hi);
+  overflow-wrap: anywhere;
+}
+
+/* The parse error, verbatim, in a block that cannot be mistaken for prose the panel wrote. */
+.error {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  background: var(--panel-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-10);
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+/*
+ * **The stray gap above New task.**
+ *
+ * `.actions` is a row of buttons that follows prose on four of this panel's five screens —
+ * `absent`, `unreadable`, the empty tracker, the filtered-to-nothing one — where 12px is the
+ * space between a sentence and the control it is about. On the *list* screen it is the first
+ * thing in `.body`, so that 12px landed on top of `.body`'s own 12px of padding and the button
+ * sat 24px down with nothing above it. Every other panel's first row starts at the padding.
+ *
+ * `:first-child` and not a second class on the list's row: the rule is "no leading gap when
+ * nothing precedes it", which is exactly what the selector says, and a class would have to be
+ * remembered by whoever adds the sixth screen.
+ */
+.actions:first-child {
+  margin-top: 0;
+}
+
+.action {
+  flex: none;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-10-5);
+  cursor: pointer;
+}
+
+.action:hover {
+  background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
+}
+
+.action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.actionPrimary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/*
+ * The armed half of a delete, in both places it appears.
+ *
+ * Only the *confirming* control takes the colour. The unarmed one is an ordinary `.action` (or,
+ * on a row, a dim glyph), because a red button that does nothing on its first press teaches a
+ * user to ignore red buttons — and this is the panel's only destructive gesture, so that lesson
+ * would be expensive. `--red` is the token the `unreadable` claim already uses; there is no
+ * `--warn` and `check:theme` fails on an invented one.
+ */
+.actionDanger,
+.actionDanger:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* The same control inside a 320px list row, where `.action`'s padding would push the title out. */
+.actionCompact {
+  padding: 0 5px;
+  font-size: var(--fs-ui-10);
+}
+
+/* --- The status filter. -------------------------------------------------------------- */
+
+/*
+ * Five toggles — All, and the four statuses in `GROUP_ORDER` — on one wrapping row.
+ *
+ * Not a `<select>`: at this width the whole vocabulary fits, and drawn all at once the control
+ * says what the choices are as well as which one is on. Not the detail view's `.segment`
+ * either, though it is the same shape of choice: that one is a *write*, and a filter that
+ * looked identical to the control which changes a task's status would be pressed for one and
+ * mean the other. So this is quieter — no track, no ground, a lit outline on the one that is on.
+ */
+.filters {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.filter {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--fs-ui-10);
+  cursor: pointer;
+}
+
+.filter:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
+}
+
+.filter:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The one that is on. An outline *and* a colour: a filter is a claim about what the list below
+   is showing, and a single discriminator is one a themed background can swallow. */
+.filterOn,
+.filterOn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: transparent;
+}
+
+/* --- The list. ----------------------------------------------------------------------- */
+
+/* The list sits below the New task row and the filter row, both of which are above it on every
+   screen that draws it — so the gap belongs here rather than as a bottom margin on either. */
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+/* The filtered-to-nothing block: the claim, the count, and the way back. Spaced off the filter
+   row above it, which is the control it is talking about. */
+.noMatch {
+  margin-top: 14px;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.groupHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.groupTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: inherit;
+}
+
+.groupCount {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-10);
+  letter-spacing: 0;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Done is a `<details>`: the collapse costs no state, so this component stays a function of
+   its props, and it is the group that grows without bound and is read least. */
+.doneGroup {
+  display: block;
+}
+
+.doneSummary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  list-style: none;
+}
+
+.doneSummary::-webkit-details-marker {
+  display: none;
+}
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/*
+ * The row is the container; `.rowMain` is the part that opens the task.
+ *
+ * It used to be one `<button>`. It cannot be, now that the row carries a delete control: a
+ * button inside a button is invalid HTML, and the browser closes the outer one early — which
+ * would put the delete outside the row it belongs to. So the hover ground and the radius live
+ * on the container and the type, padding and cursor moved down one level.
+ */
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  width: 100%;
+  border-radius: 3px;
+}
+
+/*
+ * The row whose card is open. The card is a modal over this list, so the row it came from has to
+ * be findable behind the scrim — four rows of the same shape and a dialog that does not say
+ * which one it belongs to makes the user close it to find out. A ground *and* an accent edge:
+ * the ground alone is `:hover`'s, and "the pointer is here" and "this one is open" must not look
+ * the same.
+ */
+.rowOpen,
+.rowOpen:hover {
+  background: var(--chrome-hi);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.row:hover {
+  background: var(--chrome-hi);
+  background: color-mix(in srgb, var(--sel) 55%, transparent);
+}
+
+.rowMain {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 4px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-11-5);
+  text-align: left;
+  cursor: pointer;
+}
+
+.rowMain:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * The row's unarmed delete: a dim `×` that brightens with the row.
+ *
+ * Dim rather than hidden. A control revealed only on hover is one a keyboard user never meets
+ * and a first-time user never finds — and "built and reachable from nothing" is a failure this
+ * project counts, so a delete that is technically present and practically invisible would be
+ * the same bug wearing a stylesheet. It stays in the DOM, in the tab order, and legible at rest;
+ * hover and focus merely bring it forward.
+ */
+.rowDelete {
+  flex: none;
+  align-self: center;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.row:hover .rowDelete,
+.rowDelete:hover {
+  color: var(--red);
+}
+
+.rowDelete:focus-visible {
+  color: var(--red);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.glyph {
+  flex: none;
+  width: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11);
+}
+
+.taskId {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+}
+
+.taskTitle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* --- The task→agent chip. ------------------------------------------------------------ */
+
+/*
+ * Three renderings for three facts, and the difference between two of them is the single most
+ * important thing this panel draws.
+ *
+ * A **live run** on the task is lit: full-strength label, a phase dot, and a tinted ground. An
+ * **assignment with nothing running** is dim, with no dot at all. Nothing at all is drawn when
+ * neither holds. A chip that looked the same either way would say an agent that exited an hour
+ * ago is still working — which is the one wrong statement this panel is in a position to make,
+ * and `check-agents-render.mjs` asserts the two class sets differ rather than trusting this
+ * comment.
+ */
+.chip {
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  max-width: 45%;
+  padding: 1px 5px;
+  border-radius: 8px;
+  font-size: var(--fs-ui-10);
+  overflow: hidden;
+}
+
+.chipLabel {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.chipDot {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-9);
+}
+
+/* Assigned, idle: no ground, no dot, dim ink. Deliberately the quietest thing on the row. */
+.chipAssigned {
+  color: var(--faint);
+}
+
+.chipLive {
+  background: var(--sel);
+  color: var(--green);
+}
+
+/* A live run waiting for a permission answer — the one run state that is a call to action, and
+   the reason `agentChip` promotes it over an earlier sibling. */
+.chipAttention {
+  background: var(--sel);
+  color: var(--yellow);
+}
+
+/* --- The task card. ------------------------------------------------------------------- */
+
+/*
+ * The card's contents. `OverlayCard` owns the scrim, the 620px box and its `max-height`; this is
+ * the head/body split inside it, so the head and the delete stay put while a long log scrolls.
+ *
+ * It is `tabIndex={-1}` and holds focus programmatically — that is what makes the one Escape
+ * handler on it hear a key pressed anywhere in the dialog, including after a field's editor has
+ * unmounted. A container is not a control, so it draws no ring for that; `:focus-visible` is
+ * left alone, because a keyboard user who reaches it deliberately is a different case.
+ */
+.taskCard {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* The card is 620px, not the sidebar's 320px, so the fields have room the old in-place
+     detail never had. Capped so the body scrolls rather than the dialog growing off screen. */
+  max-height: calc(100vh - 160px);
+}
+
+.taskCard:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.cardHead {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.cardBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 14px 14px;
+}
+
+/* The explicit way out. A glyph, because the head has an id and a status marker in it already,
+   and because × in a dialog's top corner is the one control nobody has to be taught. */
+.close {
+  flex: none;
+  width: 22px;
+  height: calc(22px * var(--ui-scale));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--fs-ui-15);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.close:hover {
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.close:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.detailId {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+}
+
+.field {
+  margin-top: 12px;
+}
+
+/*
+ * The heading row: the field's name, and the control that puts it into edit.
+ *
+ * The affordance sits on the field rather than in a toolbar, because "edit *this* one" is the
+ * whole posture — a single Edit button for the card would put every field back into a form.
+ */
+.fieldHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fieldHead > .fieldLabel {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+/*
+ * The pencil, and the Cancel it becomes. The same element in both states so React keeps the DOM
+ * node — see `FieldRow`, where dropping it would drop focus with it.
+ *
+ * Always visible rather than revealed on hover: a control that only exists while the pointer is
+ * over the row is one a user reading the card never learns about, and this is the only way to
+ * change three of the four fields.
+ */
+.fieldEdit {
+  flex: none;
+  min-width: 20px;
+  height: calc(20px * var(--ui-scale));
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--fs-ui-10-5);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.fieldEdit:hover {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+.fieldEdit:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/*
+ * A field at rest: its value, as text.
+ *
+ * **Not a disabled input.** A greyed-out control is still a control — it is in the tab order on
+ * some engines, it reads as broken rather than as settled, and it would put back the wall of
+ * boxes this posture exists to remove.
+ */
+.fieldValue {
+  margin: 0;
+  padding: 2px 0;
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.45;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* The body is the one field whose own line breaks are usually its only structure — the same
+   reason `.logText` preserves them. Still text, still never markup. */
+.fieldValueBody {
+  white-space: pre-wrap;
+}
+
+/* `restText`'s placeholder for an empty field. Dim and italic, so "no description" cannot be
+   mistaken for a description that says so. */
+.fieldValueEmpty {
+  color: var(--faint);
+  font-style: italic;
+}
+
+/* Save, under the editor. Right-aligned, like the composer's own action. */
+.fieldActions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.fieldLabel {
+  display: block;
+  margin-bottom: 3px;
+  font-size: var(--fs-ui-10-5);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.input,
+.textarea,
+.select {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.45;
+}
+
+.textarea {
+  min-height: calc(72px * var(--ui-scale));
+  resize: vertical;
+}
+
+.input:focus-visible,
+.textarea:focus-visible,
+.select:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* The four-way status segment: one track, four buttons, so the mutual exclusivity is visible
+   before any of the labels are read. `GitPanel.module.css`'s `.segmented`, at this scale. */
+.segment {
+  display: flex;
+  padding: 2px;
+  gap: 2px;
+  border-radius: 5px;
+  background: var(--panel-2);
+}
+
+.segmentButton {
+  flex: 1;
+  min-width: 0;
+  height: calc(20px * var(--ui-scale));
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--fs-ui-10-5);
+  cursor: pointer;
+}
+
+.segmentButton:hover {
+  color: var(--text);
+}
+
+.segmentOn,
+.segmentOn:hover {
+  background: var(--chrome-hi);
+  color: var(--accent);
+}
+
+.segmentButton:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* The live-run strip: what is actually running against this task, right now. */
+.runStrip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+}
+
+.runStripText {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-ui-10-5);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* --- The comment log. ---------------------------------------------------------------- */
+
+.log {
+  display: flex;
+  flex-direction: column;
+  /* Wider than it was, because an entry is three rows now — head, text, actions — and at 8px
+     one comment's controls sat closer to the next comment's author than to its own text. */
+  gap: 14px;
+  margin-top: 6px;
+}
+
+.logEntry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.logHead {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--fs-ui-10);
+  color: var(--faint);
+}
+
+.logAuthor {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--dim);
+}
+
+/* The user's own lines, styled off `TaskAuthor::User` rather than off the name — which is
+   what the wire carries a three-armed author enum for. */
+.logAuthorUser {
+  color: var(--accent);
+}
+
+.logTime {
+  flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Comment text.
+ *
+ * `pre-wrap`, and **never rendered as markup**. The text is model-authored, and rendering
+ * model-authored markup inside the IDE's own chrome is an injection surface bought for nothing
+ * at a 320px panel width. Whitespace is preserved because an agent's line breaks are usually
+ * the only structure it has.
+ */
+.logText {
+  margin: 0;
+  font-family: inherit;
+  font-size: var(--fs-ui-11);
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.composer {
+  margin-top: 10px;
+}
+
+.composerActions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+/*
+ * The card's foot, where the delete lives.
+ *
+ * A rule above it and a right-aligned control: the separation is the point. Everything above is
+ * a field that edits this task; this is the one control that ends it, and it must not read as
+ * the next field in the form.
+ */
+.detailActions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.empty {
+  margin: 6px 0 0;
+  font-size: var(--fs-ui-11);
+  font-style: italic;
+  color: var(--faint);
+}
+
+/* --- Tones. -------------------------------------------------------------------------- */
+
+/* One rule per `Tone` in `model.ts`. `review` is `attention` because it is the one status that
+   is a request *to the user*: an agent has finished and is waiting to be told whether it was
+   right. */
+.toneIdle {
+  color: var(--faint);
+}
+
+.toneBusy {
+  color: var(--green);
+}
+
+.toneAttention {
+  color: var(--yellow);
+}
+
+.toneDone {
+  color: var(--dim);
+}
+
+/*
+ * The per-comment controls: Edit and Delete, on their own row under the comment. (M21)
+ *
+ * # Their own row, and not the head
+ *
+ * The head is provenance and reads as one right-aligned fact — *You, 4m ago, edited*. Splicing
+ * two buttons into it took the rightmost position away from the timestamp and put the controls
+ * where nobody was pointing: a pair of 40x13 targets 4px apart at the end of a line being read
+ * rather than aimed at, which is a mis-click waiting to happen and was reported as one.
+ *
+ * # Visible, where they used to be revealed on hover
+ *
+ * The reveal was argued for a **320px sidebar** drawing four comments at once, where eight
+ * buttons would have competed with the text they act on. The card is a 620px modal now and
+ * these sit alone on a right-aligned line, so that premise is gone — and what was left was a
+ * control the user had to discover by hovering, which is a control that gets reported as
+ * missing. Dim at rest, full strength on hover: present without being loud.
+ *
+ * The row occupies its height whether or not it is hovered, so nothing in the log moves under
+ * the pointer — the failure a hover-revealed control has when it also changes layout.
+ */
+.logActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.logAction {
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  /* One step stronger than the timestamp beside it (`--faint`): a control the eye can find has
+     to read as at least as present as the label it sits under. */
+  color: var(--dim);
+  font: inherit;
+  font-size: var(--fs-ui-10-5);
+  cursor: pointer;
+}
+
+.logAction:hover {
+  background: var(--chrome-hi);
+  color: var(--text);
+}
+
+/*
+ * Always visible, unlike the buttons beside it: it is a fact about the comment rather than a
+ * control, and a provenance mark that only appears on hover is one nobody reading the log will
+ * see. The user editing an *agent's* comment is exactly the case this exists for.
+ */
+.logEdited {
+  color: var(--dim);
+  font-size: var(--fs-ui-10-5);
+  font-style: italic;
+}
+
+.logEdit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.logEditActions {
+  display: flex;
+  gap: 4px;
+}
+
+/* The editor's Save and Cancel are the same button one deliberate state further on. They stay
+   left-aligned under the textarea rather than right-aligned like the resting row, because they
+   belong to the form above them and not to the comment. */
+.logEditActions .logAction {
+  color: var(--dim);
+}

@@ -33,7 +33,7 @@
   overflow-y: auto;
   overflow-x: hidden;
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   -webkit-user-select: none;
   user-select: none;
   outline: none;
@@ -62,7 +62,7 @@
   align-items: center;
   gap: 10px;
   padding: 0 10px 0 8px;
-  height: 26px;
+  height: calc(26px * var(--ui-scale));
   flex: 0 0 auto;
   color: var(--text);
   font: inherit;
@@ -106,7 +106,7 @@
 .check {
   flex: 0 0 auto;
   width: 12px;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1;
   color: var(--accent);
   text-align: center;
@@ -128,7 +128,7 @@
 .hint {
   flex: 0 0 auto;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
   letter-spacing: 0.02em;
 }
@@ -139,14 +139,35 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   font-style: italic;
   color: var(--faint);
 }
 
 .separator {
+  /* A 1px rule. Borders are outside this setting for the same reason icons are: there is no
+     glyph in them to outgrow the box. */
   height: 1px;
   flex: 0 0 auto;
   margin: 4px 0;
   background: var(--border-soft);
+}
+
+/*
+ * The submenu marker.
+ *
+ * A `›` in the same slot a keychip would use, and never both — an item that opens a list is
+ * not an item a chord can run, so the two cannot collide. `--dim` rather than `--text` keeps
+ * it reading as furniture: it says "there is more this way", it is not part of the label.
+ *
+ * `margin-left: auto` is belt to `.label`'s `flex: 1 1 auto`: it keeps the marker hard against
+ * the right edge whatever else the row grows, which is what makes a column of them read as one
+ * column rather than as a ragged edge tracking each label's length.
+ */
+.chevron {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: var(--fs-ui-13);
+  line-height: 1;
+  color: var(--dim);
 }

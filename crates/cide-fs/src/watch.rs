@@ -19,8 +19,17 @@
 //! `.git/objects` along with everything else — tens of thousands of inotify descriptors for
 //! directories the user cannot see, which is the fastest route to `ENOSPC`. So every
 //! non-ignored directory the walk found gets its own non-recursive watch, plus the handful
-//! of git paths in [`crate::filter::Filter::git_paths`] that the `.git` rule would
-//! otherwise exclude.
+//! of paths in [`crate::filter::Filter::watched_paths`] — git metadata, and the project's own
+//! `.cide/` — that the `.git` rule and the dotfile rule would otherwise exclude.
+//!
+//! **One of those paths is recursive, and exactly one.** A git directory's `refs` tree is
+//! watched with [`RecursiveMode::Recursive`], because a branch named `feature/login` is a file
+//! inside `refs/heads/feature/` and a non-recursive watch on `refs/heads` never sees it — the
+//! bug being that it *appeared* to work, since the event loop below watches any new directory
+//! it is told about, right up until the next launch found the directory already there. Every
+//! other entry stays non-recursive; `crate::filter`'s `GIT_WATCHED` has the full account and
+//! `GIT_NEVER` has the guard that keeps `.git/objects` out of this by construction, whatever
+//! a future entry on the watched list says.
 //!
 //! **"Non-ignored" stayed literal when the file tree learned to show ignored files.** The
 //! watch list is [`crate::Index::watch_dirs`] and every event is tested with
@@ -183,6 +192,10 @@ fn run(
                         if is_dir && backend.per_directory && !backend.watched.contains(path) {
                             backend.watch_tree(path, &filter);
                         }
+                        // `is_git_path`, not `is_watched_path`: the flag becomes
+                        // `FsChange::git`, which is what makes the branch readout and the
+                        // git panel re-read. `.cide/` is on the same watch list and must
+                        // not raise it — a task write is not a commit.
                         coalescer.push(path.clone(), filter.is_git_path(path));
                     }
                 }
@@ -291,13 +304,28 @@ impl Backend {
                 .iter()
                 .cloned()
                 .map(|d| (d, RecursiveMode::NonRecursive))
-                .chain(
-                    filter
-                        .git_paths()
-                        .iter()
-                        .cloned()
-                        .map(|p| (p, RecursiveMode::NonRecursive)),
-                )
+                // The explicitly watched paths: git metadata *and* `<root>/.cide`, which is
+                // usually absent — `Filter::build` puts it on the list unconditionally,
+                // precisely so that it appearing is an event rather than a silence. Watching
+                // a path that is not there fails, and the loop below already treats that as
+                // ordinary (it is the same failure as a directory that vanished between the
+                // walk and the watch). The create then arrives on the root's own watch, and
+                // the event loop gives the new directory a watch of its own.
+                //
+                // Each entry brings its own recursion, which is the whole of the fix for a
+                // slash in a branch name: `refs` is the one entry that asks for `Recursive`.
+                // Reading the flag rather than hard-coding `NonRecursive` here is what keeps
+                // the decision in `crate::filter`, next to the comment explaining what it
+                // costs — the alternative is a watcher that watches `refs` non-recursively
+                // because a second file said so.
+                .chain(filter.watched_paths().iter().map(|w| {
+                    let mode = if w.recursive {
+                        RecursiveMode::Recursive
+                    } else {
+                        RecursiveMode::NonRecursive
+                    };
+                    (w.path.clone(), mode)
+                }))
                 .collect()
         } else {
             tracing::info!(
@@ -405,6 +433,10 @@ impl Backend {
                 let child = entry.path();
                 // `watchable` for the same reason as the event loop: a `git clone` that lands
                 // a directory the ignore rules cover is drawn, and not descended into here.
+                // It is also the guard that stops this loop walking into `.git/objects` —
+                // `Filter::classify` refuses `crate::filter::GIT_NEVER` before it consults the
+                // watched list, so no entry on that list, present or future, can turn this
+                // descent loose on a 256-way object fanout.
                 if entry.file_type().is_ok_and(|t| t.is_dir()) && filter.watchable(&child, true) {
                     stack.push(child);
                 }

@@ -9,19 +9,19 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 26px;
+  min-height: calc(26px * var(--ui-scale));
   padding: 4px 10px;
   background: var(--chrome-hi);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .glyph {
   flex: none;
   color: var(--yellow);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .text {
@@ -35,7 +35,7 @@
 /* Which repository, in a multi-root workspace. Mono because it is a path fragment. */
 .repo {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
 }
 
@@ -46,14 +46,14 @@
  */
 .action {
   flex: none;
-  height: 20px;
+  height: calc(20px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--panel);
   color: var(--text);
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   cursor: pointer;
 }
 

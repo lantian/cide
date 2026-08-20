@@ -19,19 +19,33 @@
   min-height: 0;
   background: var(--panel);
   color: var(--text);
+  /*
+   * The blame column's width, in characters of the row's own monospace face. (M18)
+   *
+   * `22ch` is `blameModel.BLAME_LABEL_CHARS`, and `check:diff-render` pins the two together —
+   * the same pin `check:blame` makes for `EditorSurface.module.css`. Shared with the editor's
+   * gutter on purpose rather than by coincidence: a file open in a diff tab and in an editor
+   * beside it would otherwise have two different left margins, and the eye reads that as the
+   * two panes being out of alignment. The cell holds `a1b2c3d Ada Lovelace` — a short oid, a
+   * space, and fourteen characters of the author — and clips with an ellipsis past that.
+   *
+   * A custom property because four `grid-template-columns` below need it and a diff whose blame
+   * column and blame cells disagreed by a character would clip every author name by one letter.
+   */
+  --blame-col: 22ch;
 }
 
 .notice {
   padding: 12px;
   color: var(--dim);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .noticeWhy {
   margin-top: 4px;
   color: var(--faint);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   /* A libgit2 message can be long and has no spaces to break on. */
   overflow-wrap: anywhere;
 }
@@ -53,7 +67,7 @@
   border-bottom: 1px solid var(--border);
   background: var(--chrome);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   color: var(--dim);
   white-space: nowrap;
   overflow: hidden;
@@ -97,7 +111,7 @@
 
 .side {
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1;
   padding: 4px 7px;
   border: 1px solid transparent;
@@ -142,7 +156,7 @@
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel-2);
   color: var(--yellow);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
 }
 
 .link {
@@ -160,7 +174,7 @@
   min-height: 0;
   overflow: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   /* The app root sets `user-select: none`; a diff is text people copy out of. */
   -webkit-user-select: text;
@@ -195,7 +209,7 @@
   background: none;
   color: var(--blue);
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   text-align: left;
   white-space: nowrap;
   overflow: hidden;
@@ -211,7 +225,7 @@
 .hunkAction {
   flex: none;
   font-family: var(--font-ui);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   line-height: 1;
   padding: 4px 8px;
   border: 1px solid var(--border);
@@ -235,7 +249,7 @@
 .box {
   flex: none;
   width: 14px;
-  height: 14px;
+  height: calc(14px * var(--ui-scale));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -244,7 +258,7 @@
   border-radius: 3px;
   background: var(--panel-2);
   color: var(--text-hi);
-  font-size: 10px;
+  font-size: var(--fs-ui-10);
   line-height: 1;
   cursor: pointer;
 }
@@ -269,6 +283,38 @@
 }
 
 /*
+ * The four column lists a row can have, and why there are four rather than one. (M18)
+ *
+ * A grid places its children **by order**, so a template with a track for a cell that was not
+ * rendered puts every later cell one column to the left. Two of this row's five cells are
+ * conditional: the tick box is withheld from a binary file and from the whole read-only arm, and
+ * the blame cell is only there when the column is on. That was already a live bug before the
+ * column existed — a revision diff drew its line numbers in the box's 16px and its text in the
+ * sign's 2ch, with the `1fr` track left empty — and nothing could see it, because
+ * `check:diff-render` reads data attributes and no audit measures a grid.
+ *
+ * The alternative was to render a zero-width placeholder for each absent cell, which keeps one
+ * template and loses the claim the blame column has to keep: **absent, not zero-width**. A
+ * reserved 22-character track on every unannotated diff is exactly the margin the toggle exists
+ * to avoid paying.
+ *
+ * The flags live on `.lines`, once per hunk, rather than on every row: it is one fact about the
+ * whole grid, and repeating it three thousand times in a large diff is three thousand attributes
+ * saying the same thing.
+ */
+.lines[data-boxed='false'] .row {
+  grid-template-columns: 5ch 5ch 2ch 1fr;
+}
+
+.lines[data-blamed='true'] .row {
+  grid-template-columns: 16px var(--blame-col) 5ch 5ch 2ch 1fr;
+}
+
+.lines[data-boxed='false'][data-blamed='true'] .row {
+  grid-template-columns: var(--blame-col) 5ch 5ch 2ch 1fr;
+}
+
+/*
  * Side by side. One grid row, two halves, one scroller — see `splitHunk` in the `.tsx` for
  * why that is the design rather than two editors kept in step by a scroll listener.
  *
@@ -289,6 +335,24 @@
   align-items: start;
   padding-right: 8px;
   min-width: 0;
+}
+
+/*
+ * The same four lists for a split half. Both halves get the blame track even though only the
+ * right one is annotated — the left draws `.blameGap` into it — because the two are separate
+ * grids and a track present in one and absent in the other slides the old side's code out of
+ * line with the new side's for every row of the diff.
+ */
+.lines[data-boxed='false'] .half {
+  grid-template-columns: 5ch 2ch minmax(0, 1fr);
+}
+
+.lines[data-blamed='true'] .half {
+  grid-template-columns: 16px var(--blame-col) 5ch 2ch minmax(0, 1fr);
+}
+
+.lines[data-boxed='false'][data-blamed='true'] .half {
+  grid-template-columns: var(--blame-col) 5ch 2ch minmax(0, 1fr);
 }
 
 /* The seam. On the left cell only, so it does not double up at the pane's right edge. */
@@ -363,7 +427,7 @@
 
 .lineBox {
   width: 12px;
-  height: 12px;
+  height: calc(12px * var(--ui-scale));
   margin: 2px;
   padding: 0;
   display: flex;
@@ -373,7 +437,7 @@
   border-radius: 2px;
   background: var(--panel-2);
   color: var(--text-hi);
-  font-size: 9px;
+  font-size: var(--fs-ui-9);
   line-height: 1;
   cursor: pointer;
 }
@@ -388,6 +452,102 @@
   /* A context line has nothing to stage; the box is kept for the column, not the gesture. */
   visibility: hidden;
   cursor: default;
+}
+
+/* --- the blame column (M18) --------------------------------------------------------------- *
+ *
+ * What is drawn; everything about *what it says* is `diffBlame.ts` and `editor/blameModel.ts`.
+ * The column sits between the tick box and the line numbers, which is where IDEA puts it and
+ * where the editor's own gutter puts it relative to its numbers.
+ */
+
+.blame {
+  /*
+   * `align-self: stretch` against the row's `align-items: start`. Without it the cell is only as
+   * tall as its one line of text while the row is as tall as its (possibly wrapped) code, and
+   * both the age tint and the hairline below would stop short — a column of dashes down the side
+   * of every long line.
+   */
+  align-self: stretch;
+  min-width: 0;
+  padding-right: 1ch;
+  overflow: hidden;
+  color: var(--faint);
+  /* Never wrap: a two-line cell would push the row taller than the code it annotates. */
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  /*
+   * A hairline, so the annotation reads as a margin against the diff rather than as part of it.
+   * `--border-soft` and not `--border`, for the reason `EditorSurface.module.css` gives about the
+   * same line: it runs the full height of every annotated pane and at `--border`'s weight it
+   * competes with the pane's own edges.
+   */
+  border-right: 1px solid var(--border-soft);
+  /*
+   * Not part of the diff. `.body` opts this pane back into text selection because a diff is text
+   * people copy out; a copied hunk with `a1b2c3d Ada Lovelace` glued to the front of every line
+   * is not a patch any more. Both spellings — WebKitGTK 2.52 drops the unprefixed one and
+   * `check:css-prefix` is what keeps the pair together.
+   */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/*
+ * The old side's spacer, in the split layout. Same track, same hairline, no content — see
+ * `cell()`'s `which === 'old'` branch for why the left column is never annotated.
+ */
+.blameGap {
+  align-self: stretch;
+  border-right: 1px solid var(--border-soft);
+}
+
+/*
+ * The age ramp: six steps, older = stronger, matching `blameModel.AGE_BUCKETS`' five boundaries.
+ *
+ * Deliberately the same six percentages over the same `--blue` as the editor's gutter, and the
+ * duplication is the point — a line has one age, and reading it as "a month old" in the editor
+ * and "a year old" in the diff of that same file is the failure a shared token would prevent and
+ * a re-derived ramp would produce. The whole argument for `color-mix()` over `--blue` rather than
+ * six new tokens is written out in `EditorSurface.module.css` and is not repeated here: in short,
+ * `tokens.css` is owned elsewhere, and a mix against a hue that is pitched to read on both
+ * palettes' backgrounds darkens the light theme and lightens the dark one by construction.
+ *
+ * Attribute selectors rather than a class per bucket because the bucket arrives as a number:
+ * `styles[`age${n}`]` on a CSS-Modules default export is an index signature, so a typo compiles
+ * and paints `undefined` — the trap `rowClass` above exists to avoid.
+ */
+.blame[data-age='0'] {
+  background: color-mix(in srgb, var(--blue) 4%, transparent);
+}
+.blame[data-age='1'] {
+  background: color-mix(in srgb, var(--blue) 7%, transparent);
+}
+.blame[data-age='2'] {
+  background: color-mix(in srgb, var(--blue) 11%, transparent);
+}
+.blame[data-age='3'] {
+  background: color-mix(in srgb, var(--blue) 15%, transparent);
+}
+.blame[data-age='4'] {
+  background: color-mix(in srgb, var(--blue) 20%, transparent);
+}
+.blame[data-age='5'] {
+  background: color-mix(in srgb, var(--blue) 26%, transparent);
+}
+
+/*
+ * `blameModel.UNCOMMITTED_BUCKET`, which is not a step on the ramp and is not drawn as one: an
+ * uncommitted line is not "very new", it is *not in history*, and a tint at one end of the age
+ * scale would invite it to be read as a step on that scale. The accent family is what this app
+ * uses for "yours, live, unsaved". Same rule and same colour as the editor's `cm-blame-touched`.
+ *
+ * On the staging arm this is what every unstaged addition looks like, which is the honest answer:
+ * nothing wrote that line yet. On a revision diff the same addition is committed — by the commit
+ * the tab is showing — and gets an age instead.
+ */
+.blame[data-age='-1'] {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .lineno {
@@ -427,7 +587,7 @@
 .count {
   margin-right: auto;
   color: var(--dim);
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
 }
 
 .kind {
@@ -437,7 +597,7 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1;
   padding: 6px 10px;
   border: 1px solid var(--border);

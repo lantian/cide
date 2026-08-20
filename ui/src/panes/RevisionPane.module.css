@@ -1,0 +1,192 @@
+/*
+ * The revision pane's own chrome: the trail above the buffer, the truncation notice, and the
+ * two states that are not a buffer. Everything about the editor itself lives in
+ * `editor/EditorSurface.module.css`.
+ *
+ * Modelled on `EditorPane.module.css` rather than on `GitDiffPane.module.css`, because what
+ * sits below is the same `EditorSurface` and a second set of numbers around one component is
+ * how two panes over one editor come to look like two applications.
+ */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.surface {
+  flex: 1;
+  min-height: 0;
+}
+
+/*
+ * The trail: `working tree ← a1b2c3d ← d4e5f6a` on the left, `⌫ Back` pinned right.
+ *
+ * The right pad is the pane frame's floating ⊞ ⛶ ⧉ × cluster, and it is `--pane-corner-clear`
+ * and not `--pane-corner` — the *sum* of the cluster's inset and its width. That distinction is
+ * not pedantry: an editor pane insets the cluster by the minimap's 96px, so a strip reserving
+ * the width alone leaves 96px of its own content underneath a live control box. That is exactly
+ * how `EditorPane.module.css`'s conflict bar shipped with both of its buttons unclickable, wired
+ * to the mechanism the whole time and passing `check:rows` — see that file, which writes the
+ * failure up at length. `⌫ Back` is the last thing in this row and would land in the same place.
+ *
+ * `RevisionPane.tsx` also marks this bar `data-pane-strip="fluid"`, which is what keeps the
+ * cluster from stepping *down* past a find bar that is no longer the topmost strip. The two go
+ * together: a strip that reserves horizontally must also opt out of the step, or the cluster
+ * moves and the reservation is paying for nothing.
+ */
+.trail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px calc(10px + var(--pane-corner-clear, 0px)) 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--chrome);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11-5);
+  color: var(--dim);
+}
+
+/*
+ * The crumbs scroll rather than wrap. A wrapping trail changes the strip's height, and a strip
+ * whose height changes is one the pane cluster cannot be reasoned about above — the `fluid`
+ * marker keeps the cluster still, but a bar that grows a line still pushes the buffer down under
+ * the user mid-read. A deep walk gets a scrollbar; the `⌫ Back` button never moves.
+ */
+.crumbs {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: thin;
+}
+
+.crumbSlot {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.arrow {
+  padding: 0 6px;
+  color: var(--faint);
+}
+
+/*
+ * Every crumb is a button, because every crumb goes somewhere: `working tree` opens the file as
+ * it is now and each oid re-opens the walk truncated at that point. A `<button>` and not a
+ * styled `<span>` with an `onClick` — this is the pane's only navigation and it has to be
+ * reachable from the keyboard, which is the whole difference between the two elements here.
+ */
+.crumb {
+  flex: none;
+  padding: 2px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.crumb:hover {
+  border-color: var(--border);
+  background: var(--chrome-hi);
+  color: var(--text-hi);
+}
+
+.crumb:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
+ * Where the user is. Lit rather than disabled: clicking it re-activates this very tab, which is
+ * a no-op the user can make without being told off — and a disabled crumb in the middle of a
+ * live trail reads as a broken one. `aria-current="page"` carries the same fact to a reader that
+ * cannot see the colour.
+ */
+.crumbCurrent {
+  color: var(--text-hi);
+  background: var(--chrome-hi);
+  border-color: var(--border);
+}
+
+.back {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--chrome-hi);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11-5);
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.back:hover {
+  border-color: var(--dim);
+  color: var(--text-hi);
+}
+
+.back:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
+ * The second strip, and the reason it is a strip rather than a sentence inside the buffer: the
+ * text below it is real and scrolls, and a notice that scrolls away with the text it is about is
+ * a notice the user reads once and then forgets while they scroll to a bottom that is not the
+ * bottom.
+ *
+ * No `--pane-corner-clear` here. It holds no controls, so nothing of it is unclickable under the
+ * cluster; reserving would only shorten a sentence for no gain. The bar above it is the one with
+ * a button at its right edge.
+ */
+.truncated {
+  flex: none;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--chrome);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-11-5);
+  color: var(--yellow);
+}
+
+.notice {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 0;
+  padding: 16px;
+  background: var(--panel);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-ui-12);
+  color: var(--dim);
+}
+
+.noticeTitle {
+  font-size: var(--fs-ui-13);
+  color: var(--text-hi);
+}
+
+.noticeWhy {
+  max-width: 60ch;
+  line-height: 1.5;
+  color: var(--faint);
+  /* A path or a git message can be long and has no spaces to break on. */
+  overflow-wrap: anywhere;
+}

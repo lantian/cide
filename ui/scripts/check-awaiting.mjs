@@ -472,14 +472,41 @@ try {
      * The 3px floor is what makes it read as a badge rather than as a filled rectangle: it is
      * the gap the reporter could see was missing.
      */
+    /*
+     * All four numbers are read at the *design* chrome size, and the geometry is asserted
+     * there rather than at every size in the band.
+     *
+     * That is sound rather than a shortcut, and only because all four scale by the same
+     * `--ui-scale`: the reserve, the height, the line-height and the glyph. `slack = box −
+     * 1.2 × fontSize` is linear in the scale with no constant term, so a ratio that clears 3px
+     * at 13 clears `3 × scale` at any other size and can never cross zero. The one way to
+     * break that is to leave one of the four unscaled while scaling the others — which is
+     * exactly what the reserve was, and what the `calc()`-aware patterns below now catch,
+     * because an unscaled literal no longer matches them at all.
+     */
     const px = (name, pattern) => {
       const hit = pattern.exec(css)
       if (hit === null) throw new Error(`check:awaiting could not read ${name} from the stylesheet`)
       return Number(hit[1])
     }
-    const reserve = px('--awaiting-w', /--awaiting-w:\s*([\d.]+)px/)
-    const fontSize = px('.awaiting font-size', /\.awaiting\b[^}]*?font-size:\s*([\d.]+)px/s)
-    const height = px('.awaiting height', /\.awaiting\b[^}]*?height:\s*([\d.]+)px/s)
+    const reserve = px('--awaiting-w', /--awaiting-w:\s*calc\(([\d.]+)px \* var\(--ui-scale\)\)/)
+    // The ladder spells a design size with a dash for the decimal point — `--fs-ui-11-5` is
+    // 11.5px at the default — so the name has to be turned back into a number rather than
+    // read as one. `Number('11-5')` is `NaN`, and a `NaN` here makes every comparison below
+    // false, which fails this check with a message about slack rather than about parsing.
+    const fontSize = Number(
+      (/\.awaiting\b[^}]*?font-size:\s*var\(--fs-ui-([\d-]+)\)/s.exec(css)?.[1] ?? '').replace(
+        '-',
+        '.',
+      ),
+    )
+    if (!Number.isFinite(fontSize)) {
+      throw new Error('check:awaiting could not read .awaiting font-size from the stylesheet')
+    }
+    const height = px(
+      '.awaiting height',
+      /\.awaiting\b[^}]*?height:\s*calc\(([\d.]+)px \* var\(--ui-scale\)\)/s,
+    )
     const label = 2 * 0.6 * fontSize
 
     eq(
@@ -495,7 +522,7 @@ try {
       `and vertically too: ${height}px box against a ${fontSize}px glyph`,
     )
     eq(
-      /\.awaiting\b[^}]*?line-height:\s*([\d.]+)px/s.exec(css)?.[1],
+      /\.awaiting\b[^}]*?line-height:\s*calc\(([\d.]+)px \* var\(--ui-scale\)\)/s.exec(css)?.[1],
       String(height),
       'line-height matches the height, or the digit is not centred in the box it was given',
     )

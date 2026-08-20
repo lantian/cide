@@ -33,6 +33,7 @@ pub mod persist;
 pub mod proxy;
 pub mod scratch;
 pub mod toolchain;
+pub mod toolwindow;
 pub mod workspace;
 
 pub use error::{CoreError, Result};

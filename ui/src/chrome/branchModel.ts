@@ -395,12 +395,56 @@ export function refusalOf(error: unknown): Refusal | null {
 export type GitOp = 'checkout' | 'pull'
 
 /**
+ * A list of paths in a sentence: `src/main.rs and src/lib.rs`, `a, b and 4 more`.
+ *
+ * Capped at three, because these go into a one-line notice and a conflict can name forty files.
+ * The overflow says how many rather than truncating with an ellipsis: "and 37 more" is a fact
+ * the user can act on — go and look in a terminal — and `a, b, c…` is not.
+ */
+function anded(items: readonly string[]): string {
+  if (items.length === 0) return ''
+  const shown = items.slice(0, 3)
+  const rest = items.length - shown.length
+  if (rest > 0) return `${shown.join(', ')} and ${rest} more`
+  const last = shown[shown.length - 1] ?? ''
+  return shown.length === 1 ? last : `${shown.slice(0, -1).join(', ')} and ${last}`
+}
+
+/**
+ * A byte count, for the one refusal that has to quote a size.
+ *
+ * `number | bigint` in, because ts-rs maps Rust's `u64` to `bigint` while serde_json puts a
+ * plain JSON number on the wire — so which of the two arrives here depends on whether anything
+ * in the transport ever grows a reviver. Accepting both costs one line and removes a class of
+ * "the limit is 0 bytes" that nobody would think to look for.
+ */
+function bytes(value: unknown): string {
+  const n = typeof value === 'bigint' ? Number(value) : typeof value === 'number' ? value : 0
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
  * A `GitError` as a sentence, for everything the popup does not have a dedicated panel for.
  *
  * Written out per variant rather than falling back to `String(error)` because the wire form
  * is a tagged object: `String({kind: 'noUpstream', …})` is `[object Object]`, which is how a
  * control ends up appearing to do nothing at all. Anything genuinely unrecognised is still
  * shown — with its tag — rather than swallowed.
+ *
+ * # The register, which is a rule rather than a style
+ *
+ * Every arm here says three things in this order: **what happened**, **why**, and **what to do
+ * instead**. The third is the one that is easy to drop and the one users need — cide performs a
+ * deliberately small subset of git, so a good half of these refusals end in "do it in a
+ * terminal", and a refusal that does not say that reads as a bug in cide rather than as a
+ * boundary it chose. `notHead` is the clearest case: *amend is not implemented for older
+ * commits* is a defect report; *amending an older commit is an interactive rebase, which cide
+ * does not do* is a design, and it names the command that does.
+ *
+ * The arms below `notARepository` are the commit actions (M19). They are grouped by the gesture
+ * they belong to rather than sorted, because that is how they are read when one of them fires.
  */
 export function explain(error: unknown, op: GitOp = 'checkout'): string {
   const parsed = wire(error)
@@ -414,6 +458,13 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
     const value = field(parsed, key)
     return typeof value === 'number' ? value : 0
   }
+  /** A path list out of the detail, already filtered to strings. */
+  const paths = (key: string): string[] => {
+    const value = field(parsed, key)
+    return Array.isArray(value) ? value.filter((p): p is string => typeof p === 'string') : []
+  }
+  /** `Reverting` / `Cherry-picking`, from a `ReplayOp` in the detail. */
+  const replaying = (): string => (name('op') === 'revert' ? 'Reverting' : 'Cherry-picking')
 
   switch (parsed.kind) {
     case 'checkoutWouldOverwrite': {
@@ -462,6 +513,79 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
       return `Push failed: ${name('output').trim()}`
     case 'notARepository':
       return `${name('path')} is not inside a git repository`
+
+    // --- amend ------------------------------------------------------------------------------
+    case 'notHead':
+      // Names the commit that *is* the tip, because the usual cause is that the log page went
+      // stale — another window committed, or a `git commit` was typed into a terminal pane —
+      // and "a1b2c3d is not the last commit" without saying which one is leaves the user
+      // staring at a row that looks like the top of the list.
+      return `${name('oid')} is not the last commit — ${name('head')} is. Amending it means rewriting history, which cide does not do — use \`git rebase -i\` in a terminal.`
+
+    // --- revert and cherry-pick ---------------------------------------------------------------
+    case 'replayWouldConflict': {
+      const where = paths('paths')
+      const list = where.length === 0 ? '' : ` in ${anded(where)}`
+      // Names the files, because the next decision — is this worth doing by hand — is entirely
+      // about which files they are. And it says *nothing was changed*: `cide_git::replay` does
+      // the merge in memory and refuses before writing, so the working tree is untouched and a
+      // user who has met git's half-applied cherry-pick will otherwise go looking for one.
+      return `${replaying()} ${name('oid')} would conflict${list}. cide has no conflict-resolution surface, so nothing was changed — do it in a terminal.`
+    }
+    case 'mergeNeedsMainline':
+      // The picker (`chrome/logActions.ts::mainlineChoices`) is what the log actually shows for
+      // this one. This sentence is the fallback for every other caller, and for the case where
+      // the parents did not survive the trip.
+      return `${name('oid')} is a merge, so it has more than one “before”. Reverting it means choosing which parent to keep — git calls that the mainline, and it will not guess.`
+    case 'notAMerge':
+      return `${name('oid')} is not a merge, so there is no mainline to choose. Ask again without one.`
+    case 'emptyReplay':
+      // "Would change nothing" and not "failed": this is the honest description of reverting a
+      // commit whose changes are already undone, and it is a normal thing to try.
+      return `${replaying()} ${name('oid')} would change nothing — the tree already matches. Nothing was committed.`
+
+    // --- tags ---------------------------------------------------------------------------------
+    case 'tagExists':
+      // Names where the existing tag points, because that is what the user needs to decide
+      // whether moving it is safe. The force path is `chrome/logActions.ts::forceTagConfirm`.
+      return `A tag named ${name('name')} already exists and points at ${name('oid')}. Move it, or pick another name.`
+    case 'invalidTagName':
+      // Same shape as `invalidBranchName` above, with the extra characters git rejects in a
+      // refname spelled out — a tag called `v1.2^` fails for a reason nothing on screen says.
+      return `${name('name') === '' ? 'A tag name' : name('name')} is not a valid tag name — no spaces, no “..”, no trailing “.lock”, and none of \` ~ ^ : ? * [ \``
+
+    // --- resolving what the user pointed at -----------------------------------------------------
+    case 'noSuchCommit':
+      return `There is no commit ${name('rev')} in this repository — it may have been rewritten or garbage-collected since this page was drawn.`
+    case 'noSuchRevision':
+      return `Nothing in this repository is named ${name('rev')} — the branch, tag or commit it pointed at is gone.`
+    case 'badRevspec':
+      // git's own parser message is carried through: it is specific ("unknown revision or path
+      // not in the working tree") in a way nothing written here could be, and the user typed
+      // the spec so they can act on it.
+      return `${name('spec')} is not something git can resolve: ${name('detail')}`
+    case 'notACommit':
+      // `kind` is git's object kind — `tree`, `blob`, `tag`. Naming it is the difference between
+      // "that did not work" and "you pointed at a file".
+      return `${name('spec')} resolves to a ${name('kind')}, not a commit. Only a commit can be shown here.`
+    case 'ambiguousRev':
+      return `${name('spec')} matches more than one object in this repository — type a few more characters of the oid.`
+
+    // --- file history and blame ------------------------------------------------------------------
+    case 'notTracked':
+      return `${name('path')} is not tracked by git, so it has no history yet — commit it first.`
+    case 'fileTooLarge':
+      // Both numbers. "Too large" without a limit is a refusal the user cannot plan around, and
+      // the limit is a constant in `cide-git` that nothing else on screen states.
+      return `${name('path')} is ${bytes(field(parsed, 'bytes'))}, past the ${bytes(field(parsed, 'limit'))} cide will read into a diff — open it in a terminal.`
+
+    // --- paging ------------------------------------------------------------------------------------
+    case 'staleLogCursor':
+      // Carries no detail on the wire, and needs none: the whole content of this error is "the
+      // history moved under the page you were reading". The action is a refresh, and saying so
+      // is the difference between an error and an instruction.
+      return 'The log moved while that page was loading. Refresh it and try again.'
+
     case 'io':
     case 'git':
       return name('detail')

@@ -2255,6 +2255,14 @@ export const claudeSend = {
    *
    * Rejects on purpose when nothing at all could receive. Call it as `void claudeSend.lines(…)`
    * and let `Failures` explain.
+   *
+   * # `exact` turns the preference into an address
+   *
+   * Pass it when the *user* named the pane — the code menu's `2: git-details` rows — rather than
+   * when the app guessed one. Rust then tries that pane and only that pane, and a pane with no
+   * connected `claude` is a rejection instead of a reroute. The fallback exists because ⌥⏎ has
+   * to guess; a stated choice is not a guess, and quietly delivering it elsewhere would answer a
+   * question nobody asked. `result.fallback` can never be true for an `exact` send.
    */
   lines: (
     projectId: ProjectId,
@@ -2263,6 +2271,7 @@ export const claudeSend = {
     text: string,
     lineStart?: number,
     lineEnd?: number,
+    exact = false,
   ) =>
     invoke<ClaudeSendTarget>('claude_send_lines', {
       project: projectId,
@@ -2271,7 +2280,23 @@ export const claudeSend = {
       text,
       lineStart: lineStart ?? null,
       lineEnd: lineEnd ?? null,
+      exact,
     }),
+
+  /**
+   * What the user has called each running conversation — `/rename`'s name, by session id.
+   *
+   * Keyed by the id cide addresses a session under, so a pane is looked up as
+   * `names[pane.conversation ?? pane.session]`. A conversation nobody has named is **absent**
+   * rather than empty, which is what lets the caller fall back to the pane's own title without
+   * having to guess whether `''` was meant.
+   *
+   * Resolves to `{}` rather than rejecting when there is nothing to read — no `~/.claude`, a
+   * relocated `CLAUDE_CONFIG_DIR`, a machine where `claude` has never run. Every one of those
+   * costs a menu row its label and nothing else, so none of them is a failure worth a toast.
+   * See `cmd::file::claude_session_names`, and `editor/claudeNames.ts` for when it is called.
+   */
+  names: () => invoke<Record<string, string>>('claude_session_names', {}),
 }
 
 // Appended here rather than reached into the import list at the top of the file, for the reason
@@ -2496,4 +2521,994 @@ export const sendFocus = {
 export const claudeSession = {
   resumable: (cwd: string, id: SessionId) =>
     invoke<boolean>('session_resumable', { cwd, session: id }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * The git tool window's own state — open, height, which tabs. (M18)
+ *
+ * Appended as its own block, with its own `import type` inside it, per this file's append-only
+ * rule: the import header at the top is the exact hunk that has conflicted every round.
+ *
+ * A namespace of its own rather than fields on `git` above, and the seam is real rather than
+ * bureaucratic. Everything on `git` takes a `RepoId` and answers with a `ChangesTree`, because
+ * every one of those calls moves a tri-state checkbox in the commit panel. Nothing here touches a
+ * repository at all: these four move a strip of chrome, and they answer with nothing, because the
+ * result arrives the way every other workspace mutation does — as a `cide://workspace-changed`
+ * snapshot that `store/workspace.ts` mirrors. The only thing the two share is the word "git" in
+ * the feature's name.
+ *
+ * **Fire-and-forget from a drag, deliberately.** `setLayout` is called once on `pointerup`, never
+ * during the gesture: the splitter writes `--h-toolwindow` on `<html>` and commits when the
+ * pointer is released, because routing pointer moves through the store would re-render `App` —
+ * the tab strip, the pane tree, every `PaneSlot` — on every move, and each `PaneSlot` resize calls
+ * `fit()`, which reflows xterm and sends a SIGWINCH to a live `claude`. That argument is
+ * `SidebarSplitter.tsx`'s, and it is stronger here: this splitter changes every pane's *rows*.
+ * --------------------------------------------------------------------------------------- */
+import type { HistoryTabId } from './generated'
+
+export const toolWindow = {
+  /**
+   * Geometry and visibility. Every argument is optional so one gesture writes one thing.
+   *
+   * `height` is CSS pixels and `logSplit` is per mille (0–1000); Rust clamps both where the patch
+   * lands, so a value out of band is corrected once in the stored document rather than being
+   * re-corrected on every read. A call that changes nothing does not bump `rev` and broadcasts
+   * nothing, which is what lets a splitter commit unconditionally on `pointerup` without
+   * flooding every window for a drag that ended where it started.
+   */
+  setLayout: (
+    project: ProjectId,
+    layout: { open?: boolean; height?: number; logSplit?: number; filesAsTree?: boolean },
+  ) =>
+    invoke<void>('tool_window_set_layout', {
+      project,
+      open: layout.open ?? null,
+      height: layout.height ?? null,
+      logSplit: layout.logSplit ?? null,
+      // `?? null` and not `?? true`: omitting the key means *do not touch it*, and the field's
+      // own default is `true`. Defaulting here would make every height commit also assert a
+      // grouping, so dragging the divider would silently undo the toggle.
+      filesAsTree: layout.filesAsTree ?? null,
+    }),
+
+  /** Bring a tab to the front, revealing the panel. `null` is the Log tab, which always exists. */
+  activate: (project: ProjectId, tab: HistoryTabId | null) =>
+    invoke<void>('tool_window_activate', { project, tab }),
+
+  /**
+   * Show a file's history, keyed on the repository and the **repo-relative** path.
+   *
+   * Open-or-activate: a file whose history is already up re-activates that tab and answers with
+   * the id it already had. Four menus reach this for the same file often — the tab strip, the file
+   * tree, the git changes tree and the editor's own menu — and three right-clicks must not give
+   * three identical tabs. The id is minted in Rust, so a webview cannot hand in one that collides
+   * with a tab it cannot see.
+   */
+  openHistory: (project: ProjectId, repo: RepoId, path: string) =>
+    invoke<HistoryTabId>('tool_window_open_history', { project, repo, path }),
+
+  /** Close one history tab. The Log tab has no id and cannot be closed. */
+  closeHistory: (project: ProjectId, tab: HistoryTabId) =>
+    invoke<void>('tool_window_close_history', { project, tab }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Reading history: where a path lives, and who wrote each line. (M18)
+ *
+ * Its own block at the end of the file, with its own `import type`, per the append-only rule.
+ * Separate from `git` above because that namespace is the *commit tool window*'s surface — every
+ * one of its calls takes a `RepoId` and answers with a `ChangesTree`, because every one of them
+ * moves a tri-state checkbox. Nothing here mutates anything: this is the read-only half of the
+ * repository, and the only part of the git surface that answers about commits rather than about
+ * the working tree.
+ *
+ * None of these swallows its rejection. A `GitError` is `{kind, detail}`, so a caller that
+ * catches and prints gets `[object Object]`; `chrome/branchModel.ts::explain` is the sentence and
+ * `chrome/Failures.tsx` is the surface. That is the bug `check:branches` exists for.
+ * --------------------------------------------------------------------------------------- */
+import type { BlameFile, BlameParent, BlameRequest, RepoPath } from './generated'
+
+/** The default blame: libgit2's own, which follows whole-file renames and cannot be told not to. */
+export const BLAME_DEFAULT: BlameRequest = {
+  follow: 'renames',
+  ignoreWhitespace: false,
+  firstParent: false,
+  newest: null,
+}
+
+export const history = {
+  /**
+   * Which repository an absolute path belongs to, and its path inside it.
+   *
+   * `null` is an answer, not a failure: a scratch file, a dependency source opened by
+   * go-to-definition, or a tab from another project is in none of this project's repositories,
+   * and the caller's job is then to say so rather than to report an error.
+   *
+   * Asked over IPC rather than derived from `RepoInfo.root` in TypeScript, because `canonical`
+   * resolves symlinks and the webview cannot: a symlinked root compares unequal to the work tree
+   * it is actually inside, so a prefix test here is correct until the first symlinked checkout
+   * and silently wrong after it. The innermost repository wins, so a file in a submodule
+   * resolves to the submodule.
+   */
+  locate: (project: ProjectId, path: string) =>
+    invoke<RepoPath | null>('git_locate', { project, path }),
+
+  /**
+   * Annotate one file.
+   *
+   * `contents` is the editor's buffer and is sent **only when the tab is dirty** — passing it
+   * costs a copy of the file over the wire, and omitting it on a dirty tab attributes every line
+   * after an unsaved insertion to the wrong commit, which in a gutter beside live text is a
+   * per-line falsehood rather than a stale view. `null` lets Rust read the file it can already
+   * see.
+   */
+  blame: (
+    project: ProjectId,
+    repo: RepoId,
+    path: string,
+    contents: string | null = null,
+    request: BlameRequest = BLAME_DEFAULT,
+  ) => invoke<BlameFile>('git_blame', { project, repo, path, contents, request }),
+
+  /** The parent of `rev` as it touched `path`. `null` is the end of the walk, not a failure. */
+  blameParent: (project: ProjectId, repo: RepoId, path: string, rev: string) =>
+    invoke<BlameParent | null>('git_blame_parent', { project, repo, path, rev }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * The task tracker: `.cide/tasks.json`, and the event that says it moved. (M18)
+ *
+ * Its own contiguous block at the foot of the file with its own `import type`, per the
+ * append-only house rule — and the listener is its own exported object rather than a member of
+ * `events` for the reason stated on `onSessionAwaiting`: appending cannot reach inside an
+ * object literal that was closed hundreds of lines ago, so a new event either sits beside
+ * `events` or the rule breaks. `fsEvents` is the precedent.
+ *
+ * `tasks` and not `task`, and deliberately not folded into `claudeTasks` above — that
+ * namespace is the *headless one-shot* surface (`claude -p`), which shares nothing with this
+ * but four letters.
+ *
+ * **Every mutation answers with the whole board**, which is `git`'s argument in this file
+ * restated: a call answering `{ok: true}` would be followed at once by a second asking what
+ * happened, and the frame in between shows a list that is visibly wrong. It also means a
+ * mutation needs no `hydrate()` follow-up and no wait for the broadcast to come back round.
+ * --------------------------------------------------------------------------------------- */
+import type { TaskBoard, TaskEdit, TaskId, TaskNew } from './generated'
+
+export const tasks = {
+  /**
+   * The board as it stands, or `null` in a build whose backend has no such handler.
+   *
+   * **Through `pendingCommand`, and that is not defensive habit.** This is called from a render
+   * effect (`tasksStore.attach`, which `App.tsx` runs on every project switch). Tauri answers an
+   * unregistered command with a *rejected promise*, an unhandled rejection out of an effect
+   * unmounts the whole tree under React 19, and the user's window goes blank — not the sidebar,
+   * the window. `useDiagnostics.refresh` is wired exactly this way and for exactly this reason.
+   *
+   * `null` is therefore "this build cannot answer", which the store turns into `BOARD_UNKNOWN`
+   * — *nobody has looked* — and never into `absent`, which is a claim about the user's project
+   * that nothing checked.
+   */
+  board: (project: ProjectId) =>
+    pendingCommand('tasks_board', () => invoke<TaskBoard>('tasks_board', { project }), null),
+
+  /*
+   * The three mutations are **not** wrapped, and the asymmetry is the design.
+   *
+   * They are user gestures — a click on New task, a status segment, a comment — and a gesture
+   * that silently does nothing is the failure this project has paid for repeatedly. A rejection
+   * here reaches the caller, which is where it can be shown; swallowing it would leave the panel
+   * painting the pre-click board with no way for anyone to find out why.
+   */
+
+  /** Create a task, and with it `.cide/tasks.json` if the project has none. */
+  create: (req: TaskNew) => invoke<TaskBoard>('task_new', { req }),
+
+  /** One mutation of one task. `TaskEdit` is an enum, not a patch — see its Rust doc. */
+  edit: (project: ProjectId, task: TaskId, edit: TaskEdit) =>
+    invoke<TaskBoard>('task_edit', { project, task, edit }),
+
+  remove: (project: ProjectId, task: TaskId) => invoke<TaskBoard>('task_delete', { project, task }),
+}
+
+/**
+ * The tracker changed — for anyone: this window, another window, or an agent through the
+ * orchestration MCP server.
+ *
+ * Carries the **whole board plus a `rev`**, which is `workspace_changed`'s arrangement and it
+ * is here for `workspace_changed`'s reason: `.cide/tasks.json` genuinely has several writers, so
+ * two snapshots can arrive out of order and a receiver that painted the last one to land would
+ * show a board behind the click that changed it. `TasksPanel/model.ts`'s `newerBoard` is the
+ * drop rule; the `rev` on the envelope duplicates the one inside a `ready` board, and the store
+ * reads the board's own.
+ *
+ * A standalone object rather than a member of `events`, per the block header.
+ */
+export const taskEvents = {
+  onChanged: (handler: (project: ProjectId, board: TaskBoard, rev: bigint) => void) =>
+    listen<{ project: ProjectId; rev: bigint; board: TaskBoard }>('cide://tasks-changed', (e) =>
+      handler(e.payload.project, e.payload.board, e.payload.rev),
+    ),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * The commit log, one commit's contents, and diffs between revisions. (M18)
+ *
+ * Appended as its own block with its own `import type`, per the append-only rule at the top of
+ * this file.
+ *
+ * `page` is one command for both the Log tab and a per-file History tab, because the two differ
+ * by exactly one field of the query — `path`. Keeping them one call is what stops the two lists
+ * drifting into two answers for "which commits touched this".
+ * --------------------------------------------------------------------------------------- */
+import type {
+  CommitDetail,
+  CommitLineCounts,
+  CommitPage,
+  LogQuery,
+  LogScope,
+  ResolvedRev,
+  RevSide,
+  RevisionBlob,
+  RevisionDiff,
+  RevisionRange,
+} from './generated'
+
+/**
+ * A query over one repository's HEAD, newest first, with no filters.
+ *
+ * Spread and overridden rather than built field by field at each call site: `LogQuery` has
+ * thirteen fields and `deny_unknown_fields` on the Rust side, so a caller that forgets one gets a
+ * deserialisation failure rather than a default. One place to add the fourteenth.
+ */
+export function logQuery(scope: LogScope, over: Partial<LogQuery> = {}): LogQuery {
+  return {
+    scope,
+    refs: { kind: 'head' },
+    cursor: { kind: 'newest' },
+    path: null,
+    follow: false,
+    simplify: 'default',
+    firstParent: false,
+    author: null,
+    text: null,
+    // Zero asks Rust for its own default rather than pinning one here: `log::LIMIT_DEFAULT` and
+    // `SCAN_DEFAULT` are the authority, and a second copy on this side would be the one that
+    // goes stale.
+    limit: 0,
+    scanLimit: 0,
+    graph: true,
+    graphLanes: 16,
+    ...over,
+  }
+}
+
+export const gitLog = {
+  /* `page` lived here until the walk became cancellable and needed the tool tab it belongs to.
+   * It is `logWalk.page` now, at the foot of this file — one call, not two wrapping one command,
+   * because `git_log` grew a required argument and a second entry point without it could only
+   * ever send `undefined`. Its doc comment moved with it. */
+
+  /** One commit's message and changed files. `parent` picks which parent a merge diffs against. */
+  detail: (project: ProjectId, repo: RepoId, rev: string, parent: number | null = null) =>
+    invoke<CommitDetail>('git_commit_detail', { project, repo, rev, parent }),
+
+  /** The `+`/`-` counts a capped detail left uncounted. See `show::MAX_COUNT_FILES`. */
+  lineCounts: (
+    project: ProjectId,
+    repo: RepoId,
+    rev: string,
+    paths: string[],
+    parent: number | null = null,
+  ) => invoke<CommitLineCounts>('git_commit_line_counts', { project, repo, rev, parent, paths }),
+
+  /** One file's diff between two revisions. */
+  diff: (project: ProjectId, repo: RepoId, path: string, next: RevSide, prev: RevSide) =>
+    invoke<RevisionDiff>('git_diff_revision', { project, repo, path, new: next, old: prev }),
+
+  /** The changed-file list for an arbitrary pair. Not a `ChangesTree` — see the command. */
+  diffFiles: (project: ProjectId, repo: RepoId, next: RevSide, prev: RevSide) =>
+    invoke<RevisionRange>('git_diff_revision_files', { project, repo, new: next, old: prev }),
+
+  /** One file's bytes as one commit left them. */
+  fileAt: (project: ProjectId, repo: RepoId, path: string, rev: string) =>
+    invoke<RevisionBlob>('git_file_at_revision', { project, repo, path, rev }),
+
+  /**
+   * Resolve anything `git rev-parse` accepts.
+   *
+   * Called before a name is persisted into a tab, so the tab stores the oid it resolved to: a
+   * tab holding `main` would name a different tree tomorrow, which is exactly the staleness
+   * `DiffSpec` refuses to carry.
+   */
+  resolve: (project: ProjectId, repo: RepoId, spec: string) =>
+    invoke<ResolvedRev>('git_resolve_rev', { project, repo, spec }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Subagents: the roster, the per-project switch, and the event that says either moved. (M18)
+ *
+ * Its own contiguous block at the foot of the file with its own `import type`, per the
+ * append-only house rule — and the listener is its own exported object rather than a member of
+ * `events`, for the reason stated on `onSessionAwaiting`: appending cannot reach inside an
+ * object literal that was closed a thousand lines ago, so a new event either sits beside
+ * `events` or the rule breaks. `taskEvents` directly above is the precedent this mirrors.
+ *
+ * `agents` and not `agent`, and deliberately not folded into `session` above: a run *is* a
+ * session once it has a child, but this namespace is about the roles a project defines and the
+ * switch that lets any of them start, which is a per-project file rather than a process.
+ * --------------------------------------------------------------------------------------- */
+import type { AgentRoster, OrchestrationConfig, OrchestrationPatch } from './generated'
+
+export const agents = {
+  /**
+   * What cide knows about this project's subagents, or `null` in a build with no such handler.
+   *
+   * **Through `pendingCommand`, and that is not defensive habit** — it is the same reason
+   * `tasks.board` gives one block up. This is called from a render effect (`agentsStore.attach`,
+   * which `App.tsx` runs on every project switch). Tauri answers an unregistered command with a
+   * *rejected* promise naming it, an unhandled rejection out of an effect unmounts the whole
+   * tree under React 19, and what the user gets is a blank window rather than a blank sidebar.
+   *
+   * `null` is therefore "this build cannot answer", which the store turns into `ROSTER_UNKNOWN`
+   * — *nobody has looked* — and never into `disabled`, which is a claim about the user's project
+   * that nothing checked, printed above a button that commits a file.
+   */
+  roster: (project: ProjectId) =>
+    pendingCommand('agents_roster', () => invoke<AgentRoster>('agents_roster', { project }), null),
+
+  /** The project's `.cide/config.json`, defaults and all. `null` for `roster`'s reason. */
+  config: (project: ProjectId) =>
+    pendingCommand(
+      'agents_config_get',
+      () => invoke<OrchestrationConfig>('agents_config_get', { project }),
+      null,
+    ),
+
+  /**
+   * Write a patch into `.cide/config.json`, creating it. Answers the config as it now stands.
+   *
+   * **Awaited by the caller and deliberately not wrapped**, which is the exact opposite of how
+   * `settings.set` a few hundred lines up is called: every caller of that one spells it
+   * `void settingsApi.set(patch).catch(() => {})`, and it can afford to, because a
+   * `cide://workspace-changed` snapshot follows every settings write — a switch whose write
+   * failed flicks back on its own, one round trip later, with no code needed to make it. There
+   * is no such snapshot for a per-project file, so nothing in the window would ever contradict
+   * a write that did not happen.
+   *
+   * It also writes a **tracked file into the user's repository** — the one gesture in this
+   * feature that changes what their next commit contains — so a silent failure here is a user
+   * pressing *Enable subagents* and being told nothing at all. The rejection reaches the store,
+   * which reaches `notifyFailure`.
+   */
+  setConfig: (project: ProjectId, patch: OrchestrationPatch) =>
+    invoke<OrchestrationConfig>('agents_config_set', { project, patch }),
+}
+
+/**
+ * The roster moved — a role file was edited, a run started, a phase changed, the switch flipped.
+ *
+ * Carries the **whole roster** and, unlike `cide://tasks-changed`, **no `rev`** — and it needs
+ * none. The registry is one in-process writer behind one lock, so emits leave in the order the
+ * state took, and the last one to arrive is by construction the newest. `.cide/tasks.json` has
+ * several writers (two windows, and every agent through the MCP server), which is why that
+ * board carries a counter and `newerBoard` drops what is not strictly newer; there is nothing
+ * here for such a rule to compare.
+ *
+ * Because the payload is whole, the store `adopt`s it rather than scheduling a re-ask:
+ * answering an event that just told you the answer with a round trip asking for it is a
+ * question with a known answer. `cide://diagnostics` is a *hint* and coalesces for that reason;
+ * this is not one.
+ *
+ * A standalone object rather than a member of `events`, per the block header.
+ */
+export const agentEvents = {
+  onChanged: (handler: (project: ProjectId, roster: AgentRoster) => void) =>
+    listen<{ project: ProjectId; roster: AgentRoster }>('cide://agents-changed', (e) =>
+      handler(e.payload.project, e.payload.roster),
+    ),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Opening a historical diff as a tab. (M18)
+ *
+ * Its own block at the end, per the append-only rule.
+ *
+ * Separate from `gitDiff` above — which opens a *working-tree* diff — because the two live in
+ * different preview slots and must not share one. The git changes tree and the log's changed-file
+ * list are on screen at the same time, so a single slot would mean clicking a file in the log
+ * throwing away the working diff the user was staging from: the mirror image of the thirty-tab
+ * report `tab_retarget_diff` was written to fix. `cide_core::workspace::PreviewSlot` derives which
+ * slot a tab is in from its origin, and `retarget_diff` refuses to move a tab across families —
+ * re-pointing a working diff at a revision would put a Stage button over a diff of two commits.
+ * --------------------------------------------------------------------------------------- */
+import type { RevSide as RevSideArg } from './generated'
+
+export const revisionDiff = {
+  /**
+   * Double-click in a commit's changed-file list: a **kept** tab, titled `main.rs @ a1b2c3d`.
+   *
+   * Keyed on all four of `(repo, path, new, old)`, unlike `gitDiff.openTab`, which deliberately
+   * omits the side. A working-tree tab *switches sides in place*, so the side is a mode of one
+   * tab; a revision pair **is** the tab's identity, and two comparisons of one file are two
+   * different documents.
+   */
+  openTab: (
+    project: ProjectId,
+    repo: RepoId,
+    path: string,
+    next: RevSideArg,
+    prev: RevSideArg,
+    oldPath: string | null = null,
+  ) =>
+    invoke<TabId>('tab_open_revision_diff', {
+      project,
+      repo,
+      path,
+      new: next,
+      old: prev,
+      oldPath,
+    }),
+
+  /** Single click while a revision diff is already up: reuse the revision preview slot. */
+  retargetTab: (
+    project: ProjectId,
+    repo: RepoId,
+    path: string,
+    next: RevSideArg,
+    prev: RevSideArg,
+    oldPath: string | null = null,
+  ) =>
+    invoke<TabId>('tab_retarget_revision_diff', {
+      project,
+      repo,
+      path,
+      new: next,
+      old: prev,
+      oldPath,
+    }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * The commit actions: revert, cherry-pick, reset, tag, and checking out a commit. (M18)
+ *
+ * One appended block at the very end with its own `import type`, per the append-only rule
+ * stated four times at the top of this file — it has conflicted in five consecutive rounds.
+ *
+ * # Why a namespace of its own and not fields on `git`
+ *
+ * Everything in `git` answers with a `ChangesTree`, because every one of those calls moves a
+ * tri-state checkbox in the commit panel and a caller that got `{ok: true}` would have to ask
+ * a second time — with a visibly wrong tree on screen in between. **These answer with an
+ * outcome instead**: the interesting result of a reset is *what it dropped*, of a replay
+ * *which commit it made*, of a tag *whether it moved one that already existed*, and none of
+ * that survives being flattened into a status walk. The panel is not left stale — Rust
+ * broadcasts `cide://git-status` after each of the five mutating ones, which is the channel
+ * the panel, the file tree and the activity rail's badge already listen on. So the two
+ * namespaces are two different questions, and mixing them would make the return type of a
+ * `git.*` call something a caller has to look up.
+ *
+ * `resetPreview` is the exception that proves it: a read, no broadcast, and its own call
+ * rather than a field of the request, because the dialog's Hard row says *"DISCARD 3 changed
+ * files"* and has to **name all three** before the user commits to anything.
+ *
+ * # Nothing here may swallow a rejection
+ *
+ * A `GitError` is `{kind, detail}` with no `message`, so `String(error)` is `[object Object]`
+ * and `error.message` is `undefined` — which is how an action that refused for a good, stated
+ * reason ends up looking like a button wired to nothing. That is the bug `check:branches`
+ * exists for. `chrome/branchModel.ts::explain` turns the tagged object into the sentence
+ * (`replayWouldConflict` names the paths, `tagExists` names where the tag points *now*,
+ * `mergeNeedsMainline` is the question the dialog has to ask), and `chrome/Failures.tsx` is
+ * the surface. Every caller either catches and `explain`s, or rethrows an `Error` carrying
+ * that sentence so the one `unhandledrejection` listener reports it.
+ *
+ * `ProjectId`, `RepoId` and `CheckoutMode` are already in scope from the blocks above — ES
+ * imports are module-wide — so only the types new to this block are imported here.
+ * --------------------------------------------------------------------------------------- */
+import type {
+  DetachOutcome,
+  ReplayOutcome,
+  ReplayRequest,
+  ResetOutcome,
+  ResetPreview,
+  ResetRequest,
+  TagOutcome,
+  TagRequest,
+} from './generated'
+
+export const commitActions = {
+  /**
+   * Apply a commit's patch **inverted** onto HEAD — the log's *Revert*.
+   *
+   * Not the Git panel's *Rollback*, which throws uncommitted work away. `request.mode` chooses
+   * between committing straight away and leaving the inverse in the working tree for the user
+   * to read first, which is IDEA's default and the safer one for a revert.
+   *
+   * `request.mainline` is required for a merge and refused for anything else, and it is
+   * deliberately not defaulted: *revert this merge* without saying which side to keep reverts
+   * either an entire feature branch or none of it, with no way to tell which you got until you
+   * read the diff. The refusal (`mergeNeedsMainline`) carries the parents, so the dialog can ask.
+   */
+  revert: (project: ProjectId, repo: RepoId, request: ReplayRequest) =>
+    invoke<ReplayOutcome>('git_revert', { project, repo, request }),
+
+  /**
+   * Apply a commit's patch **as it stands** onto HEAD — the log's *Cherry-pick*.
+   *
+   * Its own call rather than an op argument shared with `revert`, even though Rust runs both
+   * through one implementation: a caller that passed the wrong enum would revert where it meant
+   * to cherry-pick, and there is no undo for that.
+   */
+  cherryPick: (project: ProjectId, repo: RepoId, request: ReplayRequest) =>
+    invoke<ReplayOutcome>('git_cherry_pick', { project, repo, request }),
+
+  /**
+   * What each kind of reset would discard. **Touches nothing, and broadcasts nothing.**
+   *
+   * Call this before opening the confirmation, not while closing it. It carries the dropped
+   * commits (capped in Rust at ten, with `moreDropped` for the rest), the `staged` list a Mixed
+   * reset costs, the `dirty` list a Hard one destroys, `commitsGained` so a reset *forward* is
+   * described as what it is, and `useStagingArea` — which is what makes a mixed reset cost a
+   * hand-built `git add -p` selection rather than a derived index.
+   *
+   * `target` is a full oid from a log row. It is the only member here that takes a bare string
+   * rather than a request object, because it is the only one with nothing else to decide.
+   */
+  resetPreview: (project: ProjectId, repo: RepoId, target: string) =>
+    invoke<ResetPreview>('git_reset_preview', { project, repo, target }),
+
+  /**
+   * Move HEAD — and, per `request.kind`, the index and the working tree.
+   *
+   * **`hard` destroys uncommitted work and Rust will not ask.** `request.shelveFirst` is the
+   * offer that belongs beside the red button: name a shelf and the working tree is captured
+   * into it *before* the reset, with the whole `ShelfEntry` coming back on the outcome so the
+   * toast can offer *Unshelve* without a second round trip.
+   *
+   * `force` is the second click, after a dialog has listed what is at stake: it proceeds past
+   * the external-staging guard (which fires for `mixed` and `hard` and not for `soft`) and past
+   * a dirty tree. It does **not** proceed past a rebase or merge in progress, and no flag does.
+   */
+  reset: (project: ProjectId, repo: RepoId, request: ResetRequest) =>
+    invoke<ResetOutcome>('git_reset', { project, repo, request }),
+
+  /**
+   * Create — or, with `request.force`, move — a tag.
+   *
+   * `request.message` is `null` for a lightweight tag and a string for an annotated one. Which
+   * field is present *is* the choice, so the two cannot disagree; it is not cosmetic, because
+   * `git describe` and most release tooling ignore lightweight tags.
+   *
+   * Rejects with `tagExists`, which carries **where that tag points now** and not merely that
+   * the name is taken — that oid is the whole of the question the user is being asked, and
+   * `force` is what they send back after reading it. Pushing the tag is not part of this, on
+   * purpose: a `git push refs/tags/<name>` is not undoable by the person who ran it.
+   */
+  tag: (project: ProjectId, repo: RepoId, request: TagRequest) =>
+    invoke<TagOutcome>('git_tag_create', { project, repo, request }),
+
+  /**
+   * Check out a commit, which necessarily detaches HEAD.
+   *
+   * Separate from `branch.checkout` and answering a `DetachOutcome`, because `CheckoutOutcome`'s
+   * `branch` field is *the branch you are now on* and `branchModel.checkoutNote` puts it
+   * straight into "Switched to {branch}" — a short oid there reads as a branch name, and a
+   * detached HEAD mistaken for a branch is how a day's commits end up on no ref. What comes
+   * back instead carries `previous`: the way back, which is the thing a detached user least
+   * often works out for themselves and the one the toast should offer.
+   *
+   * `mode` is `'refuse'` on the first attempt, always — the same three-state answer a branch
+   * switch takes. The rejection carries the paths in the way; `'stash'` and `'stashAndRestore'`
+   * are what the user's answer to that sends back.
+   */
+  checkoutDetached: (
+    project: ProjectId,
+    repo: RepoId,
+    revision: string,
+    mode: CheckoutMode = 'refuse',
+  ) => invoke<DetachOutcome>('git_checkout_detached', { project, repo, revision, mode }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Running a subagent: dispatch, stop, pause, resume, and open one into a pane. (M18)
+ *
+ * Its own contiguous block at the foot of the file with its own `import type`, per the
+ * append-only house rule stated at the top — appending cannot reach inside the `agents` object
+ * literal several hundred lines above, and that literal is the exact hunk that conflicts when
+ * two rounds land in the same week.
+ *
+ * # Why a second namespace rather than three more fields on `agents`
+ *
+ * `agents` answers questions about **files in the project**: the roster derived from
+ * `.cide/agents/*.md`, and the switch in `.cide/config.json`. These act on the **run
+ * registry** — a process-global thing that outlives the panel, the window and the project tab
+ * — and `cmd/agents.rs` splits its own ten commands along exactly that line. Keeping the two
+ * apart on this side means the answer to "does this call touch the user's repository" is
+ * visible at the call site.
+ *
+ * # None of them goes through `pendingCommand`, and that is the design
+ *
+ * `agents.roster` and `agents.config` are wrapped because they are called from a render effect,
+ * where a rejected promise unmounts the tree under React 19. These are **user gestures** — a
+ * click on Dispatch, on ⏹, on ⏸, on ▶, on Open, on *Retry turn* — and a gesture that silently
+ * does nothing is the failure this project has paid for most often. `tasks.create`/`edit`/
+ * `remove` state the same asymmetry one block up. The rejection reaches `agentsStore`, which
+ * reaches `notifyFailure`.
+ * --------------------------------------------------------------------------------------- */
+import type { DispatchRequest, RunId } from './generated'
+
+export const agentRuns = {
+  /**
+   * Put a run on its role's queue, and answer the id it was given.
+   *
+   * **It returns as soon as the run is enqueued and does not wait for it** — not even for the
+   * spawn, let alone the turn. That is `cmd::agents::agents_dispatch`'s stated rule and it is
+   * this application's `openDiff` invariant restated: a dispatch is reachable from inside the
+   * orchestrator's own turn, so a call that waited would let one subagent stuck in a permission
+   * prompt freeze the session that dispatched it.
+   *
+   * The consequence for the panel is that **there is nothing here to hang a spinner on**. The
+   * resolved promise means "the queue has it", which is a fact already on screen one
+   * `cide://agents-changed` later as a Queued row; a progress indicator tied to this call would
+   * finish while the run had not started, which is a worse lie than no indicator at all.
+   *
+   * `request.task` is optional on the wire and the panel nonetheless always fills it — see
+   * `DispatchRequest::task`'s Rust doc: a run with no task is a run the Tasks panel cannot
+   * account for.
+   */
+  dispatch: (request: DispatchRequest) => invoke<RunId>('agents_dispatch', { request }),
+
+  /**
+   * End a run: cancel it if it is still queued, kill its child if it has one.
+   *
+   * Answers nothing, unlike every mutation in `tasks` — there is no roster to hand back,
+   * because a stop is not the only writer of one: the registry broadcasts
+   * `cide://agents-changed` when the state actually takes, which is after the child has died
+   * rather than when the request was accepted. A roster returned from here would be the one
+   * from *before* the kill landed.
+   */
+  stop: (project: ProjectId, run: RunId) => invoke<void>('agents_stop', { project, run }),
+
+  /**
+   * Close this project's dispatch queue and freeze its children — or freeze one run.
+   *
+   * # One command with a nullable `run`, not two named ones
+   *
+   * `run` omitted (or `null`) is the **project scope**: the queue is shut *and* every live run
+   * is frozen, along with the project's own console session. A run id freezes that one child.
+   * They are one command because the two scopes share a queue, a signal ladder and a refusal
+   * path, and splitting them would put two implementations of one refusal on the wire —
+   * `cmd::agents::agents_pause` makes the argument in full, and `agents_stop` already makes the
+   * same one about covering a queued run and a live one.
+   *
+   * The consequence the caller has to know about: **the project scope freezes the pane the user
+   * is typing in.** Resume therefore has to be reachable from somewhere that is not that pane —
+   * the Agents panel, and the `agents.resume` palette row — or the user has frozen their own
+   * console with no way back. See `AgentRegistry::pause`.
+   *
+   * `null` is sent explicitly rather than omitted, because serde's `Option<RunId>` reads a
+   * missing key and a `null` the same way and an explicit one keeps the two scopes visible at
+   * the call site.
+   */
+  pause: (project: ProjectId, run: RunId | null = null) =>
+    invoke<void>('agents_pause', { project, run }),
+
+  /**
+   * `SIGCONT`, reopen the queue, drain it. The mirror of `pause`, including its scope rule.
+   *
+   * A run frozen long enough that its turn may have died is watched for a few seconds afterwards
+   * and, if nothing stirs, offered a retry through `AgentRun.staleTurn` — a field on the run and
+   * not an event, so a window opened after the resume shows the same warning as the one that
+   * asked for it. That offer is a *suspicion*, never a re-dispatch; `retryTurn` is how it is
+   * taken.
+   */
+  resume: (project: ProjectId, run: RunId | null = null) =>
+    invoke<void>('agents_resume', { project, run }),
+
+  /**
+   * Take the stale-turn offer and re-send the run's last dispatched prompt.
+   *
+   * **This spends a turn.** That is the whole reason it is a wrapper of its own rather than a
+   * boolean on `ackStaleTurn`: a boolean between the user and a call that costs them money is
+   * the wrong shape, and it makes the two answers to one question — *retry* and *leave it* —
+   * indistinguishable at every call site, in the palette and in a log. `cmd/agents.rs` carries
+   * the same paragraph, and the two are deliberately two commands on the wire as well.
+   *
+   * Refused with a sentence when the run carries no offer, so a double press sends one prompt
+   * and is told about the second.
+   */
+  retryTurn: (project: ProjectId, run: RunId) =>
+    invoke<void>('agents_retry_turn', { project, run }),
+
+  /** Take the stale-turn offer off a run and do nothing else. The *leave it* answer. */
+  ackStaleTurn: (project: ProjectId, run: RunId) =>
+    invoke<void>('agents_ack_stale_turn', { project, run }),
+
+  /*
+   * There is deliberately **no `openPane` wrapper**. Opening a run into a pane is a *gesture*,
+   * not a command: it lives in `ui/src/sidebar/AgentsPanel/openRun.ts` and goes through
+   * `addRow` with `SplitIntent::Mirror`, because `addRow` calls `rememberSpawnPlan` before
+   * `hydrate()` and that is what makes `TerminalPane` set `PaneHost.mirrored`. A pane built by
+   * a command instead arrives over `cide://workspace-changed` with no spawn plan, the flag
+   * stays unset, and `closePane` kills the agent's child on the way out. See `cmd/agents.rs`,
+   * which carries the long version.
+   */
+}
+
+/* -----------------------------------------------------------------------------------------
+ * A file as one commit left it: `TabKind::Revision`. (M18)
+ *
+ * One appended block at the very end with no `import type` of its own — `ProjectId`, `RepoId`
+ * and `TabId` are already in scope from the header and a second import of them would be a
+ * duplicate identifier — per the append-only house rule stated four times at the top of this
+ * file. It has conflicted in five consecutive rounds.
+ *
+ * # Why this is not a member of `revisionDiff`
+ *
+ * That namespace is *comparisons*: `(repo, path, new, old)`, a pair of trees, a tab whose whole
+ * subject is what changed. This one names a single point — `(repo, path, rev)` — and produces a
+ * read-only **buffer**, not a patch. Folding it in would put two different tab kinds behind one
+ * object and invite the first reader to assume `revisionDiff.*` all answer with diffs.
+ *
+ * There is deliberately **no `retargetTab`**. A revision tab has no preview slot and no
+ * single-click gesture that mints one: the only ways to open one are the blame popup's
+ * *Annotate previous revision* and a crumb in a revision pane's own trail, and both are
+ * deliberate. `cide_core::workspace::PreviewSlot` is derived from a `DiffOrigin`, which this
+ * kind does not have — so a scratch revision tab is not merely unimplemented, it is
+ * unrepresentable, and that is the right answer rather than a gap.
+ * --------------------------------------------------------------------------------------- */
+
+export const revisionFile = {
+  /**
+   * Open a read-only tab for `path` as `rev` left it, or activate the one already showing it.
+   *
+   * `rev` must already be a **full oid**. `HEAD~3` resolves to a different commit tomorrow and
+   * this value is persisted into the tab; `gitLog.resolveRev` is what goes in front of anything
+   * a user typed. Every caller today hands over an oid Rust produced (`BlameParent.rev`, or a
+   * crumb read back off the tab), so nothing resolves at this call site.
+   *
+   * `from` is the walk that led here — newest **last**, `rev` itself excluded, which is the
+   * order `TabKind::Revision::from` documents and the order the pane's crumb strip draws left to
+   * right. Rust normalises it (`cide_core::workspace::revision_chain`) rather than trusting it:
+   * a walk that goes back through a merge and down the other parent rejoins, and an un-deduped
+   * chain grows by one entry per lap in a file that is written to disk.
+   *
+   * Open-or-activate is keyed on `(repo, path, rev)` and **not** on `from` — two routes to one
+   * commit are one document — and the chain of the tab that already exists wins. So passing a
+   * longer walk here never lengthens an open tab's trail, and calling this with the tab's own
+   * `(rev, from)` is exactly "activate me", which is what the current crumb does.
+   */
+  openTab: (
+    project: ProjectId,
+    repo: RepoId,
+    path: string,
+    rev: string,
+    from: readonly string[] = [],
+  ) => invoke<TabId>('tab_open_revision', { project, repo, path, rev, from }),
+}
+
+/* -----------------------------------------------------------------------------------------
+ * Taking a role's finished work into your own branch. (M18)
+ *
+ * Its own contiguous block at the foot of the file with its own `import type`, per the
+ * append-only house rule stated at the top — the two agent namespaces above were both closed
+ * hundreds of lines ago and appending cannot reach inside either literal.
+ *
+ * # Why it is neither `agents` nor `agentRuns`
+ *
+ * `agents` answers questions about **files in the project**; `agentRuns` acts on the **run
+ * registry**. This does neither: it merges a git branch into the branch the user has checked
+ * out, which is the one gesture in this feature that rewrites their working tree and adds a
+ * commit to their history. Putting it beside `dispatch` and `stop` would hide, at the call
+ * site, that this is the call which touches the repository — and that distinction is the
+ * reason `agents` and `agentRuns` were split in the first place.
+ *
+ * # Why the outcome type is written out here by hand
+ *
+ * `cide_git::worktree::Integration` is not a wire type and `cide-ipc` does not carry a copy, so
+ * `cmd/agents.rs` declares a plain `serde::Serialize` local to itself — the pattern
+ * `ClaudeCliSupport` established and documents further up this file. Nothing generates this
+ * TypeScript; it moves with the Rust by hand, and `agents_integrate`'s own
+ * `serialising_keeps_the_three_answers_apart` test pins the JSON these three arms mirror.
+ *
+ * The three arms must stay three arms. "Nothing to do", "merged, here is the commit" and
+ * "refused, and here are the conflicting paths" are three different sentences with three
+ * different next actions, and any collapse of two of them — a boolean, an empty `paths` meaning
+ * success — reaches the user as a refusal that looks like a no-op.
+ * --------------------------------------------------------------------------------------- */
+import type { AgentId } from './generated'
+
+/** What `agentWorktree.integrate` did, or refused to do. Mirrors `cmd::agents::AgentIntegration`. */
+export type AgentIntegration =
+  /** The role's branch holds nothing this checkout lacks. Nothing was merged, and nothing needed to be. */
+  | { kind: 'upToDate' }
+  /** It landed. `commit` is the full oid — a merge commit, or the tip a fast-forward moved to. */
+  | { kind: 'merged'; commit: string; files: number }
+  /**
+   * Refused, **having changed nothing at all**.
+   *
+   * `cide_git::worktree::integrate` computes the merge in memory and asks `has_conflicts` before
+   * a byte is written, so the user's checkout is exactly as it was. `paths` is the entire value
+   * of that refusal: a conflict reported without them is a dead end, which is why every caller
+   * of this is expected to put them in front of the user rather than count them.
+   */
+  | { kind: 'conflicts'; paths: string[] }
+
+export const agentWorktree = {
+  /**
+   * Merge `cide/<agent>` into the branch this project's root has checked out.
+   *
+   * **Not through `pendingCommand`**, like every other user gesture in this feature and unlike
+   * `agents.roster`: this is a click, and a click that silently does nothing is the failure this
+   * project has paid for most often. Rust refuses with a sentence — the project is not a
+   * repository, `HEAD` is detached, a rebase is in progress, the role has never run and so has
+   * no branch — and the rejection is meant to reach `notifyFailure`.
+   *
+   * It resolves only when the merge is **finished**, unlike `agentRuns.dispatch`: there is
+   * nothing asynchronous behind it, the work happens on Rust's blocking pool, and the answer is
+   * the whole point of the call.
+   */
+  integrate: (project: ProjectId, agent: AgentId) =>
+    invoke<AgentIntegration>('agents_integrate', { project, agent }),
+}
+
+/* ---------------------------------------------------------------------------------------
+ * The cancellable log walk. (M20)
+ *
+ * Its own block at the end of the file, with its own `import type`, per the append-only house
+ * rule — `gitLog` was closed hundreds of lines ago and appending cannot reach inside that
+ * literal.
+ *
+ * # This supersedes `gitLog.page`
+ *
+ * `git_log` now takes a `tab` as well as a project, so **`gitLog.page` above no longer matches
+ * the command** and every call to it rejects with a deserialization error from Rust. Use
+ * `logWalk.page`. `gitLog`'s other members — `detail`, `lineCounts`, `diff`, `diffFiles`,
+ * `fileAt`, `resolve` — are untouched and stay where they are; only the paging call moved.
+ *
+ * # Why a page needs to name its tab
+ *
+ * So that it can be **stopped**. Rust keys a cancellation flag by `(project, tab)` and
+ * `cide_git::log` polls it once per commit, so a walk that a newer query has superseded stops
+ * within one commit instead of scanning to its budget for a page nobody will draw. Per *tab* and
+ * not per project because the Log tab and N History tabs are live at once in the same panel:
+ * keyed by project, opening a History tab would cancel the Log's walk mid-page. See
+ * `crates/cide-app/src/cmd/log.rs`, which argues the whole shape.
+ *
+ * The tab id is the tool tab's, not the `HistoryTabId` of a row inside it — two levels of the
+ * same panel, and `cide_ipc::ids` says at length why they are two id spaces.
+ *
+ * # A cancelled page is not an error
+ *
+ * The promise **resolves**, with `CommitPage.cancelled` true and whatever rows the walk had
+ * reached. That is what typing in the filter box produces, several times per word. Drop the page
+ * — the better answer is already in flight — and do not paint a failure: the rows in it are
+ * correct as far as they go, and there is nothing for the user to act on.
+ *
+ * The generation counter a caller already keeps is still the authority on *which* answer to
+ * paint. `cancelled` is the backend saying it agrees, and it is what makes the abandoned walk
+ * stop costing anything; it is not a replacement for the counter, because a page can also be
+ * superseded in the moments after it returns and before it is awaited.
+ * --------------------------------------------------------------------------------------- */
+import type { ToolTabId } from './generated'
+
+export const logWalk = {
+  /**
+   * One page for one tool tab. Feed [`CommitPage.resume`] back as `{ kind: 'resume', token }` for
+   * the next.
+   *
+   * A cursor and not an offset: a `skip` re-walks the prefix on every page, and a page that
+   * stopped on the scan budget with three rows would ask for `skip: 3` and re-scan the same
+   * commits for ever. It is also why `resume` being `null` is the only honest way to read "there
+   * is no more" — `stop` can say `budget` or `page` and still leave a frontier.
+   *
+   * Asking again with an *identical* query — two windows showing the same tab — joins the walk
+   * already running rather than restarting it. Asking with any other query cancels the standing
+   * walk first, which is the whole point: the superseded page comes back `cancelled` and the
+   * repository stops being read for it.
+   */
+  page: (project: ProjectId, tab: ToolTabId, query: LogQuery) =>
+    invoke<CommitPage>('git_log', { project, tab, query }),
+
+  /**
+   * Stop the walk this tab has running, if it has one.
+   *
+   * Call it when the tab closes and when the panel unmounts. Idempotent, and `false` — meaning
+   * there was nothing to stop — is the ordinary answer rather than a problem: a caller that had
+   * to know whether a walk was in flight before it could stop one would need the state this call
+   * exists to save it keeping.
+   *
+   * Not needed merely to supersede a query. Issuing the next `page` already cancels the standing
+   * walk, and doing both is one extra round trip for no change in behaviour.
+   */
+  cancel: (project: ProjectId, tab: ToolTabId) =>
+    invoke<boolean>('git_log_cancel', { project, tab }),
+}
+
+/* ---------------------------------------------------------------------------------------
+ * Editing a role definition: the three commands behind Settings → Agents. (M18)
+ *
+ * `agents` a few hundred lines up *reads* a project's subagents and flips the per-project
+ * switch. These three **write `.cide/agents/<name>.md`** — and its global twin beside
+ * `keymap.json` — which until now could only be done with a text editor and a correct guess at
+ * the front-matter grammar. `cmd::agents`' own section header calls them "the answer to the only
+ * way there used to be of defining a role".
+ *
+ * # Why they are here at all, which is not a rhetorical question
+ *
+ * All three were registered in `generate_handler!`, listed in `contract/commands.json`,
+ * unit-tested and clippy-clean, and **invocable from nothing**: no wrapper here meant no caller
+ * anywhere, because this file is the frontend's only seam to `invoke`. That is this repository's
+ * most-repeated defect — the M18 tally is four commands in one milestone — and
+ * `ui/scripts/check-agents.mjs` fails on exactly that shape, by requiring every `agents_*` and
+ * `tasks_*` command in the contract to be spelled somewhere in this file. These three lines are
+ * what turn that gate green, and the gate is what stops them from rotting back out.
+ *
+ * # Raw `invoke`, awaited, not `pendingCommand`
+ *
+ * The opposite of `agents.roster`, and for the reason `agents.setConfig` states one block up:
+ * `pendingCommand` exists for calls made from a *render effect*, where an unhandled rejection
+ * unmounts the tree and a `null` fallback is an honest "this build cannot answer". Nothing here
+ * is called from an effect — every one of them follows a deliberate click — and each writes a
+ * file in the user's repository. A swallowed rejection would be a user pressing Save and being
+ * told nothing at all.
+ *
+ * # A refusal is not a rejection
+ *
+ * `agents_save` answers `AgentSaveOutcome`, whose `rejected` arm carries one problem per field
+ * in the **`Ok`** channel. `AgentSaveOutcome`'s doc argues the shape in full: `CoreError` has one
+ * string per variant and a form needs eleven, so a rejection routed through the error channel
+ * would arrive as one sentence with the field names inlined into prose — "says invalid without
+ * saying where", which is the state the whole `AgentField` enum exists to make unrepresentable.
+ * So `.catch` here is for a disk that would not take the write, and the `rejected` arm is for the
+ * form.
+ * --------------------------------------------------------------------------------------- */
+import type { AgentDraft, AgentSaveOutcome, AgentScope } from './generated'
+
+export const agentDefs = {
+  /**
+   * One definition file, as the form that edits it is populated — read **fresh**, at the moment
+   * the form opens.
+   *
+   * `scope` is required rather than searched for, and that is `AgentScope`'s own argument: one
+   * roster row can be backed by two files (a project role shadows a global one of the same name,
+   * whole-file), so a call that guessed would populate the form from the file the user is not
+   * looking at and save over the one they are.
+   *
+   * Rejects when there is no such file, which is how this screen discovers *where* a role lives:
+   * nothing on the wire carries a definition's scope — `AgentDef` is the roster row and
+   * deliberately does not — so the only honest answer to "is there a global `qa` as well" is to
+   * ask for it. See `AgentsSection`'s `listRoles`.
+   */
+  draft: (project: ProjectId, agent: AgentId, scope: AgentScope) =>
+    invoke<AgentDraft>('agents_draft', { project, agent, scope }),
+
+  /**
+   * Write one role's definition file. Creates, edits, renames and moves between scopes — all
+   * four are this one call, because all four are "here is what this role should be, and here is
+   * the file it is today", and `AgentDraft.original` is what distinguishes them.
+   *
+   * Answers `{ kind: 'saved', path, roster }` — `path` because a save may have *moved* the
+   * definition, so the file the user edits next is not necessarily the one they opened — or
+   * `{ kind: 'rejected', problems }`, in which case **nothing was written**.
+   */
+  save: (project: ProjectId, draft: AgentDraft) =>
+    invoke<AgentSaveOutcome>('agents_save', { project, draft }),
+
+  /**
+   * Remove one role's definition file, and answer with the roster that is left.
+   *
+   * Scoped, and it matters more here than on `draft`: a project definition shadowing a global
+   * one draws one row, and a delete that guessed would take the **global** file — which is in no
+   * repository's history, is shared by every project the user opens, and has nothing to be
+   * restored from.
+   *
+   * There is no confirmation in Rust, deliberately (`agents_delete`'s doc: a modal in the domain
+   * would also have to be a modal in the MCP vocabulary and in every other door onto the same
+   * act). The confirmation belongs to the button, and this screen's is the confirm-on-second-
+   * click the agents and tasks panels already use.
+   */
+  delete: (project: ProjectId, agent: AgentId, scope: AgentScope) =>
+    invoke<AgentRoster>('agents_delete', { project, agent, scope }),
 }

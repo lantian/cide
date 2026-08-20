@@ -736,6 +736,32 @@ try {
   )
 
   /*
+   * **The report layer sits above the overlay layer**, as two literals rather than as prose.
+   * (M21)
+   *
+   * `Failures` was `z-index: 40` and the scrim is `60`, so every command that failed while a
+   * dialog was open reported into a layer the dialog painted over — the toast rendered, and it
+   * rendered behind the veil. The gesture then presented exactly as a control wired to nothing,
+   * which is the failure `Failures` exists to prevent, and it was reported as one: *"the Delete
+   * button in a task's comment does nothing"*.
+   *
+   * Compared rather than pinned, because the numbers are allowed to move; what may not move is
+   * their order. Nothing else in the suite can see it — no check mounts a dialog and a toast
+   * together, and neither `tsc` nor `vite build` has an opinion about paint order.
+   */
+  const scrimZ = Number(/\.scrim \{[^}]*z-index:\s*(\d+)/.exec(overlayCss)?.[1])
+  const toastZ = Number(
+    /\.stack \{[^}]*z-index:\s*(\d+)/.exec(uiFile('src/chrome/Failures.module.css'))?.[1],
+  )
+  ok(Number.isFinite(scrimZ) && Number.isFinite(toastZ), 'both layers declare a numeric z-index')
+  ok(
+    toastZ > scrimZ,
+    `the failure toasts (${toastZ}) paint above the overlay scrim (${scrimZ}). A report the ` +
+      'user cannot see is the same thing as no report, and every layer above it is a surface ' +
+      'the gesture being reported on can be made from',
+  )
+
+  /*
    * Two Rust decisions with no behavioural gate, asserted at source level because the
    * alternatives cost more than they are worth — one is a wall-clock measurement over the
    * user's own cargo registry, the other is a watcher-burst path with no test harness. Both

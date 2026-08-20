@@ -14,6 +14,42 @@
   display: flex;
 }
 
+/*
+ * Everything except the activity rail, as a column: the working area on top, the git tool
+ * window under it.
+ *
+ * This exists so the tool window can be **full width minus the rail**. The rail stays a child of
+ * `.body` and therefore runs the full height; anything that should stop short of the bottom
+ * panel goes in `.upper` instead. Two arrangements were tried first and each is wrong in an
+ * instructive way — the panel inside `.content` moves its left edge every time the sidebar is
+ * opened or closed, and the panel as a sibling of `.body` cuts the rail off above it. See the
+ * comment on the panel in `App.tsx`.
+ *
+ * `min-width: 0` because the pane grid inside can be wider than the window: without it a long
+ * unbroken terminal line makes this column refuse to shrink and pushes the layout sideways.
+ */
+.workArea {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/*
+ * The horizontal row the tool window sits under: sidebar panel, splitter, panes.
+ *
+ * `min-height: 0` is the line that makes the panel's height real. A flex item defaults to
+ * `min-height: auto` and so refuses to shrink below its content, which means the `flex: none`
+ * panel below cannot take height *from* this row — it takes it from the container instead,
+ * growing past the viewport and pushing the bottom of the pane grid, and the status bar, off
+ * screen. One line, and the whole layout is wrong without it.
+ */
+.upper {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
 /* M0 placeholder for the 42px activity rail. */
 .rail {
   width: var(--h-rail);
@@ -29,13 +65,17 @@
 }
 
 .railIcon {
+  /* Fixed while the chrome font size moves everything around it: this box holds an icon, and
+     an icon does not grow with a type scale. Same call as `ActivityRail.module.css`'s `.item`,
+     and as the rail itself, which is `--h-rail` and equally fixed. The glyph inside does
+     scale, and at the band's top it is 21.5px in this 28px box — measured, not assumed. */
   width: 28px;
   height: 28px;
   display: grid;
   place-items: center;
   border-radius: 5px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
 }
 
 .railIconActive {
@@ -50,6 +90,17 @@
 .content {
   flex: 1;
   min-width: 0;
+  /*
+   * Kept after the tool window moved out from under here (M19), and no longer load-bearing for
+   * it — the panel is the last child of `.workArea` now, so the item that must not refuse to
+   * shrink is `.upper`, which has its own `min-height: 0` and a paragraph saying why.
+   *
+   * Left in place because it is right on its own terms: a flex child's default
+   * `min-height: auto` refuses to shrink below its content, and `.content` holds a pane grid
+   * whose content can be arbitrarily tall. Removing it would be trading a correct line for a
+   * shorter file and waiting to find out which pane grid overflows first.
+   */
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--panel-2);
@@ -76,25 +127,25 @@
   border-bottom: 2px solid var(--accent);
   color: var(--text-hi);
   font-weight: 500;
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   font-family: inherit;
 }
 
 .tabSwatch {
   width: 13px;
-  height: 13px;
+  height: calc(13px * var(--ui-scale));
   border-radius: 3px;
   background: var(--accent);
   display: inline-block;
 }
 
 .pinned {
-  font-size: 9.5px;
+  font-size: var(--fs-ui-9-5);
   color: var(--faint);
   border: 1px solid var(--border);
   border-radius: 3px;
   padding: 0 4px;
-  line-height: 13px;
+  line-height: calc(13px * var(--ui-scale));
   letter-spacing: 0.04em;
 }
 
@@ -121,7 +172,7 @@
   box-shadow: var(--shadow);
   padding: 16px 20px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   color: var(--text);
   white-space: pre;
   -webkit-user-select: text;
@@ -158,7 +209,7 @@
   z-index: 20;
   padding: 5px 10px;
   border-radius: 5px;
-  font-size: 11.5px;
+  font-size: var(--fs-ui-11-5);
   cursor: pointer;
   background: var(--chrome);
   border: 1px solid var(--border);

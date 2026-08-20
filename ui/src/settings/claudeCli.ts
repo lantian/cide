@@ -36,8 +36,8 @@ export interface Inj {
   flag: string
 }
 
-/** The four arguments cide adds. Mirrors `cide_ipc::ClaudeInjections`' field names. */
-export type InjectionKey = 'sessionId' | 'resume' | 'forkSession' | 'settings'
+/** The arguments cide adds. Mirrors `cide_ipc::ClaudeInjections`' field names. */
+export type InjectionKey = 'sessionId' | 'resume' | 'forkSession' | 'settings' | 'mcpConfig'
 
 /** The stored shape, structurally. Mirrors `cide_ipc::ClaudeCli`. */
 export interface CliConfig {
@@ -61,6 +61,11 @@ export const INJECTIONS: readonly { key: InjectionKey; defaultFlag: string }[] =
   { key: 'resume', defaultFlag: '--resume' },
   { key: 'forkSession', defaultFlag: '--fork-session' },
   { key: 'settings', defaultFlag: '--settings' },
+  // Last here and last in the argv, and that is the one ordering fact in this table that is
+  // load-bearing rather than cosmetic: `--mcp-config <configs...>` is variadic and collects
+  // every following token that does not begin with `-`, so the only token allowed after it is
+  // its own JSON. `cmd/session.rs` writes it last for the same reason.
+  { key: 'mcpConfig', defaultFlag: '--mcp-config' },
 ]
 
 /** One injection, resolved: what will be written, and whether a rename was thrown away. */
@@ -171,17 +176,28 @@ export const REFUSED_ARGS: readonly {
   { flag: '--fork-session', aliases: [], value: false, because: 'forkSession' },
   { flag: '--continue', aliases: ['-c'], value: false, because: 'sessionId' },
   { flag: '--settings', aliases: [], value: true, because: 'settings' },
+  { flag: '--mcp-config', aliases: [], value: true, because: 'mcpConfig' },
   { flag: '--bare', aliases: [], value: false, because: null },
   { flag: '--print', aliases: ['-p'], value: false, because: null },
 ]
 
-/** Arguments that cost something cide cannot repair and are allowed anyway. */
+/**
+ * Arguments that cost something cide cannot repair and are allowed anyway.
+ *
+ * `--append-system-prompt-file` is here rather than in `REFUSED_ARGS` because what it collides
+ * with is a paragraph *cide* adds — the CLI refuses it beside an `--append-system-prompt` — so
+ * cide's own addition is what gives way, not the user's field. Rust's row carries the argument
+ * and the sentence; only the name lives here.
+ */
 export const WARNED_ARGS: readonly {
   flag: string
   aliases: readonly string[]
   value: boolean
   because: InjectionKey | null
-}[] = [{ flag: '--safe-mode', aliases: [], value: false, because: null }]
+}[] = [
+  { flag: '--safe-mode', aliases: [], value: false, because: null },
+  { flag: '--append-system-prompt-file', aliases: [], value: true, because: null },
+]
 
 /** Variables cide sets itself, or must never set. */
 export const REFUSED_ENV: readonly string[] = [
@@ -189,6 +205,7 @@ export const REFUSED_ENV: readonly string[] = [
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_SSE_PORT',
   'CIDE_HOOK_SOCK',
+  'CIDE_AGENT_SOCK',
   'TERM',
   'COLUMNS',
   'LINES',
@@ -338,8 +355,10 @@ export function judgeEnv(cli: CliConfig): Judged[] {
  * *order* is what makes the refusals make sense: everything cide adds begins with `-`, which is
  * why a variadic user flag placed first can never swallow one of them.
  *
- * `--settings <json>` is drawn as an elided token rather than as several kilobytes of inline
- * hook payload — the readout is 620px wide and the JSON is not something a human reads.
+ * `--settings <json>` and `--mcp-config <json>` are drawn as elided tokens rather than as
+ * several kilobytes of inline hook payload and a config naming an absolute path to `cide-hook`
+ * — the readout is 620px wide and neither is something a human reads. The *position* is the
+ * part that has to be right, and `--mcp-config` is last because it is variadic.
  */
 export function resolvedArgv(cli: CliConfig, shape: 'fresh' | 'resume' | 'fork'): string[] {
   const mine = judgeArgs(cli)
@@ -349,6 +368,7 @@ export function resolvedArgv(cli: CliConfig, shape: 'fresh' | 'resume' | 'fork')
   const resume = flagFor(cli, 'resume')
   const fork = flagFor(cli, 'forkSession')
   const settings = flagFor(cli, 'settings')
+  const mcp = flagFor(cli, 'mcpConfig')
 
   // Mirrors `cide_claude::conversation`, degraded shapes included, because those are exactly
   // what a user who has switched something off needs to be able to read.
@@ -370,6 +390,9 @@ export function resolvedArgv(cli: CliConfig, shape: 'fresh' | 'resume' | 'fork')
     ...mine,
     ...conversation,
     ...(settings === null ? [] : [settings, '<cide hooks>']),
+    // Last, and after `--settings`, exactly as `cmd/session.rs` writes it. A readout that put
+    // the variadic flag anywhere else would be promising a command line nothing spawns.
+    ...(mcp === null ? [] : [mcp, '<cide tools>']),
   ]
 }
 

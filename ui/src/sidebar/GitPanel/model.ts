@@ -900,7 +900,25 @@ export interface CommitUnit {
  * changelist's membership alone, which is the only honest answer to "commit these files, which
  * came from two changelists".
  */
-export function commitUnits(view: StatusView, selected: ReadonlySet<string>): CommitUnit[] {
+export function commitUnits(
+  view: StatusView,
+  selected: ReadonlySet<string>,
+  /**
+   * The repository a reword is about, when there is one.
+   *
+   * A reword ticks nothing, so the loop below finds no files and yields no units — and a commit
+   * with no units returns without doing anything, which would leave [`canCommit`] enabling a
+   * button that silently does nothing. This is the one case that mints a unit from no files.
+   *
+   * It must be *named*, and that is not a limitation to route around: `null` here means the
+   * Amend checkbox's own meaning, which is "HEAD", and in a multi-root project there are several
+   * HEADs and no honest way to pick one. A reword of an unnamed repository would rewrite
+   * whichever root happened to sort first. The log's *Amend…* always names one, which is the
+   * route this exists for; the bare checkbox reaches it only in a single-root project, where the
+   * caller passes the sole repository because there the answer is not a guess.
+   */
+  rewordRepo: RepoId | null = null,
+): CommitUnit[] {
   const byRepo = new Map<RepoId, { paths: string[]; lists: Set<string> }>()
   for (const entry of flatFiles(view)) {
     if (!selected.has(entry.id)) continue
@@ -908,6 +926,12 @@ export function commitUnits(view: StatusView, selected: ReadonlySet<string>): Co
     unit.paths.push(entry.entry.path)
     unit.lists.add(entry.changelist)
     byRepo.set(entry.repo, unit)
+  }
+  // Only when nothing at all is ticked. A reword is *defined* as an amend that changes no files,
+  // so an amend that does tick something is an ordinary amend and must not also pick up a
+  // file-less unit for a repository the user did not select anything in.
+  if (byRepo.size === 0 && rewordRepo !== null) {
+    return [{ repo: rewordRepo, paths: [], changelist: null }]
   }
   return [...byRepo].map(([repo, u]) => ({
     repo,
@@ -1222,4 +1246,44 @@ function state(v: unknown): FileState | undefined {
  */
 export function viewOf(tree: ChangesTree): StatusView {
   return normalizeStatus(tree)
+}
+
+/**
+ * Whether *Commit* can be pressed, given what is ticked and what the Amend checkbox says.
+ *
+ * # Amend with nothing ticked is a reword, and is the exception
+ *
+ * Every other commit needs a file: the ticks *are* the commit. An amend does not, because
+ * changing only the message is the commonest amend there is — and requiring a tick made a
+ * reword unreachable from the panel entirely. The backend refused it too, until
+ * `cide_git::commit`'s `NothingToCommit` guard learned to admit an amend, and both halves had to
+ * move together: enabling the button alone gives a click that ends in a refusal, and lifting the
+ * refusal alone leaves it behind a button nobody can press.
+ *
+ * `canAmend` still gates it. An unborn branch has no commit to reword, and without that term a
+ * repository with no HEAD would offer Commit on an empty selection with nothing to amend.
+ *
+ * `busy` is last and unconditional: a second click while a commit is in flight is the one that
+ * produces two commits, and it is the reason this is a function rather than a `&&` in the view.
+ *
+ * Here rather than in `GitPanel.tsx` because a rule in a component is a rule no check can
+ * compile — the reason every other decision in this file is in this file.
+ */
+export function canCommit(input: {
+  readonly picked: number
+  /**
+   * Whether this click would reword: amending, nothing ticked, and a repository actually named.
+   *
+   * A boolean rather than the `(amend, canAmend)` pair it looks like, because the caller's answer
+   * is more specific than "amending, and something has a HEAD". A reword needs one *named*
+   * repository whose HEAD exists — `useGitPanel::rewordRepo` — and the same value is what
+   * `commitUnits` mints the file-less unit from. Passing the parts and re-deriving the
+   * conclusion here would be two derivations of one fact, and the failure when they disagree is
+   * a live button that commits nothing.
+   */
+  readonly reword: boolean
+  readonly busy: unknown
+}): boolean {
+  if (input.busy !== null && input.busy !== undefined) return false
+  return input.picked > 0 || input.reword
 }

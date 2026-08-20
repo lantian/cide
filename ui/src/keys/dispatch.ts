@@ -61,8 +61,12 @@ import { pasteIntoTerminal } from '@/terminal/clipboard'
 import { openTerminalFind } from '@/terminal/findStore'
 import { paneRestarter } from '@/panes/paneRestart'
 import { useGitCount } from '@/chrome/gitCountStore'
+import { toggleBlame } from '@/editor/blameStore'
 import { requestFocus } from '@/chrome/focusRequests'
+import { panelHostPresent, requestPanel } from '@/chrome/panelRequests'
 import {
+  agentRuns as agentRunsApi,
+  agents as agentsApi,
   branch as branchApi,
   claudeSend,
   diag,
@@ -70,6 +74,8 @@ import {
   fs as fsApi,
   git as gitApi,
   settings as settingsApi,
+  toolWindow as toolWindowApi,
+  history as historyApi,
   tab as tabApi,
   type Axis,
   type Direction,
@@ -110,25 +116,36 @@ export interface DispatchDeps {
    * binding naming something that has been deleted. `reportOnly` is a fine value for it.
    */
   fallback: (command: string, args: unknown) => void
-  /**
-   * Switch the activity rail's sidebar view, for the `sidebar.*` commands and for anything
-   * that has to reveal a panel before acting on it (`file.reveal`, `git.commit`).
+  /*
+   * There is no `showSidebar` here any more, and its absence is the point.
    *
-   * Optional because a detached-pane window has no rail and no sidebar to switch. Every arm
-   * that uses it checks for `undefined` and reports rather than assuming.
+   * It used to be an optional closure over `App.tsx`'s `setSidebar`, and it was the *only* way
+   * to reveal a panel — which meant that anything outside this dispatcher could not reveal one
+   * at all. The git log's *Amend…* shipped listed and **disabled** for exactly that reason: the
+   * item's whole job is to put the user in front of the commit box, and it had no way to open
+   * the panel the box lives in. `README.md` recorded the missing seam as the reason.
+   *
+   * `chrome/panelRequests.ts` is that seam, and every arm below now goes through it. One
+   * mechanism rather than two: a second way to reveal a panel is a second set of preconditions
+   * to keep in step, and this file's header is a list of what happens when two routes to one
+   * gesture drift. The refusal survives intact — `requestPanel` answers `false` in a window
+   * where nothing registered a sidebar, which is precisely what `showSidebar === undefined`
+   * used to stand for, asked of the module instead of read off a prop.
    */
-  showSidebar?: ((view: 'files' | 'git' | 'search' | 'problems') => void) | undefined
   /**
    * Hide the left panel, or bring back the last one that was open. F4, and the palette row.
    *
-   * Separate from [`showSidebar`] rather than an extra value it accepts, because the two are
-   * different questions: `showSidebar` names a panel and always reveals it, and this one names
-   * none and depends on what was showing. Which panel comes back is `chrome/sidebarView.ts`'s
+   * Separate from the reveal seam rather than an extra value it accepts, because the two are
+   * different questions: a reveal names a panel and always shows it, and this one names none
+   * and depends on what was showing. Which panel comes back is `chrome/sidebarView.ts`'s
    * arithmetic, not this module's — that is a rule with cases in it, and a rule that lives in a
    * React state updater is a rule no check script can compile.
    *
-   * Optional for the same reason as `showSidebar`: a detached-pane window has no rail and no
-   * sidebar to toggle.
+   * Still a dep rather than a second module-level opener, and deliberately: `App.tsx` hands
+   * `setSidebar` the `toggleSidebar` *updater itself*, which is what keeps the decision out of
+   * the component. There is nothing outside React that needs to press F4.
+   *
+   * Optional because a detached-pane window has no rail and no sidebar to toggle.
    */
   toggleSidebar?: (() => void) | undefined
   /**
@@ -219,6 +236,98 @@ function pathArg(args: unknown): string | null {
   if (typeof args !== 'object' || args === null) return null
   const path = (args as { path?: unknown }).path
   return typeof path === 'string' ? path : null
+}
+
+/** `args.rev` — a full oid from a log row, for the commands a context menu opens on one. */
+function revArg(args: unknown): string | null {
+  if (typeof args !== 'object' || args === null) return null
+  const rev = (args as { rev?: unknown }).rev
+  return typeof rev === 'string' && rev !== '' ? rev : null
+}
+
+/**
+ * The tag dialog's opener, and the seam `git.tag.new` goes through. (M18)
+ *
+ * `target` is the commit to tag: a full oid from a log row, or **`null` meaning HEAD** — which
+ * is the palette's case and the reason `git.tag.new` earns a row at all when `git.reset`,
+ * `git.revert` and `git.cherryPick` do not. `cide_git::tag::create` takes a revspec, so "the
+ * commit I am standing on" needs nothing to have been clicked.
+ */
+export type TagDialogOpener = (target: string | null) => void
+
+/**
+ * Registered by whoever mounts the dialog, in the shape `openBranchPopup` has — a module-level
+ * opener the dispatcher calls, so the control works in a window whose status bar, tool window
+ * or context menu never mounted anything.
+ *
+ * **Inverted relative to `openBranchPopup`, and only because of who owns which file.**
+ * `chrome/BranchSelector.tsx` exports its opener and this module imports it; the tag dialog is
+ * being written in `chrome/logActions.ts` in parallel with this, so the registration goes the
+ * other way and the import arrow with it. Either direction gives the same guarantee — exactly
+ * one opener, reachable from outside React — and this one has the property that the dispatcher
+ * compiles and reports sensibly before the dialog exists, rather than failing to resolve an
+ * import. Collapse it into a plain import once both halves are in the tree if that reads
+ * better; nothing here depends on the indirection.
+ *
+ * A single slot rather than a listener list. Two dialogs answering one command is two dialogs
+ * on screen, and the second registration winning silently is easier to notice than a stack.
+ */
+let tagDialog: TagDialogOpener | null = null
+
+/**
+ * A request that arrived before anything could draw it, held until something can.
+ *
+ * **This is the whole fix for a real defect, not a convenience.** The only thing that mounts the
+ * tag dialog is `gitlog/LogTab.tsx`, and that mounts only while the git tool window is *open* —
+ * which it is not on any fresh launch, because the panel's open flag deliberately starts false.
+ * So `git.tag.new`, a command the palette lists whenever a project is open, reported "nothing in
+ * this window can ask what to call the tag" in the default state, every time. A listed command
+ * that does nothing is the exact defect this file's header is written about.
+ *
+ * The prompt itself cannot simply move somewhere always-mounted: it resolves the commit's short
+ * oid and its repository from the *loaded page*, and only the log has one. So the request waits
+ * instead, and [`registerTagDialog`] drains it the moment a dialog appears. One slot, not a
+ * queue — a second request while one is parked replaces it, because they are the same gesture
+ * repeated and the newer target is the one the user just asked for.
+ */
+let parkedTag: { target: string | null } | null = null
+
+/**
+ * Install the opener, and hand it anything that was waiting.
+ *
+ * Pass `null` on unmount, or the next window's registration leaks this one. Unregistering does
+ * **not** re-park: a dialog that was open and went away took the user's answer with it, and
+ * re-raising it in the next window that happens to mount one would be a question arriving with
+ * no gesture behind it.
+ */
+export function registerTagDialog(open: TagDialogOpener | null): void {
+  tagDialog = open
+  if (open === null) return
+  const waiting = parkedTag
+  parkedTag = null
+  if (waiting !== null) open(waiting.target)
+}
+
+/**
+ * Ask for the tag dialog.
+ *
+ * `true` when something drew it, `false` when the request was **parked** for whatever mounts one
+ * next. The boolean is not decoration and it does not mean "failed": the caller uses it to decide
+ * whether it also has to *reveal* the surface that owns the dialog, which is what turns a parked
+ * request into a visible one. A caller that ignores it leaves a question nobody ever sees.
+ */
+export function openTagDialog(target: string | null): boolean {
+  if (tagDialog === null) {
+    parkedTag = { target }
+    return false
+  }
+  tagDialog(target)
+  return true
+}
+
+/** Test seam: forget anything parked. Never called by the app. */
+export function __clearParkedTag(): void {
+  parkedTag = null
 }
 
 /**
@@ -686,7 +795,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * row. With a hotkey on it, it is a key that does nothing, in an application that has
          * now found that defect fifteen times.
          */
-        if (deps.showSidebar === undefined || boot()?.role.kind !== 'shell') {
+        if (!panelHostPresent() || boot()?.role.kind !== 'shell') {
           notify('This window has no file tree, so there is nothing to select a file in.', {
             kind: 'info',
             hint: 'Detached panes are their own window and show no sidebar.',
@@ -708,7 +817,9 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         }
         // Shown before revealed. Revealing into a sidebar that is on Git — or closed —
         // scrolls a tree nobody can see, which is a command that "did nothing" again.
-        deps.showSidebar('files')
+        // The answer is not read here, unlike everywhere else: the refusal above already
+        // returned for every window where this could be `false`.
+        requestPanel('files')
         /*
          * And the answer is read, which it was not.
          *
@@ -778,8 +889,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
        * command and the fourteen dead controls this project has already found.
        */
       case 'view.externalLibraries': {
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('files')
+        if (!requestPanel('files')) return unmet(command, 'this window has no sidebar')
         void useFileTree
           .getState()
           .revealGroup(EXTERNAL_LIBRARIES)
@@ -807,8 +917,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
        * nowhere and says nothing is this codebase's signature defect.
        */
       case 'view.scratches': {
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('files')
+        if (!requestPanel('files')) return unmet(command, 'this window has no sidebar')
         void useFileTree
           .getState()
           .revealGroup(SCRATCHES)
@@ -946,9 +1055,14 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * sees it first. `unmet` rather than a thrown error for the detached-pane case: that
          * window has no sidebar and never will, which is a fact about the window and not a
          * failure the user can act on.
+         *
+         * The reveal goes through `chrome/panelRequests.ts` rather than a `showSidebar` dep, so
+         * that this arm and the git log's *Amend…* — which cannot reach a dep at all — reveal
+         * the panel by the same call. `requestAmend` in that module is the log's entry point and
+         * it ends in the same `showPanel`; two routes to one panel is how the reveal here and
+         * the reveal there come to disagree about, say, which tab of the panel is showing.
          */
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('git')
+        if (!requestPanel('git')) return unmet(command, 'this window has no sidebar')
         requestFocus('commitMessage')
         return
       }
@@ -970,6 +1084,147 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         void (status.project === project.id ? status.refresh() : status.attach(project.id))
         const count = useGitCount.getState()
         void (count.project === project.id ? count.refresh() : count.attach(project.id))
+        return
+      }
+
+      /* ------------------------------------------------ Git: the bottom tool window (M18) */
+
+      case 'git.log': {
+        if (boot()?.role.kind !== 'shell') {
+          return unmet(command, 'this window has no tool window')
+        }
+        /*
+         * Through `withRepos`, not a bare open, and that is the difference between this and a
+         * panel that draws an empty list. `withRepos` asks `git_repos` — real discovery on the
+         * disk, the only honest source, because whether a project *holds* a repository is a fact
+         * a `git init` in a bash pane changes — and throws a sentence into `chrome/Failures.tsx`
+         * when the answer is empty. So a project with no repository is told, rather than shown a
+         * blank panel it has to interpret. This is also why no `when` clause claims to know:
+         * that was the `repoOpen` mistake.
+         */
+        withRepos(command, (project) => {
+          void toolWindowApi.activate(project, null).catch(() => {})
+        })
+        return
+      }
+
+      case 'git.history.file': {
+        if (boot()?.role.kind !== 'shell') {
+          return unmet(command, 'this window has no tool window')
+        }
+        /*
+         * `args.path` wins so the four context menus name the file they were opened on;
+         * `focusedTabPath` is the fallback for the palette row. Same order and same two
+         * functions as `file.reveal`.
+         *
+         * The path arrives **absolute** — that is what the tab strip, the file tree and the
+         * editor all have — and `git_locate` turns it into `(repo, repo-relative)` in Rust. Not
+         * a prefix comparison here: a symlinked root or a nested submodule makes that silently
+         * wrong, which is the rule `TreeStatusMap` already states.
+         */
+        const path = pathArg(args) ?? focusedTabPath(boot())
+        if (path === null) {
+          return unmet(command, 'no file tab is active')
+        }
+        withRepos(command, (project) => {
+          void historyApi
+            .locate(project, path)
+            .then((found) => {
+              if (found === null) {
+                notify('That file is not inside any repository in this project.', {
+                  kind: 'info',
+                })
+                return
+              }
+              return toolWindowApi.openHistory(project, found.repo, found.path).then(() => {})
+            })
+            .catch(() => {})
+        })
+        return
+      }
+
+      case 'git.blame': {
+        /*
+         * No `shellWindow` guard and no `withRepos`: the gutter is per *buffer*, a detached-pane
+         * window can hold one, and the blame fetch reports "not in a repository" with the file's
+         * own name in it — a better sentence than the generic one this command could form before
+         * knowing which file it is about.
+         *
+         * `focusedFilePath`, not `focusedTabPath`: annotating a *diff* would have to answer
+         * "which side?", and nothing has asked.
+         */
+        const path = pathArg(args) ?? focusedFilePath(boot())
+        if (path === null) return unmet(command, 'no file editor is focused')
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        toggleBlame(project.id, path)
+        return
+      }
+
+      case 'git.tag.new': {
+        /*
+         * `git.branch.new`'s shape exactly: open the control that asks, do not guess.
+         *
+         * A tag needs a name, and a name is not something a palette row can supply — the same
+         * argument `git.commit` and both branch commands make. What makes this one *listable*
+         * where `git.reset`, `git.revert` and `git.cherryPick` are not is the other half: those
+         * three need a **commit** with no honest default, and this one has one. `null` is HEAD,
+         * `TagRequest.target` takes a revspec, and *tag where I am standing* is the common case.
+         * `args.rev` is what the log's context menu passes when the gesture started on a row.
+         *
+         * No repository check and no `withRepos`, deliberately and for `git.branch.new`'s stated
+         * reason: the dialog asks `git_repos` itself and draws its own "no repository" state, so
+         * a guard here would be a second opinion about the disk formed one round trip earlier.
+         *
+         * No `shellWindow` guard either, for `git.blame`'s reason: the dialog is an overlay and
+         * any window can raise one.
+         *
+         * # Why this reveals the tool window, and why that is not a side effect
+         *
+         * The only thing that mounts the dialog is `gitlog/LogTab.tsx`, and that mounts only
+         * while the tool window is **open** — which it is not on a fresh launch, because the
+         * panel's open flag starts false on purpose. So this command used to report "nothing in
+         * this window can ask what to call the tag" in the *default* state, every time: a listed
+         * palette row that did nothing, which is the exact defect this file's header is about.
+         *
+         * `openTagDialog` now **parks** the request when nothing is mounted, and
+         * `registerTagDialog` drains it the moment something is. So the `false` arm is not a
+         * failure — it means "held" — and all this has to do is make something mount. Revealing
+         * the log is the honest way to do that: it is the surface the dialog belongs to, it is
+         * where the tag will show up as a ref chip the moment it exists, and the alternative is
+         * a question that never appears.
+         *
+         * A detached-pane window has no tool window to reveal, so there the request stays parked
+         * and the notice below is the truthful answer rather than a fallback.
+         */
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        if (openTagDialog(revArg(args))) return
+        if (boot()?.role.kind !== 'shell') {
+          notify('Tagging needs the Git log, which this window does not have.', {
+            kind: 'info',
+            hint: 'Tag from a commit row in the main window’s Git tool window.',
+          })
+          return
+        }
+        // Parked. Open the panel on its Log tab; `LogTab` registers on mount and drains it.
+        void toolWindowApi
+          .setLayout(project.id, { open: true })
+          .then(() => toolWindowApi.activate(project.id, null))
+          .catch(() => {
+            notify('Could not open the Git log to ask what to call the tag.', { kind: 'error' })
+          })
+        return
+      }
+
+      case 'view.toolWindow.toggle': {
+        if (boot()?.role.kind !== 'shell') {
+          return unmet(command, 'this window has no tool window')
+        }
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        const open = project.toolWindow.open
+        void toolWindowApi.setLayout(project.id, { open: !open }).catch(() => {})
         return
       }
 
@@ -1030,7 +1285,9 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         void fsApi.notesEnsure(notesProject.id).then(async (path) => {
           await fileApi.open(notesProject.id, path)
           await useWorkspace.getState().hydrate()
-          deps.showSidebar?.('files')
+          // Unread, as the `?.` before it was: the role check at the top of this arm has
+          // already refused every window where nothing can reveal a panel.
+          requestPanel('files')
           await useFileTree.getState().reveal(groupPath(PROJECT_NOTES))
         })
         return
@@ -1289,8 +1546,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       }
 
       case 'sidebar.files':
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('files')
+        if (!requestPanel('files')) return unmet(command, 'this window has no sidebar')
         return
 
       /*
@@ -1315,8 +1571,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         return
 
       case 'sidebar.git':
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('git')
+        if (!requestPanel('git')) return unmet(command, 'this window has no sidebar')
         return
 
       case 'problems.refresh': {
@@ -1343,8 +1598,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         // the reason spelled out under `sidebar.search`: a panel is not an overlay, the ⚑ button
         // is right there, and a second press that closed it would take away the thing the
         // binding is for.
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('problems')
+        if (!requestPanel('problems')) return unmet(command, 'this window has no sidebar')
         return
 
       case 'sidebar.search':
@@ -1362,9 +1616,111 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * existing mouse path revealed a panel and left the caret in the terminal. Revealing
          * without focusing would have been a new command with the old defect.
          */
-        if (deps.showSidebar === undefined) return unmet(command, 'this window has no sidebar')
-        deps.showSidebar('search')
+        if (!requestPanel('search')) return unmet(command, 'this window has no sidebar')
         requestFocus('search')
+        return
+
+      /*
+       * Pause and resume, at the **project scope**: `agents_pause` / `agents_resume` take a
+       * nullable run and these two call them with `null`, which shuts the dispatch queue, freezes
+       * every live run *and* freezes the project's own console session. `client.ts` and
+       * `AgentRegistry::pause` carry the argument for one command with two scopes rather than
+       * four; the per-run halves are the ⏸ and ▶ on each Agents-panel row.
+       *
+       * **`agents.resume` is the way out of the freeze, not a convenience.** Pause-all stops the
+       * pane the user types in, so a resume reachable only from that pane is no resume at all.
+       * The palette is chrome rather than a pane, so it keeps working while every session in the
+       * project is stopped — which is why these two were registered together with the panel's
+       * per-run controls rather than after them.
+       *
+       * # The clause is `projectOpen` alone, and the handler asks the rest
+       *
+       * Whether subagents are enabled is a fact only `.cide/config.json` knows. A
+       * `subagentsEnabled` context flag would have to be supplied by the webview, the workspace
+       * mirror cannot derive it, and a flag nobody sets is false for ever — the `repoOpen`
+       * failure `cide_core::commands` spends fifty lines on. So the question is asked over IPC,
+       * here, at the gesture, and answered with a sentence.
+       *
+       * The refusal **throws into an uncaught promise chain** rather than calling `unmet`, which
+       * is `withRepos`'s rule at the top of this file and the same shape: `unmet` writes to the
+       * diag log, which is right for "this command's clause and this handler disagree" and wrong
+       * for "subagents are off for this project" — that is a fact about the user's repository,
+       * they just asked a question about it, and they are owed a sentence. `chrome/Failures.tsx`
+       * turns the rejection into one.
+       *
+       * # Only *pause* asks, and the asymmetry is deliberate
+       *
+       * A resume can do nothing but undo a freeze: it thaws what is stopped, costs no quota and
+       * starts no child, and with nothing frozen it is a no-op the registry answers `Ok` to. A
+       * pause is the one that acts — and in a project with subagents off, the only thing the
+       * project scope would find to freeze is *the user's own console*, which is why the switch
+       * is checked before it, in the direction where being wrong stops something.
+       *
+       * Gating the resume on the same switch would be worse than redundant. `.cide/config.json`
+       * is a committed file, so a `git checkout` between the freeze and the thaw can flip it, and
+       * a resume that refused on the strength of it would leave a stopped console with no control
+       * anywhere that could start it again. That is exactly the state this pair exists to keep
+       * unreachable.
+       */
+      case 'agents.pause':
+      case 'agents.resume': {
+        const project = activeProjectOf(boot())
+        if (project === null) return unmet(command, 'no open project')
+        if (command === 'agents.resume') {
+          // Uncaught on purpose: the registry refuses a resume with a sentence (it has none of
+          // its own for an empty thaw, which is a legitimate no-op) and `Failures.tsx` shows it.
+          void agentRunsApi.resume(project.id)
+          return
+        }
+        void agentsApi.config(project.id).then((config) => {
+          if (config === null) {
+            // `agents.config` goes through `pendingCommand`, so `null` is "this build could not
+            // answer" — a stale binary against a hot-reloaded frontend, the shape `Failures.tsx`
+            // was written for. Its notice carries the stale-binary hint automatically.
+            throw new Error('cide could not read this project’s subagent settings.')
+          }
+          if (!config.enabled) {
+            throw new Error(
+              'Subagents are off for this project, so there is nothing to pause. Turn them on ' +
+                'in the Agents panel — it writes .cide/config.json into your repository.',
+            )
+          }
+          return agentRunsApi.pause(project.id)
+        })
+        return
+      }
+
+      /*
+       * M18's two panels, routed exactly like `sidebar.git` above: reveal, never toggle, and
+       * `unmet` in a window that has no rail to switch.
+       *
+       * Neither arm asks whether subagents are enabled for the project, and neither ever will.
+       * That is a fact only `.cide/config.json` knows, the command's clause deliberately does
+       * not name it (see the `AGENTS` block in `cide-core::commands`), and a *panel* is the one
+       * surface that must open regardless: it is where the answer is shown. Refusing to open the
+       * panel that would have explained the feature is off is the shape of failure this project
+       * keeps finding.
+       */
+      case 'sidebar.agents':
+        if (!requestPanel('agents')) return unmet(command, 'this window has no sidebar')
+        return
+
+      /*
+       * Two ids, one arm, and the duplication is on purpose.
+       *
+       * The palette wants a verb — *Go to tasks* is what a user types when they want to be
+       * looking at the board — and the sidebar group wants a noun that reads beside *Show git
+       * sidebar* and *Show problems sidebar*. **Ids are API**: a user's `keymap.json` names
+       * them, so neither can be renamed into the other later, and shipping one id under two
+       * titles is not possible (`no_two_commands_share_a_title` forbids it, because two palette
+       * rows a user cannot tell apart is the defect it guards). So both exist, they mean the
+       * same thing today, and they share a body rather than drifting into two spellings of one
+       * gesture. `task.focusBoard` is the one that will grow — focusing a row, or the New task
+       * field — at which point it stops falling through and this comment gets shorter.
+       */
+      case 'task.focusBoard':
+      case 'sidebar.tasks':
+        if (!requestPanel('tasks')) return unmet(command, 'this window has no sidebar')
         return
 
       default:

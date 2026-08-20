@@ -30,15 +30,15 @@
 
 .title {
   margin: 0 0 6px;
-  font-size: 14px;
+  font-size: var(--fs-ui-14);
   font-weight: 600;
   color: var(--text-hi);
 }
 
 .body {
   margin: 0;
-  font-size: 12.5px;
-  line-height: 18px;
+  font-size: var(--fs-ui-12-5);
+  line-height: calc(18px * var(--ui-scale));
   color: var(--dim);
 }
 
@@ -51,7 +51,7 @@
 .list {
   flex: 1;
   min-height: 0;
-  max-height: 260px;
+  max-height: calc(260px * var(--ui-scale));
   overflow-y: auto;
   overflow-x: hidden;
   margin: 0;
@@ -61,7 +61,7 @@
 
 .groupLabel {
   padding: 8px 18px 4px;
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--faint);
@@ -80,8 +80,8 @@
 .mark {
   flex: none;
   width: 10px;
-  font-size: 10px;
-  line-height: 18px;
+  font-size: var(--fs-ui-10);
+  line-height: calc(18px * var(--ui-scale));
 }
 
 .markUnsaved {
@@ -94,7 +94,7 @@
 
 .name {
   flex: none;
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   color: var(--text-hi);
 }
 
@@ -106,7 +106,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--faint);
   /* Plain end-ellipsis, not the `direction: rtl` trick that would keep the leaf directory
      visible: rtl moves the leading `/` of an absolute path to the far end, which reads as
@@ -126,7 +126,7 @@
 
 .button {
   font-family: var(--font-ui);
-  font-size: 12.5px;
+  font-size: var(--fs-ui-12-5);
   line-height: 1;
   padding: 7px 13px;
   border-radius: 5px;

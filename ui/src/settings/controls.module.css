@@ -26,12 +26,12 @@
 }
 
 .label {
-  font-size: 13px;
+  font-size: var(--fs-ui-13);
   color: var(--text);
 }
 
 .hint {
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1.45;
   color: var(--dim);
   margin-top: 3px;
@@ -45,7 +45,7 @@
 
 .pill {
   width: 34px;
-  height: 19px;
+  height: calc(19px * var(--ui-scale));
   flex: none;
   position: relative;
   border: 0;
@@ -75,7 +75,7 @@
   top: 2px;
   left: 2px;
   width: 15px;
-  height: 15px;
+  height: calc(15px * var(--ui-scale));
   border-radius: 50%;
   /* --text-hi is near-white in the dark theme and near-black in the light one, which reads
      against both the --border track and the --accent one. A hardcoded white would vanish
@@ -99,14 +99,14 @@
 }
 
 .segment {
-  height: 24px;
+  height: calc(24px * var(--ui-scale));
   min-width: 62px;
   padding: 0 11px;
   border: 0;
   background: transparent;
   color: var(--dim);
   font-family: inherit;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -133,7 +133,7 @@
 
 .number {
   width: 74px;
-  height: 24px;
+  height: calc(24px * var(--ui-scale));
   padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -141,7 +141,7 @@
   color: var(--text);
   /* Counters and measurements are mono throughout this app. */
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
 }
 
 .number:focus {
@@ -156,7 +156,7 @@
 }
 
 .groupTitle {
-  font-size: 10.5px;
+  font-size: var(--fs-ui-10-5);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--faint);
@@ -170,7 +170,7 @@
   border-radius: 5px;
   background: var(--panel);
   padding: 10px 12px;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   line-height: 1.5;
   color: var(--dim);
   margin-bottom: 18px;
@@ -190,14 +190,14 @@
 /* --- an action row's button --- */
 
 .action {
-  height: 24px;
+  height: calc(24px * var(--ui-scale));
   padding: 0 11px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--panel-2);
   color: var(--text);
   font-family: inherit;
-  font-size: 12px;
+  font-size: var(--fs-ui-12);
   cursor: pointer;
 }
 
@@ -221,7 +221,7 @@
 .pathReadout {
   margin-top: 6px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-ui-11);
   color: var(--dim);
   overflow-wrap: anywhere;
   -webkit-user-select: text;

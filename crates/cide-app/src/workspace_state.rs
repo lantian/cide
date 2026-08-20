@@ -121,6 +121,25 @@ impl WorkspaceState {
         drop(guard);
         if let Some(app) = self.app.get() {
             crate::emit::workspace_changed(app, &snapshot);
+            // The OS window title is a **level over this tree**, so the one place that knows
+            // the tree just moved is the one place that can hold it true. A title now names
+            // the active project *and its active tab* (`cmd::window::title_for`), and the
+            // events that change either — activating a header tab, switching tabs, opening or
+            // closing a file, a `ClaudeFull` pane being renamed — are ordinary mutations with
+            // no window code anywhere near them. Retitling from each of those call sites is
+            // the version of this that goes stale the first time somebody adds a mutation and
+            // does not know they have to.
+            //
+            // Cheap enough to be unconditional, and it has to be unconditional to be a level:
+            // a window count in the low single digits, a few string builds, and a `set_title`
+            // per window with the string it already has. `retitle` reads its own two mutexes
+            // (the awaiting set and the focus set) and never re-enters this state, and the
+            // workspace guard is dropped above, so there is no lock to deadlock on.
+            //
+            // Note that this is *after* the broadcast and outside the lock, deliberately: a
+            // GTK call is the slowest thing in this function and the webviews should not wait
+            // behind it for the snapshot they are about to render.
+            crate::cmd::window::retitle(app, &snapshot);
         }
         outcome
     }

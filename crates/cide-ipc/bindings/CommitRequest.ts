@@ -18,4 +18,22 @@ selections: Array<PathSelection> | null,
  * Commit even though the index changed outside cide — the "overwrite" half of the
  * guard bar. Never defaulted to true anywhere.
  */
-force: boolean, };
+force: boolean, 
+/**
+ * The commit the caller believes it is amending. Only meaningful with `amend`. (M18)
+ *
+ * `None` keeps the behaviour the commit panel's Amend checkbox has always had — amend
+ * whatever HEAD is — which is right there, because that checkbox is *about* HEAD and cannot
+ * name anything else. The **log** can: its menu offers Amend on one row, and between the
+ * menu opening and the confirm landing a `git commit` in a bash pane can move HEAD out from
+ * under it. So the oid travels with the request and is checked in `cide_git::commit`,
+ * against the repository, rather than against a list drawn a second ago.
+ *
+ * A mismatch is [`GitError::NotHead`] and never a rewrite: amending anything but HEAD is an
+ * interactive rebase, and cide has no conflict-resolution surface to finish one — the same
+ * argument `branch::pull` makes for being fast-forward-only.
+ *
+ * `#[serde(default)]` so every caller that predates this field, and every `workspace.json`
+ * that never carried it, still deserialises.
+ */
+amendOf: string | null, };

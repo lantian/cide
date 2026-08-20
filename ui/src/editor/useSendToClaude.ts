@@ -62,9 +62,12 @@
  */
 import { useCallback } from 'react'
 import type { EditorView } from '@codemirror/view'
-import { claudeSend, diag } from '@/ipc/client'
+import { claudeSend, diag, type PaneId } from '@/ipc/client'
+import { useWorkspace } from '@/store/workspace'
 import { useMentionTarget } from './mentionTarget'
 import { revealPane } from './revealPane'
+import { claudeNames, refreshClaudeNames } from './claudeNames'
+import { claudeSessions, type ClaudeSession } from './claudeSessions'
 import { mentionLabel, rangeOf, type SendRange } from './sendToClaude'
 
 /** What the caller needs to draw the control and to fire it. */
@@ -73,8 +76,38 @@ export interface SendToClaude {
   unavailable: string | null
   /** The range the current selection means, for the label. `null` is the whole file. */
   range: (view: EditorView) => SendRange | null
-  /** Fire it. Never silent: when `unavailable`, it says so instead of doing nothing. */
+  /**
+   * Fire it at whichever Claude the app picks. Never silent: when `unavailable`, it says so
+   * instead of doing nothing.
+   */
   send: (view: EditorView, path: string) => void
+  /**
+   * Every Claude pane in this project, numbered and labelled, **built when called**.
+   *
+   * A function rather than an array, and not for tidiness: it is called from a submenu's
+   * builder, which runs when the row is hovered rather than when the menu opened, and it reads
+   * two things that move — the workspace mirror and the names Rust last answered with. A value
+   * captured at render time would be the list as it stood when the *editor* last re-rendered,
+   * which for a pane that has been sitting open all afternoon is the list from this morning.
+   */
+  sessions: () => readonly ClaudeSession[]
+  /**
+   * Send to one named pane, and to that pane only.
+   *
+   * The submenu's rows. Unlike [`send`] there is no rerouting: the user read `2: git-details`
+   * and chose it, so a pane whose `claude` is not connected is a refusal with a sentence
+   * rather than a delivery somewhere else. See `claudeSend.lines`' `exact`.
+   */
+  sendTo: (view: EditorView, path: string, pane: PaneId) => void
+  /**
+   * Ask Rust for the `/rename` names again. Fire and forget; safe to call on every menu open.
+   *
+   * Exposed rather than done inside [`sessions`] because the fetch is asynchronous and
+   * `sessions` is not: refreshing there would answer with the *previous* names every single
+   * time. The caller refreshes when the parent menu opens and reads when the submenu is
+   * hovered, which is what puts a round trip between the two. `claudeNames.ts` owns the policy.
+   */
+  refresh: () => void
 }
 
 /**
@@ -125,14 +158,25 @@ export function useSendToClaude(): SendToClaude {
     )
   }, [])
 
-  const send = useCallback(
-    (view: EditorView, path: string) => {
+  /*
+   * One delivery, two gestures.
+   *
+   * `send` guesses the destination and lets Rust improve on the guess; `sendTo` is handed one
+   * the user picked by name and forbids that. Everything between those two sentences — the
+   * range arithmetic, the document guard, the reveal, the three ways of saying where the lines
+   * went — is identical, and it is identical *because* it is one function: the version of this
+   * feature with two copies is the version where the menu route stops revealing the pane six
+   * months after the keyboard route started.
+   */
+  const deliver = useCallback(
+    (view: EditorView, path: string, pane: PaneId | null, exact: boolean) => {
       if (target === null) {
         return report(
           'There is no Claude session in this project to send to. Open the project console, ' +
             'or split a Claude pane, and try again.',
         )
       }
+      const to_ = pane ?? target.pane
       const { from, to } = view.state.selection.main
       const text = view.state.sliceDoc(from, to)
       const span = range(view)
@@ -158,11 +202,12 @@ export function useSendToClaude(): SendToClaude {
        */
       const sending = claudeSend.lines(
         target.project,
-        target.pane,
+        to_,
         path,
         text,
         span?.lineStart,
         span?.lineEnd,
+        exact,
       )
 
       void sending.then(async (sent) => {
@@ -220,11 +265,46 @@ export function useSendToClaude(): SendToClaude {
 
       // The attempt, logged before the answer and naming the pane the gesture aimed at. A
       // report of "it did nothing" is answerable from a log that records the attempt; one that
-      // records only successes says nothing at all about the case being reported.
-      void diag.log(`editor: sending ${mentionLabel(path, span)} to ${target.pane}`)
+      // records only successes says nothing at all about the case being reported. `exact` is
+      // in the line because it is the difference between "this pane refused" and "every pane
+      // in the project refused", and a log that cannot tell those apart cannot answer the
+      // report that follows either of them.
+      void diag.log(
+        `editor: sending ${mentionLabel(path, span)} to ${to_}${exact ? ' (exactly)' : ''}`,
+      )
     },
     [target, range],
   )
+
+  const send = useCallback(
+    (view: EditorView, path: string) => deliver(view, path, null, false),
+    [deliver],
+  )
+
+  const sendTo = useCallback(
+    (view: EditorView, path: string, pane: PaneId) => deliver(view, path, pane, true),
+    [deliver],
+  )
+
+  /*
+   * Built on the call, from the mirror and the names as they stand right now.
+   *
+   * `useWorkspace.getState()` rather than a selector, and the rule in `CLAUDE.md` is why: a
+   * selector that *returns* a fresh array re-renders for ever and ends at *Maximum update
+   * depth exceeded*, which unmounts the whole root — and a list of session rows is exactly
+   * the fresh array that does it. Nothing here needs to re-render anyway: the submenu is
+   * resolved once, when it opens, on purpose, so that its rows cannot shuffle under a pointer
+   * already moving towards one.
+   *
+   * The project is the *mention target's*, not the buffer's. For a file belonging to another
+   * project the two differ, and the sessions worth listing are the ones the send can actually
+   * reach — which is the project `claudeSend.lines` is addressed with three lines above.
+   */
+  const sessions = useCallback((): readonly ClaudeSession[] => {
+    if (target === null) return []
+    const open = useWorkspace.getState().boot?.workspace.projects[target.project]
+    return open === undefined ? [] : claudeSessions(open, claudeNames())
+  }, [target])
 
   return {
     // Only the *static* half is a disabled reason. Whether the pane's `claude` is actually
@@ -235,5 +315,8 @@ export function useSendToClaude(): SendToClaude {
     unavailable: target === null ? 'No Claude session in this project to send to' : null,
     range,
     send,
+    sessions,
+    sendTo,
+    refresh: refreshClaudeNames,
   }
 }

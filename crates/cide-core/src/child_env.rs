@@ -1,12 +1,13 @@
 //! What every child of cide is given on its way out of `fork`: an environment with the bundle
-//! filtered out of it, and a death signal tied to ours.
+//! filtered out of it, and a death signal tied to ours — and, once it is running, the one way
+//! to reach it with a signal.
 //!
-//! # Two rules, one module
+//! # Three rules, one module
 //!
-//! Both halves answer the same question — *what does a spawn site here owe a child?* — and both
-//! are wrong to skip, silently, in ways that surface three processes away. `CLAUDE.md` already
-//! names this module as the one every `Command::new`/`SpawnSpec` in the workspace passes
-//! through, so this is where the second rule belongs too.
+//! All three answer the same question — *what does a spawn site here owe a child?* — and all
+//! three are wrong to skip, silently, in ways that surface three processes away. `CLAUDE.md`
+//! already names this module as the one every `Command::new`/`SpawnSpec` in the workspace
+//! passes through, so this is where the others belong too.
 //!
 //! The arming half ([`arm`], [`set_parent_death_signal`], [`on_spawn_thread`]) lived in
 //! `cide_claude::orphans` until a second long-lived, memory-hungry child appeared — a language
@@ -317,8 +318,9 @@ pub fn child_path_in(
 ///
 /// For the children spawned with `std::process` — the language servers, `cargo metadata`,
 /// `go list`, the `claude` one-shots, `git push`, `claude --version`. PTY children take the same
-/// two passes through `SpawnSpec`, in `cide_app::cmd::session::base_env`, because this crate
-/// cannot see `cide-pty`'s types.
+/// two passes as the first half of [`terminal_child_env`], and get them folded into a
+/// `SpawnSpec` by `cide_pty::SpawnSpec::apply`, because this crate cannot see `cide-pty`'s
+/// types.
 ///
 /// **Named `prepare_command`, not `scrub_command`.** It was the latter until M17, when it grew
 /// the `PATH` pass; a function called *scrub* that adds a variable is the kind of drift the
@@ -341,6 +343,136 @@ pub fn prepare_command(command: &mut Command) {
             None => command.env_remove(name),
         };
     }
+}
+
+/// The whole environment a **PTY** child is given, as one ordered [`EnvChange`] list.
+///
+/// The composition half of what `cmd::session::base_env` used to do inline. It lives here and
+/// the fold lives in `cide_pty::SpawnSpec::apply`, for the reason [`claude_env`] already gives:
+/// this crate must not link `cide-pty`, and a second spawn site that needs the identical list —
+/// a subagent run — must not have to reimplement it from the comments below. `extra` is folded
+/// last; see the final section for what a caller is allowed to put there.
+///
+/// `version` is a parameter rather than this crate's own `CARGO_PKG_VERSION` because the value
+/// a terminal reports is the *application's*. They happen to be the same number today (one
+/// workspace `version`), and a caller passing its own is what keeps that a coincidence rather
+/// than a dependency.
+///
+/// # The terminal constants
+///
+/// `TERM=xterm-256color` rather than plain `xterm` is not cosmetic: with `xterm` the
+/// Claude Code TUI falls back to 8 colours and ASCII box-drawing, and the alternate screen
+/// does not engage. Scrubbing `TMUX` matters for the same reason — its presence triggers
+/// an unconditional 256-colour clamp that visibly desaturates the accent colour. A terminal
+/// that inherits stale `COLUMNS`/`LINES` lies to the child about its size until the first
+/// SIGWINCH.
+///
+/// Deliberately absent: `ANTHROPIC_API_KEY`. It outranks subscription OAuth in the
+/// credential precedence order, so injecting one would silently bill a Console org for a
+/// user on Claude Max. The child inherits its auth by inheriting the environment; cide
+/// never reads `~/.claude/.credentials.json`.
+///
+/// The proxy variables are **not** here: they are the user's configuration rather than a
+/// constant of the terminal, so they are a second pass — `cmd::session::apply_proxy`, over the
+/// rule in [`crate::proxy`] — applied on top of this one. Nothing about proxying changes the
+/// rule in the paragraph above.
+///
+/// # The first pass, and why it is first
+///
+/// [`bundle_scrub`] undoes what *our own* launcher did to the environment before a pane ever
+/// sees it. Running from the AppImage, `AppRun` leaves `PYTHONHOME` pointing inside a bundle
+/// that contains no Python, and every stdio MCP server a pane's `claude` spawns dies on
+/// `No module named 'encodings'` before it can speak protocol — reported by the CLI as
+/// `CONNECTION_CLOSED` against a configuration that is perfectly correct. It runs first so that
+/// the explicit constants above are the ones that survive a collision, and it is a no-op for
+/// every non-bundled launch.
+///
+/// [`child_path`] is M17's half, chained onto it rather than folded separately so the ordering
+/// is visible in one expression. `bundle_scrub` only ever *removes*, so until it existed a
+/// pane's child got cide's own `PATH` verbatim — which for a Finder-launched `.app` is
+/// launchd's `/usr/bin:/bin:/usr/sbin:/sbin` and contains neither Homebrew nor `~/.local/bin`.
+/// It appends the directories `toolchain::search_paths` already searches, and it is built
+/// *from* the scrub's `PATH` so nothing the scrub dropped comes back.
+///
+/// This is also what closes the exec gap `README.md` records under *Finding `claude` from a
+/// Finder-launched `.app`*: `claude_cli::resolve` validates a bare `claude` against
+/// `search_paths()`, and portable-pty resolves a bare program against the builder's own `PATH`
+/// — so the check and the spawn now consult the same list instead of disagreeing about a
+/// directory and turning a refusal with a remedy in it into an opaque `ENOENT`.
+///
+/// # The `CLAUDE_CODE_*` pass, and why it is late
+///
+/// [`claude_env`] turns the user's [`cide_ipc::ClaudeSettings`] into the same `EnvChange` list,
+/// and is folded **after** the constants above so that a switch the user actually set wins over
+/// anything this function assumed. It carries `CLAUDE_CODE_SCROLL_SPEED`, which used to be a
+/// literal `3` in `base_env`.
+///
+/// The comment that literal carried was wrong, and the correction is the point of this
+/// paragraph. It read *"xterm.js reports one wheel event per notch, unamplified"*. Claude Code's
+/// own renderer heuristic concludes the opposite: it classifies a terminal announcing itself as
+/// `xterm.js` — which cide's XTVERSION reply deliberately does, see `ui/src/terminal/xterm.ts`
+/// — as a wheel **flooder**, and on that branch its unset default is `1` rather than the `3` it
+/// gives other renderers. So this variable was never the amplifier the comment described; it
+/// was cancelling a penalty cide had asked for two files away, and landing back on the ordinary
+/// default. Setting it remains right. The stated reason was not.
+///
+/// What a notch is actually worth is the product of two numbers, and cide only owns one of
+/// them. xterm.js sends **at most one mouse report per DOM wheel event** — `sendEvent` computes
+/// a line count and then discards it — and under a high-resolution wheel on Wayland one notch
+/// arrives as several small deltas, each of which `CoreMouseService.consumeWheelEvent` scales by
+/// `0.3` when `|deltaY| < 50` on the theory that it is a trackpad. Whether this machine's mouse
+/// lands in that regime is not knowable from here, and is not knowable without a wheel and a
+/// window. That is why the number is now the user's: it is the half of the product cide can
+/// move, from a control, without guessing at the other half.
+///
+/// Applied to every pane rather than only to `claude` ones, which is deliberate and matches
+/// what the literal did before. These variables mean nothing to `bash`, and a user who types
+/// `claude` at a shell pane's prompt should get the settings they configured rather than the
+/// defaults of a program cide did not notice starting.
+///
+/// # `extra`, and why *it* stops at a shell pane (M16)
+///
+/// For a pane, `extra` is [`crate::claude_cli::user_env`] — the user's own variables from their
+/// launch configuration — and the caller passes it **only when the pane is a Claude one**. The
+/// inconsistency with the paragraph above is deliberate and is written down here so it is not
+/// "fixed" later: the four `CLAUDE_CODE_*` names are inert to `bash` — a shell that inherits
+/// them is a shell that ignores them — while an arbitrary `NODE_OPTIONS`, `GIT_SSH_COMMAND` or
+/// `PATH` from that list is not inert to anything. A field labelled *the environment claude
+/// panes are spawned with* must not quietly become the environment the user's own shell is
+/// spawned with too. This function itself is unconditional and must stay so: it decides
+/// nothing about which pane it is composing for, and folds whatever it is handed.
+///
+/// Folded last of all so that a variable the user set beats a constant this function assumed —
+/// which is why `TERM`, `COLUMNS`, `LINES` and `TMUX` are on `claude_cli`'s refusal list rather
+/// than left to be shadowed. Everything applied *after* this function — the proxy pass,
+/// `CLAUDE_CODE_SSE_PORT`, `CIDE_HOOK_SOCK` — is out of the user's reach by construction, which
+/// is the other half of why those names are refused rather than merely discouraged: a value
+/// this list carried for one of them would be overwritten with nothing on screen saying so.
+pub fn terminal_child_env(
+    claude: &cide_ipc::ClaudeSettings,
+    version: &str,
+    extra: Vec<EnvChange>,
+) -> Vec<EnvChange> {
+    let scrub = bundle_scrub();
+    let path = child_path(&scrub);
+    let mut changes: Vec<EnvChange> = scrub.into_iter().chain(path).collect();
+    changes.extend([
+        ("TERM".to_string(), Some("xterm-256color".to_string())),
+        ("COLORTERM".to_string(), Some("truecolor".to_string())),
+        ("TERM_PROGRAM".to_string(), Some("cide".to_string())),
+        (
+            "TERM_PROGRAM_VERSION".to_string(),
+            Some(version.to_string()),
+        ),
+        ("TMUX".to_string(), None),
+        ("TMUX_PANE".to_string(), None),
+        ("COLUMNS".to_string(), None),
+        ("LINES".to_string(), None),
+        ("CI".to_string(), None),
+    ]);
+    changes.extend(claude_env(claude));
+    changes.extend(extra);
+    changes
 }
 
 // ==========================================================================================
@@ -659,6 +791,60 @@ fn spawner() -> &'static Sender<Job> {
         tx
     })
 }
+
+// ==========================================================================================
+// Part three: how a running child is signalled.
+// ==========================================================================================
+//
+// The two parts above are about the moment of the fork. This one is about every moment after
+// it, and it is here for the same reason `arm` is: it answers *what does a spawn site here owe
+// a child?* — a child cide started is a child cide has to be able to reach — this module
+// already links `libc` on unix, and it is exactly where `orphans::arm` moved when it gained a
+// second consumer. Same move, same reason.
+//
+// It lived as a private `deliver` in `cide_app::lifecycle`, which was fine while the shutdown
+// ladder was the only caller. M18's pause needs `SIGSTOP`/`SIGCONT` from `cide-agents`, and
+// `cide-agents` cannot depend on `cide-app` — nothing may, except the binary.
+
+/// Send `signal` to the child's **process group**, falling back to the process itself.
+///
+/// The group is what matters. `portable-pty` starts the child in a new session, so it leads
+/// a process group holding everything it spawned — a bash tool invocation, an MCP server —
+/// and signalling the leader alone leaves those running with the pty closed under them.
+/// `kill(-pid)` fails when the child never became a group leader, hence the fallback.
+///
+/// Takes a raw signal number rather than an enum on purpose: the callers do not agree on a
+/// vocabulary. The shutdown ladder has three rungs it escalates through; a pause has two
+/// signals that are not rungs of anything and must never be handed to the ladder. Mapping a
+/// caller's vocabulary onto a number is one line at each call site, and one enum covering both
+/// would be an enum whose variants are only valid for half of its consumers.
+#[cfg(unix)]
+pub fn signal_group(pid: u32, signal: libc::c_int) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // Negating 0 or 1 turns one signal into a broadcast: `kill(0, …)` hits this process's
+    // own group, and `kill(-1, …)` hits every process this user is allowed to signal.
+    // Neither is ever a pty child, so arriving here with one is a bug to refuse, not obey.
+    if pid <= 1 {
+        return;
+    }
+    // SAFETY: `kill` takes two integers and touches no memory owned by this process.
+    unsafe {
+        if libc::kill(-pid, signal) == -1 {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+/// No-op off unix, which makes the whole shutdown ladder — and the pause — one off unix. That
+/// matches `cide_app::lifecycle::install_signal_handlers`: Linux is the supported target, and a
+/// Windows build would need a job object rather than a translation of `kill(2)`.
+///
+/// `i32` rather than `libc::c_int` because `libc` is a unix-only dependency of this crate; the
+/// two are the same type on every target Rust supports.
+#[cfg(not(unix))]
+pub fn signal_group(_pid: u32, _signal: i32) {}
 
 #[cfg(test)]
 mod tests {
