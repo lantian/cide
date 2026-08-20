@@ -887,7 +887,7 @@ function FieldRow({
         onChange={(event) => run(commitEdit(task, { field, draft: event.target.value }))}
       >
         <option value="">{UNASSIGNED}</option>
-        {assignableRoles(task, roles).map((agent) => (
+        {assignableRoles(task.agent, roles).map((agent) => (
           <option key={agent} value={agent}>
             {roles[agent] ?? agent}
           </option>

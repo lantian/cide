@@ -45,7 +45,15 @@ import {
   type TaskNew,
 } from '@/ipc/client'
 import { adaptBoard } from './TasksPanel/adapt'
-import { BOARD_UNKNOWN, canWrite, newerBoard, type Board } from './TasksPanel/model'
+import {
+  BOARD_UNKNOWN,
+  EMPTY_DRAFT,
+  assigneeFromDraft,
+  canWrite,
+  newerBoard,
+  type Board,
+  type TaskDraft,
+} from './TasksPanel/model'
 
 interface TasksStore {
   project: ProjectId | null
@@ -54,13 +62,35 @@ interface TasksStore {
   /** Which task the panel has open, or `null` for the list. */
   selected: TaskId | null
   /**
-   * Whether a create gesture is under way.
+   * The task being composed, or `null` when the compose dialog is not up. (M21)
    *
-   * Owned by the store rather than by the host because it must survive the panel unmounting —
-   * the sidebar can be toggled shut mid-round-trip — and because it is what stops a second
-   * click on *New task* from putting a second task in a file the team commits.
+   * # Why the half-typed draft is here and not in the host
+   *
+   * This was a `composing: boolean`, because *New task* used to create the row immediately and
+   * the flag existed only to stop a second click writing a second one. The dialog replaced that
+   * gesture, and the flag grew a payload rather than a companion: two fields — "is it open" and
+   * "what is in it" — can disagree, and the state where the dialog is up with no draft is one
+   * every reader would have to handle and none could produce anything sensible for.
+   *
+   * It is in the store for the reason the flag was: it must **survive the panel unmounting**.
+   * The sidebar can be toggled shut, or switched to Files, in the middle of writing a task, and
+   * a draft held in `TasksPanelHost`'s `useState` would be gone when it came back — which is the
+   * silent data loss the whole dialog exists to prevent, arriving by a different door.
+   *
+   * It is emphatically **not** durable: nothing writes it to disk, nothing puts it on the wire,
+   * and no other window can see it. `TaskDraft`'s own doc argues why that is allowed — the task
+   * does not exist yet, so there is nothing for two windows to disagree about.
    */
-  composing: boolean
+  compose: TaskDraft | null
+  /**
+   * True from the moment Create is pressed until the write lands or fails.
+   *
+   * The dialog stays up and its Create goes inert. Closing on the click instead would be one
+   * fewer state to carry and would throw the user's paragraph away on a write that failed —
+   * there is no draft on disk to recover it from, which is the point of a draft that never
+   * reached Rust.
+   */
+  creating: boolean
 
   /** Point the store at a project, or at nothing. Clears first. */
   attach: (project: ProjectId | null) => Promise<void>
@@ -69,10 +99,20 @@ interface TasksStore {
   /** Take a board somebody else produced — a broadcast, or a mutation's answer. */
   adopt: (project: ProjectId, board: WireBoard) => void
   select: (task: TaskId | null) => void
+  /** Open the compose dialog on an empty draft. A no-op while one is already open. */
   beginCompose: () => void
+  /** A keystroke in the dialog. The draft is replaced whole; the dialog is controlled. */
+  setDraft: (draft: TaskDraft) => void
+  /** Discard the draft and close the dialog. Cancel, the ✕ and Escape all arrive here. */
   endCompose: () => void
-  /** Create a task, and with it `.cide/tasks.json` if the project has none. */
-  create: (title: string, body?: string) => Promise<void>
+  /**
+   * Create a task, and with it `.cide/tasks.json` if the project has none.
+   *
+   * Takes the whole draft rather than `(title, body)`: the dialog collects four fields and a
+   * create that dropped two of them would make the user open the card and set them again, which
+   * is the two-writes-instead-of-one shape `TaskNew::status` was added to end.
+   */
+  create: (draft: TaskDraft) => Promise<void>
   edit: (task: TaskId, edit: TaskEdit) => Promise<void>
   remove: (task: TaskId) => Promise<void>
 }
@@ -89,7 +129,8 @@ export const useTasks = create<TasksStore>((set, get) => ({
   project: null,
   board: BOARD_UNKNOWN,
   selected: null,
-  composing: false,
+  compose: null,
+  creating: false,
 
   attach: async (project) => {
     generation += 1
@@ -104,7 +145,17 @@ export const useTasks = create<TasksStore>((set, get) => ({
      * The selection goes with it. A `t-14` opened in the previous project is not a task in this
      * one, and an id that happens to collide would open a different task under the same name.
      */
-    set({ project, board: BOARD_UNKNOWN, selected: null, composing: false })
+    // The draft goes with the selection, and for a sharper version of its reason: a half-written
+    // task is *for* the project it was started in — its assignee names a role out of that
+    // project's `.cide/`, and Create would write it into the tracker of whichever project the
+    // user happens to be looking at when they press it.
+    set({
+      project,
+      board: BOARD_UNKNOWN,
+      selected: null,
+      compose: null,
+      creating: false,
+    })
     if (project === null) return
     await get().refresh()
   },
@@ -147,10 +198,19 @@ export const useTasks = create<TasksStore>((set, get) => ({
 
   select: (task) => set({ selected: task }),
 
-  beginCompose: () => set({ composing: true }),
-  endCompose: () => set({ composing: false }),
+  /*
+   * Idempotent, and that is the re-entrancy guard the boolean used to be: a second *New task*
+   * while the dialog is up must not throw away what has been typed into it. `EMPTY_DRAFT` is a
+   * module constant, so re-opening does not mint a fresh object either.
+   */
+  beginCompose: () => {
+    if (get().compose !== null) return
+    set({ compose: EMPTY_DRAFT })
+  },
+  setDraft: (draft) => set({ compose: draft }),
+  endCompose: () => set({ compose: null, creating: false }),
 
-  create: async (title, body) => {
+  create: async (draft) => {
     const project = get().project
     if (project === null) return
     /*
@@ -168,30 +228,57 @@ export const useTasks = create<TasksStore>((set, get) => ({
      */
     if (!canWrite(get().board)) return
     /*
-     * Built rather than spread, and `body` is folded in only when it is a string: under
+     * Built field by field, and each optional folded in only when it has a value: under
      * `exactOptionalPropertyTypes` an explicit `body: undefined` is not the same as an absent
-     * `body`, and `TaskNew::body` is `Option<String>` precisely so the common call need not send
-     * an empty string.
+     * `body`, and every one of these three is `Option<…>` in `TaskNew` precisely so the common
+     * call — an orchestrator creating five titles at once — need not send three empty values
+     * five times.
+     *
+     * `title` is trimmed here rather than in the dialog. `draftReady` already refuses a
+     * whitespace-only one, so this is about the *inside* of the field: `TaskStore::create` trims
+     * too, and a title that arrived with a trailing space would come back from Rust differing
+     * from the draft that produced it.
+     *
+     * `status` is the field `TaskNew` grew for this dialog, and it is the whole reason the
+     * segment in it is not decoration — see that field's doc for why it is the user's and
+     * structurally not an agent's.
      */
-    const req: TaskNew = { project, title, ...(body === undefined ? {} : { body }) }
+    const body = draft.body.trim() === '' ? undefined : draft.body
+    const agent = assigneeFromDraft(draft.assignee)
+    const req: TaskNew = {
+      project,
+      title: draft.title.trim(),
+      ...(body === undefined ? {} : { body }),
+      ...(agent === null ? {} : { agent }),
+      status: draft.status,
+    }
     /*
-     * Which ids existed before the call, so the new one can be found in the answer. The board
-     * comes back whole — no `hydrate()`, no second ask — and Rust does not say which task it
-     * minted, because the file is a list whose order is the priority and "the last one" is not a
-     * promise the format makes.
+     * The dialog stays up across the await, with Create inert. See `creating`: a dialog that
+     * closed on the click would take the user's paragraph with it the first time a write failed,
+     * and there is nothing anywhere to recover it from.
      */
-    const before = new Set(idsOf(get().board))
-    const wire = await tasksApi.create(req)
-    if (get().project !== project) return
-    get().adopt(project, wire)
-    const minted = idsOf(get().board).filter((id) => !before.has(id))
-    /*
-     * Opened only when exactly one task is new. Two means another writer landed a task in the
-     * same window — an agent, or the other cide window — and opening the wrong one is worse than
-     * opening none: the user would start typing a title into somebody else's task.
-     */
-    const first = minted[0]
-    if (minted.length === 1 && first !== undefined) set({ selected: first })
+    set({ creating: true })
+    try {
+      const wire = await tasksApi.create(req)
+      // The user left for another project mid-write. The task was still created — in the project
+      // it was composed for — so this is not a failure; there is simply nothing here to paint,
+      // and `attach` has already cleared the dialog.
+      if (get().project !== project) return
+      get().adopt(project, wire)
+      /*
+       * Closed **only once the write landed**, and the card is deliberately *not* opened on top.
+       *
+       * *New task* used to create a row and open its card, because the card was where the task
+       * got its title. The dialog is that surface now, so opening a second modal for a task
+       * whose four fields the user has just filled in would be answering a finished gesture with
+       * another one. The confirmation is the row appearing in the list, which is what
+       * `filterAfterCreate` is for — a create the user cannot see reads as a create that did not
+       * happen.
+       */
+      set({ compose: null })
+    } finally {
+      set({ creating: false })
+    }
   },
 
   edit: async (task, edit) => {
@@ -214,8 +301,3 @@ export const useTasks = create<TasksStore>((set, get) => ({
     if (get().selected === task) set({ selected: null })
   },
 }))
-
-/** The ids a board holds, or `[]` for every arm that holds none. */
-function idsOf(board: Board): readonly TaskId[] {
-  return board.kind === 'ready' ? board.tasks.map((task) => task.id) : []
-}

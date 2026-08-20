@@ -33,9 +33,12 @@
  * `.cide/tasks.json` is a half-resolved merge conflict, which is to say a file that still
  * contains both sides of everything.
  *
- * `absent` offers one `New task` button, which creates the file. There is no separate ceremony
- * for that, and the path is printed in full above the button, because a control that quietly
- * adds a tracked file to somebody's repository is a surprise commit.
+ * `absent` offers one `New task` button, and the path is printed in full **above** it, because a
+ * control that quietly adds a tracked file to somebody's repository is a surprise commit. The
+ * button opens `TaskComposeModal` and writes nothing itself; the file is created by the Create
+ * inside it, along with the first task. (M21) That ordering is why the path belongs on this
+ * screen rather than in the dialog: it is the sentence that has to be readable before the click,
+ * and the dialog is already past it.
  *
  * # The open task's card is not here
  *

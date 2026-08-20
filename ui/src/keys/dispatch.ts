@@ -394,6 +394,12 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (on === null) return unmet(command, 'no focused pane')
         return void ws.closePane(on.project, on.tab, on.pane)
 
+      case 'pane.evenRow':
+        // 'row' rather than the tab's rows: the palette row and the pane menu's item are the
+        // same gesture, and the menu's says "row" on it.
+        if (on === null) return unmet(command, 'no focused pane')
+        return void ws.distributePanes(on.project, on.tab, on.pane, 'row')
+
       case 'pane.maximize': {
         // A toggle, because the command is reached by one key and one palette row: a
         // maximize with no un-maximize leaves the user with a full-screen pane and no

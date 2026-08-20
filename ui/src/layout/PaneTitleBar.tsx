@@ -66,11 +66,13 @@ import {
   type Bootstrap,
   type Pane,
   type PaneId,
+  type PaneTree,
   type ProjectId,
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
 import { useWorkspace } from '@/store/workspace'
+import { chainAround } from './SplitTree'
 import { paneSessionId } from './paneHosts'
 import { acknowledge, useAwaiting } from '@/panes/awaiting'
 import styles from './PaneTitleBar.module.css'
@@ -105,11 +107,16 @@ function inDetachedPaneWindow(): boolean {
 function paneLocation(
   boot: Bootstrap | null,
   pane: PaneId,
-): { project: ProjectId; tab: TabId } | null {
+): { project: ProjectId; tab: TabId; tree: PaneTree } | null {
   if (boot === null) return null
   for (const project of Object.values(boot.workspace.projects)) {
     for (const tab of project.tabs) {
-      if (Object.hasOwn(tab.tree.panes, pane)) return { project: project.id, tab: tab.id }
+      if (Object.hasOwn(tab.tree.panes, pane)) {
+        // The tree comes back with the ids because the one caller that needs it — the row
+        // item below, asking how many tiles this pane shares its row with — would otherwise
+        // walk the same projects a second time to find the tab it has just been handed.
+        return { project: project.id, tab: tab.id, tree: tab.tree }
+      }
     }
   }
   return null
@@ -293,6 +300,24 @@ export function PaneFrame({
       .splitPane(target.project, target.tab, pane.id, 'row', 'after', intent)
   }
 
+  /*
+   * "Set all panels in current row to same width (proportional)" — the user's own words, and
+   * the gesture that was missing: a row could only be evened out by dragging each divider
+   * back to a number you cannot see.
+   *
+   * The row, not the tab. `layout::distribute` rewrites the ratios of one chain and nothing
+   * else, so the rows above and below keep their heights bit for bit — the same theorem a
+   * divider drag rests on.
+   */
+  const evenRow = (): void => {
+    const target = paneLocation(useWorkspace.getState().boot, pane.id)
+    // A pane this window's snapshot does not hold. Unlike `addTile` there is no intent-less
+    // fallback to take, and there is nothing to lose by doing nothing: the item is greyed
+    // out in exactly this case, so reaching here means the snapshot changed under the menu.
+    if (target === null) return
+    void useWorkspace.getState().distributePanes(target.project, target.tab, pane.id, 'row')
+  }
+
   const tileMenu = useContextMenu({
     label: 'Add a pane to this row',
     items: () =>
@@ -339,6 +364,12 @@ export function PaneFrame({
       ]
     }
 
+    // At open time, like everything else here: a tile added or a divider dragged since the
+    // last right-click must not leave this item disabled against a row that has since grown.
+    const here = paneLocation(useWorkspace.getState().boot, pane.id)
+    const tiles =
+      here === null ? 0 : (chainAround(here.tree.root, pane.id, 'row')?.members.length ?? 1)
+
     return [
       {
         id: 'split-right',
@@ -365,6 +396,21 @@ export function PaneFrame({
         // works, because it belongs to the tree rather than to any one pane.
         run: onAddRow,
         disabledReason: onAddRow ? undefined : 'Use the row buttons in the header',
+      },
+      {
+        id: 'even-row',
+        label: 'Even out this row',
+        command: 'pane.evenRow',
+        /*
+         * Greyed rather than hidden when there is nothing to even out, and the count comes
+         * from `chainAround` — the frontend's mirror of the walk Rust does — so the reason
+         * this line gives and the row the command would act on are the same row.
+         *
+         * `tiles` is members, not panes: a cell holding a stacked column counts once, which
+         * is exactly what the gesture evens out.
+         */
+        run: tiles > 1 ? evenRow : undefined,
+        disabledReason: tiles > 1 ? undefined : 'This pane is the only one in its row',
       },
       { kind: 'separator' },
       {

@@ -1119,22 +1119,27 @@ export function activeEdit(
 }
 
 /**
- * The ids the assignee editor may offer, sorted, with the task's own role folded in.
+ * The ids an assignee `<select>` may offer, sorted, with the value it is already showing folded
+ * in.
  *
  * A `<select>` whose current value is not among its options **silently shows the first one**, so
  * a task assigned to a role somebody deleted from `.cide/agents/` would render as *Unassigned*
  * and then reassign itself to nobody the moment the control was touched. Folding the id in is
  * what keeps the control honest about a roster and a board that are two reads of two files.
  *
+ * Takes the **current assignee** rather than a task, because the compose dialog has no task and
+ * needs the same list: a draft's assignee can only ever have come from these options, so nothing
+ * is folded in there, but a second copy of the sorted-ids expression is how the dialog would
+ * quietly keep the old list the day this rule grows a second clause.
+ *
  * Here rather than in the component because it is that rule, not a list comprehension.
  */
 export function assignableRoles(
-  task: TaskView,
+  agent: string | null,
   roles: Readonly<Record<string, string>>,
 ): string[] {
   const ids = Object.keys(roles).sort()
-  const own = task.agent
-  if (own !== null && own.trim() !== '' && !ids.includes(own)) ids.push(own)
+  if (agent !== null && agent.trim() !== '' && !ids.includes(agent)) ids.push(agent)
   return ids
 }
 

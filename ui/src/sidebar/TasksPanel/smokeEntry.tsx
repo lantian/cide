@@ -44,11 +44,19 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { TasksPanelView } from './TasksPanel'
 import { TaskDetail } from './TaskDetail'
-import { CARD_STORIES, TASKS_STORIES, type CardStoryName, type TasksStoryName } from './fixture'
+import { TaskCompose } from './TaskCompose'
+import {
+  CARD_STORIES,
+  COMPOSE_STORIES,
+  TASKS_STORIES,
+  type CardStoryName,
+  type ComposeStoryName,
+  type TasksStoryName,
+} from './fixture'
 
 /** What the check script asserts on. */
 export interface TasksDigest {
-  story: TasksStoryName | CardStoryName
+  story: TasksStoryName | CardStoryName | ComposeStoryName
   /** The header's right-hand figure. Empty when `metaFigure` withheld it. */
   meta: string
   claim: string | null
@@ -113,6 +121,20 @@ export interface TasksDigest {
   /** Whether the card draws an explicit close control. */
   close: boolean
   /**
+   * Whether the compose dialog is on screen at all, and what it drew. (M21)
+   *
+   * `composeControls` counts `<input>`/`<textarea>`/`<select>` inside the dialog's rows, exactly
+   * as `fieldControls` does for the card — and the two assertions are inverses: the card must
+   * have **none** at rest, this must have all of them at once. `composeCreate` is `''` when
+   * there is no Create at all and `on`/`off` otherwise, so "the button vanished" and "the button
+   * is waiting" cannot be digested as the same thing.
+   */
+  compose: boolean
+  composeControls: number
+  composeStatuses: string[]
+  composeCreate: string
+  composeCancel: boolean
+  /**
    * The card's creator line, and the author arm it was drawn from: `<kind>|<text>`.
    *
    * The kind is digested beside the words so the check can assert the label was read off the
@@ -149,10 +171,16 @@ const digests: TasksDigest[] = [
   ...(Object.keys(CARD_STORIES) as CardStoryName[]).map((story) =>
     digest(story, renderToStaticMarkup(<TaskDetail {...CARD_STORIES[story]} />)),
   ),
+  ...(Object.keys(COMPOSE_STORIES) as ComposeStoryName[]).map((story) =>
+    digest(story, renderToStaticMarkup(<TaskCompose {...COMPOSE_STORIES[story]} />)),
+  ),
 ]
 console.log(JSON.stringify(digests))
 
-function digest(story: TasksStoryName | CardStoryName, html: string): TasksDigest {
+function digest(
+  story: TasksStoryName | CardStoryName | ComposeStoryName,
+  html: string,
+): TasksDigest {
   /*
    * Local class names survive Vite's hashing as a substring — `_taskTitle_1a2b3` — which is what
    * `ProblemsPanel/smokeEntry.tsx` already relies on. Keyed off those rather than off a position
@@ -203,6 +231,20 @@ function digest(story: TasksStoryName | CardStoryName, html: string): TasksDiges
       (value) => `${attr(value, 'data-field')}|${text(value)}`,
     ),
     close: html.includes('data-audit="tasksClose"'),
+    compose: html.includes('data-audit="taskCompose"'),
+    composeControls: all(html, 'taskComposeRow').reduce(
+      (n, row) => n + [...row.matchAll(/<(input|textarea|select)\b/g)].length,
+      0,
+    ),
+    composeStatuses: all(html, 'taskComposeStatus').map(
+      (button) => `${attr(button, 'data-status')}|${attr(button, 'aria-pressed')}`,
+    ),
+    composeCreate: (() => {
+      const button = all(html, 'taskComposeCreate')[0]
+      if (button === undefined) return ''
+      return / disabled(?:=|\s|\/|>)/.test(button) ? 'off' : 'on'
+    })(),
+    composeCancel: html.includes('data-audit="taskComposeCancel"'),
     creator: all(html, 'tasksCreator')
       .map((span) => `${attr(span, 'data-creator')}|${text(span)}`)
       .join(''),

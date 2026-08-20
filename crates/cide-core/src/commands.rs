@@ -398,6 +398,9 @@ fn build() -> Vec<Command> {
         Command::new("pane.detachToWindow", "Detach pane into window", WINDOW).when("paneFocused"),
         Command::new("pane.close", "Close pane", WINDOW).when("paneFocused"),
         Command::new("pane.maximize", "Maximize pane", WINDOW).when("paneFocused"),
+        // The row, not the tab: it evens out the tiles beside this pane and leaves every
+        // other chain — the rows above and below it included — bit for bit as it was.
+        Command::new("pane.evenRow", "Even out the panes in this row", WINDOW).when("paneFocused"),
         Command::new("pane.navigate.left", "Focus pane left", WINDOW).when("paneFocused"),
         Command::new("pane.navigate.right", "Focus pane right", WINDOW).when("paneFocused"),
         Command::new("pane.navigate.up", "Focus pane up", WINDOW).when("paneFocused"),

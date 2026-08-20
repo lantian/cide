@@ -530,6 +530,8 @@ interface WorkspaceStore {
   maximizePane: (project: ProjectId, tab: TabId, pane: PaneId | null) => Promise<void>
   /** Committed on pointerup only — the drag itself writes to the DOM. */
   setRatio: (project: ProjectId, tab: TabId, split: SplitId, ratio: number) => Promise<void>
+  /** Every member of the pane's chain to an equal share of it. `'row'` is its tiles. */
+  distributePanes: (project: ProjectId, tab: TabId, pane: PaneId, axis: Axis) => Promise<void>
   navigatePane: (
     project: ProjectId,
     tab: TabId,
@@ -849,6 +851,16 @@ export const useWorkspace = create<WorkspaceStore>((set, get) => ({
    */
   setRatio: async (project, tab, split, ratio) => {
     await paneApi.setRatio(project, tab, split, ratio)
+  },
+  /*
+   * Hydrates, unlike `setRatio` above, and the difference is that this one is a menu click
+   * rather than the last frame of a drag: nothing has written the new tracks to the DOM
+   * ahead of the round trip, so the snapshot *is* the only thing that moves the dividers.
+   * One re-render at the end of a click is what every other mutator here costs.
+   */
+  distributePanes: async (project, tab, pane, axis) => {
+    await paneApi.distribute(project, tab, pane, axis)
+    await get().hydrate()
   },
   navigatePane: async (project, tab, pane, direction) => {
     // Two calls because the domain separates "where would focus go" from "move it": the

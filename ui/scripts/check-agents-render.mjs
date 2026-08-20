@@ -741,8 +741,9 @@ try {
   {
     const d = t('absent')
     ok(d.buttons?.includes('New task'), 'the absent screen offers one creating control')
-    eq(d.writeControls, 1, 'exactly one — creating the first task *is* creating the file, and ' +
-      'a separate ceremony for that would be a second thing to explain')
+    eq(d.writeControls, 1, 'exactly one, and it is the entry to the compose dialog rather than ' +
+      'a write — creating the first task is what creates the file, so this screen and a ' +
+      'populated one reach it the same way')
     ok(d.text?.includes(TASKS_PATH), 'with the path printed in full, before the button')
     ok(
       d.text?.indexOf(TASKS_PATH) < d.text?.indexOf('New task'),
@@ -987,6 +988,92 @@ try {
     const live = t('card-with-live-run')
     eq(live.runStrip, true, 'a live run against this task gets its strip')
     ok(live.buttons?.includes('Open'), 'and the strip can attach a pane to it')
+  }
+
+  /*
+   * ===== The compose dialog: a task that does not exist yet. ==============================
+   *
+   * Reported as *"i'm expecting that all fields are editable and task isn't created while not
+   * press Create"*. *New task* used to create the row on the click and open its card, so a
+   * mis-click put a titled-`New task` row into a file the whole team commits — one that had to
+   * be deleted rather than abandoned, and that a dispatched agent could read in between.
+   *
+   * These assertions are the **inverse** of the card's two blocks above, and deliberately so:
+   * the card must draw no control at rest, and this must draw every one of them at once. There
+   * is nothing to read here and nobody else writing, so a pencil per field would be four
+   * ceremonies to write one task.
+   */
+  {
+    const empty = t('compose-empty')
+    const filled = t('compose-filled')
+
+    eq(empty.compose, true, 'the dialog renders at all')
+    eq(
+      empty.composeControls,
+      3,
+      'and draws a live control in every field at once — the title box, the assignee select and ' +
+        'the body box. Three and not four because the status field is a segment of buttons, ' +
+        'asserted on its own below; the card’s `fieldControls` counts the same three and must ' +
+        'be ZERO at rest, which is the pair these two numbers make',
+    )
+    eq(empty.composeControls, filled.composeControls, 'the same four whether or not it is filled in')
+    eq(
+      empty.composeStatuses,
+      ['todo|true', 'doing|false', 'review|false', 'done|false'],
+      'the status segment offers all four and starts on `todo` — `EMPTY_DRAFT`’s value, and not ' +
+        'the filter the list happens to be on: a status the user did not choose is one they will ' +
+        'not notice, in a file their repository tracks',
+    )
+    eq(
+      filled.composeStatuses,
+      ['todo|false', 'doing|true', 'review|false', 'done|false'],
+      'and a draft that named one is drawn on it. This is the field `TaskNew::status` was added ' +
+        'for, so a user starting work now says so in one write instead of two',
+    )
+
+    /*
+     * The pair the whole report turns on. Counted as `on`/`off` rather than by looking for the
+     * button, so "Create vanished" and "Create is waiting" cannot digest the same — a Create
+     * that materialised mid-word would pass a mere presence check on the filled story alone.
+     */
+    eq(
+      empty.composeCreate,
+      'off',
+      'with no title, Create is drawn and REFUSES: `draftReady` is the gate, because ' +
+        '`cide_tasks::validate` refuses a task with no title and a failure notice is a worse ' +
+        'way to learn that than a button that is visibly waiting',
+    )
+    eq(filled.composeCreate, 'on', '...and goes live once there is one')
+    eq(empty.composeCancel, true, 'Cancel is there in both')
+    eq(filled.composeCancel, true, '...and in the filled one')
+    ok(
+      empty.buttons?.includes('Create') && empty.buttons?.includes('Cancel'),
+      'both are named in words rather than glyphs — this is the one dialog in the panel whose ' +
+        'two ways out do opposite things',
+    )
+
+    /*
+     * The write in flight. The dialog stays up: closing on the click would throw the user's
+     * paragraph away the first time a create failed, and the draft is in no file to recover it
+     * from — which is precisely the property that makes "nothing is written until Create" true.
+     */
+    const busy = t('compose-busy')
+    eq(busy.compose, true, 'a create in flight leaves the dialog on screen')
+    eq(busy.composeControls, 3, 'still holding every field the user typed into')
+    eq(busy.composeCreate, 'off', 'with Create inert, so a second press cannot write twice')
+    eq(busy.composeCancel, true, 'and a way out that still works')
+
+    for (const [name, d] of [['compose-empty', empty], ['compose-filled', filled], ['compose-busy', busy]]) {
+      eq(d.unclassed, 0, `${name}: names only classes its stylesheet defines`)
+    }
+
+    /*
+     * And the card, which shares the stylesheet, still has none of this. A digest is per-story,
+     * so this is really a statement about the two components being separate: a compose form
+     * spliced into `TaskDetail` would put four live boxes over a record several agents write to.
+     */
+    eq(t('card').compose, false, 'the card is not the compose dialog')
+    eq(t('card').composeControls, 0, 'and draws none of its controls')
   }
 
   /*

@@ -128,6 +128,41 @@ export function flattenChain(node: SplitNode): Chain {
 }
 
 /**
+ * The chain of `axis` that `pane` belongs to, or `null` when no split of that axis is above
+ * it — a lone pane, or one under nothing but cross-axis splits, which is a row of one.
+ *
+ * The mirror of `cide-core::layout`'s `chain_around`, and it has to give the same answer:
+ * the *Even out this row* menu item greys itself out from this member count while the
+ * command it fires acts on whatever Rust finds, so a disagreement is an item that claims a
+ * row is a row of one and then evens out three tiles when you pick it anyway.
+ *
+ * Innermost, then outwards. The deepest same-axis ancestor is the one whose members are the
+ * pane's actual neighbours; climbing back out through the unbroken run of same-axis splits
+ * above it is what makes the answer the chain's *maximal* root, which is the only node
+ * whose shares sum to 1 — `flattenChain` on anything less is a fraction of a row read as a
+ * whole one.
+ */
+export function chainAround(root: LayoutNode, pane: PaneId, axis: Axis): Chain | null {
+  const trail: SplitNode[] = []
+  const walk = (node: LayoutNode): boolean => {
+    if (node.kind === 'leaf') return node.pane === pane
+    trail.push(node)
+    if (walk(node.a) || walk(node.b)) return true
+    trail.pop()
+    return false
+  }
+  if (!walk(root)) return null
+
+  let k = trail.length - 1
+  while (k >= 0 && trail[k]?.axis !== axis) k -= 1
+  if (k < 0) return null
+  while (k > 0 && trail[k - 1]?.axis === axis) k -= 1
+
+  const node = trail[k]
+  return node === undefined ? null : flattenChain(node)
+}
+
+/**
  * A chain member's React key: its own id, which no insertion elsewhere in the chain can
  * change. Exported so `check:rows` can pin the property the keying exists for.
  */

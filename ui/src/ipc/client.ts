@@ -299,6 +299,22 @@ export const pane = {
     invoke<{ rev: number }>('pane_maximize', { project: projectId, tab: tabId, pane: paneId }),
 
   /**
+   * Give every tile of a pane's row the same width — the row it is a tile of, and no other
+   * chain: the rows above and below keep their heights exactly.
+   *
+   * `axis: 'row'` is the tiles beside the pane, `'col'` the rows of the tab. Only the row
+   * form has a gesture today (the pane menu's *Even out this row*, and `pane.evenRow`).
+   * A pane with no chain of that axis above it is a row of one and this does nothing.
+   */
+  distribute: (projectId: ProjectId, tabId: TabId, paneId: PaneId, axis: Axis) =>
+    invoke<{ rev: number }>('pane_distribute', {
+      project: projectId,
+      tab: tabId,
+      pane: paneId,
+      axis,
+    }),
+
+  /**
    * Move a divider. `ratio` is the **pair share** — the first of the two tiles this divider
    * separates within its row, not the split node's `a`-share. The two are the same number
    * for every two-pane tab and for the shipped console, which is why this signature did not

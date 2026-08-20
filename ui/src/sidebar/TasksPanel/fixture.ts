@@ -14,7 +14,8 @@
  * # Two families of story, because the card is a modal
  *
  * `TASKS_STORIES` are `TasksPanelViewProps` — the list, in every board state. `CARD_STORIES` are
- * `TaskDetailProps` — the open task's card, in every read/edit state. They are separate because
+ * `TaskDetailProps` — the open task's card, in every read/edit state. `COMPOSE_STORIES` are
+ * `TaskComposeProps` — the new-task dialog, empty and filled in. (M21) They are separate because
  * the card is now mounted by `TasksPanelHost` beside the view rather than inside it, and because
  * the thing that mounts it (`TaskDetailModal`, an `OverlayCard`) portals to `document.body`,
  * which `react-dom/server` refuses to render at all. `TaskDetail` is the whole card minus that
@@ -37,9 +38,20 @@
  * this wrong is a blank window rather than a wrong date.
  */
 import type { ProjectId } from '@/ipc/client'
-import type { ArmedDelete, Board, CommentView, FieldEdit, RunRef, TaskStatus, TaskView } from './model'
+import {
+  EMPTY_DRAFT,
+  type ArmedDelete,
+  type Board,
+  type CommentView,
+  type FieldEdit,
+  type RunRef,
+  type TaskDraft,
+  type TaskStatus,
+  type TaskView,
+} from './model'
 import type { TasksPanelViewProps } from './TasksPanel'
 import type { TaskDetailProps } from './TaskDetail'
+import type { TaskComposeProps } from './TaskCompose'
 
 /** A fixed instant, so a digest of a story is the same on two runs. */
 export const NOW_MS = 1_764_005_000_000
@@ -250,6 +262,17 @@ function card(over: Partial<TaskDetailProps> & Pick<TaskDetailProps, 'task'>): T
   return { runs: [], roles: ROLES, nowMs: NOW_MS, ...CARD_HANDLERS, ...over }
 }
 
+function compose(draft: TaskDraft, over: Partial<TaskComposeProps> = {}): TaskComposeProps {
+  return {
+    draft,
+    roles: ROLES,
+    onDraft: () => {},
+    onCreate: () => {},
+    onCancel: () => {},
+    ...over,
+  }
+}
+
 /**
  * A task with nothing in any of the three editable fields, and the reason it is a story.
  *
@@ -455,4 +478,45 @@ export const CARD_STORIES: Record<CardStoryName, TaskDetailProps> = {
    * It stays a two-click arming inside the modal rather than becoming a second dialog.
    */
   'card-delete-armed': card({ task: T14, deleteArmed: true }),
+}
+
+/**
+ * The compose dialog's named states — `TaskCompose`, which is `TaskComposeModal` minus the one
+ * wrapper a server render cannot follow. (M21)
+ *
+ * Three stories, and the pairs are again what carry the assertions:
+ *
+ *  - **`compose-empty` against `compose-filled`.** Same dialog, one prop apart. Empty, Create
+ *    must be **present and disabled**: `draftReady` refuses a task with no title, because
+ *    `cide_tasks::validate` does, and a Create that vanished until the first keystroke is harder
+ *    to understand than one visibly waiting. Filled, the same button must be live. "Disabled
+ *    until ready" is not a claim that can be made about a single story.
+ *  - **`compose-busy` against `compose-filled`.** A ready draft with the write in flight: the
+ *    dialog is still up and Create is inert. A dialog that closed on the click would take the
+ *    user's paragraph with it the first time a write failed, and there is nothing on disk to
+ *    recover it from.
+ *
+ * Every story draws four live controls. That is the assertion the whole change is about — the
+ * report was *"all fields are editable and task isn't created while not press Create"* — and it
+ * is the exact inverse of the card's, which must draw **none** at rest.
+ */
+export type ComposeStoryName = 'compose-empty' | 'compose-filled' | 'compose-busy'
+
+/** A draft with something in every field, including a status that is not the default. */
+const FILLED_DRAFT: TaskDraft = {
+  title: 'Teach the watcher about .cide/',
+  status: 'doing',
+  assignee: 'qa',
+  body: 'The filter rejects dot-prefixed components before any gitignore matcher runs.',
+}
+
+export const COMPOSE_STORIES: Record<ComposeStoryName, TaskComposeProps> = {
+  /* Nothing typed. Four controls, and a Create that is drawn and refuses. */
+  'compose-empty': compose(EMPTY_DRAFT),
+
+  /* Every field carrying a value, including a starting status the user chose. */
+  'compose-filled': compose(FILLED_DRAFT),
+
+  /* Create pressed, the write in flight. Still on screen, still holding the draft. */
+  'compose-busy': compose(FILLED_DRAFT, { busy: true }),
 }

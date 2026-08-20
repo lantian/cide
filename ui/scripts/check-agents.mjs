@@ -190,6 +190,11 @@ try {
     canWrite,
     commentOrder,
     authorLabel,
+    EMPTY_DRAFT,
+    draftReady,
+    draftDirty,
+    closeCompose,
+    filterAfterCreate,
     TASK_FIELDS,
     EDITABLE_FIELDS,
     UNASSIGNED,
@@ -1316,18 +1321,18 @@ try {
     )
 
     eq(
-      assignableRoles(T, ROLES),
+      assignableRoles(T.agent, ROLES),
       ['developer', 'qa'],
       'the assignee editor offers the roster, sorted',
     )
     eq(
-      assignableRoles(task({ agent: 'ghost' }), ROLES),
+      assignableRoles('ghost', ROLES),
       ['developer', 'qa', 'ghost'],
       'with the task’s own role folded in even when the roster has dropped it. A `<select>` ' +
         'whose value is not among its options silently shows the first one — so this task would ' +
         'render as assigned to `developer` and reassign itself the moment it was touched',
     )
-    eq(assignableRoles(BARE, ROLES), ['developer', 'qa'], 'and nothing is folded in for nobody')
+    eq(assignableRoles(BARE.agent, ROLES), ['developer', 'qa'], 'and nothing is folded in for nobody')
 
     /* -- dirtiness, which every rule below is gated on ----------------------------------- */
 
@@ -1446,6 +1451,121 @@ try {
       const dismissNone = drive(closeCard(T, null, 'dismiss'), 'the ✕ with nothing in edit')
       eq(dismissNone.commit, null, 'nothing in edit, nothing to write')
       eq(dismissNone.close, true, 'and the card closes')
+    }
+
+    /* -- composing a task that does not exist yet (M21) ------------------------------------ */
+
+    /*
+     * The report: *"i'm expecting that all fields are editable and task isn't created while not
+     * press Create"*. *New task* used to create the row on the click, so a mis-click put a row
+     * titled `New task` into a file the whole team commits — one that had to be deleted rather
+     * than abandoned, and that a dispatched agent could read in between.
+     *
+     * The dialog's rules are here, in the module the check can drive, rather than in the
+     * component: which drafts may be created, which are worth protecting, and which ways out
+     * are honoured.
+     */
+    {
+      const draft = (over) => ({ ...EMPTY_DRAFT, ...over })
+
+      eq(EMPTY_DRAFT.status, 'todo', 'the dialog opens on `todo`, not on the filter the list ' +
+        'happens to be on — a status the user did not choose is one they will not notice, and ' +
+        'this one is written into a file their repository tracks')
+      eq(EMPTY_DRAFT.assignee, '', 'and on nobody. The empty string IS unassigned, because a ' +
+        '`<select>` has no null — `assigneeFromDraft` is the other half of that convention')
+
+      /* -- Create's gate. The title is the one required field. -- */
+
+      eq(draftReady(EMPTY_DRAFT), false, 'an empty draft cannot be created')
+      eq(
+        draftReady(draft({ title: '   ' })),
+        false,
+        'nor can a whitespace title — `cide_tasks::validate` refuses it, and a failure notice ' +
+          'is a worse way to learn that than a button that is visibly waiting',
+      )
+      eq(draftReady(draft({ title: 'x' })), true, 'one character is enough')
+      eq(
+        draftReady(draft({ body: 'a paragraph', assignee: 'qa', status: 'doing' })),
+        false,
+        'and the other three cannot stand in for it: a task with no title is a row nobody can ' +
+          'act on, whatever else is filled in',
+      )
+
+      /* -- Dirtiness, which is what the scrim is refused over. -- */
+
+      eq(draftDirty(EMPTY_DRAFT), false, 'a draft nobody has touched is clean')
+      eq(
+        draftDirty(draft({ title: '  ' })),
+        false,
+        'and so is a stray space — treating it as dirty would make the scrim stop working with ' +
+          'nothing on screen saying why',
+      )
+      eq(draftDirty(draft({ title: 'x' })), true, 'a typed title is work worth protecting')
+      eq(draftDirty(draft({ body: 'x' })), true, '...so is a body')
+      eq(draftDirty(draft({ assignee: 'qa' })), true, '...so is choosing an assignee')
+      eq(
+        draftDirty(draft({ status: 'done' })),
+        true,
+        '...and so is moving the status off the default, which is a deliberate choice about a ' +
+          'field the dialog is the only caller allowed to send',
+      )
+      eq(
+        draftDirty({ ...EMPTY_DRAFT }),
+        false,
+        'compared field by field and never by identity: the dialog rebuilds the object on every ' +
+          'keystroke, so typing a character and deleting it again leaves a draft that is `!==` ' +
+          'the constant and means exactly the same thing',
+      )
+
+      /* -- The ways out. Three are honoured always; one is refused while there is work. -- */
+
+      eq(closeCompose(EMPTY_DRAFT, 'cancel'), true, 'Cancel closes an empty dialog')
+      eq(
+        closeCompose(draft({ body: 'half a paragraph' }), 'cancel'),
+        true,
+        '...and a full one. Cancel is aimed, and it says what it does',
+      )
+      eq(closeCompose(EMPTY_DRAFT, 'escape'), true, 'Escape closes an empty dialog')
+      eq(
+        closeCompose(draft({ title: 'typed' }), 'escape'),
+        true,
+        '...and a dirty one. Escape always discards here — there is nothing to commit, because ' +
+          'the draft never reached Rust, which is the whole point of the dialog',
+      )
+      eq(closeCompose(EMPTY_DRAFT, 'dismiss'), true, 'the scrim closes a dialog with nothing in it')
+      eq(
+        closeCompose(draft({ body: 'a paragraph' }), 'dismiss'),
+        false,
+        'and is REFUSED over a dirty one. The one asymmetry with `closeCard`, where leaving ' +
+          'means keeping what you typed so a stray click costs nothing; here leaving means ' +
+          'discarding, with no undo and no draft on disk to say it happened',
+      )
+
+      /* -- What the list is showing once the task lands. -- */
+
+      eq(
+        filterAfterCreate(null, 'todo'),
+        null,
+        'a list showing everything is left exactly as it is',
+      )
+      eq(
+        filterAfterCreate('doing', 'doing'),
+        'doing',
+        '...and so is a filter that already admits the new task',
+      )
+      eq(
+        filterAfterCreate('doing', 'todo'),
+        null,
+        'a filter that would hide it is CLEARED. Filter to Doing, create a Todo task, and the ' +
+          'row lands in a group the screen is not drawing: the dialog closes, nothing appears, ' +
+          'and the only evidence is a file the user is not looking at',
+      )
+      eq(
+        filterAfterCreate('doing', 'review'),
+        null,
+        'cleared rather than switched to the new task’s status, which would answer one surprise ' +
+          'by hiding whatever the user had chosen to watch',
+      )
     }
 
     /* -- the pure gates ------------------------------------------------------------------- */

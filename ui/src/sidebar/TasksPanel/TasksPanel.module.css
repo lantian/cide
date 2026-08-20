@@ -852,6 +852,55 @@
   margin-top: 6px;
 }
 
+/* ------------------------------------------------------------------ the compose dialog (M21) */
+
+/*
+ * The dialog's heading, where the card puts its task id.
+ *
+ * Not `.detailId`: that one is `--font-mono` because it draws `t-17`, an identifier a user
+ * copies into a prompt. This is a sentence, and a monospaced one would read as a value rather
+ * than as the name of the thing on screen.
+ */
+.composeTitle {
+  flex: 1;
+  font-size: var(--fs-ui-11);
+  color: var(--text-hi);
+}
+
+/*
+ * Cancel and Create.
+ *
+ * `space-between` rather than the right-aligned `.fieldActions`/`.composerActions` above: those
+ * are one button finishing one field, and this is the pair the whole dialog ends in. Separating
+ * them puts real distance between *discard everything* and *write it*, which is worth more here
+ * than tidiness — they are the two gestures in this app most expensive to confuse.
+ */
+.composeActions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+/*
+ * Create, before there is a title.
+ *
+ * Drawn and dimmed rather than withheld — `TaskCompose`'s header argues why. `not-allowed` and
+ * not `default`: the cursor is the only feedback a pointer user gets before they read the
+ * button's title, and `default` reads as decoration rather than as a control that is waiting.
+ */
+.action:disabled {
+  border-color: var(--border-soft);
+  color: var(--faint);
+  cursor: not-allowed;
+}
+
+.action:disabled:hover {
+  background: transparent;
+}
+
 /*
  * The card's foot, where the delete lives.
  *

@@ -14,7 +14,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import type { LayoutNode, Pane, PaneId, PaneTree, SplitId } from '@/ipc/generated'
 import { applyDrag } from './Splitter'
-import { flattenChain, memberKey, SplitTree } from './SplitTree'
+import { chainAround, flattenChain, memberKey, SplitTree } from './SplitTree'
 
 const pane = (n: number): Pane => ({
   id: `pane-${n}` as PaneId,
@@ -84,6 +84,35 @@ const LEANING: PaneTree = {
   focused: pane(1).id,
   maximized: null,
   panes: Object.fromEntries([1, 2, 3].map((n) => [pane(n).id, pane(n)])) as Record<PaneId, Pane>,
+}
+
+/**
+ * `Row(a, Col(b, c))` — a pane stacked inside one cell of a row.
+ *
+ * Pane 2 is a member of the inner column and of no row of its own, so "this pane's row" can
+ * only mean the one its *cell* is a tile of. `chainAround` is what decides that, and this is
+ * the fixture where getting it wrong is visible: the menu item would grey itself out over a
+ * two-tile row.
+ */
+const STACKED: PaneTree = {
+  root: split(
+    'stack-row',
+    'row',
+    leaf(1),
+    split('stack-col', 'col', leaf(2), leaf(3), 0.5),
+    0.75,
+  ),
+  focused: pane(2).id,
+  maximized: null,
+  panes: Object.fromEntries([1, 2, 3].map((n) => [pane(n).id, pane(n)])) as Record<PaneId, Pane>,
+}
+
+/** One pane, no splits at all: a row of one, which is the item's disabled case. */
+const LONE: PaneTree = {
+  root: leaf(1),
+  focused: pane(1).id,
+  maximized: null,
+  panes: { [pane(1).id]: pane(1) } as Record<PaneId, Pane>,
 }
 
 /**
@@ -206,8 +235,36 @@ const leaning = render(LEANING, false)
 const input = [0.25, 0.25, 0.25, 0.25]
 const dragged = applyDrag(input, 0, 0.75)
 
+/**
+ * What *Even out this row* would act on: the members of the chain, and their shares.
+ *
+ * `sum` is the assertion that matters most. A chain's shares sum to 1 only at its maximal
+ * root, so a walk that stopped at the innermost same-axis split without climbing back out
+ * reports a fraction of a row as a whole one — and on `LEANING`, which is a *left*-hand
+ * comb, that is exactly the mistake that is invisible on every right-hand one.
+ */
+const around = (tree: PaneTree, n: number, axis: 'row' | 'col') => {
+  const chain = chainAround(tree.root, pane(n).id, axis)
+  if (chain === null) return null
+  return {
+    members: chain.members.map(memberKey),
+    fractions: chain.fractions,
+    sum: chain.fractions.reduce((a, b) => a + b, 0),
+  }
+}
+
 console.log(
   JSON.stringify({
+    around: {
+      rowOne: around(FIXTURE, 3, 'row'),
+      rowTwo: around(FIXTURE, 5, 'row'),
+      spine: around(FIXTURE, 1, 'col'),
+      leaning: around(LEANING, 1, 'row'),
+      stacked: around(STACKED, 2, 'row'),
+      stackedCol: around(STACKED, 2, 'col'),
+      lone: around(LONE, 1, 'row'),
+      noColumn: around(LEANING, 1, 'col'),
+    },
     plain: { chains: plain.chains, splitters: plain.splitters, addRow: plain.addRow, buttons: plain.buttons },
     maximized: {
       chains: maximized.chains.length,

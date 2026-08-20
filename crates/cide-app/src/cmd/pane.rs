@@ -206,6 +206,32 @@ pub fn pane_maximize(
         .map(|()| Mutated { rev: state.rev() })
 }
 
+/// Give every member of a pane's row the same share of it.
+///
+/// The user's words: *"set all panels in current row to same width (proportional)"*. The
+/// dividers of one chain only — evening out a row cannot change its height, or touch the row
+/// under it.
+///
+/// `axis` names which chain, exactly as it does for [`pane_split`]: `row` is the tiles beside
+/// this pane, `col` the rows of the tab. Only `row` is reachable from the UI today, and the
+/// parameter is here rather than hard-coded because the domain operation is one operation and
+/// a second command for the other axis would be the same call with a constant in it.
+#[tauri::command(rename_all = "camelCase")]
+pub fn pane_distribute(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    tab: TabId,
+    pane: PaneId,
+    axis: Axis,
+) -> Result<Mutated, CoreError> {
+    state
+        .update(|ws| {
+            let t = workspace::tab_mut(ws, project, tab)?;
+            layout::distribute(&mut t.tree, pane, axis)
+        })
+        .map(|()| Mutated { rev: state.rev() })
+}
+
 /// Move a divider. `ratio` is the **pair share** — the first of the two members this divider
 /// separates within its row, not the split node's `a`-share.
 ///

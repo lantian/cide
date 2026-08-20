@@ -215,14 +215,38 @@ pub fn insert_pane_at(tree: &mut PaneTree, anchor: &DockAnchor, pane: Pane) -> R
     Ok(id)
 }
 
-/// Remove a leaf and collapse its parent split into the surviving sibling.
+/// Remove a leaf, and give its room back to the whole row (or column) it was part of.
 ///
 /// Refused for a [`PaneRole::Primary`] pane ([`CoreError::PanePrimary`]) and for the only
 /// pane left in the tree ([`CoreError::LastPane`]): the pinned console always shows its
 /// conversation, and a tab always has at least one pane. The two errors are distinct so the
 /// caller can word the message.
+///
+/// The re-weighting is the exact inverse of [`add_tile`]/[`add_row`], and it is the whole
+/// difference between this and [`take_pane`]. Tree surgery alone collapses the parent split
+/// into the sibling, so the departing pane's width lands entirely on whichever neighbour
+/// the *binary* tree happened to pair it with: close one of four equal tiles and the row
+/// reads 50/25/25, with the shape of the tree — invisible to the user — deciding which
+/// neighbour got the lot. Spreading it in proportion instead makes four-minus-one three
+/// equal tiles, matching what adding a fourth did, and leaves a hand-tuned row's
+/// proportions intact.
+///
+/// [`take_pane`] deliberately keeps the bare collapse: its callers — detach, promote — mean
+/// to put the pane back, and [`insert_pane_at`] re-grafts against the *sibling*, so a
+/// spread on the way out would not be undone on the way in and a detach/re-dock round trip
+/// would no longer be the no-op it is documented to be.
 pub fn close(tree: &mut PaneTree, pane: PaneId) -> Result<()> {
-    take_pane(tree, pane).map(|_| ())
+    // Measured before the surgery, and for the same reason `detach_pane` reads its anchor
+    // first: `prune` collapses the split that says how much room the pane had, so asking
+    // afterwards would find the shares already merged into the sibling.
+    let plan = removal_plan(&tree.root, pane);
+    take_pane(tree, pane)?;
+    // Only after the removal succeeded — a refusal must leave the tree untouched, ratios
+    // included.
+    if let Some((path, axis, shares)) = plan {
+        write_weights(node_at_mut(&mut tree.root, &path), axis, &shares);
+    }
+    Ok(())
 }
 
 /// [`close`], but hands back the removed [`Pane`] so it can be re-homed.
@@ -414,6 +438,43 @@ pub fn add_tile(tree: &mut PaneTree, target: PaneId, side: Side, pane: Pane) -> 
         write_weights(node_at_mut(&mut tree.root, &after), Axis::Row, &next);
     }
     Ok(id)
+}
+
+/// Give every pane in a row — or every row of a column — the same share of it.
+///
+/// The user's words: *"item that will allow me to set all panels in current row to same
+/// width (proportional)"*. Three tiles a drag has left at 60/25/15 become thirds; nothing
+/// outside the chain moves at all, so evening out row one cannot change how tall it is or
+/// touch the row beneath it — the same theorem [`set_ratio`] rests on.
+///
+/// **Which** row is the innermost chain of `axis` the pane sits in, not the outermost. A
+/// pane stacked inside one cell of a row is a member of that inner column and of no row of
+/// its own, and the chain that reads as "this pane's row" is then the one its *cell* is a
+/// tile of — so the walk takes the deepest same-axis ancestor and then climbs back out
+/// through the unbroken run of them, because a chain's shares are only meaningful against
+/// its maximal root.
+///
+/// A pane with no chain of that axis above it at all — a lone pane, or one under nothing
+/// but cross-axis splits — is a row of one, and this is a no-op rather than an error. The
+/// menu greys its own item out from the same fact, and a refusal here would turn "there was
+/// nothing to do" into an error toast.
+pub fn distribute(tree: &mut PaneTree, pane: PaneId, axis: Axis) -> Result<()> {
+    if !tree.panes.contains_key(&pane) {
+        return Err(CoreError::NoSuchPane(pane));
+    }
+    let Some(path) = chain_around(&tree.root, pane, axis) else {
+        return Ok(());
+    };
+    let n = weights(node_at(&tree.root, &path), axis).len();
+    // `1 / n` is below `MIN_TILE` only past `MAX_MEMBERS` members, which both gestures
+    // refuse; a legacy chain longer than that gets `write_weights`' clamp, which is uneven
+    // but legal — the alternative is refusing to tidy the one layout that most needs it.
+    write_weights(
+        node_at_mut(&mut tree.root, &path),
+        axis,
+        &vec![1.0 / n as f32; n],
+    );
+    Ok(())
 }
 
 /// Add a full-width row holding exactly one pane.
@@ -1086,6 +1147,91 @@ fn reweight_for_insert(f: &[f32], at: usize) -> Vec<f32> {
     let mut next: Vec<f32> = f.iter().map(|w| w * keep).collect();
     next.insert(at.min(n), share);
     next
+}
+
+/// The share vector for a chain that is about to lose the member at `at`.
+///
+/// The exact inverse of [`reweight_for_insert`]: the departing member's share is handed to
+/// the survivors in proportion to what they already hold, so the sum stays 1 and everyone
+/// keeps their *relative* size — `n` equal tiles minus one is `n - 1` equal tiles.
+fn reweight_for_remove(f: &[f32], at: usize) -> Vec<f32> {
+    let rest: Vec<f32> = f
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at)
+        .map(|(_, w)| *w)
+        .collect();
+    let total: f32 = rest.iter().sum();
+    // A chain whose survivors sum to nothing can only come from a corrupt file, never from
+    // `weights`; equal shares keep it renderable, where dividing by it would write NaNs that
+    // `validate` then rejects.
+    if !total.is_finite() || total <= 0.0 {
+        return vec![1.0 / rest.len().max(1) as f32; rest.len()];
+    }
+    rest.iter().map(|w| w / total).collect()
+}
+
+/// How the chain around `pane` must be re-weighted once `pane` has gone: the path to the
+/// chain root, its axis, and the survivors' shares.
+///
+/// `None` when there is nothing to write. Either the pane is a chain of one — its parent is
+/// a cross-axis split, so the cell it shared is the only thing that grows and there is no
+/// row to spread across — or the chain holds two members, and the survivor takes all of it
+/// whatever we would have written.
+///
+/// A pane is a member in its own right of at most one axis, since that axis is its parent
+/// split's, so the first match is the answer and the loop is a two-case lookup, not a
+/// search.
+///
+/// The path survives the [`prune`] that follows. Either the chain root is a strict ancestor
+/// of the collapsing split — then nothing on the way down to it moves — or it *is* that
+/// split, and since a chain root with three or more members splits them across both sides,
+/// the survivor is a same-axis split of the remaining `n - 1` that takes its place at the
+/// very same path.
+fn removal_plan(root: &LayoutNode, pane: PaneId) -> Option<(Vec<bool>, Axis, Vec<f32>)> {
+    for axis in [Axis::Row, Axis::Col] {
+        let mut path = Vec::new();
+        let Some(m) = locate_member(root, pane, axis, &mut path) else {
+            continue;
+        };
+        let f = weights(node_at(root, &path), axis);
+        if f.len() < 3 {
+            return None;
+        }
+        let mut next = reweight_for_remove(&f, m);
+        // The survivors only ever grow, so this cannot fire on a healthy chain; it is here
+        // for the legacy chain that already held a sub-floor member.
+        legalise(&mut next);
+        return Some((path, axis, next));
+    }
+    None
+}
+
+/// The path to the root of the innermost chain of `axis` that holds `pane`, or `None` when
+/// no split of that axis is above it.
+///
+/// Different from [`locate_member`], and deliberately: that one answers "is the pane a
+/// member of this chain **in its own right**", which is what a removal needs, and says
+/// `None` for a pane sitting inside a cross-axis subtree that is *itself* a member. Here
+/// such a pane belongs to the row its cell is a tile of, so the search takes the deepest
+/// same-axis ancestor and then climbs out through the run of same-axis splits above it to
+/// reach the chain's maximal root — the node [`weights`] and [`write_weights`] are defined
+/// against.
+fn chain_around(root: &LayoutNode, pane: PaneId, axis: Axis) -> Option<Vec<bool>> {
+    let mut trail = Vec::new();
+    if !path_to(root, pane, &mut trail) {
+        return None;
+    }
+    let same_axis =
+        |node: &LayoutNode| matches!(node, LayoutNode::Split { axis: ax, .. } if *ax == axis);
+    let deepest = trail.iter().rposition(|(node, _)| same_axis(node))?;
+    let mut root_at = deepest;
+    while root_at > 0 && same_axis(trail[root_at - 1].0) {
+        root_at -= 1;
+    }
+    // `trail[k]` is the ancestor reached by the first `k` steps, so the path to it is the
+    // steps before it — not including its own.
+    Some(trail[..root_at].iter().map(|(_, took_b)| *took_b).collect())
 }
 
 /// The interior splits of the chain `node` roots, in in-order — so index `k` is the divider
@@ -2109,6 +2255,273 @@ mod tests {
         assert!(
             close_to(&tiles[0], &[0.5, 1.0 / 6.0, 1.0 / 3.0]),
             "{tiles:?}"
+        );
+        validate(&tree).expect("valid");
+    }
+
+    // --- evening a row out --------------------------------------------------------------
+
+    #[test]
+    fn distribute_evens_out_a_hand_tuned_row() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+        add_tile(&mut tree, b, Side::After, aux()).expect("joins");
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        set_ratio(&mut tree, dividers[0], 0.8).expect("moves");
+        set_ratio(&mut tree, dividers[1], 0.75).expect("moves");
+
+        distribute(&mut tree, b, Axis::Row).expect("evens out");
+
+        let (_, tiles) = shape(&tree);
+        assert!(close_to(&tiles[0], &[1.0 / 3.0; 3]), "thirds: {tiles:?}");
+        validate(&tree).expect("valid");
+    }
+
+    /// The claim that makes this safe to reach for: it is the row, not the tab.
+    #[test]
+    fn distribute_leaves_every_other_chain_alone() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+        let second = add_row(&mut tree, Some(b), Side::After, aux()).expect("a row is added");
+        let sibling = add_tile(&mut tree, second, Side::After, aux()).expect("joins row two");
+        let mut spine = Vec::new();
+        chain_splits(&tree.root, Axis::Col, &mut spine);
+        set_ratio(&mut tree, spine[0], 0.7).expect("moves");
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        // Row one only. `chain_splits` on the whole tree walks the `Col` spine, so row one's
+        // divider is not in `dividers` — take it from the row itself.
+        let mut path = Vec::new();
+        let m = locate_member(&tree.root, a, Axis::Row, &mut path).expect("a is a tile of row one");
+        assert_eq!(m, 0);
+        let mut row_one = Vec::new();
+        chain_splits(node_at(&tree.root, &path), Axis::Row, &mut row_one);
+        set_ratio(&mut tree, row_one[0], 0.85).expect("moves");
+
+        distribute(&mut tree, a, Axis::Row).expect("evens out");
+
+        let (spine_shares, tiles) = shape(&tree);
+        assert!(
+            close_to(&tiles[0], &[0.5, 0.5]),
+            "row one is even: {tiles:?}"
+        );
+        assert!(
+            close_to(&spine_shares, &[0.7, 0.3]),
+            "the rows keep the heights the user dragged them to: {spine_shares:?}",
+        );
+        assert!(
+            close_to(&tiles[1], &[0.5, 0.5]),
+            "and row two is untouched: {tiles:?}",
+        );
+        assert!(tree.panes.contains_key(&sibling));
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn distribute_evens_the_rows_of_a_tab_when_asked_for_the_column() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        add_row(&mut tree, None, Side::After, aux()).expect("a row is added");
+        add_row(&mut tree, None, Side::After, aux()).expect("a row is added");
+        let mut spine = Vec::new();
+        chain_splits(&tree.root, Axis::Col, &mut spine);
+        set_ratio(&mut tree, spine[0], 0.8).expect("moves");
+
+        distribute(&mut tree, a, Axis::Col).expect("evens out");
+
+        let (spine_shares, _) = shape(&tree);
+        assert!(close_to(&spine_shares, &[1.0 / 3.0; 3]), "{spine_shares:?}");
+        validate(&tree).expect("valid");
+    }
+
+    /// A pane stacked inside one cell is a member of no row of its own, so the row it means
+    /// is the one its *cell* is a tile of.
+    #[test]
+    fn distribute_reaches_the_row_a_stacked_pane_sits_in() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        set_ratio(&mut tree, dividers[0], 0.8).expect("moves");
+        let stacked = split_at(&mut tree, b, Axis::Col, Side::After);
+
+        distribute(&mut tree, stacked, Axis::Row).expect("evens out");
+
+        let (_, tiles) = shape(&tree);
+        assert!(
+            close_to(&tiles[0], &[0.5, 0.5]),
+            "the two cells of the row are even: {tiles:?}",
+        );
+        validate(&tree).expect("valid");
+    }
+
+    /// And when there *is* an inner row, that one is the one it means — the maximal chain
+    /// around the pane, not the outermost row on its path.
+    #[test]
+    fn distribute_evens_the_innermost_row_around_the_pane() {
+        let first = aux();
+        let outer = first.id;
+        let mut tree = new_tree(first);
+        let cell = add_tile(&mut tree, outer, Side::After, aux()).expect("joins");
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        set_ratio(&mut tree, dividers[0], 0.8).expect("moves");
+        // A column inside the second cell, then a row inside *that* — the inner row is the
+        // one the pane is a tile of.
+        let stacked = split_at(&mut tree, cell, Axis::Col, Side::After);
+        let inner = split_at(&mut tree, stacked, Axis::Row, Side::After);
+        let mut path = Vec::new();
+        locate_member(&tree.root, inner, Axis::Row, &mut path).expect("a tile of the inner row");
+        let mut inner_dividers = Vec::new();
+        chain_splits(node_at(&tree.root, &path), Axis::Row, &mut inner_dividers);
+        set_ratio(&mut tree, inner_dividers[0], 0.9).expect("moves");
+
+        distribute(&mut tree, inner, Axis::Row).expect("evens out");
+
+        let (_, tiles) = shape(&tree);
+        assert!(
+            close_to(&tiles[0], &[0.8, 0.2]),
+            "the outer row keeps the widths the user dragged: {tiles:?}",
+        );
+        let mut after = Vec::new();
+        locate_member(&tree.root, inner, Axis::Row, &mut after).expect("still a tile of it");
+        assert!(
+            close_to(
+                &weights(node_at(&tree.root, &after), Axis::Row),
+                &[0.5, 0.5]
+            ),
+            "and the inner row is even",
+        );
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn distribute_on_a_pane_with_no_row_of_its_own_changes_nothing() {
+        let (mut tree, [p1, ..]) = asymmetric();
+        let before = tree.clone();
+        // `asymmetric`'s root is a `Col`, and p1 hangs off it with no `Row` above it.
+        distribute(&mut tree, p1, Axis::Row).expect("a row of one is a no-op, not an error");
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn distribute_refuses_a_pane_that_is_not_in_the_tree() {
+        let (mut tree, _) = asymmetric();
+        let ghost = PaneId::new();
+        assert_eq!(
+            distribute(&mut tree, ghost, Axis::Row),
+            Err(CoreError::NoSuchPane(ghost)),
+        );
+        validate(&tree).unwrap();
+    }
+
+    /// The report this answers: four equal panes, close one, and the row went 50/25/25
+    /// because the collapse handed the whole gap to one neighbour.
+    #[test]
+    fn closing_a_tile_spreads_its_width_over_the_rest_of_the_row() {
+        let first = aux();
+        let mut ids = vec![first.id];
+        let mut tree = new_tree(first);
+        for _ in 0..3 {
+            let last = *ids.last().expect("seeded");
+            ids.push(add_tile(&mut tree, last, Side::After, aux()).expect("a tile joins"));
+        }
+
+        // The second tile, whose sibling in the binary tree is the subtree holding the other
+        // two — the shape that used to make one neighbour twice the size of the rest.
+        close(&mut tree, ids[1]).expect("closes");
+
+        let (spine, tiles) = shape(&tree);
+        assert!(close_to(&spine, &[1.0]), "still one row: {spine:?}");
+        assert!(
+            close_to(&tiles[0], &[1.0 / 3.0; 3]),
+            "three equal tiles, exactly as adding a third would have built: {tiles:?}"
+        );
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn closing_a_tile_preserves_the_relative_widths_of_the_survivors() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+        add_tile(&mut tree, b, Side::After, aux()).expect("joins");
+        let mut dividers = Vec::new();
+        chain_splits(&tree.root, Axis::Row, &mut dividers);
+        // Thirds, then the second divider moved: 1/3, 1/2, 1/6.
+        set_ratio(&mut tree, dividers[1], 0.75).expect("moves");
+
+        close(&mut tree, a).expect("closes");
+
+        let (_, tiles) = shape(&tree);
+        // 1/2 and 1/6 renormalised. Equalising instead would have thrown the tuning away,
+        // just as it would on the way in.
+        assert!(close_to(&tiles[0], &[0.75, 0.25]), "{tiles:?}");
+        validate(&tree).expect("valid");
+    }
+
+    #[test]
+    fn closing_a_row_gives_its_height_to_the_other_rows() {
+        let first = aux();
+        let mut tree = new_tree(first);
+        let second = add_row(&mut tree, None, Side::After, aux()).expect("a row is added");
+        add_row(&mut tree, None, Side::After, aux()).expect("a row is added");
+
+        close(&mut tree, second).expect("closes");
+
+        let (spine, _) = shape(&tree);
+        assert!(close_to(&spine, &[0.5, 0.5]), "two equal rows: {spine:?}");
+        validate(&tree).expect("valid");
+    }
+
+    /// A pane whose parent is a cross-axis split has no row to spread across: the cell it
+    /// shared is the only thing that may grow, and the rest of the tab must not move.
+    #[test]
+    fn closing_a_stacked_tile_leaves_the_other_rows_alone() {
+        let first = aux();
+        let a = first.id;
+        let mut tree = new_tree(first);
+        let b = add_tile(&mut tree, a, Side::After, aux()).expect("joins");
+        // Stacked *inside* b's cell rather than as a full-width row.
+        let stacked = split_at(&mut tree, b, Axis::Col, Side::After);
+
+        close(&mut tree, stacked).expect("closes");
+
+        let (spine, tiles) = shape(&tree);
+        assert!(close_to(&spine, &[1.0]), "one row: {spine:?}");
+        assert!(close_to(&tiles[0], &[0.5, 0.5]), "untouched: {tiles:?}");
+        validate(&tree).expect("valid");
+    }
+
+    /// [`take_pane`] keeps the bare collapse, so detach and re-dock stays the round trip it
+    /// is documented to be.
+    #[test]
+    fn detaching_a_tile_does_not_spread_the_row() {
+        let first = aux();
+        let mut ids = vec![first.id];
+        let mut tree = new_tree(first);
+        for _ in 0..3 {
+            let last = *ids.last().expect("seeded");
+            ids.push(add_tile(&mut tree, last, Side::After, aux()).expect("a tile joins"));
+        }
+        let anchor = anchor_of(&tree, ids[1]).expect("has a parent");
+
+        let taken = take_pane(&mut tree, ids[1]).expect("leaves");
+        insert_pane_at(&mut tree, &anchor, taken).expect("comes back");
+
+        let (_, tiles) = shape(&tree);
+        assert!(
+            close_to(&tiles[0], &[0.25; 4]),
+            "the row is exactly as it was: {tiles:?}"
         );
         validate(&tree).expect("valid");
     }

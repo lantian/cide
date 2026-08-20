@@ -814,6 +814,35 @@ try {
       'thing left saying which pane the domain thinks is focused',
   )
 
+  // --- which row "Even out this row" would act on ----------------------------------------
+  //
+  // `chainAround` is the frontend's mirror of `cide-core::layout`'s `chain_around`, and the
+  // pane menu greys its own item out from the member count it reports while the command it
+  // fires acts on whatever *Rust* finds. A disagreement is therefore silent in both
+  // directions: an item that says "this pane is the only one in its row" over a row of four,
+  // or a live item that evens out nothing.
+
+  const a = d.around
+  eq(a.rowOne.members, ['pane-1', 'pane-2', 'pane-3', 'pane-4'], 'a tile of row one is in a row of four')
+  near(a.rowOne.fractions, [0.25, 0.25, 0.25, 0.25], 'and its shares are the whole row')
+  eq(a.rowTwo.members, ['pane-5', 'pane-6'], 'row two answers for itself, not for the tab')
+  eq(a.spine.members, ['split-r1a', 'split-r2a'], 'asked for the column, the same pane is in the spine')
+
+  // The left-hand comb. Its innermost row around pane 1 is `lean-inner`, which holds two of
+  // the three tiles and 2/3 of the width: stopping there would grey the item out at "2" and,
+  // worse, hand `write_weights` a vector that only sums to 1 within a fraction of the row.
+  eq(a.leaning.members, ['pane-1', 'pane-2', 'pane-3'], 'the chain is the maximal run, not the innermost split')
+  near(a.leaning.fractions, [1 / 3, 1 / 3, 1 / 3], 'so the shares are the whole row')
+  ok(Math.abs(a.leaning.sum - 1) < 1e-9, 'and they sum to 1, which only the chain root does')
+
+  // A pane stacked inside one cell belongs to the row its *cell* is a tile of.
+  eq(a.stacked.members, ['pane-1', 'stack-col'], 'a stacked pane is in the row of two cells')
+  near(a.stacked.fractions, [0.75, 0.25], 'with the cell counted once, however many panes it holds')
+  eq(a.stackedCol.members, ['pane-2', 'pane-3'], 'and in the column of the two panes sharing its cell')
+
+  eq(a.lone, null, 'a lone pane is in no row at all — the case the item greys itself out for')
+  eq(a.noColumn, null, 'and so is every pane of a tab that has only ever been split sideways')
+
   // --- every pane edge gets the same gutter, including the ones with no neighbour -------
   //
   // A splitter track is 6px, which is two 3px half-gutters back to back. At the edges of the

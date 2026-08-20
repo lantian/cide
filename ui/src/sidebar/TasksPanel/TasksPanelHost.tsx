@@ -61,9 +61,13 @@
  * what is half-typed in this window's box — and that is the one category `docs/adr/0002` leaves
  * to the webview. None is durable, and none should reach another window: a second cide window
  * showing the same project must not find its list filtered, a delete armed, or a title field
- * open with somebody else's half-sentence in it. The store owns `selected` and `composing`
- * instead, and each of those has a reason in its own doc for being there (they must survive the
- * panel unmounting, and stop a double create).
+ * open with somebody else's half-sentence in it.
+ *
+ * The store owns `selected` and `compose` instead, and both for the same reason, stated in their
+ * own docs: they must **survive this panel unmounting**. The sidebar can be toggled shut or
+ * switched to Files, and a task half-written into a `useState` here would be gone when it came
+ * back — which is the silent data loss the compose dialog exists to prevent, arriving by a
+ * different door.
  */
 import { useCallback, useEffect, useState } from 'react'
 import { fsReveal, type ProjectId } from '@/ipc/client'
@@ -71,22 +75,9 @@ import { notifyFailure } from '@/chrome/notices'
 import { useTasks } from '@/sidebar/tasksStore'
 import { TasksPanelView } from './TasksPanel'
 import { TaskDetailModal } from './TaskDetail'
-import { activeEdit, armedDelete, openTask } from './model'
+import { TaskComposeModal } from './TaskCompose'
+import { activeEdit, armedDelete, filterAfterCreate, openTask } from './model'
 import type { ArmedDelete, FieldEdit, RunRef, StatusFilter } from './model'
-
-/**
- * The title a task is created with, before the user has typed one.
- *
- * There is no separate compose ceremony — the plan says so in as many words — so *New task*
- * creates the row and opens it, and the title field in the detail view is where it gets its
- * name. That is the same shape as the file tree's *New File…* landing on an editable row, and
- * the alternative is worse in both directions: a modal over a 320px sidebar, or a button that
- * needs a second surface before it can do anything at all.
- *
- * A constant rather than a literal so it is greppable from the check scripts and from the Rust
- * side, and so the composer that may replace it later has one thing to delete.
- */
-export const NEW_TASK_TITLE = 'New task'
 
 /** How often the comment log's ages are recomputed. See the header for why it is not 1 s. */
 const TICK_MS = 30_000
@@ -99,10 +90,12 @@ export interface TasksPanelProps {
 export function TasksPanel({ project }: TasksPanelProps) {
   const board = useTasks((s) => s.board)
   const selected = useTasks((s) => s.selected)
-  const composing = useTasks((s) => s.composing)
+  const compose = useTasks((s) => s.compose)
+  const creating = useTasks((s) => s.creating)
   const select = useTasks((s) => s.select)
   const refresh = useTasks((s) => s.refresh)
   const beginCompose = useTasks((s) => s.beginCompose)
+  const setDraft = useTasks((s) => s.setDraft)
   const endCompose = useTasks((s) => s.endCompose)
   const createTask = useTasks((s) => s.create)
   const editTask = useTasks((s) => s.edit)
@@ -265,14 +258,7 @@ export function TasksPanel({ project }: TasksPanelProps) {
          * warns about, and the copies are what drift. The *data* is protected a layer lower, in
          * `tasksStore.create`, which is where a palette `task.new` would arrive too.
          */
-        onCreateTask={() => {
-          // The re-entrancy guard, and the reason `composing` is on the store rather than in a
-          // ref here: a second click while the first create is in flight would put a second row
-          // in a file the whole team commits.
-          if (composing) return
-          beginCompose()
-          guarded(createTask(NEW_TASK_TITLE).finally(endCompose))
-        }}
+        onCreateTask={beginCompose}
         {...(project !== null && path !== null
           ? {
               onReveal: () => {
@@ -285,6 +271,37 @@ export function TasksPanel({ project }: TasksPanelProps) {
           : {})}
         onRetry={() => void refresh()}
       />
+      {/*
+        * The compose dialog, and the whole of the *New task* gesture. (M21)
+        *
+        * Nothing is written until Create: `onCreateTask` above opens this and does not touch
+        * Rust, and the draft lives in the store — see `tasksStore.compose` for why it is there
+        * and not in a `useState` here (the sidebar can be shut mid-sentence).
+        *
+        * `filterAfterCreate` runs **after** the write resolves, not on the click, because a
+        * create that failed must not move the list the user is reading. What it prevents is the
+        * create that reads as nothing happening at all: filter to Doing, create a Todo task, and
+        * the row lands in a group the screen is not drawing — the dialog closes and there is no
+        * evidence anywhere except a file nobody is looking at. It clears the filter rather than
+        * switching it to the new task's status, so the row appears *and* everything the user had
+        * chosen to look at is still there.
+        */}
+      {compose !== null && (
+        <TaskComposeModal
+          draft={compose}
+          roles={NO_ROLES}
+          busy={creating}
+          onDraft={setDraft}
+          onCancel={endCompose}
+          onCreate={(draft) => {
+            guarded(
+              createTask(draft).then(() => {
+                setFilter((current) => filterAfterCreate(current, draft.status))
+              }),
+            )
+          }}
+        />
+      )}
       {/*
         * The card. Mounted beside the list, never instead of it — see the header.
         *

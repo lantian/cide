@@ -371,6 +371,7 @@ pub fn run() {
             cmd::pane::pane_focus,
             cmd::pane::pane_maximize,
             cmd::pane::pane_set_ratio,
+            cmd::pane::pane_distribute,
             cmd::pane::pane_navigate,
             cmd::pane::pane_swap,
             cmd::pane::pane_bind_session,
