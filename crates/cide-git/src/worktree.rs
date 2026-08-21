@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 
 use cide_ipc::git::GitError;
-use git2::{BranchType, Index, Repository, Tree, WorktreeAddOptions, WorktreePruneOptions};
+use git2::{BranchType, Repository, Tree, WorktreeAddOptions, WorktreePruneOptions};
 
 use crate::{Result, Wrap, branch, repo as repo_mod};
 
@@ -340,7 +340,7 @@ pub fn integrate(root: &Path, agent: &str) -> Result<Integration> {
     let mut index = repo.merge_commits(&ours, &theirs, None).wrap()?;
     if index.has_conflicts() {
         return Ok(Integration::Conflicts {
-            paths: conflicting(&index)?,
+            paths: repo_mod::conflicts_of(&index)?,
         });
     }
 
@@ -453,31 +453,6 @@ fn checkout(repo: &Repository, tree: &Tree<'_>) -> Result<()> {
 fn changed(repo: &Repository, from: &Tree<'_>, to: &Tree<'_>) -> Result<usize> {
     let diff = repo.diff_tree_to_tree(Some(from), Some(to), None).wrap()?;
     Ok(diff.deltas().len())
-}
-
-/// The conflicting paths of an **in-memory** merge index.
-///
-/// Deliberately the same shape as [`repo_mod::conflicted_paths`] — `our`, else `their`, else
-/// the ancestor, sorted and deduplicated — and deliberately not that function: it reads
-/// `repo.index()`, the one on disk, which at this point is still the user's and must stay that
-/// way. Same answer, different index.
-fn conflicting(index: &Index) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for entry in index.conflicts().wrap()? {
-        let entry = entry.wrap()?;
-        let path = entry
-            .our
-            .as_ref()
-            .or(entry.their.as_ref())
-            .or(entry.ancestor.as_ref())
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned());
-        if let Some(path) = path {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
 }
 
 #[cfg(test)]

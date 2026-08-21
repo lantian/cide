@@ -160,13 +160,29 @@
 
 .body :global(.cm-gutters) {
   /*
+   * The fold column's width, named once because three rules have to agree about it: the two
+   * reservations below and `.cm-foldGutter` itself. (M19)
+   *
+   * `ch` and not `px`, for the reason the blame column uses `ch`: it resolves against this
+   * element's own font, which is the code scale times 0.88 set below — so the chevron column
+   * grows with `editor.fontSize` instead of becoming a sliver in a 20px buffer. Two characters
+   * is the glyph plus the breathing room either side of it.
+   */
+  --fold-col: 2ch;
+  /*
    * 56px until M12, 70px since: `.cm-lineNumbers` takes `flex: 1` of this reservation, so the
    * lint gutter added beside it would otherwise take its 14px *out* of the numbers' share and
    * shift every line number left the moment a file gained its first diagnostic. Widening the
    * reservation by exactly the marker's fixed width keeps the numbers where they were, whether
    * or not anything is marked.
+   *
+   * The fold column is added unconditionally rather than behind a `:has()` like the blame one,
+   * and that is the same decision `DEFAULT_FOLD_SPEC` in `languages.ts` records: **every** buffer
+   * gets a fold gutter, including a `.txt`. A conditional reservation would move every line
+   * number sideways when the user switched from a `.md` tab to a `.rs` one, which is exactly the
+   * flicker the 70px above exists to prevent.
    */
-  min-width: 70px;
+  min-width: calc(70px + var(--fold-col));
   background: var(--panel);
   color: var(--faint);
   border-right: none;
@@ -225,6 +241,92 @@
   color: var(--dim);
 }
 
+/* --- the fold column (M19) --------------------------------------------------------------- *
+ *
+ * `folding.ts` puts this gutter directly after `lineNumbers()`, so it sits *between* the numbers
+ * and the text, which is where IDEA has it. Everything below is the paint; every decision about
+ * what is foldable is `foldRanges.ts`, which `check:editor` compiles and drives.
+ */
+
+.body :global(.cm-foldGutter) {
+  /* Fixed, not `flex: 1` — the numbers take the slack. Same rule as `.cm-blame`. */
+  flex: none;
+  width: var(--fold-col);
+}
+
+.body :global(.cm-foldGutter .cm-gutterElement) {
+  padding: 0;
+  text-align: center;
+  cursor: pointer;
+}
+
+/*
+ * The chevron.
+ *
+ * A glyph and not CodeMirror's SVG, which is the choice `.cm-lint-marker` below already made for
+ * the same reason: an SVG in this gutter is a second thing to keep in step with the theme, and
+ * these two characters are in every font on the ladder.
+ *
+ * `1em` line box against the gutter's own font size, so the marker sits on the same baseline grid
+ * as the number beside it at every editor scale. Deliberately *not* a `font-size` of its own —
+ * `check:ui-scale` is the gate for that, and a literal here is a marker that stops following
+ * `editor.fontSize` the moment somebody changes it.
+ */
+.body :global(.cm-cide-foldMarker) {
+  display: inline-block;
+  width: 100%;
+  line-height: var(--lh-code);
+  color: var(--faint);
+}
+
+/*
+ * A line that *can* be folded shows its chevron only while the pointer is in the editor, and a
+ * line that *is* folded shows it always.
+ *
+ * IDEA's behaviour, and it is not decoration: a permanent chevron on every block start turns the
+ * gutter into a column of arrows and competes with the line numbers for the eye, while a folded
+ * line with no marker is a piece of the file that has silently gone missing — the placeholder is
+ * in the text, but the gutter is where a reader looks to count lines.
+ *
+ * `opacity` rather than `visibility` or `color: transparent`: the element keeps its box either
+ * way, so nothing reflows, and opacity is the one of the three that transitions.
+ */
+.body :global(.cm-cide-foldMarker[data-open='true']) {
+  opacity: 0;
+  transition: opacity 90ms ease-out;
+}
+
+.body:hover :global(.cm-cide-foldMarker[data-open='true']) {
+  opacity: 1;
+}
+
+.body :global(.cm-cide-foldMarker[data-open='false']) {
+  color: var(--accent);
+}
+
+/*
+ * What a collapsed block leaves in the text.
+ *
+ * **Mandatory, not cosmetic.** `@codemirror/language`'s base theme spells this rule with
+ * `backgroundColor: '#eee'`, `border: '1px solid #ddd'` and `color: '#888'` — three literals that
+ * survive a theme switch and read as a light chip punched into a dark buffer. Same class of
+ * defect as the `.cm-lintRange*` overrides further down, and `check:theme` is the gate for it.
+ */
+.body :global(.cm-foldPlaceholder) {
+  background: var(--chrome-hi);
+  border: 1px solid var(--border-soft);
+  border-radius: 3px;
+  color: var(--dim);
+  margin: 0 3px;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.body :global(.cm-foldPlaceholder:hover) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 /* --- the blame column (M18) ------------------------------------------------------------- *
  *
  * `blame.ts` puts this gutter FIRST in the extension array, so it sits left of the numbers where
@@ -249,7 +351,7 @@
  */
 
 .body :global(.cm-gutters:has(.cm-blame)) {
-  min-width: calc(70px + 22ch + 16px);
+  min-width: calc(70px + var(--fold-col) + 22ch + 16px);
 }
 
 .body :global(.cm-blame) {
@@ -379,53 +481,20 @@
 /* --- syntax --------------------------------------------------------------------------- */
 
 /*
- * The classes `highlight.ts` assigns. They carry `var()` rather than a literal, which is
- * the entire reason `HighlightStyle` is built with `class:` instead of `color:` — a
- * generated class would bake today's palette into a stylesheet at construction time and
- * still be purple after the user switched to the light theme.
+ * The classes `highlight.ts` assigns live in `editor/highlight.css` now, not here.
+ *
+ * They were in this file, scoped under `.body` — this module's own hashed class — which meant
+ * they painted inside an `EditorSurface` and nowhere else. Invisible while the editor was the
+ * only surface using `cideHighlightStyle`; the moment the three-pane merge resolver used it too,
+ * that pane got a highlighter, got tokens, got the class names on its spans, and got no colour.
+ * `highlight.ts` imports the stylesheet itself, so the two cannot be separated again.
  */
-.body :global(.cide-tk-keyword) {
-  color: var(--purple);
-}
-.body :global(.cide-tk-type) {
-  color: var(--cyan);
-}
-.body :global(.cide-tk-function) {
-  color: var(--blue);
-}
-.body :global(.cide-tk-string),
-.body :global(.cide-tk-attribute) {
-  color: var(--yellow);
-}
-.body :global(.cide-tk-comment) {
-  color: var(--faint);
-  font-style: italic;
-}
-.body :global(.cide-tk-control) {
-  color: var(--red);
-}
-.body :global(.cide-tk-number) {
-  color: var(--green);
-}
-.body :global(.cide-tk-property) {
-  color: var(--text);
-}
-.body :global(.cide-tk-operator) {
-  color: var(--dim);
-}
-.body :global(.cide-tk-heading) {
-  color: var(--accent);
-  font-weight: 600;
-}
-.body :global(.cide-tk-emphasis) {
-  color: var(--dim);
-  font-style: italic;
-}
 
 /*
  * Ctrl+hover's underline. (M14)
  *
- * Here rather than in a CSS module of its own for the same reason the `.cide-tk-*` block above is:
+ * Here rather than in a CSS module of its own for the reason the `.cide-tk-*` rules used to be
+ * (they now live in `editor/highlight.css`, for a reason the note above gives):
  * the class is assigned by a `Decoration.mark` in `ctrlLink.ts`, and a module-scoped name would
  * mean that TypeScript file importing a stylesheet only so it could hash a class it writes by
  * hand. `check:editor` asserts this rule exists, because a mark whose class nobody styles is an

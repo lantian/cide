@@ -13,6 +13,8 @@
 import { StreamLanguage } from '@codemirror/language'
 import type { Extension } from '@codemirror/state'
 
+import type { FoldSpec } from './foldRanges'
+
 /** A module identifier in this registry, not a user-visible name. */
 type LanguageId =
   | 'rust'
@@ -120,6 +122,140 @@ const BY_EXTENSION: Record<string, { id: LanguageId; label?: string }> = {
   md: { id: 'markdown' },
   markdown: { id: 'markdown' },
   sql: { id: 'sql' },
+}
+
+/**
+ * What the fold scanner needs to know about each language.
+ *
+ * # Why this is a second table and not a field of the grammar
+ *
+ * It is *nearly* a field of the grammar — six of its keys mirror `GrammarSpec` exactly and must
+ * never disagree with it. But a grammar arrives through a dynamic `import()`, and fold restore
+ * has to run inside the editor's **mount dispatch**: the remembered scroll position is a line
+ * number, and applying it against unfolded heights and then folding a tick later lands the user
+ * somewhere they did not leave. Waiting for the chunk would cost that; so this is static, and it
+ * costs about a line of source per language.
+ *
+ * Drift is made a build failure rather than trusted. `grammar()` in `streamGrammar.ts` hands its
+ * input back as `.spec`, and `ui/scripts/check-editor.mjs` asserts every mirrored field of every
+ * entry below equals the grammar's. A fold spec that thought `#` opened a comment in Rust would
+ * treat every `#[derive(…)]` as a dead line, and nothing on screen would say so.
+ *
+ * # What each language actually gets
+ *
+ * `regions` is on for everything with a line comment — an explicit `// region` marker is the one
+ * fold a person writes down on purpose, and refusing to honour it in six of eleven languages
+ * would be arbitrary. `indentBlocks` is on only where indentation is *semantic* (Python, YAML);
+ * turning it on for a brace language would offer a second, worse fold on every line that already
+ * has a good one.
+ */
+const FOLD: Readonly<Record<LanguageId, FoldSpec>> = {
+  rust: {
+    lineComment: '//',
+    blockComment: ['/*', '*/'],
+    nestedComments: true,
+    // A `"` genuinely spans lines in Rust, and `rawStrings` is here rather than anywhere else
+    // because `r#"…"#` is where an unbalanced brace most often lives — a `format!` template, an
+    // embedded shell script, a regex.
+    multilineQuotes: '"',
+    rawStrings: true,
+    // `fn f<'a>(x: &'a str) {` — without this the `'` opens a string, the trailing `{` is inside
+    // it, and the function is not foldable. In a codebase with lifetimes that is most of it.
+    lifetimes: true,
+    regions: true,
+  },
+  go: {
+    lineComment: '//',
+    blockComment: ['/*', '*/'],
+    nestedComments: false,
+    quotes: '"',
+    extraQuotes: '`',
+    multilineQuotes: '`',
+    regions: true,
+  },
+  typescript: {
+    lineComment: '//',
+    blockComment: ['/*', '*/'],
+    extraQuotes: '`',
+    multilineQuotes: '`',
+    regions: true,
+  },
+  python: {
+    lineComment: '#',
+    tripleQuotes: true,
+    indentBlocks: true,
+    regions: true,
+  },
+  clike: {
+    lineComment: '//',
+    blockComment: ['/*', '*/'],
+    regions: true,
+  },
+  shell: {
+    lineComment: '#',
+    // Both quotes span lines in every shell, which is not true of most languages and is why the
+    // scanner's default is the other way round.
+    multilineQuotes: '"\'',
+    regions: true,
+  },
+  json: {
+    lineComment: '//',
+    blockComment: ['/*', '*/'],
+    quotes: '"',
+  },
+  toml: {
+    lineComment: '#',
+    quotes: '"\'',
+    tripleQuotes: true,
+    regions: true,
+  },
+  yaml: {
+    lineComment: '#',
+    quotes: '"\'',
+    indentBlocks: true,
+    regions: true,
+  },
+  markdown: {
+    // No strings and no brackets: a `(` in prose is not a block, and `quotes: ''` is what the
+    // grammar says too — an apostrophe in *don't* would otherwise open a string.
+    quotes: '',
+    brackets: '',
+    headingFolds: true,
+    fencedBlocks: true,
+  },
+  sql: {
+    lineComment: '--',
+    blockComment: ['/*', '*/'],
+    nestedComments: false,
+    quotes: '\'"`',
+    escapes: false,
+    multilineQuotes: "'",
+    regions: true,
+  },
+}
+
+/**
+ * What a buffer with no known language folds by.
+ *
+ * Brackets and indentation, and **no string or comment awareness at all** — guessing that `"`
+ * opens a string in a file that might be prose would let one apostrophe hide every brace on its
+ * line. A `.txt` file with an indented block still folds, which is more than IDEA offers.
+ *
+ * It is also why this is a value rather than a `null`: every buffer gets a fold gutter, so the
+ * gutter reservation in `EditorSurface.module.css` is one constant width instead of a layout that
+ * shifts when you switch from a `.rs` tab to a `.txt` one.
+ */
+export const DEFAULT_FOLD_SPEC: FoldSpec = { quotes: '', indentBlocks: true }
+
+/** How to fold this path. Never null — see [`DEFAULT_FOLD_SPEC`]. */
+export function foldSpecFor(path: string): FoldSpec {
+  const found = lookup(path)
+  return found === null ? DEFAULT_FOLD_SPEC : FOLD[found.id]
+}
+
+/** Testing seam: the fold table, for the check that pins it against the grammars. */
+export function foldSpecs(): Readonly<Record<string, FoldSpec>> {
+  return FOLD
 }
 
 /**

@@ -16,10 +16,14 @@
  * and *delete on remote*. None of them are here, and their absence is a decision rather than a
  * backlog:
  *
- * * **Merge and rebase** end in conflicts often enough that they are only usable with a
- *   conflict-resolution surface. cide's diff panes are read-only against HEAD, so a merge that
- *   conflicts would leave a working tree nothing in the app can finish — and `git pull` here
- *   is fast-forward-only for exactly the same reason.
+ * * **Merge into current and rebase current onto** are still absent, but the reason has
+ *   changed and is worth recording rather than quietly deleting. It used to be that they *end
+ *   in conflicts often enough that they are only usable with a conflict-resolution surface* —
+ *   which cide did not have, and which is why `git pull` was fast-forward-only. M20 built one
+ *   (`panes/MergePane.tsx`, and the *Merge Conflicts* group in the commit panel), and pull now
+ *   merges and rebases. What is left is narrower: these two menu items would each need a
+ *   branch chooser and a confirmation of their own, and neither has been designed. The
+ *   *capability* is there; the gesture is not.
  * * **Compare** needs a branch-to-branch diff view. The diff tabs compare a file against HEAD.
  * * **Delete on remote** is a push of an empty refspec. It is not undoable by the person who
  *   ran it and it must not share a menu item with deleting a local ref.
@@ -491,7 +495,26 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
     case 'noSuchBranch':
       return `${name('name')} is gone — someone deleted it since this list was drawn`
     case 'notFastForward':
-      return `${name('branch')} is ${count('ahead')} ahead and ${count('behind')} behind its upstream. cide only fast-forwards; merge or rebase in a terminal.`
+      // Reworded in M20. *"cide only fast-forwards; merge or rebase in a terminal"* stopped
+      // being true — this now fires only when the user has chosen **Fast-forward only**, so it
+      // has to name the setting that caused it. Sending somebody to a terminal for something
+      // the app does on the next line is the worst kind of stale refusal.
+      return `${name('branch')} is ${count('ahead')} ahead and ${count('behind')} behind its upstream, and your pull preference is fast-forward only. Change it in Settings › Git, or merge or rebase from the pull dialog.`
+    case 'pullNeedsStrategy':
+      // Reachable only as a fallback: `pullStrategyModel.divergenceOf` catches this variant and
+      // opens the dialog instead. It still needs a sentence, because a *second* one raised while
+      // answering the first is deliberately not turned into another dialog — see `dispatch.ts`.
+      return `${name('branch')} is ${count('ahead')} ahead and ${count('behind')} behind its upstream. Pull again to choose merge or rebase.`
+    case 'rebaseWouldDropMerges':
+      return `Rebasing ${name('branch')} would drop merge commits, discarding the conflict resolutions recorded in them. Merge instead, or rebase in a terminal with \`--rebase-merges\`.`
+    case 'rebaseTooLong':
+      return `${name('branch')} has ${count('ahead')} commits to replay, more than the ${count('limit')} cide rebases in one go. Merge instead, or rebase in a terminal.`
+    case 'unrelatedHistories':
+      return `${name('branch')} and ${name('upstream')} share no common commit, so there is nothing to merge onto. Check you are on the branch you meant to be.`
+    case 'notConflicted':
+      return `${name('path')} is not conflicted — another window may have resolved it already.`
+    case 'stagesGone':
+      return `${name('path')} cannot be un-resolved: resolving a path is what removes the conflicting versions, and git keeps no copy.`
     case 'noUpstream':
       return `${name('branch')} has no upstream branch to pull from`
     case 'detachedHead':
@@ -530,7 +553,7 @@ export function explain(error: unknown, op: GitOp = 'checkout'): string {
       // about which files they are. And it says *nothing was changed*: `cide_git::replay` does
       // the merge in memory and refuses before writing, so the working tree is untouched and a
       // user who has met git's half-applied cherry-pick will otherwise go looking for one.
-      return `${replaying()} ${name('oid')} would conflict${list}. cide has no conflict-resolution surface, so nothing was changed — do it in a terminal.`
+      return `${replaying()} ${name('oid')} would conflict${list}. Nothing was changed.`
     }
     case 'mergeNeedsMainline':
       // The picker (`chrome/logActions.ts::mainlineChoices`) is what the log actually shows for
@@ -657,6 +680,14 @@ export interface FetchReport {
   deletions: number
   commits: readonly { shortOid: string; summary: string; author: string }[]
   moreCommits: number
+  /** What the pull actually did. Absent for a plain fetch and for a pull that took nothing. */
+  strategy?: 'fastForward' | 'merge' | 'rebase' | undefined
+  /** How many of your own commits a rebase replayed. */
+  rewritten: number
+  /** Local commits a rebase dropped because replaying them changed nothing. */
+  skipped: number
+  /** Paths left conflicted. Non-empty is a success with work attached, not a failure. */
+  conflicts: readonly string[]
 }
 
 /** `1 commit` / `4 commits`, so every sentence here agrees on the wording. */
@@ -707,9 +738,43 @@ function shortstat(changed: number, insertions: number, deletions: number): stri
  * shown, capped, and never parsed into anything.
  */
 export function fetchNote(outcome: FetchReport): string {
+  /*
+   * Conflicts first, because they are the only outcome with work attached.
+   *
+   * A merge that stopped still *took* every one of its commits, so the counts below are all
+   * true — and leading with them would bury the one fact the user has to act on under a
+   * sentence that reads like success. This is the arm that says what to do next.
+   */
+  if (outcome.conflicts.length > 0) {
+    const verb = outcome.strategy === 'rebase' ? 'Rebasing' : 'Merging'
+    const n = outcome.conflicts.length
+    return `${verb} ${outcome.branch} — ${n} file${n === 1 ? '' : 's'} to resolve: ${anded(outcome.conflicts)}`
+  }
   if (outcome.advanced > 0) {
     const moved = outcome.branch === '' ? '' : `${outcome.branch} `
     const stat = shortstat(outcome.filesChanged, outcome.insertions, outcome.deletions)
+    /*
+     * The verb is the strategy's, not "fast-forwarded" for all three.
+     *
+     * This function predates merge and rebase and said *"Fast-forwarded main 1 commit from
+     * origin"* whatever had happened — which is not a wording quibble: a user who chose *Rebase*
+     * in the dialog and was then told their branch had been fast-forwarded has been told their
+     * answer was ignored, and the history they are about to push is not the shape the sentence
+     * describes.
+     */
+    if (outcome.strategy === 'merge') {
+      return `Merged ${commits(outcome.advanced)} from ${outcome.remote} into ${outcome.branch}${stat}`
+    }
+    if (outcome.strategy === 'rebase') {
+      // Both numbers, because a rebase does two things and one of them is to *your* commits.
+      // The dropped ones are named too — `git rebase` drops them silently, and a user whose
+      // three commits became two goes looking for the lost one.
+      const mine =
+        outcome.rewritten === 0 ? '' : `, replaying ${commits(outcome.rewritten)} of yours`
+      const dropped =
+        outcome.skipped === 0 ? '' : ` (${commits(outcome.skipped)} already upstream, dropped)`
+      return `Rebased ${outcome.branch} onto ${commits(outcome.advanced)} from ${outcome.remote}${mine}${dropped}${stat}`
+    }
     return `Fast-forwarded ${moved}${commits(outcome.advanced)} from ${outcome.remote}${stat}`
   }
   if (outcome.branch !== '') {
@@ -794,10 +859,132 @@ export function pullReport(results: readonly RepoFetch[]): { text: string; detai
   const where = moved.length === results.length
     ? `all ${results.length} repositories`
     : `${moved.length} of ${results.length} repositories`
+  // "Updated", not "Fast-forwarded": with several repositories the strategies can differ — one
+  // fast-forwards while another merges — so the aggregate uses the word that is true of all of
+  // them, and the per-repository detail below says which was which.
   return {
-    text: `Fast-forwarded ${where} · ${commits(total((o) => o.advanced))}${stat}`,
+    text: `Updated ${where} · ${commits(total((o) => o.advanced))}${stat}`,
     detail,
   }
+}
+
+/**
+ * A `PushOutcome`, structurally.
+ *
+ * Declared rather than imported for [`FetchReport`]'s reason, and named `PushInfo` rather than
+ * `PushReport` for one more: `PushReport` and [`pushReport`] would differ only in case, which
+ * is the near-collision `ui/scripts/check-casing.mjs` exists to catch on a case-insensitive
+ * filesystem. The field names are pinned against `ui/src/ipc/generated.ts` by
+ * `check-branches.mjs`, which is the same guarantee arrived at from the other side.
+ */
+export interface PushInfo {
+  remote: string
+  refspec: string
+  shelledOut: boolean
+  output: string
+  /** The destination branch's short name. Empty when the refspec named something else. */
+  branch: string
+  /** How many commits the remote gained. Zero when it was already up to date. */
+  pushed: number
+  /** Where the remote ref was before. **Empty when the remote had no such ref.** */
+  oldOid: string
+  newOid: string
+}
+
+/**
+ * What a push has to say. Never empty: the user asked for network.
+ *
+ * Three answers, told apart at a glance, the same rule `fetchNote` follows and for the same
+ * reason — they call for different next actions:
+ *
+ *   * **a branch that did not exist on the remote** — `Published feature to origin · 3 commits`.
+ *     `oldOid` is empty only for a `--set-upstream` publish, and *"Pushed 3 commits"* is true
+ *     but misses the thing the user actually just did: the branch is now visible to everybody
+ *     else, which is the fact they will act on next.
+ *   * **nothing went up** — `main is already up to date on origin`. The branch is named for
+ *     `pullReport`'s reason: with four repositories it is the only thing that says which one
+ *     answered.
+ *   * **commits went up** — `Pushed 3 commits to origin/main`.
+ *
+ * A refusal is not here at all. That is a `GitError` and `explain` is its sentence.
+ */
+export function pushNote(outcome: PushInfo): string {
+  const where = outcome.branch === '' ? outcome.remote : `${outcome.remote}/${outcome.branch}`
+  if (outcome.oldOid === '' && outcome.pushed > 0) {
+    return `Published ${outcome.branch} to ${outcome.remote} · ${commits(outcome.pushed)}`
+  }
+  if (outcome.pushed === 0) {
+    const said = oneLine(outcome.output)
+    if (outcome.branch !== '') return `${outcome.branch} is already up to date on ${outcome.remote}`
+    return said === '' ? `Already up to date on ${outcome.remote}` : said
+  }
+  return `Pushed ${commits(outcome.pushed)} to ${where}`
+}
+
+/**
+ * The body under `pushNote`: git's own text, multi-line.
+ *
+ * **Not through `oneLine`**, and that is the one place this differs from `fetchDetail`.
+ * `Notice.detail` is documented as multi-line and rendered pre-wrapped, and `oneLine`'s
+ * 160-character cap would truncate a GitHub push's
+ * `remote: Create a pull request for 'x' on GitHub: https://…` mid-URL — which is the single
+ * most useful thing a push ever prints. Collapsed, trimmed and capped instead, so a chatty
+ * server cannot turn one toast into a page.
+ *
+ * Untrusted and never parsed, exactly as `fetchDetail`'s is: on the binary route this is the
+ * remote server's own text, written by whoever runs that server.
+ */
+export function pushDetail(outcome: PushInfo): string {
+  const lines = outcome.output
+    .split(/[\r\n]+/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+  const said = lines.join('\n')
+  return said.length > 600 ? `${said.slice(0, 599)}…` : said
+}
+
+/** One repository's push, labelled. `RepoFetch`'s shape, for `RepoFetch`'s reason. */
+export interface RepoPush {
+  /** `RepoInfo.name`. Ignored when there is only one repository. */
+  name: string
+  outcome: PushInfo
+}
+
+/**
+ * Several repositories' pushes as **one** notice.
+ *
+ * Aggregated for exactly `pullReport`'s two reasons, restated because they are what make this
+ * function necessary rather than decorative. One gesture deserves one answer: `git.push` names
+ * no repository, so it acts on every one in the project. And the failure mode of not
+ * aggregating is worse than noise — `notices.admit` collapses toasts by identical text, so five
+ * submodules all answering *"already up to date on origin"* would show **one** toast and
+ * silently speak for five.
+ *
+ * With one repository this is exactly `pushNote` / `pushDetail`, so the common case reads as
+ * though the multi-root machinery were not there.
+ */
+export function pushReport(results: readonly RepoPush[]): { text: string; detail: string } {
+  const first = results[0]
+  if (results.length === 1 && first !== undefined) {
+    return { text: pushNote(first.outcome), detail: pushDetail(first.outcome) }
+  }
+  if (first === undefined) return { text: '', detail: '' }
+
+  const moved = results.filter((r) => r.outcome.pushed > 0)
+  // Every repository is listed, moved or not. One that was already up to date is an answer to
+  // the question that was asked, and leaving it out would make the notice look like the command
+  // had skipped it.
+  const detail = results.map((r) => `${r.name}: ${pushNote(r.outcome)}`).join('\n')
+
+  if (moved.length === 0) {
+    return { text: `All ${results.length} repositories are already up to date`, detail }
+  }
+  const total = moved.reduce((n, r) => n + r.outcome.pushed, 0)
+  const where =
+    moved.length === results.length
+      ? `all ${results.length} repositories`
+      : `${moved.length} of ${results.length} repositories`
+  return { text: `Pushed ${commits(total)} from ${where}`, detail }
 }
 
 /*

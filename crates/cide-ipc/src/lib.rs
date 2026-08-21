@@ -37,7 +37,7 @@ pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
 pub use positions::ViewPosition;
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
-    DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings,
+    DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,
     GraphicsSettings, HighlightLevel, InspectionSettings, MAX_CODE_FONT_SIZE, MAX_PUSH_DEBOUNCE_MS,
     MAX_UI_FONT_SIZE, MIN_CODE_FONT_SIZE, MIN_PUSH_DEBOUNCE_MS, MIN_UI_FONT_SIZE, ProxyMode,
     ProxyScope, ProxySettings, ProxyTarget, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, Settings,

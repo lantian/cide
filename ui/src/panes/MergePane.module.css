@@ -1,0 +1,386 @@
+/*
+ * The three-pane conflict resolver. (M20)
+ *
+ * A grid of three equal columns over one scroll-free body, with the toolbar pinned above and
+ * the footer below — the same head/body/foot shape `DiffPane` and the agent role editor use, so
+ * a pane that has to live inside a split does not fight the splitter for height.
+ */
+.host {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/*
+ * The toolbar, and the one number in this file that is a contract rather than a taste.
+ *
+ * `--pane-corner-clear` is the band the pane's floating control cluster occupies — maximize,
+ * split, detach, close — published by `layout/PaneTitleBar.module.css`. The cluster wins the
+ * paint order, so anything a pane puts in its own top-right corner is **drawn and not
+ * clickable**: `Apply` sat under the close button, which is the worst possible pairing.
+ *
+ * `DiffPane`, `GitDiffPane` and `EditorPane`'s conflict bar all reserve it, and `check:rows`
+ * pins that they do — this file is now a fourth entry in that list. `--pane-corner-clear` and
+ * not `--pane-corner`: the former is the inset plus the width, which is the band the cluster
+ * actually occupies, and reserving only the width is the exact bug that made `EditorPane`'s
+ * *Keep mine* close the pane instead.
+ */
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 0 calc(8px + var(--pane-corner-clear, 0px)) 0 8px;
+  min-height: calc(26px * var(--ui-scale));
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-ui-12);
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+.counter {
+  font-family: var(--font-mono);
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+}
+
+.action {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-ui-11);
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.action:hover:not(:disabled) {
+  background: var(--chrome-hi);
+}
+
+.action:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+
+.primary:disabled {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--faint);
+}
+
+/* Three columns, equal, with a hairline between them rather than a gap: the panes are three
+   views of one document and a gutter would read as three documents. */
+.panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.pane:last-child {
+  border-right: none;
+}
+
+.paneHead {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  font-size: var(--fs-ui-11);
+  color: var(--dim);
+  background: var(--chrome-hi);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The editable one, marked as such: the centre is the only pane a keystroke reaches, and three
+   identical frames would leave that to be discovered. */
+.paneHeadActive {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/*
+ * `hidden`, not `auto`. CodeMirror scrolls itself — `.cm-editor` below is given the full height,
+ * so `.cm-scroller` inside it is the scroll container — and `auto` here made a **second** one
+ * around it. Two nested scrollers over one document is why the scroll-sync listener, which is
+ * attached to `view.scrollDOM`, saw events that did not correspond to what had actually moved.
+ *
+ * `min-height: 0` is what gives the flex child a definite height to fill; without it the editor
+ * grows to its content and the pane scrolls after all.
+ */
+.paneBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* CodeMirror fills its pane. */
+.paneBody > :global(.cm-editor) {
+  height: 100%;
+}
+
+.empty {
+  padding: 12px;
+  color: var(--dim);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+}
+
+.note {
+  margin: 0 0 8px;
+}
+
+/* The per-conflict widget the centre pane draws above each unresolved region. */
+.decisions {
+  display: flex;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--chrome-hi);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.decisionLabel {
+  color: var(--dim);
+  font-size: var(--fs-ui-11);
+  margin-right: 4px;
+  align-self: center;
+}
+
+/* A conflict that still has no answer. `--red` means one thing in this app — *this needs a
+   decision before anything else can happen* — and this is exactly that. */
+.pending {
+  color: var(--red);
+}
+
+.resolved {
+  color: var(--green);
+}
+
+/* The pane heading's label, shrinking before the accept button does. */
+.paneLabel {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * IDEA's chevron, as a button in the side pane's heading.
+ *
+ * In the *heading* rather than in the editor's gutter, and that is a limit worth stating: IDEA
+ * puts one beside every change block. Here there is one per pane, acting on the conflict the
+ * toolbar is on, because the three panes are three independent CodeMirror documents with no
+ * alignment between them — a gutter button would need a line in `ours` matched to a line in the
+ * result, which is the diff this resolver deliberately does not compute (see `mergeModel`'s
+ * header). The regions are still painted in all three panes, so the button always has a visible
+ * subject.
+ */
+.accept {
+  flex: none;
+  height: calc(18px * var(--ui-scale));
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-ui-11);
+  cursor: pointer;
+}
+
+.accept:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text-hi);
+}
+
+.accept:disabled {
+  color: var(--faint);
+  border-color: var(--border-soft);
+  cursor: default;
+}
+
+/* Already taken. Green, and it stays clickable — clicking again removes it, which is how a
+   user backs out of "both" without resetting the whole region. */
+.acceptOn {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.paneHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/*
+ * The conflict tones, from IDEA's colour legend. (M20)
+ *
+ * `:global` because CodeMirror writes these class names onto its own line elements, where a CSS
+ * module's hashed names cannot reach — `panes/mergeDecorations.ts` is the only thing that emits
+ * them, and the two ends name the same four strings.
+ *
+ * Backgrounds are mixed into the pane rather than being flat colours, so syntax-coloured text
+ * stays readable on top of them; a solid tint at any strength that reads as "conflict" also
+ * makes code underneath it unreadable.
+ */
+/* Both sides changed it differently and nobody has decided. Red: nothing else can happen here
+   until they do. */
+:global(.cm-mergeConflict) {
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+}
+
+/* One side changed it and has not been answered. Blue — a change, not a problem, and the
+   distinction is the whole reason the centre pane opens as the base. */
+:global(.cm-mergePending) {
+  background: color-mix(in srgb, var(--blue) 13%, transparent);
+}
+
+/*
+ * There is deliberately no third or fourth tone.
+ *
+ * An accepted block and a rejected one used to get green and faint, and that was the wrong idea
+ * of what the colour is for. A highlight here means *work you have not done*: a merge of thirty
+ * blocks that keeps painting the answered ones ends with thirty coloured bands and nothing to
+ * separate the two you have not read from the twenty-eight you have. What was decided is
+ * recorded by the result column's text and by the `↺` left in the gutter of the pane it was
+ * decided in.
+ */
+
+/* The one the side buttons act on, in all three panes at once. A left border rather than a
+   stronger fill: the fill already means "conflict", and doubling it would leave the current
+   region competing with its own state instead of standing out from its neighbours. */
+:global(.cm-mergeCurrent) {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/*
+ * The per-conflict chevrons, in the side panes' gutters. (M20)
+ *
+ * `:global` for the reason the tones above are: CodeMirror writes these onto its own gutter DOM.
+ * `panes/mergeGutter.ts` is the only thing that emits them.
+ *
+ * The gutter itself gets no border and no background — it is part of the pane's own margin, and
+ * a second rule beside the line numbers would read as a third column.
+ */
+:global(.cm-mergeChevronGutter) {
+  min-width: calc(30px * var(--ui-scale));
+}
+
+:global(.cm-mergeChevron) {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: var(--fs-ui-12);
+  line-height: inherit;
+  cursor: pointer;
+}
+
+:global(.cm-mergeChevron):hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text-hi);
+}
+
+/*
+ * The pair of buttons a block gets in one side's gutter, side by side.
+ *
+ * They are removed once that side is answered — see `mergeGutter.ts` — so there is no "already
+ * taken" state to paint here. A chevron that stayed after being used looked like it had not
+ * worked, and clicking it again did something else entirely.
+ */
+:global(.cm-mergeChevronPair) {
+  display: flex;
+  gap: 1px;
+}
+
+/* IDEA's `X`. Rejecting is a decision, so it gets a real button rather than being the absence
+   of one — but it is not the primary gesture, so it is dim until reached for. */
+:global(.cm-mergeIgnore) {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: var(--fs-ui-10);
+  line-height: inherit;
+  cursor: pointer;
+}
+
+:global(.cm-mergeIgnore):hover {
+  background: color-mix(in srgb, var(--red) 22%, transparent);
+  color: var(--text-hi);
+}
+
+/*
+ * `↺`, on a side that has already been answered. (M20)
+ *
+ * An answered side used to get no control at all, which made it a dead end: the only way back
+ * was the toolbar's Reset, acting on whichever block the toolbar happened to be on. It matters
+ * most for blocks nobody decided — *Apply non-conflicting*, and the setting that runs it on open,
+ * settle a dozen at once, and a decision made on somebody's behalf has to be reachable.
+ *
+ * Dim, because it is not a decision the user still owes: it is the way out of one they have
+ * already made.
+ */
+:global(.cm-mergeRevert) {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--fs-ui-11);
+  line-height: inherit;
+  cursor: pointer;
+}
+
+:global(.cm-mergeRevert):hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--text-hi);
+}
+
+/*
+ * The part of a changed line that actually moved. (M20)
+ *
+ * IDEA dims the unchanged text of a modified line and highlights only this; a whole-block tint
+ * says *something here is different* and leaves the reader to find it, which on a reformatted
+ * line or a renamed identifier is most of the work.
+ *
+ * Stronger than the block tint it sits inside, and underlined as well as filled, because the two
+ * are stacked: a fill alone at any strength that survives being layered on the block colour is
+ * one that swamps the syntax colours underneath.
+ */
+:global(.cm-mergeWord) {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  border-radius: 2px;
+  box-shadow: inset 0 -1px 0 var(--accent);
+}

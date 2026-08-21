@@ -136,7 +136,18 @@ try {
         'deletions',
         'commits',
         'moreCommits',
+        // The M20 half. `strategy` is what stops the notice saying "Fast-forwarded" after a
+        // rebase, and `conflicts` is what makes a stopped merge a success with work attached
+        // rather than a failure.
+        'strategy',
+        'rewritten',
+        'skipped',
+        'conflicts',
       ],
+    ],
+    [
+      'PushOutcome',
+      ['remote', 'refspec', 'shelledOut', 'output', 'branch', 'pushed', 'oldOid', 'newOid'],
     ],
     ['PulledCommit', ['shortOid', 'summary', 'author']],
   ]) {
@@ -481,6 +492,11 @@ try {
     branch: '',
     oldOid: '',
     newOid: '',
+    // The M20 half: which strategy ran, what a rebase did to your own commits, and what is left
+    // to resolve. A plain fetch fills in none of it, which is what these defaults are.
+    rewritten: 0,
+    skipped: 0,
+    conflicts: [],
     filesChanged: 0,
     insertions: 0,
     deletions: 0,
@@ -496,6 +512,68 @@ try {
   )
   eq(m.fetchNote(fetched({ advanced: 1 })), 'Fast-forwarded 1 commit from origin', 'singular')
   eq(m.fetchNote(fetched({ advanced: 4 })), 'Fast-forwarded 4 commits from origin', 'plural')
+
+  /*
+   * The verb follows the strategy. (M20)
+   *
+   * This function predated merge and rebase and said *"Fast-forwarded"* whatever had happened,
+   * which is not a wording quibble: a user who chose **Rebase** in the dialog and was then told
+   * their branch had been fast-forwarded has been told their answer was ignored, and the history
+   * they are about to push is not the shape the sentence describes.
+   */
+  eq(
+    m.fetchNote(fetched({ advanced: 4, branch: 'main', strategy: 'merge' })),
+    'Merged 4 commits from origin into main',
+    'a merge says it merged',
+  )
+  eq(
+    m.fetchNote(
+      fetched({ advanced: 4, branch: 'main', strategy: 'rebase', rewritten: 2 }),
+    ),
+    'Rebased main onto 4 commits from origin, replaying 2 commits of yours',
+    'a rebase says both numbers, because it does two things and one is to YOUR commits',
+  )
+  eq(
+    m.fetchNote(
+      fetched({ advanced: 4, branch: 'main', strategy: 'rebase', rewritten: 1, skipped: 2 }),
+    ),
+    'Rebased main onto 4 commits from origin, replaying 1 commit of yours (2 commits already upstream, dropped)',
+    'and names the dropped ones — git drops them silently and the user goes looking for them',
+  )
+  eq(
+    m.fetchNote(
+      fetched({ advanced: 4, branch: 'main', strategy: 'fastForward' }),
+    ),
+    'Fast-forwarded main 4 commits from origin',
+    'and a fast-forward still says so',
+  )
+
+  /*
+   * Conflicts lead, whatever else is true.
+   *
+   * A merge that stopped still *took* every one of its commits, so the counts are all true —
+   * and leading with them would bury the one fact the user has to act on under a sentence that
+   * reads like success.
+   */
+  eq(
+    m.fetchNote(
+      fetched({
+        advanced: 4,
+        branch: 'main',
+        strategy: 'merge',
+        conflicts: ['src/a.rs', 'src/b.rs'],
+      }),
+    ),
+    'Merging main — 2 files to resolve: src/a.rs and src/b.rs',
+    'a conflicted merge says what is left to do, not how many commits it took',
+  )
+  eq(
+    m.fetchNote(
+      fetched({ advanced: 4, branch: 'main', strategy: 'rebase', conflicts: ['src/a.rs'] }),
+    ),
+    'Rebasing main — 1 file to resolve: src/a.rs',
+    'and a conflicted rebase names its own verb',
+  )
   eq(
     m.fetchNote(fetched({ output: ' From /tmp/x\n' })),
     'From /tmp/x',
@@ -633,7 +711,7 @@ try {
       repoFetch('vendor/zlib'),
       repoFetch('docs', { advanced: 5, filesChanged: 7, insertions: 40, deletions: 2 }),
     ]).text,
-    'Fast-forwarded 2 of 3 repositories · 7 commits · 10 files +49 −3',
+    'Updated 2 of 3 repositories · 7 commits · 10 files +49 −3',
     'the totals are summed across the repositories that moved, and the ones that did not are '
       + 'counted in the denominator rather than hidden',
   )
@@ -646,7 +724,7 @@ try {
   )
   eq(
     m.pullReport([repoFetch('app', { advanced: 1 }), repoFetch('lib', { advanced: 1 })]).text,
-    'Fast-forwarded all 2 repositories · 2 commits',
+    'Updated all 2 repositories · 2 commits',
     '"all N" rather than "N of N", which reads as though something had been left out',
   )
   eq(

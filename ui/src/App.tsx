@@ -73,6 +73,8 @@ import { TransportNotice } from '@/ipc/TransportNotice'
 import { CloseConfirm } from '@/chrome/CloseConfirm'
 import { useCloseConfirm, requestCloseConfirm } from '@/chrome/closeConfirmStore'
 import { OutsideOpenGate } from '@/chrome/OutsideOpenGate'
+import { PullStrategyGate } from '@/chrome/PullStrategyGate'
+import { ConflictsDialog } from '@/chrome/ConflictsDialog'
 import { requestOutsideOpen } from '@/chrome/outsideOpenStore'
 import { outsideAsk } from '@/terminal/outsideOpen'
 import { canSaveAll, saveAll } from '@/editor/openBuffers'
@@ -995,6 +997,8 @@ export function App() {
           * half was fixing in `restorePlan`; it does not get to reappear in the same file.
           */}
         <OutsideOpenGate />
+        <PullStrategyGate />
+        <ConflictsDialog />
       </>
     )
   }
@@ -1177,6 +1181,11 @@ export function App() {
                   // repo-relative path to the repository's root before calling this, because every
                   // other surface hands over an absolute one and `git.history.file` expects it.
                   onShowHistory={(path) => runCommand('git.history.file', { path })}
+                  // And the toolbar's *Update project*, which had no command to call until M20.
+                  // Through `runCommand` rather than `branchApi.pull`, so the divergence dialog,
+                  // the retry and the aggregated notice are the key's code path and not a second
+                  // copy of it.
+                  onUpdate={() => runCommand('git.pull', null)}
                 />
               </PanelBoundary>
             )}
@@ -1663,6 +1672,8 @@ export function App() {
         {/* The out-of-project confirmation. Also in the detached branch above — one gesture,
             two window kinds, and neither of them may be the one that asks nobody. */}
         <OutsideOpenGate />
+        <PullStrategyGate />
+        <ConflictsDialog />
 
         {/*
           * The switcher popup — one component for Ctrl+Tab (tabs) and Ctrl+` (projects). No

@@ -30,8 +30,10 @@ force: boolean,
  * against the repository, rather than against a list drawn a second ago.
  *
  * A mismatch is [`GitError::NotHead`] and never a rewrite: amending anything but HEAD is an
- * interactive rebase, and cide has no conflict-resolution surface to finish one — the same
- * argument `branch::pull` makes for being fast-forward-only.
+ * **interactive** rebase, which is a different thing from the plain one `cide_git::pull`
+ * performs — it needs a todo list the user edits, and cide has no surface for that. The
+ * conflict half of the old argument no longer applies (see [`ConflictFile`]); the
+ * interactive half still does.
  *
  * `#[serde(default)]` so every caller that predates this field, and every `workspace.json`
  * that never carried it, still deserialises.

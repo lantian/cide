@@ -6,6 +6,20 @@ import { App } from './App'
 // a beat. Both are bundled locally — the CSP names no external font host.
 import './styles/fonts.css'
 import './styles/tokens.css'
+/*
+ * The colours for `editor/highlight.ts`'s token classes. (M20)
+ *
+ * Here, and not beside the code that emits them, for a reason worth writing down: `highlight.ts`
+ * is compiled and *run under node* by `check:editor`, where a `.css` import cannot resolve. So
+ * the stylesheet is loaded by the app entry instead — which is also where it belongs, since these
+ * are global class names (CodeMirror writes the literal `cide-tk-keyword` onto its spans, so they
+ * cannot be hashed) painting a concern shared by every surface that highlights code.
+ *
+ * They used to live inside `EditorSurface.module.css`, scoped under that module's `.body`. That
+ * made them apply inside an `EditorSurface` and nowhere else, which was invisible until the merge
+ * resolver started highlighting too and got plain text with nothing failing.
+ */
+import './editor/highlight.css'
 import { installConsoleBridge } from './ipc/consoleBridge'
 import { installThemeSync } from './settings/useSettings'
 

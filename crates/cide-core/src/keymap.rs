@@ -529,6 +529,54 @@ pub fn defaults() -> Vec<Binding> {
              * so a bare f-key passes through untouched.
              */
             ("f4", "sidebar.toggle", "shellWindow"),
+            /*
+             * Code folding — IDEA's chords, spelled the way this table has to spell them. (M19)
+             *
+             * # `minus` / `equal` / `plus`, never `-` or `+`
+             *
+             * `ui/src/keys/chords.ts::strokeFromEvent` reads `KeyboardEvent.code` **before**
+             * `key`, and `CODE_NAMES` maps `Minus → minus`, `Equal → equal`,
+             * `NumpadSubtract → minus`, `NumpadAdd → plus`. Two consequences, both load-bearing:
+             * one `ctrl+minus` covers the main row *and* the numeric keypad, which is what makes
+             * this IDEA-compatible on a full keyboard and on a laptop; and `equal` and `plus` are
+             * two different physical keys, so "expand" needs both lines. A binding written
+             * `ctrl+shift+-` would parse here — `normalize_key` renames no keys — and be inert
+             * for ever, because no keystroke ever produces the token `-`.
+             *
+             * # Why the `when` is not optional
+             *
+             * The gate is a window **capture** listener, so an unscoped chord is taken from every
+             * pane in every window. xterm encodes a control byte for a plain `Ctrl+-` (0x1f), so
+             * an unscoped `ctrl+minus` would be a keystroke silently removed from every shell.
+             * `editorFocused` is the same reasoning `ctrl+b` and `ctrl+g` above are scoped by.
+             *
+             * # What was checked, not assumed
+             *
+             * Nothing in this table binds `minus`, `equal`, `plus` or `period`; `defaultKeymap`,
+             * `historyKeymap` and `closeBracketsKeymap` bind none of them either. On macOS the
+             * blanket `ctrl_to_meta` rewrite lands these on ⌘−/⌘=/⌘. — which is what IDEA uses
+             * there — and none of them is in `MACOS_MENU_CHORDS`, so AppKit's menu bar does not
+             * eat them before the webview sees them.
+             *
+             * CodeMirror's own `foldKeymap` is deliberately *not* installed. It spells these
+             * `Ctrl-Shift-[` / `Ctrl-Alt-[`, one modifier from `indentLess`/`indentMore`, and on
+             * macOS `⌘[`/`⌘]` are already `navigate.back`/`navigate.forward` — pushed by
+             * [`platform_layer`] below.
+             */
+            ("ctrl+minus", "editor.fold", "editorFocused"),
+            ("ctrl+equal", "editor.unfold", "editorFocused"),
+            ("ctrl+plus", "editor.unfold", "editorFocused"),
+            ("ctrl+shift+minus", "editor.foldAll", "editorFocused"),
+            ("ctrl+shift+equal", "editor.unfoldAll", "editorFocused"),
+            ("ctrl+shift+plus", "editor.unfoldAll", "editorFocused"),
+            ("ctrl+alt+minus", "editor.foldRecursively", "editorFocused"),
+            (
+                "ctrl+alt+equal",
+                "editor.unfoldRecursively",
+                "editorFocused",
+            ),
+            ("ctrl+alt+plus", "editor.unfoldRecursively", "editorFocused"),
+            ("ctrl+period", "editor.toggleFold", "editorFocused"),
         ]
         .into_iter()
         .map(|(key, command, when)| Binding::new(key, command).when(when)),
@@ -2885,10 +2933,19 @@ mod tests {
 
     /// Every default can be unbound, and unbinding is the only thing it does.
     ///
-    /// Pinned to the PC layer, and the "exactly one line" assertion at the foot is *why*: it is
-    /// a property of `defaults()`, where no command carries two chords. The macOS layer breaks
-    /// that by design — see the test directly below, which states the other half rather than
-    /// leaving this one silently platform-specific.
+    /// Pinned to the PC layer, and the assertion at the foot is *why*: an unbind must write one
+    /// removal line **per chord the command actually stands on**, and not one more. Fewer would
+    /// leave the command live on a chord the user thought they had taken away — the precise
+    /// failure `suppress` exists to prevent, and the one the macOS test below states for the
+    /// layer that adds a second chord.
+    ///
+    /// It read `assert_eq!(user.len(), 1)` until M19, with a comment calling one-chord-per-command
+    /// a property of `defaults()`. That was true and incidental rather than intended, and folding
+    /// ended it on purpose: `ctrl+equal` and `ctrl+plus` are **two physical keys** — the main row's
+    /// `=` and the keypad's `+`, which `keys/chords.ts` names `equal` and `plus` off
+    /// `KeyboardEvent.code` — for one glyph and one command. Spelling only one of them would make
+    /// Expand dead on the numeric keypad while Collapse worked there, which is worse than either
+    /// alternative. So the counted form is the invariant, and it was always the one that mattered.
     #[test]
     fn every_default_binding_can_be_given_back_to_whatever_is_underneath() {
         for binding in defaults() {
@@ -2912,8 +2969,19 @@ mod tests {
                 "unbinding {} matched nothing: {diags:?}",
                 binding.command
             );
-            // Exactly one line per unbind, so a user's file stays readable.
-            assert_eq!(user.len(), 1);
+            // One line per chord the command stands on, and not one more, so a user's file
+            // stays readable and no chord survives the unbind.
+            let chords = defaults()
+                .iter()
+                .filter(|other| other.command == binding.command && other.when == binding.when)
+                .count();
+            assert_eq!(
+                user.len(),
+                chords,
+                "unbinding {} wrote {} lines for {chords} chord(s)",
+                binding.command,
+                user.len()
+            );
         }
     }
 

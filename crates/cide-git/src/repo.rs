@@ -282,17 +282,32 @@ pub fn operation_in_progress(repo: &Repository) -> Option<String> {
     Some(name.to_string())
 }
 
-/// The paths libgit2 reports as conflicted.
+/// The paths libgit2 reports as conflicted in **this repository's** index.
 pub fn conflicted_paths(repo: &Repository) -> Result<Vec<String>> {
     let index = repo.index().wrap()?;
+    conflicts_of(&index)
+}
+
+/// The conflicting paths of an index, which need not be the repository's.
+///
+/// # Why the parameter is an index and not a repository
+///
+/// Three callers ask this about an index that has never been written anywhere: `replay`
+/// composes a cherry-pick in memory, `worktree::integrate` composes a merge, and `pull`
+/// composes both. Each had grown its own copy of the fifteen lines below — `conflicts_of`
+/// in `replay`, `conflicting` in `worktree` — which is three chances to disagree about the
+/// missing-side rule, in code whose whole job is to name the files a person has to look at.
+///
+/// `our` is absent for a delete/modify conflict; `their` is absent for the mirror case;
+/// taking whichever exists is what makes both show up in the list at all. Getting that wrong
+/// in one copy loses a file silently.
+pub fn conflicts_of(index: &git2::Index) -> Result<Vec<String>> {
     if !index.has_conflicts() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
     for entry in index.conflicts().wrap()? {
         let entry = entry.wrap()?;
-        // `our` is absent for a delete/modify conflict; `their` is absent for the mirror
-        // case. Taking whichever exists is what makes both show up in the list.
         let path = entry
             .our
             .as_ref()

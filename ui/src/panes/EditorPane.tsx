@@ -608,7 +608,11 @@ export function EditorPane({
     // Fire-and-forget: a lost position costs a scroll offset, and a rejected promise on the
     // scroll path would reach `Failures` and put a notice on screen for something the user did
     // not ask for and cannot act on.
-    void fileApi.notePosition(at).catch(() => {})
+    //
+    // `folds` is copied out of the readonly array the editor reported: the DTO's field is a
+    // `Vec<u32>` and therefore a mutable `number[]` on this side, and handing the same array to
+    // a caller that could sort it is how a "pure observation" quietly stops being one.
+    void fileApi.notePosition({ ...at, folds: [...at.folds] }).catch(() => {})
   }, [])
   const reportPosition = useCallback(
     (at: FileView) => {
@@ -678,7 +682,13 @@ export function EditorPane({
             at:
               at === null
                 ? null
-                : { path: at.path, line: at.line, column: at.column, topLine: at.topLine },
+                : {
+                    path: at.path,
+                    line: at.line,
+                    column: at.column,
+                    topLine: at.topLine,
+                    folds: at.folds,
+                  },
           })
           stampRef.current = doc.stamp
           writableRef.current = doc.writable
@@ -840,6 +850,49 @@ export function EditorPane({
         if (!paths.includes(path)) return
         if (dirtyRef.current) setConflict(true)
         else read(true)
+      })
+      .then((fn) => {
+        if (dropped) fn()
+        else unlisten = fn
+      })
+      .catch(() => {})
+    return () => {
+      dropped = true
+      unlisten?.()
+    }
+  }, [path, read])
+
+  /**
+   * Follow the file across a git operation. (M20)
+   *
+   * The reported bug: pull a branch that changes a file you have open, and the pane goes on
+   * showing what it showed before. `cide://session-tool` above covers the agent's edits and
+   * nothing else, and a pull is not an agent edit.
+   *
+   * # Why this re-reads rather than reloading
+   *
+   * `cide://git-status` fires after **every** git mutation cide makes — a stage, an unstage, a
+   * changelist move — and a `read(true)` on each of those would rebuild the `EditorView` and take
+   * the user's scroll position, selection and undo history with it, several times per commit.
+   * So the file is read and its **stamp compared**; only a stamp that actually moved gets the
+   * reload. A read is cheap, and the rebuild is the part that costs something.
+   *
+   * A dirty buffer is never overwritten: it raises the same conflict bar an agent's edit does,
+   * which is the one outcome here that could lose work.
+   */
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let dropped = false
+    void events
+      .onGitStatus(() => {
+        void fileApi
+          .read(path)
+          .then((doc) => {
+            if (dropped || doc.stamp === stampRef.current) return
+            if (dirtyRef.current) setConflict(true)
+            else read(true)
+          })
+          .catch(() => {})
       })
       .then((fn) => {
         if (dropped) fn()

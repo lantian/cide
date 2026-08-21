@@ -31,7 +31,7 @@ import type {
   ShelfRow,
 } from './types'
 
-export type GitStoryName = 'mock' | 'guard' | 'multi' | 'empty'
+export type GitStoryName = 'mock' | 'guard' | 'multi' | 'empty' | 'conflict'
 
 const CIDE_ID = '3f2a1b00-0000-4000-8000-000000000001'
 const VENDOR_ID = '3f2a1b00-0000-4000-8000-000000000002'
@@ -202,6 +202,34 @@ export const GUARD_STATUS: ChangesTree = {
   repos: [{ ...CIDE_REPO, indexChangedExternally: true }],
 }
 
+/**
+ * A merge that stopped. (M20)
+ *
+ * The *Merge Conflicts* group has existed on the wire since M10 and every fixture set
+ * `conflicts: []`, so `check:render` never drew it and it may never have been seen on screen at
+ * all. That is the shape of defect this project keeps producing — a surface that compiles,
+ * mounts, and renders nothing — so the group gets a story of its own.
+ *
+ * One resolved row among the unresolved ones, because *resolved* is the state a row moves
+ * through rather than out of: a row that vanished when it was answered would leave the user no
+ * way to see what they had done, and no way back to a file they answered wrongly.
+ */
+export const CONFLICT_STATUS: ChangesTree = {
+  repos: [
+    {
+      ...CIDE_REPO,
+      branch: { ...branch('hub-provider-config'), operation: 'merge' },
+      conflicts: [
+        entry('crates/cide-git/src/pull.rs', 'conflicted', 'conflicted', 'default'),
+        entry('ui/src/panes/MergePane.tsx', 'conflicted', 'conflicted', 'default'),
+        // Resolved: both sides collapsed to stage 0, so git reports it as an ordinary staged
+        // modification and it is the panel's roster that still remembers it was conflicted.
+        entry('README.md', 'modified', 'unmodified', 'default'),
+      ],
+    },
+  ],
+}
+
 /** Two roots and a submodule: the only story in which repo rows exist at all. */
 export const MULTI_STATUS: ChangesTree = { repos: [CIDE_REPO, VENDOR_REPO, ZLIB_REPO] }
 
@@ -252,6 +280,7 @@ const STORIES: Record<GitStoryName, GitStory> = {
   guard: { status: GUARD_STATUS, shelf: SHELF_FIXTURE },
   multi: { status: MULTI_STATUS, shelf: SHELF_FIXTURE },
   empty: { status: EMPTY_STATUS, shelf: [] },
+  conflict: { status: CONFLICT_STATUS, shelf: [] },
 }
 
 /**

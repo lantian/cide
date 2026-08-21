@@ -2,6 +2,7 @@
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { ExplorerSettings } from "./ExplorerSettings";
+import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { ProxySettings } from "./ProxySettings";
@@ -79,4 +80,4 @@ keepSessionsOnWindowClose: boolean,
  * too. If unsaved edits ever need their own toggle, that is a second field with its own
  * wording, not a second meaning stapled to this one.
  */
-confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: TerminalSettings, graphics: GraphicsSettings, claude: ClaudeSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, };
+confirmCloseWithLiveSession: boolean, editor: EditorSettings, terminal: TerminalSettings, graphics: GraphicsSettings, claude: ClaudeSettings, proxy: ProxySettings, sidebar: SidebarSettings, explorer: ExplorerSettings, inspections: InspectionSettings, git: GitSettings, };

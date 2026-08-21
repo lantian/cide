@@ -10,7 +10,11 @@
 //! would mean two of every refusal below, and a frontend that catches one of them and not the
 //! other.
 //!
-//! # libgit2's stateful `revert` / `cherrypick` are rejected
+//! # libgit2's stateful `revert` / `cherrypick` are rejected — for the clean path
+//!
+//! **Read `docs/adr/0009-real-sequencer-state.md` before undoing any of this.** The section
+//! below is the original argument and it still holds for a replay that applies cleanly, which is
+//! almost all of them. The conflicting path reverses it deliberately, and the ADR records why.
 //!
 //! [`git2::Repository::revert`] and [`git2::Repository::cherrypick`] do the whole job in one
 //! call, and cide uses neither. They write `REVERT_HEAD` / `CHERRY_PICK_HEAD`, set
@@ -40,16 +44,33 @@
 //! and hand back an **in-memory [`git2::Index`]**, writing nothing at all. With
 //! [`git2::Index::has_conflicts`] and [`git2::Index::conflicts`] that answers *"would this
 //! conflict, and where"* before a byte moves — the same shape of answer
-//! [`crate::branch::checkout_blockers`] gives a branch switch, and for the same reason: cide
-//! has no conflict-resolution surface, so a refusal that names the files is the only useful
-//! one. "Cherry-pick failed" is unactionable; "these three files would conflict" is a decision
-//! the user can make.
+//! [`crate::branch::checkout_blockers`] gives a branch switch. It used to decide whether to
+//! *refuse*; since M20 it decides whether to write anything at all. See below.
 //!
 //! The only thing written before the point of no return is the merged tree itself
 //! ([`git2::Index::write_tree_to`]), and that is a handful of unreferenced objects in the
 //! object database: no ref names them, nothing observes them, and `git gc` removes them. It is
 //! also unavoidable — the tree has to exist before it can be compared with `HEAD`'s or checked
 //! out.
+//!
+//! # What happens when it *does* conflict (M20)
+//!
+//! It used to be a refusal — `ReplayWouldConflict`, naming the files and changing nothing — on
+//! the argument that *cide has no conflict-resolution surface, so a refusal that names the files
+//! is the only useful one*. That was true, and the refusal was the better of the two answers
+//! available at the time. It is no longer: [`crate::conflict`] is the surface, so a refusal
+//! would name the files and then send the user somewhere else to do the whole thing again.
+//!
+//! So the conflicting path now runs libgit2's stateful [`git2::Repository::cherrypick`] /
+//! [`git2::Repository::revert`] after all, leaves `CHERRY_PICK_HEAD` or `REVERT_HEAD`, and hands
+//! back the paths in [`cide_ipc::history::ReplayOutcome::conflicts`]. The two objections in the
+//! section above are answered rather than ignored: [`crate::commit`] takes the staging-area arm
+//! and concludes the operation with `cleanup_state`, and `operation_in_progress` is what the
+//! panel's merge bar is drawn from rather than a blanket refusal.
+//!
+//! **The clean path is unchanged**, and that is the case that matters — it is almost every
+//! cherry-pick anyone makes. It is still composed by hand, still creates no sequencer state, and
+//! `nothing_leaves_a_sequencer_state_behind` still asserts so.
 //!
 //! # Where this is deliberately more permissive than `git`
 //!
@@ -64,7 +85,7 @@ use std::path::Path;
 
 use cide_ipc::git::{GitError, PulledCommit};
 use cide_ipc::history::{ReplayMode, ReplayOp, ReplayOutcome, ReplayRequest};
-use git2::{Commit, Index, Oid, Repository, Tree};
+use git2::{Commit, Oid, Repository, Tree};
 
 use crate::{Result, Wrap, branch, changelist, repo as repo_mod, status};
 
@@ -124,10 +145,60 @@ fn replay(root: &Path, op: ReplayOp, request: &ReplayRequest) -> Result<ReplayOu
     }
     .wrap()?;
     if merged.has_conflicts() {
-        return Err(GitError::ReplayWouldConflict {
+        /*
+         * Conflicts, so the operation runs **for real** and is left for the resolver. (M20)
+         *
+         * This used to be `GitError::ReplayWouldConflict`, and the in-memory merge above was
+         * thrown away — for the reason this module's header gave: there was nothing in the app
+         * that could finish a half-applied cherry-pick, so a refusal naming the files was the
+         * only useful answer. `cide_git::conflict` is that surface, so the refusal became the
+         * lesser answer: it told the user which files were the problem and then made them go
+         * and do the whole thing again somewhere else.
+         *
+         * The pre-check is not wasted. It is still what decides *whether* to write anything at
+         * all, and the clean path below still composes the result by hand and creates no
+         * sequencer state — which is the case that matters, because it is almost all of them.
+         *
+         * `mainline` is not passed on: libgit2's stateful calls take it in their options, and
+         * `mainline_of` has already refused every value they would reject.
+         */
+        drop(merged);
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.safe();
+        match op {
+            ReplayOp::CherryPick => {
+                let mut opts = git2::CherrypickOptions::new();
+                opts.mainline(mainline).checkout_builder(checkout);
+                repo.cherrypick(&source, Some(&mut opts)).wrap()?;
+            }
+            ReplayOp::Revert => {
+                let mut opts = git2::RevertOptions::new();
+                opts.mainline(mainline).checkout_builder(checkout);
+                repo.revert(&source, Some(&mut opts)).wrap()?;
+            }
+        }
+        // `ORIG_HEAD` so Abort has somewhere to go back to. libgit2 writes it for `merge` and
+        // `rebase` and not for these two, and `cide_git::conflict::abort` resets to it.
+        let _ = repo.reference("ORIG_HEAD", head.id(), true, "cide: replay");
+
+        let index = repo.index().wrap()?;
+        let conflicts = repo_mod::conflicts_of(&index)?;
+        drop(index);
+        let _ = changelist::record_index(root, &repo);
+        let live = status::live_paths(root).unwrap_or_default();
+        let _ = changelist::update(root, |data| {
+            let _ = data.reconcile(&live);
+            Ok(())
+        });
+        let message = message_for(op, &source, mainline)?;
+        return Ok(ReplayOutcome {
             op,
-            oid,
-            paths: conflicts_of(&merged)?,
+            source: source.id().to_string(),
+            // Nothing is committed yet: the user resolves, then presses Continue.
+            created: String::new(),
+            summary: message.lines().next().unwrap_or("").to_string(),
+            files: conflicts.len() as u32,
+            conflicts,
         });
     }
 
@@ -184,6 +255,7 @@ fn replay(root: &Path, op: ReplayOp, request: &ReplayRequest) -> Result<ReplayOu
         created,
         summary,
         files,
+        conflicts: Vec::new(),
     })
 }
 
@@ -371,33 +443,6 @@ fn changed_files(repo: &Repository, head: &Commit<'_>, tree: &Tree<'_>) -> Resul
         .diff_tree_to_tree(Some(&head_tree), Some(tree), None)
         .wrap()?;
     Ok(diff.deltas().len() as u32)
-}
-
-/// The conflicted paths of an index that is not the repository's.
-///
-/// [`crate::repo::conflicted_paths`] answers the same question about `.git/index` and cannot be
-/// reused: the whole point of the pre-check is that this index has never been written anywhere.
-/// Kept here rather than beside it because this is its only caller and the merged-index shape
-/// is a fact about replaying, not about repositories.
-fn conflicts_of(index: &Index) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for entry in index.conflicts().wrap()? {
-        let entry = entry.wrap()?;
-        // `our` is absent for a delete/modify conflict and `their` for the mirror case; taking
-        // whichever exists is what makes both show up in the list the refusal carries.
-        let path = entry
-            .our
-            .as_ref()
-            .or(entry.their.as_ref())
-            .or(entry.ancestor.as_ref())
-            .map(|e| String::from_utf8_lossy(&e.path).into_owned());
-        if let Some(path) = path {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
 }
 
 /// A full oid, as a commit. `NoSuchCommit` on anything that does not peel to one.

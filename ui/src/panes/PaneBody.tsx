@@ -25,6 +25,7 @@ import { ClaudeDiffPane } from './ClaudeDiffPane'
 // frame while a chunk arrives is a pane the layout measures at zero.
 import { GitDiffPane } from './GitDiffPane'
 import { RevisionPane } from './RevisionPane'
+import { MergePane } from './MergePane'
 import { ResumeSplash } from '@/windows/ResumeSplash'
 import { paneSessionId } from '@/layout/paneHosts'
 import { useWorkspace } from '@/store/workspace'
@@ -32,6 +33,9 @@ import type { Bootstrap, DiffSpec, Pane, PaneId, PaneRestore, TabKind } from '@/
 
 /** The `TabKind::Revision` arm, so the lookup below and the pane agree about its shape. */
 type RevisionTab = Extract<TabKind, { kind: 'revision' }>
+
+/** The `TabKind::Merge` arm — the three-pane conflict resolver. (M20) */
+type MergeTab = Extract<TabKind, { kind: 'merge' }>
 
 /**
  * The revision tab this pane belongs to, or `null`.
@@ -65,6 +69,54 @@ function revisionTabFor(
   if (tabs === undefined) return null
   for (const tab of tabs) {
     if (tab.kind.kind === 'revision' && pane in tab.tree.panes) return tab.kind
+  }
+  return null
+}
+
+/**
+ * The merge tab this pane belongs to, or `null`.
+ *
+ * `revisionTabFor`'s twin, and its header carries the argument for reading this off the mirror
+ * rather than threading a prop.
+ *
+ * **Returns `tab.kind` itself, never a copy**, and the resolver's tab id is read by a *second*
+ * selector below rather than folded in here. A spread — `{ ...tab.kind, id: tab.id }` — is a
+ * fresh object on every store snapshot, which under `Object.is` equality re-renders this pane
+ * for every unrelated workspace change. `check:selectors` exists for exactly that class and
+ * does not catch it in this shape, because the fresh value is built inside a named function
+ * rather than inline in the selector.
+ */
+function mergeTabFor(
+  boot: Bootstrap | null,
+  project: string | undefined,
+  pane: PaneId,
+): MergeTab | null {
+  if (boot === null || project === undefined) return null
+  const tabs = boot.workspace.projects[project]?.tabs
+  if (tabs === undefined) return null
+  for (const tab of tabs) {
+    if (tab.kind.kind === 'merge' && pane in tab.tree.panes) return tab.kind
+  }
+  return null
+}
+
+/**
+ * The id of the merge tab this pane belongs to — a plain string, so it compares by value.
+ *
+ * Split from `mergeTabFor` for the reason that function's header gives. The resolver needs it
+ * because it closes its own tab once the file is written, and a pane cannot ask the workspace
+ * which tab contains it from the inside.
+ */
+function mergeTabIdFor(
+  boot: Bootstrap | null,
+  project: string | undefined,
+  pane: PaneId,
+): string | null {
+  if (boot === null || project === undefined) return null
+  const tabs = boot.workspace.projects[project]?.tabs
+  if (tabs === undefined) return null
+  for (const tab of tabs) {
+    if (tab.kind.kind === 'merge' && pane in tab.tree.panes) return tab.id
   }
   return null
 }
@@ -192,6 +244,8 @@ export function PaneBody({
    * lookup returns the mirror's own value or `null` and never a wrapper.
    */
   const revision = useWorkspace((s) => revisionTabFor(s.boot, project, pane.id))
+  const merge = useWorkspace((s) => mergeTabFor(s.boot, project, pane.id))
+  const mergeTab = useWorkspace((s) => mergeTabIdFor(s.boot, project, pane.id))
 
   // A file is a document too: no session, no spawn, nothing to resume. (M9)
   //
@@ -253,6 +307,20 @@ export function PaneBody({
    * A revision tab outside a project is unreachable (a `RepoId` only exists inside one), so this
    * is a type narrowing rather than a case with behaviour behind it.
    */
+  /*
+   * The conflict resolver. (M20)
+   *
+   * Guarded on the pane kind for `revision`'s reason, stated just below: splitting a non-console
+   * tab produces a `PaneKind::Claude` pane, and without this test that pane would draw a second
+   * resolver over the same conflict instead of the terminal it is.
+   *
+   * Before the `held` splash, with every other document branch, and for the reason the revision
+   * diff states: a document must never be offered a Resume.
+   */
+  if (merge && mergeTab && pane.kind === 'editor' && project) {
+    return <MergePane project={project} repo={merge.repo} path={merge.path} tab={mergeTab} />
+  }
+
   if (revision && pane.kind === 'editor' && project) {
     return (
       <RevisionPane

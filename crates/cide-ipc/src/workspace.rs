@@ -99,7 +99,7 @@ impl Workspace {
     /// the cheap walk back now turns it off against a default that is finally the one the
     /// feature was asked for — a statement on their disk, which is what rungs 1 → 2 and 2 → 3
     /// are both about.
-    pub const CURRENT_SCHEMA: u32 = 4;
+    pub const CURRENT_SCHEMA: u32 = 5;
 }
 
 impl Default for Workspace {
@@ -656,6 +656,29 @@ pub enum TabKind {
         /// saved tab.
         title: String,
     },
+    /// The three-pane conflict resolver, for one conflicted path. (M20)
+    ///
+    /// Carries only the **key** — which repository, which path — for `TabKind::Diff`'s reason,
+    /// stated at length on [`DiffSpec`]: this enum is persisted inside `Workspace`, which
+    /// `cide_core::persist` debounces to `workspace.json`, so a document that travelled in here
+    /// would be a document written to disk. The pane calls `git_conflict_read` when it mounts.
+    ///
+    /// **Restoring one is not reproducible, and that is handled rather than ignored.** Unlike
+    /// [`Self::Revision`], which names an immutable commit, this names a path in a *conflict* —
+    /// and by the time the workspace is restored the merge may have been finished, aborted, or
+    /// finished differently in a terminal. The pane asks and draws "no longer conflicted" if it
+    /// is gone; it does not resurrect anything.
+    ///
+    /// Additive: no `workspace.json` in existence carries this variant, so `CURRENT_SCHEMA` does
+    /// not move and `persist::migrate` needs no arm — the same argument
+    /// [`DiffOrigin::Git`]'s fields make above.
+    Merge {
+        repo: RepoId,
+        /// Repo-relative and slash-separated, the way `cide_ipc::git` spells every path.
+        path: String,
+        /// Unsaved edits in the centre pane. Same flag, same guard, as [`Self::File`]'s.
+        dirty: bool,
+    },
     Settings {
         section: SettingsSection,
     },
@@ -678,6 +701,10 @@ impl TabKind {
                 .unwrap_or_else(|| path.to_string_lossy().into_owned()),
             Self::Diff { spec, .. } => spec.title.clone(),
             Self::Revision { title, .. } => title.clone(),
+            Self::Merge { path, .. } => format!(
+                "{} — merge",
+                path.rsplit('/').next().unwrap_or(path.as_str())
+            ),
             Self::Settings { .. } => "Settings".into(),
         }
     }

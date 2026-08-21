@@ -8,6 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::git::PullDefault;
 use crate::{Theme, WindowMode};
 
 // No `Eq`: `EditorSettings`/`TerminalSettings` carry an `f32` font size now, and a float has
@@ -89,6 +90,7 @@ pub struct Settings {
     pub sidebar: SidebarSettings,
     pub explorer: ExplorerSettings,
     pub inspections: InspectionSettings,
+    pub git: GitSettings,
 }
 
 impl Default for Settings {
@@ -109,6 +111,7 @@ impl Default for Settings {
             sidebar: SidebarSettings::default(),
             explorer: ExplorerSettings::default(),
             inspections: InspectionSettings::default(),
+            git: GitSettings::default(),
         }
     }
 }
@@ -1969,3 +1972,48 @@ mod font_size_tests {
         assert_eq!(back.ui_font_size, DEFAULT_UI_FONT_SIZE);
     }
 }
+
+/// Git behaviour that is cide's own and not the repository's. (M20)
+///
+/// # Why this is a group with one field
+///
+/// A scalar would do today, and `theme` beside it is the precedent for one. It is a group
+/// because the *next* two git settings are already visible from here — IDEA's *Update
+/// Project* offers a stash-before-update toggle, and the resolver wants its
+/// auto-apply-non-conflicting switch — and [`SettingsPatch`](crate::SettingsPatch) patches
+/// per top-level field, so promoting a scalar to a group later means every caller that
+/// touched the scalar has to be found and rewritten. The cost of being wrong in this
+/// direction is one nested struct; in the other it is a migration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default)]
+#[ts(export)]
+pub struct GitSettings {
+    /// What a divergent pull does when neither `branch.<name>.rebase` nor `pull.rebase` says.
+    ///
+    /// **Last** in the resolution order, and that ordering is the design rather than an
+    /// implementation detail: `pull.rebase` is a fact about a particular project's workflow,
+    /// often set by whoever set the repository up, and a global application preference must
+    /// not silently override it. This answers only for the repositories that have not
+    /// decided for themselves.
+    ///
+    /// Defaults to [`PullDefault::Ask`], which is also the only value that can put a dialog
+    /// on screen. The dialog's *remember this choice* box does not write here — it writes
+    /// `pull.rebase` into the repository, one level up this ladder — so a remembered answer
+    /// is scoped to the project it was given for.
+    pub pull_strategy: PullDefault,
+
+    /// Apply the changes that only one side made, without being asked, when the three-pane
+    /// resolver opens a file.
+    ///
+    /// IDEA's *Tools | Diff & Merge | Automatically apply non-conflicting changes*, and **off**
+    /// by default exactly as it is there. The resolver's centre pane opens as the *base*
+    /// revision and every difference either side made is a block you take or reject; applying
+    /// two thirds of them before the user has looked would undo the reason for showing them at
+    /// all. The toolbar's *Apply non-conflicting* is the same action on demand, and it is one
+    /// click.
+    pub auto_apply_non_conflicting: bool,
+}
+
+// Both fields' defaults are the derive's — `PullDefault::Ask` and `false` — which is why there
+// is no hand-written `impl` here. `#[serde(default)]` above is what fills them into a
+// `workspace.json` written before this group existed.

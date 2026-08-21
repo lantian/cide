@@ -823,12 +823,22 @@ fn build() -> Vec<Command> {
         Command::new("git.fetch", "Fetch from remote", GIT)
             .when("projectOpen")
             .keywords(&["download", "remote"]),
-        // Fast-forward only, and the title says so: cide has no conflict-resolution surface,
-        // so a pull that had to merge would leave a working tree nothing in the app can
-        // finish. A divergence is reported with both counts. See `cide_git::branch::pull`.
-        Command::new("git.pull", "Pull (fast-forward only)", GIT)
+        /*
+         * IDEA's name for it, and the same name the commit panel's toolbar button carries.
+         *
+         * It was "Pull (fast-forward only)" until M20, because cide had no conflict-resolution
+         * surface and a pull that had to merge would have left a working tree nothing in the
+         * app could finish. It has one now (`cide_git::conflict`, and the resolver behind the
+         * commit panel's *Merge Conflicts* group), so this fetches and then integrates — by
+         * fast-forward where it can, and otherwise by whatever `pull.rebase` says or the user
+         * chooses in the dialog.
+         *
+         * **The id does not change and must not.** Ids are API: a user's `keymap.json` names
+         * them, and `ctrl+t` is bound to this one by default.
+         */
+        Command::new("git.pull", "Update project", GIT)
             .when("projectOpen")
-            .keywords(&["update", "merge", "ff"]),
+            .keywords(&["pull", "update", "merge", "rebase", "ff"]),
         Command::new("git.stageSelected", "Stage selected changes", GIT)
             .when("projectOpen")
             // Still unavailable, and unlike `git.commit` this one stays that way. "Selected"
@@ -1221,6 +1231,52 @@ fn build() -> Vec<Command> {
                 "stale",
                 "analyse",
             ]),
+        /*
+         * Code folding. (M19)
+         *
+         * # Why `VIEW` and not a new `Code` group
+         *
+         * IDEA files these under *Code ▸ Folding* and a `CODE` constant would read better in the
+         * palette. It loses on what a group *is* here: `groups_are_listed_once_each_in_table_order`
+         * pins the whole list, so a tenth group is a deliberate decision about the shape of the
+         * palette, and folding does not earn one on its own — collapsing a block changes what is
+         * on screen and changes nothing about the file, which is the definition `VIEW` already
+         * holds for the sidebar toggles and the theme.
+         *
+         * # Why seven and not three
+         *
+         * Because the three-command version is the one that does not work. Collapse-all leaves a
+         * file where every expand needs a second expand for the level below it, and IDEA's answer
+         * — the recursive pair — is what makes that navigable. They are cheap: all seven are one
+         * `case` each over the same `FoldActions` bundle, and a command nobody binds costs a row
+         * in Settings ▸ Keymap.
+         *
+         * All seven are `editorFocused`, and the *handlers* re-check it: a clause here filters
+         * the palette and never gates the keyboard (see this module's header), so the arm in
+         * `ui/src/keys/dispatch.ts` asks `focusedFolds()` itself and reports a refusal when the
+         * answer is null.
+         */
+        Command::new("editor.fold", "Collapse", VIEW)
+            .when("editorFocused")
+            .keywords(&["fold", "collapse", "hide", "block"]),
+        Command::new("editor.unfold", "Expand", VIEW)
+            .when("editorFocused")
+            .keywords(&["unfold", "expand", "open", "block"]),
+        Command::new("editor.toggleFold", "Toggle fold", VIEW)
+            .when("editorFocused")
+            .keywords(&["fold", "collapse", "expand", "toggle"]),
+        Command::new("editor.foldAll", "Collapse all", VIEW)
+            .when("editorFocused")
+            .keywords(&["fold", "collapse", "everything", "file"]),
+        Command::new("editor.unfoldAll", "Expand all", VIEW)
+            .when("editorFocused")
+            .keywords(&["unfold", "expand", "everything", "file"]),
+        Command::new("editor.foldRecursively", "Collapse recursively", VIEW)
+            .when("editorFocused")
+            .keywords(&["fold", "collapse", "nested", "children"]),
+        Command::new("editor.unfoldRecursively", "Expand recursively", VIEW)
+            .when("editorFocused")
+            .keywords(&["unfold", "expand", "nested", "children"]),
     ]
 }
 

@@ -73,6 +73,18 @@ import { levelFor, setLevel } from './highlightLevel'
 import { goToDefinition } from './goToDefinition'
 import { findUsages } from './codeIntel'
 import { wordTargetAt } from './ctrlLink'
+import {
+  canFold,
+  canFoldAll,
+  canUnfold,
+  canUnfoldAll,
+  foldAllRanges,
+  foldHere,
+  foldRecursive,
+  unfoldAllRanges,
+  unfoldHere,
+  unfoldRecursive,
+} from './folding'
 import { sendLabel } from './sendToClaude'
 import { useSendToClaude } from './useSendToClaude'
 
@@ -338,6 +350,99 @@ export function useCodeMenu({
           label: 'Find…',
           run: () => {
             openSearchPanel(live)
+          },
+        },
+        /*
+         * Folding, as a submenu. (M19)
+         *
+         * IDEA files these under *Folding ▸* and so does this, for the reason the submenu exists
+         * at all: six rows is more than a third of this menu, and every one of them is a gesture
+         * a keyboard user has already learnt a chord for. Flattening them would push *Go to
+         * definition* and *Find usages* — the two rows people actually open this menu for — below
+         * the fold, which is the ordering complaint M14 already filed about this menu once.
+         *
+         * Each row `run`s the same function `keys/dispatch.ts` reaches through
+         * `focusedFolds()`, and names its `command` so the chip on the right comes from the live
+         * keymap rather than from a literal that a `keymap.json` would silently falsify.
+         *
+         * The `disabledReason`s are the point rather than polish. A menu row that looks live and
+         * does nothing is the state `menus/model.ts` refuses to represent, and every one of these
+         * six is inapplicable most of the time — *Expand all* in a file with nothing collapsed is
+         * the common case, not the edge one.
+         */
+        {
+          id: 'folding',
+          label: 'Folding',
+          submenu: () => {
+            const state = live.state
+            return [
+              {
+                id: 'fold',
+                label: 'Collapse',
+                command: 'editor.fold',
+                disabledReason: canFold(state) ? undefined : 'Nothing to collapse at the caret',
+                run: () => {
+                  foldHere(live)
+                  live.focus()
+                },
+              },
+              {
+                id: 'unfold',
+                label: 'Expand',
+                command: 'editor.unfold',
+                disabledReason: canUnfold(state) ? undefined : 'Nothing is collapsed at the caret',
+                run: () => {
+                  unfoldHere(live)
+                  live.focus()
+                },
+              },
+              { kind: 'separator' },
+              {
+                id: 'foldRecursively',
+                label: 'Collapse recursively',
+                command: 'editor.foldRecursively',
+                disabledReason: canFold(state) ? undefined : 'Nothing to collapse at the caret',
+                run: () => {
+                  foldRecursive(live)
+                  live.focus()
+                },
+              },
+              {
+                id: 'unfoldRecursively',
+                label: 'Expand recursively',
+                command: 'editor.unfoldRecursively',
+                disabledReason: canUnfold(state) ? undefined : 'Nothing is collapsed at the caret',
+                run: () => {
+                  unfoldRecursive(live)
+                  live.focus()
+                },
+              },
+              { kind: 'separator' },
+              {
+                id: 'foldAll',
+                label: 'Collapse all',
+                command: 'editor.foldAll',
+                disabledReason: canFoldAll(state)
+                  ? undefined
+                  : 'This file has nothing left to collapse',
+                run: () => {
+                  foldAllRanges(live)
+                  live.focus()
+                },
+              },
+              {
+                id: 'unfoldAll',
+                label: 'Expand all',
+                command: 'editor.unfoldAll',
+                disabledReason: canUnfoldAll(state)
+                  ? undefined
+                  : 'Nothing in this file is collapsed',
+                run: () => {
+                  unfoldAllRanges(live)
+                  live.focus()
+                },
+              },
+            ]
           },
         },
         { kind: 'separator' },

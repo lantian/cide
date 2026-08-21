@@ -99,8 +99,15 @@ pub fn push(
         None => format!("refs/heads/{0}:refs/heads/{0}", branch.head),
     };
 
+    // Read **before** the push, and that ordering is the whole design of these three numbers.
+    // Afterwards the remote-tracking ref has moved to the tip and `graph_ahead_behind` would
+    // answer zero for every successful push. The alternative — parsing them out of git's
+    // output — is refused by this module's own rule: on the binary route that text is the
+    // remote server's, it is shown verbatim, and nothing in cide may branch on it.
+    let report = ahead_of_remote(&repo, &remote_name, &refspec);
+
     let route = route(&repo, &remote_name);
-    match route {
+    let outcome = match route {
         Route::Binary => push_via_binary(root, &remote_name, &refspec, set_upstream, proxy),
         // No proxy is applied here, and none is needed: this arm is reached only for a local
         // or `file://` remote, and libgit2 would ignore the environment even if it were. See
@@ -108,7 +115,118 @@ pub fn push(
         Route::Libgit2 => {
             push_via_libgit2(&repo, &remote_name, &refspec, set_upstream, &branch.head)
         }
+    };
+    outcome.map(|out| PushOutcome {
+        ..report.into_outcome(out)
+    })
+}
+
+/// What the push is about to send, measured against the remote-tracking ref.
+///
+/// Empty for a refspec this cannot describe — a deletion, a tag, anything whose destination is
+/// not `refs/heads/<name>`. That is deliberately silent: the caller still gets a `PushOutcome`
+/// and the frontend still has git's own text; what it loses is a count it could not have
+/// stated truthfully anyway.
+#[derive(Default)]
+struct PushReport {
+    branch: String,
+    pushed: u32,
+    old_oid: String,
+    new_oid: String,
+}
+
+impl PushReport {
+    fn into_outcome(self, base: PushOutcome) -> PushOutcome {
+        PushOutcome {
+            branch: self.branch,
+            pushed: self.pushed,
+            old_oid: self.old_oid,
+            new_oid: self.new_oid,
+            ..base
+        }
     }
+}
+
+fn ahead_of_remote(repo: &Repository, remote: &str, refspec: &str) -> PushReport {
+    // `src:dst`, or one name meaning both. A leading `+` is `--force`, which changes nothing
+    // about what is being counted.
+    let (src, dst) = match refspec.split_once(':') {
+        Some((src, dst)) => (src.trim_start_matches('+'), dst),
+        None => {
+            let one = refspec.trim_start_matches('+');
+            (one, one)
+        }
+    };
+    // A deletion pushes an empty source. Nothing to count and nothing to name.
+    let Some(name) = dst.strip_prefix("refs/heads/") else {
+        return PushReport::default();
+    };
+    let Some(local) = repo
+        .revparse_single(src)
+        .ok()
+        .and_then(|o| o.peel_to_commit().ok())
+    else {
+        return PushReport::default();
+    };
+
+    let tracking = repo
+        .find_reference(&format!("refs/remotes/{remote}/{name}"))
+        .ok()
+        .and_then(|r| r.target());
+
+    match tracking {
+        Some(old) => {
+            let (ahead, _) = repo.graph_ahead_behind(local.id(), old).unwrap_or((0, 0));
+            PushReport {
+                branch: name.to_string(),
+                pushed: ahead as u32,
+                old_oid: short_oid(old),
+                new_oid: short_oid(local.id()),
+            }
+        }
+        // No remote-tracking ref: `git push -u` publishing a branch the remote has never
+        // seen. `old_oid` stays empty, which is how the frontend tells *published* from
+        // *pushed* without a second boolean.
+        //
+        // Counted by hiding **every** remote-tracking ref of this remote rather than walking
+        // the whole history: a branch cut from `main` an hour ago is three commits the remote
+        // does not have, not the four thousand reachable from its tip. That is also what git
+        // itself sends.
+        None => PushReport {
+            branch: name.to_string(),
+            pushed: unseen_by_remote(repo, local.id(), remote),
+            old_oid: String::new(),
+            new_oid: short_oid(local.id()),
+        },
+    }
+}
+
+/// How many commits reachable from `tip` no branch of `remote` already has.
+fn unseen_by_remote(repo: &Repository, tip: git2::Oid, remote: &str) -> u32 {
+    let Ok(mut walk) = repo.revwalk() else {
+        return 0;
+    };
+    if walk.push(tip).is_err() {
+        return 0;
+    }
+    let prefix = format!("refs/remotes/{remote}/");
+    if let Ok(refs) = repo.references() {
+        for reference in refs.flatten() {
+            let Ok(name) = reference.name() else { continue };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(oid) = reference.target() {
+                let _ = walk.hide(oid);
+            }
+        }
+    }
+    walk.count() as u32
+}
+
+/// Eight hex digits, the width every other short oid in this crate uses.
+fn short_oid(oid: git2::Oid) -> String {
+    oid.to_string().chars().take(8).collect()
 }
 
 /// Which route a push to `remote` would take.
@@ -219,6 +337,10 @@ fn push_via_binary(
         refspec: refspec.to_string(),
         shelled_out: true,
         output: text,
+        // Filled in by `PushReport::into_outcome` from a reading taken before the push. The
+        // two route functions cannot take it themselves: they are also the crate's own test
+        // surface, and threading a report through them would mean building one in every test.
+        ..PushOutcome::blank()
     })
 }
 
@@ -231,6 +353,22 @@ fn push_via_libgit2(
 ) -> Result<PushOutcome> {
     let mut remote: Remote<'_> = repo.find_remote(remote_name).wrap()?;
     let mut messages = String::new();
+    /*
+     * Per-ref rejections, which `Remote::push` does **not** report as an error. (M20)
+     *
+     * This is the half that was missing, and it was missing in the direction that costs the
+     * most: `git_remote_push` returns `Ok` when the transport worked, whatever the remote
+     * decided about the refs. A non-fast-forward — somebody else pushed first, which is the
+     * commonest rejection there is — arrives only through `push_update_reference`, one call per
+     * ref, with `Some(reason)` when it was refused. Without this callback the push reported
+     * success and the panel said *"Pushed 1 commit to origin/main"* over a remote that had
+     * refused it.
+     *
+     * The binary route never had the bug — `git push` exits non-zero — which is why it showed up
+     * only on a local or `file://` remote, and why it showed up as *the palette says one thing
+     * and Commit-and-Push says another*.
+     */
+    let mut rejected: Vec<String> = Vec::new();
     {
         let mut callbacks = git2::RemoteCallbacks::new();
         // The remote's own text: `remote: ...` lines, which is where a server-side hook
@@ -238,6 +376,15 @@ fn push_via_libgit2(
         callbacks.sideband_progress(|bytes| {
             messages.push_str(&String::from_utf8_lossy(bytes));
             true
+        });
+        callbacks.push_update_reference(|reference, status| {
+            if let Some(reason) = status {
+                rejected.push(format!("{reference}: {reason}"));
+            }
+            // `Ok(())` even for a rejection: returning an error here aborts the whole push and
+            // loses the *other* refs' outcomes, and the refusal is reported below with all of
+            // them rather than as whichever one happened to be first.
+            Ok(())
         });
         let mut options = git2::PushOptions::new();
         options.remote_callbacks(callbacks);
@@ -248,6 +395,12 @@ fn push_via_libgit2(
             })?;
     }
 
+    if !rejected.is_empty() {
+        return Err(GitError::Push {
+            output: format!("{}{}", messages, rejected.join("\n")),
+        });
+    }
+
     if set_upstream {
         set_branch_upstream(repo, branch, remote_name, refspec)?;
     }
@@ -256,6 +409,7 @@ fn push_via_libgit2(
         refspec: refspec.to_string(),
         shelled_out: false,
         output: messages,
+        ..PushOutcome::blank()
     })
 }
 

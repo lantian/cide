@@ -1527,3 +1527,71 @@ fn a_whole_selection_with_a_rev_is_still_refused_when_the_file_moved() {
         "f.txt"
     );
 }
+
+#[test]
+fn a_rejected_push_is_an_error_and_not_a_silent_success() {
+    /*
+     * libgit2's `git_remote_push` returns `Ok` when the *transport* worked, whatever the remote
+     * decided about the refs. A non-fast-forward — somebody else pushed first, the commonest
+     * rejection there is — arrives only through `push_update_reference`.
+     *
+     * Without that callback this pushed "successfully" and the panel reported *"Pushed 1 commit
+     * to origin/main"* over a remote that had refused it. The binary route never had the bug
+     * (`git push` exits non-zero), so it showed up only on a local remote — and as the palette
+     * and Commit-and-Push disagreeing about the same push.
+     */
+    let origin = support::TempRepo::new("push-reject-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+    // A non-bare remote refuses a push to its checked-out branch outright, which is a different
+    // refusal; this has to be the *ref* being rejected, so the origin sits on another branch.
+    origin.git(&["checkout", "-q", "-b", "parked"]);
+
+    let work = support::TempRepo::new("push-reject-work");
+    work.git(&[
+        "remote",
+        "add",
+        "origin",
+        origin.root.to_str().expect("utf-8 path"),
+    ]);
+    work.git(&["fetch", "-q", "origin"]);
+    work.git(&["checkout", "-q", "-b", "main", "origin/main"]);
+
+    // The remote moves on, and this clone does not know about it.
+    origin.git(&["checkout", "-q", "main"]);
+    origin.write("b.txt", b"theirs\n");
+    origin.commit_all("theirs");
+    origin.git(&["checkout", "-q", "parked"]);
+
+    work.write("c.txt", b"mine\n");
+    work.commit_all("mine");
+
+    let outcome = cide_git::push::push(
+        &work.root,
+        None,
+        None,
+        false,
+        &cide_core::proxy::ProxyEnv::default(),
+    );
+    let Err(cide_ipc::git::GitError::Push { output }) = outcome else {
+        panic!("a rejected push must be an error, got {outcome:?}");
+    };
+    assert!(
+        !output.trim().is_empty(),
+        "and it must say why, not merely fail: {output}"
+    );
+
+    /*
+     * The remote is where it was. A push that reported success while changing nothing is the
+     * worse of the two failures, and this is what proves it did not happen.
+     *
+     * Note which half of the guard this exercises: libgit2 refuses this one itself, before
+     * `push_update_reference` is ever called, so what is pinned here is that the refusal
+     * *reaches the user*. The callback covers the other half — a ref the server rejects, from a
+     * pre-receive hook — which no local remote can produce and which therefore has no test.
+     */
+    assert!(
+        !origin.root.join("c.txt").exists(),
+        "nothing of the refused push landed"
+    );
+}

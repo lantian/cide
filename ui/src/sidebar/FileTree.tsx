@@ -227,6 +227,10 @@ const CLEAN: StatusStyle = { nameClass: undefined, letterClass: undefined }
 const STATUS: Readonly<Record<TreeStatus, StatusStyle>> = {
   clean: CLEAN,
   modified: { nameClass: styles.statusModified, letterClass: styles.statusModified },
+  // Its own colour rather than `modified`'s blue. (M20) A conflicted file is the one thing in
+  // this column a user must not open and edit without noticing — it is full of `<<<<<<<` and
+  // saving over the markers commits them — so it does not get to look like an ordinary edit.
+  conflicted: { nameClass: styles.statusConflicted, letterClass: styles.statusConflicted },
   added: { nameClass: styles.statusAdded, letterClass: styles.statusAdded },
   deleted: { nameClass: styles.statusDeleted, letterClass: styles.tagDeleted },
   untracked: { nameClass: styles.statusUntracked, letterClass: undefined },

@@ -202,6 +202,19 @@ export function grammar(spec: GrammarSpec) {
   return {
     name: spec.name,
 
+    /**
+     * The data this parser was built from, handed back untouched.
+     *
+     * `StreamLanguage.define` reads the fields it knows by name and ignores the rest, so this
+     * costs nothing at runtime. It exists for `ui/scripts/check-editor.mjs`, which has to compare
+     * a language's [`FoldSpec`](./foldRanges) against the grammar it must agree with — the fold
+     * scanner and the tokenizer disagreeing about what opens a comment is a defect that shows up
+     * as folding that silently stops working in one language, and nothing else can see it. The
+     * modules export the *built* parser rather than the literal, so without this the check would
+     * have to re-parse the source text of nine files.
+     */
+    spec,
+
     startState(): GrammarState {
       return { comment: 0, quote: null, triple: false, hashes: -1, flag: 0 }
     },

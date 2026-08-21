@@ -171,6 +171,11 @@ try {
       // this reason — the two bugs this project has paid most for both hid in a rule written
       // inside an event handler, which is where nothing can compile it.
       'src/editor/codeIntelGate.ts',
+      // M19, section 21: the fold scanner. Import-free for the reason every module above it is —
+      // the alternative was this logic inside the `foldService` closure in `folding.ts`, which
+      // needs an `EditorState`, and a fold that starts one line off is invisible in a screenshot
+      // and obvious in an assertion.
+      'src/editor/foldRanges.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -188,6 +193,40 @@ try {
       '--lib', 'es2023',
       // `@types/react-dom` is auto-included from `node_modules/@types` and does not compile
       // without the DOM lib. Matches the project tsconfig, and what `check-picker.mjs` does.
+      '--skipLibCheck',
+    ],
+    { stdio: 'inherit' },
+  )
+
+  /*
+   * A second pass for `folding.ts`, and the only thing that differs is `--lib`.
+   *
+   * It is not one of the import-free modules and never will be: it holds a `StateField`, a
+   * `foldService` and two DOM builders, which is exactly the half `foldRanges.ts` was split out
+   * from. But the *commands* in it — the seven things a keystroke actually runs — take an
+   * `EditorView` and touch nothing on it but `.state` and `.dispatch`, so they can be driven
+   * against a real `EditorState` in node. Section 21 does that, and it is worth a second tsc
+   * invocation: source assertions can say that a command is wired, and only this can say that
+   * Collapse recursively collapses the right five blocks.
+   *
+   * Separate rather than adding `dom` to the list above, so the pure modules keep being compiled
+   * against a library that does not have a `document` in it. A module that reaches for one is
+   * supposed to fail there.
+   */
+  execFileSync(
+    'node',
+    [
+      'node_modules/typescript/bin/tsc',
+      'src/editor/folding.ts',
+      '--outDir', out,
+      '--rootDir', 'src',
+      '--module', 'commonjs',
+      '--moduleResolution', 'node10',
+      '--target', 'es2022',
+      '--strict',
+      '--exactOptionalPropertyTypes',
+      '--noUncheckedIndexedAccess',
+      '--lib', 'es2023,dom',
       '--skipLibCheck',
     ],
     { stdio: 'inherit' },
@@ -221,6 +260,8 @@ try {
   const revealPlan = load('revealTarget.js')
   const { claudeSessions } = load('claudeSessions.js')
   const readout = load('statusReadout.js')
+  const folds = load('foldRanges.js')
+  const { foldSpecFor, foldSpecs, DEFAULT_FOLD_SPEC } = load('languages.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
   const { tags } = require('@lezer/highlight')
@@ -623,13 +664,21 @@ try {
   eq(classOf('variableName'), null, 'a plain identifier has no role')
 
   /*
-   * The buffer paints from `EditorSurface.module.css`; the canvas minimap paints from
+   * The buffer paints from `editor/highlight.css`; the canvas minimap paints from
    * `TOKEN_VAR_BY_CLASS`. `highlight.ts` exists so those two cannot disagree, and this is
    * the assertion that makes that true rather than merely intended — the failure it catches
    * is a keyword being purple in the text and blue in the map, which nothing else here can
    * see.
+   *
+   * The stylesheet moved out of `EditorSurface.module.css` in M20, and *why* is worth keeping
+   * next to the path: it lived there scoped under that module's `.body`, so it painted inside an
+   * `EditorSurface` and nowhere else. The three-pane merge resolver then used the same
+   * highlighter, got the same class names onto its spans, and got plain text — with nothing in
+   * the build failing. A plain `.css` file, because CodeMirror writes the literal class name and
+   * a module would hash it; loaded by `main.tsx`, because `check:editor` runs `highlight.ts`
+   * under node where a `.css` import cannot resolve.
    */
-  const surfaceCss = readFileSync('src/editor/EditorSurface.module.css', 'utf8')
+  const surfaceCss = readFileSync('src/editor/highlight.css', 'utf8')
   const cssVarByClass = new Map()
   for (const [, selector, body] of surfaceCss.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
     const colour = /color:\s*var\((--[a-z-]+)\)/.exec(body)
@@ -647,6 +696,22 @@ try {
     eq(cssVarByClass.get(role.cls), role.token, `${role.cls} is styled to match in the buffer`)
   }
   eq(cssVarByClass.size, TOKEN_ROLES.length, 'the stylesheet has no token class the table lacks')
+  /*
+   * And it is reachable from every surface, not from one.
+   *
+   * The rules are global class names now; the thing that can silently regress is nobody loading
+   * them. `main.tsx` is the one entry every window goes through.
+   */
+  ok(
+    readFileSync('src/main.tsx', 'utf8').includes("import './editor/highlight.css'"),
+    'the token stylesheet is loaded by the app entry, so every surface that highlights gets it',
+  )
+  ok(
+    // A *rule*, not a mention: that file's prose still refers to the `.cide-tk-*` block by name,
+    // which is worth keeping and is not a selector.
+    !/\.cide-tk-[a-z]+[^{}]*\{/.test(readFileSync('src/editor/EditorSurface.module.css', 'utf8')),
+    'and it has NOT crept back into a CSS module, where it would paint in one surface only',
+  )
 
   // Every custom property either table names has to exist in *both* themes, or the canvas
   // silently falls back to `UNRESOLVED` grey while the buffer inherits whatever it inherits.
@@ -3135,7 +3200,26 @@ try {
      * column takes its width out of the numbers' share unless the reservation grows by exactly
      * that much — and every line number shifts left the moment a file gains its first diagnostic.
      */
-    ok(/\.cm-gutters\)[^}]*min-width:\s*70px/.test(css), 'the gutter reserves room for the marker')
+    ok(
+      /\.cm-gutters\)[^}]*min-width:\s*calc\(70px \+ var\(--fold-col\)\)/.test(css),
+      'the gutter reserves room for the marker — 70px for the numbers plus the lint column, and '
+        + 'since M19 the fold column on top of it. `.cm-lineNumbers` is `flex: 1` of this '
+        + 'reservation, so a gutter added beside it takes its width OUT of the numbers\' share '
+        + 'and every line number shifts left the moment the new column appears',
+    )
+    ok(
+      /--fold-col:\s*2ch/.test(css) && /\.cm-foldGutter\)[^}]*width:\s*var\(--fold-col\)/.test(css),
+      '…and the fold column is exactly as wide as the reservation grew by, named once so the '
+        + 'two cannot drift. `ch` and not `px`, so it follows `editor.fontSize` — the same '
+        + 'reasoning the blame column\'s `22ch` is written with',
+    )
+    ok(
+      /\.cm-gutters:has\(\.cm-blame\)\)[^}]*min-width:\s*calc\(70px \+ var\(--fold-col\) \+ 22ch/.test(
+        css,
+      ),
+      '…and the annotated reservation carries it too, or turning blame on in a folded buffer '
+        + 'takes the fold column back out of the numbers',
+    )
     ok(/\.cm-lint-marker\)[^}]*width:\s*14px/.test(css), 'and the marker is a fixed 14px')
     ok(
       css.split('.cm-gutters)').length === 2,
@@ -3663,7 +3747,13 @@ try {
 
     /* ------------------------------------------------ the shared type and its clamp */
 
-    const view = (path, line, column, topLine) => ({ path, line, column, topLine })
+    const view = (path, line, column, topLine, folds = []) => ({
+      path,
+      line,
+      column,
+      topLine,
+      folds,
+    })
 
     eq(
       pos.clampView(view('/a.rs', 400, 9, 380), 120),
@@ -3721,6 +3811,48 @@ try {
     ok(
       pos.worthNoting(view('/a', 4, 2, 1), view('/a', 4, 2, 2)),
       'and a scroll with the caret still is: `topLine` is half of what "the same lines" means',
+    )
+
+    /*
+     * Folds are the third of what "the same lines" means. (M19)
+     *
+     * A file left with its imports and three long functions collapsed is a different document to
+     * read than the same file with everything open, so a fold that nothing reports is a restore
+     * that puts the caret on a line number which now means something else. There is deliberately
+     * no threshold on this the way there arguably is on a scroll: collapsing a block is a
+     * decision, and nobody folds half a block by accident.
+     */
+    ok(
+      !pos.worthNoting(view('/a', 4, 2, 1, [10, 20]), view('/a', 4, 2, 1, [10, 20])),
+      'the same folds are not news',
+    )
+    ok(
+      pos.worthNoting(view('/a', 4, 2, 1, [10]), view('/a', 4, 2, 1, [10, 20])),
+      'a new fold is, with the caret and the scroll both still',
+    )
+    ok(
+      pos.worthNoting(view('/a', 4, 2, 1, [10, 20]), view('/a', 4, 2, 1, [10])),
+      'and so is an unfold — the list is compared, not its length',
+    )
+    ok(
+      pos.worthNoting(view('/a', 4, 2, 1, [10, 20]), view('/a', 4, 2, 1, [10, 21])),
+      'and a fold that moved, which is what an edit above it does',
+    )
+
+    /*
+     * Folds are **filtered** by the clamp where the caret is **clamped**, and the asymmetry is
+     * the whole of the decision.
+     *
+     * Clamping a caret past the end of a shortened file lands the user somewhere plausible.
+     * Clamping a *fold* there would collapse whatever block happens to sit at the end of the
+     * file — a piece of the document silently hidden, in a file that has changed underneath the
+     * user, which is precisely the moment they most need to see all of it.
+     */
+    eq(
+      pos.clampView(view('/a.rs', 10, 1, 5, [3, 400, 0, NaN, 90]), 120).folds,
+      [3, 90],
+      'a remembered fold past the end of a shortened file is dropped, not clamped onto ' +
+        'whatever block is now last',
     )
 
     /*
@@ -5552,7 +5684,7 @@ try {
         + 'Back-stack recorder, or each of them answers for two buffers at once',
     )
     ok(
-      /claimCaret\(identity/.test(surfaceSrc) && /claimStatusReadout\(\s*path,/.test(surfaceSrc),
+      /claimCaret\(\s*identity/.test(surfaceSrc) && /claimStatusReadout\(\s*path,/.test(surfaceSrc),
       'AND THE PAIR THAT SPLITS: the caret slot takes the identity, the status readout keeps the '
         + 'path. Opposite on purpose — one ADDRESSES the buffer and the other DESCRIBES it. Go to '
         + 'line hands `focusedCaret().path` straight to `requestReveal` and `navRecorder` '
@@ -5899,6 +6031,663 @@ try {
         + 'counting off the screen, and whether a pane’s `claude` is on the IDE server is not '
         + 'something this webview can see anyway: the send reports that, with a sentence',
     )
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // 21. Code folding — what a document offers to collapse (M19)
+  // ---------------------------------------------------------------------------------------
+  //
+  // There is no parse tree in this editor and there deliberately never will be
+  // (`streamGrammar.ts` states the decision and names folding as its price), so every fold in
+  // cide comes from `foldRanges.ts` reading the text. That makes this section the only thing
+  // standing between the feature and its characteristic failure: one unbalanced brace inside a
+  // string or a comment, and folding silently stops working for the rest of the file — no
+  // exception, no log line, just a gutter that runs out of chevrons halfway down.
+  //
+  // Driven against CodeMirror's own `Text`, not against a hand-rolled fixture. `DocLines` is a
+  // structural interface precisely so `Text` satisfies it, and passing one here is what proves
+  // that claim rather than asserting it in a comment.
+
+  {
+    const doc = (text) => Text.of(text.split('\n'))
+
+    /** Every range as `kind startLine-endLine`, which is what a reader checks by eye. */
+    const shape = (text, spec) =>
+      folds.scanFolds(doc(text), spec).map((r) => `${r.kind} ${r.startLine}-${r.endLine}`)
+
+    const RUST = foldSpecFor('/x.rs')
+    const PY = foldSpecFor('/x.py')
+    const YAML = foldSpecFor('/x.yaml')
+    const MD = foldSpecFor('/x.md')
+    const SQL = foldSpecFor('/x.sql')
+    const TS = foldSpecFor('/x.ts')
+    const GO = foldSpecFor('/x.go')
+
+    /* --------------------------------------------------- the fold table against the grammars */
+
+    /*
+     * **The drift check, and it is the most valuable assertion in this section.**
+     *
+     * Six fields of every `FoldSpec` mirror the `GrammarSpec` the same language is tokenized
+     * with. They are a second copy — written out in `languages.ts` rather than read off the
+     * grammar, because a grammar arrives through a dynamic `import()` and the fold restore has
+     * to run inside the editor's mount dispatch. A second copy that nothing compares is a second
+     * copy that drifts, and the way this one would fail is specific and silent: a `lineComment`
+     * that says `#` for Rust makes every `#[derive(…)]` a dead line, so half the braces in the
+     * file are never seen and the outer `impl` block stops being foldable.
+     *
+     * `grammar()` hands its input back as `.spec` for exactly this loop.
+     */
+    const MIRRORED = ['lineComment', 'blockComment', 'nestedComments', 'quotes', 'escapes', 'tripleQuotes']
+    const LOADERS = {
+      rust: () => require(join(out, 'editor/languages/rust.js')).spec,
+      go: () => require(join(out, 'editor/languages/go.js')).spec,
+      typescript: () => require(join(out, 'editor/languages/typescript.js')).spec,
+      python: () => require(join(out, 'editor/languages/python.js')).spec,
+      clike: () => require(join(out, 'editor/languages/clike.js')).spec,
+      shell: () => require(join(out, 'editor/languages/shell.js')).spec,
+      markdown: () => require(join(out, 'editor/languages/markdown.js')).spec,
+      sql: () => require(join(out, 'editor/languages/sql.js')).spec,
+      json: () => require(join(out, 'editor/languages/data.js')).json,
+      toml: () => require(join(out, 'editor/languages/data.js')).toml,
+      yaml: () => require(join(out, 'editor/languages/data.js')).yaml,
+    }
+    const table = foldSpecs()
+    eq(
+      Object.keys(table).sort(),
+      Object.keys(LOADERS).sort(),
+      'every language in the registry has a fold spec, and the fold table names no language ' +
+        'that does not exist — a missing entry is a `Record` lookup returning undefined and a ' +
+        'buffer whose gutter throws on its first line',
+    )
+    for (const [id, loadSpec] of Object.entries(LOADERS)) {
+      const grammar = loadSpec().spec
+      ok(
+        grammar !== undefined,
+        `${id}: grammar() hands its input back as \`.spec\`, which is what makes this loop ` +
+          'possible at all — the modules export the built parser, not the literal',
+      )
+      for (const field of MIRRORED) {
+        eq(
+          [id, field, table[id][field] ?? null],
+          [id, field, grammar[field] ?? null],
+          `${id}.${field} agrees with the grammar it must not disagree with`,
+        )
+      }
+    }
+    eq(
+      foldSpecFor('/notes.txt'),
+      DEFAULT_FOLD_SPEC,
+      'a file with no known language still folds — the gutter is in every buffer, so the ' +
+        'gutter reservation is one constant width rather than a layout that shifts between a ' +
+        '`.rs` tab and a `.txt` one',
+    )
+    eq(
+      DEFAULT_FOLD_SPEC.quotes,
+      '',
+      '…and it reads no strings: guessing that `"` opens one in a file that might be prose ' +
+        'would let a single apostrophe hide every brace on its line',
+    )
+
+    /* ----------------------------------------------------------------------------- brackets */
+
+    eq(
+      shape(
+        [
+          'fn main() {',
+          '    let s = "a { b";',
+          '    if x {',
+          '        y();',
+          '    }',
+          '}',
+        ].join('\n'),
+        RUST,
+      ),
+      ['bracket 1-6', 'bracket 3-5'],
+      'a function and the `if` inside it, and NOT the brace in the string literal — which is ' +
+        'the whole reason a fold spec exists rather than a brace count',
+    )
+    {
+      // Two sources can land on one span — a bracket that opens at the end of a header line and
+      // an indentation block over the same body. Kept twice, `foldAllRanges` would build both
+      // effects against one state, both would pass its already-folded filter, and one span would
+      // carry two identical `Decoration.replace` ranges.
+      const both = folds.scanFolds(doc('def f(\n  a,\n):\n  pass\n'), PY)
+      const spans = both.map((r) => `${r.from}-${r.to}`)
+      eq(spans.length, new Set(spans).size, 'no two ranges cover exactly the same span')
+    }
+    eq(
+      shape('fn one() {}\nfn two() {\n    x()\n}', RUST),
+      ['bracket 2-4'],
+      'a block that opens and closes on one line is not foldable: there is nothing to hide ' +
+        'and a chevron there is a control that does nothing',
+    )
+    eq(
+      shape('fn a() {\n    /* /* two */ deep */\n    if x { }\n}', RUST),
+      ['bracket 1-4'],
+      'Rust nests block comments, so the inner `*/` does not end the outer one — a spec that ' +
+        'got this wrong would read `deep */` as code and the trailing `}` as the function\'s',
+    )
+    eq(
+      shape('fn a() {\n    let r = r#"a { b"#;\n    let t = "c }";\n}', RUST),
+      ['bracket 1-4'],
+      'and a raw string is a string: `r#"…"#` is where an unbalanced brace actually lives — a ' +
+        'shell script, a regex, a `format!` template',
+    )
+    /*
+     * **Lifetimes, and this is the fixture that would have made folding useless in this repo.**
+     *
+     * `'` is a string quote in Rust — it opens a character literal — so read naively, the `'` in
+     * `<'a>` opens a string that runs to the end of the line. The `{` at the end is then inside
+     * it, the function is not foldable, and every brace after it is off by one level. Nearly
+     * every trait impl and half the signatures in this workspace have a lifetime in them.
+     */
+    eq(
+      shape("fn f<'a>(x: &'a str) {\n    g(x);\n}", RUST),
+      ['bracket 1-3'],
+      "a lifetime is not a character literal — `'` then an identifier NOT followed by a closing " +
+        "quote, which is the grammar's own test in `languages/rust.ts`",
+    )
+    eq(
+      shape("fn f() {\n    let c = '}';\n    let d = '\\'';\n}", RUST),
+      ['bracket 1-4'],
+      "…and a real character literal still is one, brace inside and escaped quote included",
+    )
+    eq(
+      shape('}\nfn a() {\n    x()\n}\n)', RUST),
+      ['bracket 2-4'],
+      'a closer with nothing to close is ignored rather than resyncing the rest of the file ' +
+        'onto the wrong depth — half-written code is the state an editor is in most of the time',
+    )
+    eq(
+      shape('fn a() {\n    x()', RUST),
+      [],
+      'and a block that never closes offers nothing: folding to the end of a file the user is ' +
+        'in the middle of typing would hide the line they are on',
+    )
+    eq(
+      shape('const x = `a\nb { c`\nfunction f() {\n  g()\n}', TS),
+      ['bracket 3-5'],
+      'a template literal spans lines and is still a string, so the brace in it is not a block',
+    )
+    eq(
+      shape('var s = `a\nb } c`\nfunc f() {\n\tg()\n}', GO),
+      ['bracket 3-5'],
+      "…and so is Go's backtick raw string. Both are opened by the grammar's *hook* rather " +
+        'than by `quotes`, which is what `extraQuotes` is for',
+    )
+    eq(
+      shape("SELECT a\nFROM t\nWHERE b IN (\n  'it''s (',\n  2\n)", SQL),
+      ['bracket 3-6'],
+      'SQL doubles a quote instead of escaping it, and folds the bracket that survives it',
+    )
+
+    /* ------------------------------------------------------------------------- indentation */
+
+    eq(
+      shape('def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass\n', PY),
+      ['indent 1-4', 'indent 6-7'],
+      'a blank line inside a suite does not end it, and a blank line after one is not part of ' +
+        'it — otherwise the whitespace piles up under the collapsed row and the document does ' +
+        'not look shorter, which is the only thing folding is for',
+    )
+    eq(
+      shape('def f():\n    if x:\n        a\n    b\n', PY),
+      ['indent 1-4', 'indent 2-3'],
+      'nested suites are separate ranges, so Expand reveals one level at a time',
+    )
+    eq(
+      shape('root:\n  a: 1\n  b:\n    c: 2\nother: 3\n', YAML),
+      ['indent 1-4', 'indent 3-4'],
+      'YAML folds by indentation, and a key at column 0 closes every block above it',
+    )
+    eq(
+      shape('a = 1\nb = 2\n', RUST),
+      [],
+      'a brace language is NOT folded by indentation — a second, worse fold offered on every ' +
+        'line that already has a good one',
+    )
+
+    /* ------------------------------------------------------------ headings, fences, regions */
+
+    eq(
+      shape('# T\nintro\n\n## A\nbody\n\n```rust\nfn x() {}\n```\n\n## B\ntail\n', MD),
+      ['heading 1-12', 'heading 4-9', 'fence 7-9', 'heading 11-12'],
+      'Markdown folds by heading level and by fence — `##` runs to just before the next ' +
+        'heading of level 2 or higher, and stops short of the blank line before it',
+    )
+    eq(
+      shape('# T\n\n# u {\nnot code\n', MD),
+      ['heading 3-4'],
+      'and it folds by nothing else: a brace in prose is not a block, and `quotes: \'\'` keeps ' +
+        'the apostrophe in *don\'t* from opening a string. `# T` gets no range either — its ' +
+        'whole body is one blank line, and trimming it leaves nothing to hide',
+    )
+    eq(
+      shape('// region helpers\nfn a() {}\nfn b() {}\n// endregion\n', RUST),
+      ['region 1-4'],
+      'an explicit region is the one fold a person writes down on purpose',
+    )
+    eq(
+      shape('// <editor-fold desc="x">\nfn a() {}\n// </editor-fold>\n', RUST),
+      ['region 1-3'],
+      "…and IDEA's own spelling is honoured, because a file written in IntelliJ contains it",
+    )
+    eq(
+      shape('# region a\nkey: 1\n# endregion\n', YAML),
+      ['region 1-3'],
+      'in every language with a line comment, not only the brace ones',
+    )
+    /*
+     * **Crossing ranges are dropped, and this is the assertion behind that.**
+     *
+     * Four independent sources feed the list and nothing makes them agree; a `// region` opened
+     * outside a block and closed inside it is the simplest way to produce a pair that overlaps
+     * without nesting. Both cannot be offered: a fold is a `Decoration.replace`, and two
+     * overlapping replacements leave the text between them belonging to neither placeholder.
+     * The earlier, wider one survives — which in this malformed file is the region.
+     */
+    eq(
+      shape('// region a\nfn f() {\n// endregion\n}\n', RUST),
+      ['region 1-3'],
+      'a region marker that cuts across a block leaves exactly one of the two, never both',
+    )
+    {
+      const corpus = [
+        ['fn a() {\n  // region r\n  if x {\n  // endregion\n  }\n}\n', RUST],
+        ['def f():\n    x = (\n        1,\n    )\n    y\n', PY],
+        ['# a\n```\n## b\n```\n## c\ntext\n', MD],
+        ['a:\n  b: [\n    1,\n  ]\n  c: 2\n', YAML],
+      ]
+      let crossing = null
+      for (const [text, spec] of corpus) {
+        const ranges = folds.scanFolds(doc(text), spec)
+        for (const a of ranges) {
+          for (const b of ranges) {
+            if (a.from < b.from && b.from < a.to && a.to < b.to) {
+              crossing = `${a.kind} ${a.startLine}-${a.endLine} x ${b.kind} ${b.startLine}-${b.endLine}`
+            }
+          }
+        }
+      }
+      eq(
+        crossing,
+        null,
+        'and the invariant holds across every source in combination: any two ranges are ' +
+          'disjoint or nested, never overlapping. That is what lets Collapse all fold the whole ' +
+          'list in one transaction without asking whether the ranges agree',
+      )
+    }
+
+    /* -------------------------------------------------------------------- what fires where */
+
+    const rustDoc = doc('fn a() {\n    if x {\n        y()\n    }\n}\nfn b() {}\n')
+    const rustRanges = folds.scanFolds(rustDoc, RUST)
+    eq(
+      folds.foldAtLine(rustRanges, 1)?.endLine ?? null,
+      5,
+      'the caret on a header line collapses that block',
+    )
+    eq(
+      folds.foldAtLine(rustRanges, 3),
+      null,
+      '…and a line that starts nothing offers nothing to `foldAtLine`',
+    )
+    eq(
+      folds.enclosing(rustRanges, 3)?.startLine ?? null,
+      2,
+      'but `enclosing` finds the INNERMOST block around it, which is what makes Ctrl+Minus ' +
+        'work three lines into a function body — the gesture people actually make',
+    )
+    eq(
+      folds.within(rustRanges, folds.foldAtLine(rustRanges, 1)).map((r) => r.startLine),
+      [1, 2],
+      'and Collapse recursively takes the block plus everything nested in it, itself included',
+    )
+
+    const first = rustRanges[0]
+    eq(
+      rustDoc.sliceString(first.from, first.to),
+      '\n    if x {\n        y()\n    }\n',
+      "the range starts AFTER the opener and ends AT the closer, so a collapsed function reads " +
+        '`fn a() {…}` — `foldInside`\'s convention in `@codemirror/language`, matched so the ' +
+        'placeholder needs no special casing',
+    )
+
+    /* ----------------------------------------------------------------------------- the cap */
+
+    eq(
+      folds.scanFolds(doc('fn a() {\n' + 'x\n'.repeat(folds.FOLD_LINE_LIMIT) + '}'), RUST),
+      [],
+      'above `FOLD_LINE_LIMIT` nothing is foldable — a generated file of a hundred thousand ' +
+        'lines is opened to look at, not worked in, and the scan is linear but not free. Same ' +
+        'judgement as `HIGHLIGHT_LIMIT_BYTES`',
+    )
+
+    /*
+     * **Linear, and measured rather than reasoned about.**
+     *
+     * `foldable()` is called once per visible line, so this runs on every viewport change in
+     * every buffer. Section 5 already found two live quadratics in this directory on its first
+     * run — both the same unbounded-scan-then-backtrack shape — and the indentation walk is
+     * exactly where a third would go: the obvious implementation searches forward from every
+     * line for where the indent drops, which is O(n²) on a deeply nested file.
+     *
+     * Ratios rather than absolute times, so a loaded CI box fails the same way a quiet one does.
+     */
+    {
+      const time = (lines) => {
+        const nested = Array.from({ length: lines }, (_, i) => '  '.repeat(i % 40) + `a${i}: 1`)
+        const text = doc(nested.join('\n'))
+        const started = process.hrtime.bigint()
+        folds.scanFolds(text, YAML)
+        return Number(process.hrtime.bigint() - started) / 1e6
+      }
+      time(2000)
+      const small = Math.max(time(2000), 0.05)
+      const large = Math.max(time(8000), 0.05)
+      ok(
+        large / small < 12,
+        `scanning 4x the lines costs about 4x, not 16x (2000 lines: ${small.toFixed(2)}ms, ` +
+          `8000 lines: ${large.toFixed(2)}ms) — the indentation walk is a monotonic stack, and ` +
+          'the forward search it replaces is the quadratic this directory has already shipped twice',
+      )
+    }
+
+    /* ------------------------------------------- the commands, against a real EditorState */
+
+    /*
+     * **The seven commands, driven — not asserted about.**
+     *
+     * `folding.ts` is not import-free and cannot be: it holds a `StateField`, a `foldService`
+     * and two DOM builders. But every command in it takes an `EditorView` and touches nothing on
+     * one except `.state` and `.dispatch`, so a four-line stand-in is enough to run all of them
+     * against a real `EditorState` with the real extension installed. That is the difference
+     * between "Collapse recursively is wired" and "Collapse recursively collapses the impl block
+     * and both of its methods and nothing else", and only the second is worth having.
+     *
+     * What this still cannot reach is the picture: the gutter chevrons, the placeholder, the
+     * hover reveal and the scroll position after a restore all need a laid-out DOM, and they are
+     * verified by hand. The header of this file makes the same admission about `minimap.ts`.
+     */
+    const fold = load('folding.js')
+    const { EditorState } = require('@codemirror/state')
+
+    const stateOf = (text, path) =>
+      EditorState.create({ doc: text, extensions: [fold.foldExtensions(foldSpecFor(path))] })
+    /** Everything the commands use of an `EditorView`. Deliberately no more than that. */
+    const asView = (state) => {
+      const v = { state, dispatch: (spec) => { v.state = v.state.update(spec).state } }
+      return v
+    }
+    const caretOn = (state, line) =>
+      state.update({ selection: { anchor: state.doc.line(line).from } }).state
+
+    const RS = [
+      'impl Foo {',
+      '    fn one() {',
+      '        a();',
+      '    }',
+      '    fn two() {',
+      '        b();',
+      '    }',
+      '}',
+    ].join('\n')
+    const rs = stateOf(RS, '/x.rs')
+
+    {
+      const v = asView(rs)
+      eq(fold.foldHere(v), true, 'the caret on line 1 collapses the impl block')
+      eq(fold.foldedStartLines(v.state), [1], '…and exactly that block')
+      eq(
+        fold.foldHere(v),
+        false,
+        '…and collapsing an already-collapsed block reports that it did nothing, which is what ' +
+          'lets `dispatch.ts` say so instead of leaving a keystroke that silently no-ops',
+      )
+      eq(fold.unfoldHere(v), true, 'Expand puts it back')
+      eq(fold.foldedStartLines(v.state), [], '…leaving nothing collapsed')
+    }
+    {
+      const v = asView(caretOn(rs, 3))
+      fold.foldHere(v)
+      eq(
+        fold.foldedStartLines(v.state),
+        [2],
+        'the caret INSIDE a body collapses the innermost block around it — three lines into a ' +
+          'function is where a person decides to collapse it, and a rule that only read the ' +
+          'header line would make the commonest gesture do nothing',
+      )
+    }
+    {
+      const v = asView(rs)
+      eq(fold.foldAllRanges(v), true, 'Collapse all collapses every level')
+      eq(
+        fold.foldedStartLines(v.state),
+        [1, 2, 5],
+        '…the impl AND both methods. `@codemirror/language`\'s own `foldAll` does top-level ' +
+          'ranges only, after which one Expand reveals the whole file at once — which is not ' +
+          'what IDEA does and not what makes a collapsed file navigable',
+      )
+      const one = asView(caretOn(v.state, 1))
+      fold.unfoldHere(one)
+      eq(
+        fold.foldedStartLines(one.state),
+        [2, 5],
+        '…and Expand then reveals ONE level: the outermost collapsed block at the caret, ' +
+          'because the ones nested inside it are behind its placeholder and expanding those ' +
+          'would change nothing on screen',
+      )
+      eq(fold.unfoldAllRanges(one), true, 'Expand all takes the rest')
+      eq(fold.foldedStartLines(one.state), [], '…all of it, at every level')
+    }
+    {
+      const v = asView(caretOn(rs, 1))
+      fold.foldRecursive(v)
+      eq(
+        fold.foldedStartLines(v.state),
+        [1, 2, 5],
+        'Collapse recursively takes the block at the caret and everything nested in it',
+      )
+      eq(fold.unfoldRecursive(v), true, 'and Expand recursively takes them all back')
+      eq(
+        fold.foldedStartLines(v.state),
+        [],
+        '…including the ones that were invisible behind the outer placeholder. Unfolding only ' +
+          'what can be seen would need one press per level, which is the opposite of what ' +
+          '"recursively" means',
+      )
+    }
+    {
+      const v = asView(caretOn(rs, 1))
+      eq(fold.toggleFoldHere(v), true, 'Toggle collapses when nothing is collapsed')
+      eq(fold.foldedStartLines(v.state), [1], '')
+      eq(fold.toggleFoldHere(v), true, '…and expands when something is')
+      eq(fold.foldedStartLines(v.state), [], '')
+    }
+    {
+      const flat = asView(stateOf('let a = 1\nlet b = 2\n', '/x.rs'))
+      eq(
+        [
+          fold.foldHere(flat),
+          fold.unfoldHere(flat),
+          fold.foldAllRanges(flat),
+          fold.unfoldAllRanges(flat),
+          fold.foldRecursive(flat),
+          fold.unfoldRecursive(flat),
+        ],
+        [false, false, false, false, false, false],
+        'in a file with nothing foldable every one of the seven declines rather than throwing ' +
+          'or pretending — the refusal is what reaches the user as a sentence',
+      )
+      eq(
+        [
+          fold.canFold(flat.state),
+          fold.canUnfold(flat.state),
+          fold.canFoldAll(flat.state),
+          fold.canUnfoldAll(flat.state),
+        ],
+        [false, false, false, false],
+        '…and the menu predicates agree with them, which is what keeps a greyed row and a ' +
+          'refused command from telling the user two different things',
+      )
+    }
+
+    /*
+     * **A fold moves with the text, and that is what makes storing a start LINE work.**
+     *
+     * CodeMirror maps the fold's range through every change, so an edit above a collapsed block
+     * shifts it. The record written to `positions.json` is the line the fold *now* starts on, so
+     * the two stay in step without anything having to notice the edit.
+     */
+    {
+      const v = asView(caretOn(rs, 2))
+      fold.foldHere(v)
+      eq(fold.foldedStartLines(v.state), [2], 'a method is collapsed on line 2')
+      v.state = v.state.update({ changes: { from: 0, insert: '// one\n// two\n' } }).state
+      eq(
+        fold.foldedStartLines(v.state),
+        [4],
+        '…and two lines inserted above it move the fold rather than breaking it',
+      )
+    }
+
+    /* ------------------------------------------------------- the persistence round trip */
+
+    {
+      const v = asView(rs)
+      fold.foldAllRanges(v)
+      const remembered = fold.foldedStartLines(v.state)
+      const fresh = stateOf(RS, '/x.rs')
+      const restored = fresh.update({ effects: fold.foldEffectsFor(fresh, remembered) }).state
+      eq(
+        fold.foldedStartLines(restored),
+        remembered,
+        'what a buffer reports is exactly what restores it — the round trip through ' +
+          '`positions.json` is closed, not approximately closed',
+      )
+      const stale = fresh.update({ effects: fold.foldEffectsFor(fresh, [1, 999, 3]) }).state
+      eq(
+        fold.foldedStartLines(stale),
+        [1],
+        'and a line that no longer names a foldable range is dropped in silence — 999 is past ' +
+          'the end of a file that has been shortened, 3 is a line in the middle of a body. That ' +
+          'is the ordinary case after the file changed elsewhere and it is not an error; a ' +
+          'stored OFFSET would have collapsed a range of text nobody chose',
+      )
+    }
+
+    /* --------------------------------------------- and the same, in every other language */
+
+    {
+      const collapsed = (text, path) => {
+        const v = asView(stateOf(text, path))
+        fold.foldAllRanges(v)
+        return fold.foldedStartLines(v.state)
+      }
+      eq(
+        collapsed('def f():\n    a = 1\n    b = 2\ndef g():\n    pass\n', '/x.py'),
+        [1, 4],
+        'Python folds its suites',
+      )
+      eq(collapsed('root:\n  a: 1\n  b:\n    c: 2\n', '/x.yaml'), [1, 3], 'YAML folds its mappings')
+      eq(collapsed('# T\nintro\n\n## A\nbody\n', '/x.md'), [1, 4], 'Markdown folds its headings')
+      eq(
+        collapsed('plain text\n  indented\n  more\nback\n', '/notes.txt'),
+        [1],
+        'and a file with no language at all still folds by indentation — which is why the ' +
+          'gutter column is in every buffer and its reservation is one constant width',
+      )
+    }
+
+    /* --------------------------------------------------- the call sites, which a module cannot see */
+
+    /*
+     * Source assertions, and they are the weaker kind on purpose — every bug they cover is a
+     * *missing call* or a *wrong order*, and an absence is exactly what a test of the
+     * surrounding code passes over. Section 12 makes the same argument at greater length.
+     */
+    const bare = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
+    const surface = bare(readFileSync('src/editor/EditorSurface.tsx', 'utf8'))
+    {
+      const composed = surface.slice(
+        surface.indexOf('const shared: Extension[] = ['),
+        surface.indexOf('new EditorView({'),
+      )
+      ok(
+        composed.indexOf('lineNumbers()') < composed.indexOf('foldExtensions('),
+        'the fold gutter is composed AFTER `lineNumbers()` — gutters are laid out in extension ' +
+          'order, so that position is what puts the chevrons between the numbers and the text ' +
+          'where IDEA has them. Above it, folding still works and is simply in the wrong place, ' +
+          'which is the kind of regression a reader cannot see in a diff. `check:blame` pins the ' +
+          'mirror image for the column on the other side of the numbers',
+      )
+      const tail = composed.slice(composed.indexOf('if (!oversize) {'))
+      ok(
+        tail.indexOf('foldExtensions(') > 0 &&
+          tail.indexOf('if (readOnly)') > tail.indexOf('foldExtensions('),
+        '…and it is inside the SIZE gate and outside the READ-ONLY one. A megabyte of generated ' +
+          'output gets no grammar, no bracket matching and no folding — one answer to "what does ' +
+          'an oversize buffer do" rather than two — while a toolchain source gets all of it, ' +
+          'because a std-library file is exactly the file somebody opens to read one function of',
+      )
+    }
+    ok(
+      /foldExtensions\(foldSpecFor\(path\)\)/.test(surface),
+      '…and it is given the spec synchronously. A spec arriving with the grammar\'s dynamic ' +
+        '`import()` would land a tick after the restore dispatch below, which is the one place ' +
+        'it has to be there for',
+    )
+    {
+      const dispatch = surface.slice(surface.indexOf('const plan = planRestore'))
+      const effects = dispatch.indexOf('foldEffectsFor(view.state, plan.folds)')
+      const scroll = dispatch.indexOf('EditorView.scrollIntoView')
+      ok(
+        effects > 0 && scroll > effects && dispatch.slice(0, scroll).split('view.dispatch(').length === 2,
+        'the remembered folds and the remembered scroll are ONE dispatch. Two would lay the ' +
+          'document out at its unfolded heights, scroll to a line, and then collapse several ' +
+          'thousand lines above it — landing the user somewhere they have never been, once per ' +
+          'restore, on every file they had folded',
+      )
+    }
+    ok(
+      /claimCaret\(\s*identity,[\s\S]{0,4000}?foldRecursively:/.test(surface),
+      'the folding commands are handed to the caret slot, which is the only thing ' +
+        '`keys/dispatch.ts` can reach — a claim without them leaves seven bound chords doing ' +
+        'nothing at all',
+    )
+    ok(
+      /viewRef\.current/.test(surface.slice(surface.indexOf('const onLiveView'), surface.indexOf('const onLiveView') + 300)),
+      '…and they run against `viewRef.current` rather than the captured view, so a chord in ' +
+        'flight as the tab closes does not dispatch into a destroyed EditorView and throw out ' +
+        'of the window capture listener',
+    )
+    {
+      const tracker = bare(readFileSync('src/editor/viewTracker.ts', 'utf8'))
+      ok(
+        /foldedStartLines\(view\.state\)/.test(tracker) && /isFoldEffect/.test(tracker),
+        'the tracker reports the folds AND wakes on the effects that change them. A fold is a ' +
+          '`StateEffect`: it changes neither the document nor the selection, so it reaches ' +
+          'neither of the first two tests, and relying on the height change to set ' +
+          '`geometryChanged` is correctness that lasts until CodeMirror measures differently',
+      )
+    }
+    {
+      const menu = bare(readFileSync('src/editor/codeMenu.tsx', 'utf8'))
+      for (const id of ['editor.fold', 'editor.unfold', 'editor.foldAll', 'editor.unfoldAll']) {
+        ok(
+          menu.includes(`command: '${id}'`),
+          `the context menu names ${id}, so its key chip comes from the live keymap rather ` +
+            'than from a literal a `keymap.json` would silently falsify',
+        )
+      }
+      ok(
+        /disabledReason: canFold\(state\)/.test(menu) && /disabledReason: canUnfoldAll\(state\)/.test(menu),
+        '…and every row that cannot act says why. A row that looks live and does nothing is ' +
+          'the one state `menus/model.ts` refuses to represent, and *Expand all* in a file ' +
+          'with nothing collapsed is the common case rather than the edge one',
+      )
+    }
   }
 
   if (failed > 0) {

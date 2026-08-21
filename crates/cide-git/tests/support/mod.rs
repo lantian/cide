@@ -296,3 +296,92 @@ pub fn binary_blob(rng: &mut Rng, len: usize) -> Vec<u8> {
         .map(|_| (rng.next() % 256) as u8)
         .collect::<Vec<u8>>()
 }
+
+/// A fresh clone of `from`, on `main`, tracking `origin/main`.
+///
+/// Hoisted out of `branches.rs` when `pull.rs` needed the same three lines. A *local* remote on
+/// purpose: `cide_git::push::route` sends those to libgit2, so the tests exercise the route
+/// that needs no credentials and no network — which is the whole reason that route was kept.
+pub fn clone_of(from: &TempRepo, tag: &str) -> TempRepo {
+    let work = TempRepo::new(tag);
+    work.git(&[
+        "remote",
+        "add",
+        "origin",
+        from.root.to_str().expect("utf-8 path"),
+    ]);
+    work.git(&["fetch", "-q", "origin"]);
+    work.git(&["checkout", "-q", "-b", "main", "origin/main"]);
+    work
+}
+
+/// Every tracked file's path and contents, hashed into one comparable string.
+///
+/// The oracle for *"the working tree is byte-identical"*, which is what every refusal in
+/// `pull.rs` has to promise. `git status --porcelain` alone is not enough: it says a file is
+/// modified, not what it now holds, so a refusal that rewrote a file and left it modified
+/// would pass.
+pub fn worktree_hash(repo: &TempRepo) -> String {
+    let mut out = Vec::new();
+    walk(&repo.root, &repo.root, &mut out);
+    out.sort();
+    out.join("\n")
+}
+
+fn walk(root: &std::path::Path, at: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(at) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == ".git") {
+            continue;
+        }
+        if path.is_dir() {
+            walk(root, &path, out);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            out.push(format!("{} {:x?}", rel.display(), simple_hash(&bytes)));
+        }
+    }
+}
+
+fn simple_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a. Not cryptographic and does not need to be: this compares a tree against itself a
+    // few milliseconds later, and the only adversary is a bug.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// Assert that no sequencer state exists — by `RepositoryState` **and** by the files.
+///
+/// Both, because they can disagree: libgit2 reads the state from the files, so a stale
+/// `MERGE_HEAD` that `cleanup_state` failed to remove would make one of them wrong and the
+/// other right, and it is exactly the kind of leftover that locks every other action in
+/// `cide-git` until somebody runs a `git` command by hand.
+pub fn assert_no_sequencer_state(repo: &TempRepo, when: &str) {
+    let git_dir = repo.root.join(".git");
+    for name in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        assert!(
+            !git_dir.join(name).exists(),
+            "{when}: .git/{name} was left behind"
+        );
+    }
+    let state = git2::Repository::open(&repo.root).expect("open").state();
+    assert_eq!(
+        state,
+        git2::RepositoryState::Clean,
+        "{when}: repository state is not clean"
+    );
+}

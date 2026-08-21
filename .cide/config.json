@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "agents": {
+    "enabled": true,
+    "maxConcurrent": 2,
+    "harness": "claude",
+    "isolation": "worktree",
+    "allowDangerousPermissions": false,
+    "nudgeOrchestrator": true
+  }
+}

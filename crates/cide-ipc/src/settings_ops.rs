@@ -14,8 +14,8 @@ use ts_rs::TS;
 
 use crate::Theme;
 use crate::settings::{
-    ClaudeSettings, EditorSettings, ExplorerSettings, GraphicsSettings, InspectionSettings,
-    ProxySettings, SidebarSettings, TerminalSettings,
+    ClaudeSettings, EditorSettings, ExplorerSettings, GitSettings, GraphicsSettings,
+    InspectionSettings, ProxySettings, SidebarSettings, TerminalSettings,
 };
 
 /// A partial update to [`crate::Settings`]. `None` means "leave this alone".
@@ -97,6 +97,13 @@ pub struct SettingsPatch {
     /// `workspace.json` cannot make the app type into a live prompt on every `cargo check`.
     #[ts(optional)]
     pub inspections: Option<InspectionSettings>,
+    /// The Git screen: what a divergent pull does, and how the resolver opens a file. (M20)
+    ///
+    /// Nothing to clamp — an enum and a boolean — but it goes through `apply_patch`'s
+    /// destructuring like every other group, which is what makes a forgotten arm a compile
+    /// error rather than a setting that silently never saves.
+    #[ts(optional)]
+    pub git: Option<GitSettings>,
 }
 
 /// Two or more commands competing for one keystroke in one context.

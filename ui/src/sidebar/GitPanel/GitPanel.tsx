@@ -38,6 +38,7 @@ import { CommitBox } from './CommitBox'
 import { ConfirmDestructive } from '@/chrome/ConfirmDestructive'
 import { useFocusRequested } from '@/chrome/focusRequests'
 import { GuardBar } from './GuardBar'
+import { MergeBar } from './MergeBar'
 import { ShelfList } from './ShelfList'
 import { Toolbar } from './Toolbar'
 import { allRepos, canCommit, repoOf, summarize } from './model'
@@ -68,9 +69,25 @@ export interface GitPanelViewProps {
   iconTheme: IconTheme
   /** Absent in a render with no window — the SSR check, and any fixture harness. */
   treeMenu?: TreeMenu | undefined
+  /**
+   * *Update project* — the toolbar's third glyph, which had been disabled since it was written.
+   *
+   * Optional for `onOpenDiff`'s reason: this panel cannot run a command by itself and must not
+   * pretend to. It is routed through `runCommand('git.pull')` by `App.tsx` rather than calling
+   * `branchApi.pull` here — the `file.reveal` precedent, one handler and one copy of the
+   * preconditions for every surface — so the strategy dialog, the retry and the aggregated
+   * notice are one code path and not two.
+   */
+  onUpdate?: (() => void) | undefined
 }
 
-export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelViewProps) {
+export function GitPanelView({
+  project,
+  git,
+  iconTheme,
+  treeMenu,
+  onUpdate,
+}: GitPanelViewProps) {
   const [tab, setTab] = useState<PanelTab>('commit')
   /*
    * The cursor used to be a `useState` right here, held above `ChangesTree` because that
@@ -150,6 +167,10 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
         onStagingArea={git.setStagingArea}
         onCollapseAll={() => git.setAllExpanded(false)}
         onExpandAll={() => git.setAllExpanded(true)}
+        // Optional all the way down, and still optional here: a window with no dispatcher — the
+        // fixture stories, and `check:render`'s SSR pass — must draw the button disabled with a
+        // reason rather than a control wired to nothing.
+        {...(onUpdate !== undefined ? { onUpdate } : {})}
         {...(repos.length === 1
           ? { onNewChangelist: () => git.newChangelist() }
           : // With several repositories the toolbar cannot know which one a new changelist
@@ -233,6 +254,29 @@ export function GitPanelView({ project, git, iconTheme, treeMenu }: GitPanelView
           />
         )}
       </div>
+
+      {/*
+        * One bar per repository mid-merge, above the staging guard. (M20)
+        *
+        * Rendered for both tabs, for `GuardBar`'s reason one step stronger: a merge in progress
+        * is not merely still true while the Shelf tab is showing — it *blocks the commit*, and a
+        * user who cannot see why Commit refuses will conclude the button is broken.
+        *
+        * Above the guard bar because it is the outer fact: while a merge is in flight the index
+        * is the merge's, so "staging changed outside cide" is both expected and not the thing to
+        * act on first.
+        */}
+      {Object.entries(git.merges).map(([repo, state]) => (
+        <MergeBar
+          key={repo}
+          state={state}
+          busy={git.busy !== null}
+          onContinue={() => git.continueMerge(repo)}
+          onAbort={() => git.abortMerge(repo)}
+          onResolveSimple={() => git.resolveSimpleConflicts(repo)}
+          onShowList={() => git.showConflictList(repo)}
+        />
+      ))}
 
       {/* Rendered for both tabs: an index that moved under us is still true while the
           Shelf tab is showing, and hiding the warning behind a tab is how it gets missed. */}

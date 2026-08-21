@@ -171,7 +171,32 @@ fn mark(
         if into.len() >= MAX_ENTRIES {
             return false;
         }
-        into.entry(display(dir)).or_insert(TreeStatus::Modified);
+        /*
+         * A directory is `modified` — *something under here changed* — except when what
+         * changed is a conflict, which wins. (M20)
+         *
+         * `or_insert` alone would leave the first descendant to be walked deciding, and the
+         * walk order is path order: `src/a.rs` modified and `src/z.rs` conflicted would paint
+         * `src` blue and leave the conflict findable only by expanding. That is the same
+         * argument that puts *Merge Conflicts* first in the commit panel — a conflict blocks
+         * the commit, so a folder that hides one hides the reason the commit will not go.
+         *
+         * Only these two statuses meet here: the rung above returns early for `ignored`, and
+         * every other leaf status still tints its ancestors `modified`, which is what a folder
+         * can usefully say about a deletion or an untracked file underneath it.
+         */
+        let roll = if status == TreeStatus::Conflicted {
+            TreeStatus::Conflicted
+        } else {
+            TreeStatus::Modified
+        };
+        into.entry(display(dir))
+            .and_modify(|held| {
+                if roll == TreeStatus::Conflicted {
+                    *held = TreeStatus::Conflicted;
+                }
+            })
+            .or_insert(roll);
         if dir == root {
             break;
         }
@@ -245,10 +270,15 @@ fn collect(work_tree: &Path) -> crate::Result<Vec<(String, TreeStatus)>> {
 ///
 /// * **Ignored first.** An ignored path carries no other bits worth reporting, and a tracked
 ///   path that merely matches an ignore pattern is not ignored as far as git is concerned.
-/// * **Conflicted becomes `modified`.** A conflicted file *is* modified in the working tree,
-///   and a one-glyph column is not a merge tool: conflicts are resolved in the commit panel,
-///   which has real UI for them. Inventing a `!` the mock does not have would be a design
-///   decision made in a status mapper.
+/// * **Conflicted is its own status.** (M20) It used to collapse into `modified`, on the
+///   argument that *"a one-glyph column is not a merge tool: conflicts are resolved in the
+///   commit panel, which has real UI for them"*. The premise was true and the conclusion
+///   followed from it — until the panel grew a resolver, at which point the tree became the
+///   surface most likely to cause the damage: a file tagged as ordinarily modified is one a
+///   user opens and edits straight over git's conflict markers, saving a file containing
+///   `<<<<<<<` as though it were their own work. Second only to `ignored`, because a
+///   conflicted path is also index-deleted or worktree-new often enough to fall through to a
+///   rung that says something less useful.
 /// * **Deleted before untracked.** `git rm --cached secrets.env` leaves the file on disk and
 ///   sets `INDEX_DELETED | WT_NEW`. Reading that as "untracked" is true but useless; reading
 ///   it as "this path is on its way out of the repository" is what the user just asked for,
@@ -260,7 +290,7 @@ fn classify(status: Status) -> TreeStatus {
     if status.is_ignored() {
         TreeStatus::Ignored
     } else if status.is_conflicted() {
-        TreeStatus::Modified
+        TreeStatus::Conflicted
     } else if status.is_index_deleted() || status.is_wt_deleted() {
         TreeStatus::Deleted
     } else if status.is_wt_new() {
@@ -279,7 +309,7 @@ mod tests {
     #[test]
     fn classify_orders_the_two_sides() {
         assert_eq!(classify(Status::IGNORED), TreeStatus::Ignored);
-        assert_eq!(classify(Status::CONFLICTED), TreeStatus::Modified);
+        assert_eq!(classify(Status::CONFLICTED), TreeStatus::Conflicted);
         assert_eq!(classify(Status::WT_NEW), TreeStatus::Untracked);
         assert_eq!(classify(Status::INDEX_NEW), TreeStatus::Added);
         assert_eq!(classify(Status::WT_MODIFIED), TreeStatus::Modified);

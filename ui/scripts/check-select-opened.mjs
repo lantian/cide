@@ -173,8 +173,15 @@ try {
    * asserts the binding is not in it.
    */
   const chained = keymapRs.slice(keymapRs.indexOf('.chain('))
+  /*
+   * Quoted, and the quotes are the assertion. Unanchored, this pattern is a **prefix** match:
+   * M19 added `("ctrl+shift+equal", "editor.unfoldAll", "editorFocused")` to the chained block
+   * and `/ctrl\+shift\+e/` matched it, failing a check about a binding that had not moved. The
+   * same class of defect `RefusedArg::matches_as` exists to prevent on the Rust side — a
+   * `starts_with` over a flag table folding two different flags onto one.
+   */
   ok(
-    !/ctrl\+shift\+e/.test(chained),
+    !/"ctrl\+shift\+e"/.test(chained),
     'and it carries no `when`: a clause here would make the chord dead in a terminal pane, ' +
       'which is where the question is usually asked from',
   )

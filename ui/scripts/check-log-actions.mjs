@@ -845,7 +845,16 @@ try {
     }
   }
   says('notHead', 'a1b2c3d', '9f8e7d6c', 'rebase')
-  says('replayWouldConflict', 'Cherry-picking', 'a1b2c3d', 'src/main.rs', 'src/lib.rs', 'terminal')
+  // `terminal` is gone from this sentence, and its absence is the assertion. (M20) The variant
+  // is unreachable now — `cide_git::replay` lands the conflict and the resolver finishes it —
+  // but the sentence has to survive for an old payload, and it must not go on telling people
+  // to leave the app for something the app now does. The paths still matter: they are what the
+  // user acts on either way.
+  says('replayWouldConflict', 'Cherry-picking', 'a1b2c3d', 'src/main.rs', 'src/lib.rs')
+  ok(
+    !(sentences.get('replayWouldConflict') ?? '').includes('terminal'),
+    'explain(replayWouldConflict) no longer sends the user to a terminal',
+  )
   says('mergeNeedsMainline', 'a1b2c3d', 'merge')
   says('notAMerge', 'a1b2c3d')
   says('noSuchCommit', 'a1b2c3d')

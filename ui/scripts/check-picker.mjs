@@ -183,7 +183,16 @@ try {
    */
   const GIT = [
     { id: 'git.branch.switch', title: 'Switch branch…', group: 'Git', keywords: [] },
-    { id: 'git.pull', title: 'Pull (fast-forward only)', group: 'Git', keywords: ['update'] },
+    // Kept in step with `cide_core::commands` by hand — this fixture is not the registry, so a
+    // stale title here would go on passing while saying something false. It was
+    // `Pull (fast-forward only)` with the single keyword `update` until M20 renamed the command
+    // to *Update project*, at which point `update` stopped being a title-less keyword at all.
+    {
+      id: 'git.pull',
+      title: 'Update project',
+      group: 'Git',
+      keywords: ['pull', 'update', 'merge', 'rebase', 'ff'],
+    },
     {
       id: 'git.branch.new',
       title: 'New branch…',
@@ -205,10 +214,15 @@ try {
     'a keyword matches on its own, and only for the command that declares it',
   )
   eq(
+    gitIds('rebase'),
+    ['git.pull'],
+    'a keyword the title does not contain at all — `Update project` is what the app calls it ' +
+      'and `rebase` is one of the things a user comes looking for',
+  )
+  eq(
     gitIds('update'),
     ['git.pull'],
-    'a keyword the title does not contain at all — `Pull (fast-forward only)` is what the app ' +
-      'calls it and `update` is what a user calls it',
+    'and a word that is now in the title as well as the keywords still finds it once',
   )
   eq(
     gitIds('eat'),

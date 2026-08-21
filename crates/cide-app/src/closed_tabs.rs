@@ -183,6 +183,14 @@ fn remembered(kind: &TabKind) -> bool {
         TabKind::Diff { spec, .. } => {
             !matches!(spec.origin, cide_ipc::DiffOrigin::ClaudeMcp { .. })
         }
+        // A merge resolver is **not** remembered, and it is the one tab kind where "reopen the
+        // last thing I closed" is actively wrong. It is a query about a *conflict*, which is by
+        // definition transient: by the time somebody presses the reopen chord the merge may be
+        // finished, aborted, or resolved differently in a terminal, and the tab would come back
+        // as a pane saying "this is no longer conflicted". Worse, the reopen would arrive with a
+        // stale centre pane over a file that has since been committed. The panel's *Merge
+        // Conflicts* group is where a conflict is reopened from, and it reads the live state.
+        TabKind::Merge { .. } => false,
         // A revision tab is remembered like any other document. It is a *query* — a file as one
         // commit left it — so reopening it costs one `git_file_at_revision` and lands on exactly
         // the same bytes, because a commit is immutable. That immutability is what makes it

@@ -2,6 +2,19 @@
 
 /**
  * Result of `git.push`, including whatever the transport said.
+ *
+ * # Why the counts are here and not read out of `output`
+ *
+ * A push used to report `output` and nothing else, and the only sentence anything could
+ * build from it was git's own text or a bare *"Pushed to origin"*. That answers "did it
+ * work"; it does not answer *how much went up*, which is what a person checks a push
+ * result for.
+ *
+ * The counts are read from `graph_ahead_behind` **before** the push rather than parsed out
+ * of `output`, and that is not a style preference. On the binary route `output` is the
+ * remote server's own text — see [`Self::output`] — and `cide_git::push`'s header is
+ * explicit that it is shown and never parsed into an action. Reading the numbers from the
+ * object database is the only way to have them on both routes and to keep that rule.
  */
 export type PushOutcome = { remote: string, refspec: string, 
 /**
@@ -12,5 +25,36 @@ shelledOut: boolean,
 /**
  * stderr of the `git push`, or libgit2's progress text. This is where "Everything
  * up-to-date" and the remote's own messages live, and users read them.
+ *
+ * **Untrusted on the binary route**, exactly as [`FetchOutcome::output`] is: it carries
+ * the server's `remote:` sideband lines verbatim. Shown, never parsed.
  */
-output: string, };
+output: string, 
+/**
+ * The destination branch's short name — `main` for `refs/heads/main:refs/heads/main`.
+ *
+ * Empty when the refspec named something that is not a branch (a tag, a deletion), in
+ * which case the frontend falls back to naming the remote alone. Taken from the
+ * **destination** half of the refspec, because "which remote and which branch" is what
+ * the notice promises and a push may rename on the way.
+ */
+branch: string, 
+/**
+ * How many commits the remote gained.
+ *
+ * Zero when it was already up to date, which is what lets the frontend say so instead
+ * of reporting a push of nothing as a success with no number in it.
+ */
+pushed: number, 
+/**
+ * Where the remote ref was before, short.
+ *
+ * **Empty when the remote had no such ref** — the `--set-upstream` publish. That is a
+ * different sentence from an ordinary push (*"Published feature to origin"*), and an
+ * empty string is how the frontend tells them apart without a second boolean.
+ */
+oldOid: string, 
+/**
+ * Where it is now, short.
+ */
+newOid: string, };

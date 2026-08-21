@@ -144,6 +144,7 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
         sidebar,
         explorer,
         inspections,
+        git,
     } = patch;
 
     // Destructured rather than field-by-field on purpose: adding a field to `SettingsPatch`
@@ -196,6 +197,12 @@ fn apply_patch(settings: &mut Settings, patch: SettingsPatch) {
     // any future caller, can print it. Nothing on this path logs the patch either way.
     if let Some(v) = proxy {
         settings.proxy = v;
+    }
+    // Nothing to clamp — an enum and a boolean — and nothing to react to either: the pull
+    // strategy is read fresh by `cmd::git::git_pull` on every pull, and the resolver reads its
+    // own toggle when it opens a file. Neither is mirrored anywhere that would go stale.
+    if let Some(v) = git {
+        settings.git = v;
     }
     // The one patched field that is clamped rather than taken at face value.
     //

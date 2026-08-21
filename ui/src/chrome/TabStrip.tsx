@@ -632,6 +632,38 @@ function viewFor(kind: TabKind): TabView {
       }
     }
 
+    case 'merge': {
+      /*
+       * The three-pane resolver for one conflicted path. (M20)
+       *
+       * Borrows the file shape and its language badge, for the reason `revision` does: this is a
+       * file, and it should sit beside its own tab under the same mark rather than inventing a
+       * sixth silhouette. What distinguishes it is `⚔` and the hint — a conflict is a *state*
+       * the file is in, not a different kind of document.
+       *
+       * **Dirty is real here**, unlike `revision`'s. The centre pane is editable, so the tab
+       * carries the same guard every file tab does: `cide_core::workspace::close_tab` refuses it
+       * without `force`, and quitting reports it by name. Resolving a merge is exactly the work
+       * a user must not lose to a stray Ctrl+W.
+       */
+      const badge = badgeFor(kind.path)
+      return {
+        shape: styles.shapeFile,
+        body: (
+          <>
+            <span className={`${styles.badge} ${badge.tone}`} data-audit="fileTabBadge">
+              {badge.label}
+            </span>
+            <span>{`⚔ ${basename(kind.path)}`}</span>
+          </>
+        ),
+        closable: true,
+        dirty: kind.dirty,
+        hint: `Resolving ${kind.path}`,
+        audit: 'fileTab',
+      }
+    }
+
     case 'settings':
       return {
         shape: styles.shapeSettings,

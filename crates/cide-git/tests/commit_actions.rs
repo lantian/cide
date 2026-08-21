@@ -401,6 +401,24 @@ fn cherry_pick_matches_the_git_binary() {
         let (their_ok, their_output) = theirs.try_git(&["cherry-pick", &picked]);
 
         match outcome {
+            // A landed conflict, which since M20 is an `Ok` rather than a refusal. git reports
+            // it by exiting non-zero and leaving the same state, so the two still have to agree
+            // about *whether* there was one.
+            Ok(outcome) if !outcome.conflicts.is_empty() => {
+                assert!(
+                    !their_ok,
+                    "{what}: cide saw a conflict in {:?} and git did not",
+                    outcome.conflicts
+                );
+                assert!(
+                    ours.root.join(".git/CHERRY_PICK_HEAD").exists(),
+                    "{what}: a landed conflict must leave the state that lets it be finished"
+                );
+                // Abandoned so the loop's next seed starts from a clean repository, and so the
+                // abort path is exercised on every conflicting seed rather than once by hand.
+                cide_git::conflict::abort(&ours.root).expect("abort");
+                assert_no_sequencer_state(&ours, &what);
+            }
             Ok(outcome) => {
                 assert!(
                     their_ok,
@@ -410,13 +428,6 @@ fn cherry_pick_matches_the_git_binary() {
                 assert_eq!(outcome.op, ReplayOp::CherryPick);
                 assert_no_sequencer_state(&ours, &what);
                 compared += 1;
-            }
-            Err(GitError::ReplayWouldConflict { paths, .. }) => {
-                assert!(
-                    !their_ok,
-                    "{what}: cide saw a conflict in {paths:?} and git did not"
-                );
-                assert_refused_cleanly(&ours, &what);
             }
             Err(GitError::EmptyReplay { .. }) => {
                 assert!(!their_ok, "{what}: git committed an empty cherry-pick");
@@ -892,62 +903,77 @@ fn conflicting_branches(tag: &str) -> (TempRepo, String) {
 }
 
 #[test]
-fn a_conflicting_cherry_pick_is_refused_and_changes_nothing() {
+fn a_conflicting_cherry_pick_lands_the_conflict_for_the_resolver() {
+    /*
+     * This test used to assert the opposite, and the reversal is the point of M20.
+     *
+     * It was `a_conflicting_cherry_pick_is_refused_and_changes_nothing`, and its closing line
+     * read: *"git's own cherry-pick would have left `CHERRY_PICK_HEAD` and a conflicted index
+     * here, and the panel has no Continue button."* The panel has one now
+     * (`sidebar/GitPanel/MergeBar.tsx`), so the refusal became the lesser answer: it named the
+     * files and then made the user do the whole thing again in a terminal.
+     *
+     * What has **not** changed, and is asserted below, is that the pre-check still decides
+     * whether anything is written at all — the clean path still composes the result by hand and
+     * creates no sequencer state, which is almost every cherry-pick anyone makes.
+     */
     let (repo, main_tip) = conflicting_branches("pick-conflict");
     repo.write("unrelated.txt", b"work in progress\n");
-    let before_status = porcelain(&repo);
     let before_head = head_oid(&repo);
-    let before_worktree = worktree_hash(&repo.root);
-    let before_index = repo.index_state();
 
-    let error = replay::cherry_pick(
+    let outcome = replay::cherry_pick(
         &repo.root,
         &replay_request(&main_tip, ReplayMode::Commit, None),
     )
-    .expect_err("a cherry-pick that would conflict is refused, not forced");
+    .expect("a landed conflict is not an error");
 
-    match error {
-        GitError::ReplayWouldConflict { op, oid, paths } => {
-            assert_eq!(op, ReplayOp::CherryPick);
-            assert_eq!(oid, main_tip);
-            // `paths` is the whole point of the variant: "cherry-pick failed" is unactionable.
-            assert_eq!(paths, vec!["f.txt".to_string()]);
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
-
+    assert_eq!(outcome.op, ReplayOp::CherryPick);
+    // `conflicts` is the whole point of the field, exactly as `paths` was of the variant it
+    // replaced: "cherry-pick failed" is unactionable.
+    assert_eq!(outcome.conflicts, vec!["f.txt".to_string()]);
     assert_eq!(
-        porcelain(&repo),
-        before_status,
-        "`git status --porcelain` must be byte-identical across a refusal"
+        outcome.created, "",
+        "nothing is committed until the user resolves"
     );
+
+    // Real git state, which is what makes it resolvable — here, in a terminal, or after a
+    // restart.
+    assert!(repo.root.join(".git/CHERRY_PICK_HEAD").exists());
+    assert!(
+        porcelain(&repo).contains("UU f.txt"),
+        "git itself sees the conflict"
+    );
+    assert_eq!(head_oid(&repo), before_head, "and HEAD has not moved");
+    // The dirty file the cherry-pick does not touch came along, which is `replay`'s documented
+    // permissiveness and is unaffected by any of this.
+    assert_eq!(repo.read("unrelated.txt"), b"work in progress\n");
+
+    // And it can be abandoned.
+    cide_git::conflict::abort(&repo.root).expect("abort");
+    assert_no_sequencer_state(&repo, "after aborting a cherry-pick");
     assert_eq!(head_oid(&repo), before_head);
-    assert_eq!(worktree_hash(&repo.root), before_worktree);
-    assert_eq!(repo.index_state(), before_index);
-    // The claim the whole hand-composed design is for: git's own cherry-pick would have left
-    // `CHERRY_PICK_HEAD` and a conflicted index here, and the panel has no *Continue* button.
-    assert_no_sequencer_state(&repo, "a refused cherry-pick");
 }
 
 #[test]
-fn a_conflicting_revert_is_refused_the_same_way() {
+fn a_conflicting_revert_lands_the_same_way() {
     let (repo, main_tip) = conflicting_branches("revert-conflict");
-    let error = replay::revert(
+    let outcome = replay::revert(
         &repo.root,
         &replay_request(&main_tip, ReplayMode::Commit, None),
     )
-    .expect_err("reverting a commit whose lines this branch has rewritten conflicts");
-    assert!(
-        matches!(
-            error,
-            GitError::ReplayWouldConflict {
-                op: ReplayOp::Revert,
-                ..
-            }
-        ),
-        "{error:?}"
-    );
-    assert_no_sequencer_state(&repo, "a refused revert");
+    .expect("a landed conflict is not an error");
+    assert_eq!(outcome.op, ReplayOp::Revert);
+    assert_eq!(outcome.conflicts, vec!["f.txt".to_string()]);
+    assert!(repo.root.join(".git/REVERT_HEAD").exists());
+
+    // Resolved and concluded through the ordinary commit path, which is what
+    // `cide_git::conflict::cont` drives — a cherry-pick and a revert have no sequencer, so
+    // concluding one is a commit plus `cleanup_state`.
+    cide_git::conflict::take_side(&repo.root, "f.txt", cide_ipc::git::ConflictSide::Theirs)
+        .expect("take");
+    cide_git::conflict::cont(&repo.root, None).expect("continue");
+    assert_no_sequencer_state(&repo, "after concluding a revert");
+    assert_eq!(porcelain(&repo).trim(), "", "and the tree is clean");
 }
 
 /// `main` and `side` each add a file, then merge. `M` has two parents with different content.
@@ -1833,14 +1859,23 @@ fn nothing_leaves_a_sequencer_state_behind() {
     .expect("revert");
     assert_no_sequencer_state(&repo, "a committed revert");
 
-    // The root commit created both files and both have been rewritten since, so undoing it is
-    // a delete/modify conflict on each — refused, and refused without a trace.
-    replay::revert(
+    /*
+     * The root commit created both files and both have been rewritten since, so undoing it is a
+     * delete/modify conflict on each.
+     *
+     * Since M20 that **lands** rather than being refused — the state is what makes it
+     * resolvable — so what this sweep asserts about it changed shape: not *no trace*, but *no
+     * trace that outlives an abort*. The claim the sweep is for is unchanged and is arguably
+     * stronger: nothing this crate does leaves a sequencer state nobody asked for.
+     */
+    let conflicted = replay::revert(
         &repo.root,
         &replay_request(&first, ReplayMode::WorkingTree, None),
     )
-    .expect_err("reverting the root commit conflicts with everything written since");
-    assert_no_sequencer_state(&repo, "a refused revert");
+    .expect("a landed conflict is not an error");
+    assert!(!conflicted.conflicts.is_empty());
+    cide_git::conflict::abort(&repo.root).expect("abort");
+    assert_no_sequencer_state(&repo, "a reverted-then-aborted revert");
 
     repo.git(&["checkout", "-q", "-b", "side", &first]);
     replay::cherry_pick(

@@ -64,6 +64,7 @@ interface Claim {
   column: number
   lines: number
   word: WordReader | null
+  folds: FoldActions | null
 }
 
 /**
@@ -78,6 +79,35 @@ interface Claim {
  * `null` when the caret is not in a word — whitespace, punctuation, an empty line.
  */
 export type WordReader = () => string | null
+
+/**
+ * The folding commands of the editor that holds the slot.
+ *
+ * # Why these ride on the caret slot rather than on a registry of their own
+ *
+ * Because the question they answer is the one this module already answers: *which editor is the
+ * user in*. `keys/dispatch.ts` fires `editor.fold` with no `EditorView` and no way to get one —
+ * the same predicament [`focusedCaret`] exists for — and a second module-level stack would be a
+ * second answer to that question, kept in step by hand. The note above `CaretPosition.lines`
+ * makes exactly this argument about a field, and it applies harder to a whole registry.
+ *
+ * `openBuffers.ts` is the other shape available and it is the wrong one here: it is keyed by
+ * *tab*, which is right for Ctrl+S (a save means a tab, whether or not it is focused) and wrong
+ * for a fold (a split shows two editors of the same file and only one of them is being read).
+ *
+ * Each returns whether it did anything, so a command that finds nothing to collapse can say so
+ * through `unmet(...)` rather than being a keystroke that silently did nothing — which is the
+ * failure `cide_core::commands`' header is written against.
+ */
+export interface FoldActions {
+  fold(): boolean
+  unfold(): boolean
+  toggle(): boolean
+  foldAll(): boolean
+  unfoldAll(): boolean
+  foldRecursively(): boolean
+  unfoldRecursively(): boolean
+}
 
 /**
  * Newest last, so the top of the stack is the editor the user is in.
@@ -112,20 +142,32 @@ export function focusedWord(): string | null {
 }
 
 /**
+ * The folding commands of the editor the user is in, or `null`.
+ *
+ * `null` means "no editor holds the slot" — a detached terminal window, a Claude tab — and every
+ * caller has to render it, exactly as they already do for [`focusedCaret`]. It is *also* null for
+ * a claim made without actions, which is what a fixture or a check script produces.
+ */
+export function focusedFolds(): FoldActions | null {
+  const top = claims.at(-1)
+  return top === undefined ? null : top.folds
+}
+
+/**
  * Claim the slot for an editor showing `path`.
  *
  * Mounting claims it, because a freshly opened file is the one being looked at — the same rule
  * `claimStatusReadout` follows, and the two are claimed and released together.
  *
- * `word` is optional so a caller that has no cheap way to answer it — a fixture, a check script —
- * still gets a working claim; [`focusedWord`] then answers `null`, which every caller already has
- * to handle.
+ * `word` and `folds` are optional so a caller that has no cheap way to supply them — a fixture, a
+ * check script — still gets a working claim; [`focusedWord`] and [`focusedFolds`] then answer
+ * `null`, which every caller already has to handle.
  */
-export function claimCaret(path: string, word?: WordReader): CaretSlot {
+export function claimCaret(path: string, word?: WordReader, folds?: FoldActions): CaretSlot {
   // `lines: 1` rather than 0, because "an empty document is one empty line" is CodeMirror's own
   // arithmetic and this value is read before the first `set` arrives. A 0 here would let Go to
   // line report a file with no lines in it for one frame after a split opens.
-  const claim: Claim = { path, line: 1, column: 1, lines: 1, word: word ?? null }
+  const claim: Claim = { path, line: 1, column: 1, lines: 1, word: word ?? null, folds: folds ?? null }
   claims.push(claim)
 
   let released = false

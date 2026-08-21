@@ -1216,6 +1216,16 @@ pub struct ReplayOutcome {
     /// The summary line of the new commit, or the one that would be used.
     pub summary: String,
     pub files: u32,
+    /// Paths the replay left conflicted. Empty when it applied cleanly. (M20)
+    ///
+    /// **Non-empty is not a failure**, and this field replacing a refusal is the whole change.
+    /// It used to be [`crate::git::GitError::ReplayWouldConflict`]: the merge was composed in
+    /// memory and thrown away, because there was nothing in the app that could finish one. Now
+    /// the operation runs for real — `CHERRY_PICK_HEAD` or `REVERT_HEAD` on disk, stages 1/2/3
+    /// in the index, git's markers in the files — and the user resolves it through the same
+    /// surface a conflicted pull opens. `created` is empty in that case: nothing has been
+    /// committed yet.
+    pub conflicts: Vec<String>,
 }
 
 /// How far back a reset moves the index and the working tree.

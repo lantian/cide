@@ -338,7 +338,7 @@ fn a_root_with_no_repository_is_empty_rather_than_an_error() {
 }
 
 #[test]
-fn a_conflicted_file_reads_as_modified() {
+fn a_conflicted_file_gets_its_own_status_and_tints_the_folders_above_it() {
     let repo = TempRepo::new("tree-conflict");
     repo.write("f.txt", b"base\n");
     repo.commit_all("base");
@@ -351,12 +351,51 @@ fn a_conflicted_file_reads_as_modified() {
     let (ok, _) = repo.try_git(&["merge", "other"]);
     assert!(!ok, "the merge is supposed to conflict");
 
+    /*
+     * This used to assert `Modified`, on the argument that *"the one-glyph column is not a
+     * merge tool, and the commit panel is where conflicts are actually resolved"*. The premise
+     * was true and the conclusion followed from it — until M20 gave the panel a resolver, at
+     * which point the tree became the surface most likely to cause the damage: a file tagged as
+     * ordinarily modified is one somebody opens and edits straight over git's markers, saving a
+     * file containing `<<<<<<<` as though it were their own work.
+     */
+    let map = tree_status(&roots(&repo));
+    assert_eq!(at(&map, &repo.root, "f.txt"), Some(TreeStatus::Conflicted));
+}
+
+#[test]
+fn a_conflict_wins_over_a_modification_when_a_folder_rolls_up() {
+    // Path order decides which descendant is walked first, and `a.txt` comes before `z.txt`.
+    // Without the promotion the folder would take the first answer and paint itself `modified`,
+    // hiding the very thing that is blocking the commit.
+    let repo = TempRepo::new("tree-conflict-roll");
+    std::fs::create_dir_all(repo.root.join("src")).expect("dir");
+    repo.write("src/a.txt", b"base\n");
+    repo.write("src/z.txt", b"base\n");
+    repo.commit_all("base");
+    repo.git(&["checkout", "-q", "-b", "other"]);
+    repo.write("src/z.txt", b"other\n");
+    repo.commit_all("other");
+    repo.git(&["checkout", "-q", "main"]);
+    repo.write("src/z.txt", b"main\n");
+    repo.commit_all("main");
+    let (ok, _) = repo.try_git(&["merge", "other"]);
+    assert!(!ok, "the merge is supposed to conflict");
+    repo.write("src/a.txt", b"just edited\n");
+
     let map = tree_status(&roots(&repo));
     assert_eq!(
-        at(&map, &repo.root, "f.txt"),
-        Some(TreeStatus::Modified),
-        "a conflict is shown as modified: the one-glyph column is not a merge tool, and the \
-         commit panel is where conflicts are actually resolved"
+        at(&map, &repo.root, "src/a.txt"),
+        Some(TreeStatus::Modified)
+    );
+    assert_eq!(
+        at(&map, &repo.root, "src/z.txt"),
+        Some(TreeStatus::Conflicted)
+    );
+    assert_eq!(
+        at(&map, &repo.root, "src"),
+        Some(TreeStatus::Conflicted),
+        "the folder reports the conflict, not the modification"
     );
 }
 

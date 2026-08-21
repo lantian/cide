@@ -61,14 +61,51 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
         return Err(GitError::Conflicted { paths: conflicts });
     }
     let merge_heads = merge_heads(&repo)?;
+    /*
+     * Which in-progress operations this commit is allowed to *conclude*.
+     *
+     * `merge` was the only one until M20, on the argument that a rebase, a cherry-pick sequence
+     * or an `am` each have their own `--continue` and that forging a commit underneath one
+     * leaves the sequencer pointing at a state that no longer exists. That argument still holds
+     * for `rebase` — libgit2's own `git_rebase_commit` is what advances it, and
+     * `cide_git::conflict::cont` calls it — and it never applied to a **single** cherry-pick or
+     * revert, which have no sequencer at all: `CHERRY_PICK_HEAD` and `REVERT_HEAD` are one
+     * marker file each, and concluding one is an ordinary commit followed by `cleanup_state`.
+     *
+     * So those two are admitted now that `cide_git::replay` can leave them behind, and `rebase`
+     * and `am` are still refused with a sentence.
+     */
+    let concluding = matches!(
+        repo_mod::operation_in_progress(&repo).as_deref(),
+        Some("merge") | Some("cherry-pick") | Some("revert")
+    );
     if let Some(operation) = repo_mod::operation_in_progress(&repo)
-        && operation != "merge"
+        && !concluding
     {
         return Err(GitError::OperationInProgress { operation });
     }
 
     let sidecar = changelist::load(root);
-    if !sidecar.use_staging_area && !request.force {
+    /*
+     * A merge conclusion takes the staging-area arm whatever the sidecar says, and waives the
+     * external-index guard. (M20)
+     *
+     * Both follow from the same fact: **on a merge the index is the truth.** It was built by
+     * the merge, edited by `cide_git::conflict`'s resolutions, and it holds the only record of
+     * which side won each conflicted file. `rebuild_index` below would `read_tree(HEAD)` over
+     * it and apply the active changelist's hunks on top — which silently discards *theirs* and
+     * commits HEAD-plus-selected-hunks under a message that says the branches were merged.
+     * ADR 0004's rule that `.git/index` is derived from a changelist has one exception, and
+     * this is it.
+     *
+     * The guard is waived for the same reason and not out of convenience: it exists to catch
+     * an index cide did not write, and a merge index is *by construction* one cide did not
+     * write hunk by hunk. Leaving it armed would raise the "staging changed outside cide" bar
+     * on every merge anyone ever concludes.
+     */
+    let merging = !merge_heads.is_empty() || concluding;
+    let staging_arm = sidecar.use_staging_area || merging;
+    if !staging_arm && !request.force {
         changelist::require_index_unchanged(root, &repo)?;
     }
 
@@ -98,8 +135,9 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
      */
     let mut saved: Vec<(String, Option<git2::IndexEntry>)> = Vec::new();
 
-    let committed: Vec<String> = if sidecar.use_staging_area {
-        // Nothing to build: whatever the user staged is what gets committed.
+    let committed: Vec<String> = if staging_arm {
+        // Nothing to build: whatever the index holds is what gets committed — the user's own
+        // staging, or the merge's.
         staged_paths(&repo)?
     } else {
         let list = request
@@ -126,7 +164,13 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
         // new message. The worktree is not touched, so unstaged work survives a reword — and in
         // `use_staging_area` mode this branch is not taken at all, so a hand-built `git add -p`
         // selection is never in reach of it.
-        if selections.is_empty() && merge_heads.is_empty() && !request.amend {
+        //
+        // This branch is not reached during a merge at all any more — `staging_arm` sends one
+        // to `staged_paths` above — so the `merge_heads.is_empty()` term that used to be part
+        // of this condition has gone with it. It existed to let a clean auto-merge commit with
+        // nothing ticked; that case now never composes an index from a changelist in the first
+        // place, which is the stronger version of the same guarantee.
+        if selections.is_empty() && !request.amend {
             return Err(GitError::NothingToCommit);
         }
         saved = staged_entries(&repo, head_tree.as_ref())?;
@@ -147,7 +191,7 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
             // Guarded on the mode because `saved` is empty in staging-area mode for the good
             // reason that nothing was rebuilt: rewinding there would reset the index to HEAD
             // and throw away the staging the user built by hand.
-            if !sidecar.use_staging_area {
+            if !staging_arm {
                 let _ = rewind_index(&repo, head_tree.as_ref(), &saved);
             }
             // The index is already whatever `rebuild_index` made it, so the fingerprint from
@@ -158,7 +202,11 @@ pub fn commit(root: &Path, request: &CommitRequest) -> Result<CommitOutcome> {
         }
     };
 
-    if !merge_heads.is_empty() {
+    // Cleared for every operation this commit concluded, not only for a merge. A
+    // `CHERRY_PICK_HEAD` left behind would make `operation_in_progress` go on reporting a
+    // cherry-pick that has already been committed, and the panel would draw a bar for it for
+    // ever.
+    if concluding {
         repo.cleanup_state().wrap()?;
     }
 

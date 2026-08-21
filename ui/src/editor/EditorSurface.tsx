@@ -52,7 +52,18 @@ import { cideHighlightStyle } from './highlight'
 import { useCodeMenu } from './codeMenu'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
-import { languageName, loadLanguage } from './languages'
+import { foldSpecFor, languageName, loadLanguage } from './languages'
+import {
+  foldAllRanges,
+  foldEffectsFor,
+  foldExtensions,
+  foldHere,
+  foldRecursive,
+  toggleFoldHere,
+  unfoldAllRanges,
+  unfoldHere,
+  unfoldRecursive,
+} from './folding'
 import { captureLineEndings, restoreLineEndings, type DocumentEndings } from './lineEndings'
 import type { AutosaveReason } from './autosave'
 import { exceedsBytes } from './byteSize'
@@ -1087,6 +1098,32 @@ export function EditorSurface({
         bracketMatching(),
         closeBrackets(),
         indentOnInput(),
+        /*
+         * Code folding. (M19)
+         *
+         * # Why it is here and not beside `lineNumbers()`
+         *
+         * Two reasons, and the first is the ordering it *keeps*: this array is appended to
+         * `shared`, so the fold gutter still lands after `lineNumbers()` — and gutters are laid
+         * out in extension order, which is what puts the chevrons *between* the numbers and the
+         * text where IDEA has them. `blame.ts` carries the mirror image of that note for why its
+         * column goes first. `check:editor` pins the ordering the way `check:blame` pins the
+         * other one.
+         *
+         * The second is the gate itself. Above `HIGHLIGHT_LIMIT_BYTES` this buffer gets no
+         * grammar, no bracket matching and no wrapping, because a megabyte of generated output is
+         * opened to look at rather than worked in. A fold scan is linear and cheap next to any of
+         * those, but it is the same judgement about the same population, and putting it under the
+         * same flag means there is one answer to "what does an oversize buffer do" rather than
+         * two. `scanFolds` has its own `FOLD_LINE_LIMIT` besides, for the file that is enormous
+         * without being large.
+         *
+         * `foldSpecFor` is synchronous and total — it answers for a `.txt` too, see
+         * `DEFAULT_FOLD_SPEC` — and it has to be: the fold restore below runs inside the mount
+         * dispatch, and a spec arriving with the grammar's dynamic `import()` would land a tick
+         * after it.
+         */
+        foldExtensions(foldSpecFor(path)),
       )
     }
     if (readOnly) {
@@ -1267,11 +1304,49 @@ export function EditorSurface({
      * The cost is that a revision buffer contributes no *useful* path to those three, and that is
      * correct: there is no place in the working tree that means "line 40 as it was at `a1b2c3d`".
      */
-    caret = claimCaret(identity, () => {
+    /**
+     * Run one folding command against whatever view is live, or answer that none is.
+     *
+     * `viewRef.current` and not the `view` this effect built: the two are the same object for
+     * the whole of its life, and differ for exactly the window in which the effect's cleanup has
+     * run and a chord is still in flight — a Ctrl+Minus pressed as the tab closes. Dispatching
+     * into a destroyed `EditorView` throws, and it would throw *out of the key gate*, which is a
+     * window-level capture listener with no boundary above it.
+     */
+    const onLiveView = (run: (target: EditorView) => boolean): boolean => {
       const live = viewRef.current
-      if (live === null) return null
-      return wordTargetAt(live, live.state.selection.main.head)?.text ?? null
-    })
+      return live !== null && run(live)
+    }
+
+    caret = claimCaret(
+      identity,
+      () => {
+        const live = viewRef.current
+        if (live === null) return null
+        return wordTargetAt(live, live.state.selection.main.head)?.text ?? null
+      },
+      /*
+       * The folding commands, on the same claim. (M19)
+       *
+       * `keys/dispatch.ts` fires `editor.fold` with no `EditorView` and no way to get one — the
+       * predicament this whole slot exists for — and the question "which editor should collapse"
+       * is the question the slot already answers. `caretTrack.ts` writes out why this is not a
+       * second registry.
+       *
+       * Every one reads `viewRef.current` rather than closing over `view`: a claim outlives no
+       * view, but a chord that arrives during the teardown of one would otherwise dispatch into
+       * a destroyed instance, which throws out of the key gate.
+       */
+      {
+        fold: () => onLiveView(foldHere),
+        unfold: () => onLiveView(unfoldHere),
+        toggle: () => onLiveView(toggleFoldHere),
+        foldAll: () => onLiveView(foldAllRanges),
+        unfoldAll: () => onLiveView(unfoldAllRanges),
+        foldRecursively: () => onLiveView(foldRecursive),
+        unfoldRecursively: () => onLiveView(unfoldRecursive),
+      },
+    )
     /*
      * Seed the real numbers immediately, because nothing else will until the user types.
      *
@@ -1351,10 +1426,27 @@ export function EditorSurface({
              * 199 — and it would have given 198 the launch after that, creeping a line per
              * relaunch. `firstFullyVisible` covers the same class of error from the other side.
              */
-            effects: EditorView.scrollIntoView(view.state.doc.line(plan.topLine).from, {
-              y: 'start',
-              yMargin: 0,
-            }),
+            /*
+             * The folds go in **this** transaction, ahead of the scroll. (M19)
+             *
+             * Not a second dispatch, and the order inside the array is not the reason — a
+             * transaction's effects all apply to one new state, and `scrollIntoView` is measured
+             * against it. Two dispatches would be the bug: the first lays the document out at
+             * its *unfolded* heights and scrolls line `topLine` to the top, the second collapses
+             * several thousand lines above it, and the user lands somewhere they have never
+             * been. Once per restore, on every file they had folded.
+             *
+             * `foldEffectsFor` drops a remembered line that no longer names a foldable range,
+             * which is the ordinary case after the file changed underneath — see its note on why
+             * this stores lines rather than offsets.
+             */
+            effects: [
+              ...foldEffectsFor(view.state, plan.folds),
+              EditorView.scrollIntoView(view.state.doc.line(plan.topLine).from, {
+                y: 'start',
+                yMargin: 0,
+              }),
+            ],
           })
         } catch (error) {
           // Wrapped for the reason `registerReveal`'s handler is: this runs inside an effect

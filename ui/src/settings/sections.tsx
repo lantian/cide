@@ -21,6 +21,7 @@ import type {
   ClaudeSettings,
   EditorSettings,
   ExplorerSettings,
+  GitSettings,
   Settings,
   SettingsPatch,
   SettingsSection,
@@ -100,7 +101,11 @@ export const SECTIONS: readonly { id: SettingsSection; title: string; descriptio
     description:
       'The subagent roles this project and you define. Each one is a file — a system prompt plus the switches a run is spawned with — not a cide setting, so saving one changes the project, not your preferences.',
   },
-  { id: 'git', title: 'Git', description: 'Changelists, staging and the commit tool window.' },
+  {
+    id: 'git',
+    title: 'Git',
+    description: 'What Update project does when your branch has diverged, and how conflicts open.',
+  },
   { id: 'terminal', title: 'Terminal', description: 'Every pane running a shell or a TUI.' },
 ]
 
@@ -471,15 +476,64 @@ function Files({ settings, patch }: SectionProps) {
   )
 }
 
-function Git() {
+/**
+ * The Git screen. (M20)
+ *
+ * A pure function of `settings`, deliberately: `sections.tsx`'s header is explicit that
+ * *"a section that reads the store is a section the fixture cannot drive"*, and every row here
+ * is a plain settings value. The one thing that would need the store — what each repository's
+ * own `pull.rebase` currently resolves to — is not here for that reason; the `Note` names the
+ * command that clears it instead, which is what
+ * `terminal/outsideOpen.ts`'s *"listed in Settings where it can be revoked"* rule asks for.
+ */
+function Git({ settings, patch }: SectionProps) {
+  const git = settings.git
+  const set = (next: Partial<GitSettings>) => patch({ git: { ...git, ...next } })
+
   return (
-    <Note title="No git settings yet">
-      The commit tool window and its changelists land with the git milestone. Changelists are
-      cide's own model rather than the index — committing rewrites <code>.git/index</code> from
-      the active changelist — so this section will grow the switch that hands staging back to
-      git, and the guard for an index changed outside cide. See{' '}
-      <code>docs/adr/0004-changelists-not-index.md</code>.
-    </Note>
+    <>
+      <Group title="Update project">
+        <Row
+          label="When your branch has diverged"
+          hint="cide fast-forwards whenever it can. This is what happens when it cannot — when you have commits the remote does not and the remote has commits you do not. A repository's own pull.rebase always wins over this; it is the answer for the ones that have not decided for themselves. Ask puts the choice in front of you and offers to write your answer into that repository. Fast-forward only is what cide did before this setting existed: it refuses, and says how far apart the two have got."
+          control={
+            <Segmented
+              label="Diverged pull"
+              value={git.pullStrategy}
+              options={[
+                { value: 'ask', label: 'Ask' },
+                { value: 'merge', label: 'Merge' },
+                { value: 'rebase', label: 'Rebase' },
+                { value: 'fastForward', label: 'Fast-forward only' },
+              ]}
+              onChange={(pullStrategy) => set({ pullStrategy })}
+            />
+          }
+        />
+        <Note title="A repository can answer for itself">
+          Ticking <em>remember this choice</em> in the dialog writes <code>pull.rebase</code> into
+          that repository&rsquo;s own <code>.git/config</code> — the same key{' '}
+          <code>git pull</code> reads in a terminal, and not a cide setting. To go back to being
+          asked, run <code>git config --unset pull.rebase</code> in that repository. Your global{' '}
+          <code>~/.gitconfig</code> is never edited.
+        </Note>
+      </Group>
+
+      <Group title="Resolving a conflict">
+        <ToggleRow
+          label="Apply non-conflicting changes automatically"
+          hint="When the three-pane resolver opens a file, apply the changes only one side made without asking about them. Off by default, as it is in IDEA: the middle pane opens as the version both branches came from, and every difference either side made is a block you take or reject — applying two thirds of them before you have looked undoes the reason for showing them. The toolbar's Apply non-conflicting is the same action when you want it."
+          checked={git.autoApplyNonConflicting}
+          onChange={(v) => set({ autoApplyNonConflicting: v })}
+        />
+        <Note title="Conflicts are git's, not cide's">
+          A merge or rebase that stops leaves real git state — <code>MERGE_HEAD</code>, an index
+          with all three versions, markers in the files — so the same conflict is visible to{' '}
+          <code>git status</code> in a terminal pane, survives closing cide, and can be abandoned
+          with <code>git merge --abort</code> if you would rather not use the resolver at all.
+        </Note>
+      </Group>
+    </>
   )
 }
 
@@ -568,7 +622,7 @@ export function renderSection(id: SettingsSection, props: SectionProps): ReactNo
       // command registry — see its own header for why that is right here and nowhere else.
       return <AgentsSection />
     case 'git':
-      return <Git />
+      return <Git {...props} />
     case 'terminal':
       return <Terminal {...props} />
   }

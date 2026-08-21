@@ -56,6 +56,20 @@ export interface FilePosition {
 export interface FileView extends FilePosition {
   /** First visible line, 1-based. */
   readonly topLine: number
+  /**
+   * The 1-based start lines of the collapsed blocks, ascending. (M19)
+   *
+   * Part of "the same lines" for the same reason `topLine` is: a file left with its imports and
+   * three long functions collapsed is a *different document to read* than the same file with
+   * everything open, and restoring the scroll without the folds puts the caret at a line number
+   * that now means something else entirely.
+   *
+   * **Start lines, not offsets.** A record is written against one version of a file and applied
+   * to another. A line that no longer names a foldable range is dropped in silence by
+   * `folding.ts::foldEffectsFor`; a stale offset would collapse a range of text nobody chose.
+   * Same argument this module already makes for storing a line rather than a `scrollTop`.
+   */
+  readonly folds: readonly number[]
 }
 
 /** Are these the same place? Path, line and column, exactly. */
@@ -64,10 +78,25 @@ export function samePosition(a: FilePosition | null, b: FilePosition | null): bo
   return a.path === b.path && a.line === b.line && a.column === b.column
 }
 
-/** Are these the same place *and* the same scroll? */
+/** Are these the same place, the same scroll *and* the same folds? */
 export function sameView(a: FileView | null, b: FileView | null): boolean {
   if (a === null || b === null) return a === b
-  return samePosition(a, b) && a.topLine === b.topLine
+  return samePosition(a, b) && a.topLine === b.topLine && sameLines(a.folds, b.folds)
+}
+
+/**
+ * Element-wise equality for two ascending line lists.
+ *
+ * Both sides come from `folding.ts::foldedStartLines`, which sorts and dedupes, so order is
+ * meaningful and a set comparison would be doing the same work more slowly. Written out rather
+ * than joined into a string because this runs on the update path `worthNoting` guards.
+ */
+function sameLines(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
 }
 
 /**
@@ -79,6 +108,10 @@ export function sameView(a: FileView | null, b: FileView | null): boolean {
  * nothing — all of them reach the debounce and none of them is news. Dropping them here costs a
  * three-field comparison and saves a round trip plus a store mutation plus, eventually, a disk
  * write.
+ *
+ * A fold or an unfold is **always** news — there is no threshold on it the way there arguably is
+ * on a scroll, because collapsing a block is a deliberate gesture and there is no such thing as
+ * accidentally folding half a line. That falls out of [`sameView`] comparing the lists exactly.
  */
 export function worthNoting(previous: FileView | null, next: FileView): boolean {
   return !sameView(previous, next)
@@ -106,6 +139,12 @@ export function clampView(at: FileView, lines: number): FileView {
     line: clamp(whole(at.line, 1), 1, total),
     column: Math.max(1, whole(at.column, 1)),
     topLine: clamp(whole(at.topLine, 1), 1, total),
+    // Folds are **filtered, not clamped**, which is the opposite of what happens to the caret
+    // one line above and is deliberate. Clamping a caret past the end of a shortened file lands
+    // the user somewhere plausible; clamping a fold there would collapse whatever block happens
+    // to be at the end of the file — a piece of the document silently hidden, in a file that has
+    // changed under the user, which is precisely when they most need to see all of it.
+    folds: at.folds.filter((line) => Number.isFinite(line) && line >= 1 && line <= total),
   }
 }
 

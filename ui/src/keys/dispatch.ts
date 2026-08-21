@@ -55,7 +55,15 @@ import { useWorkspace } from '@/store/workspace'
 import { toggleTheme } from '@/settings/useSettings'
 import { paneSessionId, peekHost } from '@/layout/paneHosts'
 import { openBranchPopup } from '@/chrome/BranchSelector'
-import { explain, pullReport, type RepoFetch } from '@/chrome/branchModel'
+import { explain, pullReport, pushReport, type RepoFetch, type RepoPush } from '@/chrome/branchModel'
+import {
+  divergenceOf,
+  strategyAsk,
+  type PullStrategy,
+  type RepoDivergence,
+} from '@/chrome/pullStrategyModel'
+import { requestPullStrategy } from '@/chrome/pullStrategyStore'
+import { showConflicts } from '@/chrome/conflictsStore'
 import { notify, notifyFailure } from '@/chrome/notices'
 import { pasteIntoTerminal } from '@/terminal/clipboard'
 import { openTerminalFind } from '@/terminal/findStore'
@@ -85,7 +93,7 @@ import {
   type SplitIntent,
   type TabId,
 } from '@/ipc/client'
-import { focusedCaret, focusedWord } from '@/editor/caretTrack'
+import { focusedCaret, focusedFolds, focusedWord } from '@/editor/caretTrack'
 import { goToDefinition } from '@/editor/goToDefinition'
 import { findUsages, goToImplementation } from '@/editor/codeIntel'
 import { refreshDiagnostics } from '@/sidebar/ProblemsPanel/actions'
@@ -228,6 +236,118 @@ function withRepos(command: string, run: (project: ProjectId, repos: RepoInfo[])
     // every repository has to be able to *name* them when it reports back — "already up to
     // date" four times over says nothing about which four.
     run(project.id, repos)
+  })
+}
+
+/**
+ * One pass of `git.fetch` / `git.pull` over every repository, and the retry after a dialog.
+ *
+ * Factored out of the `case` so the answer to *merge or rebase?* re-enters exactly the same
+ * code path the first attempt took — one place that knows how to fan out, report and fail, and
+ * therefore one place that can be wrong.
+ *
+ * `strategy === null` means *first pass*: only then is a divergence a question rather than a
+ * failure, and only then is the dialog built.
+ */
+function pullPass(
+  project: ProjectId,
+  repos: readonly RepoInfo[],
+  pulling: boolean,
+  strategy: PullStrategy | null,
+  remember: boolean,
+): void {
+  const attempts = repos.map((repo) =>
+    pulling
+      ? branchApi.pull(project, repo.id, {
+          // Spread rather than `strategy: strategy ?? undefined`. `strategy` is `#[ts(optional)]`
+          // on the wire and `exactOptionalPropertyTypes` is on, so *absent* and *present and
+          // undefined* are different types here — and absent is the one that means "decide from
+          // configuration".
+          ...(strategy !== null ? { strategy } : {}),
+          // See the `case` above: the refusal was raised *after* the fetch, so the numbers the
+          // user just answered about are already on disk.
+          skipFetch: strategy !== null,
+          remember,
+        })
+      : branchApi.fetch(project, repo.id),
+  )
+
+  for (const attempt of attempts) {
+    void attempt.catch((error: unknown) => {
+      // A divergence is a question, asked below. Swallowed rather than rethrown so this derived
+      // promise *resolves* and no `unhandledrejection` fires for it; every other rejection keeps
+      // the property the `case`'s comment depends on.
+      if (strategy === null && divergenceOf(error) !== null) return
+      // The operation only changes one variant's wording, and only on the pull side: a fetch
+      // moves no working tree, so it cannot raise `checkoutWouldOverwrite` at all and the
+      // argument is unreachable for it.
+      throw new Error(explain(error, pulling ? 'pull' : 'checkout'))
+    })
+  }
+
+  void Promise.allSettled(attempts).then((settled) => {
+    const done: RepoFetch[] = []
+    const asked: RepoDivergence[] = []
+    // The repositories a merge or rebase stopped in, carried with their **ids** rather than
+    // looked up by name afterwards: two roots in a monorepo can share a basename, and a lookup
+    // that matched the wrong one would open the conflict list over somebody else's merge.
+    const stopped: { id: string; name: string }[] = []
+    settled.forEach((result, i) => {
+      const repo = repos[i]
+      if (repo === undefined) return
+      if (result.status === 'fulfilled') {
+        done.push({ name: repo.name, outcome: result.value })
+        if (result.value.conflicts.length > 0) stopped.push({ id: repo.id, name: repo.name })
+        return
+      }
+      const diverged = strategy === null ? divergenceOf(result.reason) : null
+      if (diverged !== null) asked.push({ name: repo.name, repo: repo.id, diverged })
+    })
+
+    // Every repository failed. They each have a toast of their own already, and a report of
+    // nothing on top of them would be a second surface saying less.
+    if (done.length > 0) {
+      const report = pullReport(done)
+      notify(report.text, { kind: 'info', detail: report.detail })
+    }
+
+    /*
+     * A conflict opens its own list. (M20)
+     *
+     * The toast says *"2 files to resolve"* and offers nothing that resolves them; the Git
+     * panel's `MergeBar` does, but only if the sidebar happens to be open — and Ctrl+T is
+     * reachable from a terminal pane with it shut. So the one surface that a stopped merge
+     * cannot leave to chance opens itself, which is what IDEA does and why.
+     *
+     * The **first** conflicted repository only. `showConflicts` drops a second while one is up,
+     * and a monorepo where three roots all conflict would otherwise stack three modal lists over
+     * each other; the bar is what carries the rest.
+     */
+    const first = stopped[0]
+    if (first !== undefined) {
+      void branchApi.conflicts(project, first.id).then((state) => {
+        if (state === null) return
+        showConflicts({
+          project,
+          repo: first.id,
+          repoName: repos.length > 1 ? first.name : '',
+          state,
+        })
+      })
+    }
+
+    const ask = strategyAsk(asked)
+    if (ask === null) return
+    requestPullStrategy({
+      ask,
+      repos: asked,
+      proceed: (picked, keep) => {
+        // Only the repositories that actually asked. Re-issuing for the ones that already
+        // fast-forwarded would pull them a second time and report them twice.
+        const again = repos.filter((r) => asked.some((a) => a.repo === r.id))
+        pullPass(project, again, pulling, picked, keep)
+      },
+    })
   })
 }
 
@@ -940,14 +1060,48 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
       /* --------------------------------------------------------------------------- Git */
 
       case 'git.push': {
-        // Every repository in the project, in root order. A monorepo with submodules has
-        // several and the command names none of them, so pushing "the" repo would have to
-        // pick one; pushing each is what *Push to remote* says.
-        //
-        // Uncaught on purpose, like `claudeSend.lines`: a rejected push — no upstream, no
-        // credential helper — is exactly what `chrome/Failures.tsx` exists to put on screen.
+        /*
+         * Every repository in the project, in root order. A monorepo with submodules has
+         * several and the command names none of them, so pushing "the" repo would have to pick
+         * one; pushing each is what *Push to remote* says.
+         *
+         * # Two things this used to get wrong, both fixed in M20
+         *
+         * It was `Promise.all` with the value discarded. That is the recurring defect of this
+         * project with the sign flipped — not "implemented and nothing calls it" but "called,
+         * and the answer dropped on the floor". A user who pressed the key and got silence had
+         * the same evidence a dead key would give them. `allSettled` over the *same* promises
+         * collects the answers without disturbing the failure path, exactly as `git.pull` does
+         * one case below, and for the same two reasons: with four repositories and two
+         * failures `Promise.all` reports the first and marks the rest handled.
+         *
+         * And it had **no `.catch` at all**, so a rejection reached `Failures.tsx` as a raw
+         * `GitError` — `{kind: 'push', detail: {output: …}}`, which has no `message` field and
+         * whose `detail` is an object, so `notices.describe` fell through to `kind` and the
+         * toast read the single word `push`. `explain` is the sentence.
+         */
         withRepos(command, (project, repos) => {
-          void Promise.all(repos.map((repo) => gitApi.push(project, repo.id, null, null)))
+          const attempts = repos.map((repo) => gitApi.push(project, repo.id, null, null))
+          for (const attempt of attempts) {
+            void attempt.catch((error: unknown) => {
+              throw new Error(explain(error))
+            })
+          }
+          void Promise.allSettled(attempts).then((settled) => {
+            const done: RepoPush[] = []
+            settled.forEach((result, i) => {
+              const repo = repos[i]
+              if (result.status === 'fulfilled' && repo !== undefined) {
+                done.push({ name: repo.name, outcome: result.value })
+              }
+            })
+            if (done.length === 0) return
+            // Aggregated into one notice, never one per repository: `notices.admit` collapses
+            // toasts by identical text, so five submodules all saying "already up to date"
+            // would show one toast that silently spoke for five.
+            const report = pushReport(done)
+            notify(report.text, { kind: 'info', detail: report.detail })
+          })
         })
         return
       }
@@ -1013,32 +1167,28 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          * one gesture, one answer, and — see `notices.admit` — five identical "already up to
          * date" texts would collapse into one toast that silently spoke for five.
          */
+        /*
+         * # The divergence, which is a question and not a failure (M20)
+         *
+         * A `pullNeedsStrategy` rejection is **swallowed** in the loop below rather than
+         * rethrown, so its derived promise resolves and no `unhandledrejection` fires for it.
+         * Every other rejection keeps the property the paragraphs above depend on. The
+         * `allSettled` pass then collects those questions the same way it collects successes,
+         * and asks **once** for all of them — see `chrome/pullStrategyStore.ts` for why one
+         * question rather than a queue.
+         *
+         * The retry passes `skipFetch`, because the counts and commits the user has just read
+         * describe refs that are already on disk: re-fetching could only make them answer a
+         * question about one divergence and get another.
+         *
+         * And the ask is built **only on the first pass** (`strategy === null`). A
+         * `pullNeedsStrategy` arriving on the retry — which Rust must not produce, but might —
+         * falls through to `explain` and toasts once, rather than putting the dialog back on
+         * screen for ever. Same reasoning as `logMenu.ts`'s mainline guard.
+         */
         const pulling = command === 'git.pull'
-        const run = pulling ? branchApi.pull : branchApi.fetch
         withRepos(command, (project, repos) => {
-          const attempts = repos.map((repo) => run(project, repo.id))
-          for (const attempt of attempts) {
-            void attempt.catch((error: unknown) => {
-              // The operation only changes one variant's wording, and only on the pull side:
-              // a fetch moves no working tree, so it cannot raise `checkoutWouldOverwrite` at
-              // all and the argument is unreachable for it.
-              throw new Error(explain(error, pulling ? 'pull' : 'checkout'))
-            })
-          }
-          void Promise.allSettled(attempts).then((settled) => {
-            const done: RepoFetch[] = []
-            settled.forEach((result, i) => {
-              const repo = repos[i]
-              if (result.status === 'fulfilled' && repo !== undefined) {
-                done.push({ name: repo.name, outcome: result.value })
-              }
-            })
-            // Every repository failed. They each have a toast of their own already, and a
-            // report of nothing on top of them would be a second surface saying less.
-            if (done.length === 0) return
-            const report = pullReport(done)
-            notify(report.text, { kind: 'info', detail: report.detail })
-          })
+          pullPass(project, repos, pulling, null, false)
         })
         return
       }
@@ -1492,6 +1642,62 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           column: to.startColumn,
           endColumn: to.endColumn,
         })
+        return
+      }
+
+      /* ----------------------------------------------------------------------- Folding */
+
+      case 'editor.fold':
+      case 'editor.unfold':
+      case 'editor.toggleFold':
+      case 'editor.foldAll':
+      case 'editor.unfoldAll':
+      case 'editor.foldRecursively':
+      case 'editor.unfoldRecursively': {
+        /*
+         * Folding is entirely client-side — no IPC, no Rust — so the whole of this arm is
+         * finding the editor. `focusedFolds()` is `caretTrack.ts`'s claim stack, which is the
+         * same slot `navigate.line` and ⌥F7 read; the module note there says why folding rides
+         * on it rather than on a registry of its own.
+         *
+         * **The precondition is re-checked here even though every one of these commands carries
+         * `.when("editorFocused")`.** That clause filters the palette and never gates the
+         * keyboard — the key gate resolves through `Binding::when`, a different field — so a
+         * chord arriving with no editor focused reaches this line and must be answered. Leaving
+         * that out is how Ctrl+W on the pinned console came to raise a dialog and then fail; the
+         * rule is written out at the top of `cide_core::commands`.
+         */
+        const folds = focusedFolds()
+        if (folds === null) return unmet(command, 'no editor focused')
+        const did =
+          command === 'editor.fold'
+            ? folds.fold()
+            : command === 'editor.unfold'
+              ? folds.unfold()
+              : command === 'editor.toggleFold'
+                ? folds.toggle()
+                : command === 'editor.foldAll'
+                  ? folds.foldAll()
+                  : command === 'editor.unfoldAll'
+                    ? folds.unfoldAll()
+                    : command === 'editor.foldRecursively'
+                      ? folds.foldRecursively()
+                      : folds.unfoldRecursively()
+        /*
+         * A refusal is reported rather than swallowed, for the reason `unmet` exists: a caret in
+         * a file with nothing foldable under it, or an Expand with nothing collapsed, is a
+         * keystroke that did nothing — and a keystroke that does nothing *and says nothing* is
+         * indistinguishable from a command that is not wired, which is the complaint this whole
+         * dispatcher was rewritten to answer.
+         */
+        if (!did) {
+          return unmet(
+            command,
+            command.startsWith('editor.unfold') || command === 'editor.toggleFold'
+              ? 'nothing is collapsed here'
+              : 'nothing to collapse here',
+          )
+        }
         return
       }
 

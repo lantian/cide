@@ -161,6 +161,29 @@ try {
 
   // --- nothing to commit -------------------------------------------------------------------
 
+  /*
+   * The *Merge Conflicts* group and the bar above it. (M20)
+   *
+   * This is the first check that has ever drawn either. The group has been on the wire since
+   * M10 and every fixture set `conflicts: []`, so a surface that compiled and mounted was never
+   * once asserted to paint anything — which is precisely the defect this whole file exists for.
+   */
+  eq(
+    byName.conflict.mergeBar,
+    '⚔ Merging origin/hub-provider-config into hub-provider-config · 1 of 3 resolved Resolve conflicts… Resolve simple Continue Abort',
+    'the merge bar names both sides, counts the resolutions, and offers every verb',
+  )
+  eq(
+    byName.conflict.rows.length >= 3,
+    true,
+    'and the conflicted files are drawn as rows rather than being counted and hidden',
+  )
+  eq(
+    byName.mock.mergeBar,
+    null,
+    'no merge bar when nothing is in progress, which is almost every panel there is',
+  )
+
   eq(byName.empty.rows, [], 'a clean tree renders no rows')
   eq(byName.empty.summary, 'nothing selected', 'and says so in the footer')
 

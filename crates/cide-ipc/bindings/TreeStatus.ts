@@ -14,4 +14,4 @@
  * the two the tree can hold that the mock does not draw. Every one of them is reachable;
  * see `cide_git::tree_status` for what produces each.
  */
-export type TreeStatus = "clean" | "modified" | "added" | "deleted" | "untracked" | "ignored";
+export type TreeStatus = "clean" | "modified" | "conflicted" | "added" | "deleted" | "untracked" | "ignored";

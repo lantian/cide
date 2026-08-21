@@ -1354,7 +1354,13 @@ export const git = {
   commit: (project: ProjectId, repo: RepoId, request: CommitRequest) =>
     invoke<CommitOutcome>('git_commit', { project, repo, request }),
 
-  /** Shells out to `git push` when a credential helper is configured or the remote is HTTPS. */
+  /**
+   * Shells out to `git push` when a credential helper is configured or the remote is HTTPS.
+   *
+   * Answers with the counts as well as the transport's text since M20 — `pushNote` is what
+   * turns them into a sentence, and they are read from the object database before the push
+   * rather than parsed out of git's output, which on the binary route is the remote server's.
+   */
   push: (
     project: ProjectId,
     repo: RepoId,
@@ -1495,6 +1501,16 @@ export const file = {
   /** Record whether a file tab has unsaved edits. This is what draws the tab's dirty dot. */
   setDirty: (projectId: ProjectId, id: TabId, dirty: boolean) =>
     invoke<{ rev: number }>('tab_set_dirty', { project: projectId, tab: id, dirty }),
+
+  /**
+   * Open the three-pane conflict resolver for one path, or activate the tab already on it. (M20)
+   *
+   * On `file` rather than on `branch` because it opens a **tab**, which is what every other
+   * `tab_open_*` here does; the conflict *verbs* live on `branch` beside `pull`, which is what
+   * lands the conflict in the first place.
+   */
+  openMergeTab: (projectId: ProjectId, repo: string, path: string) =>
+    invoke<TabId>('tab_open_merge', { project: projectId, repo, path }),
 
   read: (path: string) => invoke<FileDoc>('file_read', { path }),
 
@@ -2105,7 +2121,12 @@ import type {
   BranchList,
   CheckoutMode,
   CheckoutOutcome,
+  ConflictFile,
+  ConflictSide,
+  ContinueOutcome,
   FetchOutcome,
+  MergeState,
+  PullRequest,
   RepoId as BranchRepoId,
 } from './generated'
 
@@ -2477,12 +2498,78 @@ export const branch = {
     invoke<FetchOutcome>('git_fetch', { project, repo, remote }),
 
   /**
-   * Fetch, then fast-forward. **Never merges**: a divergence rejects with `notFastForward`
-   * and both counts, because there is no conflict-resolution surface in this app to finish a
-   * merge in.
+   * Fetch, then integrate — fast-forward, merge or rebase. (M20)
+   *
+   * `request` carries the whole decision: the remote, the strategy the user chose (or `null`
+   * to let git config and the cide default decide), whether to skip the fetch because the refs
+   * are already the ones a `pullNeedsStrategy` described, and whether to remember the answer in
+   * the repository's own `pull.rebase`.
+   *
+   * Three answers rather than two. It resolves with a `FetchOutcome` whose **`conflicts` may be
+   * non-empty** — the merge or rebase landed and is waiting to be resolved, which is a success
+   * and not a failure — and it rejects with `pullNeedsStrategy` when nothing has said how to
+   * reconcile, which is a question rather than an error. `chrome/pullStrategyModel.ts` unpacks
+   * that one; everything else goes through `explain`.
+   *
+   * Defaulted so the existing one-line call sites (`branchApi.pull(p, r)`) still mean *pull,
+   * decide everything from configuration*.
    */
-  pull: (project: ProjectId, repo: BranchRepoId, remote: string | null = null) =>
-    invoke<FetchOutcome>('git_pull', { project, repo, remote }),
+  pull: (
+    project: ProjectId,
+    repo: BranchRepoId,
+    // Spelled out rather than `{}`: `skipFetch` and `remember` are plain booleans on the wire,
+    // and these two defaults are the ones that must never be assumed — a first-click Pull
+    // always fetches, and never rewrites the repository's config behind the user.
+    request: PullRequest = { skipFetch: false, remember: false },
+  ) =>
+    invoke<FetchOutcome>('git_pull', { project, repo, request }),
+
+  /**
+   * The merge or rebase in progress and its conflicted paths, or `null` when the tree is clean.
+   *
+   * Read on demand rather than mirrored into the workspace store, because it is *git's* state:
+   * a `git merge` typed into a terminal pane changes it, and a mirror of something git owns is
+   * stale with no upper bound on how long it stays that way. `cide://git-status` is what says
+   * to ask again.
+   */
+  conflicts: (project: ProjectId, repo: BranchRepoId) =>
+    invoke<MergeState | null>('git_conflicts', { project, repo }),
+
+  /** The three sides of one conflicted file, for the resolver. */
+  conflictRead: (project: ProjectId, repo: BranchRepoId, path: string) =>
+    invoke<ConflictFile>('git_conflict_read', { project, repo, path }),
+
+  /** Write the resolved text and collapse the path's conflict stages. */
+  conflictResolve: (project: ProjectId, repo: BranchRepoId, path: string, content: string) =>
+    invoke<MergeState | null>('git_conflict_resolve', { project, repo, path, content }),
+
+  /**
+   * Resolve a path by taking one side whole.
+   *
+   * **`ours` and `theirs` are the index's stages, not the panel's words.** During a *rebase*
+   * git swaps them — stage 2 is the branch being rebased onto and stage 3 is your own commit —
+   * so a caller must take the side the labels in `ConflictFile` name, never the one the button
+   * would be called in a merge. `cide_git::conflict::side_labels` is where that is decided.
+   */
+  conflictTake: (project: ProjectId, repo: BranchRepoId, path: string, side: ConflictSide) =>
+    invoke<MergeState | null>('git_conflict_take', { project, repo, path, side }),
+
+  /** Put a resolved path back into conflict. Only possible while its stages can be rebuilt. */
+  conflictUnresolve: (project: ProjectId, repo: BranchRepoId, path: string) =>
+    invoke<MergeState | null>('git_conflict_unresolve', { project, repo, path }),
+
+  /**
+   * Conclude the merge, or advance the rebase to its next stop.
+   *
+   * Resolves with `state: null` when the operation is over and with a fresh `MergeState` when a
+   * rebase stopped again — which is why the button says *Continue* and not *Finish*.
+   */
+  mergeContinue: (project: ProjectId, repo: BranchRepoId, message: string | null = null) =>
+    invoke<ContinueOutcome>('git_merge_continue', { project, repo, message }),
+
+  /** `git merge --abort` / `git rebase --abort`. Puts the tree back where it was. */
+  mergeAbort: (project: ProjectId, repo: BranchRepoId) =>
+    invoke<void>('git_merge_abort', { project, repo }),
 }
 
 /**

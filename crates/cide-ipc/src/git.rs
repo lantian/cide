@@ -198,9 +198,27 @@ pub enum TreeStatus {
     /// Tracked and unchanged. Never travels in a [`TreeStatusMap`] — absence means this, and
     /// a 100k-file repository would otherwise ship 100k entries saying nothing.
     Clean,
-    /// Changed against HEAD, or conflicted. Also what a directory gets when something under
-    /// it changed.
+    /// Changed against HEAD. Also what a directory gets when something under it changed.
     Modified,
+    /// Left conflicted by a merge, rebase, cherry-pick or revert.
+    ///
+    /// # Why this is a variant now when it deliberately was not
+    ///
+    /// It used to collapse into [`Self::Modified`], and the reason given was that *"a
+    /// one-glyph column is not a merge tool: conflicts are resolved in the commit panel,
+    /// which has real UI for them"*. The premise was true and the conclusion followed from
+    /// it — until the commit panel grew a resolver, at which point the tree became the
+    /// surface most likely to *cause* the damage: a file the tree tags as ordinarily modified
+    /// is one a user opens and edits straight over git's conflict markers, saving a file that
+    /// contains `<<<<<<<` as though it were their own work.
+    ///
+    /// So the column earns the variant. A conflicted path also **wins over `Modified` when a
+    /// directory rolls its descendants up**, for the same reason `Merge Conflicts` is the
+    /// panel's first group: it blocks the commit, and a status a roll-up hides is a status
+    /// nobody sees. That precedence is spelled out in `cide_git::tree_status`, not inferred
+    /// from this enum's declaration order — the derived `Ord` here exists for `BTreeMap`
+    /// keys and asserting on it would be reading meaning into an accident.
+    Conflicted,
     /// New in the index.
     Added,
     /// Deleted on one side while the path is still on disk — `git rm --cached`. A path
@@ -418,8 +436,10 @@ pub struct CommitRequest {
     /// against the repository, rather than against a list drawn a second ago.
     ///
     /// A mismatch is [`GitError::NotHead`] and never a rewrite: amending anything but HEAD is an
-    /// interactive rebase, and cide has no conflict-resolution surface to finish one — the same
-    /// argument `branch::pull` makes for being fast-forward-only.
+    /// **interactive** rebase, which is a different thing from the plain one `cide_git::pull`
+    /// performs — it needs a todo list the user edits, and cide has no surface for that. The
+    /// conflict half of the old argument no longer applies (see [`ConflictFile`]); the
+    /// interactive half still does.
     ///
     /// `#[serde(default)]` so every caller that predates this field, and every `workspace.json`
     /// that never carried it, still deserialises.
@@ -437,6 +457,19 @@ pub struct CommitOutcome {
 }
 
 /// Result of `git.push`, including whatever the transport said.
+///
+/// # Why the counts are here and not read out of `output`
+///
+/// A push used to report `output` and nothing else, and the only sentence anything could
+/// build from it was git's own text or a bare *"Pushed to origin"*. That answers "did it
+/// work"; it does not answer *how much went up*, which is what a person checks a push
+/// result for.
+///
+/// The counts are read from `graph_ahead_behind` **before** the push rather than parsed out
+/// of `output`, and that is not a style preference. On the binary route `output` is the
+/// remote server's own text — see [`Self::output`] — and `cide_git::push`'s header is
+/// explicit that it is shown and never parsed into an action. Reading the numbers from the
+/// object database is the only way to have them on both routes and to keep that rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -448,7 +481,51 @@ pub struct PushOutcome {
     pub shelled_out: bool,
     /// stderr of the `git push`, or libgit2's progress text. This is where "Everything
     /// up-to-date" and the remote's own messages live, and users read them.
+    ///
+    /// **Untrusted on the binary route**, exactly as [`FetchOutcome::output`] is: it carries
+    /// the server's `remote:` sideband lines verbatim. Shown, never parsed.
     pub output: String,
+    /// The destination branch's short name — `main` for `refs/heads/main:refs/heads/main`.
+    ///
+    /// Empty when the refspec named something that is not a branch (a tag, a deletion), in
+    /// which case the frontend falls back to naming the remote alone. Taken from the
+    /// **destination** half of the refspec, because "which remote and which branch" is what
+    /// the notice promises and a push may rename on the way.
+    pub branch: String,
+    /// How many commits the remote gained.
+    ///
+    /// Zero when it was already up to date, which is what lets the frontend say so instead
+    /// of reporting a push of nothing as a success with no number in it.
+    pub pushed: u32,
+    /// Where the remote ref was before, short.
+    ///
+    /// **Empty when the remote had no such ref** — the `--set-upstream` publish. That is a
+    /// different sentence from an ordinary push (*"Published feature to origin"*), and an
+    /// empty string is how the frontend tells them apart without a second boolean.
+    pub old_oid: String,
+    /// Where it is now, short.
+    pub new_oid: String,
+}
+
+impl PushOutcome {
+    /// The four report fields empty, for a caller that has not measured them yet.
+    ///
+    /// `cide_git::push` builds the transport half in whichever route ran and folds the counts
+    /// in afterwards, because the counts have to be read *before* the push and the routes are
+    /// also the crate's test surface. This keeps that seam to one `..` rather than four zeros
+    /// repeated at each of the two constructors.
+    pub fn blank() -> Self {
+        Self {
+            remote: String::new(),
+            refspec: String::new(),
+            shelled_out: false,
+            output: String::new(),
+            branch: String::new(),
+            pushed: 0,
+            old_oid: String::new(),
+            new_oid: String::new(),
+        }
+    }
 }
 
 // --- branches ---------------------------------------------------------------------------
@@ -562,6 +639,133 @@ pub struct PulledCommit {
     pub author: String,
 }
 
+/// How a pull integrates a divergence.
+///
+/// On a [`PullRequest`] it is an instruction; on a [`FetchOutcome`] it is a report of what
+/// actually happened.
+///
+/// `FastForward` means **fast-forward only**: advance when the upstream already contains the
+/// branch, and refuse with [`GitError::NotFastForward`] otherwise. That is exactly what
+/// `cide_git::pull` did before merge and rebase existed, which is why it is a value here and
+/// not a third radio button in the dialog — see `cide_git::pull`'s header. A user who wants
+/// today's behaviour permanently sets it in Settings; the dialog does not offer it, because
+/// it is the one answer that always fails in the only situation the dialog appears in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PullStrategy {
+    FastForward,
+    Merge,
+    Rebase,
+}
+
+/// What cide does about a divergence that **git config says nothing about**.
+///
+/// The last step of the resolution order — `branch.<name>.rebase`, then `pull.rebase`, then
+/// this — and the only one that can answer `Ask`.
+///
+/// A separate enum from [`PullStrategy`] rather than a fourth variant of it, because `Ask` is
+/// not a strategy: it is a request for a dialog. A fourth variant would be representable on a
+/// [`PullRequest`], where it would mean nothing and every match would need an unreachable arm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PullDefault {
+    /// Put the choice in front of the user, and offer to remember the answer.
+    #[default]
+    Ask,
+    FastForward,
+    Merge,
+    Rebase,
+}
+
+impl PullDefault {
+    /// The strategy this default names, or `None` for `Ask`.
+    pub fn strategy(self) -> Option<PullStrategy> {
+        match self {
+            Self::Ask => None,
+            Self::FastForward => Some(PullStrategy::FastForward),
+            Self::Merge => Some(PullStrategy::Merge),
+            Self::Rebase => Some(PullStrategy::Rebase),
+        }
+    }
+}
+
+/// Everything a pull needs to know beyond which repository it is about.
+///
+/// A struct rather than four parameters on `cide_git::pull::pull_with`, and every field
+/// `#[serde(default)]`, so `PullRequest::default()` is the plain *"pull, decide everything
+/// from configuration"* that `git_pull` used to mean — and so a payload written by an older
+/// build still deserialises. Same shape and same reasoning as [`CommitRequest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+#[ts(export)]
+pub struct PullRequest {
+    /// `None` is the branch's upstream remote, else `origin` — `push::default_remote`, which
+    /// is shared with `fetch` precisely so *Fetch* and *Pull* in one menu cannot disagree.
+    #[ts(optional)]
+    pub remote: Option<String>,
+
+    /// The user's explicit answer, from the dialog.
+    ///
+    /// `None` resolves from git config and then from the cide default, and may come back as
+    /// [`GitError::PullNeedsStrategy`] — which is the dialog's cue.
+    #[ts(optional)]
+    pub strategy: Option<PullStrategy>,
+
+    /// The refs are already fresh; do not fetch again.
+    ///
+    /// **Set only when answering a [`GitError::PullNeedsStrategy`].** That refusal is raised
+    /// *after* the fetch, so the counts and commits it carries describe refs that are already
+    /// on disk. Re-fetching to answer it would be a second network round trip whose only
+    /// possible effect is to make the dialog's numbers describe a state that no longer
+    /// exists — the user would answer a question about one divergence and get another.
+    ///
+    /// Never defaulted true, so a first-click Pull can never skip the wire.
+    pub skip_fetch: bool,
+
+    /// Write the answer into this repository's own `pull.rebase` — the dialog's *remember
+    /// this choice* box.
+    ///
+    /// Honoured once the strategy has been **applied**, which includes a pull that landed
+    /// conflicts: the user answered the question either way, and a merge that needs resolving
+    /// is the strategy working, not failing. It is *not* honoured when the pull was refused
+    /// before integrating at all, because remembering an answer that never ran would pin the
+    /// user to a strategy with no dialog left to change it.
+    pub remember: bool,
+}
+
+/// How far a branch and its upstream have parted, and what is on each side.
+///
+/// The payload of [`GitError::PullNeedsStrategy`], and everything the dialog needs, so
+/// answering costs no second round trip.
+///
+/// Both sides of the divergence travel, and the local half is not decoration: **rebase is the
+/// choice that risks something, and what it risks is your commits**. A payload carrying only
+/// the behind-side would leave the dialog listing, under both answers, things that are at risk
+/// under neither.
+///
+/// **The fetch has already happened when this is built.** That is what lets the answering call
+/// set [`PullRequest::skip_fetch`] and integrate precisely the state these numbers describe,
+/// rather than re-fetching into a divergence the user never saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Divergence {
+    pub branch: String,
+    pub remote: String,
+    /// The upstream's short ref — `origin/main`. Every sentence in the dialog names it.
+    pub upstream: String,
+    pub ahead: u32,
+    pub behind: u32,
+    /// What came down, newest first, capped like [`FetchOutcome::commits`].
+    pub incoming: Vec<PulledCommit>,
+    pub more_incoming: u32,
+    /// Your commits, newest first — what a rebase would replay.
+    pub local: Vec<PulledCommit>,
+    pub more_local: u32,
+}
+
 /// Result of a fetch or a fast-forward pull.
 ///
 /// # Why this carries more than `advanced`
@@ -613,9 +817,50 @@ pub struct FetchOutcome {
     /// Capped here and not in the frontend on purpose: a 400-commit pull after a fortnight
     /// away must not put 400 rows on the IPC wire to have 390 of them dropped by a `slice`
     /// in a component.
+    ///
+    /// Always *what came down from upstream*, whichever strategy ran — walked as
+    /// `push(upstream).hide(pre-pull local tip)`. That is what makes one field right for a
+    /// fast-forward, a merge and a rebase alike.
     pub commits: Vec<PulledCommit>,
     /// How many more there were beyond `commits`. Zero when the list is complete.
     pub more_commits: u32,
+
+    /// What the pull did.
+    ///
+    /// `None` for a plain fetch **and** for a pull that had nothing to take: in both cases no
+    /// integration happened, and there is no honest value to name. A separate `PullOutcome`
+    /// type was considered and rejected — the frontend has exactly one function that turns
+    /// this struct into a sentence, and a second DTO would double the shapes it handles to
+    /// avoid four zeros.
+    #[ts(optional)]
+    pub strategy: Option<PullStrategy>,
+
+    /// How many of **your own** commits a rebase replayed onto the new base.
+    ///
+    /// Zero for every other strategy. [`Self::advanced`] is still what came *down*; a rebase
+    /// reports both because it does both, and one number cannot say "took 7, rewrote 3".
+    pub rewritten: u32,
+
+    /// Local commits a rebase did not replay because replaying them would have produced
+    /// nothing — git's `--empty=drop`, which is nearly always *this patch is already
+    /// upstream*.
+    ///
+    /// Reported rather than swallowed: `git rebase` drops them silently, and a user whose
+    /// three commits became two has to be told which arithmetic happened or they go looking
+    /// for the lost one.
+    ///
+    /// It also counts one case `git rebase` does **not** drop — a commit that was empty to
+    /// begin with, which git keeps and libgit2 does not. `cide_git::pull` states both
+    /// differences; this number is what makes either of them visible.
+    pub skipped: u32,
+
+    /// Paths left conflicted by a merge or rebase that could not complete on its own.
+    ///
+    /// **Non-empty is not a failure.** The operation did what was asked; git state is on disk
+    /// (`MERGE_HEAD` or `.git/rebase-merge`), the index carries stages 1/2/3, and the user now
+    /// resolves. Reporting it as `Ok` rather than `Err` is what routes it to the conflict
+    /// surface instead of to the red toast that `chrome/Failures.tsx` draws for refusals.
+    pub conflicts: Vec<String>,
 }
 
 impl FetchOutcome {
@@ -639,6 +884,10 @@ impl FetchOutcome {
             deletions: 0,
             commits: Vec::new(),
             more_commits: 0,
+            strategy: None,
+            rewritten: 0,
+            skipped: 0,
+            conflicts: Vec::new(),
         }
     }
 }
@@ -665,6 +914,138 @@ pub struct StashEntry {
     pub index: u32,
     pub message: String,
     pub oid: String,
+}
+
+// --- conflicts --------------------------------------------------------------------------
+
+/// Which side of a three-way merge a one-click resolution takes.
+///
+/// `Base` is offered because a delete/modify conflict sometimes has no other sensible answer,
+/// and because *"put it back how it was"* is a real decision. It is not offered as a default
+/// anywhere — `cide_git::conflict::take_side` does exactly what it is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ConflictSide {
+    /// Stage 1 — the merge base, the version both sides started from.
+    Base,
+    /// Stage 2 — what the branch you are on has.
+    Ours,
+    /// Stage 3 — what the branch being merged in has.
+    Theirs,
+}
+
+/// One conflicted path, as the panel's *Merge Conflicts* group draws a row.
+///
+/// `resolved` is *"this path once had conflict stages and no longer does"*, which is what
+/// makes a resolved row stay visible with a tick rather than vanishing — a row that
+/// disappears when you resolve it gives the user no way to see what they have done, and no
+/// way back to a file they resolved wrongly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConflictEntry {
+    pub path: String,
+    pub resolved: bool,
+    /// libgit2 called at least one side binary. The three-pane resolver refuses it and the
+    /// row offers *Yours* and *Theirs* only — see [`ConflictFile::binary`].
+    pub binary: bool,
+}
+
+/// The operation the repository is in the middle of, and how far through it is.
+///
+/// This is what `cide_git::repo::operation_in_progress` becomes. It used to answer a single
+/// `Option<String>` whose only consumer was a tooltip fragment, and whose real effect was to
+/// make every other action in `cide-git` refuse. Now it is the state a bar is drawn from and
+/// a resolver reads, which is what makes those refusals survivable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MergeState {
+    /// `merge`, `rebase`, `cherry-pick`, `revert` — `RepositoryState`'s own vocabulary, which
+    /// is also git's, so the bar's sentence matches what `git status` says.
+    pub operation: String,
+    /// The branch being merged *into* — where you are standing. Short name, or a short oid
+    /// for a detached `HEAD`.
+    pub ours: String,
+    /// What is being merged in: `origin/main`, or a short oid with its summary for a
+    /// cherry-pick. Written for a person, not parsed.
+    pub theirs: String,
+    /// A rebase's position: `(done, total)`, one-based, so it renders as *"3 of 7"*.
+    ///
+    /// `None` for a merge, which is one step by construction. Not faked as `(1, 1)`: a bar
+    /// that says *"1 of 1"* for every merge is noise that trains the reader to skip the
+    /// counter on the rebases where it matters.
+    #[ts(optional)]
+    pub step: Option<MergeStep>,
+    /// Every path the operation left conflicted, resolved ones included.
+    pub entries: Vec<ConflictEntry>,
+}
+
+/// A rebase's position through its todo list, one-based.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MergeStep {
+    pub done: u32,
+    pub total: u32,
+}
+
+/// The three sides of one conflicted file, as text, for the resolver.
+///
+/// # Why every side is optional
+///
+/// A delete/modify conflict has no `ours`; its mirror has no `theirs`; a file added on both
+/// sides has no `base`. `cide_git::repo::conflicts_of` already handles the missing-side case
+/// for *paths* — taking `our`, else `their`, else the ancestor — and the resolver has to
+/// handle it for *content*. A three-pane view that renders a missing side as an empty
+/// document would say "the other branch deleted every line", which is a different fact from
+/// "the other branch deleted the file", and the difference decides what the user clicks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConflictFile {
+    /// Repo-relative and slash-separated, as every path in this module is.
+    pub path: String,
+    /// Stage 1. `None` when the file exists on both sides but has no common ancestor.
+    #[ts(optional)]
+    pub base: Option<String>,
+    /// Stage 2. `None` when your side deleted the file.
+    #[ts(optional)]
+    pub ours: Option<String>,
+    /// Stage 3. `None` when their side deleted it.
+    #[ts(optional)]
+    pub theirs: Option<String>,
+    /// What the left pane is titled: `HEAD (main)`.
+    pub our_label: String,
+    /// What the right pane is titled: `origin/main`.
+    pub their_label: String,
+    /// At least one side is not valid UTF-8, or contains a NUL.
+    ///
+    /// The resolver draws no text panes for it at all and offers *Yours* / *Theirs*. Set
+    /// **instead of** filling the three sides, so a caller that ignores this flag renders
+    /// nothing rather than mojibake.
+    pub binary: bool,
+    /// The largest side's byte length when it is over the resolver's limit, else `None`.
+    ///
+    /// Same treatment as `binary` and for the same reason a diff pane has
+    /// `MAX_DIFF_CHARS`: three CodeMirror documents with `height: auto` defeat the
+    /// viewport windowing that makes a large file survivable at all.
+    #[ts(optional)]
+    pub too_large: Option<u64>,
+}
+
+/// What happened when the user pressed *Continue*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ContinueOutcome {
+    /// The commit that concluded a merge, or the last one a rebase wrote. Empty when a
+    /// rebase step produced nothing to commit.
+    pub oid: String,
+    /// Where the operation stands now. `None` means it finished and the tree is clean.
+    #[ts(optional)]
+    pub state: Option<MergeState>,
 }
 
 // --- errors -----------------------------------------------------------------------------
@@ -823,13 +1204,73 @@ pub enum GitError {
         branch: String,
         paths: Vec<String>,
     },
-    /// A pull that is not a fast-forward. cide does not merge or rebase for you — there is
-    /// no conflict-resolution surface yet — so it says how far the two have diverged and
-    /// stops.
+    /// A pull that is not a fast-forward, when the resolved strategy is
+    /// [`PullStrategy::FastForward`].
+    ///
+    /// Raised only for that strategy now, and unchanged in shape and wording because the
+    /// sentence it already carried is exactly right for it: the user asked for
+    /// fast-forward-only, and these are the two numbers that say why it could not happen.
     NotFastForward {
         branch: String,
         ahead: u32,
         behind: u32,
+    },
+    /// The branch has diverged and nothing has said whether to merge or rebase.
+    ///
+    /// **Boxed**, and that is not a style choice: nine fields inline made this variant 136
+    /// bytes, which is what every `Result<_, GitError>` in the workspace then costs, and
+    /// `clippy::result_large_err` fails the build over it at 128. Adjacent tagging means the
+    /// boxed struct serialises to exactly the JSON the inline form did — `{"kind": …,
+    /// "detail": {…}}` — so the wire and the frontend see no difference at all.
+    PullNeedsStrategy(Box<Divergence>),
+    /// A rebase pull whose local-only commits include merges.
+    ///
+    /// `git rebase` drops them by default and flattens their content. cide refuses, because a
+    /// dropped merge silently discards the conflict resolution recorded *in* it — a content
+    /// change on a branch about to be pushed, with nothing in the app to undo it. It is the
+    /// same refusal [`Self::MergeNeedsMainline`] makes: *which side do you want to keep* is
+    /// unanswerable from a count, and flattening answers it for every merge at once without
+    /// asking. The user is not stranded — the dialog's other button merges.
+    RebaseWouldDropMerges {
+        branch: String,
+        commits: Vec<PulledCommit>,
+    },
+    /// More local commits than cide will replay in one go.
+    ///
+    /// Refused up front and never truncated: a truncated rebase is a rewrite that lost
+    /// commits. Merging is always available and always correct here.
+    RebaseTooLong {
+        branch: String,
+        ahead: u32,
+        limit: u32,
+    },
+    /// The branch and its upstream share no commit — git's own *refusing to merge unrelated
+    /// histories*.
+    ///
+    /// Raised before either strategy runs, because both would otherwise fail deep inside
+    /// libgit2 and surface as [`Self::Git`], which prints a class name at a user who pressed
+    /// Pull.
+    UnrelatedHistories {
+        branch: String,
+        upstream: String,
+    },
+    /// A conflict verb was asked about a path that is not conflicted.
+    ///
+    /// Its own variant rather than a bare `NotFound`, because the ordinary cause is a stale
+    /// view: two windows have the panel open, one resolved the path, and the other still
+    /// draws its buttons. The sentence says so, and the fix is a refresh rather than anything
+    /// the user must do.
+    NotConflicted {
+        path: String,
+    },
+    /// A resolved path cannot be put back into conflict: the index no longer holds its
+    /// stages.
+    ///
+    /// Collapsing stages 1/2/3 into stage 0 is what resolving *is*, and git keeps no copy.
+    /// `Unresolve` therefore works only until something else rewrites the index, and saying
+    /// that plainly is better than a button that silently produces an empty conflict.
+    StagesGone {
+        path: String,
     },
     /// The branch has no upstream, so there is nothing to pull from.
     NoUpstream {
@@ -906,10 +1347,14 @@ pub enum GitError {
         oid: String,
         head: String,
     },
-    /// A revert or cherry-pick would conflict. **`paths` is the whole point**: cide has no
-    /// conflict-resolution surface yet, so it refuses rather than leaving the tree half-applied
-    /// with no way to finish — and a refusal that does not name the files is one the user cannot
-    /// act on.
+    /// A revert or cherry-pick would conflict.
+    ///
+    /// **Unreachable since M20 and kept deliberately.** `cide_git::replay` no longer refuses on
+    /// a conflict — it runs the operation for real and reports the paths in
+    /// [`crate::history::ReplayOutcome::conflicts`], because there is now a surface that can
+    /// finish one. The variant stays because ids on this wire are API: a `keymap.json` cannot
+    /// name it, but a frontend `explain` arm and a user's saved bug report both can, and
+    /// removing it would turn an old payload into `[object Object]`.
     ReplayWouldConflict {
         op: crate::history::ReplayOp,
         oid: String,
@@ -1055,6 +1500,34 @@ impl std::fmt::Display for GitError {
                 f,
                 "{branch} is {ahead} ahead and {behind} behind its upstream, so this is not a fast-forward"
             ),
+            Self::PullNeedsStrategy(d) => write!(
+                f,
+                "{} is {} ahead and {} behind its upstream; merge or rebase?",
+                d.branch, d.ahead, d.behind
+            ),
+            Self::RebaseWouldDropMerges { branch, commits } => write!(
+                f,
+                "rebasing {branch} would drop {} merge commit(s)",
+                commits.len()
+            ),
+            Self::RebaseTooLong {
+                branch,
+                ahead,
+                limit,
+            } => write!(
+                f,
+                "{branch} has {ahead} commits to replay, over the {limit} cide rebases in one go"
+            ),
+            Self::UnrelatedHistories { branch, upstream } => {
+                write!(f, "{branch} and {upstream} share no history")
+            }
+            Self::NotConflicted { path } => write!(f, "{path} is not conflicted"),
+            Self::StagesGone { path } => {
+                write!(
+                    f,
+                    "{path} was resolved and its conflicting versions are gone"
+                )
+            }
             Self::NoUpstream { branch } => write!(f, "{branch} has no upstream branch"),
             Self::DetachedHead { head } => write!(f, "HEAD is detached at {head}"),
             Self::NoRemote { name } => write!(f, "no remote named {name}"),

@@ -35,19 +35,25 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
+  branch as branchApi,
   diag,
   events,
+  file as fileApi,
   git as gitApi,
   gitDiff as gitDiffApi,
   type ChangesTree,
+  type ConflictSide,
   type DiffSide,
   type FileDiff,
+  type MergeState,
   type PathSelection,
   type ProjectId,
   type RepoId,
 } from '@/ipc/client'
 import { noteChangeCount } from '@/chrome/gitCountStore'
-import { explain } from '@/chrome/branchModel'
+import { explain, pushReport, type RepoPush } from '@/chrome/branchModel'
+import { notify } from '@/chrome/notices'
+import { showConflicts } from '@/chrome/conflictsStore'
 import { requestFocus } from '@/chrome/focusRequests'
 import {
   amendPending,
@@ -220,6 +226,14 @@ export interface GitPanelModel {
   busy: string | null
   /** Repos whose index moved under us and whose bar has not been answered yet. */
   diverged: RepoId[]
+  /**
+   * The merge or rebase in progress, per repository, or an empty map when none is. (M20)
+   *
+   * Keyed by `RepoId` because a project can hold several repositories and only one of them may
+   * be mid-merge. Read on every refresh rather than mirrored anywhere durable: it is *git's*
+   * state, and a `git merge` typed into a terminal pane changes it under the panel.
+   */
+  merges: Readonly<Record<string, MergeState>>
   message: string
   amend: boolean
   /**
@@ -279,6 +293,26 @@ export interface GitPanelModel {
 
 export interface GitPanelActions {
   refresh: () => void
+  /** Take one side of a conflicted file whole — the row's *Yours* / *Theirs* buttons. */
+  resolveWith: (repo: RepoId, path: string, side: ConflictSide) => void
+  /** Put a resolved file back into conflict. */
+  unresolveFile: (repo: RepoId, path: string) => void
+  /** Open the three-pane resolver for a conflicted file. */
+  openMerge: (repo: RepoId, path: string) => void
+  /** Conclude the merge, or advance the rebase to its next stop. */
+  continueMerge: (repo: RepoId) => void
+  /** `git merge --abort` / `git rebase --abort`. */
+  abortMerge: (repo: RepoId) => void
+  /**
+   * Resolve every conflicted file whose two sides are byte-identical.
+   *
+   * The panel's version of the resolver's *Resolve simple conflicts*, and deliberately narrower
+   * than it: this one only settles whole files where `ours == theirs`, because that is the only
+   * judgement that can be made without reading the file. Anything finer needs the three panes.
+   */
+  resolveSimpleConflicts: (repo: RepoId) => void
+  /** Reopen the *Files merged with conflicts* list for a repository. */
+  showConflictList: (repo: RepoId) => void
   /** Re-read every repo's shelf. Called when the Shelf tab opens, and after it changes. */
   refreshShelf: () => void
   /**
@@ -428,6 +462,37 @@ export interface GitPanelOptions {
   onOpenDiff?: ((diff: FileDiff, repo: RepoId) => void) | undefined
 }
 
+/**
+ * A story's conflicts as a `MergeState`, so the fixture can draw the merge bar.
+ *
+ * `branch.operation` is what says a repository is mid-anything — it is `RepositoryState`'s own
+ * word, the same one `git status` prints — so a story that sets it gets a bar and one that does
+ * not gets none. Resolved rows are the ones the fixture lists under `conflicts` without either
+ * side actually being `conflicted`, which is exactly the state a resolved path is in: stages
+ * collapsed to 0, and only the panel's roster still remembering it was ever a conflict.
+ */
+function storyMerges(story: GitStory | null): Record<string, MergeState> {
+  if (story === null) return {}
+  const out: Record<string, MergeState> = {}
+  for (const repo of story.status.repos) {
+    const operation = repo.branch.operation
+    if (operation === null || operation === undefined) continue
+    out[repo.repo.id] = {
+      operation,
+      ours: repo.branch.head,
+      theirs: repo.branch.upstream ?? 'the other branch',
+      // Absent, not null: `step` is `#[ts(optional)]` and `exactOptionalPropertyTypes` is on,
+      // so *missing* and *present and undefined* are different types. A merge has no steps.
+      entries: repo.conflicts.map((entry) => ({
+        path: entry.path,
+        resolved: entry.index !== 'conflicted' && entry.worktree !== 'conflicted',
+        binary: entry.binary,
+      })),
+    }
+  }
+  return out
+}
+
 export function useGitPanel(
   project: ProjectId | null,
   options: GitPanelOptions = {},
@@ -456,6 +521,16 @@ export function useGitPanel(
   const [loading, setLoading] = useState(false)
   const [unavailable, setUnavailable] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
+  /**
+   * The merge or rebase in progress, per repository. Empty for almost every panel there is.
+   *
+   * Seeded from the story when one is open, which is what lets `check:render` draw the bar at
+   * all — a fixture cannot make a `git_conflicts` call, and the *Merge Conflicts* group went
+   * two milestones without ever being rendered by a check for exactly that kind of reason.
+   * Synthesised rather than carried on `GitStory`, because everything it needs is already in
+   * the story's own `ChangesTree`: which repository is mid-operation, and which paths.
+   */
+  const [merges, setMerges] = useState<Record<string, MergeState>>(() => storyMerges(story))
   const [message, setMessage] = useState('')
   const [amend, setAmendFlag] = useState(false)
   const [amendOf, setAmendOf] = useState<AmendTarget | null>(null)
@@ -730,6 +805,28 @@ export function useGitPanel(
     // exist, so a failure empties the panel.
     if (raw === undefined) adopt(EMPTY, false)
     else adopt(absorb(raw))
+
+    /*
+     * And the merge state, per repository, on the same refresh.
+     *
+     * Asked here rather than kept anywhere durable because it is git's: a `git merge` typed
+     * into a terminal pane, or a resolution made in a second window, changes it under this
+     * panel, and `cide://git-status` — which every conflict verb broadcasts — is what says to
+     * ask again.
+     *
+     * Failures are swallowed. A repository that cannot answer is one where a *status* call has
+     * almost certainly already failed and put its own line in the note bar; a second sentence
+     * about the merge state would be noise about the same broken repository.
+     */
+    const repos = (raw?.repos ?? []).map((r) => r.repo.id)
+    const found: Record<string, MergeState> = {}
+    await Promise.all(
+      repos.map(async (id) => {
+        const state = await branchApi.conflicts(project, id).catch(() => null)
+        if (state !== null) found[id] = state
+      }),
+    )
+    setMerges(found)
   }, [project, story, guarded, adopt, absorb])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
@@ -1051,6 +1148,11 @@ export function useGitPanel(
       void (async () => {
         setBusy(push ? 'Committing and pushing…' : 'Committing…')
         let allOk = true
+        // Collected across the whole gesture and reported **once** at the end. Never one toast
+        // per unit: `notices.admit` dedupes by text, so two units both answering "already up to
+        // date on origin" would collapse into one toast that silently spoke for two. Same
+        // argument, same shape, as `branchModel::pullReport`.
+        const pushes: RepoPush[] = []
         for (const unit of units) {
           /*
            * An unanswered guard bar stops the commit here rather than at the backend.
@@ -1112,11 +1214,44 @@ export function useGitPanel(
             break
           }
           if (push) {
-            const ok = await guarded('git push', () => gitApi.push(project, unit.repo, null, null))
-            if (ok === undefined) {
+            /*
+             * `setUpstream` is the branch's own answer, not a hardcoded `false`. (M20)
+             *
+             * It was `false` here and `head.upstream === null` in the branch popup, so
+             * *Commit and Push* on a brand-new branch failed — *"no upstream"* — where the
+             * popup's Push button on the same branch succeeded. Two gestures that mean
+             * "publish this" cannot disagree about whether they do.
+             */
+            const publish = (repoOf(view, unit.repo)?.branch.upstream ?? null) === null
+            /*
+             * Caught here rather than through `guarded`, so a refused push gets a **toast** as
+             * well as the panel's note line.
+             *
+             * The note bar is the right surface for a refusal about the *commit* — it sits
+             * beside the message box the user is still holding, and it stays put while they fix
+             * it. A push is not that. It is a network round trip about work they are trying to
+             * publish, its commonest refusal is *somebody else pushed first*, and it happens
+             * seconds after a commit that succeeded — so the panel is very likely not the thing
+             * being looked at. Reporting it in one dim line meant *Commit and Push* said nothing
+             * while the palette's Push, on the same rejection, put a red box on screen: two
+             * routes to one gesture disagreeing about whether it worked.
+             */
+            let ok: Awaited<ReturnType<typeof gitApi.push>> | undefined
+            try {
+              ok = await gitApi.push(project, unit.repo, null, null, publish)
+              note('git push', null)
+            } catch (error) {
+              const detail = explain(error)
+              note('git push', `git push unavailable — ${detail}`)
+              notify(detail, {
+                kind: 'error',
+                hint: 'The commit landed; only the push was refused.',
+              })
+              void diag.log(`git panel: git push failed: ${detail}`)
               allOk = false
               break
             }
+            pushes.push({ name: repoOf(view, unit.repo)?.name ?? unit.repo, outcome: ok })
           }
           overwritten.current.delete(unit.repo)
         }
@@ -1131,6 +1266,19 @@ export function useGitPanel(
           // that is already gone, and `require_amend_head` would refuse it with a sentence
           // about a commit the user has forgotten asking about.
           setAmendOf(null)
+        }
+        /*
+         * The successes, which had no surface at all until now.
+         *
+         * `guarded` keeps the *refusals*, and that split is deliberate: the panel's one-line
+         * note bar is the right place for "this did not happen and here is why" — it stays put
+         * while the user fixes it — and its `undefined` return is what breaks the loop. A
+         * success is the opposite kind of thing: transient, and about a remote the panel does
+         * not otherwise draw.
+         */
+        if (pushes.length > 0) {
+          const report = pushReport(pushes)
+          notify(report.text, { kind: 'info', detail: report.detail })
         }
         await refresh()
       })()
@@ -1861,9 +2009,40 @@ export function useGitPanel(
    * lands on is deliberately not done here, because a tab is workspace state that a second
    * window can also be looking at. See `cmd::file::tab_retarget_diff`.
    */
+  /**
+   * Open the three-pane resolver for a conflicted path.
+   *
+   * Declared above [`showDiff`] because that function routes to it, which is the whole point:
+   * every gesture that opens a row — double-click, Enter, the toolbar's ◫ — goes through
+   * `showDiff`, and a conflicted row must not reach a diff pane.
+   */
+  const openMerge = useCallback(
+    (repo: RepoId, path: string) => {
+      if (project === null) return
+      void fileApi.openMergeTab(project, repo, path).catch(() => {})
+    },
+    [project],
+  )
+
   const showDiff = useCallback(
     (repo: RepoId, entry: ChangeEntry, mode: DiffOpenMode = 'open') => {
       if (project === null) return
+      /*
+       * A conflicted row opens the **resolver**, never a diff.
+       *
+       * This was the first thing anyone hit. A diff pane asks `git_diff_file` for one side of
+       * `HEAD → index → working tree`, and a conflicted path has **no stage-0 entry in the
+       * index at all** — it has stages 1, 2 and 3 — so libgit2 diffs against nothing and the
+       * pane draws its empty state: *"No text changes on this side."* Which is true, and reads
+       * exactly like a bug, over a file that is the single most changed thing in the tree.
+       *
+       * Routed here rather than at each call site because there are three of them and they are
+       * three different gestures; the rule is about the *row*, not about which key opened it.
+       */
+      if (entry.index === 'conflicted' || entry.worktree === 'conflicted') {
+        openMerge(repo, entry.path)
+        return
+      }
       // `combined` is HEAD→working tree, which is what a changelist row *is*, and the side a
       // commit selects from. In staging-area mode the index is the truth, so the staged side
       // is the honest one. Either way the pane can switch, and switching clears the selection
@@ -1898,7 +2077,7 @@ export function useGitPanel(
         )
       })()
     },
-    [project, guarded, note, stagingArea, onOpenDiff],
+    [project, guarded, note, stagingArea, onOpenDiff, openMerge],
   )
 
   /**
@@ -1937,6 +2116,7 @@ export function useGitPanel(
     unavailable,
     busy,
     diverged,
+    merges,
     message,
     amend,
     /** Non-null exactly when Commit would reword — see the `useMemo` that computes it. */
@@ -1950,6 +2130,92 @@ export function useGitPanel(
     refresh: () => {
       void refresh()
       void loadShelf()
+    },
+    /*
+     * The five conflict verbs.
+     *
+     * Every one goes through `guarded`, so a refusal lands in the panel's one-line note rather
+     * than as a toast — `NotConflicted` in particular, whose ordinary cause is a second window
+     * having resolved the row a moment ago, and which wants a line the user can read next to
+     * the row rather than a red box in the corner.
+     *
+     * Each refreshes afterwards rather than trusting the `MergeState` the command hands back.
+     * The command's answer is about *that repository*; a refresh redraws the changes tree too,
+     * and a resolved file moves out of the Merge Conflicts group and into a changelist, which
+     * is the visible half of what just happened.
+     */
+    resolveWith: (repo, path, side) => {
+      if (project === null) return
+      void guarded('resolve', () => branchApi.conflictTake(project, repo, path, side)).then(
+        () => void refresh(),
+      )
+    },
+    unresolveFile: (repo, path) => {
+      if (project === null) return
+      void guarded('unresolve', () => branchApi.conflictUnresolve(project, repo, path)).then(
+        () => void refresh(),
+      )
+    },
+    openMerge,
+    continueMerge: (repo) => {
+      if (project === null) return
+      void guarded('continue', () => branchApi.mergeContinue(project, repo)).then(
+        () => void refresh(),
+      )
+    },
+    abortMerge: (repo) => {
+      if (project === null) return
+      void guarded('abort', () => branchApi.mergeAbort(project, repo)).then(() => void refresh())
+    },
+    showConflictList: (repo) => {
+      if (project === null) return
+      const state = merges[repo]
+      if (state === undefined) return
+      const name = view.repos.length > 1 ? (repoOf(view, repo)?.name ?? '') : ''
+      showConflicts({ project, repo, repoName: name, state })
+    },
+    resolveSimpleConflicts: (repo) => {
+      if (project === null) return
+      const state = merges[repo]
+      if (state === undefined) return
+      void (async () => {
+        let settled = 0
+        let looked = 0
+        for (const entry of state.entries) {
+          if (entry.resolved || entry.binary) continue
+          looked += 1
+          // Read all three sides and settle only the files where the two are byte-identical.
+          // A file cide cannot read as text is skipped rather than guessed at.
+          const file = await branchApi.conflictRead(project, repo, entry.path).catch(() => null)
+          if (file === null || file.ours === undefined || file.theirs === undefined) continue
+          if (file.ours !== file.theirs) continue
+          await branchApi.conflictTake(project, repo, entry.path, 'ours').catch(() => {})
+          settled += 1
+        }
+        /*
+         * It always says what it did, **including when it did nothing**.
+         *
+         * A pass that settles nothing is the ordinary outcome — git only marks a region when the
+         * two sides genuinely differ, so a file whose sides are byte-identical is the rare case
+         * — and a button that runs, changes nothing and reports nothing is indistinguishable
+         * from a dead one. That is the complaint this panel keeps answering; it must not be the
+         * thing this button produces.
+         */
+        if (settled > 0) {
+          notify(`Resolved ${settled} of ${looked} conflicted file${looked === 1 ? '' : 's'}`, {
+            kind: 'info',
+          })
+        } else {
+          notify('Nothing could be resolved automatically', {
+            kind: 'info',
+            hint:
+              looked === 0
+                ? 'Every conflicted file has already been answered.'
+                : 'These files differ on both sides, so each one needs a decision — open one to choose.',
+          })
+        }
+        void refresh()
+      })()
     },
     refreshShelf,
     toggleCheck,

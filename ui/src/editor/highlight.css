@@ -1,0 +1,58 @@
+/*
+ * The colours behind `highlight.ts`'s token classes. (M20)
+ *
+ * # Why these are not in `EditorSurface.module.css` any more
+ *
+ * They were, scoped under that file's `.body`, which is the editor's own hashed class — so they
+ * painted inside an `EditorSurface` and nowhere else. That was invisible while the editor was
+ * the only surface using `cideHighlightStyle`; the moment the three-pane merge resolver used it
+ * too, that pane got a highlighter, got tokens, got the class names on its spans, and got no
+ * colour at all. Plain text, with nothing in the build failing.
+ *
+ * A plain `.css` file rather than a module, because these names are not ours to hash: CodeMirror
+ * writes the literal string `cide-tk-keyword` onto its spans, so the selector has to be that
+ * string. And it is imported by **`highlight.ts` itself**, not by each surface — the failure mode
+ * this file exists to prevent is *using the highlighter and getting no colours*, and binding the
+ * stylesheet to the highlighter makes that combination unreachable.
+ *
+ * They carry `var()` rather than a literal, which is the entire reason `HighlightStyle` is built
+ * with `class:` instead of `color:` — a generated class would bake today's palette into a
+ * stylesheet at construction time and still be purple after the user switched to the light theme.
+ */
+.cide-tk-keyword {
+  color: var(--purple);
+}
+.cide-tk-type {
+  color: var(--cyan);
+}
+.cide-tk-function {
+  color: var(--blue);
+}
+.cide-tk-string,
+.cide-tk-attribute {
+  color: var(--yellow);
+}
+.cide-tk-comment {
+  color: var(--faint);
+  font-style: italic;
+}
+.cide-tk-control {
+  color: var(--red);
+}
+.cide-tk-number {
+  color: var(--green);
+}
+.cide-tk-property {
+  color: var(--text);
+}
+.cide-tk-operator {
+  color: var(--dim);
+}
+.cide-tk-heading {
+  color: var(--accent);
+  font-weight: 600;
+}
+.cide-tk-emphasis {
+  color: var(--dim);
+  font-style: italic;
+}

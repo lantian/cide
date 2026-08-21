@@ -61,6 +61,7 @@ import {
   checkoutNote,
   explain,
   fetchNote,
+  pushNote,
   headLabel,
   headTitle,
   kindOf,
@@ -77,6 +78,8 @@ import {
   type GitOp,
   type Refusal,
 } from './branchModel'
+import { divergenceOf, strategyAsk } from './pullStrategyModel'
+import { requestPullStrategy } from './pullStrategyStore'
 import styles from './BranchSelector.module.css'
 
 // --- the store --------------------------------------------------------------------------
@@ -398,10 +401,57 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
   }
 
   /*
+   * Pull, which — like `tryCheckout` below — has one rejection that is **not a sentence**.
+   *
+   * A divergence with nothing configured is a question, and routing it through `store.run`
+   * would print *"main is 2 ahead and 5 behind…"* into the note bar: a true sentence, offering
+   * no way to act on it, from the one control in the app that could have offered one. So it is
+   * unpacked here and handed to the same dialog Ctrl+T raises, and everything else falls back
+   * to `explain` exactly as before. Same shape, same reason, as `tryCheckout`'s stash panel.
+   *
+   * The gate is mounted at `App.tsx` level and `OverlayCard` draws its own scrim above this
+   * popup's, so the dialog is legible from here without the popup having to close.
+   */
+  const tryPull = async () => {
+    if (project === null || repo === null || busy) return
+    const p = project
+    const r = repo
+    const one = (request: Parameters<typeof branchApi.pull>[2]) =>
+      useBranches.getState().run(async () => fetchNote(await branchApi.pull(p, r, request)), 'pull')
+
+    search.current?.focus()
+    try {
+      await branchApi
+        .pull(p, r, { skipFetch: false, remember: false })
+        .then((outcome) => useBranches.getState().say(fetchNote(outcome)))
+    } catch (error) {
+      const diverged = divergenceOf(error)
+      if (diverged === null) {
+        useBranches.getState().say(explain(error, 'pull'))
+        return
+      }
+      const name = list?.repo.name ?? 'this repository'
+      const asked = [{ name, repo: String(r), diverged }]
+      const ask = strategyAsk(asked)
+      if (ask === null) return
+      requestPullStrategy({
+        ask,
+        repos: asked,
+        // `skipFetch`, for the reason `keys/dispatch.ts` gives at length: the counts the user
+        // has just read describe refs that are already on disk.
+        proceed: (strategy, remember) => void one({ strategy, skipFetch: true, remember }),
+      })
+    } finally {
+      void useBranches.getState().load(p, true)
+    }
+  }
+
+  /*
    * The refusal cannot travel through `store.run`, which turns every rejection into a
    * sentence. This one is not a sentence — it is a list of files plus a choice — so the
    * checkout is called directly here and only the *other* failures fall back to `explain`.
    */
+
   const tryCheckout = (name: string, how: CheckoutMode = 'refuse') => {
     if (project === null || repo === null || busy) return
     setOpenRow(null)
@@ -562,8 +612,8 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   className={styles.action}
                   // Without an upstream this only ever fails, so it is not offered.
                   disabled={busy || !canPull(list?.head ?? null)}
-                  onClick={() => act(async (p, r) => fetchNote(await branchApi.pull(p, r)), 'pull')}
-                  title="Fetch and fast-forward. cide never merges for you."
+                  onClick={() => void tryPull()}
+                  title="Fetch, then integrate — fast-forward, merge or rebase."
                 >
                   Pull
                 </button>
@@ -574,11 +624,11 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
                   onClick={() =>
                     act(async (p, r) => {
                       // A branch with no upstream needs one, and this is the gesture that
-                      // means "publish this branch" — the same thing `git push -u` does.
+                      // means "publish this branch" — the same thing `git push -u` does. It is
+                      // still the only caller that passes it, which is why it is also the only
+                      // one that can reach `pushNote`'s *Published …* arm.
                       const publish = (list?.head.upstream ?? null) === null
-                      const out = await gitApi.push(p, r, null, null, publish)
-                      const said = out.output.trim()
-                      return said === '' ? `Pushed to ${out.remote}` : said
+                      return pushNote(await gitApi.push(p, r, null, null, publish))
                     })
                   }
                 >

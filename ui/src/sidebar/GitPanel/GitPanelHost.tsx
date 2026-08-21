@@ -67,9 +67,17 @@ export interface GitPanelProps {
    * panel pretend otherwise, and the item is drawn disabled with the reason on it.
    */
   onShowHistory?: ((path: string) => void) | undefined
+  /**
+   * *Update project* — the toolbar button that was disabled with *"needs a pull command"* from
+   * the day it was written until M20. `git_pull` had existed since M10; nothing ever passed it.
+   *
+   * Routed by the host through `runCommand('git.pull', …)`, the same way `onShowHistory` is,
+   * and for the same reason: one handler, one copy of the preconditions, several surfaces.
+   */
+  onUpdate?: (() => void) | undefined
 }
 
-export function GitPanel({ project, onOpenDiff, onShowHistory }: GitPanelProps) {
+export function GitPanel({ project, onOpenDiff, onShowHistory, onUpdate }: GitPanelProps) {
   const git = useGitPanel(project, { onOpenDiff })
   const iconTheme = useIconTheme()
 
@@ -124,7 +132,54 @@ export function GitPanel({ project, onOpenDiff, onShowHistory }: GitPanelProps) 
       /** This repository's work tree, for the one item below that needs an absolute path. */
       const root = repoRoot(row.repo)
 
+      /*
+       * The resolution verbs, first, and only on a conflicted row. (M20)
+       *
+       * First because a conflicted row has exactly one useful next action and every item below
+       * it is refused — *Resolve the conflict before staging this file*, *Resolve the conflict
+       * first — conflicts are listed apart from changelists*. A menu whose first four entries
+       * are all disabled is a menu that reads as broken.
+       *
+       * **The two side labels come from the file, not from the words "yours" and "theirs".**
+       * During a rebase git swaps stage 2 and stage 3 — `HEAD` is the branch being rebased
+       * *onto* and your commit is the incoming side — so a menu that said *Accept Yours* over
+       * stage 2 would hand the user the other branch's work under their own name.
+       * `cide_git::conflict::side_labels` decides the wording; this only draws it.
+       */
+      const merge = git.merges[row.repo]
+      const conflictEntry = merge?.entries.find((e) => e.path === path)
+      const conflictItems: MenuEntry[] =
+        conflictEntry === undefined
+          ? []
+          : conflictEntry.resolved
+            ? [
+                {
+                  id: 'unresolve',
+                  label: 'Un-resolve',
+                  run: () => git.unresolveFile(row.repo, path),
+                },
+              ]
+            : [
+                {
+                  id: 'merge-open',
+                  label: 'Resolve…',
+                  run: () => git.openMerge(row.repo, path),
+                },
+                {
+                  id: 'take-ours',
+                  label: `Accept ${merge?.ours ?? 'Yours'}`,
+                  run: () => git.resolveWith(row.repo, path, 'ours'),
+                },
+                {
+                  id: 'take-theirs',
+                  label: `Accept ${merge?.theirs ?? 'Theirs'}`,
+                  run: () => git.resolveWith(row.repo, path, 'theirs'),
+                },
+                { kind: 'separator' },
+              ]
+
       const entries: MenuEntry[] = [
+        ...conflictItems,
         {
           id: 'stage',
           label: 'Stage',
@@ -244,6 +299,7 @@ export function GitPanel({ project, onOpenDiff, onShowHistory }: GitPanelProps) 
       git={git}
       iconTheme={iconTheme}
       treeMenu={{ onContextMenu, menu }}
+      {...(onUpdate !== undefined ? { onUpdate } : {})}
     />
   )
 }

@@ -71,4 +71,12 @@ from: Array<string>,
  * gives: a derived title changes the day the derivation is improved and relabels every
  * saved tab.
  */
-title: string, } | { "kind": "settings", section: SettingsSection, };
+title: string, } | { "kind": "merge", repo: RepoId, 
+/**
+ * Repo-relative and slash-separated, the way `cide_ipc::git` spells every path.
+ */
+path: string, 
+/**
+ * Unsaved edits in the centre pane. Same flag, same guard, as [`Self::File`]'s.
+ */
+dirty: boolean, } | { "kind": "settings", section: SettingsSection, };

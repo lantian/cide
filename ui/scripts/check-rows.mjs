@@ -416,6 +416,9 @@ try {
     ['src/panes/DiffPane.module.css', '.header'],
     ['src/panes/GitDiffPane.module.css', '.header'],
     ['src/panes/EditorPane.module.css', '.conflict'],
+    // The merge resolver's toolbar. (M20) Its `Apply` button sat directly under the pane's
+    // close button — drawn, and closing the pane when pressed.
+    ['src/panes/MergePane.module.css', '.bar'],
   ]) {
     // The selector is matched literally rather than built into a character-escaped pattern:
     // the `"\\" + selector` trick these were originally written with escapes only the leading

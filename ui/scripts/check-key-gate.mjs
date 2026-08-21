@@ -58,11 +58,19 @@ function rustDefaults() {
    * and "the regex did not match it" is the quietest way for a gate to fail. `check-commands.mjs`
    * had already been taught the same lesson and carries the same pair of patterns.
    */
-  const two = [...body.matchAll(/\("([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({
+  /*
+   * `\s*` before the opening quote as well as after the commas, and that is not belt-and-braces
+   * either. `rustfmt` breaks a tuple across four lines the moment it passes 100 columns, and it
+   * did exactly that to `("ctrl+alt+equal", "editor.unfoldRecursively", "editorFocused")` in
+   * M19 — at which point a one-line pattern stopped seeing a shipped binding, which is the same
+   * silent hole the paragraph above describes arriving by a different route. Caught by the
+   * mirror assertion in the other direction, which is the half that exists for this.
+   */
+  const two = [...body.matchAll(/\(\s*"([^"]+)",\s*"([^"]+)",?\s*\)/g)].map((m) => ({
     key: m[1],
     command: m[2],
   }))
-  const three = [...body.matchAll(/\("([^"]+)",\s*"([^"]+)",\s*"([^"]+)"\)/g)].map((m) => ({
+  const three = [...body.matchAll(/\(\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)",?\s*\)/g)].map((m) => ({
     key: m[1],
     command: m[2],
     when: m[3],
@@ -276,6 +284,27 @@ try {
     // and the day one did it must not resolve here.
     { key: 'mouseback', command: 'navigate.back', when: null },
     { key: 'mouseforward', command: 'navigate.forward', when: null },
+    /*
+     * M19. Code folding — IDEA's chords, and the first commands in this table to stand on two
+     * of them each.
+     *
+     * `minus`, `equal` and `plus` are the *code*-derived names (`CODE_NAMES` in `chords.ts`), so
+     * one `ctrl+minus` covers the main row's `-` and the keypad's `−`, while `=` and `+` are two
+     * different physical keys and therefore two lines. `Minus` and `Equal` are in the sweep
+     * corpus below, which is what holds all three entry points to agreeing about them — and to
+     * leaving them alone in every context that is not a focused editor, because xterm encodes
+     * 0x1f for a plain `Ctrl+-` and an unscoped binding would take that from every shell.
+     */
+    { key: 'ctrl+minus', command: 'editor.fold', when: 'editorFocused' },
+    { key: 'ctrl+equal', command: 'editor.unfold', when: 'editorFocused' },
+    { key: 'ctrl+plus', command: 'editor.unfold', when: 'editorFocused' },
+    { key: 'ctrl+shift+minus', command: 'editor.foldAll', when: 'editorFocused' },
+    { key: 'ctrl+shift+equal', command: 'editor.unfoldAll', when: 'editorFocused' },
+    { key: 'ctrl+shift+plus', command: 'editor.unfoldAll', when: 'editorFocused' },
+    { key: 'ctrl+alt+minus', command: 'editor.foldRecursively', when: 'editorFocused' },
+    { key: 'ctrl+alt+equal', command: 'editor.unfoldRecursively', when: 'editorFocused' },
+    { key: 'ctrl+alt+plus', command: 'editor.unfoldRecursively', when: 'editorFocused' },
+    { key: 'ctrl+period', command: 'editor.toggleFold', when: 'editorFocused' },
   ]
 
   /* The fixture is a mirror, so check it against the thing it mirrors before trusting it. */
@@ -391,6 +420,26 @@ try {
     { code: 'ArrowLeft', key: 'ArrowLeft' },
     { code: 'ArrowRight', key: 'ArrowRight' },
     { code: 'Comma', key: ',' },
+    /*
+     * M19. The folding keys, and the reason the gate reads `code` written out one more time.
+     *
+     * Shift on `Minus` produces `_` and shift on `Equal` produces `+`, so a resolver that read
+     * `key` would spell `ctrl+shift+minus` as `ctrl+shift+_` and never match — while
+     * `ctrl+shift+equal`, which is what a US keyboard reports for the chord IDEA draws as
+     * `Ctrl+Shift++`, would resolve to a key named `plus` that a *different* physical key also
+     * produces. Both are swept in all sixteen combinations, in a focused editor and in a
+     * terminal, because a plain `Ctrl+-` is 0x1f to a pty and the claim worth measuring is that
+     * these are taken *only* where the `editorFocused` clause is true.
+     */
+    { code: 'Minus', key: '-' },
+    { code: 'Equal', key: '=' },
+    // The keypad's `+` and `-`, which fold onto the same two names — so IDEA's chords work on a
+    // full keyboard, and one `ctrl+minus` in `defaults()` is genuinely covering two keys.
+    { code: 'NumpadSubtract', key: '-' },
+    { code: 'NumpadAdd', key: '+' },
+    // `ctrl+period` is Toggle fold; its neighbour `Comma` above is Settings, so the pair is
+    // swept together the way F3/F4 are.
+    { code: 'Period', key: '.' },
     // Shift on this key produces `~`, which is exactly why the gate reads `code`.
     { code: 'Backquote', key: '`' },
     { code: 'Enter', key: 'Enter' },

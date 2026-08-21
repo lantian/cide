@@ -195,6 +195,7 @@ pub fn migrate(value: Value) -> Result<Workspace> {
         1 => migrate(v1_to_v2(value)),
         2 => migrate(v2_to_v3(value)),
         3 => migrate(v3_to_v4(value)),
+        4 => migrate(v4_to_v5(value)),
         v if v > CURRENT => Err(CoreError::Serde(format!(
             "workspace schema {v} is newer than this build's {CURRENT}; refusing to downgrade it"
         ))),
@@ -202,6 +203,43 @@ pub fn migrate(value: Value) -> Result<Workspace> {
             "workspace schema {v} is no longer supported"
         ))),
     }
+}
+
+/// Schema 4 → 5: forget `settings.git.autoApplyNonConflicting`.
+///
+/// # This is the opposite of what [`v1_to_v2`] does, on purpose
+///
+/// That function *writes* a default down, so that a later change to the default reaches new
+/// installs and nobody else — because the value it preserves is one a user might have relied on.
+/// This one *deletes* a stored value so the new default reaches everybody, and the difference is
+/// whether the stored value was ever a decision.
+///
+/// It was not. `auto_apply_non_conflicting` was added during M20 with a default of `true`, on the
+/// argument that git had already merged the non-conflicting hunks and re-showing them would be
+/// noise. The three-pane resolver was then rebuilt to compute the merge itself, at which point
+/// the whole point of it became that the centre pane opens as the **base** and every change is
+/// something you take — and a default that applied two thirds of them before the user had looked
+/// undid exactly that. The default became `false`.
+///
+/// A changed default does not reach a value that is already stored. Anyone who ran an
+/// intermediate build has `true` on disk, was never asked, and gets a resolver that silently
+/// applies most of its own blocks — which is precisely the behaviour that was reported. No
+/// released build ever offered the setting, so there is no deliberate `true` anywhere to destroy.
+///
+/// Deleting rather than overwriting with `false`: the key's absence is what makes
+/// `#[serde(default)]` answer, so this stays correct if the default ever moves again.
+fn v4_to_v5(mut value: Value) -> Value {
+    if let Some(root) = value.as_object_mut() {
+        root.insert("schemaVersion".into(), Value::from(5u32));
+        // Anything that is not an object is left exactly as found and allowed to fail in
+        // `from_value`, with serde's own message — `v1_to_v2`'s rule, for its reason.
+        if let Some(settings) = root.get_mut("settings").and_then(Value::as_object_mut)
+            && let Some(git) = settings.get_mut("git").and_then(Value::as_object_mut)
+        {
+            git.remove("autoApplyNonConflicting");
+        }
+    }
+    value
 }
 
 /// Schema 1 → 2: write down which children the proxy settings reached.
@@ -555,6 +593,15 @@ pub fn forget_recent(list: &mut Vec<RecentProject>, path: &Path) -> bool {
 /// at line 1, which is the complaint this exists to answer.
 pub const MAX_POSITIONS: usize = 256;
 
+/// How many collapsed blocks one file may remember.
+///
+/// A ceiling on a *list inside* a record, which [`MAX_POSITIONS`] is not: that one bounds how
+/// many files are remembered, and without this a single generated file with ten thousand
+/// foldable blocks — all of them collapsed by one Ctrl+Shift+Minus — would be one entry of
+/// forty kilobytes. 256 is past any file a person collapses by hand and is the same number for
+/// the same reason.
+pub const MAX_FOLDS: usize = 256;
+
 /// Where the view positions live: `$XDG_STATE_HOME/cide/positions.json`.
 ///
 /// Beside `recent.json` and `workspace.json`, on the same argument [`state_dir`] makes — the
@@ -613,6 +660,7 @@ pub fn save_positions(path: &Path, list: &[ViewPosition]) -> Result<()> {
 /// — see `ui/src/editor/navHistory.ts`, which deliberately does not share this store.
 pub fn remember_position(list: &mut Vec<ViewPosition>, mut at: ViewPosition, touched_at: u64) {
     at.touched_at = touched_at;
+    normalise_folds(&mut at.folds);
     list.retain(|entry| entry.path != at.path);
     list.push(at);
     if list.len() > MAX_POSITIONS {
@@ -622,6 +670,24 @@ pub fn remember_position(list: &mut Vec<ViewPosition>, mut at: ViewPosition, tou
         sort_positions(list);
         list.truncate(MAX_POSITIONS);
     }
+}
+
+/// Sorted, deduplicated, positive, and no longer than [`MAX_FOLDS`]. (M19)
+///
+/// Every one of those is enforced *here* rather than trusted from the caller, because the caller
+/// is a webview: a bug in a `ViewPlugin` that appended instead of replacing would otherwise grow
+/// one entry of `positions.json` without bound, and this file is read on every launch. It is the
+/// same reasoning that makes `touched_at` a value Rust stamps rather than one the frontend sends.
+///
+/// Sorting is not only hygiene — `ui/src/editor/position.ts::sameView` compares the lists
+/// element-wise to decide whether a change is worth an IPC call, so an unsorted list read back
+/// from disk would look different from the identical one the editor is holding and note itself
+/// again on every mount.
+fn normalise_folds(folds: &mut Vec<u32>) {
+    folds.retain(|line| *line > 0);
+    folds.sort_unstable();
+    folds.dedup();
+    folds.truncate(MAX_FOLDS);
 }
 
 /// The remembered place for `path`, or `None`.
@@ -1332,10 +1398,10 @@ mod tests {
 
         let ws = load(&path);
 
-        assert_eq!(Workspace::CURRENT_SCHEMA, 4);
+        assert_eq!(Workspace::CURRENT_SCHEMA, 5);
         assert_eq!(
-            ws.schema_version, 4,
-            "the ladder ran every rung — 1 → 2 → 3 → 4 — and stopped at current"
+            ws.schema_version, 5,
+            "the ladder ran every rung — 1 → 2 → 3 → 4 → 5 — and stopped at current"
         );
         assert_eq!(
             dir.entries(),
@@ -1756,9 +1822,21 @@ mod tests {
             "a snake_case key means `rename_all` is missing"
         );
         assert!(
-            raw.contains(r#""schemaVersion": 4"#),
-            "adding a `#[serde(default)]` field must not move CURRENT_SCHEMA; got:\n{raw}"
+            raw.contains(&format!(
+                r#""schemaVersion": {}"#,
+                Workspace::CURRENT_SCHEMA
+            )),
+            "the saved document carries the current schema; got:\n{raw}"
         );
+        /*
+         * Named through the constant rather than as a literal, which is a change of intent worth
+         * recording. The literal was making a second claim — *and adding a `#[serde(default)]`
+         * field must not move it* — that this test is not in a position to check: the number
+         * moves for reasons that have nothing to do with this panel, and when it did (M20's
+         * `v4_to_v5`) the failure landed here, on a test about the tool window, naming a rule
+         * nobody had broken. The rule itself is real and is enforced where it belongs, by
+         * `a_current_schema_document_migrates_to_itself` and by the ladder's own arms.
+         */
 
         let back = load(&path);
         assert_eq!(back, workspace, "every field of the panel comes back");
@@ -2164,6 +2242,57 @@ mod tests {
         assert!(migrate(pre_1).is_err());
     }
 
+    /// The stale `autoApplyNonConflicting` is dropped, so the current default answers. (M20)
+    ///
+    /// The value was written by intermediate M20 builds whose default was `true`, was never a
+    /// decision anybody made, and produced the reported bug: a merge resolver that silently
+    /// applied most of its own blocks before the user had looked at them.
+    #[test]
+    fn the_stale_auto_apply_setting_is_forgotten() {
+        // Built from a real `Workspace` and then downgraded, rather than hand-written: the
+        // struct has required fields this test has no opinion about, and a literal would have to
+        // be edited every time one of them is added.
+        let mut stale = serde_json::to_value(Workspace::default()).expect("serialise");
+        let root = stale.as_object_mut().expect("an object");
+        root.insert("schemaVersion".into(), serde_json::json!(4));
+        root.insert(
+            "settings".into(),
+            serde_json::json!({ "git": { "pullStrategy": "ask", "autoApplyNonConflicting": true } }),
+        );
+        let ws = migrate(stale).expect("a schema-4 document migrates");
+
+        assert_eq!(ws.schema_version, Workspace::CURRENT_SCHEMA);
+        assert!(
+            !ws.settings.git.auto_apply_non_conflicting,
+            "the stored `true` is gone and the current default answers"
+        );
+        assert_eq!(
+            ws.settings.git.pull_strategy,
+            cide_ipc::git::PullDefault::Ask,
+            "and the sibling key it was stored beside is untouched"
+        );
+    }
+
+    /// A `settings.git` that is not an object is left alone to fail with serde's own message.
+    ///
+    /// `v1_to_v2`'s rule, for its reason: overwriting it would turn *your settings block is
+    /// corrupt* into *your configuration silently became the default*, which is the wrong of the
+    /// two answers to give somebody who hand-edited the file.
+    #[test]
+    fn a_corrupt_git_settings_block_is_not_quietly_repaired() {
+        let mut broken = serde_json::to_value(Workspace::default()).expect("serialise");
+        let root = broken.as_object_mut().expect("an object");
+        root.insert("schemaVersion".into(), serde_json::json!(4));
+        root.insert(
+            "settings".into(),
+            serde_json::json!({ "git": "not an object" }),
+        );
+        assert!(
+            migrate(broken).is_err(),
+            "it fails rather than being rewritten"
+        );
+    }
+
     #[test]
     fn a_current_schema_document_migrates_to_itself() {
         let workspace = fixture();
@@ -2521,6 +2650,7 @@ mod tests {
             top_line: line.saturating_sub(5).max(1),
             line,
             column: 1,
+            folds: Vec::new(),
             touched_at: 0,
         }
     }

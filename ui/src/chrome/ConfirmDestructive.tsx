@@ -171,6 +171,20 @@ export interface ConfirmState {
    * radio in it is a control that cannot be operated, and every caller that predates the log's
    * reset would have had to grow one to keep drawing the same dialog it already drew.
    */
+  /**
+   * Split each entry of `files` into a basename and a directory. Default true.
+   *
+   * `false` for a list whose entries are **not paths**. The pull dialog lists commits — a short
+   * oid, a summary and an author — and `basename`/`dirname` on *"a1b2c3d  fix ui/src/foo — Ivan"*
+   * produces a name of `"foo — Ivan"` sitting under a directory of `"a1b2c3d  fix ui/src"`:
+   * backwards, and mangled by a slash that was never a path separator.
+   *
+   * The same kind of override `mark` is, and for the same reason — the caller is the only thing
+   * that knows what kind of list this is. The alternatives both lost: sanitising the summary
+   * lies about the commit, and moving the commits into `body` drops rule 1, which is the rule
+   * this dialog exists for.
+   */
+  split?: boolean
   choices?: readonly ConfirmChoice[]
   /**
    * Which choice is selected, by `id`. An id no choice carries — including the `null` the
@@ -311,8 +325,9 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
             // same arithmetic: this file no longer lives in that panel, and a chrome component
             // reaching back into a feature folder for a two-line helper is the import that
             // makes a shared component un-shareable again.
-            const name = basename(path)
-            const dir = dirname(path)
+            const split = state.split !== false
+            const name = split ? basename(path) : path
+            const dir = split ? dirname(path) : ''
             return (
               <li key={path} className={styles.row} title={path}>
                 {/* `−` rather than the tab strip's `●`: what is about to happen to these rows
@@ -323,7 +338,7 @@ export function ConfirmDestructive({ state, onCancel, onConfirm }: ConfirmDestru
                   {state.mark ?? '−'}
                 </span>
                 <span className={styles.name}>{name}</span>
-                <span className={styles.where}>{dir}</span>
+                {dir !== '' && <span className={styles.where}>{dir}</span>}
               </li>
             )
           })}

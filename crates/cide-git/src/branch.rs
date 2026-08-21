@@ -52,7 +52,7 @@ use std::process::Command;
 use cide_core::proxy::ProxyEnv;
 use cide_ipc::git::{
     BranchInfo, BranchList, BranchRef, CheckoutMode, CheckoutOutcome, FetchOutcome, GitError,
-    PulledCommit, RepoInfo,
+    RepoInfo,
 };
 use cide_ipc::history::DetachOutcome;
 use git2::{BranchType, Commit, Oid, Repository, Status, StatusOptions, Tree};
@@ -154,7 +154,7 @@ pub fn checkout_blockers(root: &Path, revision: &str) -> Result<Vec<String>> {
     blockers(&repo, &target)
 }
 
-fn blockers(repo: &Repository, target: &Commit<'_>) -> Result<Vec<String>> {
+pub(crate) fn blockers(repo: &Repository, target: &Commit<'_>) -> Result<Vec<String>> {
     let target_tree = target.tree().wrap()?;
     blockers_against_tree(repo, &target_tree)
 }
@@ -683,7 +683,7 @@ pub fn fetch(root: &Path, remote: Option<&str>, proxy: &ProxyEnv) -> Result<Fetc
     fetch_with(&repo, root, &name, proxy)
 }
 
-fn fetch_with(
+pub(crate) fn fetch_with(
     repo: &Repository,
     root: &Path,
     remote: &str,
@@ -776,177 +776,13 @@ fn fetch_with(
     }
 }
 
-/// Fetch, then fast-forward the current branch onto its upstream.
+/// Fetch, then integrate — re-exported from [`crate::pull`], which owns it now.
 ///
-/// **Fast-forward only.** cide has no conflict-resolution surface — the diff panes are
-/// read-only against HEAD — so a pull that has to merge would drop the user into a conflicted
-/// working tree with nothing in the app able to finish it. A divergence is reported as
-/// [`GitError::NotFastForward`] with both counts, which is the information needed to choose
-/// between merge and rebase in a terminal that is one keystroke away.
-pub fn pull(root: &Path, remote: Option<&str>, proxy: &ProxyEnv) -> Result<FetchOutcome> {
-    let outcome = fetch(root, remote, proxy)?;
-
-    // Reopened after the fetch on purpose: the fetch wrote refs, and this crate's rule is
-    // that no `Repository` handle outlives the operation that opened it.
-    let repo = repo_mod::open(root)?;
-    let head = status::branch_info(&repo)?;
-    /*
-     * Three states, three sentences. These used to collapse into `NoUpstream`, which meant a
-     * detached HEAD was told `a1b2c3d4 has no upstream branch to pull from` — a sentence that
-     * calls a commit a branch and points at the wrong fix, since no `--set-upstream` will help
-     * someone who is not on a branch at all. An unborn branch had the same problem in reverse:
-     * there is no commit to fast-forward, which `Unborn` already says in one word.
-     */
-    if head.unborn {
-        return Err(GitError::Unborn);
-    }
-    if head.detached {
-        return Err(GitError::DetachedHead { head: head.head });
-    }
-    let branch = repo
-        .find_branch(&head.head, BranchType::Local)
-        .map_err(|_| GitError::NoSuchBranch {
-            name: head.head.clone(),
-        })?;
-    let upstream = branch.upstream().map_err(|_| GitError::NoUpstream {
-        branch: head.head.clone(),
-    })?;
-    let (Some(local_oid), Some(remote_oid)) = (branch.get().target(), upstream.get().target())
-    else {
-        return Err(GitError::NoUpstream { branch: head.head });
-    };
-
-    if local_oid == remote_oid {
-        // Nothing came down — but the branch is still worth naming. *"main is already up to
-        // date with origin"* is a different sentence from a bare fetch's *"already up to
-        // date"*, and in a project with four repositories it is the only thing that says
-        // which of them just answered.
-        return Ok(FetchOutcome {
-            branch: head.head,
-            old_oid: short_oid(local_oid),
-            new_oid: short_oid(local_oid),
-            ..outcome
-        });
-    }
-    let (ahead, behind) = repo.graph_ahead_behind(local_oid, remote_oid).wrap()?;
-    if ahead > 0 {
-        return Err(GitError::NotFastForward {
-            branch: head.head,
-            ahead: ahead as u32,
-            behind: behind as u32,
-        });
-    }
-
-    let target = repo.find_commit(remote_oid).wrap()?;
-    let in_the_way = blockers(&repo, &target)?;
-    if !in_the_way.is_empty() {
-        // The same refusal as a checkout, because it is the same operation: moving the
-        // working tree onto a different commit.
-        return Err(GitError::CheckoutWouldOverwrite {
-            branch: head.head,
-            paths: in_the_way,
-        });
-    }
-
-    /*
-     * The report is built **before** the working tree moves, and that ordering is the design.
-     *
-     * Everything it reads is a local object the fetch already wrote, so it can only fail if
-     * the object database is broken — and in that case failing here leaves the tree exactly
-     * where it was, whereas failing after `checkout_tree` would report an error for a pull
-     * that had actually happened. That is the worse of the two: a user who is told the pull
-     * failed will run it again.
-     */
-    let report = pull_report(&repo, local_oid, remote_oid, behind as u32)?;
-
-    let mut builder = git2::build::CheckoutBuilder::new();
-    builder.safe();
-    repo.checkout_tree(target.as_object(), Some(&mut builder))
-        .wrap()?;
-    repo.reference(
-        &format!("refs/heads/{}", head.head),
-        remote_oid,
-        true,
-        "cide: fast-forward pull",
-    )
-    .wrap()?;
-
-    Ok(FetchOutcome {
-        advanced: behind as u32,
-        branch: head.head,
-        old_oid: short_oid(local_oid),
-        new_oid: short_oid(remote_oid),
-        files_changed: report.files_changed,
-        insertions: report.insertions,
-        deletions: report.deletions,
-        commits: report.commits,
-        more_commits: report.more_commits,
-        ..outcome
-    })
-}
-
-/// How many of a fast-forward's commits are described one by one.
-///
-/// Ten, because the surface is a toast: it is the number that fits without the notice
-/// becoming a scrolling panel, and everything past it is still reported as a count. The cap
-/// is here rather than in the frontend so that a fortnight away — four hundred commits —
-/// does not put four hundred rows on the IPC wire for a component to `slice` down to ten.
-const PULL_COMMIT_CAP: usize = 10;
-
-/// What a fast-forward from `local` to `remote` actually contains.
-struct PullReport {
-    files_changed: u32,
-    insertions: u32,
-    deletions: u32,
-    commits: Vec<PulledCommit>,
-    more_commits: u32,
-}
-
-/// Read that report out of the object database. Touches nothing.
-///
-/// `behind` is passed in rather than recomputed: `graph_ahead_behind` has already walked this
-/// exact set of commits, and the revwalk below yields precisely `behind` of them, so the
-/// overflow count is arithmetic rather than a second walk.
-fn pull_report(repo: &Repository, local: Oid, remote: Oid, behind: u32) -> Result<PullReport> {
-    let local_tree = repo.find_commit(local).wrap()?.tree().wrap()?;
-    let remote_tree = repo.find_commit(remote).wrap()?.tree().wrap()?;
-    // The totals across the whole fast-forward, not per commit: the question a pull answers
-    // is "what is different about my tree now", and summing per-commit stats would count a
-    // file touched by three of them three times.
-    let stats = repo
-        .diff_tree_to_tree(Some(&local_tree), Some(&remote_tree), None)
-        .wrap()?
-        .stats()
-        .wrap()?;
-
-    let mut walk = repo.revwalk().wrap()?;
-    walk.push(remote).wrap()?;
-    walk.hide(local).wrap()?;
-
-    let mut commits = Vec::new();
-    for oid in walk.take(PULL_COMMIT_CAP) {
-        let oid = oid.wrap()?;
-        let commit = repo.find_commit(oid).wrap()?;
-        // Both refuse non-UTF-8 bytes rather than mangling them, and an empty string is the
-        // honest rendering of that: the alternative is mojibake in a toast, and the short oid
-        // beside it is still enough to run `git show`. Same `.ok().flatten()` as `collect`
-        // above, which reads the same field for the branch list's subject.
-        let author = commit.author();
-        commits.push(PulledCommit {
-            short_oid: short_oid(oid),
-            summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
-            author: author.name().unwrap_or("").to_string(),
-        });
-    }
-
-    Ok(PullReport {
-        files_changed: stats.files_changed() as u32,
-        insertions: stats.insertions() as u32,
-        deletions: stats.deletions() as u32,
-        more_commits: behind.saturating_sub(commits.len() as u32),
-        commits,
-    })
-}
+/// It moved when it grew merge and rebase: the decision ladder, two integrations and the
+/// conflict handoff are a coherent unit, and this module is about *the branch selector* —
+/// listing, switching, creating, and the transport half a pull borrows. The re-export is here
+/// so `cide_git::branch::pull` keeps working for the callers and tests that predate the split.
+pub use crate::pull::pull;
 
 /// The head of a repository, for callers that want the status bar's one line and nothing else.
 ///

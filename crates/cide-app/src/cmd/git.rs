@@ -24,13 +24,14 @@
 use std::path::PathBuf;
 
 use cide_git::{
-    branch, changelist, commit as git_commit, diff, patch, push, shelf, stage, stash, status,
-    tree_status,
+    branch, changelist, commit as git_commit, conflict, diff, patch, push, shelf, stage, stash,
+    status, tree_status,
 };
 use cide_ipc::git::{
     BranchInfo, BranchList, ChangesTree, CheckoutMode, CheckoutOutcome, CommitOutcome,
-    CommitRequest, DiffSide, FetchOutcome, FileDiff, GitError, PathSelection, PushOutcome,
-    RepoInfo, ShelfEntry, StashEntry, TreeStatusMap,
+    CommitRequest, ConflictFile, ConflictSide, ContinueOutcome, DiffSide, FetchOutcome, FileDiff,
+    GitError, MergeState, PathSelection, PullRequest, PushOutcome, RepoInfo, ShelfEntry,
+    StashEntry, TreeStatusMap,
 };
 use cide_ipc::{ProjectId, RepoId, ToolTabId};
 use tauri::State;
@@ -653,8 +654,21 @@ pub async fn git_commit(
 /// `push` shells out to `git` when a credential helper is configured, so this can sit on a
 /// network round trip for minutes. Doubly worth keeping off both the main thread and the
 /// async runtime's workers.
+///
+/// # Why it broadcasts, when it writes nothing in the working tree
+///
+/// This was the only mutating handler in this file without an `AppHandle`, and the symptom was
+/// a status bar that still said *"3 ahead"* after a push until something unrelated happened to
+/// refresh it. A successful push updates `refs/remotes/<remote>/<branch>` — through
+/// `git_remote_update_tips` on the libgit2 route and through `git push`'s own bookkeeping on
+/// the binary one — so every branch row's ahead-count in every *other* window is now wrong.
+/// `git_tag_create` makes the same argument for the same reason.
+///
+/// `AppHandle` is injected by Tauri rather than sent from JavaScript, so adding it changes
+/// neither the frontend call nor `contract/commands.json`.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn git_push(
+    app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     repo: RepoId,
@@ -666,13 +680,15 @@ pub async fn git_push(
     let proxy = git_proxy(&state);
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        push::push(
+        let outcome = push::push(
             &root,
             remote.as_deref(),
             refspec.as_deref(),
             set_upstream,
             &proxy,
-        )
+        )?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(outcome)
     })
     .await
 }
@@ -859,23 +875,166 @@ pub async fn git_fetch(
     .await
 }
 
-/// Fetch, then fast-forward. Refuses a divergence rather than merging — see
-/// `cide_git::branch::pull`.
+/// Fetch, then integrate — fast-forward, merge or rebase. See `cide_git::pull`.
+///
+/// # Two things about the body that are deliberate
+///
+/// **The settings default is read on the caller's thread**, before `blocking`, for the reason
+/// `git_proxy` is: the workspace lock is a `parking_lot` mutex and must not be held across an
+/// await, and `cide-git` reads no cide configuration — so the value travels rather than the
+/// lookup.
+///
+/// **It refreshes on every outcome, not only on success**, which is why the `?` is after the
+/// broadcast rather than before it. The case that matters is the *refusal*:
+/// `PullNeedsStrategy` is raised after the fetch has already written remote-tracking refs, so
+/// the dialog that is about to open must not sit beside a status bar still showing yesterday's
+/// behind-count. A landed conflict is the same argument again — it returns `Ok`, but the panel
+/// has a merge to draw.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn git_pull(
     app: tauri::AppHandle,
     state: State<'_, WorkspaceState>,
     project: ProjectId,
     repo: RepoId,
-    remote: Option<String>,
+    request: PullRequest,
 ) -> Result<FetchOutcome> {
     let roots = roots(&state, project)?;
     let proxy = git_proxy(&state);
+    let fallback = state.with(|ws| ws.settings.git.pull_strategy);
     blocking(move || {
         let root = repo_root(&roots, repo)?;
-        let outcome = branch::pull(&root, remote.as_deref(), &proxy)?;
+        let outcome = cide_git::pull::pull_with(&root, &request, fallback, &proxy);
         let _ = refreshed(&app, &roots, project);
-        Ok(outcome)
+        outcome
+    })
+    .await
+}
+
+// --- conflicts ------------------------------------------------------------------------------
+
+/// The operation in progress and its conflicted paths, or `None` when the tree is clean.
+///
+/// Read fresh rather than mirrored into the workspace, for `agents_config_get`'s reason: this
+/// is git's state, it changes when somebody types `git merge` into a pane, and cide's own
+/// state file holding a stale copy of something git owns is a bug with no upper bound on how
+/// long it lasts.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_conflicts(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+) -> Result<Option<MergeState>> {
+    let roots = roots(&state, project)?;
+    blocking(move || conflict::state(&repo_root(&roots, repo)?)).await
+}
+
+/// The three sides of one conflicted file, for the resolver.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_conflict_read(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+) -> Result<ConflictFile> {
+    let roots = roots(&state, project)?;
+    blocking(move || conflict::read(&repo_root(&roots, repo)?, &path)).await
+}
+
+/// Write the resolved text and collapse the path's conflict stages.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_conflict_resolve(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    content: String,
+) -> Result<Option<MergeState>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        conflict::resolve(&root, &path, content.as_bytes())?;
+        let state = conflict::state(&root)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(state)
+    })
+    .await
+}
+
+/// Resolve a path by taking one side whole — the panel's one-click buttons.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_conflict_take(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+    side: ConflictSide,
+) -> Result<Option<MergeState>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        conflict::take_side(&root, &path, side)?;
+        let state = conflict::state(&root)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(state)
+    })
+    .await
+}
+
+/// Put a resolved path back into conflict.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_conflict_unresolve(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+) -> Result<Option<MergeState>> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        conflict::unresolve(&root, &path)?;
+        let state = conflict::state(&root)?;
+        let _ = refreshed(&app, &roots, project);
+        Ok(state)
+    })
+    .await
+}
+
+/// Conclude the merge, or advance the rebase to its next stop.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_merge_continue(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    message: Option<String>,
+) -> Result<ContinueOutcome> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = conflict::cont(&root, message.as_deref());
+        let _ = refreshed(&app, &roots, project);
+        outcome
+    })
+    .await
+}
+
+/// `git merge --abort` / `git rebase --abort`. Puts the tree back where it was.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn git_merge_abort(
+    app: tauri::AppHandle,
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+) -> Result<()> {
+    let roots = roots(&state, project)?;
+    blocking(move || {
+        let root = repo_root(&roots, repo)?;
+        let outcome = conflict::abort(&root);
+        let _ = refreshed(&app, &roots, project);
+        outcome
     })
     .await
 }

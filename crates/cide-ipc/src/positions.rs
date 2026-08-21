@@ -63,6 +63,25 @@ pub struct ViewPosition {
     pub line: u32,
     /// Caret column, 1-based, UTF-16 code units.
     pub column: u32,
+    /// The 1-based start lines of the collapsed blocks, ascending. (M19)
+    ///
+    /// Part of "the same lines" for the same reason `top_line` is: a file left with its imports
+    /// and three long functions collapsed is a different document to read than the same file
+    /// with everything open, and restoring the scroll without the folds lands the user on a line
+    /// number that now means something else.
+    ///
+    /// **Start lines, not offsets**, for the reason this whole type stores lines: the record is
+    /// written against one version of a file and applied to another. A line that no longer names
+    /// a foldable range is dropped in silence by `ui/src/editor/folding.ts::foldEffectsFor`,
+    /// where a stale offset would collapse a range of text nobody chose.
+    ///
+    /// `#[serde(default)]` so a `positions.json` written before M19 loads unchanged. There is no
+    /// migration and none is owed: this file is a cache of where somebody was looking, the whole
+    /// of it is re-derived by opening a file, and it has no schema version to move — which is
+    /// exactly the distinction `Workspace::CURRENT_SCHEMA` exists to make about the file that
+    /// does.
+    #[serde(default)]
+    pub folds: Vec<u32>,
     /// Milliseconds since the Unix epoch, at the last note. The LRU key.
     ///
     /// Written by Rust rather than taken from the caller: a webview clock is the user's system

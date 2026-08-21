@@ -1139,6 +1139,59 @@ fn open_revision(
     )
 }
 
+/// Whether an open tab is already the resolver for this conflicted path.
+///
+/// Keyed on `(repo, path)` and nothing else, because that pair *is* the document: there is one
+/// conflict per path in an operation, and a second tab over it would be two editable centre
+/// panes writing the same file.
+fn shows_merge(kind: &TabKind, repo: RepoId, path: &str) -> bool {
+    matches!(kind, TabKind::Merge { repo: r, path: p, .. } if *r == repo && p == path)
+}
+
+/// Open the three-pane conflict resolver for one path, or activate the one already open. (M20)
+///
+/// [`tab_open_revision`]'s cousin, and the same rule holds for the same reason: **no text is
+/// accepted**. `TabKind::Merge` is persisted inside `Workspace`, `cide_core::persist` debounces
+/// that to `workspace.json`, and the three sides of a conflict passed in here would be three
+/// documents written to disk. The pane calls `git_conflict_read` with `(repo, path)` when it
+/// mounts, exactly as a revision pane calls `git_file_at_revision` with its key.
+///
+/// Nothing here checks that the path is *actually* conflicted. That is deliberate and it is the
+/// same division `tab_open_diff` makes: this command opens a view, the pane asks the question,
+/// and a pane that draws *"no longer conflicted"* is a better answer than a command that refuses
+/// — because by the time a user clicks, another window may have resolved it, and a refusal here
+/// would be a dead menu item with no explanation.
+#[tauri::command(rename_all = "camelCase")]
+pub fn tab_open_merge(
+    state: State<'_, WorkspaceState>,
+    project: ProjectId,
+    repo: RepoId,
+    path: String,
+) -> Result<TabId> {
+    state.update(|ws| {
+        let existing = workspace::project(ws, project)?
+            .tabs
+            .iter()
+            .find(|t| shows_merge(&t.kind, repo, &path))
+            .map(|t| t.id);
+        if let Some(id) = existing {
+            workspace::activate_tab(ws, project, id)?;
+            return Ok(id);
+        }
+        let title = format!("{} — merge", path.rsplit('/').next().unwrap_or(&path));
+        workspace::open_tab(
+            ws,
+            project,
+            TabKind::Merge {
+                repo,
+                path: path.clone(),
+                dirty: false,
+            },
+            revision_pane(title),
+        )
+    })
+}
+
 /// Record whether a file tab has unsaved edits.
 ///
 /// The dirty flag lives in the Rust-owned tree rather than in the editor component because

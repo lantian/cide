@@ -35,11 +35,13 @@ export interface StoryDigest {
   selectedRows: number
   multiSelectable: boolean
   guard: string | null
+  /** The merge bar's sentence, or `null` when no operation is in progress. */
+  mergeBar: string | null
   summary: string | null
   commitEnabled: boolean
 }
 
-const STORIES: GitStoryName[] = ['mock', 'guard', 'multi', 'empty']
+const STORIES: GitStoryName[] = ['mock', 'guard', 'multi', 'empty', 'conflict']
 
 /**
  * The view, with its model built beside it.
@@ -66,6 +68,7 @@ const digests = STORIES.map((story) => {
   // `[^>]*>` skips the rest of the bar's own attributes; the bar holds only spans and
   // buttons, so the first `</div>` after it is its own.
   const guard = /data-audit="gitGuard"[^>]*>(.*?)<\/div>/.exec(html)?.[1]
+  const merge = /data-audit="mergeBar"[^>]*>(.*?)<\/div>/.exec(html)?.[1]
   return {
     story,
     rows: [...html.matchAll(/data-audit="gitRow"[^>]*aria-level="(\d+)" aria-checked="(\w+)"/g)].map(
@@ -76,6 +79,7 @@ const digests = STORIES.map((story) => {
     multiSelectable: /data-audit="gitTree"/.test(html)
       && /role="tree"[^>]*aria-multiselectable="true"/.test(html),
     guard: guard === undefined ? null : text(guard),
+    mergeBar: merge === undefined ? null : text(merge),
     summary: /data-audit="gitSummary"[^>]*>([^<]*)</.exec(html)?.[1] ?? null,
     commitEnabled: !/data-audit="gitCommit"[^>]*disabled/.test(html),
   } satisfies StoryDigest

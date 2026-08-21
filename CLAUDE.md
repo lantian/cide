@@ -78,6 +78,8 @@ Which check covers what you touched:
 | --- | --- |
 | `keys/`, a default binding, `cide-core::commands` | `check:keys`, `check:commands`, `check:switcher` |
 | `sidebar/GitPanel/`, `cide-git` | `check:git`, `check:render`, `check:diff`, `check:diff-render`, `check:branches` |
+| **pull, merge, rebase — `cide-git`'s `pull`/`conflict`, the divergence dialog** | `check:pull-strategy`, `check:branches`, plus `cargo test -p cide-git --test pull --test conflicts` (differential against the real `git`, including the merge message byte for byte) |
+| the conflict resolver — `panes/MergePane*`, `panes/mergeModel.ts`, `sidebar/GitPanel/MergeBar.tsx` | `check:merge`, `check:render`, `check:theme`, `check:ui-scale` |
 | `toolwindow/`, the activity rail, the bottom panel | `check:toolwindow`, `check:toolwindow-render`, `check:sidebar`, `check:menus` |
 | `gitlog/`, `cide-git`'s `log`/`lanes`/`show`/`revision` | `check:log`, `check:log-render`, `check:diff-render` |
 | blame — `editor/blame*`, `cide-git::blame` | `check:blame`, `check:editor` |
@@ -120,7 +122,8 @@ crates/
   cide-claude/    spawning and supervising `claude`: env, hooks, resume/fork, headless one-shots.
   cide-ide-mcp/   the Claude Code IDE-integration MCP server (openDiff, getDiagnostics, openFile).
   cide-git/       multi-root git, hunk/line staging, changelists, shelf; and the read-only
-                  half — log, graph lanes, file history, blame — plus the commit actions.
+                  half — log, graph lanes, file history, blame — plus the commit actions,
+                  pull's merge/rebase, and the conflict surface (ADR 0009).
   cide-fs/        gitignore-aware indexing and watching.   cide-search/  fuzzy + content search.
   cide-tasks/     `.cide/tasks.json`: one owning store, a repairing loader, a stale-file merge.
   cide-agents/    `.cide/` roles and config, and the `cide_task_*` MCP vocabulary. Spawns nothing yet.
@@ -133,7 +136,8 @@ crates/
 
 `docs/adr/` records the decisions that a refactor would otherwise undo — read 0001 (no
 multiwebview), 0002 (Rust owns state), 0003 (xterm owns VT) before changing anything
-structural.
+structural, and 0009 (real sequencer state) before touching how a conflict is landed: it
+reverses an argument still written out at length in `cide-git/src/replay.rs`.
 
 ### The state loop
 

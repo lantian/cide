@@ -2,6 +2,7 @@
 import type { ClaudeSettings } from "./ClaudeSettings";
 import type { EditorSettings } from "./EditorSettings";
 import type { ExplorerSettings } from "./ExplorerSettings";
+import type { GitSettings } from "./GitSettings";
 import type { GraphicsSettings } from "./GraphicsSettings";
 import type { InspectionSettings } from "./InspectionSettings";
 import type { ProxySettings } from "./ProxySettings";
@@ -69,4 +70,12 @@ explorer?: ExplorerSettings,
  * than on read, so the stored value is the one the user set and a hand-edited
  * `workspace.json` cannot make the app type into a live prompt on every `cargo check`.
  */
-inspections?: InspectionSettings, };
+inspections?: InspectionSettings, 
+/**
+ * The Git screen: what a divergent pull does, and how the resolver opens a file. (M20)
+ *
+ * Nothing to clamp — an enum and a boolean — but it goes through `apply_patch`'s
+ * destructuring like every other group, which is what makes a forgotten arm a compile
+ * error rather than a setting that silently never saves.
+ */
+git?: GitSettings, };

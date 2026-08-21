@@ -123,4 +123,10 @@ const LETTERS: Readonly<Partial<Record<TreeStatus, string>>> = {
   modified: 'M',
   added: 'A',
   deleted: 'D',
+  // `!`, and it is the one letter here that is not in the mock. (M20) The rule above says the
+  // column answers *what will git do with this file when you commit* — and for a conflicted
+  // path the answer is "refuse", which is a fourth answer and not the absence of one. It is
+  // also the only status whose colour alone would be too quiet: red on a name reads as an
+  // error somewhere, `!` reads as an error *here*.
+  conflicted: '!',
 }

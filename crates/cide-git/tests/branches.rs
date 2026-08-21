@@ -17,10 +17,10 @@
 
 mod support;
 
-use cide_git::branch;
 use cide_git::repo as repo_mod;
-use cide_ipc::git::{CheckoutMode, GitError};
-use support::TempRepo;
+use cide_git::{branch, pull};
+use cide_ipc::git::{CheckoutMode, GitError, PullDefault, PullRequest, PullStrategy};
+use support::{TempRepo, clone_of};
 
 /// The proxy environment these tests spawn `git` with: none at all.
 ///
@@ -319,19 +319,6 @@ fn a_restore_that_conflicts_says_so_and_keeps_the_stash() {
 ///
 /// A path remote (not `file://`, not `https://`) is what keeps `push::route` on the libgit2
 /// side, so these tests never fork a `git` that could block on a credential prompt.
-fn clone_of(from: &TempRepo, tag: &str) -> TempRepo {
-    let work = TempRepo::new(tag);
-    work.git(&[
-        "remote",
-        "add",
-        "origin",
-        from.root.to_str().expect("utf-8 path"),
-    ]);
-    work.git(&["fetch", "-q", "origin"]);
-    work.git(&["checkout", "-q", "-b", "main", "origin/main"]);
-    work
-}
-
 #[test]
 fn checking_out_a_remote_branch_creates_a_local_one_that_tracks_it() {
     let origin = TempRepo::new("remote-origin");
@@ -734,7 +721,7 @@ fn an_unborn_branch_cannot_be_pulled() {
 }
 
 #[test]
-fn a_divergent_pull_reports_both_counts_instead_of_merging() {
+fn a_divergent_pull_under_fast_forward_only_reports_both_counts() {
     let origin = TempRepo::new("pull-diverge-origin");
     origin.write("a.txt", b"one\n");
     origin.commit_all("first");
@@ -745,10 +732,26 @@ fn a_divergent_pull_reports_both_counts_instead_of_merging() {
     work.write("c.txt", b"mine\n");
     work.commit_all("mine");
 
-    // cide has no conflict-resolution surface, so it refuses with the numbers a user needs to
-    // choose between merge and rebase rather than dropping them into a conflicted tree.
+    /*
+     * This test used to assert that a *default* pull refused, on the argument that cide had no
+     * conflict-resolution surface. It has one now (M20), so the default is `Ask` and the same
+     * repository raises `PullNeedsStrategy`.
+     *
+     * The refusal itself is not gone and neither is this test: `NotFastForward` is what the
+     * `FastForward` strategy means, it is what a user who sets *Fast-forward only* in Settings
+     * asks for, and the two counts are still the whole content of it. Rewritten rather than
+     * deleted, so the sentence keeps a test.
+     */
     assert_eq!(
-        branch::pull(&work.root, None, &untouched()),
+        pull::pull_with(
+            &work.root,
+            &PullRequest {
+                strategy: Some(PullStrategy::FastForward),
+                ..PullRequest::default()
+            },
+            PullDefault::Ask,
+            &untouched(),
+        ),
         Err(GitError::NotFastForward {
             branch: "main".to_string(),
             ahead: 1,
@@ -756,6 +759,42 @@ fn a_divergent_pull_reports_both_counts_instead_of_merging() {
         })
     );
     assert!(!work.root.join("b.txt").exists(), "nothing was merged in");
+}
+
+#[test]
+fn a_divergent_pull_with_nothing_configured_asks_which_strategy() {
+    let origin = TempRepo::new("pull-ask-origin");
+    origin.write("a.txt", b"one\n");
+    origin.commit_all("first");
+    let work = clone_of(&origin, "pull-ask-work");
+
+    origin.write("b.txt", b"theirs\n");
+    origin.commit_all("theirs");
+    work.write("c.txt", b"mine\n");
+    work.commit_all("mine");
+
+    let before = work.git(&["rev-parse", "HEAD"]);
+    let err = pull::pull(&work.root, None, &untouched()).expect_err("diverged");
+    let GitError::PullNeedsStrategy(divergence) = err else {
+        panic!("expected PullNeedsStrategy, got {err:?}");
+    };
+    assert_eq!(divergence.branch, "main");
+    assert_eq!((divergence.ahead, divergence.behind), (1, 1));
+    // Both halves travel. The local one is what a rebase would rewrite, and a dialog that
+    // could not name it would be listing, under both answers, things at risk under neither.
+    assert_eq!(divergence.incoming.len(), 1);
+    assert_eq!(divergence.incoming[0].summary, "theirs");
+    assert_eq!(divergence.local.len(), 1);
+    assert_eq!(divergence.local[0].summary, "mine");
+
+    // Nothing moved — but the fetch did happen, which is the premise `skip_fetch` rests on.
+    assert_eq!(work.git(&["rev-parse", "HEAD"]), before);
+    assert!(!work.root.join("b.txt").exists());
+    assert_eq!(
+        work.git(&["rev-parse", "refs/remotes/origin/main"]).trim(),
+        origin.git(&["rev-parse", "HEAD"]).trim(),
+        "the refs the dialog describes are on disk"
+    );
 }
 
 #[test]

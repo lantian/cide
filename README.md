@@ -3605,6 +3605,269 @@ So `checkState` is now a function of the ticks alone, and `isPartiallyStaged` is
 fixture's half-staged file is deliberately kept: `check:git` and `check:render` now pin the
 opposite behaviour from the same data.
 
+## Updating a project, and resolving a conflict (M20), and what is not done
+
+Ctrl+T was bound to `git.pull` and the command was titled **Pull (fast-forward only)**, which is
+what it did: `cide_git::branch::pull` fetched, and the moment the branch had diverged it returned
+`NotFastForward` with both counts and a sentence telling the user to merge or rebase in a
+terminal. That is the IDE's headline key sending you to a shell for the most ordinary thing that
+happens on a shared branch.
+
+It is now IDEA's **Update project**: fetch, fast-forward where it can, and otherwise merge or
+rebase — asking which, once, when nothing has said.
+
+### The ladder, and where the answer is stored
+
+`branch.<name>.rebase` → `pull.rebase` → cide's own `Settings › Git` default → ask.
+
+The repository's own configuration wins over the application's, because `pull.rebase` is a fact
+about a project's workflow — often set by whoever set the repository up — and a global preference
+that silently overrode it would make cide disagree with the `git pull` typed into a pane two lines
+below. A user who has already run `git config pull.rebase true` is therefore never asked.
+
+The dialog's *remember this choice* box writes `pull.rebase` into that repository's **local**
+`.git/config` — `Config::open_level(ConfigLevel::Local)`, which is explicit rather than
+load-bearing: a bare `set_bool` already lands there for an ordinary checkout, and differs only
+under `extensions.worktreeConfig`, where it would scope the answer to one worktree. `~/.gitconfig`
+is never touched. It starts **unticked**, which inverts `ConfirmDestructive`'s house rule for a
+checkbox — that rule is for an option that makes an act *recoverable*, and this one makes an
+answer permanent in a file nothing outside Settings will remind anyone about.
+
+Parsing `pull.rebase` reproduces `builtin/pull.c::rebase_parse_value`, and three clauses of it
+are not guessable: git's boolean set is `true`/`yes`/`on`/any non-zero integer against
+`false`/`no`/`off`/`0`/empty; a **valueless** key — `[pull]` then a bare `rebase` line — is
+`true`, and `Config::get_string` cannot see the difference between that and a missing key, so
+`ConfigEntry::has_value` is the only way to ask; and `preserve` or a typo is treated as
+*unconfigured* with a warning, because git dies on it, cide cannot die, and quietly choosing
+merge would be a lie about the user's own file.
+
+### The decision that reverses a written one
+
+`crates/cide-git/src/replay.rs` had rejected libgit2's stateful `revert`/`cherrypick` — and by
+extension `merge` and `rebase` — for two reasons. The first, that `.git/index` is derived from a
+changelist under ADR 0004, is answered directly: `cide_git::commit` now takes the staging-area arm
+whenever it is concluding an operation, because on a merge **the index is the truth** — it was
+built by the merge and edited by the resolutions, and `rebuild_index` would `read_tree(HEAD)` over
+it and commit HEAD-plus-selected-hunks under a message saying the branches were merged.
+
+The second was the load-bearing one: *the moment `RepositoryState` is non-clean,
+`operation_in_progress` starts refusing every other action in this crate — from a panel with
+nothing on it that can finish or abort the operation.* That panel now exists, so the decision
+reverses with its reason. `docs/adr/0009-real-sequencer-state.md` records it, because reverting
+this by reflex from `replay.rs`'s header is the likeliest way it gets undone.
+
+Real git state is what makes a conflict resumable across a restart, legible to `git status` in a
+terminal pane, and abandonable with `git merge --abort` by somebody who would rather not use the
+resolver at all.
+
+### Resolving
+
+A conflicted pull is **not an error**. `FetchOutcome.conflicts` comes back non-empty and the
+gesture succeeded; the user now has work to do, and an `Err` would route it to the red toast
+`chrome/Failures.tsx` draws for refusals.
+
+The commit panel already had a *Merge Conflicts* group — `FileState::Conflicted` and
+`RepoChanges.conflicts` have been on the wire since M10 and `model.ts` draws the group first — and
+every write verb refused on it with *"Resolve the conflict first"*. There was no verb that
+resolved. There are five now: *Resolve…* opens the three-pane tab, *Accept ⟨side⟩* takes one whole,
+*Un-resolve* puts a file back, and a `MergeBar` above the tree carries *Resolve simple*,
+*Continue* and *Abort*. `GuardBar`'s argument for a bar rather than a modal holds one step
+stronger here: the honest default of a conflict is *do nothing yet*.
+
+**`ours` and `theirs` are index stages, not the words on the buttons.** During a *rebase* git
+swaps them — stage 2 is the branch being rebased onto and stage 3 is your own commit — so
+`cide_git::conflict::side_labels` decides the wording and the panel only draws it. A resolver
+that hardcoded *Accept Yours* over stage 2 would hand the user the other branch's work under
+their own name.
+
+### The three panes, and the merge they compute
+
+`@codemirror/merge` ships a two-pane `MergeView` and a `unifiedMergeView`, and no three-way
+primitive at all, so the panes are three plain `EditorView`s — left `ours`, centre editable, right
+`theirs`, with line numbers in all three.
+
+**The centre opens as the base revision**, which is IDEA's model and its documentation's own
+words: *"Initially, the contents of this pane are the same as the base revision of the file, that
+is, the revision from which both conflicting versions are derived."* Every difference either side
+made is a block you take or reject.
+
+This reverses an earlier decision, and the reversal is the interesting part. The resolver first
+**parsed git's conflict markers**, on the argument that git had already merged the non-conflicting
+hunks and re-deriving them risked disagreeing with the index cide was about to commit. The
+argument is sound and it produced the wrong tool: the hunks git had already applied were
+**invisible and unrevertable**, so a merge tool could show you two decisions out of thirty and
+call the rest settled. What that argument was really protecting is preserved from the other end —
+**the resolved text is written to the working tree and staged verbatim**, so what the user sees is
+what gets committed, whatever any algorithm thought.
+
+So the merge is computed here, from the three index stages, by a **patience diff** over lines.
+Patience rather than a dynamic table because that is `O(n·m)` cells — 144 million for two
+12,000-line files, in a webview, on a keystroke — and because it anchors on lines unique to both
+sides, which produces the hunks a person expects rather than matching braces and blank lines
+across unrelated blocks. It is what `git diff --patience` does.
+
+**A chevron per block, in the gutter of the side it belongs to** — `»` in the left pane, `«` in
+the right, with IDEA's `X` beside it to reject. **Both disappear once that side is answered**,
+which is IDEA's behaviour: a chevron that stayed after being used looked like it had not worked,
+and clicking it again did something else entirely. A side has three states, not two — asking,
+accepted, rejected — and *rejected* is what a toggle cannot express.
+
+Rejecting **keeps the base**; it does not delete the block. Deletion is what you get by accepting
+a side that deleted it, which is a decision somebody made rather than the by-product of two
+clicks.
+
+**Both sides, in the order you click them.** A block's answer records `taken` as an ordered list,
+because the commonest real conflict is two people adding a function, a test or an import at the
+same line — where the answer is neither side but both, and the order is the order of the resulting
+file. Two insertions at one base line are both zero-width there, so they overlap and become **one**
+block offering both. JetBrains describes the same case: *"the change on the other side will remain
+open… to combine the changes from both sides, you can choose to accept them both."*
+
+**A highlight means work you have not done.** A block is lit while it is still asking and goes
+dark the moment that side is accepted or discarded — in all three panes, by one rule. Two tones,
+not four: red for an undecided conflict, **blue for an undecided one-sided change** (a change, not
+a problem). Painting the answered blocks as well leaves a merge of thirty with thirty coloured
+bands and nothing to separate the two you have not read from the twenty-eight you have; the colour
+stops being a signal at exactly the point it is needed.
+
+It is not a record of what was decided. The result column's *text* is that record, and the `↺` in
+the gutter marks every side that was answered, in the pane it was answered in.
+
+The side panes ask this **per side**, so answering the left half of a conflict quietens the left
+pane while the right stays lit — which is what tells you the half that is left. The result asks it
+per region, because a block is only finished there once both sides are.
+
+The decorations are a `StateField` rather than a fixed set, so an edit in the centre pane moves
+them with the text instead of throwing a range error.
+
+*Apply non-conflicting* takes the one side of every block only one side touched, and
+`Settings › Git › Apply non-conflicting changes automatically` runs it on open — **off by
+default, as it is in IDEA**, because applying two thirds of the blocks before the user has looked
+undoes the reason for showing them. The default changed within this milestone, and a changed
+default does not reach a value that is already stored — so `persist`'s ladder grew a **schema 4 →
+5** arm that deletes the key. That is the inverse of what `v1_to_v2` does two functions above it,
+which *writes* a default down so a later change reaches new installs and nobody else; the
+difference is whether the stored value was ever a decision. This one never was: no released build
+offered the setting, and everyone who ran an intermediate one got `true` without being asked.
+
+The side panes are **read-only but selectable**: `EditorState.readOnly` alone, deliberately
+without `EditorView.editable.of(false)` beside it. `DiffPane` uses both and is right to; here the
+second one takes the caret away and with it keyboard selection, Ctrl+A and Ctrl+C — and these
+panes are where the text somebody wants to copy *into* the result lives. A pane you cannot copy
+out of is a pane you have to retype from.
+
+All three panes carry the editor's own syntax highlighting — the same `cideHighlightStyle` over
+the same `TOKEN_ROLES`, so a merge does not show the file in different colours from the tab beside
+it. Wiring the highlighter turned out not to be enough: the `.cide-tk-*` colours lived in
+`EditorSurface.module.css`, **scoped under that module's `.body`**, so they painted inside an
+`EditorSurface` and nowhere else. The resolver got a highlighter, got tokens, got the class names
+onto its spans and got plain text, with nothing in the build failing. They now live in
+`editor/highlight.css` — a plain stylesheet, because CodeMirror writes the literal class name and
+a module would hash it — loaded by `main.tsx`, because `check:editor` runs `highlight.ts` under
+node where a `.css` import cannot resolve. The grammar arrives through a `Compartment` once its chunk lands, for `EditorSurface`'s
+reason: it is a dynamic `import()` that is not available when the editor is built, and rebuilding
+to add it would take the scroll position and selection with it.
+
+Inside a lit line, the part that actually moved is marked — a **word-level diff** against the
+base, split on identifier boundaries rather than characters, because a character diff over
+`alpha` → `beta` marks a scatter of shared vowels. The three panes **scroll together**, anchored
+on block boundaries rather than on a scroll fraction: the documents are different lengths, so 40%
+down `ours` is not 40% down the result, and the drift grows with every block taken. Two details
+there are worth the words, because the first version of it had both wrong and the symptom was
+*scrolling takes you back to the top*. `scrollTop` is **not** a document-relative height —
+CodeMirror measures blocks from the top of the document, which sits at `view.documentTop` — so the
+conversion goes through that. And the re-entry guard is a set of marks rather than a timer: a
+programmatic `scrollTop` fires its own `scroll` event a frame or more later, so a flag released on
+the next frame was already down when the echo arrived, and the three panes converged on line one. **Ctrl+Z**
+walks back through the block decisions, which the centre pane's own CodeMirror history does not
+cover — a block accepted by a chevron is not an edit anybody typed.
+
+*Apply* is gated on **every block** being answered — not only the conflicting ones — and on no
+conflict marker anywhere in the text. It used to light up as soon as the conflicts were done, on
+the argument that leaving a one-sided change keeps the base and is a valid outcome. It is a valid
+outcome and a terrible default: the user is looking at a chevron and an `✕` still sitting in the
+gutter, has not decided about them, and the tool is telling them they have finished. Rejecting is
+one click and *is* the answer for a change you want the base for.
+
+The marker check is not redundant with that.
+The centre pane is a real editor, a marker can arrive by typing, and
+staging marker soup is the worst thing this surface could do — it commits cleanly and breaks the
+build for everybody. It checks only `<<<<<<<` and `>>>>>>>`; a line of seven `=` is a Markdown
+setext heading, and a resolver that cannot save a README is one people work around. An unanswered
+*one-sided* change blocks nothing — leaving it means keeping the base, which is a valid outcome.
+
+### One file at a time, and the merge commits itself
+
+A merge of four conflicted files is a sequence, not four unrelated gestures. Resolving one closes
+its tab and brings the list back with that row ticked and the rest still to do; closing a resolver
+without answering does the same, rather than leaving somebody in a repository that is mid-merge
+with nothing on screen saying so. **When the last file is answered the merge commits** — a merge
+with every conflict resolved has exactly one remaining action, and `git reset --hard ORIG_HEAD`
+covers anybody who disagrees.
+
+### Notices, and four defects fixed on the way past
+
+A pull already reported well. A **push** reported nothing at all on success — `keys/dispatch.ts`
+was a bare `void Promise.all(...)` — and had no `.catch` either, so a *failed* push toasted the
+single word `push` (`GitError::Push`'s detail is an object, so `notices.describe` fell through to
+the tag). Both are fixed, `PushOutcome` carries the counts, and multi-root pushes aggregate into
+one notice the way pulls do — `notices.admit` dedupes by text, so five submodules each saying
+*"already up to date"* would otherwise show one toast speaking for five.
+
+* **`branch.rs` was the only mutating module in `cide-git` that never called
+  `changelist::record_index`.** A `checkout_tree` makes libgit2 rewrite `.git/index`, so the
+  sidecar's fingerprint described an index that no longer existed and the *next* commit refused
+  with `IndexChangedExternally` — pointing the "staging changed outside cide" bar at cide's own
+  act.
+* **`branch::pull` checked neither `operation_in_progress` nor `conflicted_paths`.** A pull run
+  during a rebase spent a network round trip and then failed inside `checkout_tree` with a raw
+  `GitError::Git`. Both checks now happen *before* the fetch.
+* **`behind == 0` with `ahead > 0` was reported as a divergence.** The test was `ahead > 0`
+  alone, so a branch with one unpushed commit and a quiet remote was told it had diverged and
+  handed two counts explaining why it could not fast-forward. `git pull` says *Already up to
+  date*.
+* **A push libgit2's route could not deliver reported success.** `git_remote_push` returns `Ok`
+  when the *transport* worked, whatever the remote decided about the refs; a server-side
+  rejection arrives only through `push_update_reference`, which nothing was listening to. And a
+  refused push from *Commit and Push* landed in the panel's one dim note line while the palette's
+  Push, on the same rejection, put a red box on screen — two routes to one gesture disagreeing
+  about whether it worked. Both now toast.
+* **An open editor did not follow a pull.** `cide://session-tool` covers an agent's edits and
+  nothing else, so pulling a branch that changed a file you had open left the pane showing the
+  old text. It now re-reads on `cide://git-status` and **compares the stamp** before reloading —
+  that event fires on every stage and unstage, and a rebuild per stage would take the scroll
+  position, selection and undo history with it.
+* **`git_push` had no `AppHandle` and broadcast nothing**, so ahead/behind counts went stale in
+  every other window until something unrelated refreshed them. And the panel's *Update project*
+  button, disabled since it was written with the tooltip *"needs a pull command"*, is finally
+  passed one — `git_pull` had existed since M10.
+
+### Not done
+
+* **No `--rebase=merges` and no interactive rebase.** A merge commit among the commits a rebase
+  would replay is **refused** (`RebaseWouldDropMerges`) rather than flattened: `git rebase` drops
+  it silently and the conflict resolutions recorded inside it go with it, which is a content
+  change on a branch about to be pushed with no undo surface. The dialog's other button merges.
+* **No autostash.** A pull that would overwrite local changes refuses by naming them — the same
+  refusal a checkout makes, computed by the same `blockers_against_tree`.
+* **Two documented differences from `git rebase`**, both *reported* rather than hidden, through
+  `FetchOutcome::skipped`. libgit2 has no `--cherry-pick` patch-id pre-pass, so a commit whose
+  patch is already upstream but whose replay would conflict stops the rebase where git would have
+  dropped it before trying. And libgit2 answers `GIT_EAPPLIED` for a commit that was **empty to
+  begin with**, which `git rebase` keeps — it offers no way to force one through mid-sequence, so
+  cide follows libgit2 and counts it.
+* **`REBASE_COMMIT_CAP` is 100**, refused up front and never truncated. A truncated rebase is a
+  rewrite that lost commits.
+* **A file resolved outside cide mid-merge** — `git checkout --ours` in a pane — is picked up on
+  the next refresh, but a resolver tab already open on it goes on showing what it read.
+* **The merge tab is not remembered by *Reopen closed tab*.** It is a query about a transient
+  state: by the time somebody presses the chord the merge may be finished, aborted, or resolved
+  differently in a terminal.
+* **Nothing here has been confirmed on screen.** The Rust side is covered by
+  `crates/cide-git/tests/pull.rs` (differential against the real `git` binary, including the merge
+  message byte for byte) and `tests/conflicts.rs`; the frontend by `check:pull-strategy` and
+  `check:merge`. The three-pane resolver has not been driven by hand.
+
 ## The git tool window: log, graph, file history and blame (M19)
 
 A bottom panel — IDEA's *Git* tool window — opened from a new button pinned to the foot of the
@@ -3937,6 +4200,122 @@ of that bound.
   revert and cherry-pick suites are differential against the real `git` binary over a thousand
   randomised working trees. What that coverage cannot speak to is whether any of it is legible on
   screen.
+
+## Code folding (M19), and what it costs to have no parse tree
+
+Collapse and expand a block, from the caret or from a chevron in the gutter, in every language
+the editor knows plus the ones it does not. IDEA's chords, IDEA's keypad included:
+
+| | |
+| --- | --- |
+| `Ctrl+-` / `Ctrl+=` | Collapse / Expand the block at the caret |
+| `Ctrl+Shift+-` / `Ctrl+Shift+=` | Collapse all / Expand all, **at every level** |
+| `Ctrl+Alt+-` / `Ctrl+Alt+=` | Collapse / Expand recursively |
+| `Ctrl+.` | Toggle |
+
+All ten bindings are scoped `editorFocused`, and that scope is load-bearing rather than tidy:
+the key gate is a window **capture** listener, and xterm encodes 0x1f for a plain `Ctrl+-`, so an
+unscoped binding would silently remove that byte from every shell in every window. They are also
+spelled `minus`, `equal` and `plus` and never `-` or `+` — `strokeFromEvent` reads
+`KeyboardEvent.code` first, so one `ctrl+minus` covers the main row *and* `NumpadSubtract`, while
+`Equal` and `NumpadAdd` are two different physical keys and Expand therefore needs two lines.
+A binding written `ctrl+shift+-` would parse in Rust and be inert for ever, because no keystroke
+ever produces the token `-`.
+
+### There is no parse tree, and this is what that costs
+
+`streamGrammar.ts` has said since M9 that folding was the price of its design:
+
+> What is knowingly given up: anything that needs structure. […] there is no folding or
+> indentation beyond the bracket heuristic.
+
+That decision is not reversed here. Every language is still a `StreamLanguage` over a data
+table, there is still no `@codemirror/lang-*` in this project, and CodeMirror's usual route —
+`foldNodeProp` over a Lezer tree — is still unavailable. So folding comes from a `foldService`
+over the *text*, and `ui/src/editor/foldRanges.ts` is the bracket heuristic written out with
+enough of a tokenizer to know that the `{` in `println!("{}")` is not a block.
+
+Four sources, one linear pass:
+
+- **Brackets** — `{ [ (`, skipping strings and comments, nested `/* /* */ */` where the language
+  nests them, and Rust's `r#"…"#`, which is where an unbalanced brace actually lives.
+- **Indentation** — Python's suites and YAML's mappings, as a monotonic stack rather than a
+  forward search per line. The forward search is O(n²) on a deeply nested file and is the
+  quadratic this directory has already shipped twice; `check:editor` asserts the ratio.
+- **Headings and fences** — Markdown, because indentation folding is wrong for prose.
+- **Explicit regions** — `// region` / `// endregion`, `#region`, and IDEA's own
+  `<editor-fold>`, in every language with a line comment. The one fold a person writes on
+  purpose.
+
+**Crossing ranges are dropped.** Nothing makes four independent sources agree, and a `// region`
+opened outside a block and closed inside it produces a pair that overlaps without nesting. Both
+cannot be offered: a fold is a `Decoration.replace`, and two overlapping replacements leave the
+text between them belonging to neither placeholder. The earlier, wider one survives.
+
+The honest limit is the same one the tokenizer has. An apostrophe in a language where `'` opens
+a string still ends that line's scan, an unterminated `"` in a language whose strings may span
+lines still swallows what follows, and a `{` inside a construct no `FoldSpec` describes is still
+a block. What is different from the highlighter is the *direction of the default*: a quote is
+assumed **not** to cross a line unless the language opts in, because a mis-coloured tail is
+cosmetic and a mis-scanned brace deletes folding for the rest of the file.
+
+### The fold table is a second copy, and a gate makes it one
+
+`FoldSpec` mirrors six fields of `GrammarSpec` and is written out again in `languages.ts` rather
+than read off the grammar — because a grammar arrives through a dynamic `import()` and the fold
+restore has to run inside the editor's **mount dispatch**, one transaction with the remembered
+scroll. Two dispatches would lay the document out at its unfolded heights, scroll to a line, and
+*then* collapse several thousand lines above it, landing the user somewhere they have never been
+— once per restore, on every file they had folded.
+
+So `grammar()` now hands its input back as `.spec`, and `check:editor` compares every mirrored
+field of every language against the grammar it must not disagree with. The failure it prevents is
+specific and silent: a `lineComment` reading `#` for Rust makes every `#[derive(…)]` a dead line,
+half the braces are never seen, and the outer `impl` quietly stops being foldable.
+
+### Folds persist, as start lines
+
+They ride the per-file view memory that already existed — `ViewPosition` gained a `folds:
+Vec<u32>`, so a fold reaches the disk through the same four-stage write ladder a scroll does
+(`positions_state.rs` has the ladder). Nothing new crosses the wire and there is no new Tauri
+command; folding is entirely client-side.
+
+**Start lines and not offsets**, and that is the whole design. A record is written against one
+version of a file and applied to another — the agent rewrote it, a `cargo fmt` shortened it. A
+line that no longer names a foldable range is dropped in silence, which is the ordinary case and
+not an error; a stale *offset* would collapse a range of text nobody chose. `clampView` therefore
+**filters** folds where it **clamps** the caret: landing a caret on the last line of a shortened
+file is a disappointment, and collapsing whatever block now sits there is a piece of the document
+silently missing, in the file that has just changed under the user.
+
+`remember_position` sorts, dedupes and caps the list at `MAX_FOLDS` (256) in Rust rather than
+trusting the webview, for the reason `touched_at` is stamped there: a `ViewPlugin` that appended
+instead of replacing would otherwise grow one entry of `positions.json` without bound. The sort
+is not only hygiene — `sameView` compares the lists element-wise, so an unsorted list read back
+from disk would look different from the identical one the editor holds and note itself again on
+every mount.
+
+### What is not done
+
+- **Nothing here has been confirmed on screen.** The standing reason plus a new one: the author
+  of this change was running inside the user's own installed AppImage, and `run.sh` stops any
+  instance already running. What *is* covered is more than usual — `check:editor` compiles
+  `folding.ts` in a second pass and drives all seven commands against a real `EditorState` with
+  the real extension installed, including the persistence round trip and a fold surviving an edit
+  above it. What no check in this repo can speak to is the picture: the chevrons, the hover
+  reveal, the placeholder, and whether the scroll lands right after a restore.
+- **There is no "fold selection".** IDEA's `Ctrl+.` is Fold Selection and creates an ad-hoc
+  region; here it is Toggle, and an ad-hoc fold would be a second kind of record in
+  `positions.json` — a range, not a line — with the offset-rot problem the line-based design
+  exists to avoid.
+- **`.cm-gutters` reserves the fold column unconditionally**, including in a `.txt`, which is why
+  a file with no known language folds by indentation instead of not folding at all. The
+  alternative was a `:has()` reservation like the blame column's, and it moves every line number
+  sideways when you switch from a `.md` tab to a `.rs` one.
+- **Folds are per document, not per pane.** A split showing one file twice restores the same
+  folds into both, and collapsing in one does not collapse in the other until the next mount.
+  Same shape as the remembered scroll position, and the same argument: the record is keyed on
+  the file.
 
 ## Sending a selection to a named conversation (M19), and what is not done
 

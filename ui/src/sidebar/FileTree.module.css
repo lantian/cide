@@ -446,6 +446,18 @@
   text-decoration: line-through;
 }
 
+/*
+ * A conflicted path. (M20)
+ *
+ * `--red`, which in this app means one thing — *this needs a decision before anything else can
+ * happen* — and is spent nowhere else in the tree. It is deliberately not `--blue`: the whole
+ * reason this status stopped collapsing into `modified` is that a conflicted file which looks
+ * like an ordinary edit is one somebody opens, edits over git's markers, and saves.
+ */
+.statusConflicted {
+  color: var(--red);
+}
+
 /* The `D` itself: faint, but not struck through — a one-glyph tag with a rule through it is
    unreadable at this size. */
 .tagDeleted {

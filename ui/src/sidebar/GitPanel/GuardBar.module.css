@@ -24,6 +24,18 @@
   font-size: var(--fs-ui-12);
 }
 
+/*
+ * The merge bar's glyph. (M20)
+ *
+ * `--red` rather than the guard's yellow, and the distinction is the whole reason for a second
+ * class: yellow above means *two views of the index disagree and you may ignore this*, which is
+ * true of the staging guard and is exactly not true here. A conflict blocks the commit until
+ * somebody decides something.
+ */
+.glyphConflict {
+  color: var(--red);
+}
+
 .text {
   flex: 1 1 auto;
   min-width: 0;
@@ -57,9 +69,27 @@
   cursor: pointer;
 }
 
-.action:hover {
+.action:hover:not(:disabled) {
   border-color: var(--accent-dim);
   color: var(--text-hi);
+}
+
+/*
+ * A disabled action has to *look* disabled. (M20)
+ *
+ * There was no rule here at all, because `GuardBar`'s own two buttons are never disabled — and
+ * the omission stopped being harmless the moment `MergeBar` reused this stylesheet and disabled
+ * *Continue* while files are still unresolved. The button kept its border, its colour, its hover
+ * and its `cursor: pointer`, so it read as live and did nothing when pressed: a dead control,
+ * which is the exact complaint this project keeps answering.
+ *
+ * `not(:disabled)` on the hover rule above is the other half — a control that lights up under
+ * the pointer and then refuses is worse than one that never lit up.
+ */
+.action:disabled {
+  color: var(--faint);
+  border-color: var(--border-soft);
+  cursor: default;
 }
 
 .action:focus-visible {

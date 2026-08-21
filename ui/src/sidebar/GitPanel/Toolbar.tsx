@@ -21,10 +21,14 @@ export interface ToolbarProps {
   onRefresh: () => void
   onUnstage: () => void
   /**
-   * Pull. Optional, and the button is disabled while it is absent: there is no pull in the
-   * command surface this panel was built against, and a button labelled "Update project"
-   * that quietly re-reads status instead would be a lie about whether the remote was
-   * contacted. Disabled-with-a-tooltip is the honest placeholder.
+   * Pull — IDEA's *Update project*.
+   *
+   * Still optional, and the button still disables itself when it is absent, but the reason has
+   * changed. It used to be that *there is no pull in the command surface this panel was built
+   * against*, which stopped being true in M10 and left this button dead for two milestones
+   * because nothing was ever passed. Now it is absent only where there is no dispatcher to
+   * route to — the fixture stories and `check:render`'s SSR pass — and a button that quietly
+   * re-read status instead would still be a lie about whether the remote was contacted.
    */
   onUpdate?: (() => void) | undefined
   onShelve: () => void
@@ -75,7 +79,9 @@ export function Toolbar(props: ToolbarProps) {
     {
       glyph: '↻',
       label:
-        props.onUpdate === undefined ? 'Update project — needs a pull command' : 'Update project',
+        props.onUpdate === undefined
+          ? 'Update project — not available in this view'
+          : 'Update project',
       onClick: props.onUpdate ?? (() => {}),
       disabled: props.onUpdate === undefined,
     },

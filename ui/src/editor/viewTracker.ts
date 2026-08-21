@@ -27,6 +27,7 @@
  */
 import { EditorView, ViewPlugin, type ViewUpdate } from '@codemirror/view'
 import type { Extension } from '@codemirror/state'
+import { foldedStartLines, isFoldEffect } from './folding'
 import { topVisibleLine, worthNoting, type FileView } from './position'
 
 /**
@@ -81,6 +82,7 @@ function observe(view: EditorView, path: string): FileView {
     line: line.number,
     column: head - line.from + 1,
     topLine: firstVisibleLine(view),
+    folds: foldedStartLines(view.state),
   }
 }
 
@@ -125,11 +127,18 @@ class ViewTracker {
   update(update: ViewUpdate): void {
     // `geometryChanged` is in the list because a pane resize moves which line is at the top
     // without moving the caret or the scroll offset by a pixel.
+    //
+    // A fold is a `StateEffect` and changes neither the document nor the selection, so it would
+    // reach none of the first two tests. It *does* change block heights, which today makes
+    // `geometryChanged` true — and that is exactly the kind of correctness that survives until
+    // CodeMirror gets cleverer about measuring, so the effects are tested for by name rather
+    // than relied on to arrive as a side effect. (M19)
     if (
       update.selectionSet ||
       update.docChanged ||
       update.viewportChanged ||
-      update.geometryChanged
+      update.geometryChanged ||
+      update.transactions.some((tr) => tr.effects.some(isFoldEffect))
     ) {
       this.schedule()
     }
