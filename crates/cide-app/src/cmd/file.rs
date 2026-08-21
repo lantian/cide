@@ -44,7 +44,15 @@ pub fn tab_open_file(
 /// Split out so [`terminal_open_path`] can perform its refusals and then land in *this* tab
 /// list rather than growing a second one. Two functions that both open file tabs is how two
 /// tabs over one path come back.
-fn open_file_tab(state: &WorkspaceState, project: ProjectId, path: PathBuf) -> Result<TabId> {
+///
+/// `pub(crate)` for the same reason, one caller further out: `crate::edit_wait` opens the tab a
+/// blocked `cide --wait` is waiting on, and it needs the deduplication above — a second tab over
+/// the path would be a second buffer over the file the CLI is about to read back.
+pub(crate) fn open_file_tab(
+    state: &WorkspaceState,
+    project: ProjectId,
+    path: PathBuf,
+) -> Result<TabId> {
     state.update(|ws| {
         let existing = workspace::project(ws, project)?
             .tabs

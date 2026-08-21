@@ -68,6 +68,12 @@ caps how many windows a file may produce, and `run.sh` checks before anything is
 ./run.sh --on-top           # keep the window above others, for screenshots
 ```
 
+The binary has a **second mode**, which is not a way to start the app: `cide --wait <file>` opens
+that file in the cide already running and blocks until the tab is closed. It is what a pane's
+`$EDITOR` points at, so Claude Code's Ctrl+G edits a plan in cide rather than in whatever the CLI
+guessed — see *Ctrl+G edits the plan in cide* below. It needs `$CIDE_EDIT_SOCK`, which only a
+child cide spawned has, and says so if run anywhere else.
+
 ### Environment variables
 
 | variable | effect |
@@ -2999,10 +3005,12 @@ binding exists now, spelled `Mod-Shift-Arrow` off macOS and `Mod-Alt-Shift-Arrow
 `check:editor` **computes** the freedom of both — expanding the composed CodeMirror keymap the way
 CodeMirror expands it, `shift:` sub-bindings and `mac:` overrides included — rather than trusting
 the documentation, since trusting the documentation is what produced the sentence being replaced.
-`check:keys` holds the other end: the re-homed chord is read out of `EditorSurface.tsx` and asserted
+`check:keys` holds the other end: the re-homed chord is read out of `editorKeys.ts` and asserted
 **unbound in `cide_core::keymap`**, on both layers, because the gate is a window capture listener
 and a `ctrl+shift+up` added there next year would delete the capability a second time in exactly
-the way it was deleted the first — with no conflict visible to either side alone.
+the way it was deleted the first — with no conflict visible to either side alone. The binding sat
+inline in `EditorSurface.tsx` until M17 moved it into `editorKeys.ts`; see *Ctrl+D duplicates a
+line* for what that was worth.
 
 **Still chord-only.** Move line up/down has a key and nothing else: no palette row, no *Code* menu
 item. `moveLineUp` is a `@codemirror/commands` function, not a `cide-core::commands` id, and giving
@@ -3435,6 +3443,110 @@ So the keystroke is now *always* intercepted, and re-emitted as `\x16` to the CL
 clipboard turns out to hold no text. Text pastes through cide; an image still reaches Claude's own
 handler, one round trip later. Both live in the single implementation in `terminal/clipboard.ts`
 that the keystroke and the context menu share.
+
+## Ctrl+G edits the plan in cide, and why it used to say VS Code (M20)
+
+> *"Why in claude session i see: `ctrl+g to edit in VS Code` but we here have integration with
+> cide IDE, why ctrl+g not opens plan in cide and opens it in vscode?"*
+
+**Ctrl+G was never part of the IDE integration**, and the integration was working the whole time.
+`cide-ide-mcp` publishes `ideName: "cide"` into `~/.claude/ide/<port>.lock`, a real CLI reads it,
+picks the WebSocket transport and completes the handshake — that is the channel carrying
+`openDiff`, `openFile` and `getDiagnostics`. The external editor is a different mechanism that
+happens to be reachable from the same session, and it never asks the IDE anything.
+
+What it does instead, read out of the 2.1.238 bundle: resolve `$EDITOR`; failing that, take the
+first of `code`, `vi`, `nano` that is on `PATH`; look the result up in a table
+(`{code: "VS Code", cursor: "Cursor", vi: "Vim", …}`) for the hint; then `spawnSync` it with a
+file, **block the agent's turn until that process exits**, and read the file back off disk. cide
+set no `EDITOR` and `/usr/bin/code` existed, so the hint said *VS Code* on a machine where nothing
+about VS Code was otherwise involved. It would have said the same on one with no VS Code
+integration at all — the sentence was never evidence about which IDE the CLI was talking to.
+
+### Why this could not be `openFile`
+
+That is the obvious fix and it does not work. The CLI does not want the file *shown*; it wants **a
+process whose exit means the human is finished**, because what it does after the wait is read the
+file. An MCP call returns as soon as the tab is on screen and contains no such moment, so routing
+Ctrl+G through the IDE socket would hand Claude Code an unedited file and call it a success.
+
+So the `cide` binary grew a second mode. `cide --wait <file>` opens the file in the running
+application and does not exit until the tab is closed, which is `code -w`'s contract and the one
+the CLI already knows how to consume. `main.rs` dispatches it **before the graphics ladder**: this
+mode creates no window, needs no display, and every line below that branch is setting an
+environment variable for a webview it never builds.
+
+### A third socket, and why it is not either of the two that existed
+
+`$CIDE_EDIT_SOCK`, at `$XDG_RUNTIME_DIR/cide-edit-<pid>.sock`, `0600`, unlinked on drop — the
+lifecycle is copied from `hooks.rs` and `agent_rpc.rs` line for line. What is not copied is the
+socket itself, because both of the others are the wrong shape:
+
+| socket | shape | why not this |
+| --- | --- | --- |
+| `CIDE_HOOK_SOCK` | write-and-forget, one connection per frame, every frame serialised through one applier thread | a verb that blocks for as long as a human is editing would occupy that thread and take every session's busy/idle chrome down with it |
+| `CIDE_AGENT_SOCK` | MCP, and its header line is an **authorisation** — it decides which project's tasks a model may write | `cide --wait` is not a model and asks for no tools; the one place that answers *what may this caller reach* should not also answer something else |
+
+### What "finished" means, and the three cheaper answers that are wrong
+
+The wait ends when **no tab anywhere in the workspace is showing that path**.
+
+* *Watch the `TabId` we opened.* A tab detached into its own window and re-docked comes back with a
+  **fresh id**, so tearing the editor out into a window would release the CLI's turn mid-sentence.
+* *Wait for a save.* People save several times and close once.
+* *Resolve from the close paths, the way the `openDiff` broker does.* That is edge-triggered and
+  needs every close path enumerated — `tab_close`, closing a project, closing a window, the quit
+  ladder — and a path added next year silently stops resolving. Missing one does not cost a stale
+  tab; it costs a `claude` turn that never ends.
+
+So the check is level-triggered and therefore a poll: one uncontended mutex and a walk of a few tab
+lists every 250 ms, for as long as one person has one file open. It rides on the socket's own read
+timeout, so the syscall that paces the loop is also the one that notices the client dying — `Ok(0)`
+is EOF and only EOF, because the client writes one line and then waits.
+
+Which project the tab lands in is four questions in order: the client's `CIDE_SESSION` (a Claude
+pane has one, and it is the only fact here that is not a guess — the plan file itself is under
+`/tmp` and inside no project at all), then the client's cwd (a *shell* pane gets no `CIDE_SESSION`,
+so a `git commit` in one has nothing else), then the file's own path, then whatever the user is
+looking at. The session is read from the client's own environment and never from an argument — the
+rule `cide-hook`'s `forward` states and all three sockets now depend on.
+
+### Three refusals in `child_env::editor_env`, each avoiding something worse than the default
+
+* **No socket, no `EDITOR`.** Both variables come out of one function so a spawn site cannot ship
+  one without the other. `cide --wait` with nowhere to report can only fail, and an editor that
+  fails every time is strictly worse than the `code` guess it displaced.
+* **A path with whitespace in it, no `EDITOR`.** The CLI splits this variable on `" "` with no
+  quoting and no shell, so `/Applications/My App.app/…/cide` names a program called
+  `/Applications/My`. macOS-shaped, unfixable from this end, and a `warn` rather than a silence.
+* **An `EDITOR` the user already set is never overwritten.** `EDITOR=nvim` is an answer someone
+  already gave, for `git commit` as much as for Ctrl+G. The reported case is the *unset* one, which
+  is exactly the case where the CLI guesses. A user's `.bashrc` still wins over cide either way,
+  since it runs after the environment is inherited.
+
+Set for **every** pane, shell as well as Claude, for the reason `CLAUDE_CODE_SSE_PORT` is: a
+`git commit` in a cide shell wants the same editor a `claude` there would get.
+
+### Not done
+
+* **Nothing here has been run against a live `claude`.** The unit tests cover the placement and the
+  wait condition; `crates/cide-app/tests/edit_wait.rs` drives the real binary against a socket the
+  test owns and pins the half that is a process — the argv, the cwd-relative path resolution, that
+  it does *not* exit while the answer is outstanding, and the exit code. What no test here reaches
+  is the CLI actually pressing Ctrl+G, because that needs a restart of the running instance.
+* **The CLI will enter the alternate screen while you edit.** It classifies an editor as *GUI* by
+  substring-matching the command's basename against `["code", "cursor", "windsurf", "codium",
+  "subl", "atom", "gedit", "notepad++", "notepad"]`; `cide` matches none, so it is treated as a
+  terminal editor and the pane blanks until the tab closes. Cosmetic, and not fixable without
+  naming the binary after somebody else's.
+* **A dispatched subagent's pane does not get it.** `cide-agents`' harnesses compose their own
+  environment and are not passed the socket, so a run's `claude` falls back to the CLI's guess.
+* **Quitting cide mid-edit ends the wait as a failure.** The connection dies, the client exits
+  non-zero, and the CLI reports that rather than reading the file back. Honest, and noisier than a
+  clean answer would be.
+* **`ServerEvent::OpenFile` is still a `tracing::debug!` and nothing else.** The IDE socket's own
+  `openFile` — a different caller with a different contract — remains unwired; it was unwired
+  before this and is not what Ctrl+G goes through.
 
 ## Verifying the Claude Code CLI
 
@@ -4523,6 +4635,36 @@ so a chord claimed twice reported the *last* binding — while CodeMirror's `run
 *first*. The two answers are opposites, and they differ in precisely the case the expansion exists
 to catch: a chord that is bound and shadowed. First claim wins now. It changed no existing answer,
 which is the other half of why it was safe to have been wrong.
+
+**Move line up/down rode along, and gained two surfaces doing it.** Ctrl+Shift+Up/Down (⌘⌥⇧↑/↓ on
+macOS) lived inline in `EditorSurface.tsx`, which made move-line true of exactly one of the three
+editable surfaces `editorKeys.ts` exists to keep in step: the diff pane's proposed side and the
+merge pane's result pane are both places a user edits text, and both had Ctrl+D and no way to move
+a line — *duplicate* was the only line command in the pane. Both chords are in `lineEditKeymap` now
+and all three surfaces get both. It costs nothing extra to put them there: `moveLine` guards on
+`state.readOnly` and returns `false` exactly as `copyLine` does, which is the same guarantee that
+already let one array serve `DiffPane`'s read-only side and `MergePane`'s two conflict panes.
+`check-editor.mjs` drives it rather than asserting about it — the line ends up one line over with
+the caret riding it, a multi-line selection moves as a block, the line count is unchanged, and both
+directions refuse a read-only state — and computes the chord's freedom against an **upstream-only**
+expansion, because asking the full composed map whether `Mod-Shift-ArrowUp` is claimed now answers
+"yes, by us" for ever and would hide the very collision the expansion exists to catch.
+
+**Then the chord the report was actually about.** `Ctrl+Shift+Arrow` is the compensation the app
+keymap owes, but the chord a hand reaches for to move a line is **⌥⇧↑/↓** — IDEA's spelling on
+every platform — and in `defaultKeymap` that is `copyLineUp`/`copyLineDown`, so it *duplicated* the
+line above or below instead. `editorKeys.ts` said in as many words that IDEA's spelling "loses,
+because trading one capability for another is not a re-homing". That was true while duplicate-line
+had no other chord and stopped being true the moment Ctrl+D landed: duplicate-below is Ctrl+D, and
+duplicate-above is re-homed to **Ctrl+Alt+D** — free in both layers and unbound in
+`cide_core::keymap`, both computed rather than asserted from the paragraph. So `Shift-Alt-Arrow`
+moves a line now, in all three surfaces, shadowing `defaultKeymap` rather than deleting it: the
+array is spread ahead of it and CodeMirror stops at the first command that returns `true`.
+`check:editor` writes that up the other way round from the re-homed pair — upstream **must** still
+claim the chord, or the shadowing is decoration — and `check:keys` now reads *every* literal
+binding in the file, not just the two with a `mac:` spelling, and asserts each one unbound in
+`cide_core::keymap`. Its regex had required `run: x }`, so the three bindings carrying
+`preventDefault` had been skipped in silence.
 
 **And a comment in `MergePane` that was false in the hardest way to notice.** Its Ctrl+Z handler
 says *"the centre pane's CodeMirror history owns typing, and it must go on owning it"*, and steps

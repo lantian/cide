@@ -13,6 +13,7 @@ pub mod agent_rpc;
 pub mod agents;
 pub mod closed_tabs;
 pub mod cmd;
+pub mod edit_wait;
 pub mod emit;
 // M8: one file index, picker and watcher per project.
 pub mod files;
@@ -630,6 +631,27 @@ pub fn run() {
                 // cannot connect, precisely so that this failure is not a broken `claude`.
                 Err(error) => {
                     tracing::error!(%error, "no agent rpc socket; sessions get no task tools")
+                }
+            }
+
+            // And the editor socket, third and last of the three, for the same ordering reason
+            // again: `CIDE_EDIT_SOCK` is read out of a child's environment at exec, so a pane
+            // spawned before this binds has no way to be told about it later.
+            //
+            // A *separate* socket from both above rather than a fourth verb on either — the hook
+            // socket is write-and-forget and strictly serialised, the agent socket's header line
+            // is an authorisation decision about MCP tools, and this one blocks a thread for as
+            // long as a human is editing a file. See `edit_wait`'s header.
+            match edit_wait::EditWaitServer::start(app.handle().clone()) {
+                Ok(server) => {
+                    app.manage(server);
+                }
+                // Costs Ctrl+G in a Claude pane and nothing else: `child_env::editor_env` sets
+                // `EDITOR` only when there is a socket to name, so a child gets exactly the
+                // environment it had before this feature existed and the CLI falls back to its
+                // own guess.
+                Err(error) => {
+                    tracing::error!(%error, "no edit socket; $EDITOR is left to the user's own")
                 }
             }
 

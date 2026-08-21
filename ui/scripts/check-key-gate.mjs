@@ -1673,7 +1673,7 @@ try {
   }
 
   /* ------------------------------------------------------------------------------------
-   * M16: the chords `EditorSurface` re-homes must stay unbound in the app keymap.
+   * M16: the chords `editorKeys.ts` re-homes must stay unbound in the app keymap.
    *
    * # The conflict neither side can see alone
    *
@@ -1684,12 +1684,18 @@ try {
    * comment in `keymap.rs` claiming `EditorSurface` compensated for it and `grep moveLineUp
    * ui/src` returning nothing. That comment had been wrong since M12.
    *
-   * `EditorSurface` now re-homes both to `Mod-Shift-Arrow` (and `Mod-Alt-Shift-Arrow` on
+   * `lineEditKeymap` now re-homes both to `Mod-Shift-Arrow` (and `Mod-Alt-Shift-Arrow` on
    * macOS). The compensation is only worth anything while those chords stay free, and **no
    * existing gate can see that**: `the_default_keymap_has_no_conflicts` sees one table,
    * `check-editor.mjs` sees the other, and neither knows the other exists. A `ctrl+shift+up`
    * added to `defaults()` next year deletes move-line a second time in exactly the way it was
    * deleted the first.
+   *
+   * **The bindings moved out of `EditorSurface.tsx` in M17** — into `editor/editorKeys.ts`,
+   * beside Ctrl+D, because the diff pane and the merge pane install that array too and had
+   * duplicate-line with no way to move a line. This block reads them from there now. Reading
+   * the array rather than the surface is also the stricter choice: three surfaces mount it, so
+   * a chord that goes free here goes free in all three at once.
    *
    * Both sides are folded through `normalizeSequence` rather than compared as literals. That is
    * not defensive: this side builds a stroke in its own modifier order (`alt+shift+meta+up`)
@@ -1697,9 +1703,7 @@ try {
    * goes green against the very binding it forbids. It did, in the first draft.
    * ---------------------------------------------------------------------------------- */
   {
-    const surfacePath = fileURLToPath(
-      new URL('../src/editor/EditorSurface.tsx', import.meta.url),
-    )
+    const surfacePath = fileURLToPath(new URL('../src/editor/editorKeys.ts', import.meta.url))
     // Comments stripped, and load-bearing: the paragraph beside those two bindings names both
     // chords and both command names at length, so a grep over raw source finds the feature's
     // *explanation* after the feature has been deleted.
@@ -1727,15 +1731,30 @@ try {
           .join('+'),
       )
 
+    /*
+     * Every literal binding in the file, not only the two that carry a `mac:` spelling.
+     *
+     * The `mac:` group is optional because most of these are one chord on every platform —
+     * IDEA's `Shift-Alt-Arrow` for move-line, `Mod-Alt-d` for duplicate-above, `Alt-j` for
+     * select-next-occurrence — and every one of them is a chord the app keymap must leave alone
+     * for the same reason the re-homed pair is: the gate is a window CAPTURE listener, so a
+     * `defaults()` entry on any of them swallows the stroke before the editor is asked. When a
+     * binding names no `mac:`, CodeMirror uses `key` on both platforms, so the mac stroke is the
+     * same spelling with `Mod` resolved the other way — which is what `asStroke(key, true)` does.
+     *
+     * The tail is `[\s,}]` rather than `\s*\}` because `preventDefault: true` follows `run:` in
+     * three of these. Requiring the brace meant the regex silently skipped exactly the bindings
+     * that had an extra property, which is the quiet half of a check that cannot fail.
+     */
     const rehomed = [
       ...surface.matchAll(
-        /\{\s*key:\s*'([^']+)'\s*,\s*mac:\s*'([^']+)'\s*,\s*run:\s*(\w+)\s*\}/g,
+        /\{\s*key:\s*'([^']+)'\s*,\s*(?:mac:\s*'([^']+)'\s*,\s*)?run:\s*(\w+)\s*[,}]/g,
       ),
-    ].map((m) => ({ key: m[1], mac: m[2], run: m[3] }))
+    ].map((m) => ({ key: m[1], mac: m[2] ?? m[1], run: m[3] }))
 
     ok(
       rehomed.length > 0,
-      'EditorSurface re-homes at least one command taken by the app keymap. Every assertion ' +
+      'editorKeys.ts re-homes at least one command taken by the app keymap. Every assertion ' +
         'below is vacuous without one, and the state this whole block exists for is exactly ' +
         'the state where the re-homing has been deleted and its paragraph left behind',
     )

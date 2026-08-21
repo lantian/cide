@@ -253,6 +253,143 @@ pub fn claude_env(settings: &cide_ipc::ClaudeSettings) -> Vec<EnvChange> {
     ]
 }
 
+// ==========================================================================================
+// Part one and three-quarters: `EDITOR`, and the editor it names. (M20)
+// ==========================================================================================
+
+/// The variable Claude Code's Ctrl+G reads — and `git commit`, and `crontab -e`, and everything
+/// else that hands a human a file and waits.
+const EDITOR_VAR: &str = "EDITOR";
+
+/// Where the editor [`EDITOR_VAR`] names reports back to. Set beside it and never without it.
+const EDIT_SOCK_VAR: &str = "CIDE_EDIT_SOCK";
+
+/// The subcommand [`editor_env_in`] spells and `cide_app::edit_wait::cli` parses.
+///
+/// A constant in this crate rather than a literal at each end, because the two ends are in
+/// different crates and a typo in either is a `$EDITOR` that fails at the moment a user presses
+/// a key, with the message coming from a process three removes away.
+pub const WAIT_FLAG: &str = "--wait";
+
+/// Said once per process, when this executable's path cannot be spelled in `$EDITOR`.
+static EDITOR_UNSPELLABLE: std::sync::Once = std::sync::Once::new();
+
+/// `EDITOR` for a PTY child, and the socket the editor it names reports back over. (M20)
+///
+/// # The report
+///
+/// > *"Why in claude session i see: `ctrl+g to edit in VS Code` but we here have integration
+/// > with cide IDE, why ctrl+g not opens plan in cide and opens it in vscode?"*
+///
+/// **Ctrl+G was never part of the IDE integration.** `cide-ide-mcp` publishes `ideName: "cide"`
+/// in `~/.claude/ide/<port>.lock` and a real CLI connects to it; that channel carries
+/// `openDiff`, `openFile` and `getDiagnostics`, and it was working. The external editor is a
+/// separate mechanism with a different shape. The CLI resolves `$EDITOR`, and failing that takes
+/// the first of `code`, `vi`, `nano` that is on `PATH`; it then `spawnSync`s that command with
+/// the file, **blocks its own turn until that process exits**, and reads the file back off disk.
+/// cide set no `EDITOR` and `/usr/bin/code` existed, so the hint read *VS Code* on a machine
+/// where nothing about VS Code was otherwise involved — it would have said the same on one with
+/// no VS Code integration at all.
+///
+/// The read-back-after-exit is also why this cannot be an `openFile` over the MCP socket, which
+/// is the obvious-looking fix and the wrong one: the CLI needs *a process whose exit means the
+/// human is finished*, and a call that returns as soon as the tab appears contains no such
+/// moment. Hence a second mode of the `cide` binary — `cide --wait <file>` — and hence this
+/// variable, which is the only way a child can be told which running cide to report to.
+///
+/// # Three refusals, each avoiding a state worse than the default
+///
+/// **No socket, no `EDITOR`.** The two go out together or not at all. `cide --wait` with no
+/// `$CIDE_EDIT_SOCK` can do nothing but exit non-zero, so a spawn site that set the command
+/// without the socket would hand its children an editor that fails *every* time — strictly
+/// worse than the `code` fallback it displaced. Returning both from one function is what makes
+/// that combination unrepresentable at a call site instead of a rule to remember at three.
+///
+/// **A path with whitespace in it, no `EDITOR`.** The CLI splits this variable on `" "` and
+/// takes the first field as the program. There is no quoting, no escaping and no shell, so an
+/// executable at `/Applications/My App.app/…/cide` cannot be spelled here at all and the value
+/// that would go out names a program called `/Applications/My`. Refusing leaves the CLI's own
+/// guess in place, which at least opens something. This is a macOS-shaped hazard and there is
+/// no way to fix it from this end; it is a `warn` rather than a silence for that reason.
+///
+/// **An `EDITOR` the user already set is never overwritten.** Someone with `EDITOR=nvim` in
+/// their profile has already answered this question, for `git commit` as much as for Ctrl+G,
+/// and a terminal emulator that quietly replaced it would be answering one nobody asked. The
+/// case in the report is the *unset* one — which is exactly the case where the CLI guesses — so
+/// this reaches precisely the population that had no answer of its own. The user's shell still
+/// has the last word either way: an `export EDITOR=…` in a `.bashrc` runs after the environment
+/// is inherited and wins, which is how a desktop-launched cide with an empty environment ends
+/// up doing what someone's dotfiles say rather than what this function assumed.
+///
+/// # Why this is not folded into [`terminal_child_env`]
+///
+/// That function composes from constants and from the user's settings, and takes nothing that
+/// only the running application knows. The socket path is exactly that: it carries cide's pid
+/// and does not exist until `cide_app::edit_wait::EditWaitServer` has bound it. It is applied
+/// where `CIDE_HOOK_SOCK` and `CIDE_AGENT_SOCK` are, beside the two other sockets a child is
+/// told about, and for the same reason they are there.
+pub fn editor_env(socket: Option<&std::path::Path>) -> Vec<EnvChange> {
+    let exe = std::env::current_exe().ok();
+    let inherited = std::env::var_os(EDITOR_VAR);
+    let changes = editor_env_in(exe.as_deref(), socket, inherited.as_deref());
+
+    // The whitespace refusal, and only that one: the other two are ordinary states (no socket
+    // because the server did not bind; an `EDITOR` because the user set one) and neither is
+    // worth a line. This one is a packaging fact the user cannot see and cannot act on from
+    // inside cide, so it goes in the log a bug report carries.
+    if changes.is_empty()
+        && socket.is_some()
+        && inherited.is_none()
+        && let Some(exe) = exe.as_deref()
+    {
+        EDITOR_UNSPELLABLE.call_once(|| {
+            tracing::warn!(
+                exe = %exe.display(),
+                "this executable's path cannot be spelled in $EDITOR; Ctrl+G in a Claude pane \
+                 falls back to the CLI's own guess"
+            );
+        });
+    }
+    changes
+}
+
+/// The rule itself, over values rather than over this process. See [`editor_env`].
+///
+/// Pure for [`bundle_scrub_from`]'s reason: the alternative is a test that calls `set_var`,
+/// which is `unsafe` in edition 2024 precisely because it races every other thread reading the
+/// environment, and this crate's tests share a process with everything else.
+pub fn editor_env_in(
+    exe: Option<&std::path::Path>,
+    socket: Option<&std::path::Path>,
+    inherited: Option<&OsStr>,
+) -> Vec<EnvChange> {
+    // Empty counts as unset, because that is how the reader treats it: the CLI's test is
+    // `if (V.EDITOR)`, and the empty string is falsy there. Leaving an empty value in place
+    // would be deferring to a preference nobody expressed.
+    if inherited.is_some_and(|value| !value.is_empty()) {
+        return Vec::new();
+    }
+    let (Some(exe), Some(socket)) = (exe, socket) else {
+        return Vec::new();
+    };
+    // Both have to survive as UTF-8, since [`EnvChange`] cannot carry anything else. Lossy
+    // would be worse than nothing in both slots: it would name a path that does not exist
+    // rather than fail to name one, which turns a missing feature into a failing one.
+    let (Some(exe), Some(socket)) = (exe.to_str(), socket.to_str()) else {
+        return Vec::new();
+    };
+    // `char::is_whitespace` and not `== ' '`: the CLI splits on a literal space, so a tab in a
+    // path would survive this check and then be handed to `spawnSync` as part of the program
+    // name. Both are absurd in a path and both are cheaper to exclude than to reason about.
+    if exe.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    vec![
+        (EDIT_SOCK_VAR.to_string(), Some(socket.to_string())),
+        (EDITOR_VAR.to_string(), Some(format!("{exe} {WAIT_FLAG}"))),
+    ]
+}
+
 /// Is this path-list entry inside the bundle?
 ///
 /// The boundary is a whole path component, so `/tmp/.mount_cideAAA` does not swallow
@@ -1368,5 +1505,99 @@ mod claude_env_tests {
             "a field added to ClaudeSettings whose environment variable never got a line here \
              is exactly the defect this module was written to end"
         );
+    }
+}
+
+/// The `EDITOR` rule.
+///
+/// Apart from both modules above for [`claude_env_tests`]'s reason: what these hold is the set
+/// of states in which cide must *decline* to name itself as the editor, and each of those was
+/// found by asking what a spawn site could ship that is worse than the CLI's own guess.
+#[cfg(test)]
+mod editor_env_tests {
+    use super::*;
+
+    /// The three-line shape [`editor_env_in`] hands a spawn site, as (name, value) pairs.
+    fn editor(
+        exe: &str,
+        socket: Option<&str>,
+        inherited: Option<&str>,
+    ) -> Vec<(String, Option<String>)> {
+        editor_env_in(
+            Some(std::path::Path::new(exe)),
+            socket.map(std::path::Path::new),
+            inherited.map(OsStr::new),
+        )
+    }
+
+    #[test]
+    fn the_command_is_this_binary_plus_the_wait_flag() {
+        // The whole feature, spelled the one way the CLI can parse: it splits on a space and
+        // execs the first field with the file appended.
+        assert_eq!(
+            editor(
+                "/opt/cide/cide",
+                Some("/run/user/1000/cide-edit-42.sock"),
+                None
+            ),
+            vec![
+                (
+                    "CIDE_EDIT_SOCK".to_string(),
+                    Some("/run/user/1000/cide-edit-42.sock".to_string())
+                ),
+                (
+                    "EDITOR".to_string(),
+                    Some("/opt/cide/cide --wait".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_command_and_the_socket_are_never_separable() {
+        // A `cide --wait` with nowhere to report is an editor that fails every single time,
+        // which is worse than the `code` guess it would have displaced. Neither variable may
+        // reach a child without the other, in either direction.
+        for changes in [
+            editor("/opt/cide/cide", None, None),
+            editor_env_in(None, Some(std::path::Path::new("/run/s.sock")), None),
+        ] {
+            assert!(
+                changes.is_empty(),
+                "half of the pair went out on its own: {changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_with_a_space_in_it_is_refused_rather_than_mangled() {
+        // `$EDITOR` has no quoting: this value would name a program called `/Applications/My`.
+        // macOS is where such a path is ordinary, which is why this is a refusal and not an
+        // assertion that it cannot happen.
+        assert_eq!(
+            editor(
+                "/Applications/My App.app/Contents/MacOS/cide",
+                Some("/run/s.sock"),
+                None
+            ),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn an_editor_the_user_chose_survives() {
+        // Someone with `EDITOR=nvim` has answered this question already, for `git commit` as
+        // much as for Ctrl+G.
+        assert_eq!(
+            editor("/opt/cide/cide", Some("/run/s.sock"), Some("nvim")),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn an_empty_editor_is_not_a_preference() {
+        // The CLI's own test is `if (V.EDITOR)`, on which "" is falsy: deferring to it would be
+        // deferring to nothing.
+        assert!(!editor("/opt/cide/cide", Some("/run/s.sock"), Some("")).is_empty());
     }
 }

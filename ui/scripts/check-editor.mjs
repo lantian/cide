@@ -3463,7 +3463,7 @@ try {
      * quietly claimed Mod-z would fail here rather than in a bug report.
      */
     const { closeBracketsKeymap } = require('@codemirror/autocomplete')
-    const { copyLineDown, defaultKeymap, historyKeymap, indentWithTab } =
+    const { copyLineDown, defaultKeymap, historyKeymap, indentWithTab, moveLineDown, moveLineUp } =
       require('@codemirror/commands')
     const { selectNextOccurrence } = require('@codemirror/search')
     /*
@@ -3557,12 +3557,12 @@ try {
        * It changed no existing answer here — nothing else in the composed keymap is claimed
        * twice — which is the other half of why it was safe to have been wrong.
        */
-      const claimedOn = (platform) => {
+      const claimedOn = (platform, bindings = composed) => {
         const claimed = new Map()
         const keep = (chord, run) => {
           if (!claimed.has(chord)) claimed.set(chord, run)
         }
-        for (const b of composed) {
+        for (const b of bindings) {
           const spelling = b[platform] ?? b.key
           if (spelling === undefined) continue
           if (b.run) keep(normalizeChord(spelling, platform), b.run)
@@ -3572,6 +3572,16 @@ try {
       }
       const mac = claimedOn('mac')
       const linux = claimedOn('linux')
+      /*
+       * The same expansion with **this project's own array removed**, which is what "is this
+       * chord free?" has to mean once the array being checked is part of `composed`. Asking the
+       * full map whether `Mod-Shift-ArrowUp` is claimed now answers "yes, by us" for ever, and
+       * an upstream binding that landed on the same chord would hide behind our own entry —
+       * which is precisely the collision these two maps exist to catch.
+       */
+      const upstream = composed.filter((b) => !keys.lineEditKeymap.includes(b))
+      const macUpstream = claimedOn('mac', upstream)
+      const linuxUpstream = claimedOn('linux', upstream)
       // The expansion is only worth anything if it reproduces bindings we know are there.
       eq(linux.get('Ctrl-f')?.name, 'openSearchPanel', 'the expansion finds Mod-f on Linux')
       eq(mac.get('Meta-f')?.name, 'openSearchPanel', 'and ⌘F on macOS')
@@ -3750,22 +3760,38 @@ try {
         }
       }
 
-      /* Move line up/down: taken by alt+up/alt+down in the app keymap, re-homed here. */
-      ok(
-        /run: moveLineUp/.test(surface12) && /run: moveLineDown/.test(surface12),
-        'EditorSurface re-homes moveLineUp/moveLineDown. `cide-core::keymap` binds alt+up and ' +
-          'alt+down to the member walk and the key gate is a window CAPTURE listener, so ' +
-          'CodeMirror never sees Alt+Arrow — and the comment beside those bindings claimed this ' +
-          'compensation existed while `grep moveLineUp src/` returned nothing at all',
+      /*
+       * ------------------------------------------------------- move line up/down (M16, M17)
+       *
+       * `alt+up`/`alt+down` are the member walk in `cide-core::keymap` and the key gate is a
+       * window CAPTURE listener, so CodeMirror is never offered `Alt+Arrow`: without a re-homing
+       * there is no move-line in any buffer at all. It was asserted here as a regex over
+       * `EditorSurface.tsx` while it lived inline in that file — which was true and too narrow.
+       * **The binding is `lineEditKeymap`'s now**, so it is read out of the loaded array by
+       * command identity, and the three-surface install check above is what carries it into the
+       * diff and merge panes. Those two had Ctrl+D and no move-line, which is the report.
+       */
+      const moving = keys.lineEditKeymap.filter(
+        (b) => b.run === moveLineUp || b.run === moveLineDown,
+      )
+      eq(
+        moving.map((b) => b.run.name),
+        ['moveLineUp', 'moveLineDown', 'moveLineUp', 'moveLineDown'],
+        'lineEditKeymap moves a line on TWO chords per direction — a chord that duplicates a ' +
+          'line and no chord that moves one is the state this fixed, twice, and it is reachable ' +
+          'again by deleting either pair',
       )
       /*
-       * The chords are read out of the source rather than restated here, so this checks the
-       * binding that ships instead of a copy of it that agrees with it today.
+       * The pair that carries a `mac:` spelling is the app-keymap compensation; the pair that
+       * does not is IDEA's own ⌥⇧↑/↓, which is spelled the same on every platform. They are
+       * checked differently below — one has to be free upstream, the other deliberately is not —
+       * so they are separated here by the property that actually distinguishes them rather than
+       * by position in the array.
        */
-      const homed = [
-        ...surface12.matchAll(/\{ key: '([^']+)', mac: '([^']+)', run: (moveLine(?:Up|Down)) \}/g),
-      ]
-      eq(homed.length, 2, 'both directions are re-homed, and both name a mac spelling of their own')
+      const homed = moving.filter((b) => b.mac !== undefined).map((b) => [b, b.key, b.mac, b.run.name])
+      const idea = moving.filter((b) => b.mac === undefined).map((b) => [b, b.key, b.run.name])
+      eq(homed.length, 2, 'both directions of the re-homed chord name a mac spelling of their own')
+      eq(idea.length, 2, "and both directions of IDEA's chord are spelled once, for all platforms")
       /*
        * `ok`, never `eq`, for "nothing claims this chord". The map holds *functions*, and `eq`
        * compares through `JSON.stringify`, which answers `undefined` for a function — so
@@ -3778,14 +3804,133 @@ try {
         const claim = map.get(normalizeChord(chord, platform))
         return claim === undefined ? null : (claim.name || 'an anonymous command')
       }
-      for (const [, key, macKey, run] of homed) {
-        eq(freeOn(linux, key, 'linux'), null, `${key} (${run}) is free off macOS`)
-        eq(freeOn(mac, macKey, 'mac'), null, `${macKey} (${run}) is free on macOS`)
+      for (const [binding, key, macKey, run] of homed) {
+        eq(freeOn(linuxUpstream, key, 'linux'), null, `${key} (${run}) is free off macOS`)
+        eq(freeOn(macUpstream, macKey, 'mac'), null, `${macKey} (${run}) is free on macOS`)
         ok(
-          freeOn(mac, key, 'mac') !== null,
+          freeOn(macUpstream, key, 'mac') !== null,
           `${key} is NOT free on macOS, which is the whole reason ${run} carries a mac spelling ` +
             'of its own — if upstream ever drops that binding, this fails and the exception goes',
         )
+        /*
+         * And the chord actually resolves to it in the map a buffer composes — the half the
+         * freedom assertions cannot see. `lineEditKeymap` is spread ahead of `defaultKeymap` in
+         * all three surfaces, so this is what fails if someone reorders that spread and lets
+         * `standardKeymap`'s `shift:` sub-binding claim the stroke first.
+         */
+        eq(linux.get(normalizeChord(key, 'linux')), binding.run, `${key} resolves to ${run}`)
+        eq(mac.get(normalizeChord(macKey, 'mac')), binding.run, `${macKey} does on macOS`)
+      }
+      /*
+       * ------------------------------------------------ IDEA's ⌥⇧↑/↓, taken back from copy-line
+       *
+       * This pair is the opposite case and every assertion has to be written the other way up:
+       * the chord is **not** free upstream, it is `copyLineUp`/`copyLineDown`, and taking it is
+       * the point. `Shift-Alt-Arrow` is what a hand reaches for to move a line, it duplicated
+       * one instead, and that is the bug this pair closes.
+       *
+       * So: upstream still claims it (if that ever stops being true, the shadowing is pointless
+       * and this fails, loudly, instead of quietly becoming decoration); and the composed map — the
+       * one a buffer actually resolves through — answers move-line on both platforms, because
+       * this array is spread ahead of `defaultKeymap` and CodeMirror stops at the first command
+       * that returns `true`.
+       */
+      const { copyLineUp } = require('@codemirror/commands')
+      for (const [binding, key, run] of idea) {
+        const taken = run === 'moveLineUp' ? copyLineUp : copyLineDown
+        eq(
+          freeOn(linuxUpstream, key, 'linux'),
+          taken.name,
+          `${key} is upstream's ${taken.name} — the chord ${run} SHADOWS rather than fills`,
+        )
+        eq(freeOn(macUpstream, key, 'mac'), taken.name, `…on macOS too, where IDEA spells it ⌥⇧`)
+        eq(
+          linux.get(normalizeChord(key, 'linux')),
+          binding.run,
+          `${key} resolves to ${run} in the composed map, NOT ${taken.name}. This is the ` +
+            'assertion that fails if someone spreads lineEditKeymap below defaultKeymap — the ' +
+            'binding would still be there and the line would still duplicate',
+        )
+        eq(mac.get(normalizeChord(key, 'mac')), binding.run, `${key} resolves to ${run} on macOS`)
+      }
+      /*
+       * **And duplicate-line moved rather than disappearing**, which is this file's standing rule
+       * and the reason the first attempt at this chord was rejected. `copyLineDown` — the
+       * direction users mean — is Ctrl+D. `copyLineUp` is Ctrl+Alt+D, and it has to be reachable
+       * from exactly one chord: two would mean the re-homing was added without taking the
+       * original, which is the state where nobody notices the trade never happened.
+       */
+      eq(
+        linux.get(normalizeChord('Mod-Alt-d', 'linux')),
+        copyLineUp,
+        'duplicate-above is re-homed to Ctrl+Alt+D rather than deleted to make room',
+      )
+      eq(mac.get(normalizeChord('Mod-Alt-d', 'mac')), copyLineUp, '…and to ⌘⌥D on macOS')
+      eq(
+        keys.lineEditKeymap.filter((b) => b.run === copyLineUp).length,
+        1,
+        'and duplicate-above answers exactly one chord in this array',
+      )
+      eq(
+        keys.lineEditKeymap.filter((b) => b.run === copyLineDown).length,
+        1,
+        '…as does duplicate-below',
+      )
+      /*
+       * **Driven, not asserted about**, for the reason the Ctrl+D block above gives: "bound to
+       * moveLineUp" and "the line ends up one line higher with the caret still on it" are
+       * different claims, and only the second is the feature. The read-only halves are the
+       * load-bearing ones — `lineEditKeymap` is installed on DiffPane's `a` side and on both of
+       * MergePane's conflict sides, and one array is safe for all of them ONLY because
+       * `moveLine` guards on `state.readOnly` exactly as `copyLine` does.
+       */
+      {
+        const { EditorState: ES } = require('@codemirror/state')
+        const asView = (state) => {
+          const v = { state, dispatch: (spec) => { v.state = v.state.update(spec).state } }
+          return v
+        }
+        const DOC = ['one', 'two', 'three'].join('\n')
+
+        const up = asView(ES.create({ doc: DOC }).update({ selection: { anchor: 5 } }).state)
+        eq(moveLineUp(up), true, 'a caret on line 2 moves line 2 up')
+        eq(
+          up.state.doc.toString().split('\n'),
+          ['two', 'one', 'three'],
+          '…by swapping it with line 1 — MOVED, and the line count is unchanged. A duplicate ' +
+            'here is the bug that was reported against the chord',
+        )
+        eq(
+          up.state.doc.lineAt(up.state.selection.main.head).number,
+          1,
+          '…and the caret rides with the line. Leaving it behind turns a held chord into one ' +
+            'move followed by a stationary caret dragging different lines past it',
+        )
+
+        const down = asView(ES.create({ doc: DOC }).update({ selection: { anchor: 5 } }).state)
+        eq(moveLineDown(down), true, 'and the other direction')
+        eq(down.state.doc.toString().split('\n'), ['one', 'three', 'two'], '…swaps it downward')
+
+        const block = asView(
+          ES.create({ doc: DOC }).update({ selection: { anchor: 0, head: 7 } }).state,
+        )
+        eq(moveLineDown(block), true, 'a selection spanning two lines moves as a block')
+        eq(
+          block.state.doc.toString().split('\n'),
+          ['three', 'one', 'two'],
+          '…both lines together, past the one below them',
+        )
+
+        for (const [name, cmd] of [['moveLineUp', moveLineUp], ['moveLineDown', moveLineDown]]) {
+          const ro = asView(ES.create({ doc: DOC, extensions: [ES.readOnly.of(true)] }))
+          eq(cmd(ro), false, `${name} refuses a read-only state, the way copyLineDown does`)
+          eq(
+            ro.state.doc.toString(),
+            DOC,
+            `…and refusing means ${name} wrote nothing. This is what lets ONE array serve ` +
+              "DiffPane's read-only side and MergePane's two conflict panes",
+          )
+        }
       }
 
       /*
@@ -3812,9 +3957,9 @@ try {
        * and the reason the `freeOn` note above says a check that cannot fail is worse than none.
        *
        * The array is bracket-matched rather than regexed to its end: it contains array literals
-       * of its own (`...defaultKeymap` is spread, but the `Alt-Enter` entry and the two re-homed
-       * move-line entries are object literals with nested calls), so `indexOf('])')` finds the
-       * wrong close as soon as anything is added.
+       * of its own (`...defaultKeymap` is spread, but the `Mod-s` and `Alt-Enter` entries are
+       * object literals with nested calls), so `indexOf('])')` finds the wrong close as soon as
+       * anything is added.
        */
       const keymapAt = surface12.indexOf('keymap.of([')
       ok(keymapAt !== -1, 'EditorSurface still builds its own keymap')
@@ -3836,13 +3981,28 @@ try {
         'and EditorSurface actually installs indentWithTab IN ITS KEYMAP — the survival path for ' +
           'indent and dedent on macOS has to be a binding, not merely an import',
       )
-      for (const [, key, macKey, run] of homed) {
-        ok(
-          editorKeymap.includes(key) && editorKeymap.includes(macKey),
-          `and ${run}'s re-homed chords are in that keymap rather than somewhere the view never ` +
-            'reads — an extension built and not mounted is this project\'s most-repeated defect',
-        )
-      }
+      /*
+       * Move-line reaches this keymap through `...lineEditKeymap` rather than as two literals,
+       * and **where in the array that spread sits is the whole of its correctness**. It has to
+       * come before `...defaultKeymap`: `standardKeymap` carries `{ mac: 'Cmd-ArrowUp', shift:
+       * selectDocStart }`, and CodeMirror collects every command claiming one chord into one
+       * list and runs them in array order, so a spread moved below `defaultKeymap` hands ⌘⇧↑ to
+       * select-to-top-of-file first — and that command returns `true` on every document. On
+       * Linux it would still work, which is where this is being written, so nothing local would
+       * ever show it.
+       */
+      const spreadAt = editorKeymap.indexOf('...lineEditKeymap')
+      ok(
+        spreadAt !== -1,
+        'EditorSurface installs lineEditKeymap IN ITS KEYMAP — an extension built and not ' +
+          "mounted is this project's most-repeated defect, and Ctrl+D and move-line both ride " +
+          'in on this one spread now',
+      )
+      ok(
+        spreadAt < editorKeymap.indexOf('...defaultKeymap'),
+        '…and before defaultKeymap, which is what keeps Mod-Shift-Arrow ahead of ' +
+          "standardKeymap's `shift:` sub-bindings on macOS",
+      )
     }
 
     const diffSrc = strip(readFileSync('src/panes/DiffPane.tsx', 'utf8'))

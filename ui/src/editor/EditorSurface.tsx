@@ -22,14 +22,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
-import {
-  defaultKeymap,
-  history,
-  historyKeymap,
-  indentWithTab,
-  moveLineDown,
-  moveLineUp,
-} from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import {
   bracketMatching,
   indentOnInput,
@@ -976,35 +969,20 @@ export function EditorSurface({
           preventDefault: true,
         },
         /*
-         * Move line up / down, re-homed — the compensation `cide-core::keymap` has claimed since
-         * M12 and that nobody had built. (M16)
+         * Ctrl+D — duplicate line or selection — and Ctrl+Shift+Up/Down — move it. Shared with
+         * `DiffPane` and `MergePane`; the bindings and the whole argument for them are in
+         * `editorKeys.ts`.
          *
-         * `alt+up`/`alt+down` are `navigate.prevMember`/`navigate.nextMember` in the app keymap,
-         * and the key gate is a window **capture** listener, so `defaultKeymap`'s
-         * `Alt-ArrowUp`/`Alt-ArrowDown` never see the event: move-line was simply gone from every
-         * buffer, with no replacement anywhere — not in the palette, not in the Code menu. The
-         * comment beside those two bindings said this file re-homed them to `Mod-Shift-Arrow`,
-         * `grep` found nothing, and that comment is now true.
+         * **Move-line lived here, inline, until M17, and that is why it moved.** It is the
+         * compensation for `alt+up`/`alt+down` going to `navigate.prevMember`/`nextMember` in
+         * the app keymap, and a compensation present in one of the three editable surfaces is
+         * the same shape of hole it was built to fill: the diff pane's proposed side and the
+         * merge pane's result pane had Ctrl+D and no way to move a line at all. Both chords now
+         * arrive together, in the array whose header exists to say that three copies drift.
          *
-         * # Why the chord is spelled twice
-         *
-         * `Mod-Shift-Arrow` is free on Linux and Windows and is **not** free on macOS, which is
-         * the half the old comment got wrong: `standardKeymap` carries `{ mac: 'Cmd-ArrowUp',
-         * shift: selectDocStart }`, so ⌘⇧↑/⌘⇧↓ are select-to-top-of-file and select-to-bottom
-         * there. This block is added before `defaultKeymap` and therefore claims first, so
-         * spelling it `Mod-` would take those two away silently. `Mod-Alt-Shift-Arrow` is free in
-         * both layers — checked in `check-editor.mjs` by expanding the composed keymap the way
-         * CodeMirror expands it, `shift:` sub-bindings and per-platform `mac:` spellings included,
-         * rather than by reading the documentation.
-         *
-         * IDEA spells this ⌥⇧↑ on both platforms; that is `Shift-Alt-ArrowUp`, which is
-         * `copyLineUp` here — trading one capability for another is not a re-homing, so it loses.
-         */
-        { key: 'Mod-Shift-ArrowUp', mac: 'Mod-Alt-Shift-ArrowUp', run: moveLineUp },
-        { key: 'Mod-Shift-ArrowDown', mac: 'Mod-Alt-Shift-ArrowDown', run: moveLineDown },
-        /*
-         * Ctrl+D — duplicate line or selection. Shared with `DiffPane` and `MergePane`; the
-         * binding and the whole argument for it are in `editorKeys.ts`.
+         * The ordering that made the inline version correct is unchanged — this spread still
+         * sits before `defaultKeymap`, so `Mod-Shift-Arrow` is claimed before `standardKeymap`'s
+         * `shift:` sub-bindings can look at it.
          *
          * **No `Prec.high` needed, and that is a fact about `find.ts` rather than about this
          * array.** `findExtensions()` is added *earlier* in `shared`, so its keymap is offered

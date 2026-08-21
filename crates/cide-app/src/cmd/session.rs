@@ -838,6 +838,26 @@ pub async fn session_spawn(
         }
     }
 
+    // `$EDITOR`, and the socket the editor it names reports back over. (M20)
+    //
+    // The rule is `cide_core::child_env::editor_env` and the diagnosis is in its header: Ctrl+G
+    // in a Claude pane resolves `$EDITOR` and, finding none, guessed `code` — so a cide session
+    // offered to edit its own plan *in VS Code*. It refuses to set either variable without the
+    // other, and refuses both when the user already chose an editor, so this is a fold and not a
+    // decision.
+    //
+    // **Every pane, not only Claude ones**, and for the reason `CLAUDE_CODE_SSE_PORT` above
+    // gives: a `git commit` or a `crontab -e` in a cide shell wants the same editor a `claude`
+    // there would get, and the socket does not care which program opened the connection.
+    //
+    // Applied *here* rather than inside `terminal_child_env`, which composes from constants and
+    // from the user's settings and takes nothing that only the running application knows. The
+    // socket path carries cide's pid and does not exist until `EditWaitServer` has bound it,
+    // which puts it with the other two sockets rather than with the constants.
+    if let Some(server) = app.try_state::<crate::edit_wait::EditWaitServer>() {
+        spec = spec.apply(cide_core::child_env::editor_env(Some(server.socket())));
+    }
+
     // The task tools. `CIDE_AGENT_SOCK` names the socket `crate::agent_rpc` bound at startup and
     // `--mcp-config` attaches the bridge that reaches it, so a pane's own Claude can read and
     // write `.cide/tasks.json` through `mcp__cide__cide_task_*` rather than by editing the file.
