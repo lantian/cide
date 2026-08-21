@@ -23,6 +23,7 @@ import {
   setDiffView,
   subscribeDiffView,
 } from '@/editor/diffViewMode'
+import { lineEditKeymap } from '@/editor/editorKeys'
 import type { DiffView } from '@/ipc/client'
 import styles from './DiffPane.module.css'
 
@@ -270,7 +271,17 @@ export function DiffPane({
      * serialising a `StateField` across two different extension sets, which CodeMirror offers no
      * way to do.
      */
-    const shared = [lineNumbers(), EditorView.lineWrapping, history(), keymap.of(historyKeymap)]
+    /*
+     * Ctrl+D rides in the same array, and for the same reason `historyKeymap` does: `copyLine`
+     * guards on `state.readOnly` and returns `false`, so the read-only `a` side refuses it
+     * without a second array. See `editor/editorKeys.ts` for the binding and the chord trade.
+     */
+    const shared = [
+      lineNumbers(),
+      EditorView.lineWrapping,
+      history(),
+      keymap.of([...historyKeymap, ...lineEditKeymap]),
+    ]
     // Long unchanged stretches collapse to a clickable band. Without this a one-line change in
     // a thousand-line file opens on a screen of identical context.
     const collapseUnchanged = { margin: 3, minSize: 4 }

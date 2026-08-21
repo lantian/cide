@@ -1,0 +1,540 @@
+name: Release
+
+# Manual, and manual on purpose. Every other gate in this repository answers a question about a
+# commit; this one publishes artefacts under a version number and pushes a tag, and neither is
+# undoable once somebody has downloaded from it. It is `workflow_dispatch` alone — no `push`
+# trigger, no tag trigger — so cutting a release is always a decision somebody made in the
+# Actions tab and never a side effect of merging.
+#
+# What it does, in the order it does it:
+#
+#   prepare  cut release/v<version> from master, write the version into the four files that
+#            carry it, regenerate what is derived from them, commit, tag, push; and render the
+#            release notes from the commits since the previous release.
+#   linux    the AppImage, the binary tarball and the source tarball, from that tag.
+#   macos    the .dmg, from that tag.
+#   publish  one GitHub release with all of it and a SHA256SUMS beside it.
+#
+# Everything is built by `cargo xtask package`, never by calling `cargo tauri build` directly.
+# That task is the packaging brain (docs/adr/0007): it preflights the configuration, refuses a
+# target this host cannot build, prefetches the AppImage runtime that otherwise hangs the
+# bundler forever, shims a 32-bit gtk-query-immodules-3.0, builds the sidecar, and prints a
+# sha256 per artefact. A workflow that reimplemented any of that would be a second packaging
+# brain, and the two would drift the first time somebody fixed a bug in one of them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.2.0 — no leading v"
+        required: true
+        type: string
+      base:
+        description: "Branch to cut the release from"
+        required: false
+        default: master
+        type: string
+      draft:
+        description: "Publish as a draft, so the notes can be read before anyone can download"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark as a pre-release"
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time, and `cancel-in-progress` is deliberately absent — CI cancels a
+# superseded run because its answer is worthless, while a release cancelled between `git push`
+# and `gh release create` leaves a tag with nothing on it. Two concurrent dispatches queue.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# CI is `contents: read`. This one pushes a branch, a tag and a release, and that is the whole
+# difference — no other scope is added, so a compromised step in here still cannot touch
+# packages, pages or workflow files.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------------
+  # Everything that writes to the repository happens here, once, before anything is
+  # compiled. A build that fails then leaves a branch and a tag and no release, which is
+  # recoverable by hand; the reverse — artefacts built against a tree that was never
+  # tagged — is not.
+  # ---------------------------------------------------------------------------------
+  prepare:
+    name: prepare ${{ inputs.version }}
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      branch: ${{ steps.plan.outputs.branch }}
+      previous: ${{ steps.notes.outputs.previous }}
+    steps:
+      # fetch-depth: 0 twice over. The changelog needs the history to walk, and
+      # `xtask`'s source-tarball preflight looks for a tag at HEAD matching the version —
+      # with a shallow clone it warns that there is none, on every release, for ever.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base }}
+          fetch-depth: 0
+
+      - name: Validate the version and refuse an existing tag
+        id: plan
+        # Through the environment, never interpolated into the script body. `${{ }}` is
+        # substituted into the shell source before bash sees it, so an input containing a quote
+        # or a `$(...)` would run as code with this job's `contents: write` token. It takes a
+        # collaborator to dispatch this workflow, which lowers the odds and not the rule.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          # Semver, with an optional pre-release or build suffix. Anchored, because
+          # `cide_1.2.3-rc1_amd64.AppImage` is a file name people will read, and a version
+          # with a space or a leading `v` in it produces one nobody can parse.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a semver version. Write 0.2.0, not v0.2.0." >&2
+            exit 1
+          fi
+          tag="v$version"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::$tag already exists. A release is cut once." >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "branch=release/$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      # No apt packages. `xtask` depends on anyhow, serde_json and sha2, and `package --write`
+      # short-circuits before it looks at the host or the toolchain — so none of the webview
+      # stack has to be installed to regenerate three text files.
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-prepare
+
+      - name: Write the version into every file that carries it
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+
+          # Four files, three formats, and none of them derives from the others — which is
+          # the drift this step exists to end. Before it existed, Cargo.toml said 0.2.0 and
+          # tauri.conf.json said 0.1.0, and since every artefact name comes from
+          # tauri.conf.json, a release tagged v0.2.0 would have shipped files called
+          # cide_0.1.0_amd64.AppImage.
+          python3 - "$version" <<'PY'
+          import json, re, sys
+
+          version = sys.argv[1]
+
+          # Anchored to the [workspace.package] table. A bare `s/^version = .*/` would also
+          # rewrite the first version key of whatever table happens to come first in the file.
+          path = "Cargo.toml"
+          src = open(path, encoding="utf-8").read()
+          out, n = re.subn(
+              r'(\[workspace\.package\][^\[]*?\nversion = ")[^"]*(")',
+              lambda m: m.group(1) + version + m.group(2),
+              src,
+              count=1,
+              flags=re.S,
+          )
+          assert n == 1, f"no version key under [workspace.package] in {path}"
+          open(path, "w", encoding="utf-8").write(out)
+
+          # A line rewrite and NOT a json round-trip, which is what this was first and which was
+          # wrong: `json.dump(indent=2)` reformats the whole document, and tauri.conf.json keeps
+          # short arrays inline — `"targets": ["appimage", "deb"]` came back as four lines. The
+          # version was correct and the diff was twenty lines of reflow inside a release tag.
+          #
+          # `^  "version":` is exact enough to be safe: both files are indented two spaces, so a
+          # key at that indent is a top-level key, and a nested "version" would be at four or
+          # more. The parse below is what makes that a checked claim rather than a hopeful one.
+          for path in ("crates/cide-app/tauri.conf.json", "ui/package.json"):
+              src = open(path, encoding="utf-8").read()
+              out, n = re.subn(
+                  r'^(  "version": ")[^"]*(")',
+                  lambda m: m.group(1) + version + m.group(2),
+                  src,
+                  count=1,
+                  flags=re.M,
+              )
+              assert n == 1, f"no top-level version line in {path}"
+              open(path, "w", encoding="utf-8").write(out)
+              assert json.load(open(path, encoding="utf-8"))["version"] == version, (
+                  f"{path} still parses, but its top-level version is not {version} — the line "
+                  f"that matched was not the one that means the product's version"
+              )
+          PY
+
+          # Cargo.lock records every workspace member's version, and every cargo invocation in
+          # this workflow passes --locked. Without this the first one fails with "the lock file
+          # needs to be updated but --locked was passed".
+          cargo update --workspace --offline
+
+          # packaging/flatpak/* is generated from tauri.conf.json's AppInfo — the manifest, the
+          # desktop entry and the AppStream metainfo, which publishes the version as a
+          # <release>. `package --check` is the gate that fails when they drift, so this is the
+          # step that keeps that gate green.
+          cargo --locked xtask package --write
+
+      # A guard, not a formality. Both edits above are pattern matches over files somebody
+      # else may have reformatted since; a regex that matched twice, or a json dump that
+      # reflowed a file, would otherwise land inside a tag and be discovered by a reader of
+      # the release diff. Six paths, named, and anything else fails the release.
+      - name: Refuse anything the bump was not supposed to touch
+        run: |
+          set -euo pipefail
+          expected=$(printf '%s\n' \
+            Cargo.lock \
+            Cargo.toml \
+            crates/cide-app/tauri.conf.json \
+            packaging/flatpak/dev.cide.ide.desktop \
+            packaging/flatpak/dev.cide.ide.metainfo.xml \
+            packaging/flatpak/dev.cide.ide.yml \
+            ui/package.json | sort)
+          actual=$(git diff --name-only | sort)
+          # A subset, not an exact match: the flatpak manifest and the .desktop entry only
+          # change when something other than the version does, so a release that leaves them
+          # alone is the normal case rather than a failure. What is never acceptable is a file
+          # OUTSIDE the expected set, which is what comm -23 lists.
+          unexpected=$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$expected"))
+          if [ -n "$unexpected" ]; then
+            echo "::error::the version bump touched files it should not have:" >&2
+            printf '  %s\n' $unexpected >&2
+            git diff -- $unexpected >&2
+            exit 1
+          fi
+          # One line in, one line out, per file. This is what catches a rewrite that produced
+          # the right version and reformatted everything around it — which the json round-trip
+          # this step used to sit behind did, silently, because it changed no file the list
+          # above objects to.
+          for f in Cargo.toml crates/cide-app/tauri.conf.json ui/package.json; do
+            numstat=$(git diff --numstat -- "$f" | cut -f1,2 | tr '\t' ' ')
+            if [ "$numstat" != "1 1" ]; then
+              echo "::error::$f should differ by exactly one line, not '$numstat':" >&2
+              git diff -- "$f" >&2
+              exit 1
+            fi
+          done
+
+          echo "changed:"; printf '  %s\n' $actual
+          git diff --stat
+
+      - name: Verify the tree still builds its own gates
+        run: |
+          set -euo pipefail
+          # Cheap, and it is the one thing that can go wrong silently here: `--locked` proves
+          # Cargo.lock actually absorbed the new version, and `package --check` proves the
+          # generated flatpak files match what the new AppInfo produces.
+          cargo --locked xtask package --check
+          cargo --locked metadata --format-version 1 --offline > /dev/null
+
+      - name: Commit, tag and push
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          tag="$TAG"
+          branch="$BRANCH"
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git commit -am "Release $version"
+          # Annotated. A lightweight tag carries no date and no author, and `git describe`
+          # ignores it by default — which is the wrong shape for the one ref a release page
+          # points at.
+          git tag -a "$tag" -m "cide $version"
+          git push origin "$branch"
+          git push origin "$tag"
+
+      # Only the changelog half. The "what's attached" table is built in `publish`, from the
+      # files that were actually uploaded — writing it here would mean guessing artefact names
+      # before anything has been built, and a release page whose download table names a file
+      # that is not on it is worse than one with no table at all.
+      - name: Render the changelog
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+
+          # The previous *release*, not the previous tag — a tag may exist for something that
+          # was never published. Falling back to tags anyway, because the first run of this
+          # workflow has no releases to ask about, and the repository already carries a `0.1.0`
+          # tag from before it existed.
+          previous=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // empty' 2>/dev/null || true)
+          if [ -z "$previous" ]; then
+            previous=$(git tag --list --sort=-v:refname --merged "$tag^" | head -1 || true)
+          fi
+
+          if [ -n "$previous" ]; then
+            range="$previous..$tag"
+            heading="Changes since $previous"
+          else
+            # No previous release and no earlier tag: everything reachable from the tag. The
+            # first release's notes are the whole history, which is the honest answer rather
+            # than an arbitrary cutoff.
+            range="$tag"
+            heading="Changes"
+          fi
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "range: $range"
+
+          {
+            echo "## $heading"
+            echo
+            git log --no-merges --pretty='- %s (%h)' "$range"
+            if [ -n "$previous" ]; then
+              echo
+              echo "**Full diff:** ${{ github.server_url }}/${{ github.repository }}/compare/$previous...$tag"
+            fi
+          } > changelog.md
+
+          cat changelog.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: changelog.md
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------
+  # The AppImage, the binary tarball and the source tarball. One `xtask` invocation
+  # produces all three; the job is mostly the toolchain that invocation's preflight
+  # insists on.
+  # ---------------------------------------------------------------------------------
+  linux:
+    name: linux artefacts
+    runs-on: ubuntu-24.04
+    needs: prepare
+    env:
+      # linuxdeploy, linuxdeploy-plugin-gtk and appimagetool are themselves AppImages, which
+      # mount themselves with FUSE — and a GitHub runner has no libfuse2. Without this they
+      # fail inside a downloaded shell script several layers under `cargo tauri build`, and
+      # the only line that reaches the log is `failed to run linuxdeploy`. Extracting instead
+      # of mounting is the supported way out and costs a few seconds of disk.
+      APPIMAGE_EXTRACT_AND_RUN: 1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # The first five are what ci.yml installs to compile the workspace. The rest are the
+          # bundling chain ci.yml deliberately leaves out, because nothing in that workflow
+          # bundles: patchelf is how linuxdeploy rewrites the AppDir's RPATHs, librsvg2 is how
+          # the icons are rasterised, and desktop-file-utils supplies the
+          # desktop-file-validate that linuxdeploy runs over the entry before it accepts it.
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            pkg-config \
+            patchelf \
+            librsvg2-dev \
+            librsvg2-bin \
+            desktop-file-utils \
+            file
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-linux
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      # `ui/node_modules` is a preflight failure, not an optimisation: `beforeBuildCommand`
+      # runs `pnpm build` in ui/, and the bundler dies with "Unable to find your web assets"
+      # a long way from the missing install.
+      - name: pnpm install
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - uses: ./.github/actions/install-tauri-cli
+
+      # One command for three artefacts. --deb is deliberately not here: the AppImage is the
+      # Linux channel (docs/adr/0007) and the tarball is the no-runtime alternative; a .deb
+      # nobody has installed from is a promise this release page should not make yet.
+      - name: cargo xtask package --appimage --tarball --src --run
+        run: cargo --locked xtask package --appimage --tarball --src --run
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-artefacts
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/tarball/*.tar.gz
+            target/release/bundle/src/*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------
+  # The .dmg. Blocking, unlike ci.yml's advisory `macos` job — a release that silently
+  # dropped an artefact its own notes list is worse than a release that failed.
+  # ---------------------------------------------------------------------------------
+  macos:
+    name: macos artefacts
+    runs-on: macos-15
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-macos
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: pnpm install
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - uses: ./.github/actions/install-tauri-cli
+
+      # --dmg alone, and that is not a typo: tauri's dmg bundler runs the .app bundler first,
+      # so naming both would not add anything. --src is absent for a different reason — the
+      # source tarball has one producer on purpose (see Targets::MACOS), because two hosts
+      # running `git archive` produce files with the same name whose gzip layers differ, and
+      # whichever upload lost would leave a published checksum matching neither.
+      #
+      # No signing secrets are set, so the preflight warns twice and continues, and the
+      # release notes say what an unsigned .dmg does on a machine that downloaded it.
+      - name: cargo xtask package --dmg --run
+        run: cargo --locked xtask package --dmg --run
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-artefacts
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------
+  publish:
+    name: publish ${{ needs.prepare.outputs.tag }}
+    runs-on: ubuntu-24.04
+    needs: [prepare, linux, macos]
+    steps:
+      # Two downloads, and separately on purpose: `dist/` becomes the asset list verbatim
+      # (`gh release create ... dist/*`), so the notes must not land in it — attaching the
+      # release notes to the release as a downloadable file is not the same as using them.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-artefacts"
+          path: dist
+          merge-multiple: true
+
+      # The same numbers `xtask` printed per artefact as it built them, in a file somebody can
+      # download beside the artefacts. Computed over the assets as uploaded rather than copied
+      # out of the build logs, so it describes the bytes on the release page.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # The download table, from the files that are about to be attached. Each row is matched
+      # by shape rather than by an expected name, so the version, the architecture and the
+      # bundler's own spelling of them come from the artefact instead of from a guess made in
+      # another job several minutes earlier. A file no pattern recognises still gets a row —
+      # silently omitting an asset from the table is exactly the failure this replaced.
+      - name: Assemble the release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "## Downloads"
+            echo
+            echo "| file | size | what it is |"
+            echo "| --- | --- | --- |"
+            for f in dist/*; do
+              name=$(basename "$f")
+              # --apparent-size, or a 300-byte SHA256SUMS is reported as the 4.0K block it
+              # occupies. The number in this table is what a person is about to download.
+              size=$(du -h --apparent-size "$f" | cut -f1)
+              case "$name" in
+                *.AppImage)
+                  what="Linux, self-contained. Carries its own WebKitGTK, and the only format that can ever self-update." ;;
+                *-linux-*.tar.gz)
+                  what="Linux, extract and run. Needs WebKitGTK 4.1 already installed; put \`bin/\` on your \`PATH\` so the desktop entry can find \`cide\`." ;;
+                *.dmg)
+                  what="macOS 11+. **Unsigned** — see below." ;;
+                *-src.tar.gz)
+                  what="The source at this tag. \`git archive\`, so its sha256 is reproducible from the tag; the binaries' are not." ;;
+                SHA256SUMS)
+                  what="Checksums for everything above." ;;
+                *)
+                  what="" ;;
+              esac
+              echo "| \`$name\` | $size | $what |"
+            done
+            echo
+            echo "The \`.dmg\` is not notarised, so a downloaded copy is quarantined and macOS reports"
+            echo "it as damaged rather than as unidentified; \`xattr -dr com.apple.quarantine\` on the"
+            echo "app clears it. Nothing here self-updates yet — no updater endpoint is configured."
+            echo
+            cat notes/changelog.md
+          } > notes/notes.md
+          cat notes/notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ needs.prepare.outputs.tag }}'
+          args=(release create "$tag"
+                --title "cide ${{ needs.prepare.outputs.version }}"
+                --notes-file notes/notes.md
+                --target "${{ needs.prepare.outputs.branch }}")
+          # `if` and not `[ ... ] && args+=(...)`: under `set -e` the && form exits the script
+          # when the test is false, so a non-draft release would end the job successfully
+          # having published nothing.
+          if [ '${{ inputs.draft }}' = 'true' ]; then
+            args+=(--draft)
+          fi
+          if [ '${{ inputs.prerelease }}' = 'true' ]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}" dist/*

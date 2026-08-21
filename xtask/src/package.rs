@@ -161,12 +161,76 @@ fn src_archive_path(info: &AppInfo) -> String {
     format!("{SRC_BUNDLE_DIR}/{}", src_archive_name(info))
 }
 
+/// Where the binary tarball is written, relative to the workspace root.
+///
+/// Its own subdirectory under `target/release/bundle/`, for the reason [`SRC_BUNDLE_DIR`] gives:
+/// `artefacts` enumerates that tree by subdirectory name, and an artefact outside it is the
+/// asset a release forgets to upload.
+const TARBALL_BUNDLE_DIR: &str = "target/release/bundle/tarball";
+
+/// Where the tarball's contents are assembled before `tar` reads them.
+///
+/// Under `target/` and not a temporary directory: the plan is printed before it is run and is
+/// meant to be pasteable, and a `$TMPDIR/tmp.XXXXXX` in a printed command is a path the reader
+/// cannot reproduce. It also survives the run, so a failed archive step can be inspected.
+const TARBALL_STAGE_DIR: &str = "target/release/tarball-stage";
+
+/// The icon sizes the tarball installs, which are the ones `crates/cide-app/icons/` holds at
+/// `<n>x<n>.png` — the same set the `.deb` ships into `share/icons/hicolor`.
+///
+/// `icon.png` and `icon.svg` are deliberately absent: the first is the bundler's source image
+/// and has no `hicolor` size directory to live in, and nothing here renders SVG.
+const TARBALL_ICON_SIZES: [u32; 6] = [16, 32, 48, 64, 128, 256];
+
+/// The tarball's file name: `cide-0.1.0-linux-x86_64.tar.gz`.
+///
+/// `linux-<arch>` and not the bundler's `_<version>_amd64` spelling, because this file is not
+/// produced by the bundler and pretending otherwise would suggest the two are interchangeable.
+/// `x86_64` is the triple's own name for the architecture — the same slice
+/// [`runtime_arch`] takes — and it is what `uname -m` answers on the machine that will unpack
+/// it, which `amd64` is not.
+fn tarball_name(info: &AppInfo, triple: &str) -> String {
+    format!(
+        "{}-{}-linux-{}.tar.gz",
+        info.product_name,
+        info.version,
+        runtime_arch(triple)
+    )
+}
+
+/// The tarball's path, relative to the workspace root.
+fn tarball_path(info: &AppInfo, triple: &str) -> String {
+    format!("{TARBALL_BUNDLE_DIR}/{}", tarball_name(info, triple))
+}
+
+/// The directory the tarball unpacks into: `cide-0.1.0/`.
+///
+/// No trailing slash, unlike [`src_prefix`] — that one is `git archive --prefix`, which is
+/// string concatenation, while this one is a real directory under the staging root and is
+/// passed to `tar` as a path.
+fn tarball_prefix(info: &AppInfo) -> String {
+    format!("{}-{}", info.product_name, info.version)
+}
+
 /// The directory `cargo tauri build` must run from — the crate holding `tauri.conf.json`.
 const APP_CRATE: &str = "crates/cide-app";
 
 /// The second binary. See the module docs: without it in the bundle the product runs with
 /// no hooks and nothing reports an error.
 const HOOK_BIN: &str = "cide-hook";
+
+/// The first binary — `crates/cide-app/Cargo.toml`'s `[[bin]] name`, which is what the release
+/// profile writes into `target/release/`.
+///
+/// Spelled out rather than taken from `info.product_name`, which happens to be the same string
+/// today and is not the same *fact*: `productName` is the name a user sees on a window and a
+/// desktop entry, and nothing stops it becoming "Cide" or "cide IDE" without the binary moving.
+/// `the_app_binary_is_what_the_crate_declares` asserts the two agree with the crate.
+const APP_BIN: &str = "cide";
+
+/// The package `cargo build -p` is given for [`APP_BIN`]. Not the same string: the crate is
+/// `cide-app` and the binary it produces is `cide`.
+const APP_PACKAGE: &str = "cide-app";
 
 /// Where the sidecar copy is written, relative to the workspace root. `tauri.conf.json`'s
 /// `externalBin` entry names the same path relative to `crates/cide-app`, and the two have to
@@ -215,6 +279,21 @@ pub struct Targets {
     pub app: bool,
     /// macOS: the disk image, which is what a person downloads.
     pub dmg: bool,
+    /// The Linux binary tarball: the release binaries, the desktop entry and the icons under
+    /// one prefix directory, gzipped.
+    ///
+    /// The artefact for somebody who wants the program without an AppImage's runtime, a package
+    /// manager, or root. Two things it is *not*, both of which a reader will assume from its
+    /// neighbours here:
+    ///
+    /// * **Not reproducible.** `--src` is `git archive` and its bytes follow from the commit, so
+    ///   a published sha256 is checkable by anyone. This one contains `rustc` output; nothing
+    ///   about it is byte-stable across two machines, and the sha256 the run prints describes
+    ///   that build alone.
+    /// * **Not self-contained.** The AppImage carries WebKitGTK; this carries a dynamically
+    ///   linked `cide` that needs the host's WebKitGTK 4.1 already installed. That is the trade
+    ///   it exists to offer — roughly a tenth of the size, and a dependency on the distribution.
+    pub tarball: bool,
     /// The source tarball for a release page: `git archive` of `HEAD`, nothing compiled.
     ///
     /// The one target that is not platform-bound. Every other field names a bundle that only
@@ -244,6 +323,7 @@ impl Targets {
         flatpak: true,
         app: false,
         dmg: false,
+        tarball: true,
         src: true,
         // Inherited, not asked for. A dirty tree therefore warns and drops the archive step
         // rather than failing the whole run — see the field's own docs.
@@ -266,6 +346,7 @@ impl Targets {
         flatpak: false,
         app: true,
         dmg: true,
+        tarball: false,
         src: false,
         src_named: false,
     };
@@ -305,6 +386,7 @@ impl Targets {
             (self.appimage, "appimage", false),
             (self.deb, "deb", false),
             (self.flatpak, "flatpak", false),
+            (self.tarball, "tarball", false),
             (self.app, "app", true),
             (self.dmg, "dmg", true),
         ]
@@ -316,7 +398,9 @@ impl Targets {
 
     /// The `--bundles` value for `cargo tauri build`, or `None` when no Tauri target was
     /// asked for. (Flatpak is not one: it is built by `flatpak-builder` from a manifest. Nor is
-    /// `src`: it is `git archive`, and it compiles nothing at all.)
+    /// `src`: it is `git archive`, and it compiles nothing at all. Nor is `tarball`: the
+    /// bundler has no format for it, so it is `install` and `tar` over what the release
+    /// profile already produced.)
     fn bundles(self) -> Option<String> {
         let mut names = Vec::new();
         if self.appimage {
@@ -456,7 +540,9 @@ impl AppInfo {
 /// Free function rather than a method because it is about a *request*, not about the repository.
 fn icon_list(info: &AppInfo, targets: Targets) -> Vec<(&str, &'static str)> {
     let mut out: Vec<(&str, &'static str)> = Vec::new();
-    if targets.appimage || targets.deb || targets.flatpak {
+    // `tarball` joins them: it installs a subset of the same `bundle.icon` files into
+    // `share/icons/hicolor`, so the same existence check is the one it needs.
+    if targets.appimage || targets.deb || targets.flatpak || targets.tarball {
         out.extend(info.icons.iter().map(|i| (i.as_str(), TAURI_CONF)));
     }
     if targets.app || targets.dmg {
@@ -555,7 +641,7 @@ fn artefacts(root: &Path) -> Vec<(String, u64)> {
     // `metadata().len()` is the directory entry's size and not the bundle's — it is listed
     // anyway, because "the .app exists" is the fact worth printing and the `.dmg` beside it
     // carries the number that means something.
-    for sub in ["appimage", "deb", "macos", "dmg", "src"] {
+    for sub in ["appimage", "deb", "macos", "dmg", "tarball", "src"] {
         let Ok(entries) = fs::read_dir(bundle.join(sub)) else {
             continue;
         };
@@ -752,6 +838,22 @@ pub fn plan(root: &Path, info: &AppInfo, targets: Targets, triple: &str) -> Vec<
         });
     }
 
+    // After the bundler block, and that ordering is the whole reason this needs no build steps
+    // of its own in the common case: `cargo tauri build` has already produced
+    // `target/release/cide` and its `beforeBuildCommand` has already built `ui/dist`.
+    if targets.tarball {
+        // ...but with no Tauri bundle in the plan, nothing above built either of them, and
+        // `cargo build -p cide-app` against an absent or stale `ui/dist` produces a binary that
+        // launches to a blank window rather than an error. Conditional rather than
+        // unconditional for the same reason the bundler step has no `pnpm build` beside it: a
+        // plan that builds the frontend twice is a plan that misdescribes the run.
+        if targets.bundles().is_none() {
+            steps.extend(frontend_build_step(info));
+            steps.push(release_binaries_step());
+        }
+        steps.extend(tarball_steps(info, triple));
+    }
+
     if targets.flatpak {
         steps.push(Step {
             program: "flatpak-builder".into(),
@@ -876,6 +978,189 @@ fn sidecar_steps(triple: &str) -> Vec<Step> {
 /// Where the suffixed copy of `cide-hook` goes, relative to the workspace root.
 fn sidecar_path(triple: &str) -> String {
     format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}-{triple}")
+}
+
+/// Run `build.beforeBuildCommand` the way `cargo tauri build` would, for a plan that has no
+/// `cargo tauri build` in it.
+///
+/// `sh -c` with the whole line, and the config's own `cwd`, because that is literally what
+/// tauri-cli does with it (`src/helpers/mod.rs:105`) — reimplementing it as `pnpm build` with a
+/// hardcoded directory would be a second reading of the same config, and the day someone changes
+/// `beforeBuildCommand` only one of the two would follow.
+///
+/// `None` when the config declares no hook. That is a legitimate arrangement — the frontend is
+/// built by hand — and `frontend_verdicts` already warns about it; inventing a step here would
+/// turn that warning into a failure to run a command nobody configured.
+fn frontend_build_step(info: &AppInfo) -> Option<Step> {
+    let build = info.before_build.as_ref()?;
+    Some(Step {
+        program: "sh".into(),
+        args: vec!["-c".into(), build.script.clone()],
+        cwd: frontend_dir(build),
+        env: Vec::new(),
+        optional: false,
+    })
+}
+
+/// Build both binaries the tarball ships.
+///
+/// Only reached when no Tauri bundle was asked for; otherwise `cargo tauri build` has already
+/// built the app and [`sidecar_steps`] the hook, and a second `cargo build` would be a no-op
+/// line in a printed plan that suggests two compilations happen.
+///
+/// One step rather than reusing [`sidecar_steps`], even though that also builds `cide-hook`.
+/// Its second command copies the binary to `cide-hook-<triple>`, which exists so
+/// `tauri-bundler` can resolve `externalBin` — and a plan with no bundler in it that produces a
+/// bundler-shaped file is a plan that has to be explained. The tarball puts `cide-hook` beside
+/// `cide` under its own name, which is where `cide` looks for it.
+fn release_binaries_step() -> Step {
+    Step {
+        program: "cargo".into(),
+        args: vec![
+            "build".into(),
+            "--release".into(),
+            "--locked".into(),
+            "-p".into(),
+            APP_PACKAGE.into(),
+            "-p".into(),
+            HOOK_BIN.into(),
+        ],
+        cwd: ".".into(),
+        env: Vec::new(),
+        optional: false,
+    }
+}
+
+/// Assemble `target/release/tarball-stage/<prefix>/` and archive it.
+///
+/// # Why a staging tree and not `tar --transform`
+///
+/// `tar` can rewrite paths on the way in, and doing so would save these `install` calls. It
+/// would also make the archive's layout a regex in an argument list, invisible until someone
+/// unpacks the result — and it is GNU-only, which the rest of this module is careful not to be
+/// where it has a choice. The staging tree is the layout, written out, and `ls -R` on it answers
+/// "what is in the tarball" without unpacking anything.
+///
+/// # Why `install` and not `cp`
+///
+/// The same reason [`sidecar_steps`] uses it: the mode is stated rather than inherited, so the
+/// binaries are executable in the archive even if the build left them otherwise, and the config
+/// files are not. `install` also creates nothing but the file — the directories are made once,
+/// up front, which is what keeps the printed plan short enough to read.
+fn tarball_steps(info: &AppInfo, triple: &str) -> Vec<Step> {
+    let prefix = tarball_prefix(info);
+    let root = format!("{TARBALL_STAGE_DIR}/{prefix}");
+
+    let mut dirs = vec![format!("{root}/bin"), format!("{root}/share/applications")];
+    dirs.extend(
+        TARBALL_ICON_SIZES
+            .iter()
+            .map(|n| format!("{root}/share/icons/hicolor/{n}x{n}/apps")),
+    );
+
+    // `rm -rf` first, in the same `sh -c` as the `mkdir -p`: the staging directory survives a
+    // run, so a second build with a different version — or one where a file was renamed — would
+    // otherwise archive both the new tree and whatever the last run left beside it.
+    let mut steps = vec![Step {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "rm -rf '{TARBALL_STAGE_DIR}' && mkdir -p {}",
+                dirs.iter()
+                    .map(|d| format!("'{d}'"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ],
+        cwd: ".".into(),
+        env: Vec::new(),
+        optional: false,
+    }];
+
+    let mut install = |mode: &str, from: String, to: String| {
+        steps.push(Step {
+            program: "install".into(),
+            args: vec![mode.into(), from, to],
+            cwd: ".".into(),
+            env: Vec::new(),
+            optional: false,
+        });
+    };
+
+    install(
+        "-m755",
+        format!("{HOOK_SIDECAR_DIR}/{APP_BIN}"),
+        format!("{root}/bin/{APP_BIN}"),
+    );
+    // The hook, and not as a `-<triple>` sidecar copy: that name exists so `tauri-bundler` can
+    // resolve `externalBin`, and outside a bundle it is noise. `cide` looks for `cide-hook`
+    // beside itself.
+    install(
+        "-m755",
+        format!("{HOOK_SIDECAR_DIR}/{HOOK_BIN}"),
+        format!("{root}/bin/{HOOK_BIN}"),
+    );
+
+    // The generated desktop entry rather than one written here: it is derived from `AppInfo` and
+    // `package --check` keeps it in sync, so there is one source for what the entry says. Its
+    // `Exec=cide %U` is unqualified, which is the tarball's one instruction to the person
+    // unpacking it — `bin/` has to be on `PATH` for the entry to launch anything.
+    install(
+        "-m644",
+        format!("{FLATPAK_DIR}/{}.desktop", info.identifier),
+        format!("{root}/share/applications/{}.desktop", info.identifier),
+    );
+
+    for n in TARBALL_ICON_SIZES {
+        install(
+            "-m644",
+            format!("{APP_CRATE}/icons/{n}x{n}.png"),
+            format!(
+                "{root}/share/icons/hicolor/{n}x{n}/apps/{}.png",
+                info.identifier
+            ),
+        );
+    }
+
+    // Both, and neither is decoration. `LICENSE` is the licence this archive is distributed
+    // under and a binary distribution has to carry it; `README.md` is where "it needs WebKitGTK
+    // 4.1" is written down, which is the first thing that goes wrong for someone who unpacked
+    // this instead of downloading the AppImage.
+    install("-m644", "LICENSE".into(), format!("{root}/LICENSE"));
+    install("-m644", "README.md".into(), format!("{root}/README.md"));
+
+    steps.push(Step {
+        program: "mkdir".into(),
+        args: vec!["-p".into(), TARBALL_BUNDLE_DIR.into()],
+        cwd: ".".into(),
+        env: Vec::new(),
+        optional: false,
+    });
+
+    steps.push(Step {
+        program: "tar".into(),
+        args: vec![
+            // Sorted, and owned by uid/gid 0 with no name lookup, so the archive does not carry
+            // the build machine's user in it and two builds of the same tree differ only where
+            // the compiler made them differ. That is tidiness, NOT the reproducibility promise
+            // `--src` makes: this contains rustc output and its sha256 describes one build.
+            "--sort=name".into(),
+            "--owner=0".into(),
+            "--group=0".into(),
+            "--numeric-owner".into(),
+            "-czf".into(),
+            tarball_path(info, triple),
+            "-C".into(),
+            TARBALL_STAGE_DIR.into(),
+            prefix,
+        ],
+        cwd: ".".into(),
+        env: Vec::new(),
+        optional: false,
+    });
+
+    steps
 }
 
 /// The environment variable `linuxdeploy-plugin-appimage` turns into `--runtime-file`.
@@ -1153,6 +1438,17 @@ pub fn preflight(root: &Path, info: &AppInfo, targets: Targets, triple: &str) ->
                 dir.to_string_lossy()
             )));
         }
+    } else if targets.tarball {
+        // A tarball-only run has no `cargo tauri build` in it, so none of the block above
+        // applies: no CLI version to check, and no sidecar question, because `externalBin` is a
+        // bundler concept and the tarball simply copies `cide-hook` in beside `cide`.
+        //
+        // What does still apply is the frontend, because `plan` runs `beforeBuildCommand` itself
+        // in that case (see `frontend_build_step`). Without this, `--tarball` on a machine with
+        // no `ui/node_modules` passes preflight and then fails several minutes later inside
+        // `cargo build`, with "Unable to find your web assets" and no hint that `pnpm install`
+        // was the missing step.
+        out.extend(frontend_checks(root, info));
     }
 
     if targets.appimage {
@@ -2101,7 +2397,7 @@ fn metainfo(info: &AppInfo) -> String {
   <name>{product}</name>
   <summary>A Claude-Code-native IDE</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT OR Apache-2.0</project_license>
+  <project_license>MIT</project_license>
   <launchable type="desktop-id">{id}.desktop</launchable>
   <description>
     <p>
@@ -2603,6 +2899,7 @@ mod tests {
             flatpak: true,
             app: false,
             dmg: false,
+            tarball: false,
             src: false,
             src_named: false,
         };
@@ -2696,6 +2993,7 @@ mod tests {
             flatpak: false,
             app: false,
             dmg: false,
+            tarball: false,
             src: false,
             src_named: false,
         };
@@ -3044,6 +3342,7 @@ mod tests {
             flatpak: true,
             app: false,
             dmg: false,
+            tarball: false,
             src: false,
             src_named: false,
         };
@@ -3354,6 +3653,208 @@ mod tests {
         }
     }
 
+    /// A `Targets` naming only the binary tarball.
+    fn tarball_only() -> Targets {
+        Targets {
+            appimage: false,
+            deb: false,
+            flatpak: false,
+            app: false,
+            dmg: false,
+            tarball: true,
+            src: false,
+            src_named: false,
+        }
+    }
+
+    #[test]
+    fn the_binary_tarball_is_linux_only_and_is_not_a_bundler_format() {
+        // The contrast with `--src` below is the point. That one is `git archive` and runs
+        // anywhere; this one archives ELF binaries linked against the host's WebKitGTK, so a Mac
+        // asking for it is asking for a cross-compilation this repository does not do.
+        assert!(tarball_only().impossible_on(LINUX).is_empty());
+        assert_eq!(tarball_only().impossible_on(MACOS), vec!["tarball"]);
+        // Not in `--bundles`: `cargo tauri build` has no format for it, and passing the name
+        // through would fail inside the bundler with an unknown-target error.
+        assert_eq!(tarball_only().bundles(), None);
+    }
+
+    #[test]
+    fn the_binary_tarball_is_in_the_linux_default_set_only() {
+        const { assert!(Targets::LINUX.tarball) };
+        const { assert!(!Targets::MACOS.tarball) };
+        assert!(Targets::for_host(LINUX).tarball);
+        assert!(!Targets::for_host(MACOS).tarball);
+    }
+
+    #[test]
+    fn the_tarball_is_named_for_the_version_and_the_triples_architecture() {
+        let info = info();
+        assert_eq!(
+            tarball_name(&info, LINUX),
+            format!("{}-{}-linux-x86_64.tar.gz", info.product_name, info.version)
+        );
+        assert_eq!(
+            tarball_name(&info, "aarch64-unknown-linux-gnu"),
+            format!(
+                "{}-{}-linux-aarch64.tar.gz",
+                info.product_name, info.version
+            ),
+            "the architecture is the triple's, not this machine's"
+        );
+        // Under the directory `artefacts` enumerates, or the release script that globs that tree
+        // never sees it. `is_artefact` already answers yes for `*.tar.gz`.
+        assert!(tarball_path(&info, LINUX).starts_with(TARBALL_BUNDLE_DIR));
+        assert!(is_artefact(&tarball_name(&info, LINUX)));
+    }
+
+    #[test]
+    fn the_tarball_prefix_has_no_trailing_slash_and_the_source_prefix_does() {
+        // Two archives, two mechanisms. `git archive --prefix` is string concatenation onto
+        // every path, so it needs the slash; `tar -C <stage> <prefix>` names a real directory,
+        // and a trailing slash there is at best noise. Asserted together because the pair is
+        // easy to "tidy" into agreement, and one of them would then be wrong.
+        let info = info();
+        assert!(src_prefix(&info).ends_with('/'));
+        assert!(!tarball_prefix(&info).ends_with('/'));
+        assert_eq!(
+            src_prefix(&info).trim_end_matches('/'),
+            tarball_prefix(&info)
+        );
+    }
+
+    #[test]
+    fn a_tarball_only_plan_builds_the_frontend_and_both_binaries() {
+        let steps = plan(Path::new("/nonexistent"), &info(), tarball_only(), LINUX);
+        let printed: Vec<String> = steps.iter().map(Step::display).collect();
+        let joined = printed.join("\n");
+
+        // Nothing else in this plan runs `beforeBuildCommand`, so it has to appear here or the
+        // binary embeds whatever `ui/dist` happened to hold.
+        assert!(
+            joined.contains(r#"sh -c "pnpm build""#),
+            "the frontend is built: {joined}"
+        );
+        assert!(
+            joined.contains("cargo build --release --locked -p cide-app -p cide-hook"),
+            "both binaries are built: {joined}"
+        );
+        // The bundler-only sidecar copy has no business in a plan with no bundler in it.
+        assert!(
+            !joined.contains(&sidecar_path(LINUX)),
+            "no `cide-hook-<triple>` sidecar: {joined}"
+        );
+        assert!(
+            printed
+                .last()
+                .is_some_and(|last: &String| last.starts_with("tar ")),
+            "the archive is last: {printed:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundled_plan_does_not_build_the_frontend_twice() {
+        // The whole reason the tarball's build steps are conditional. `cargo tauri build` runs
+        // `beforeBuildCommand` itself and compiles `cide-app` on the way to the AppImage; adding
+        // the steps unconditionally would print a plan that claims two frontend builds and two
+        // compilations, and a reader pasting it would perform them.
+        let mut targets = tarball_only();
+        targets.appimage = true;
+        let joined = plan(Path::new("/nonexistent"), &info(), targets, LINUX)
+            .iter()
+            .map(|s| s.display())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            joined.matches("pnpm build").count(),
+            0,
+            "the bundler's beforeBuildCommand is the only frontend build: {joined}"
+        );
+        assert!(
+            !joined.contains("-p cide-app"),
+            "the bundler compiles the app crate itself: {joined}"
+        );
+        // ...but the tarball is still cut, from what the bundler left in target/release.
+        assert!(joined.contains(&tarball_path(&info(), LINUX)), "{joined}");
+        // And the bundler runs before it, or there is nothing to archive.
+        assert!(
+            joined.find("cargo tauri build") < joined.find("tar --sort=name"),
+            "the bundler comes first: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_tarball_ships_the_licence_the_binaries_and_every_icon_size() {
+        let info = info();
+        let joined = tarball_steps(&info, LINUX)
+            .iter()
+            .map(|s| s.display())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // A binary distribution that does not carry its licence is the problem `LICENSE` at the
+        // root was added to fix; shipping it is the whole of the fix reaching this artefact.
+        assert!(joined.contains("install -m644 LICENSE "), "{joined}");
+        assert!(joined.contains("install -m644 README.md"), "{joined}");
+        assert!(
+            joined.contains(&format!("bin/{APP_BIN}"))
+                && joined.contains(&format!("bin/{HOOK_BIN}")),
+            "both binaries: {joined}"
+        );
+        for n in TARBALL_ICON_SIZES {
+            assert!(
+                joined.contains(&format!("hicolor/{n}x{n}/apps/{}.png", info.identifier)),
+                "icon {n}: {joined}"
+            );
+        }
+        // The generated entry, not a hand-written one — `package --check` is what keeps it true.
+        assert!(
+            joined.contains(&format!("{FLATPAK_DIR}/{}.desktop", info.identifier)),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn every_icon_the_tarball_installs_is_one_the_config_declares() {
+        // The sizes are a literal here and a list in `tauri.conf.json`, and the drift is silent:
+        // `install` would fail at run time on a size that was removed from `crates/cide-app/icons`,
+        // twenty minutes into a release. The preflight's own icon check reads the config's list,
+        // so this is what ties this literal to it.
+        let info = read_app_info(&crate::workspace_root().expect("a workspace root"))
+            .expect("the real config parses");
+        for n in TARBALL_ICON_SIZES {
+            let wanted = format!("icons/{n}x{n}.png");
+            assert!(
+                info.icons.contains(&wanted),
+                "{wanted} is installed by the tarball but is not in {TAURI_CONF}'s bundle.icon: \
+                 {:?}",
+                info.icons
+            );
+        }
+    }
+
+    #[test]
+    fn the_app_binary_is_what_the_crate_declares() {
+        // `APP_BIN` and `APP_PACKAGE` are two different strings for one crate, and the tarball
+        // installs `target/release/<APP_BIN>` — a name only `crates/cide-app/Cargo.toml` decides.
+        let manifest = fs::read_to_string(
+            crate::workspace_root()
+                .expect("a workspace root")
+                .join(APP_CRATE)
+                .join("Cargo.toml"),
+        )
+        .expect("the app crate has a manifest");
+        assert!(
+            manifest.contains(&format!("name = \"{APP_PACKAGE}\"")),
+            "package name"
+        );
+        assert!(
+            manifest.contains(&format!("name = \"{APP_BIN}\"")),
+            "[[bin]] name"
+        );
+    }
+
     #[test]
     fn the_source_tarball_is_the_only_target_no_host_refuses() {
         // Every other field of `Targets` names a bundler that exists on one platform. This one
@@ -3366,6 +3867,7 @@ mod tests {
             flatpak: false,
             app: false,
             dmg: false,
+            tarball: false,
             src: true,
             src_named: true,
         };
@@ -3471,6 +3973,7 @@ mod tests {
             flatpak: false,
             app: false,
             dmg: false,
+            tarball: false,
             src: true,
             src_named: true,
         };

@@ -237,7 +237,7 @@ export function createTerminal(kind: TerminalPaneKind, paneId: string): Terminal
     linkHandler: {
       activate: (_event, uri) => {
         notify(`cide does not open web links from terminal output: ${oneLine(uri)}`, {
-          kind: 'info',
+          kind: 'warn',
           hint: 'Copy the address and open it in a browser.',
         })
       },

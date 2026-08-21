@@ -15,26 +15,46 @@
  * skipped — so they are pure functions here rather than closures inside a `useState` updater,
  * and `ui/scripts/check-notices.mjs` compiles this file on its own and drives them.
  *
- * # Why errors and successes share one surface
+ * # Why all three kinds share one surface
  *
- * A second bottom-right stack would fight this one for the same 12px corner, and the two are
+ * A second bottom-right stack would fight this one for the same 12px corner, and the three are
  * the same thing to a user: the outcome of something they just did. What differs is the
- * colour, the ARIA role, and nothing else — see `Failures.tsx` for both.
+ * colour and the ARIA role, and nothing else — see `Failures.tsx` for both.
  *
  * Module-level and per-window. `Failures` mounts once per window (the shell returns before it
  * for a detached pane and renders its own), so there is exactly one reader.
  */
 
 /**
- * Failure or report.
+ * What happened. Three, and each one has a colour and an ARIA role of its own.
  *
- * The kind is not decoration: it picks `role="alert" aria-live="assertive"` against
- * `role="status" aria-live="polite"`. A screen reader must be interrupted for a command that
- * failed and must **not** be for one that worked — announcing "fast-forwarded 7 commits" over
- * whatever the user is reading is the accessibility equivalent of a modal dialog for a
- * success.
+ *   * `ok`    — the gesture did what it said. Green edge, `role="status" aria-live="polite"`.
+ *   * `warn`  — understood, and nothing happened: a refusal, a "there is none here", a partial
+ *               result. Yellow edge, `role="alert" aria-live="assertive"`.
+ *   * `error` — the command failed. Red edge, `role="alert" aria-live="assertive"`.
+ *
+ * # Why there are three and not two
+ *
+ * There were two, `error` and `info`, and the second was doing two unrelated jobs: sixteen real
+ * successes ("Merge committed", "Copied a1b2c3d") and twenty-five refusals ("This window has no
+ * file tree", "There is no file path under the pointer"). One colour for both is one colour for
+ * *worked* and *did not work*, which is the distinction a toast exists to carry.
+ *
+ * It was worse than that on screen. `info` was painted `--accent`, and `--accent` is #c4452a
+ * light / #d97757 dark — Claude's red-orange, a few percent from `--red`'s #c0332b / #e06c75. On
+ * a 3px edge nobody can tell them apart, so **every** notice read as a failure, including the
+ * ones reporting that a pull had worked.
+ *
+ * # Why `warn` is assertive
+ *
+ * The old rule was "interrupt a screen reader for a failure, never for a success" — announcing
+ * "fast-forwarded 7 commits" over the sentence someone is reading is a modal dialog for a
+ * success. That rule survives for `ok`. A refusal is not a success: "There is no file path under
+ * the pointer" is the direct answer to a Ctrl+click the user has just made, and a screen-reader
+ * user who is told nothing concludes the gesture is wired to nothing — which is the whole reason
+ * this surface exists. So `warn` interrupts, and only `ok` waits for a pause.
  */
-export type NoticeKind = 'error' | 'info'
+export type NoticeKind = 'ok' | 'warn' | 'error'
 
 export interface Notice {
   id: number
@@ -169,13 +189,21 @@ function publish(next: readonly Notice[]): void {
  *
  * Returns nothing on purpose: a caller that wants to know whether its notice was collapsed
  * into an existing one is a caller that is about to build a second surface.
+ *
+ * **`kind` is required, and that is the point.** It used to default to `info`, which was safe
+ * while `info` meant everything-that-is-not-a-failure: the default could only be vague, never
+ * wrong. With three kinds a default silently picks between green and yellow, and a green edge
+ * on a refusal is the same mislabel this vocabulary was split up to remove, pointing the other
+ * way. There were eight bare `notify(text)` calls and seven of them meant `ok` — the eighth
+ * ("this agent has nothing to integrate") is exactly the one a default would have got wrong.
+ * `tsc` asks every caller instead; `notifyFailure` is the shorthand for the error case.
  */
 export function notify(
   text: string,
-  options: { kind?: NoticeKind; hint?: string | undefined; detail?: string | undefined } = {},
+  options: { kind: NoticeKind; hint?: string | undefined; detail?: string | undefined },
 ): void {
   nextId += 1
-  const kind = options.kind ?? 'info'
+  const { kind } = options
   publish(
     admit(notices, {
       id: nextId,

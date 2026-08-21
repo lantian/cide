@@ -225,10 +225,35 @@ function useBranchData(): { project: ProjectId | null; lists: BranchList[]; load
     void useBranches.getState().load(project)
   }, [project])
 
-  // Every mutation in `cmd/git.rs` broadcasts this, and so does the watcher's view of `HEAD`
-  // and the refs — which is how a `git checkout` in a bash pane moves the label.
+  // Every mutation in `cmd/git.rs` broadcasts this — a checkout, a branch created or deleted,
+  // a commit — so it is what moves the label for anything cide itself did.
   useEffect(() => {
     const stop = events.onGitStatus((changed: ProjectId) => {
+      if (changed === useBranches.getState().project) void useBranches.getState().load(changed)
+    })
+    return () => void stop.then((off: () => void) => off())
+  }, [])
+
+  /*
+   * The watcher, for a checkout cide did not make. (M17)
+   *
+   * The comment above used to claim this second half — *"and so does the watcher's view of
+   * `HEAD` and the refs, which is how a `git checkout` in a bash pane moves the label"* — and it
+   * was false in the way that is hardest to notice: the mechanism it described exists, it is
+   * just on a different event. `cide://git-status` is emitted only by `cmd/git.rs::refreshed`.
+   * The watcher's view arrives as `cide://fs-changed`, and nothing here was listening, so a
+   * `git checkout` typed into a bash pane left the status bar naming the branch you left.
+   *
+   * **Gated on `change.git`, which is the opposite of the choice the Git panel makes** and is
+   * right for the opposite reason. A label only moves when `HEAD`, a ref or `packed-refs` moves,
+   * and `cide_fs`'s watcher raises this flag for exactly those and deliberately not for `.cide/`
+   * (a ticked task is not a commit). Without the gate every keystroke-triggered file save would
+   * cost a `git_branches` walk of every repository in the project, for an answer that cannot
+   * have changed.
+   */
+  useEffect(() => {
+    const stop = events.onFsChanged((changed: ProjectId, change) => {
+      if (!change.git) return
       if (changed === useBranches.getState().project) void useBranches.getState().load(changed)
     })
     return () => void stop.then((off: () => void) => off())
@@ -482,7 +507,7 @@ export function BranchPopup({ onDismiss }: BranchPopupProps) {
          */
         const said = checkoutNote(outcome)
         if (said !== '') {
-          notify(said, { kind: outcome.restoreFailed !== null ? 'error' : 'info' })
+          notify(said, { kind: outcome.restoreFailed !== null ? 'error' : 'ok' })
         }
         onDismiss()
       } catch (error) {

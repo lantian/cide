@@ -34,6 +34,7 @@
     "check:keys": "node scripts/check-key-gate.mjs",
     "check:log-actions": "node scripts/check-log-actions.mjs",
     "check:log": "node scripts/check-log.mjs",
+    "check:markdown": "node scripts/check-markdown.mjs",
     "check:log-render": "node scripts/check-log-render.mjs",
     "check:menu-model": "node scripts/check-menu-model.mjs",
     "check:merge": "node scripts/check-merge.mjs",

@@ -88,3 +88,47 @@ export const cideHighlightStyle = HighlightStyle.define(
 export const TOKEN_VAR_BY_CLASS: ReadonlyMap<string, string> = new Map(
   TOKEN_ROLES.map((role) => [role.cls, role.token]),
 )
+
+/**
+ * The `Tag`s a stream parser's token *name* stands for. (M20)
+ *
+ * `@codemirror/language` does this with `createTokenType`, which it does not export, so this is
+ * that function's rule and only that rule: split on `.`, look each part up in `tags`, and treat a
+ * function-valued part as a modifier applied to what came before. That is how
+ * `variableName.function` becomes `t.function(t.variableName)`.
+ *
+ * It lived inside `ui/scripts/check-editor.mjs` until M20, with a comment calling itself "the
+ * smallest possible restatement" — which was right while the check was its only caller. The
+ * markdown preview is the second: `markdown/fenceTokens.ts` drives the same parsers by hand,
+ * outside any `EditorView`, and needs the same name → class answer the buffer gets. Two copies of
+ * a restatement of somebody else's unexported function is one copy too many, so the check now
+ * calls this and pins it.
+ */
+export function tagsFor(name: string): readonly Tag[] {
+  let found: readonly Tag[] = []
+  for (const part of name.split('.')) {
+    const value: unknown = (t as unknown as Record<string, unknown>)[part]
+    if (value === undefined) return []
+    if (typeof value === 'function') {
+      const modifier = value as (tag: Tag) => Tag
+      found = found.map(modifier)
+    } else {
+      found = Array.isArray(value) ? (value as Tag[]) : [value as Tag]
+    }
+  }
+  return found
+}
+
+/**
+ * The `cide-tk-*` class a stream parser's token name paints as, or null for no role.
+ *
+ * The same answer `cideHighlightStyle` gives the buffer, by construction — it *is*
+ * `cideHighlightStyle`, asked directly rather than through an `EditorView`. That is the whole
+ * point: a preview that coloured a `rust` fence from a second table would drift from the buffer
+ * beside it in split mode, where the two are eight pixels apart.
+ */
+export function tokenClassFor(name: string): string | null {
+  const tags = tagsFor(name)
+  if (tags.length === 0) return null
+  return cideHighlightStyle.style(tags) ?? null
+}

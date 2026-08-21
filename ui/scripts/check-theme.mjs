@@ -446,6 +446,62 @@ try {
       'and exactly one file publishes it',
   )
 
+  // --- the three notice edges are three colours a person can tell apart --------------------
+  //
+  // The gap this closes, found from the outside: every toast read as an error. `chrome/notices.ts`
+  // had two kinds and `Failures.module.css` painted them `--red` and `--accent` — #c0332b and
+  // #c4452a in the light palette, #e06c75 and #d97757 in the dark one. Claude's accent *is* a
+  // red-orange, so the distinction the code was making never reached a 3px edge, and the surface
+  // built to prove a command is not dead was reporting a successful pull in the colour of failure.
+  //
+  // Nothing could see it. Everything above this line contrast-checks `TERMINAL_TOKENS` and stops
+  // there; the palette walk proves a token *resolves*, never that two of them differ. So this is
+  // the assertion the defect was missing, and it is here rather than in `check-notices.mjs`
+  // because this file already owns `tokens.css` and the manual cascade that resolves it.
+  //
+  // The floor is a wide one on purpose — it is a claim that three colours are OBVIOUSLY different,
+  // not that they clear a just-noticeable difference. The margin either side of 100 is what makes
+  // it worth having: the closest legitimate pair is dark `--yellow`/`--red` at 133, and the pair
+  // that actually shipped is light `--red`/`--accent` at 37.
+  const EDGE_APART = 100
+  const EDGES = ['--green', '--yellow', '--red']
+  for (const [name, rules] of [['dark', docRules], ['light', docRules]]) {
+    const palette = resolveTheme(rules, name, [...EDGES, '--accent'])
+    const pairs = []
+    for (let i = 0; i < EDGES.length; i += 1) {
+      for (let j = i + 1; j < EDGES.length; j += 1) {
+        const d = apart(palette[EDGES[i]], palette[EDGES[j]])
+        // `null` is a failure here, unlike in the contrast walk above: an edge token that is not a
+        // flat hex is an edge this file cannot compare, and an uncomparable edge is an unchecked one.
+        if (d === null || d < EDGE_APART) {
+          pairs.push(
+            `${EDGES[i]}=${palette[EDGES[i]]} vs ${EDGES[j]}=${palette[EDGES[j]]} ` +
+              `${d === null ? '(not a hex colour)' : d.toFixed(0)}`,
+          )
+        }
+      }
+    }
+    eq(
+      pairs,
+      [],
+      `the ${name} notice edges are mutually distinguishable (>= ${EDGE_APART} apart). ` +
+        `\`Failures.module.css\` paints ok/warn/error with these three, and two of them looking ` +
+        `alike is two kinds the user does not have`,
+    )
+
+    // And that the floor is a floor rather than a number every palette clears — the same discipline
+    // the QUIET exemption table above is held to. This pair is the one that shipped: if a future
+    // edit to `--accent` or `--red` pulls them apart, the assertion above stops proving anything
+    // and this line says so out loud rather than staying quietly green.
+    const shipped = apart(palette['--red'], palette['--accent'])
+    ok(
+      shipped !== null && shipped < EDGE_APART,
+      `the ${name} \`--red\`/\`--accent\` pair is still BELOW the floor (${shipped?.toFixed(0)}) — ` +
+        'that pairing is the defect this section exists for, and a floor it would pass is a floor ' +
+        'that cannot fail',
+    )
+  }
+
   // --- typography: never ask the engine for a face this app did not bundle ----------------
   //
   // Same class of bug as the palette above, and the same reason it lives in a script: it
@@ -900,6 +956,44 @@ function contrast(a, b) {
   const lb = luminance(b)
   if (la === null || lb === null) return null
   return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+}
+
+/**
+ * How far apart two `#rgb`/`#rrggbb` colours look, or `null` if either is not one.
+ *
+ * **Not `contrast`, and the difference is the whole point.** WCAG contrast is a ratio of
+ * *luminance*, which is a question about legibility — can this ink be read on that ground. Two
+ * colours can be equally bright and completely different (a saturated green and a saturated red
+ * sit at almost the same luminance), and two colours can be a few percent apart in hue and pass
+ * any luminance test you like. The notice edges need the second question answered: can a person
+ * tell these three apart. Asking `contrast` would have rated the pair that shipped broken as
+ * fine, and rated green-against-red as a failure.
+ *
+ * Thiadmer Riemersma's "redmean" weighted RGB distance — a low-precision approximation of a
+ * perceptual metric, chosen over a real CIE ΔE because it is six lines with no colour-space
+ * conversion and the decision it informs is "are these three obviously different", not "are they
+ * within a just-noticeable difference". Range is roughly 0…765.
+ */
+function apart(a, b) {
+  const x = rgb(a)
+  const y = rgb(b)
+  if (x === null || y === null) return null
+  const mean = (x[0] + y[0]) / 2
+  const [dr, dg, db] = [x[0] - y[0], x[1] - y[1], x[2] - y[2]]
+  return Math.sqrt(
+    (2 + mean / 256) * dr * dr + 4 * dg * dg + (2 + (255 - mean) / 256) * db * db,
+  )
+}
+
+/** The three channels of a hex colour as 0…255, or `null` for anything that is not one. */
+function rgb(colour) {
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec((colour ?? '').trim())
+  if (!hex) return null
+  const digits =
+    hex[1].length === 3
+      ? [...hex[1]].map((c) => c + c)
+      : [hex[1].slice(0, 2), hex[1].slice(2, 4), hex[1].slice(4, 6)]
+  return digits.map((d) => parseInt(d, 16))
 }
 
 /** Relative luminance per WCAG 2.x, or `null` for anything that is not a hex colour. */

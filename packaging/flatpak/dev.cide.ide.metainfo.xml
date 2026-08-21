@@ -5,7 +5,7 @@
   <name>cide</name>
   <summary>A Claude-Code-native IDE</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>MIT OR Apache-2.0</project_license>
+  <project_license>MIT</project_license>
   <launchable type="desktop-id">dev.cide.ide.desktop</launchable>
   <description>
     <p>

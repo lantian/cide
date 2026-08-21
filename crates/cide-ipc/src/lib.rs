@@ -34,7 +34,7 @@ pub use headless::{HeadlessError, HeadlessRequest, HeadlessResult};
 pub use ids::*;
 pub use image::{ImageDoc, ImageFormat};
 pub use keymap::{Binding, Command, KeymapEdit, KeymapLayer, ResolvedBinding};
-pub use positions::ViewPosition;
+pub use positions::{MarkdownView, ViewPosition};
 pub use settings::{
     ClaudeCli, ClaudeEnvVar, ClaudeInjection, ClaudeInjections, ClaudeSettings,
     DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, EditorSettings, ExplorerSettings, GitSettings,

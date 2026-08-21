@@ -19,7 +19,18 @@ paths: Array<string>,
  */
 truncated: boolean, 
 /**
- * A watched git file changed — `HEAD`, `index`, or a ref. The branch readout and the
- * git panel refresh on this; nothing else needs to.
+ * A watched git file changed — `HEAD`, `index`, or a ref.
+ *
+ * The branch readout gates on this: a label only moves when `HEAD` or a ref does, and
+ * without the gate every file save would cost a branch walk of every repository.
+ *
+ * The **git panel does not**, and the asymmetry is the point rather than an oversight. A
+ * plain working-tree write is what turns a file from clean to modified and it raises no
+ * flag here, so the panel refreshes on any burst for its project and lets one coalesced
+ * `git status` decide what actually moved. `gitlog`'s `gitRefsMoved` is a third answer
+ * again — it ignores index-only bursts, because a history walk only cares about refs.
+ *
+ * This comment claimed both consumers from the day the flag landed and had neither until
+ * M17: the log and the blame gutter were the first, and the two named here came later.
  */
 git: boolean, };

@@ -36,8 +36,13 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Compartment, EditorState } from '@codemirror/state'
-import { EditorView, lineNumbers } from '@codemirror/view'
+import { EditorView, keymap, lineNumbers } from '@codemirror/view'
+// `history` is aliased: this component already has a `history` ref of its own, holding the
+// block-decision undo stack. The two are genuinely different undos and both are wanted — see
+// the `onKeyDown` handler near the bottom of the file, which routes between them.
+import { history as textHistory, historyKeymap } from '@codemirror/commands'
 import { syntaxHighlighting } from '@codemirror/language'
+import { lineEditKeymap } from '@/editor/editorKeys'
 import { cideHighlightStyle } from '@/editor/highlight'
 import { loadLanguage } from '@/editor/languages'
 import { notify } from '@/chrome/notices'
@@ -558,8 +563,35 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
             paintedField,
             // The chevrons, on the side panes only. The result pane is where they point.
             ...(side === 'result' ? [] : conflictGutter(side)),
+            /*
+             * Ctrl+D in all three, and it needs no `editable` branch of its own: `copyLine`
+             * guards on `state.readOnly` and returns `false`, so the two side panes refuse it
+             * on their own. The binding and the chord trade are in `editor/editorKeys.ts`.
+             */
+            keymap.of(lineEditKeymap),
             ...(editable
               ? [
+                  /*
+                   * **A text undo history, which this pane claimed to have and did not.**
+                   *
+                   * The `onKeyDown` handler below says "the centre pane's CodeMirror history
+                   * owns typing, and it must go on owning it", and steps out of the way for any
+                   * Ctrl+Z that came from inside an editable surface. There was no CodeMirror
+                   * history: this file imported nothing from `@codemirror/commands` and
+                   * installed no `history()`. `undo` is a `StateCommand` over a `StateField`, so
+                   * with no field there are no transactions to walk — the chord was handed to a
+                   * history that did not exist and died there. Ctrl+Z in the result pane did
+                   * nothing at all, and the comment saying otherwise had been read past.
+                   *
+                   * It matters more now than it did: `lineEditKeymap` above puts a
+                   * document-editing command on Ctrl+D, and shipping an edit into a pane whose
+                   * undo is inert is how a hand-merged block gets lost with nothing to reach for.
+                   *
+                   * Editable side only. `readOnly` refuses the transactions anyway, so a history
+                   * on the side panes would be a field with nothing in it.
+                   */
+                  textHistory(),
+                  keymap.of(historyKeymap),
                   EditorView.updateListener.of((update) => {
                     if (update.docChanged) setEdited(update.state.doc.toString())
                   }),
@@ -826,6 +858,13 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
    * should undo the character you just typed, not the block you accepted five minutes ago. So
    * this listens on the pane and steps out of the way whenever the event came from inside an
    * editable surface.
+   *
+   * That handoff was to nobody until M17. This file installed no `history()`, so stepping aside
+   * handed the chord to a `StateField` that did not exist and Ctrl+Z in the result pane did
+   * nothing whatsoever — the sentence above was true about the intent and false about the code
+   * for as long as the pane has shipped. The extension is installed on the editable side now
+   * (see `mountEditors`' `extensions`), which is what makes this paragraph describe the
+   * behaviour rather than the plan.
    */
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const key = event.key.toLowerCase()
@@ -851,7 +890,7 @@ export function MergePane({ project, repo, path, tab }: MergePaneProps) {
     void branchApi
       .conflictResolve(project, repo, path, result)
       .then(async () => {
-        notify(`Resolved ${path}`, { kind: 'info' })
+        notify(`Resolved ${path}`, { kind: 'ok' })
         void fileApi.setDirty(project, tab, false).catch(() => {})
         await tabApi.close(project, tab, true).catch(() => {})
         // Back to the list, with this row ticked — or the merge commits itself if that was the

@@ -50,6 +50,7 @@ import {
 } from '@codemirror/view'
 import { cideHighlightStyle } from './highlight'
 import { useCodeMenu } from './codeMenu'
+import { lineEditKeymap } from './editorKeys'
 import { findExtensions } from './find'
 import { minimap } from './minimap'
 import { foldSpecFor, languageName, loadLanguage } from './languages'
@@ -255,6 +256,20 @@ export interface EditorSurfaceProps {
    */
   onSaveHandle?: ((save: (() => Promise<void>) | null) => void) | undefined
   /**
+   * Hand out a way to scroll this buffer to a line, without moving the caret. (M20)
+   *
+   * The same shape as [`onSaveHandle`] and for the same reason — a live view outlives any value a
+   * callback could close over — and the same lifetime: handed out when the view is built, handed
+   * back as `null` in the cleanup, so nothing can scroll a destroyed editor.
+   *
+   * **Not a reveal, and the difference is the whole point.** `revealRequest.ts` and `jump.ts`
+   * move the *selection* and then scroll it into view, which is right for Go to definition and
+   * wrong for this: the caller is the markdown preview keeping the buffer in step as somebody
+   * scrolls the rendering, and a selection that walked down the file while they read it would be
+   * a selection they did not make, in a buffer they are about to type into.
+   */
+  onScrollHandle?: ((scrollTo: ((line: number) => void) | null) => void) | undefined
+  /**
    * The buffer changed, and here is how to read it. (M12)
    *
    * **No text is passed.** This fires on every keystroke, and `doc.toString()` on a five-megabyte
@@ -412,6 +427,7 @@ export function EditorSurface({
   onFocus,
   onSelection,
   onSaveHandle,
+  onScrollHandle,
   onDocChanged,
   symbols,
   diagnostics,
@@ -446,6 +462,8 @@ export function EditorSurface({
   selectionCb.current = onSelection
   const saveHandleCb = useRef(onSaveHandle)
   saveHandleCb.current = onSaveHandle
+  const scrollHandleCb = useRef(onScrollHandle)
+  scrollHandleCb.current = onScrollHandle
   const docChangedCb = useRef(onDocChanged)
   docChangedCb.current = onDocChanged
   const viewCb = useRef(onView)
@@ -984,6 +1002,18 @@ export function EditorSurface({
          */
         { key: 'Mod-Shift-ArrowUp', mac: 'Mod-Alt-Shift-ArrowUp', run: moveLineUp },
         { key: 'Mod-Shift-ArrowDown', mac: 'Mod-Alt-Shift-ArrowDown', run: moveLineDown },
+        /*
+         * Ctrl+D — duplicate line or selection. Shared with `DiffPane` and `MergePane`; the
+         * binding and the whole argument for it are in `editorKeys.ts`.
+         *
+         * **No `Prec.high` needed, and that is a fact about `find.ts` rather than about this
+         * array.** `findExtensions()` is added *earlier* in `shared`, so its keymap is offered
+         * the stroke first — and `searchKeymap` used to bind `Mod-d` to `selectNextOccurrence`,
+         * which returns `true` whenever the caret is in a word. An entry added here without
+         * touching that one would simply never have fired. `searchBindings` filters it out and
+         * re-homes it to `Alt-j`, which is what leaves `Mod-d` free for this line.
+         */
+        ...lineEditKeymap,
         ...closeBracketsKeymap,
         ...defaultKeymap,
         ...historyKeymap,
@@ -1225,6 +1255,31 @@ export function EditorSurface({
     // Cleared in the cleanup below: a handle to a destroyed view would write from a buffer
     // that is no longer on screen.
     saveHandleCb.current?.(() => saveNow(view))
+
+    /*
+     * And the way to scroll it, for the markdown preview. (M20)
+     *
+     * `EditorView.scrollIntoView` on the line's *start*, with `y: 'start'`, rather than writing
+     * `scrollDOM.scrollTop`: the height map is measured from the top of the document,
+     * `.cm-content` carries its own padding and a wrapped line is taller than one row, so a
+     * pixel offset computed out here would be off by all three. `viewTracker.ts` reads this
+     * geometry the same way round, through `posAtCoords`, and for the same reason.
+     *
+     * Clamped, because the caller's line came from a *rendering* of the document and the
+     * document may have changed since it was rendered. An out-of-range position throws out of
+     * `dispatch`, and there is no error boundary between here and the React root.
+     */
+    scrollHandleCb.current?.((line) => {
+      const doc = view.state.doc
+      const clamped = Math.min(Math.max(1, Math.trunc(line)), doc.lines)
+      try {
+        view.dispatch({
+          effects: EditorView.scrollIntoView(doc.line(clamped).from, { y: 'start' }),
+        })
+      } catch (error) {
+        console.error('[cide] could not scroll the buffer to line', clamped, error)
+      }
+    })
 
     // Claimed after the view is built and released in the cleanup below, so the bar's line
     // and the buffer on screen have exactly the same lifetime. A view that failed to
@@ -1533,6 +1588,7 @@ export function EditorSurface({
       lintSlotRef.current = null
       blameSlotRef.current = null
       saveHandleCb.current?.(null)
+      scrollHandleCb.current?.(null)
       /*
        * **The single most important line in this feature.**
        *

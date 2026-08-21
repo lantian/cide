@@ -28,6 +28,37 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// Which of the three layouts a markdown file was last read in. (M20)
+///
+/// # Why this is a property of the *file* and not of the pane
+///
+/// The same argument the whole of this module is built on, and it lands harder here than it
+/// does for a scroll position. A `README.md` is a document somebody reads and a `NOTES.md` is
+/// one they write, and the layout each wants is a fact about the file rather than about the
+/// tile it happens to be showing in. A per-pane mode would also be lost by the one gesture a
+/// reader makes most — closing the tab and opening it again from `Ctrl+P`.
+///
+/// The cost is stated rather than hidden: a split showing one `.md` in two panes restores the
+/// same layout into both, and switching in one does not switch the other until the next mount.
+/// That is exactly the limitation [`ViewPosition::folds`] has, for exactly the same reason.
+///
+/// Every file has one of these, including `main.rs`, where it is [`MarkdownView::Text`] and is
+/// never read. A second store keyed on "only the markdown ones" would be a second answer to
+/// "where was I in this file", which is the thing this module exists to have one of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum MarkdownView {
+    /// The buffer, and nothing else. What every file has always shown, so it is the default.
+    #[default]
+    Text,
+    /// Buffer on the left, rendering on the right, scroll-synchronised.
+    Split,
+    /// The rendering only. The buffer stays mounted and merely invisible — see
+    /// `ui/src/editor/markdown/MarkdownFrame.tsx` for why it is never unmounted.
+    Preview,
+}
+
 /// One file's remembered place.
 ///
 /// # The units, once, for both features that use them
@@ -82,6 +113,17 @@ pub struct ViewPosition {
     /// does.
     #[serde(default)]
     pub folds: Vec<u32>,
+    /// Which markdown layout this file was last read in. (M20)
+    ///
+    /// `#[serde(default)]` for the reason [`ViewPosition::folds`] gives at length: this file is
+    /// a cache of where somebody was looking, it has no schema version, and a `positions.json`
+    /// written before M20 must load unchanged rather than be migrated.
+    ///
+    /// Unlike `folds` there is nothing to normalise. A `Vec<u32>` from a webview can be
+    /// unsorted, duplicated or unbounded, which is why `cide_core::persist::normalise_folds`
+    /// exists; an enum that failed to deserialise is not a value this field can hold.
+    #[serde(default)]
+    pub markdown_view: MarkdownView,
     /// Milliseconds since the Unix epoch, at the last note. The LRU key.
     ///
     /// Written by Rust rather than taken from the caller: a webview clock is the user's system

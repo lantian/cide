@@ -1677,7 +1677,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         ? commitActions.revert(project, repo, request)
         : commitActions.cherryPick(project, repo, request)
     void call
-      .then((outcome) => notify(replayNote(outcome)))
+      .then((outcome) => notify(replayNote(outcome), { kind: 'ok' }))
       .catch((error: unknown) => {
         /*
          * A merge, reverted without saying which side to keep.
@@ -1748,7 +1748,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
             )
             void commitActions
               .reset(project, repo, request)
-              .then((outcome) => notify(resetNote(outcome)))
+              .then((outcome) => notify(resetNote(outcome), { kind: 'ok' }))
               .catch(report)
           },
         })
@@ -1775,7 +1775,9 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
         // A failed restore is a failure even though the checkout worked: the user's changes are
         // in a stash they have not been told about anywhere else, and `detachNote` returns git's
         // own message verbatim for exactly that case.
-        notify(detachNote(outcome), outcome.restoreFailed === null ? {} : { kind: 'error' }),
+        notify(detachNote(outcome), {
+          kind: outcome.restoreFailed === null ? 'ok' : 'error',
+        }),
       )
       .catch((error: unknown) => {
         /*
@@ -1804,7 +1806,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
   ): void {
     void commitActions
       .tag(project, repo, tagRequestFor(name, target, message, force))
-      .then((outcome) => notify(tagNote(outcome)))
+      .then((outcome) => notify(tagNote(outcome), { kind: 'ok' }))
       .catch((error: unknown) => {
         // `TagExists` carries where the tag points *now*, and that oid is the whole of the
         // question `forceTagConfirm` asks — "move it off there?" is answerable and "the name is
@@ -1833,7 +1835,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
        * from a list of branches — and wrong here: the commit is the entire point of *from here*,
        * and a note that omitted it could not be told from an ordinary checkout.
        */
-      .then(() => notify(`Created ${name} at ${shortOid} and switched to it`))
+      .then(() => notify(`Created ${name} at ${shortOid} and switched to it`, { kind: 'ok' }))
       .catch(report)
   }
 
@@ -1841,7 +1843,7 @@ export function LogTab({ project, tab, repo, path }: LogTabProps) {
   function copyOid(oid: string): void {
     void copyText(oid).then((done) => {
       if (done) {
-        notify(`Copied ${oid}`)
+        notify(`Copied ${oid}`, { kind: 'ok' })
         return
       }
       // `copyText` has already tried the `execCommand` fallback and logged the rejection, so

@@ -238,12 +238,14 @@ export function AgentsPanel({ project, onShowTasks }: AgentsPanelProps) {
         .integrate(agent)
         .then((done) => {
           if (done.kind === 'upToDate') {
-            notify(`${agent} has nothing to integrate — its branch holds no new commits.`)
+            notify(`${agent} has nothing to integrate — its branch holds no new commits.`, {
+              kind: 'warn',
+            })
             return
           }
           if (done.kind === 'merged') {
             const n = done.files === 1 ? '1 file' : `${done.files} files`
-            notify(`Integrated ${agent}: ${n} at ${done.commit.slice(0, 8)}.`)
+            notify(`Integrated ${agent}: ${n} at ${done.commit.slice(0, 8)}.`, { kind: 'ok' })
             return
           }
           notify(`${agent} conflicts with your branch — nothing was merged.`, {

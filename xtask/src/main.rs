@@ -53,9 +53,9 @@ Tasks:
                              dev server on :1420 (`pnpm --dir ui dev`); --release builds
                              ui/dist and embeds it instead. See BENCH.md.
   package [targets] [...]  preflight the packaging and print the plan
-                             targets: --appimage --deb --flatpak (Linux)
-                                      --app --dmg                (macOS)
-                                      --src                      (any host)
+                             targets: --appimage --deb --flatpak --tarball (Linux)
+                                      --app --dmg                          (macOS)
+                                      --src                                (any host)
                              default: everything this host is responsible for. Nothing
                              here cross-compiles, so naming a bundle the host cannot
                              produce fails the preflight rather than printing a plan.
@@ -115,6 +115,7 @@ fn main() -> ExitCode {
                 "--appimage",
                 "--deb",
                 "--flatpak",
+                "--tarball",
                 "--app",
                 "--dmg",
                 "--src",
@@ -138,6 +139,7 @@ fn main() -> ExitCode {
                 "--appimage",
                 "--deb",
                 "--flatpak",
+                "--tarball",
                 "--app",
                 "--dmg",
                 "--src",
@@ -150,6 +152,7 @@ fn main() -> ExitCode {
                 flatpak: f.contains("--flatpak"),
                 app: f.contains("--app"),
                 dmg: f.contains("--dmg"),
+                tarball: f.contains("--tarball"),
                 src: f.contains("--src"),
                 // Named on the command line, by construction: this whole literal only runs when
                 // `named` is true. The distinction it carries is about the DIRTY-TREE verdict —

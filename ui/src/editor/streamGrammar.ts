@@ -124,6 +124,15 @@ function isIdentifierPart(ch: string, extra: string): boolean {
  * decide what to wrap it in — and so this file can be unit-tested without constructing an
  * `EditorState`.
  */
+/**
+ * A built tokenizer: what every `languages/*.ts` module exports as `spec`. (M20)
+ *
+ * Named so that callers outside `StreamLanguage.define` can hold one. There is one — the markdown
+ * preview drives `token()` over a fenced block by hand, because a fence has no `EditorView` to
+ * tokenize it and `StreamLanguage`'s own parser is not reachable from the extension it returns.
+ */
+export type Grammar = ReturnType<typeof grammar>
+
 export function grammar(spec: GrammarSpec) {
   const keywords = new Set(spec.keywords ?? [])
   const types = new Set(spec.types ?? [])

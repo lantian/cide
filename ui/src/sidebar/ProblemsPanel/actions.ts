@@ -27,8 +27,8 @@ import { diagnostics as diagnosticsApi, type DiagnosticSourceId, type ProjectId 
 /**
  * Ask every running analyser to check this project again.
  *
- * Fire-and-forget; the outcome is a notice either way. The `info` notice is deliberate rather than
- * a silence: a re-run that finds the same problems changes *nothing* on screen, and without a line
+ * Fire-and-forget; the outcome is a notice either way. The notice is deliberate rather than a
+ * silence: a re-run that finds the same problems changes *nothing* on screen, and without a line
  * saying it ran, a user who presses this because their diagnostics look stale learns that the
  * button does nothing.
  */
@@ -38,7 +38,7 @@ export function refreshDiagnostics(project: ProjectId): void {
     // The sentence is the server-side one: it names the analysers that were kicked, or says
     // plainly that none is running. Inventing a cheerful one here would mean claiming a re-run
     // happened in a project that has no language server at all.
-    .then((sentence) => notify(sentence, { kind: 'info' }))
+    .then((sentence) => notify(sentence, { kind: 'ok' }))
     .catch(notifyFailure)
 }
 
@@ -51,8 +51,11 @@ export function refreshDiagnostics(project: ProjectId): void {
  * panel's own row will sit at `Starting…` for all of it.
  */
 export function restartDiagnosticSource(project: ProjectId, source: DiagnosticSourceId): void {
-  notify(`Restarting ${source === 'rustAnalyzer' ? 'rust-analyzer' : source}. It re-indexes from scratch, which can take a while.`, {
-    kind: 'info',
+  // `ok`, and the wait is a `hint`: the restart is a gesture that worked, and the minutes of
+  // re-indexing behind it are the thing the user has to know rather than the outcome itself.
+  notify(`Restarting ${source === 'rustAnalyzer' ? 'rust-analyzer' : source}.`, {
+    kind: 'ok',
+    hint: 'It re-indexes from scratch, which can take a while.',
   })
   void diagnosticsApi.restart(project, source).catch(notifyFailure)
 }

@@ -364,7 +364,7 @@ export function findUsages(
     ask: () => diagnosticsApi.usages(project, path, line, column),
     // A caret on a keyword, a comment, punctuation. There is no symbol, so there is nothing to
     // fall back to and the honest answer is a sentence.
-    onNoSymbol: () => notify(noSymbolSentence(), { kind: 'info' }),
+    onNoSymbol: () => notify(noSymbolSentence(), { kind: 'warn' }),
     failureLead: 'Find usages',
   })
 }
@@ -494,7 +494,7 @@ function locationQuery(spec: {
       const rows = answer.rows
       if (rows.length === 0) {
         dismiss()
-        if (spec.onEmpty === undefined) notify(noUsagesSentence(name, kind), { kind: 'info' })
+        if (spec.onEmpty === undefined) notify(noUsagesSentence(name, kind), { kind: 'warn' })
         else spec.onEmpty()
         return
       }

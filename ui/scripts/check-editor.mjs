@@ -176,6 +176,12 @@ try {
       // needs an `EditorState`, and a fold that starts one line off is invisible in a screenshot
       // and obvious in an assertion.
       'src/editor/foldRanges.ts',
+      // M17, section 12: the editor's key bindings, as data. Not import-free — it imports the
+      // two CodeMirror packages whose commands it names — but deliberately import-*light*, and
+      // that is the point: `find.ts` and `EditorSurface.tsx` cannot be required (a CSS module
+      // and React respectively), so bindings living in them can only ever be regexed. These can
+      // be loaded, folded into the composed keymap below, and resolved by identity.
+      'src/editor/editorKeys.ts',
       '--outDir', out,
       '--rootDir', 'src',
       // CommonJS, and this is load-bearing twice over. `languages.ts` reaches its grammars
@@ -254,7 +260,8 @@ try {
     defaultScratchType,
     filterScratchTypes,
   } = load('languages.js')
-  const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle } = load('highlight.js')
+  const { TOKEN_ROLES, PLAIN_TOKEN, TOKEN_VAR_BY_CLASS, cideHighlightStyle, tagsFor, tokenClassFor } =
+    load('highlight.js')
   const geo = load('minimapGeometry.js')
   const send = load('sendToClaude.js')
   const revealPlan = load('revealTarget.js')
@@ -264,7 +271,6 @@ try {
   const { foldSpecFor, foldSpecs, DEFAULT_FOLD_SPEC } = load('languages.js')
   const { StringStream } = require('@codemirror/language')
   const { Text } = require('@codemirror/state')
-  const { tags } = require('@lezer/highlight')
 
   // ---------------------------------------------------------------------------------------
   // 1. Line endings
@@ -615,22 +621,13 @@ try {
 
   /*
    * `@codemirror/language` turns a stream parser's tag *name* into `Tag` objects with
-   * `createTokenType`, which is not exported. This is that function's rule, and only that
-   * rule: split on `.`, look each part up in `tags`, and treat a function-valued part as a
-   * modifier applied to what came before. Getting this wrong here would make the assertions
-   * below test a fiction, so it is deliberately the smallest possible restatement.
+   * `createTokenType`, which is not exported. The restatement of that rule used to live here;
+   * since M20 it is `highlight.ts::tokenClassFor`, because the markdown preview needs the same
+   * answer outside an `EditorView` and two copies of a restatement of somebody else's unexported
+   * function is one too many. The assertions below are now pinning the app's own code rather
+   * than a copy of it, which is strictly better: a mistake in it is a mistake on screen.
    */
-  const tagsFor = (name) => {
-    let found = []
-    for (const part of name.split('.')) {
-      const value = tags[part]
-      if (value === undefined) return []
-      if (typeof value === 'function') found = found.map(value)
-      else found = Array.isArray(value) ? value : [value]
-    }
-    return found
-  }
-  const classOf = (name) => cideHighlightStyle.style(tagsFor(name)) ?? null
+  const classOf = (name) => tokenClassFor(name)
 
   // The mock's own six roles, plus `?`. These are the assertions a screenshot would make.
   eq(classOf('keyword'), 'cide-tk-keyword', 'keywords are the keyword class')
@@ -3375,11 +3372,23 @@ try {
       'runScopeHandlers comes from @codemirror/view — the scope string is matched by value, so a ' +
         'typo in either half fails silently and for ever',
     )
+    /*
+     * The search bindings moved to `editorKeys.ts` in M17, and the move is the assertion worth
+     * having. This file cannot be `require`d — it imports `./EditorSurface.module.css` — so
+     * every claim about its chords could only ever be a regex over its source. The bindings now
+     * live in a module a check can load, and the composed-keymap block below resolves them by
+     * identity instead of by pattern. What is left here is that this file installs *that* array
+     * and does not quietly grow a second one.
+     */
     ok(
-      /searchKeymap\.filter\(\(binding\) => binding\.run !== gotoLine\)/.test(findCode),
-      'searchKeymap is installed whole except CodeMirror\'s own gotoLine, and the one exception ' +
-        'is filtered by command identity rather than by key string — a `key === \'Mod-Alt-g\'` ' +
-        'test would stop matching silently the day upstream re-spells the chord',
+      /keymap\.of\(searchBindings\)/.test(findCode),
+      'find.ts installs `searchBindings` from editorKeys.ts — the array a check can load and ' +
+        'resolve, rather than an inline filter that can only be pattern-matched',
+    )
+    ok(
+      !/searchKeymap/.test(findCode),
+      'and it does not reach for the raw `searchKeymap` as well: two sources for one keymap is ' +
+        'how the filtered-out gotoLine dialog would come back with nothing failing',
     )
     ok(
       /'Next match \(F3, Enter\)'/.test(findCode) && /'Previous match \(Shift\+F3, Shift\+Enter\)'/.test(findCode),
@@ -3454,13 +3463,30 @@ try {
      * quietly claimed Mod-z would fail here rather than in a bug report.
      */
     const { closeBracketsKeymap } = require('@codemirror/autocomplete')
-    const { defaultKeymap, historyKeymap, indentWithTab } = require('@codemirror/commands')
-    const { searchKeymap } = require('@codemirror/search')
+    const { copyLineDown, defaultKeymap, historyKeymap, indentWithTab } =
+      require('@codemirror/commands')
+    const { selectNextOccurrence } = require('@codemirror/search')
+    /*
+     * The app's own two arrays, **loaded rather than restated**.
+     *
+     * `searchBindings` replaces the raw `searchKeymap` here: what a buffer is offered is what
+     * `find.ts` installs, and that is `searchKeymap` minus `gotoLine`, minus
+     * `selectNextOccurrence`, plus the `Alt-j` this project re-homed the latter to. Expanding
+     * the upstream array instead would compute the freedom of chords in a keymap nothing mounts
+     * — the same class of mistake as the `Mod-Shift-Arrow` comment two sections down, where a
+     * documented answer disagreed with the shipped one for four milestones.
+     *
+     * Ordering mirrors the extension order in `EditorSurface`: `findExtensions()` is added
+     * before the surface's own `keymap.of([...])`, so `searchBindings` claims first. That
+     * matters for exactly one chord and it is `Mod-d`.
+     */
+    const keys = load('editorKeys.js')
     const composed = [
+      ...keys.searchBindings,
+      ...keys.lineEditKeymap,
       ...closeBracketsKeymap,
       ...defaultKeymap,
       ...historyKeymap,
-      ...searchKeymap,
       indentWithTab,
     ]
     for (const chord of ['Mod-z', 'Mod-y', 'Mod-u']) {
@@ -3517,13 +3543,30 @@ try {
         if (shift) result = `Shift-${result}`
         return result
       }
+      /*
+       * **First claim wins, and that is the correction rather than a detail.**
+       *
+       * This built the map with a bare `set`, so a chord claimed twice reported the *last*
+       * binding — while `@codemirror/view`'s `runHandlers` walks the keymaps in facet order and
+       * stops at the first `run` that returns true. The two answers are opposites, and they
+       * differ in exactly the case this expansion exists to catch: a chord that is bound and
+       * shadowed. `composed` is ordered the way a buffer composes it (`findExtensions()` before
+       * `EditorSurface`'s own array), so keeping the first claim makes the map say what the
+       * editor would do.
+       *
+       * It changed no existing answer here — nothing else in the composed keymap is claimed
+       * twice — which is the other half of why it was safe to have been wrong.
+       */
       const claimedOn = (platform) => {
         const claimed = new Map()
+        const keep = (chord, run) => {
+          if (!claimed.has(chord)) claimed.set(chord, run)
+        }
         for (const b of composed) {
           const spelling = b[platform] ?? b.key
           if (spelling === undefined) continue
-          if (b.run) claimed.set(normalizeChord(spelling, platform), b.run)
-          if (b.shift) claimed.set(normalizeChord(`Shift-${spelling}`, platform), b.shift)
+          if (b.run) keep(normalizeChord(spelling, platform), b.run)
+          if (b.shift) keep(normalizeChord(`Shift-${spelling}`, platform), b.shift)
         }
         return claimed
       }
@@ -3538,6 +3581,174 @@ try {
         'and it reaches a `shift:` sub-binding of a `mac:`-only entry — which is the one the ' +
           'old keymap.rs comment did not know about',
       )
+
+      /*
+       * ------------------------------------------------- Ctrl+D, and the chord it took (M17)
+       *
+       * *"Need a hotkey Ctrl+D — copy current line and paste it below."* `copyLineDown` is
+       * `@codemirror/commands`' own and does exactly that; the whole of the work was that the
+       * chord was already taken.
+       *
+       * **`Mod-d` was `selectNextOccurrence`**, from `searchKeymap`, and `findExtensions()` is
+       * added to `shared` *before* `EditorSurface`'s own `keymap.of([...])` — so a `Mod-d` entry
+       * appended to the surface would have been offered the stroke second, behind a command that
+       * returns `true` whenever the caret is in a word. It would have looked wired and fired
+       * almost never. `searchBindings` filters it out by identity and re-homes it to `Alt-j`,
+       * IDEA's own chord for it, and *that* is what frees `Mod-d`.
+       *
+       * Both halves are resolved out of the composed map rather than asserted from the source,
+       * because the failure this guards against is precisely a binding that is present and
+       * shadowed. `freeOn` returns the claiming command's name or `null`, so a chord claimed by
+       * the wrong command reads differently from a chord claimed by nobody.
+       */
+      eq(
+        linux.get(normalizeChord('Mod-d', 'linux'))?.name,
+        copyLineDown.name,
+        'Ctrl+D duplicates the line — resolved out of the composed keymap in the order a buffer ' +
+          'composes it, so a `searchKeymap` upgrade that re-added Mod-d would fail here rather ' +
+          'than by silently shadowing the binding',
+      )
+      eq(
+        mac.get(normalizeChord('Mod-d', 'mac'))?.name,
+        copyLineDown.name,
+        'and ⌘D on macOS — `Mod` is the whole reason the chord needs no second spelling',
+      )
+      eq(
+        composed.filter((b) => b.key === 'Mod-d').length,
+        1,
+        'exactly one binding in the composed keymap claims Mod-d. Two would mean the re-homing ' +
+          'below was added without the filter that makes room for it, which is the state where ' +
+          'the feature reads as shipped and does nothing',
+      )
+      eq(
+        linux.get(normalizeChord('Alt-j', 'linux'))?.name,
+        selectNextOccurrence.name,
+        'and select-next-occurrence MOVED rather than disappearing: Alt+J is IDEA\'s chord for ' +
+          'it, and a capability deleted to make room for another is not a re-homing. This is ' +
+          'the assertion that fails if the filter outlives the replacement',
+      )
+      eq(
+        mac.get(normalizeChord('Alt-j', 'mac'))?.name,
+        selectNextOccurrence.name,
+        'on macOS too. Option rewrites `event.key` there — ⌥J is `∆` — and CodeMirror\'s ' +
+          '`runHandlers` falls back to the keyCode base name for exactly that, which is why ' +
+          'this carries no `mac:` spelling of its own',
+      )
+      /*
+       * `ok` over an explicit `!== undefined`, not `eq`, for the reason the note under `freeOn`
+       * below gives: the map holds functions, and `eq` compares through `JSON.stringify`, which
+       * answers `undefined` for one — so `eq(claimed, undefined)` passes for every chord in the
+       * table as well as every chord outside it.
+       */
+      ok(
+        linux.get(normalizeChord('Mod-Shift-l', 'linux')) !== undefined,
+        'the rest of searchKeymap survived the two removals — Mod-Shift-l still selects every ' +
+          'match, so this was a picking-over and not a replacement',
+      )
+      eq(
+        composed.filter((b) => b.run === selectNextOccurrence).length,
+        1,
+        'and select-next-occurrence is reachable from exactly one chord: the filter is by ' +
+          'command identity, so a re-homing that forgot to remove the original would leave two',
+      )
+
+      /*
+       * **Driven, not asserted about.** The stand-in is the one section 21 uses on the fold
+       * commands — `copyLineDown` is a `StateCommand`, so `.state` and `.dispatch` are the whole
+       * of what it touches. "Ctrl+D is bound to copyLineDown" and "Ctrl+D leaves the line
+       * duplicated below with the caret on the copy" are different claims and only the second is
+       * the feature.
+       */
+      {
+        const { EditorState: ES } = require('@codemirror/state')
+        const asView = (state) => {
+          const v = { state, dispatch: (spec) => { v.state = v.state.update(spec).state } }
+          return v
+        }
+        const DOC = ['one', 'two', 'three'].join('\n')
+
+        const caret = asView(
+          ES.create({ doc: DOC }).update({ selection: { anchor: 5 } }).state,
+        )
+        eq(copyLineDown(caret), true, 'a caret on line 2 duplicates line 2')
+        eq(
+          caret.state.doc.toString().split('\n'),
+          ['one', 'two', 'two', 'three'],
+          '…below the original and nowhere else — the request was "paste it below of current ' +
+            'line", which is copyLineDown and not copyLineUp',
+        )
+        eq(
+          caret.state.doc.lineAt(caret.state.selection.main.head).number,
+          3,
+          '…and the caret rides down to the COPY. It is the line you are about to edit; leaving ' +
+            'it on the original is what makes a duplicate-line chord feel like it did nothing',
+        )
+
+        const span = asView(
+          ES.create({ doc: DOC }).update({ selection: { anchor: 0, head: 7 } }).state,
+        )
+        eq(copyLineDown(span), true, 'a selection spanning two lines duplicates both')
+        eq(
+          span.state.doc.toString().split('\n'),
+          ['one', 'two', 'one', 'two', 'three'],
+          '…as a block. IDEA calls this command Duplicate Line OR SELECTION and the selection ' +
+            'half is the one a user notices missing',
+        )
+
+        const ro = asView(ES.create({ doc: DOC, extensions: [ES.readOnly.of(true)] }))
+        eq(
+          copyLineDown(ro),
+          false,
+          'and it refuses a read-only state. That refusal is load-bearing rather than tidy: ' +
+            'DiffPane and MergePane install this array on their READ-ONLY sides too, sharing ' +
+            'one array on exactly this guarantee, the way DiffPane already shares historyKeymap',
+        )
+        eq(
+          ro.state.doc.toString(),
+          DOC,
+          '…and refusing means it wrote nothing, not that it returned false on the way out',
+        )
+      }
+
+      /*
+       * Installed in all three editable surfaces, and read out of each one's own keymap array
+       * rather than out of the file. The note under `indentWithTab` below records why that
+       * distinction is not pedantry: `/indentWithTab,/` over the whole file was a check that
+       * could not fail, because the import line matched it. `lineEditKeymap` is on an import
+       * line in all three of these.
+       */
+      {
+        /** The first bracket-balanced `[...]` after `from`. */
+        const arrayAt = (src, from) => {
+          const open = src.indexOf('[', from)
+          if (open === -1) return ''
+          let depth = 0
+          for (let i = open; i < src.length; i++) {
+            if (src[i] === '[') depth += 1
+            else if (src[i] === ']') {
+              depth -= 1
+              if (depth === 0) return src.slice(open, i + 1)
+            }
+          }
+          return ''
+        }
+        const surfaces = [
+          ['src/editor/EditorSurface.tsx', 'keymap.of(['],
+          ['src/panes/DiffPane.tsx', 'const shared ='],
+          ['src/panes/MergePane.tsx', 'extensions: ['],
+        ]
+        for (const [file, marker] of surfaces) {
+          const src = strip(readFileSync(file, 'utf8'))
+          const at = src.indexOf(marker)
+          ok(at !== -1, `${file} still builds its extension list at \`${marker}\``)
+          ok(
+            arrayAt(src, at).includes('lineEditKeymap'),
+            `and ${file} installs lineEditKeymap IN THAT ARRAY. An extension built and not ` +
+              "mounted is this project's most-repeated defect, and an import that survives its " +
+              'last use is how it hides',
+          )
+        }
+      }
 
       /* Move line up/down: taken by alt+up/alt+down in the app keymap, re-homed here. */
       ok(
@@ -3637,9 +3848,28 @@ try {
     const diffSrc = strip(readFileSync('src/panes/DiffPane.tsx', 'utf8'))
     const sharedAt = diffSrc.indexOf('const shared =')
     ok(sharedAt !== -1, 'DiffPane still builds a shared extension list')
-    const sharedLine = diffSrc.slice(sharedAt, diffSrc.indexOf('\n', sharedAt))
+    /*
+     * Bracket-matched rather than sliced to the end of the line. `shared` grew a second entry in
+     * M17 and wrapped, and the one-line slice then matched `const shared = [` and nothing else —
+     * a check that had been asserting an undo history went on passing while asserting nothing.
+     * The array is the unit; where it happens to break lines is not.
+     */
+    const sharedOpen = diffSrc.indexOf('[', sharedAt)
+    let sharedDepth = 0
+    let sharedEnd = sharedOpen
+    for (let i = sharedOpen; i < diffSrc.length; i++) {
+      if (diffSrc[i] === '[') sharedDepth += 1
+      else if (diffSrc[i] === ']') {
+        sharedDepth -= 1
+        if (sharedDepth === 0) {
+          sharedEnd = i + 1
+          break
+        }
+      }
+    }
+    const sharedLine = diffSrc.slice(sharedOpen, sharedEnd)
     ok(
-      /history\(\)/.test(sharedLine) && /keymap\.of\(historyKeymap\)/.test(sharedLine),
+      /history\(\)/.test(sharedLine) && /\bhistoryKeymap\b/.test(sharedLine),
       'the diff pane has an undo history: it is the one editable surface whose Accept writes a ' +
         'file, and it shipped with no `history()` at all, so Ctrl+Z there did nothing',
     )
@@ -4485,7 +4715,7 @@ try {
      * button wired to nothing, which is the exact defect `WalkRefusal` exists to prevent.
      */
     ok(
-      /\.then\(\(refusal\) => \{/.test(dispatchSrc) && /notify\(refusal, \{ kind: 'info' \}\)/.test(dispatchSrc),
+      /\.then\(\(refusal\) => \{/.test(dispatchSrc) && /notify\(refusal, \{ kind: 'warn' \}\)/.test(dispatchSrc),
       'and it awaits the answer and says it out loud — a refusal that is only known after the ' +
         'round trip is still a refusal the user has to be told about',
     )
@@ -5257,10 +5487,14 @@ try {
         'and the discriminator can send them somewhere they did not ask to go',
     )
     /*
-     * Zero usages is a sentence, and it is an `info` — "used nowhere" is a *result*, and
-     * `role="alert"` in red for a result is the accessibility equivalent of a modal dialog
-     * announcing a success. Scoped to the branch, because the neighbouring "no declaration here"
-     * arm also notifies and a whole-file grep would pass on a file where only that one survived.
+     * Zero usages is a sentence, and it is a `warn` — "used nowhere" is a *result*, not a
+     * command that failed, and a red edge for it would train a user out of what red means. It
+     * was `info` until M22 split that kind into `ok` and `warn`; yellow is where a question the
+     * app understood and answered with "there are none" belongs. Deliberately NOT `ok`: green
+     * for an empty answer reads as "found them", which is the opposite of what happened.
+     *
+     * Scoped to the branch, because the neighbouring "no declaration here" arm also notifies and
+     * a whole-file grep would pass on a file where only that one survived.
      */
     {
       const at = intelSrc.indexOf('rows.length === 0')
@@ -5271,8 +5505,9 @@ try {
         'zero usages is a sentence and not a silent no-op',
       )
       ok(
-        /kind: 'info'/.test(branch),
-        'and an info notice, not an error',
+        /kind: 'warn'/.test(branch),
+        'and a warn notice — not an error, which red is reserved for, and not an ok, which '
+          + 'would paint an empty answer green',
       )
     }
     /*

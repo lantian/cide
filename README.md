@@ -684,14 +684,66 @@ prior codegen, and `contract-check` runs green inside it. What it correctly does
 tarball is therefore a preflight failure with that sentence in it, rather than a confusing error
 out of git.
 
-**What the tarball is still missing is a licence.** `Cargo.toml` declares
-`license = "MIT OR Apache-2.0"` and the generated AppStream metainfo publishes the same string,
-but there is no `LICENSE-MIT`/`LICENSE-APACHE` at the root, so there is none in the archive
-either — and Apache-2.0 §4(a) requires the licence text to accompany redistributed source, which
-a tarball on a public release page unambiguously is. Adding the two files fixes it with no code
-change (they are tracked, so they land in the archive for free). It has not been done because the
-MIT text needs a copyright holder named, and that is not a choice this repository can make for
-itself.
+**The tarball carries the licence.** `LICENSE` is MIT, at the root, tracked — so it lands in the
+archive for free, which is the whole reason this step is `git archive` and not `tar`. It used to
+be missing, and the dual `MIT OR Apache-2.0` claim it was missing the text of made that worse
+rather than better: Apache-2.0 §4(a) requires the licence text to accompany redistributed source,
+and a tarball on a public release page unambiguously is that. The project is MIT, singly, and
+three files say so — `Cargo.toml`'s `license`, `LICENSE` itself, and the `<project_license>` the
+AppStream metainfo publishes, which is a literal in `xtask/src/package.rs` rather than something
+derived from `AppInfo`, so it has to be changed by hand when the other two are.
+
+### `--tarball`: the binary one, which promises the opposite
+
+`cargo xtask package --tarball --run` writes
+`target/release/bundle/tarball/cide-0.1.0-linux-x86_64.tar.gz` — 8.1 MiB against the AppImage's
+86.5 MiB, unpacking into `cide-0.1.0/` with `bin/cide`, `bin/cide-hook`, the desktop entry, the
+six `hicolor` icon sizes, `README.md` and `LICENSE`. It is for the person who wants the program
+without a package manager, without root, and without an AppImage's runtime.
+
+**Read it against `--src` above, because every promise inverts.** That one is `git archive`, so
+its checksum follows from the commit and anyone can reproduce it from the tag; this one contains
+`rustc` output, and its sha256 describes one build on one machine. That one runs on any host;
+this one is Linux-only and `impossible_on` refuses it on a Mac, because the archive holds ELF
+binaries linked against the host's WebKitGTK. The `--sort=name --owner=0 --group=0
+--numeric-owner` flags on its `tar` are for a clean extraction and are *not* a reproducibility
+claim — they are there so the archive does not carry the build machine's username in it.
+
+The one thing it asks of whoever unpacks it: `bin/` has to go on `PATH`. The desktop entry it
+installs is the same generated `dev.cide.ide.desktop` the Flatpak and the `.deb` use, and its
+`Exec=cide %U` is unqualified — so the entry appears in a launcher and starts nothing until
+`cide` is findable.
+
+Nothing about the layout is hand-written twice. The icon sizes are a literal in `package.rs`, and
+`every_icon_the_tarball_installs_is_one_the_config_declares` ties that literal to
+`tauri.conf.json`'s `bundle.icon`, because the failure mode otherwise is an `install` that fails
+twenty minutes into a release over an icon somebody deleted.
+
+### Releases are a workflow, not a checklist
+
+`.github/workflows/release.yml`, dispatched by hand with a version. It cuts `release/v<version>`
+from master, writes that version into the four files that carry it, regenerates the flatpak files
+from it, commits, tags, and only then builds — so artefacts never exist for a tree that was never
+tagged. Linux produces the AppImage, the binary tarball and the source tarball; a `macos-15`
+runner produces the `.dmg`, blocking rather than advisory. The release notes' download table is
+built in the publishing job from the files that were actually uploaded, and the changelog runs
+from the previous *release* (falling back to the previous tag, then to the whole history).
+
+Every artefact is built by `cargo xtask package` and none by calling `cargo tauri build`
+directly — the task is the packaging brain, and a workflow that reimplemented the runtime
+prefetch, the GTK shim or the sidecar would be a second one that drifts from it. What the
+workflow adds is the toolchain that task's preflight insists on and CI deliberately omits:
+`patchelf`, `librsvg2`, `desktop-file-utils`, a pinned `cargo-tauri`, and
+`APPIMAGE_EXTRACT_AND_RUN=1`, because `linuxdeploy` and `appimagetool` are AppImages themselves
+and a GitHub runner has no libfuse2.
+
+**The version bump used to be the interesting part and is now a guarded one.** `Cargo.toml` said
+`0.2.0` while `tauri.conf.json` said `0.1.0`, and since every artefact name comes from the
+latter, a release tagged `v0.2.0` would have shipped `cide_0.1.0_amd64.AppImage`. The job rewrites
+one line per file and then asserts exactly that: `git diff --numstat` must read `1 1` for each,
+which is what catches a rewrite that produced the right version and reformatted everything around
+it. A `json.dump` round-trip did precisely that during development — correct version, twenty
+lines of reflow, and a file list the guard had no objection to.
 
 ### Paths stay XDG, deliberately
 
@@ -2632,7 +2684,7 @@ rust-analyzer's copy of the buffer permanently, which is the exact failure `docS
 prevent.
 
 **One usage jumps, with no popup**, through `jumpTo` so it lands on the Back stack. Zero usages is a
-sentence in the notice stack (`info`, not an error — "used nowhere" is a *result*), and it is a
+sentence in the notice stack (`warn`, not an error — "used nowhere" is a *result*), and it is a
 different sentence from "there is no declaration under the caret": `textDocument/references` answers
 `null` for the second and `[]` for the first, and collapsing them would tell a user who clicked a
 keyword that their function is unused. Two or more opens the 620px card after a 150 ms grace, so a
@@ -3605,6 +3657,179 @@ So `checkState` is now a function of the ticks alone, and `isPartiallyStaged` is
 fixture's half-staged file is deliberately kept: `check:git` and `check:render` now pin the
 opposite behaviour from the same data.
 
+## Markdown preview (M20), and what is not done
+
+A `.md` pane draws in one of three layouts — the buffer, the buffer and a rendering side by side,
+or the rendering alone — switched from a three-button cluster that floats in the pane's top-right
+corner beside `⊞ ⛶ ⧉ ×` and is revealed the same way. IDEA's arrangement, and the report it
+answers is the ordinary one: opening `README.md` in cide gave you its bytes.
+
+The layout is remembered **per file**. It rides `ViewPosition` in `positions.json`, the record
+that already carries the scroll offset, the caret and the folds, and it arrives the way `folds`
+did one milestone earlier: one `#[serde(default)]` field, no schema bump, no migration. The two
+reasons that store exists rather than `workspace.json` both apply harder here than they do to a
+scroll — *lifetime*, because the record you most want back is the one closing the tab has just
+removed from the workspace, and *cost*, because every workspace mutation bumps `rev`, clones the
+tree twice and broadcasts it to every window. A layout is a click, but it must not become one of
+those. `a_positions_file_written_before_the_markdown_layout_loads_unchanged` is the test, and the
+half it is really about is the absent field: without the `default`, every entry in an existing
+user's file fails to deserialise, `load_positions` answers empty, and everybody loses their place
+in every file they have ever opened, on the launch after an update.
+
+### The renderer is written here, and it produces React elements rather than HTML
+
+There is no markdown dependency in this repository and this did not add one. Every renderer in
+the ecosystem answers `string → HTML string`, and consuming one means `dangerouslySetInnerHTML`
+plus a sanitizer — a pair this project has twice written comments to avoid, most plainly in
+`sidebar/TasksPanel/TaskDetail.tsx`: *"rendering model-authored markup inside the IDE's own chrome
+is an injection surface bought for nothing."* A `.md` in a cloned repository is exactly as
+untrusted as a task comment, and the same answer applies as the one *Images* below records for
+SVG: the fix is not to filter the markup, it is not to have a path for it.
+
+So `editor/markdown/blocks.ts` and `inline.ts` parse to a tree with **no node that can carry
+markup**, and `MarkdownPreview.tsx` maps that tree to elements. `<script>alert(1)</script>` in a
+document renders as those characters. `check:markdown` walks every node of nine hostile inputs
+and fails on any kind outside the safe set — which is not a filter but a proof that no filter is
+needed, and the assertion to look at if a node is ever added to `types.ts`.
+
+The second argument for a tree is that it can be *checked*. `ui/scripts/check-*.mjs` are this
+project's only frontend tests, and what they do is compile an import-free module and assert on the
+values it returns. A pure `parseMarkdown` is exactly that shape; an HTML string is assertable only
+by matching substrings of itself.
+
+**It is a subset, not CommonMark.** In: ATX and setext headings, thematic breaks, fenced and
+indented code, blockquotes with lazy continuation, bullet and ordered lists nested arbitrarily,
+tight and loose, GFM tables and task items, link reference definitions, and the whole of the usual
+inline vocabulary including reference links and autolinks. Out, and listed under *what is not
+done*.
+
+**Both scans are bounded, and the bound is not new.** `languages/markdown.ts` already paid for
+this and wrote the measurement into its header: an unbounded `\[[^\]]*\]\(` "scans to the end of
+the line for every `[` that does not open a link and then backtracks over the whole scan one
+character at a time — so a line of brackets is quadratic. Measured at 3.8 s for a
+160,000-character line of `[`, against 0.13 s for the same line with this bound." The parser uses
+the same 512, deliberately the same number rather than a second opinion, and emphasis resolution
+runs over a **doubly linked list** — `Array.prototype.splice` shifts everything after the cut, so
+`*a*` repeated *n* times, which is an ordinary paragraph rather than a pathological input, is
+O(n²) on an array. `check:markdown` measures nine inputs at 20,000 and 160,000 characters and
+fails on anything superlinear.
+
+### Fences are coloured by the buffer's own grammars
+
+```rust
+fn main() {}
+```
+
+— coloured by the same `languages/rust.ts` table that colours a `.rs` buffer, through the same
+`highlight.ts`, because in split mode the two are eight pixels apart and two highlighters that
+could disagree would be seen disagreeing. `REGISTRY` now holds each language's *grammar* and
+`loadLanguage` wraps it, so `markdown/fenceTokens.ts` can drive `token()` over a string directly;
+and `createTokenType`'s rule — the token-name → `Tag` mapping CodeMirror does not export — has
+moved out of `check-editor.mjs`, where it called itself "the smallest possible restatement", into
+`highlight.ts::tokenClassFor`, which the check now pins instead of duplicating.
+
+**The preview therefore colours code the buffer does not**, and that is worth naming because
+`languages/markdown.ts` says the opposite about itself: *"Code inside a fence is left uncoloured
+rather than dispatched to the fence's language. Nesting one stream parser inside another needs
+`StreamLanguage`'s nesting support, which it does not have."* That is a constraint on CodeMirror,
+not on markdown — out here the fence's text is a string and the grammar is a function.
+
+### Scroll sync is anchored on lines, and has a latch
+
+The naive version keeps the two halves at the same *fraction*, and it is wrong in the way that is
+most annoying: fifty lines of fenced code are tall in both halves, and fifty lines of paragraph
+are fifty lines in the buffer and four wrapped lines in the rendering, so the two drift further
+apart the further down you read. Every top-level block therefore renders with its source line on
+it, and `scrollSync.ts` interpolates between those anchors — lines and not pixels, for the reason
+`positions.rs` gives about the record itself.
+
+Nothing new crosses into the editor to make it work. `viewTracker.ts` already publishes the first
+visible line at most once an animation frame, which is exactly a follower's cadence, so the
+preview follows the buffer on a signal that was already there; the other direction is one new
+`EditorSurface` prop, `onScrollHandle`, in the shape `onSaveHandle` has and **not** in the build
+effect's `[path, reloadKey]` dependency array, which `check:markdown` asserts as well as
+`check:editor`. It scrolls without moving the selection, which is the difference between this and
+`revealRequest.ts`: a caret that walked down the file while somebody read it would be a selection
+they did not make, in a buffer they are about to type into.
+
+The latch is the part that is invisible until it is missing. Scrolling either half moves the
+other, and moving the other fires *its* scroll event; whoever moved first therefore owns the
+gesture for 150 ms and the follower's own events are ignored. Last-event-wins is the feedback
+loop with extra steps, because a programmatic scroll fires events indistinguishable from a
+person's.
+
+### The pane's corner was already spoken for
+
+`layout/PaneTitleBar.module.css` floats the pane controls in the top-right and publishes
+`--pane-corner-clear` — `--w-minimap` plus `--pane-corner`, 221px on an editor pane — as the band
+a pane's own content must keep clear. `panes/EditorPane.module.css` carries the write-up of the
+once a strip reserved 125 instead: both of its buttons were drawn *inside* the cluster's live hit
+box, hovered, and answered the ×'s click. The switch reserves the published sum, and below 320px
+of pane it moves to the bottom-right instead of being squeezed — where `panes/ImagePane.tsx`
+already puts its one toggle, for the same reason. `check:markdown` re-derives the 221 from the two
+tokens and fails if the threshold stops covering it.
+
+Below 520px, `split` is overruled to **preview** — the pattern `panes/GitDiffPane.tsx` solved once
+for side-by-side diffs, `data-overruled` and an explanatory `title` included. The fallback differs
+because the question does: a diff falls back to unified because that is the shape its per-line
+staging is expressed in, and a reader who asked for split asked to see the rendering.
+
+### Three things that are cheap only because something else already paid for them
+
+**The buffer is never unmounted.** In preview mode the `EditorSurface` is still in the tree, still
+laid out at the pane's full size, and merely `visibility: hidden` with the rendering painted over
+it — so unsaved edits, undo history, find state, the LSP document and the autosave timer all
+survive, and switching text ⇄ preview costs no reflow at all. `display: none` is the trap, and it
+is the same one `layout/paneHosts.ts` states for hidden terminal tabs: measurements read zero, and
+a CodeMirror asked to lay a wrapped document into zero columns re-wraps every line of it twice.
+`MarkdownFrame` also keeps the surface inside **one** element in all three layouts and changes
+only its class, so switching text ⇄ split ⇄ preview does not re-parent the editor at all. (The
+markdown-or-not branch above it does re-parent, and that is fine: only a rename flips it, and
+`EditorSurface` rebuilds on a path change in any case.)
+
+**Local images go through `image.read`**, the same two calls `ImagePane` makes, which is what
+grants `asset_protocol_scope().allow_file()` for one path *after* the size, type and header
+refusals have run. A `![](../../.ssh/id_rsa)` is refused on its header, in Rust, before anything
+reaches the protocol. Remote images cannot load — the CSP's `img-src` has no `https:` and will not
+get one — and both refusals draw the alt text with the sentence on hover rather than nothing,
+because a document with a silently missing diagram looks fine and reads wrong. 64 images per
+document, because each one is a standing grant and a document is a thing an agent can write.
+
+**No `href` is written anywhere in the preview.** An `<a href>` in this webview is a way to
+navigate the application itself away from its own document, which is the hazard `terminal/xterm.ts`
+closes for OSC 8 links: until that handler existed, "any program in any pane could emit
+`ESC ] 8 ;; https://… ST` and a single click on the text it wrapped would navigate part of the
+application to a URL that program chose." A middle-click or one forgotten `preventDefault` is all
+it takes, so the attribute is simply never written and there is nothing to forget — the link is a
+`role="link"` span, put back on the tab order by hand. Activating an external one **copies the
+address and says so**, which is the terminal's *"Copy the address and open it in a browser"*
+carried out rather than recited; a local one opens a tab; a `#fragment` scrolls the preview.
+
+### What is not done
+
+- **There is no command, no default binding and no palette row.** The floating switch is the only
+  route to the feature. Adding one is a `Command::new(… VIEW)` and a `case` in `keys/dispatch.ts`
+  — but note that `editorFocused` is true for every buffer, so a correct gate wants a new
+  `markdownTabActive` context flag, and `cide-core::commands` records at length what happens when
+  a flag is added without a supplier that really derives it.
+- **The layout is per file, not per pane.** A split showing one `.md` twice restores the same
+  layout into both, and switching in one does not switch the other until the next mount. Exactly
+  the limitation folds have, for exactly the same reason.
+- **Out of the CommonMark subset**: HTML blocks and inline HTML (text, on purpose), footnotes,
+  definition lists, math, YAML front matter — which renders as a paragraph of `key: value` lines
+  rather than as the table it deserves — reference-style images, and nested tables.
+- **The divider position is session-global and is not saved.** One number shared by every markdown
+  pane in the window, gone when the window closes. Persisting it would mean either a second wire
+  field on a per-file record for something nobody asked to keep, or a settings write per drag.
+- **A task item's checkbox is not clickable.** Ticking it would have to edit the buffer, and a
+  preview that writes to the document the user is editing is a second author of that file.
+- **Nothing here has been confirmed on screen.** The standing reason plus the same one M19 had:
+  the author of this change is running inside the user's own instance, and `run.sh` stops any
+  instance already running. What is covered is more than usual — `check:markdown` is 231
+  assertions over the parser, the sync arithmetic, the layout rules and the fence tokenizer, and
+  it drives the real grammars. What no check in this repository can speak to is the picture: the
+  hover reveal, the type scale, whether the two halves land where a reader expects.
+
 ## Updating a project, and resolving a conflict (M20), and what is not done
 
 Ctrl+T was bound to `git.pull` and the command was titled **Pull (fast-forward only)**, which is
@@ -4091,7 +4316,9 @@ admissible and a fetch's 256 fanout directories each get an inotify watch — th
 
 **No new event, and no new watcher.** `FsChange.git` already existed, already covered `HEAD`, the
 index and the refs, and already rode `cide://fs-changed`; it simply had no consumer that read it.
-The log and the blame gutter are its first.
+The log and the blame gutter are its first. (The Git panel and the branch readout joined them in
+M17 — see *The Git panel followed cide and not the disk*, which is that doc comment being made
+true several milestones after it was written.)
 
 ### Full width, and a refresh that does not throw the page away
 
@@ -4200,6 +4427,111 @@ of that bound.
   revert and cherry-pick suites are differential against the real `git` binary over a thousand
   randomised working trees. What that coverage cannot speak to is whether any of it is legible on
   screen.
+
+## The Git panel followed cide and not the disk (M17)
+
+Reported as *"need autoupdate git tree when got new changes in files."*
+
+The panel had two triggers, `cide://session-tool` and `cide://git-status`, and
+`crates/cide-app/src/cmd/git.rs::refreshed` is the **only** emitter of the second. So between them
+they answered *Claude did it* and *cide did it*, and nothing else: a `git add` typed into a bash
+pane, a `git pull`, a `cargo fmt`, an editor outside cide. In an IDE whose centre of gravity is a
+terminal and an agent, that is most of what happens to a working tree, and the panel sat there
+until somebody pressed ↻.
+
+**Three comments already said this worked.** `FsChange.git`'s own doc in `cide-ipc` — *"The branch
+readout and the git panel refresh on this"* — `client.ts`'s note on `onGitStatus`, and
+`BranchSelector`'s *"and so does the watcher's view of `HEAD` and the refs, which is how a `git
+checkout` in a bash pane moves the label."* All three described a mechanism that exists, attached
+to a subscription that did not. It is the `moveLineUp` shape exactly: a compensation written down,
+never built, and read past for milestones because the paragraph reads as evidence.
+
+The visible symptom was the tell and nobody chased it: `chrome/gitCountStore.ts` **did** subscribe
+to the watcher, so the change count in the panel's own header stayed correct while the tree beneath
+it went stale. The header said 5 and the tree listed 3.
+
+**The fix is two subscriptions and no new plumbing** — `cide://fs-changed` already carried
+everything, and every other git-adjacent surface already read it. What is worth recording is that
+the two new subscribers filter it **differently, and oppositely**:
+
+* The **panel** refreshes on *any* burst for its project. `change.git` is wrong here — a plain
+  working-tree write raises no flag and is exactly what turns a file from clean to modified — and
+  `gitlog`'s `gitRefsMoved` is wrong more sharply still, since it answers `false` for an index-only
+  burst, i.e. for `git add`. The burst's paths are not inspected either: that judgement belongs to
+  `cide_fs::filter`, and re-deriving it from path strings in the frontend would be a second, worse
+  copy of it. One coalesced `git status` is the call that actually knows.
+* The **branch readout** gates on `change.git`. A label only moves when `HEAD`, a ref or
+  `packed-refs` moves; without the gate every file save costs a branch walk of every repository for
+  an answer that cannot have changed.
+
+**The coalescer had to change with it, and that was not tidying.** `useGitPanel`'s `schedule` was a
+*restarting* debounce — it cleared and re-armed on every trigger — where every other git surface in
+the app is a throttle, `gitStatusStore.ts` having written down two milestones earlier why: *"A
+debounce that restarts can be starved indefinitely by a steady stream of writes."* That was
+survivable while the only trigger arrived in gaps. Feed it the watcher and the steady stream becomes
+the normal case, because an agent editing files is what the app is *for* — the panel would have
+frozen for exactly as long as anything was happening, which is a worse bug than the staleness being
+fixed and would have passed every gate. It is a throttle now, at the same 120 ms as its four
+siblings.
+
+`refresh` also gained a **generation guard**. `git status` on a real repository takes longer than
+the coalescing window and `invoke` promises resolve independently, so the slower *older* walk can
+land last and install a tree computed before the edits that triggered the newer one — and if the
+user has stopped typing there is no next event to correct it. Checked after both awaits: the
+merge-state pass is a further round trip per repository and is the half most likely to be overtaken.
+
+**Gated by greps, and that is written down as the weak choice it is.** `check-git-tree.mjs` compiles
+`model.ts` and runs it; it cannot reach `useGitPanel.ts`, whose own comment already records that a
+defect in it was *"invisible to all 29 gates"*. The new block asserts on source text — three
+subscriptions, the throttle's one distinguishing line, both generation checks, and the branch
+readout's `change.git` gate — because extracting that wiring out of a 2264-line hook is a larger
+change than the one being gated. Each assertion was confirmed by mutation.
+
+## Ctrl+D duplicates a line, and what it cost (M17)
+
+`copyLineDown` is `@codemirror/commands`' own and is IDEA's *Duplicate Line or Selection*; the whole
+of the work was that the chord was taken. `searchKeymap` binds `Mod-d` to `selectNextOccurrence`,
+and `findExtensions()` is added to `EditorSurface`'s extension list **before** the surface's own
+keymap — so a `Mod-d` entry appended there would have been offered the stroke second, behind a
+command that returns `true` whenever the caret is in a word. It would have read as wired and fired
+almost never.
+
+So the capability **moves** rather than being deleted: `selectNextOccurrence` is filtered out of
+`searchKeymap` by command identity and re-homed to **Alt+J**, IDEA's own chord for it, free in both
+layers. That freedom is *computed* by `check-editor.mjs` and not asserted from this paragraph —
+which is the lesson of the `Mod-Shift-Arrow` comment that was wrong for four milestones.
+
+**Not a `cide-core::commands` id, and the `when` clause would not have saved it.** A binding in
+`keymap.rs` is resolved by the key gate's window *capture* listener before any text surface sees the
+event, and plain `ctrl+d` is a byte a pty wants — `^D` is EOF. An id would take EOF from every
+terminal pane in every window, which is why `gitlog/LogView.tsx` already refuses to register *its*
+Ctrl+D. And `editorFocused` is a **pane-kind** flag, so it is false in the diff and merge panes,
+which are two of the three surfaces this had to work in. The cost is the same one move-line-up and
+move-line-down pay and it is stated rather than discovered later: **no palette row, no menu item.**
+
+The bindings live in `ui/src/editor/editorKeys.ts` as data, because `find.ts` imports a CSS module
+and `EditorSurface.tsx` imports React — neither can be `require`d, so bindings inside them can only
+ever be regexed. `check-editor.mjs` loads that module, folds both arrays into the composed-keymap
+expansion it already runs, resolves the chords **by identity**, and then *drives* `copyLineDown`
+against a real `EditorState`: the line lands below the original, the caret rides to the copy, a
+multi-line selection duplicates as a block, and a read-only state refuses. That last one is
+load-bearing rather than tidy — `DiffPane` and `MergePane` install the array on their read-only
+sides too, sharing one array on exactly that guarantee.
+
+**One thing that expansion found on the way.** `claimedOn` built its chord map with a bare `Map.set`,
+so a chord claimed twice reported the *last* binding — while CodeMirror's `runHandlers` stops at the
+*first*. The two answers are opposites, and they differ in precisely the case the expansion exists
+to catch: a chord that is bound and shadowed. First claim wins now. It changed no existing answer,
+which is the other half of why it was safe to have been wrong.
+
+**And a comment in `MergePane` that was false in the hardest way to notice.** Its Ctrl+Z handler
+says *"the centre pane's CodeMirror history owns typing, and it must go on owning it"*, and steps
+aside for any Ctrl+Z from inside an editable surface. There was no CodeMirror history: the file
+imported nothing from `@codemirror/commands` and installed no `history()`, so the chord was handed
+to a `StateField` that did not exist and Ctrl+Z in the result pane did nothing at all. It mattered
+more once Ctrl+D put a document-editing command in that pane — shipping an edit into a surface whose
+undo is inert is how a hand-merged block gets lost with nothing to reach for. `history()` and
+`historyKeymap` are on the editable side now.
 
 ## Code folding (M19), and what it costs to have no parse tree
 

@@ -1,0 +1,272 @@
+/*
+ * The rendered document.
+ *
+ * # The type scale hangs off `--fs-code`, not off the chrome ladder
+ *
+ * A preview is a *document*, and the thing it is a preview of is the buffer eight pixels to its
+ * left. So it follows the editor's font size — `--fs-code`, the setting under Settings → Editor —
+ * rather than `--fs-ui-*`, which is the size of menus and labels. `check:ui-scale` allows exactly
+ * this: `var(--fs-code)` and `calc(var(--fs-code) * <ratio>)` are the two forms it whitelists
+ * beside the ladder, and the gutter already uses the second one.
+ *
+ * The family is `--font-ui`, not `--font-mono`. Prose set in a monospace font is the one thing a
+ * markdown preview exists to stop looking at; code inside it goes back to `--font-mono`, which is
+ * the distinction the whole feature is for.
+ *
+ * # Colours are tokens, including the syntax ones
+ *
+ * A fence's tokens are coloured by inline `var(--purple)`-style properties read out of
+ * `editor/highlight.ts::TOKEN_VAR_BY_CLASS` — the same map the minimap reads, which is why there
+ * is no `.cide-tk-*` rule in this file. A second copy of the syntax palette here is precisely the
+ * drift `highlight.ts` exists to prevent, and it would be invisible except in split mode, where
+ * the two are on screen together.
+ */
+
+/*
+ * One wrapper per top-level block, carrying `data-line`.
+ *
+ * It exists to be measured: `MarkdownFrame.tsx` reads `offsetTop` off every one of these to build
+ * the scroll-sync anchor table. `display: block` and no margin of its own, so it changes nothing
+ * about the layout it is measuring — a wrapper with a margin would make `offsetTop` the top of
+ * the *gap*, and every anchor would be a few pixels early.
+ */
+.anchor {
+  display: block;
+  padding: 0 20px;
+}
+
+.anchor:first-child {
+  padding-top: 14px;
+}
+
+.anchor:last-child {
+  padding-bottom: 40vh;
+}
+
+.paragraph {
+  margin: 0 0 0.85em;
+  font-family: var(--font-ui);
+  font-size: calc(var(--fs-code) * 1.08);
+  line-height: 1.65;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.heading {
+  margin: 1.4em 0 0.5em;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-hi);
+}
+
+.anchor:first-child .heading {
+  margin-top: 0;
+}
+
+h1.heading {
+  font-size: calc(var(--fs-code) * 1.9);
+  padding-bottom: 0.24em;
+  border-bottom: 1px solid var(--border);
+}
+
+h2.heading {
+  font-size: calc(var(--fs-code) * 1.5);
+  padding-bottom: 0.24em;
+  border-bottom: 1px solid var(--border);
+}
+
+h3.heading {
+  font-size: calc(var(--fs-code) * 1.28);
+}
+
+h4.heading {
+  font-size: calc(var(--fs-code) * 1.12);
+}
+
+h5.heading {
+  font-size: calc(var(--fs-code) * 1.04);
+}
+
+h6.heading {
+  font-size: var(--fs-code);
+  color: var(--dim);
+}
+
+.rule {
+  margin: 1.6em 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+/* --- lists ---------------------------------------------------------------------------------- */
+
+.tight,
+.loose {
+  margin: 0 0 0.85em;
+  padding-left: 1.6em;
+  font-family: var(--font-ui);
+  font-size: calc(var(--fs-code) * 1.08);
+  line-height: 1.65;
+  color: var(--text);
+}
+
+/*
+ * A tight list's items have no paragraph spacing; a loose one's do. That distinction is the whole
+ * of what `tight` means in `blocks.ts`, and getting it wrong is the difference between a
+ * seven-item list you can scan and one that fills the pane.
+ */
+.tight .paragraph {
+  margin: 0;
+}
+
+.loose > .item,
+.loose > .taskItem {
+  margin-bottom: 0.5em;
+}
+
+.item,
+.taskItem {
+  margin: 0.15em 0;
+}
+
+/* The marker would sit where the checkbox is, so the checkbox takes its place. */
+.taskItem {
+  list-style: none;
+  margin-left: -1.2em;
+}
+
+.task {
+  margin: 0 0.5em 0 0;
+  vertical-align: middle;
+  /* Never clickable — see `MarkdownPreview.tsx`. Dimmed so it reads as a record, not a control. */
+  accent-color: var(--accent);
+  cursor: default;
+}
+
+/* --- quotes and code ------------------------------------------------------------------------- */
+
+.quote {
+  margin: 0 0 0.85em;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--border);
+  color: var(--dim);
+}
+
+.codeSpan {
+  padding: 0.12em 0.35em;
+  border-radius: 3px;
+  background: var(--chrome-hi);
+  font-family: var(--font-mono);
+  font-size: calc(var(--fs-code) * 0.94);
+  color: var(--text-hi);
+}
+
+/*
+ * A fence scrolls itself.
+ *
+ * The alternative is a preview whose body scrolls sideways, which moves the prose out from under
+ * the reader to show them the tail of a line they were not reading. Same argument as `.tableWrap`.
+ */
+.code {
+  margin: 0 0 0.9em;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--chrome);
+  font-family: var(--font-mono);
+  font-size: var(--fs-code);
+  line-height: 1.5;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: pre;
+  tab-size: 4;
+}
+
+.codeLine {
+  display: inline;
+}
+
+/* --- tables --------------------------------------------------------------------------------- */
+
+.tableWrap {
+  margin: 0 0 0.9em;
+  overflow-x: auto;
+}
+
+.table {
+  border-collapse: collapse;
+  font-family: var(--font-ui);
+  font-size: calc(var(--fs-code) * 1.02);
+  color: var(--text);
+}
+
+.table th,
+.table td {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.table th {
+  background: var(--chrome);
+  color: var(--text-hi);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* --- links and images ------------------------------------------------------------------------ */
+
+/*
+ * A `<span role="link">`, not an `<a href>` — see `MarkdownPreview.tsx` for why no href is ever
+ * written. It therefore has to be given back everything an anchor would have had: the colour, the
+ * pointer, and a focus ring.
+ */
+.link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.link:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* An external target is marked, because activating it copies the address instead of opening it. */
+.link[data-target='external']::after {
+  content: ' ↗';
+  color: var(--faint);
+}
+
+.image {
+  max-width: 100%;
+  height: auto;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+.imagePending {
+  color: var(--faint);
+}
+
+/*
+ * An image that is not on screen, saying so.
+ *
+ * Dotted rather than blank: a remote image cide will not fetch and a local one Rust refused are
+ * both *absences the reader should know about*, and the `title` carries the sentence Rust wrote.
+ * Rendering nothing is how a document with a broken diagram looks fine and reads wrong.
+ */
+.imageMissing {
+  padding: 0.1em 0.35em;
+  border: 1px dotted var(--border);
+  border-radius: 3px;
+  color: var(--faint);
+  font-size: calc(var(--fs-code) * 0.94);
+}

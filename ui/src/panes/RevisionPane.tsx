@@ -209,7 +209,7 @@ export function RevisionPane({
       .then((repos) => {
         const root = repos.find((info) => info.id === repo)?.root
         if (root === undefined) {
-          notify('That repository is no longer part of this project.', { kind: 'info' })
+          notify('That repository is no longer part of this project.', { kind: 'warn' })
           return undefined
         }
         return fileApi.open(project as ProjectId, `${root.replace(/\/+$/, '')}/${path}`)

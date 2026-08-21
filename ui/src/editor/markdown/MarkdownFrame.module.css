@@ -1,0 +1,203 @@
+/*
+ * The markdown pane's layout: two halves, a divider, and the floating switch.
+ *
+ * Every colour is a token from `styles/tokens.css`, and every `font-size` is either a rung of the
+ * `--fs-ui-*` ladder or a ratio of `--fs-code`. `check:ui-scale` bans anything else, and the
+ * reason is worth restating where somebody will read it while adding a rule: a bare
+ * `font-size: 12px` looks correct at the default, which is where it would be written, and
+ * silently stops following the user's font size everywhere else.
+ */
+
+.frame {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--panel);
+}
+
+/*
+ * The buffer's half.
+ *
+ * `min-width: 0` because a flex child's default `min-width: auto` is its content's intrinsic
+ * width — which for a CodeMirror scroller holding a long unwrapped line is the line — so without
+ * it the divider cannot be dragged left past the longest line in the file.
+ */
+.buffer {
+  position: relative;
+  flex: 1 1 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/*
+ * Preview mode: present, laid out, and not painted.
+ *
+ * `visibility: hidden` and never `display: none`. A `display: none` editor measures zero, and
+ * CodeMirror asked to lay out a wrapped document into zero columns re-wraps every line of it —
+ * once on the way in and once on the way back. `layout/paneHosts.ts` states the same rule for
+ * hidden terminal tabs, where the same mistake corrupts the child's terminal size.
+ *
+ * The element keeps its box, so the preview is positioned over it rather than instead of it.
+ */
+.buffer[data-hidden='true'] {
+  visibility: hidden;
+  position: absolute;
+  inset: 0;
+  flex: none;
+}
+
+.frame[data-layout='preview'] .preview {
+  position: absolute;
+  inset: 0;
+}
+
+/*
+ * The divider.
+ *
+ * 1px of border and a `::before` that widens the target to 7px, which is the same trick
+ * `layout/SplitTree.module.css` uses on a pane splitter and for the same reason: a 1px hit area
+ * is a target nobody can hit, and a visible 7px bar between two documents is a piece of furniture
+ * neither of them asked for.
+ */
+.divider {
+  flex: none;
+  position: relative;
+  width: 1px;
+  background: var(--border);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.divider::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+
+.divider:hover {
+  background: var(--accent);
+}
+
+.preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--panel);
+  /*
+   * Written twice. WebKitGTK 2.52.3 does not implement unprefixed `user-select` — it drops the
+   * declaration outright — and `vite build` lowers it while `run.sh`'s dev server does not, so
+   * the unprefixed-only version works in the build nobody develops against. `check:css-prefix`
+   * is what keeps the pair together; its header has the two fixes that did nothing.
+   *
+   * `text` and not `auto`: the app root sets `user-select: none` so window chrome does not
+   * text-select on drag, and a document you cannot copy out of is not a document.
+   */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.notice {
+  margin: 0;
+  padding: 16px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui-12);
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+/* --- the switch ---------------------------------------------------------------------------- */
+
+/*
+ * Floating, and clear of the pane's own controls.
+ *
+ * `--pane-corner-clear` is `layout/PaneTitleBar.module.css`'s published sum of the cluster's
+ * width and the inset an editor pane keeps for its minimap — 221px here. Reserving less than
+ * that is not a near miss: `panes/EditorPane.module.css` records the once a bar reserved 125,
+ * which put both of its buttons *inside* the cluster's live hit box, drawn and hovered and
+ * answering the ×'s click. The `0px` fallback is for a frame rendered outside a pane.
+ */
+.switch {
+  position: absolute;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 80ms linear;
+}
+
+.switch[data-corner='top'] {
+  top: 4px;
+  right: calc(4px + var(--pane-corner-clear, 0px));
+}
+
+/*
+ * The narrow-pane home. Nothing floats in a pane's bottom-right, so there is no band to reserve
+ * and the switch simply sits in the corner — which is also where `panes/ImagePane.tsx` puts its
+ * one toggle, for the same reason.
+ */
+.switch[data-corner='bottom'] {
+  bottom: 4px;
+  right: 4px;
+}
+
+/*
+ * Revealed on hover or focus, exactly as the pane cluster is, and **pinned open whenever the
+ * layout is not the default**. A switch that vanishes is a switch the user cannot use to undo
+ * what it just did, and unlike the pane controls this one changes what the pane *is*.
+ *
+ * `opacity` rather than `visibility`, so it stays in the tab order while invisible — that is how
+ * somebody who cannot hover reaches it.
+ */
+.frame:hover .switch,
+.switch:focus-within,
+.switch[data-pinned='true'] {
+  opacity: 1;
+  background: color-mix(in srgb, var(--chrome) 88%, transparent);
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+.switchButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.switchButton:hover {
+  color: var(--text-hi);
+  background: var(--chrome-hi);
+}
+
+.switchButton[aria-pressed='true'] {
+  color: var(--accent);
+  background: var(--chrome-hi);
+}
+
+/*
+ * The pane is too narrow for the layout this button asks for, and it says so rather than
+ * refusing. Same treatment as `panes/GitDiffPane.tsx`'s `data-overruled`: still pressable, still
+ * *pressed* when it is the choice on record, and struck through so the picture on screen and the
+ * state in the store are visibly two different things.
+ */
+.switchButton[data-overruled='true'] {
+  color: var(--faint);
+  text-decoration: line-through;
+}

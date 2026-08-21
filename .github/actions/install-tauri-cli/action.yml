@@ -1,0 +1,65 @@
+name: Install cargo-tauri
+description: >
+  Puts a `cargo-tauri` of the version this workspace pins on PATH, from cache when there is
+  one. A composite action because both release jobs need it and `cargo install` of the tauri
+  CLI is minutes of compilation — a copy-pasted second block is how the version pin quietly
+  forks, and how one of the two runners silently builds with a different bundler.
+
+inputs:
+  version:
+    description: >
+      The `tauri-cli` crate version. Defaults to the version `ui/package.json` pins for
+      `@tauri-apps/cli`, which is read from the file rather than restated here: the npm CLI and
+      the cargo CLI are the same tool released in step, and a workflow that bundled with a
+      different one than the repository develops against would be testing a bundler nobody
+      else runs.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # `cargo xtask package`'s preflight fails when `cargo-tauri` is absent or is major 1 — a
+    # v1 CLI is the likely accident, because that is what `cargo install tauri-cli` gave people
+    # for years, and it fails on a v2 config with a schema error a long way from its cause.
+    - name: Resolve the pinned version
+      id: pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ inputs.version }}'
+        if [ -z "$version" ]; then
+          version=$(python3 -c 'import json;print(json.load(open("ui/package.json"))["devDependencies"]["@tauri-apps/cli"])')
+        fi
+        # The npm pin is exact (ui/package.json pins every version with no carets, on purpose).
+        # A caret or a range would install something this has not named, so refuse rather than
+        # resolve it silently.
+        if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::@tauri-apps/cli is pinned as '$version', which is not an exact version" >&2
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "cargo-tauri $version"
+
+    # Only the one binary. Swatinem/rust-cache does not carry ~/.cargo/bin, and caching the
+    # whole of it would restore every other tool a job installed as well.
+    - name: Cache cargo-tauri
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-tauri
+        key: cargo-tauri-${{ steps.pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: cargo install tauri-cli
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # --locked so the CLI is built from the lockfile it was published with. Without it a
+        # transitive dependency published since can fail to compile, which turns "install a
+        # pinned tool" into a build of whatever resolved today.
+        cargo install tauri-cli --version '${{ steps.pin.outputs.version }}' --locked
+
+    - name: Verify
+      shell: bash
+      run: cargo tauri --version

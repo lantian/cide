@@ -6,9 +6,19 @@
  * content the user is reading. Deliberately *not* centred over the workspace: a notice here
  * is informational, and a modal treatment would interrupt a turn the user is watching.
  *
- * Every colour is a token, so both themes work. `--red` is the semantic error colour in both
- * palettes and is checked against `--panel` by `check:theme`; `--accent` is the same for the
- * report variant.
+ * Every colour is a token, so both themes work. The three edges are `--green`, `--yellow` and
+ * `--red`, which is the same severity vocabulary `ProblemsPanel.module.css`, `AgentsPanel`'s
+ * `.tone*` set and `EditorSurface`'s `.cm-diagnostic-*` borders already speak, and which
+ * `TransportNotice.module.css` names outright ("`--yellow` is the warning ink in each").
+ *
+ * The pair they replace was `--red` and `--accent`, and it is worth saying why that failed,
+ * because nothing in the suite could see it. `--accent` is #c4452a light / #d97757 dark —
+ * Claude's red-orange, a few percent from `--red`'s #c0332b / #e06c75 — so a report and a
+ * failure painted the same edge to any eye, and every notice read as an error. The old comment
+ * here claimed `--red` was "checked against `--panel` by `check:theme`"; it was not.
+ * `check-theme.mjs`'s contrast assertions cover `TERMINAL_TOKENS` alone. It now also resolves
+ * these three in both palettes and fails when any two of them are indistinguishable, which is
+ * the gate that would have caught this.
  */
 
 .stack {
@@ -40,7 +50,17 @@
   gap: 8px;
   /* The stack is a positioned overlay across the workspace; only the toasts take clicks. */
   pointer-events: none;
-  max-width: min(420px, calc(100% - 24px));
+  /*
+   * `width`, not `max-width`, and that is the whole fix for a dismiss button that moved.
+   *
+   * An absolutely positioned box with no `width` shrink-wraps its content, so the stack was as
+   * wide as its longest message and no wider. "Merge finished" gave a narrow card with the ×
+   * tucked up against the text; a saved-file failure gave a 420px one with the × out at the
+   * edge — and since the toasts are transient, the button was somewhere new on every one of
+   * them. Pinning the width puts it in the same place always, at the cost of a short message
+   * sitting in a wide card, which is the right trade for a control the user is aiming at.
+   */
+  width: min(420px, calc(100% - 24px));
 }
 
 .toast {
@@ -52,25 +72,31 @@
   background: var(--panel);
   border: 1px solid var(--border);
   /* The one saturated edge, so the kind reads at a glance without the whole card being
-     alarming. Which colour it is, is the `.failed` / `.info` pair below — the edge itself is
-     declared once here so the two variants cannot drift in width. */
+     alarming. Which colour it is, is the three `data-kind` rules below — the edge itself is
+     declared once here so the variants cannot drift in width, and `--border` is what an
+     unrecognised kind falls back to: a grey edge is visibly wrong, which a missing rule on a
+     class table would not be. */
   border-left: 3px solid var(--border);
   border-radius: 6px;
   box-shadow: var(--shadow);
 }
 
-.failed {
-  border-left-color: var(--red);
+/*
+ * The three kinds. Selectors on the vocabulary value rather than on classes handed down from
+ * `Failures.tsx` — see the comment at the `<div>` there for why.
+ *
+ * `ok` is a green and not the accent, which is where this started: see the head of this file.
+ */
+.toast[data-kind='ok'] {
+  border-left-color: var(--green);
 }
 
-/*
- * A report gets the accent, not a green: the app has no semantic "success" token, and
- * inventing one for a single edge would put a colour in `tokens.css` that nothing else could
- * justify. The accent already means "this is cide talking" everywhere else in the chrome, and
- * it is contrast-checked against `--panel` in both themes by `check:theme`.
- */
-.info {
-  border-left-color: var(--accent);
+.toast[data-kind='warn'] {
+  border-left-color: var(--yellow);
+}
+
+.toast[data-kind='error'] {
+  border-left-color: var(--red);
 }
 
 .body {
@@ -78,6 +104,13 @@
   flex-direction: column;
   gap: 4px;
   min-width: 0;
+  /*
+   * Grows into the fixed-width card, so the × is pushed to the far edge rather than sitting
+   * against the end of the sentence. Without it `.body` is `flex-grow: 0`, the row packs to
+   * the left, and pinning the stack's width above would have moved the button's drift from
+   * "wherever the text ends" to "wherever the text ends, in a wider box".
+   */
+  flex: 1;
 }
 
 .text {

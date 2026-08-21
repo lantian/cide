@@ -14,9 +14,10 @@ import { StreamLanguage } from '@codemirror/language'
 import type { Extension } from '@codemirror/state'
 
 import type { FoldSpec } from './foldRanges'
+import type { Grammar } from './streamGrammar'
 
 /** A module identifier in this registry, not a user-visible name. */
-type LanguageId =
+export type LanguageId =
   | 'rust'
   | 'go'
   | 'typescript'
@@ -32,53 +33,62 @@ type LanguageId =
 interface Entry {
   /** What the status bar readout calls it. */
   label: string
-  load: () => Promise<Extension>
+  /**
+   * The built tokenizer, behind the dynamic `import()`.
+   *
+   * The registry holds the *grammar* and [`loadLanguage`] wraps it, rather than each entry
+   * building its own `StreamLanguage`. Two callers need the two different things: the buffer
+   * wants a CodeMirror extension, and `editor/markdown/fenceTokens.ts` wants the parser itself,
+   * because it colours a fenced code block with no `EditorView` anywhere near it and
+   * `StreamLanguage` does not expose the parser it was defined from.
+   */
+  grammar: () => Promise<Grammar>
 }
 
 const REGISTRY: Record<LanguageId, Entry> = {
   rust: {
     label: 'Rust',
-    load: async () => StreamLanguage.define((await import('./languages/rust')).spec),
+    grammar: async () => (await import('./languages/rust')).spec,
   },
   go: {
     label: 'Go',
-    load: async () => StreamLanguage.define((await import('./languages/go')).spec),
+    grammar: async () => (await import('./languages/go')).spec,
   },
   typescript: {
     label: 'TypeScript',
-    load: async () => StreamLanguage.define((await import('./languages/typescript')).spec),
+    grammar: async () => (await import('./languages/typescript')).spec,
   },
   python: {
     label: 'Python',
-    load: async () => StreamLanguage.define((await import('./languages/python')).spec),
+    grammar: async () => (await import('./languages/python')).spec,
   },
   clike: {
     label: 'C-like',
-    load: async () => StreamLanguage.define((await import('./languages/clike')).spec),
+    grammar: async () => (await import('./languages/clike')).spec,
   },
   shell: {
     label: 'Shell',
-    load: async () => StreamLanguage.define((await import('./languages/shell')).spec),
+    grammar: async () => (await import('./languages/shell')).spec,
   },
   json: {
     label: 'JSON',
-    load: async () => StreamLanguage.define((await import('./languages/data')).json),
+    grammar: async () => (await import('./languages/data')).json,
   },
   toml: {
     label: 'TOML',
-    load: async () => StreamLanguage.define((await import('./languages/data')).toml),
+    grammar: async () => (await import('./languages/data')).toml,
   },
   yaml: {
     label: 'YAML',
-    load: async () => StreamLanguage.define((await import('./languages/data')).yaml),
+    grammar: async () => (await import('./languages/data')).yaml,
   },
   markdown: {
     label: 'Markdown',
-    load: async () => StreamLanguage.define((await import('./languages/markdown')).spec),
+    grammar: async () => (await import('./languages/markdown')).spec,
   },
   sql: {
     label: 'SQL',
-    load: async () => StreamLanguage.define((await import('./languages/sql')).spec),
+    grammar: async () => (await import('./languages/sql')).spec,
   },
 }
 
@@ -460,6 +470,27 @@ export function languageName(path: string): string {
 }
 
 /**
+ * Which grammar a path resolves to, or null. (M20)
+ *
+ * The *id*, where [`languageName`] gives the label, and the difference matters to any caller
+ * asking a question about the language rather than displaying it. Six extensions share the
+ * `clike` grammar under six different labels, and `md` and `markdown` share one under one — so
+ * `languageName(path) === 'Markdown'` happens to work today and is a string comparison against a
+ * user-facing caption, which is the kind of test that stops being true the day somebody
+ * capitalises it differently.
+ *
+ * Added for `editor/markdown/`, which has to know whether a pane may be previewed at all.
+ */
+export function languageIdFor(path: string): LanguageId | null {
+  return lookup(path)?.id ?? null
+}
+
+/** Is this a file the markdown preview can render? (M20) */
+export function isMarkdownPath(path: string): boolean {
+  return languageIdFor(path) === 'markdown'
+}
+
+/**
  * The highlighting extension for a path, or null if there is none.
  *
  * Resolves to null rather than rejecting when the chunk fails to load: a network hiccup
@@ -469,10 +500,23 @@ export function languageName(path: string): string {
 export async function loadLanguage(path: string): Promise<Extension | null> {
   const found = lookup(path)
   if (!found) return null
+  const spec = await loadGrammar(found.id)
+  return spec === null ? null : StreamLanguage.define(spec)
+}
+
+/**
+ * The tokenizer for a language id, or null if its chunk will not load. (M20)
+ *
+ * The half of [`loadLanguage`] that is not about CodeMirror. Both swallow a failed import for
+ * the same reason: a network hiccup behind the dev server, or a corrupted asset in a packaged
+ * build, should cost colour and nothing else, and an uncaught rejection out of a dynamic import
+ * inside a React render leaves the surface permanently blank.
+ */
+export async function loadGrammar(id: LanguageId): Promise<Grammar | null> {
   try {
-    return await REGISTRY[found.id].load()
+    return await REGISTRY[id].grammar()
   } catch (error) {
-    console.error(`[cide] could not load the ${found.label} grammar`, error)
+    console.error(`[cide] could not load the ${REGISTRY[id].label} grammar`, error)
     return null
   }
 }

@@ -30,8 +30,19 @@
  *
  * M10's acceptance test is "Claude edits a file → the panel updates within 200 ms with no
  * manual refresh". `cide://session-tool` names the touched paths and arrives ahead of any
- * filesystem watcher, so it is one trigger; `cide://git-status` is the other, and carries the
- * new tree rather than asking for it. Both land on the same coalescer.
+ * filesystem watcher, so it is one trigger; `cide://git-status` is another, and carries the new
+ * tree rather than asking for it.
+ *
+ * Those two were the whole list until M17, and between them they answer only "Claude did it" and
+ * "cide did it". **`cide://fs-changed` is the third**, and it is the only one that covers a
+ * change neither of them made: `git add` in a bash pane, a `git pull`, a `cargo fmt`, an editor
+ * outside cide. The panel had gone stale on all of those since it shipped, while the change-count
+ * badge in its own header — which subscribes to the watcher — stayed correct and disagreed with
+ * it. The subscription at the bottom of this file carries the argument in full.
+ *
+ * All three land on the same coalescer, and that coalescer is a **throttle**: with the watcher
+ * feeding it, a restarting debounce is starvable by a tree that never goes quiet, which is what
+ * a tree with an agent working in it is. See `REFRESH_COALESCE_MS`.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
@@ -167,8 +178,25 @@ function files(n: number): string {
  */
 const TRACK_NOTE = 'git add and file'
 
-/** Coalescing window for refresh bursts. One edit reports several paths. */
-const REFRESH_DEBOUNCE_MS = 60
+/**
+ * Coalescing window for refresh bursts. One edit reports several paths.
+ *
+ * **A throttle rather than a trailing debounce** — `schedule` does *not* restart a timer that is
+ * already armed. It used to, and that was survivable only because the sole trigger was
+ * `cide://session-tool`, which arrives in gaps. M17 added the filesystem watcher as a third
+ * trigger, and `gitStatusStore.ts` had already written down what that costs: *"A debounce that
+ * restarts can be starved indefinitely by a steady stream of writes (a `cargo watch` loop, a
+ * formatter on save in a big tree)"* — and in this project the steady stream is the normal case,
+ * because the whole point of the app is an agent editing files continuously. A panel that stops
+ * updating for as long as anything is happening is a worse bug than the stale panel this change
+ * exists to fix, arrived at from the other end.
+ *
+ * 120 ms rather than the 60 it was, matching every other git surface in the app
+ * (`gitStatusStore`, `gitCountStore`, `diagnosticsStore`, `blameStore`). The trigger rate went
+ * up and a status walk is the expensive half; the two windows differ only for triggers closer
+ * together than the window, and both answer that case with one walk.
+ */
+const REFRESH_COALESCE_MS = 120
 
 /**
  * The commit an amend is aimed at, once something has named one.
@@ -789,16 +817,35 @@ export function useGitPanel(
     [project],
   )
 
+  /*
+   * Bumped on every `refresh`, and an answer tagged with an older one is dropped.
+   *
+   * Two walks of the same project overlap whenever `git status` takes longer than the coalescing
+   * window, which on a repository of any size it does — and `invoke` promises resolve
+   * independently, so the slower, *older* walk can land last and install a tree computed before
+   * the edits that triggered the second. Nothing would correct it until the next event, and if
+   * the user has stopped typing there is no next event: the panel sits there showing a state the
+   * working tree left a second ago.
+   *
+   * It was reachable before M17 and is reachable far more easily now that the watcher feeds this
+   * as well. The same counter also covers a project switch landing mid-flight. This is
+   * `gitStatusStore`'s idiom, and `treeStore`'s, for the same two races.
+   */
+  const generation = useRef(0)
+
   const refresh = useCallback(async () => {
     if (story) return
     if (project === null) {
       adopt(EMPTY, false)
       return
     }
+    generation.current += 1
+    const mine = generation.current
     setLoading(true)
     const raw = await guarded('git status', () =>
       gitApi.status(project, includeIgnoredRef.current),
     )
+    if (generation.current !== mine) return
     setLoading(false)
     // `undefined` is the guard's failure signal; `{ repos: [] }` is a legitimate answer.
     // Keeping the previous tree after a failure would show changes that may no longer
@@ -826,17 +873,23 @@ export function useGitPanel(
         if (state !== null) found[id] = state
       }),
     )
+    // Checked again after the second await, not only after the first: this is a whole extra
+    // round trip per repository, so it is the half most likely to be overtaken.
+    if (generation.current !== mine) return
     setMerges(found)
   }, [project, story, guarded, adopt, absorb])
 
   // One timer, shared by the mount refresh and by every event that invalidates the tree.
   const pending = useRef<number | null>(null)
   const schedule = useCallback(() => {
-    if (pending.current !== null) window.clearTimeout(pending.current)
+    // Armed already: leave it alone. Clearing and re-arming here is the starvable shape — see
+    // `REFRESH_COALESCE_MS`. This is the whole of the difference between a throttle and a
+    // trailing debounce, and it is one line.
+    if (pending.current !== null) return
     pending.current = window.setTimeout(() => {
       pending.current = null
       void refresh()
-    }, REFRESH_DEBOUNCE_MS)
+    }, REFRESH_COALESCE_MS)
   }, [refresh])
 
   useEffect(() => {
@@ -885,6 +938,43 @@ export function useGitPanel(
         if (project !== null && forProject === project) adopt(absorb(tree))
       }),
       'git-status',
+    )
+    /*
+     * **The watcher, which is the only signal for a change cide did not make.** (M17)
+     *
+     * `cide://git-status` is emitted from exactly one place — `cmd/git.rs::refreshed` — so it
+     * covers mutations cide performed and nothing else. `cide://session-tool` covers Claude.
+     * Between them they miss `git add` typed into a bash pane, `git pull`, `cargo fmt`, `sed -i`
+     * and a save from an editor outside cide, which in an IDE built around a terminal and an
+     * agent is most of what happens to a working tree. The panel simply went stale until
+     * somebody pressed ↻.
+     *
+     * Every other git-adjacent surface already subscribed to this — the file tree, its status
+     * tags, the log, the diff pane, blame, and the change-count badge in the sidebar header.
+     * That badge reads `git_status` too, so **the count was fresher than the panel that owns
+     * it**: the header said 5 while the tree below it listed 3. `FsChange.git`'s doc comment in
+     * `cide-ipc` and `client.ts`'s note on `onGitStatus` had both claimed this subscription
+     * existed for several milestones. It did not.
+     *
+     * # Every burst, and deliberately not `change.git`
+     *
+     * `FsChange.git` says a watched *git* file moved — `HEAD`, the index, a ref. That is the
+     * right filter for the branch readout and it is the wrong one here: a plain working-tree
+     * write is what turns a file from clean to modified, and it raises no flag. `gitRefsMoved`
+     * (`gitlog/logModel.ts`) is wrong here for the same reason and more sharply — it answers
+     * *false* for an index-only burst, i.e. for `git add`, because a history walk only cares
+     * about refs.
+     *
+     * The burst's paths are not inspected either. Whether a path matters is a question about
+     * the repository, and re-deriving it from strings in the frontend would be a second, worse
+     * copy of `cide_fs::filter` — the argument `Explorer.tsx` makes for the file tree. The
+     * answer is one coalesced `git status`, which is the call that actually knows.
+     */
+    track(
+      events.onFsChanged((forProject) => {
+        if (project !== null && forProject === project) schedule()
+      }),
+      'fs',
     )
     return () => {
       gone = true
@@ -1278,7 +1368,7 @@ export function useGitPanel(
          */
         if (pushes.length > 0) {
           const report = pushReport(pushes)
-          notify(report.text, { kind: 'info', detail: report.detail })
+          notify(report.text, { kind: 'ok', detail: report.detail })
         }
         await refresh()
       })()
@@ -2203,11 +2293,11 @@ export function useGitPanel(
          */
         if (settled > 0) {
           notify(`Resolved ${settled} of ${looked} conflicted file${looked === 1 ? '' : 's'}`, {
-            kind: 'info',
+            kind: 'ok',
           })
         } else {
           notify('Nothing could be resolved automatically', {
-            kind: 'info',
+            kind: 'warn',
             hint:
               looked === 0
                 ? 'Every conflicted file has already been answered.'

@@ -113,7 +113,7 @@ export async function afterResolve(
     if (next === null) {
       useConflicts.getState().close()
       notify(`${state.operation === 'rebase' ? 'Rebase' : 'Merge'} committed`, {
-        kind: 'info',
+        kind: 'ok',
         hint: 'Every conflicted file was resolved, so it finished on its own.',
       })
       return

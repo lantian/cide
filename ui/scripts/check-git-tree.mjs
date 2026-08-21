@@ -1910,6 +1910,132 @@ try {
       + 'selected anything in',
   )
 
+  /* ------------------------------------------------------------------------------------
+   * The panel's freshness wiring. (M17)
+   *
+   * # Why these are source assertions, which are the weak kind
+   *
+   * Everything above compiles `model.ts` and runs it. None of it can reach `useGitPanel.ts`,
+   * and that hook's own comment already records the cost of that: a defect in it was
+   * "invisible to all 29 gates". The subscriptions and the coalescer live inside a 2264-line
+   * hook that needs React and a window, and extracting them so this could drive them is a
+   * larger change than the one being gated.
+   *
+   * So: greps, chosen to fail on the *specific* regressions that already happened once, and
+   * written down as weak rather than dressed up. `check-tree-flicker.mjs` makes the same
+   * trade against `FileTree.tsx` for the same reason.
+   *
+   * # What actually went wrong
+   *
+   * The panel subscribed to `cide://session-tool` and `cide://git-status` and nothing else.
+   * `git-status` has one emitter, `cmd/git.rs::refreshed`, so between them they covered
+   * "Claude did it" and "cide did it" — and missed `git add` in a bash pane, `git pull`,
+   * `cargo fmt` and any editor outside cide. Three separate comments claimed the watcher
+   * subscription existed. It did not, and the change-count badge in the panel's own header —
+   * which did subscribe — stayed correct and visibly disagreed with the tree below it.
+   * ---------------------------------------------------------------------------------- */
+  {
+    const strip = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+    const hook = strip(readFileSync(join(UI, 'src/sidebar/GitPanel/useGitPanel.ts'), 'utf8'))
+
+    for (const [event, why] of [
+      [
+        'onSessionTool',
+        'Claude\'s tool calls, which arrive ahead of the watcher and are what make the panel ' +
+          'move while an agent is working rather than 300ms after it stops',
+      ],
+      [
+        'onGitStatus',
+        'mutations cide itself made, in any window — it carries the new tree, so it is the one ' +
+          'trigger that costs no round trip',
+      ],
+      [
+        'onFsChanged',
+        'and the WATCHER, which is the only signal for a change cide did not make: a `git add` ' +
+          'in a bash pane, a `git pull`, a formatter. Without it the panel is stale until ' +
+          'somebody presses the refresh button, while the badge in its own header is not',
+      ],
+    ]) {
+      ok(hook.includes(`events.${event}(`), `the git panel subscribes to ${event} — ${why}`)
+    }
+
+    ok(
+      !/gitRefsMoved|change\.git/.test(hook),
+      'and it does NOT gate that subscription on `change.git` or `gitRefsMoved`. Both answer ' +
+        'false for a plain working-tree write, and a plain working-tree write is exactly what ' +
+        'turns a file from clean to modified in this panel; `gitRefsMoved` additionally ignores ' +
+        'index-only bursts, i.e. `git add`. The branch readout gates and this must not',
+    )
+
+    /*
+     * The coalescer, pinned by the one line that distinguishes a throttle from a debounce.
+     *
+     * A trailing debounce restarts its timer on every trigger, so a steady stream of writes
+     * starves it indefinitely — and now that the watcher feeds this, the steady stream is the
+     * normal case: an agent editing files is what the app is for. The panel would freeze for as
+     * long as anything was happening, which is a worse bug than the staleness above and would
+     * pass every other assertion here.
+     */
+    const scheduleAt = hook.indexOf('const schedule = useCallback(')
+    ok(scheduleAt !== -1, 'the panel still coalesces its refreshes in one place')
+    const scheduleBody = hook.slice(scheduleAt, hook.indexOf('}, [refresh])', scheduleAt))
+    ok(
+      /if \(pending\.current !== null\) return/.test(scheduleBody),
+      'and it is a THROTTLE: an armed timer is left alone. `clearTimeout` here instead is the ' +
+        'starvable shape — see gitStatusStore.ts, which wrote this down two milestones before ' +
+        'this panel needed it',
+    )
+    ok(
+      !/clearTimeout/.test(scheduleBody),
+      '…and it does not clear the pending timer on the way in, which is the same statement from ' +
+        'the other side and the one that fails if the guard above is bypassed',
+    )
+
+    /*
+     * The generation guard. `git status` on a real repository takes longer than the coalescing
+     * window, `invoke` promises resolve independently, and the slower OLDER walk can therefore
+     * land last and install a tree computed before the edits that triggered the newer one.
+     * Nothing corrects it until the next event, and if the user has stopped typing there is no
+     * next event.
+     */
+    const refreshAt = hook.indexOf('const refresh = useCallback(')
+    ok(refreshAt !== -1, 'the panel still has one refresh')
+    const refreshBody = hook.slice(refreshAt, hook.indexOf('}, [project, story', refreshAt))
+    ok(
+      /generation\.current \+= 1/.test(refreshBody) &&
+        /generation\.current !== mine/.test(refreshBody),
+      'refresh is generation-guarded: it stamps the walk and drops an answer that was overtaken ' +
+        'while it was in flight. Two walks of one project overlap whenever a status call takes ' +
+        'longer than the coalescing window, which the watcher makes routine',
+    )
+    eq(
+      (refreshBody.match(/generation\.current !== mine/g) ?? []).length,
+      2,
+      '…and it re-checks after the SECOND await too. The merge-state pass is a further round ' +
+        'trip per repository, so it is the half most likely to be overtaken',
+    )
+
+    /*
+     * The branch readout, which had the identical bug and one of the three wrong comments.
+     * `cide://git-status` is emitted only by `cmd/git.rs::refreshed`, so a `git checkout` typed
+     * into a bash pane left the status bar naming the branch you had left.
+     */
+    const branch = strip(readFileSync(join(UI, 'src/chrome/BranchSelector.tsx'), 'utf8'))
+    ok(
+      branch.includes('events.onFsChanged('),
+      'the branch readout subscribes to the watcher — a `git checkout` in a bash pane emits no ' +
+        '`cide://git-status`, and the comment claiming this subscription existed shipped ' +
+        'several milestones before the subscription did',
+    )
+    ok(
+      /if \(!change\.git\) return/.test(branch),
+      '…and it DOES gate on `change.git`, unlike the panel. A label only moves when HEAD or a ' +
+        'ref moves; without the gate every file save costs a branch walk of every repository ' +
+        'in the project for an answer that cannot have changed',
+    )
+  }
+
   if (failed > 0) {
     console.error(`\n${failed} failure(s)`)
     process.exit(1)

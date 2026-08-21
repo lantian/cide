@@ -412,3 +412,25 @@ text, which is the one thing wrong with it — see README.
 - Anyone enabling the updater needs to add `plugins.updater` with a public key and endpoints,
   and sign releases with `tauri signer`. Until then the warning in the preflight is accurate
   and should stay.
+- **A fourth Linux target was added after this decision: `--tarball`.** It does not revisit the
+  reasoning above — the AppImage is still the channel, because it is still the only Linux format
+  `tauri-plugin-updater` supports, and a tarball can never self-update. It answers a different
+  question, the one the "AppImage is 86 MiB because it carries WebKitGTK" trade raises: 8.1 MiB
+  of binaries for anyone whose distribution already ships WebKitGTK 4.1. It is `install` and
+  `tar` over what the release profile already produced, so it adds no tool and no download to
+  the preflight, and it is refused on macOS for the same reason the AppImage is.
+- **Releasing is `.github/workflows/release.yml`, and it drives this task rather than replacing
+  it.** Everything above — the runtime prefetch that exists because `appimagetool` hangs, the
+  32-bit `gtk-query-immodules-3.0` shim, the sidecar, the preflight's refusals — is reachable
+  from CI only because the workflow's build step is one `cargo xtask package --run`. The
+  workflow's own content is the toolchain this task's preflight requires and `ci.yml`
+  deliberately does not install, plus one environment variable: `APPIMAGE_EXTRACT_AND_RUN=1`,
+  because `linuxdeploy` and `appimagetool` are AppImages and a GitHub runner has no libfuse2.
+  That variable belongs in this record next to the `LDAI_RUNTIME_FILE` finding — both are
+  failures of the same shape, several processes below anything cide logs.
+- **The version had three answers and now has one.** `Cargo.toml` said `0.2.0`, `tauri.conf.json`
+  and `ui/package.json` said `0.1.0`, and `AppInfo` reads the second — so every artefact name
+  came from the file that was behind. The release workflow writes all of them from one input and
+  regenerates the flatpak files from the result. Nothing outside that workflow enforces the
+  agreement, which is the remaining gap: `package --check` re-derives from `tauri.conf.json` and
+  so cannot see the Cargo.toml half.

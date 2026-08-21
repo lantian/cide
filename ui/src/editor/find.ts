@@ -34,10 +34,8 @@ import {
   findNext,
   findPrevious,
   getSearchQuery,
-  gotoLine,
   highlightSelectionMatches,
   search,
-  searchKeymap,
   setSearchQuery,
 } from '@codemirror/search'
 import {
@@ -48,6 +46,7 @@ import {
   type ViewUpdate,
 } from '@codemirror/view'
 import type { Extension } from '@codemirror/state'
+import { searchBindings } from './editorKeys'
 import { countLabel, tally, type MatchSpan, type Tally } from './findMatches'
 import styles from './EditorSurface.module.css'
 
@@ -304,37 +303,18 @@ class FindPanel implements Panel {
 /**
  * Search, its keymap, and the match highlighting.
  *
- * `searchKeymap` was included whole, and the comment here used to say so as a principle. It is
- * now picked over by exactly one entry, and the honest version of the rule is: *everything
- * except a second user interface for something cide already has.*
- *
- * # What stays, and why each one earns it
- *
- * `Mod-f` opens the bar, `F3`/`Shift-F3` walk the matches, `Escape` closes it, `Mod-Shift-l`
- * selects every match and `Mod-d` adds the next occurrence to the selection. `Mod-g` is
- * find-next as well, and it stays even though `cide-core::keymap` now binds `ctrl+g` to
- * `navigate.line` and the window capture gate therefore eats it before CodeMirror is offered it
- * in an editor pane. That is not a dead entry: a user who takes Ctrl+G back with one line of
- * `keymap.json` gets find-next on it again, for free, because it was never removed. Deleting it
- * would turn a rebindable trade into a permanent loss.
- *
- * # The one that goes: `Mod-Alt-g` → `gotoLine`
- *
- * Go to line is cide's now — `navigate.line`, in the registry, in the palette, on Ctrl+G, and
- * rebindable. Leaving CodeMirror's binding in place would give one action two user interfaces:
- * ours, and a stock `showDialog` panel that docks at the *bottom* of the pane and paints itself
- * from `.cm-panels`, whose colours are literals in CodeMirror's base theme — the exact hazard
- * this file's header cites as the reason the search panel was replaced in the first place. Two
- * dialogs for one verb, one of which ignores the theme, is worse than either alone.
- *
- * Filtered by **command identity**, not by key string. `binding.key === 'Mod-Alt-g'` would stop
- * matching the day upstream re-spells the chord, and would stop matching *silently* — the
- * stock dialog would simply reappear. Comparing against the imported `gotoLine` cannot drift.
+ * **The bindings themselves live in `editorKeys.ts`, and the argument for each one lives there
+ * with them.** This file imports `./EditorSurface.module.css`, so a check script cannot
+ * `require` it — and a keymap nothing can load is a keymap whose chords have never been
+ * resolved, only regexed. `searchBindings` is `searchKeymap` with `gotoLine` filtered out (cide
+ * owns Go to line) and `Mod-d` re-homed to `Alt-j` (duplicate-line took Ctrl+D). Both edits are
+ * by command identity rather than by key string; the reasoning is four paragraphs and it is over
+ * there rather than summarised here.
  */
 export function findExtensions(): Extension {
   return [
     search({ top: true, createPanel: (view) => new FindPanel(view) }),
     highlightSelectionMatches(),
-    keymap.of(searchKeymap.filter((binding) => binding.run !== gotoLine)),
+    keymap.of(searchBindings),
   ]
 }

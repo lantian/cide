@@ -938,8 +938,8 @@ mod tests {
     use super::*;
 
     use cide_ipc::{
-        Axis, DiffOrigin, DiffSpec, LayoutNode, Pane, PaneKind, PaneRole, PaneTree, Project,
-        ProjectRoot, SettingsSection, Tab, TabKind, ToolWindowState, WindowRole,
+        Axis, DiffOrigin, DiffSpec, LayoutNode, MarkdownView, Pane, PaneKind, PaneRole, PaneTree,
+        Project, ProjectRoot, SettingsSection, Tab, TabKind, ToolWindowState, WindowRole,
     };
     use cide_ipc::{PaneId, ProjectId, SessionId, SplitId, TabId, WindowLabel};
     use indexmap::IndexMap;
@@ -2651,6 +2651,7 @@ mod tests {
             line,
             column: 1,
             folds: Vec::new(),
+            markdown_view: MarkdownView::default(),
             touched_at: 0,
         }
     }
@@ -2790,6 +2791,79 @@ mod tests {
 
         // And a file that was never written is the first launch, not a failure.
         assert!(load_positions(&dir.join("nothing-here.json")).is_empty());
+    }
+
+    /// A `positions.json` from before M20 loads, and the layout round-trips. (M20)
+    ///
+    /// Two claims, and the first is the one that would hurt. `ViewPosition::markdown_view` is
+    /// `#[serde(default)]`, and without that attribute *every* entry in an existing user's file
+    /// fails to deserialise — which for this store means `load_positions` answers empty and
+    /// everybody loses the remembered place in every file they have ever opened, silently, on
+    /// the launch after an update. The document below is written by hand with the field removed,
+    /// which is exactly the shape a build one version older wrote.
+    ///
+    /// There is deliberately no schema bump and no migration arm. This file is a cache of where
+    /// somebody was looking, the whole of it is re-derived by opening a file, and it has no
+    /// version to move — the distinction `Workspace::CURRENT_SCHEMA` exists to make about the
+    /// file that does.
+    #[test]
+    fn a_positions_file_written_before_the_markdown_layout_loads_unchanged() {
+        let dir = TempDir::new("positions-md");
+        let path = dir.join("positions.json");
+
+        let mut list = Vec::new();
+        remember_position(&mut list, at("/README.md", 40), 10);
+        save_positions(&path, &list).expect("save");
+
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(
+            written.contains("markdownView"),
+            "the field is written, so an older build reading this file is the case serde's \
+             unknown-field tolerance covers",
+        );
+
+        // The field removed, which is what a build before M20 produced.
+        let older = written
+            .replace(",\n      \"markdownView\": \"text\"", "")
+            .replace("\"markdownView\": \"text\",", "")
+            .replace("\"markdownView\":\"text\",", "");
+        assert!(
+            !older.contains("markdownView"),
+            "the stand-in really is missing the field"
+        );
+        fs::write(&path, older.as_bytes()).expect("write the older shape back");
+
+        let loaded = load_positions(&path);
+        let entry = position_for(&loaded, Path::new("/README.md")).expect("still remembered");
+        assert_eq!(
+            (entry.line, entry.top_line),
+            (40, 35),
+            "an entry written before the field existed still carries its position",
+        );
+        assert_eq!(
+            entry.markdown_view,
+            MarkdownView::Text,
+            "and defaults to the layout every file has always opened in",
+        );
+
+        // And the field survives a round trip when it is set.
+        let mut chosen = Vec::new();
+        remember_position(
+            &mut chosen,
+            ViewPosition {
+                markdown_view: MarkdownView::Split,
+                ..at("/README.md", 40)
+            },
+            11,
+        );
+        save_positions(&path, &chosen).expect("save");
+        let back = load_positions(&path);
+        assert_eq!(
+            position_for(&back, Path::new("/README.md"))
+                .expect("remembered")
+                .markdown_view,
+            MarkdownView::Split,
+        );
     }
 
     #[test]

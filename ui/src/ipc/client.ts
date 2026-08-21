@@ -1240,9 +1240,16 @@ export const events = {
   /**
    * A project's changes tree was recomputed.
    *
-   * Fires after any git mutation cide made, in every window. Changes made *outside* cide —
-   * a `git add` in a bash pane — do not fire it; those arrive through the filesystem
-   * watcher, which is what the panel's own refresh is wired to.
+   * Fires after any git mutation cide made, in every window, and carries the new tree — so a
+   * subscriber pays no round trip. `cmd/git.rs::refreshed` is its only emitter.
+   *
+   * Changes made *outside* cide — a `git add` in a bash pane, a `git pull`, a formatter — do not
+   * fire it. Those arrive as `cide://fs-changed`, and **a surface that wants both has to
+   * subscribe to both.** The final clause of this comment used to say the git panel's refresh
+   * was wired to the watcher; it was not, and had not been for several milestones, so the panel
+   * went stale on every change cide did not make while the badge in its own header — which
+   * *was* wired to it — stayed correct and disagreed. Both subscribe now, as do the file tree,
+   * its status tags, the log, blame, the diff pane and the branch readout.
    */
   onGitStatus: (handler: (project: ProjectId, tree: ChangesTree) => void) =>
     listen<{ project: ProjectId; tree: ChangesTree }>('cide://git-status', (e) =>

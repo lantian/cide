@@ -181,7 +181,7 @@ export function ConflictsDialog() {
                 // than an explicit null. Both mean the same thing here.
                 const next = outcome.state ?? null
                 useConflicts.getState().update(next)
-                if (next === null) notify('Merge finished', { kind: 'info' })
+                if (next === null) notify('Merge finished', { kind: 'ok' })
               })
               .catch((error: unknown) => notify(explain(error), { kind: 'error' }))
           }}

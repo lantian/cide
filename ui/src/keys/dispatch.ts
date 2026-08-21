@@ -308,7 +308,7 @@ function pullPass(
     // nothing on top of them would be a second surface saying less.
     if (done.length > 0) {
       const report = pullReport(done)
-      notify(report.text, { kind: 'info', detail: report.detail })
+      notify(report.text, { kind: 'ok', detail: report.detail })
     }
 
     /*
@@ -760,7 +760,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
               // A sentence, not a diag line. Whether Claude Code still holds the transcript is
               // a fact about the user's disk that they just asked a question about, and the
               // alternative to saying so is a menu row that appears to do nothing.
-              notify('There is no saved conversation for this pane to resume.', { kind: 'info' })
+              notify('There is no saved conversation for this pane to resume.', { kind: 'warn' })
               return
             }
             return restarter.restart('resume')
@@ -923,7 +923,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          */
         if (!panelHostPresent() || boot()?.role.kind !== 'shell') {
           notify('This window has no file tree, so there is nothing to select a file in.', {
-            kind: 'info',
+            kind: 'warn',
             hint: 'Detached panes are their own window and show no sidebar.',
           })
           return
@@ -936,7 +936,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         const path = pathArg(args) ?? focusedTabPath(boot())
         if (path === null) {
           notify('No file tab is active, so there is nothing to select.', {
-            kind: 'info',
+            kind: 'warn',
             hint: 'Open a file — the Claude console and the settings tab are not files.',
           })
           return
@@ -966,7 +966,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           .then((shown) => {
             if (!shown) {
               notify(`${path} is not in this project's file tree, so there is no row to show.`, {
-                kind: 'info',
+                kind: 'warn',
                 /*
                  * The third clause is M15's. A standard-library file used to land here always —
                  * `~/.rustup/toolchains/…/library/core/src/option.rs` was in no root, no
@@ -1022,7 +1022,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           .then((shown) => {
             if (shown) return
             notify('This project has no External Libraries group.', {
-              kind: 'info',
+              kind: 'warn',
               hint: 'The group is shown for a project with a Cargo.toml or a go.mod under one of its roots.',
             })
           })
@@ -1050,7 +1050,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
           .then((shown) => {
             if (shown) return
             notify('This project has no Scratches group.', {
-              kind: 'info',
+              kind: 'warn',
               hint: 'The group is keyed by the project\u2019s first root directory.',
             })
           })
@@ -1100,7 +1100,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
             // toasts by identical text, so five submodules all saying "already up to date"
             // would show one toast that silently spoke for five.
             const report = pushReport(done)
-            notify(report.text, { kind: 'info', detail: report.detail })
+            notify(report.text, { kind: 'ok', detail: report.detail })
           })
         })
         return
@@ -1288,7 +1288,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
             .then((found) => {
               if (found === null) {
                 notify('That file is not inside any repository in this project.', {
-                  kind: 'info',
+                  kind: 'warn',
                 })
                 return
               }
@@ -1358,7 +1358,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
         if (openTagDialog(revArg(args))) return
         if (boot()?.role.kind !== 'shell') {
           notify('Tagging needs the Git log, which this window does not have.', {
-            kind: 'info',
+            kind: 'warn',
             hint: 'Tag from a commit row in the main window’s Git tool window.',
           })
           return
@@ -1594,7 +1594,7 @@ export function createDispatcher(deps: DispatchDeps): (command: string, args: un
          */
         void navigate(command === 'navigate.back' ? 'back' : 'forward').then((refusal) => {
           if (refusal !== null) {
-            notify(refusal, { kind: 'info' })
+            notify(refusal, { kind: 'warn' })
           }
         })
         return

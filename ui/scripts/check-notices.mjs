@@ -100,7 +100,7 @@ try {
       + 're-render every `useSyncExternalStore` reader on every duplicate',
   )
   eq(
-    m.admit([notice(1, 'boom', 'error')], notice(2, 'boom', 'info')).length,
+    m.admit([notice(1, 'boom', 'error')], notice(2, 'boom', 'ok')).length,
     1,
     'the comparison is the message alone: an error and a report that say the same words are '
       + 'the same words, and two toasts would explain no more than one',
@@ -191,13 +191,12 @@ try {
   const stop = m.subscribe(() => {
     woken += 1
   })
-  m.notify('pulled 3 commits')
+  m.notify('pulled 3 commits', { kind: 'ok' })
   eq(m.getSnapshot().length, 1, 'notify puts one on screen')
-  eq(m.getSnapshot()[0].kind, 'info', 'and a report is the default kind — the failures come '
-    + 'in through `notifyFailure`, which cannot get the kind wrong')
+  eq(m.getSnapshot()[0].kind, 'ok', 'carrying the kind it was given')
   eq(woken, 1, 'and wakes the subscriber')
 
-  m.notify('pulled 3 commits')
+  m.notify('pulled 3 commits', { kind: 'ok' })
   eq(m.getSnapshot().length, 1, 'a duplicate is still declined through the store')
   eq(woken, 1, 'and does not wake anyone, because nothing changed')
 
@@ -206,15 +205,15 @@ try {
   eq(failure.kind, 'error', 'notifyFailure reports an error')
   ok(failure.hint !== undefined, 'and derives the hint rather than making every caller remember it')
 
-  m.notify('quiet', { kind: 'info' })
+  m.notify('quiet', { kind: 'warn' })
   eq(
     m.getSnapshot()[2].hint,
     undefined,
-    'a report never carries the stale-binary hint: it is a fact about a failed command, and '
-      + 'attaching it to a success would tell a user to rebuild after a pull that worked',
+    'nothing but an error carries the stale-binary hint: it is a fact about a failed command, '
+      + 'and attaching it to a refusal would tell a user to rebuild because a file had no blame',
   )
 
-  m.notify('with a body', { detail: 'a1b2c3d4  Add the thing' })
+  m.notify('with a body', { kind: 'ok', detail: 'a1b2c3d4  Add the thing' })
   eq(
     m.getSnapshot().map((n) => n.text),
     ['Command pane_add_row not found', 'quiet', 'with a body'],
@@ -228,9 +227,47 @@ try {
 
   stop()
   const before = woken
-  m.notify('after unsubscribing')
+  m.notify('after unsubscribing', { kind: 'ok' })
   eq(woken, before, 'an unsubscribed listener is not called')
   m.clearNotices()
+
+  /* ------------------------------------------------------------------ three kinds, not two */
+  //
+  // The vocabulary is `ok` / `warn` / `error`, and each one reaches the screen as a different
+  // colour and a different ARIA role. Before M22 it was `error` / `info`, and `info` carried both
+  // sixteen successes and twenty-five refusals — one word, and therefore one colour, for *worked*
+  // and *did not work*.
+  for (const kind of ['ok', 'warn', 'error']) {
+    m.clearNotices()
+    m.notify(`a ${kind}`, { kind })
+    eq(m.getSnapshot()[0].kind, kind, `\`${kind}\` round-trips through the store`)
+  }
+  m.clearNotices()
+
+  /*
+   * `kind` is REQUIRED, and this is where that intent is recorded.
+   *
+   * It is a `tsc` property, so `pnpm exec tsc --noEmit` is what actually enforces it and this
+   * script cannot — a compiled-away type annotation leaves nothing to assert at runtime. What it
+   * can do is fail when someone puts the default back, which is the edit worth catching: with two
+   * kinds `info` was the everything-that-is-not-a-failure bucket and a default could only be
+   * vague, while with three it silently picks between green and yellow. Seven of the eight bare
+   * `notify(text)` calls meant `ok`; the eighth ("this agent has nothing to integrate") is exactly
+   * the one a majority-rules default would have painted green.
+   */
+  const src = readFileSync(join(UI, 'src', 'chrome', 'notices.ts'), 'utf8').replace(
+    /\/\*[\s\S]*?\*\//g,
+    '',
+  )
+  ok(
+    /options:\s*\{\s*kind:\s*NoticeKind\b/.test(src),
+    "`notify`'s option bag declares `kind: NoticeKind` — not `kind?:`, so every caller has to say "
+      + 'which of the three it means',
+  )
+  ok(
+    !/kind\s*\?\?/.test(src),
+    'and there is no `??` default behind it, which is the other way the same hole opens',
+  )
 
   /* ------------------------------------------------------- the text has to be copyable out */
   //
@@ -266,6 +303,43 @@ try {
   for (const part of ['.summary', '.dismiss']) {
     eq(rule.includes(part), false, `${part} stays unselectable — it is a control, not text`)
   }
+
+  /* --------------------------------------------------- one edge colour per kind, all distinct */
+  //
+  // The defect this replaced: `error` was `--red` and `info` was `--accent`, which are #c0332b and
+  // #c4452a in the light palette. A user cannot tell those apart on a 3px edge, so every notice —
+  // including the ones saying a pull had worked — read as a failure, and NOTHING in the suite could
+  // see it. `check:theme` contrast-checks `TERMINAL_TOKENS` and nothing else.
+  //
+  // This is the cheap structural half: three kinds, three rules, three different tokens. The
+  // perceptual half — that the three tokens actually resolve to colours a person can distinguish,
+  // in both palettes — is in `check-theme.mjs`, which already owns `tokens.css` and a WCAG
+  // `contrast()`.
+  const edges = new Map()
+  for (const m of css.matchAll(
+    /\.toast\[data-kind='([a-z]+)'\]\s*\{[^}]*border-left-color:\s*var\((--[\w-]+)\)/g,
+  )) {
+    edges.set(m[1], m[2])
+  }
+  eq(
+    [...edges.keys()].sort(),
+    ['error', 'ok', 'warn'],
+    'every kind in `NoticeKind` has an edge rule, keyed on the vocabulary value itself — a '
+      + 'selector that IS the enum value falls back to the grey `--border` when the enum moves, '
+      + 'where a stale class table paints nothing and `tsc` cannot see it either',
+  )
+  eq(
+    new Set(edges.values()).size,
+    3,
+    `the three name three DIFFERENT tokens (${[...edges].map(([k, v]) => `${k}=${v}`).join(' ')}) `
+      + '— two kinds sharing a colour is two kinds the user does not have',
+  )
+  eq(
+    [...edges.values()].filter((t) => t === '--accent'),
+    [],
+    'and none of them is `--accent`, which is Claude\u2019s red-orange and sits a few percent '
+      + 'from `--red`. That pairing is the whole reason this vocabulary was split up.',
+  )
 } finally {
   rmSync(out, { recursive: true, force: true })
 }

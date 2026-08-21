@@ -60,7 +60,9 @@ import { collapseRuns } from '@/editor/blameModel'
 import { requestLogReveal } from '@/gitlog/LogTab'
 import type { FileView } from '@/editor/position'
 import { levelFor, subscribeHighlightLevels } from '@/editor/highlightLevel'
-import { basename } from '@/editor/languages'
+import { basename, isMarkdownPath } from '@/editor/languages'
+import { MarkdownFrame } from '@/editor/markdown/MarkdownFrame'
+import type { MdView } from '@/editor/markdown/types'
 import { useDiagnostics } from '@/sidebar/diagnosticsStore'
 import { useWorkspace } from '@/store/workspace'
 import { visible, type DiagnosticFilters } from '@/sidebar/ProblemsPanel/model'
@@ -271,6 +273,59 @@ export function EditorPane({
   const readTextRef = useRef<(() => string) | null>(null)
 
   /*
+   * The markdown preview's three wires, and none of them is a prop that changes per keystroke.
+   *
+   * `docListeners` is notified from `onDocChanged` below; `readText` reads the buffer when asked,
+   * falling back to the text on disk before the editor has reported a change; `scrollTo` is the
+   * handle `EditorSurface` hands out when its view is built. All three are refs because the
+   * alternative is a `setState` on the typing path, which would re-render this component — and
+   * therefore every editor in the app — sixty times a second.
+   */
+  const docListeners = useRef(new Set<() => void>())
+  const diskTextRef = useRef('')
+  const scrollToRef = useRef<((line: number) => void) | null>(null)
+  const followRef = useRef<((topLine: number) => void) | null>(null)
+  /*
+   * The last view the editor reported, kept after `sendPosition` has cleared the pending one.
+   * Switching layout has to write a *whole* `ViewPosition`, and writing one built from
+   * defaults would reset the file's remembered scroll to line 1 — the exact data loss the
+   * position store exists to prevent, arriving through the feature that reads it.
+   */
+  const lastViewRef = useRef<FileView | null>(null)
+
+  const subscribeText = useCallback((listener: () => void) => {
+    docListeners.current.add(listener)
+    return () => {
+      docListeners.current.delete(listener)
+    }
+  }, [])
+  const readText = useCallback(() => readTextRef.current?.() ?? diskTextRef.current, [])
+  const scrollEditorTo = useCallback((line: number) => {
+    scrollToRef.current?.(line)
+  }, [])
+  /**
+   * Choose a markdown layout, and record it now rather than on the scroll debounce.
+   *
+   * A click is a discrete intention; `worthNoting` and the 500 ms timer exist to keep a 60 Hz
+   * scroll off the IPC thread and have nothing to say about this one. Noting immediately is also
+   * what makes closing the tab straight after switching keep the switch.
+   */
+  const chooseView = useCallback((next: MdView) => {
+    setMdView(next)
+    mdViewRef.current = next
+    const at = pendingPosition.current ?? lastViewRef.current
+    if (at === null) return
+    void fileApi.notePosition({ ...at, folds: [...at.folds], markdownView: next }).catch(() => {})
+  }, [])
+
+  const onScrollHandle = useCallback((scrollTo: ((line: number) => void) | null) => {
+    scrollToRef.current = scrollTo
+  }, [])
+  const onSyncHandle = useCallback((follow: ((topLine: number) => void) | null) => {
+    followRef.current = follow
+  }, [])
+
+  /*
    * Who wrote each line — subscribe here, and read the store directly below. (M18)
    *
    * `useSyncExternalStore` over `blameStore`, the same shape `outlineStore` is read with a few
@@ -326,7 +381,7 @@ export function EditorPane({
    */
   const blameFailure = blameNow !== null && blameNow.kind === 'failed' ? blameNow.reason : null
   useEffect(() => {
-    if (blameFailure !== null) notify(blameFailure, { kind: 'info' })
+    if (blameFailure !== null) notify(blameFailure, { kind: 'warn' })
   }, [blameFailure])
 
   /*
@@ -411,7 +466,7 @@ export function EditorPane({
         .locate(id, path)
         .then((found) => {
           if (found === null) {
-            notify('This file is not inside any repository in this project.', { kind: 'info' })
+            notify('This file is not inside any repository in this project.', { kind: 'warn' })
             return undefined
           }
           return toolWindowApi
@@ -495,7 +550,7 @@ export function EditorPane({
           return historyApi.blameParent(id, found.repo, found.path, oid).then((parent) => {
             if (parent === null) {
               notify('This is where the file was introduced — there is no earlier revision.', {
-                kind: 'info',
+                kind: 'warn',
               })
               return undefined
             }
@@ -595,6 +650,27 @@ export function EditorPane({
    * scroll recorded; what has to survive is where the gesture ended, which is why this resets
    * the timer on every report rather than rate-limiting.
    */
+  /**
+   * Which markdown layout this file is in. (M20)
+   *
+   * Held here rather than inside `MarkdownFrame` because it is **persisted**, and the record it
+   * rides is `ViewPosition` — the same per-file store as the scroll position and the folds, which
+   * this component already reads at mount and writes on a debounce. A layout kept inside the
+   * frame would be a second lifetime for one of that record's fields.
+   *
+   * `text` for every file that is not markdown, where it is never read. See Rust's `MarkdownView`
+   * for why one field on one record beats a second store keyed on "only the markdown ones".
+   */
+  const [mdView, setMdView] = useState<MdView>('text')
+  /*
+   * Read on every note, so an ordinary scroll does not overwrite the layout with a default.
+   * A ref and not the state value: `sendPosition` is a `useCallback` with an empty dependency
+   * list — it is held by a timer, and re-creating it on every layout change would restart the
+   * debounce — so it must read the mode when it fires rather than when it was made.
+   */
+  const mdViewRef = useRef<MdView>('text')
+  mdViewRef.current = mdView
+
   const positionTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const pendingPosition = useRef<FileView | null>(null)
   const sendPosition = useCallback(() => {
@@ -612,10 +688,20 @@ export function EditorPane({
     // `folds` is copied out of the readonly array the editor reported: the DTO's field is a
     // `Vec<u32>` and therefore a mutable `number[]` on this side, and handing the same array to
     // a caller that could sort it is how a "pure observation" quietly stops being one.
-    void fileApi.notePosition({ ...at, folds: [...at.folds] }).catch(() => {})
+    void fileApi
+      .notePosition({ ...at, folds: [...at.folds], markdownView: mdViewRef.current })
+      .catch(() => {})
   }, [])
   const reportPosition = useCallback(
     (at: FileView) => {
+      /*
+       * Split-mode scroll sync, on the signal that already exists. `viewTracker.ts` publishes at
+       * most once an animation frame, which is exactly the cadence a follower wants, so the
+       * preview needs no listener of its own on the buffer's scroller — and the *note* keeps its
+       * own 500 ms debounce below, untouched.
+       */
+      followRef.current?.(at.topLine)
+      lastViewRef.current = at
       pendingPosition.current = at
       if (positionTimer.current !== undefined) clearTimeout(positionTimer.current)
       positionTimer.current = setTimeout(sendPosition, POSITION_DEBOUNCE_MS)
@@ -690,6 +776,13 @@ export function EditorPane({
                     folds: at.folds,
                   },
           })
+          /*
+           * The remembered layout, applied on the same frame as the remembered scroll. A tick
+           * later would open every previewed file as a buffer and then swap it, which reads as
+           * the setting not having been saved.
+           */
+          setMdView(at?.markdownView ?? 'text')
+          diskTextRef.current = doc.text
           stampRef.current = doc.stamp
           writableRef.current = doc.writable
           setConflict(false)
@@ -979,6 +1072,17 @@ export function EditorPane({
       <div className={styles.surface}>
         <OutlineFeed project={project} path={path} text={load.text} />
         <SyncFeed project={project} path={path} text={load.text} />
+        <MaybeMarkdown
+          path={path}
+          project={project}
+          view={mdView}
+          onView={chooseView}
+          readText={readText}
+          subscribeText={subscribeText}
+          onScreen={onScreen ?? true}
+          scrollEditorTo={scrollEditorTo}
+          onSyncHandle={onSyncHandle}
+        >
         <EditorSurface
           path={path}
           root={root}
@@ -1011,6 +1115,9 @@ export function EditorPane({
             // a closure over this ref rather than over `read` itself, so a blame started ten
             // minutes into an editing session gets the buffer as it is then. (M18)
             readTextRef.current = read
+            // The markdown preview, if there is one. A `Set` and not a single callback: a
+            // detached pane and its original are two components over one path.
+            for (const listener of docListeners.current) listener()
             // Debounced in the store, and the text is read when the timer fires — so the popup,
             // the breadcrumb and the member walk follow the buffer rather than the last save.
             if (project !== undefined) scheduleOutline(project as ProjectId, path, read)
@@ -1023,10 +1130,85 @@ export function EditorPane({
           blame={blame}
           blameOn={blameOn}
           onShowCommit={onShowCommit}
+          onScrollHandle={onScrollHandle}
           {...(onAnnotateParent === null ? {} : { onAnnotateParent })}
         />
+        </MaybeMarkdown>
       </div>
     </div>
+  )
+}
+
+/**
+ * The markdown wrapper, or nothing at all. (M20)
+ *
+ * For a file the editor does not call Markdown this renders its children and nothing else, so a
+ * `.rs` pane's tree is exactly what it was before this feature existed — no wrapper element, no
+ * observer, no subscription.
+ *
+ * # What is and is not protected here
+ *
+ * React reconciles by position, so this branch flipping *does* re-parent the `EditorSurface` and
+ * rebuild it. That is not worth avoiding, because the only thing that flips it is `path` changing
+ * — a rename from `notes.txt` to `notes.md` — and `EditorSurface`'s build effect is keyed on
+ * `[path, reloadKey]`, so a path change rebuilds the view in any case.
+ *
+ * The re-parenting that would matter is **changing layout**, and that one is genuinely avoided:
+ * `MarkdownFrame` keeps the surface in the same `.buffer` element in all three layouts and only
+ * changes its class, so switching text ⇄ split ⇄ preview does not touch the editor at all. See
+ * that component's header for why preview mode hides the buffer rather than unmounting it.
+ */
+function MaybeMarkdown({
+  path,
+  project,
+  view,
+  onView,
+  readText,
+  subscribeText,
+  onScreen,
+  scrollEditorTo,
+  onSyncHandle,
+  children,
+}: {
+  path: string
+  project: ProjectId | undefined
+  view: MdView
+  onView: (next: MdView) => void
+  readText: () => string
+  subscribeText: (listener: () => void) => () => void
+  onScreen: boolean
+  scrollEditorTo: (line: number) => void
+  onSyncHandle: (follow: ((topLine: number) => void) | null) => void
+  children: ReactNode
+}): ReactNode {
+  const openPath = useCallback(
+    (target: string) => {
+      if (project === undefined) {
+        notify('cide cannot open a link from a file that is not in a project', { kind: 'warn' })
+        return
+      }
+      void fileApi.open(project, target).catch((error: unknown) => {
+        notify(describe(error), { kind: 'warn' })
+      })
+    },
+    [project],
+  )
+
+  if (!isMarkdownPath(path)) return children
+  return (
+    <MarkdownFrame
+      path={path}
+      view={view}
+      onView={onView}
+      readText={readText}
+      subscribeText={subscribeText}
+      onScreen={onScreen}
+      scrollEditorTo={scrollEditorTo}
+      onSyncHandle={onSyncHandle}
+      openPath={openPath}
+    >
+      {children}
+    </MarkdownFrame>
   )
 }
 

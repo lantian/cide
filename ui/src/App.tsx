@@ -1639,7 +1639,7 @@ export function App() {
                   const shown = await useFileTree.getState().reveal(path)
                   if (!shown) {
                     notify('The scratch file was created but has no row in the tree yet.', {
-                      kind: 'info',
+                      kind: 'warn',
                       hint: 'Fold and unfold Scratches to re-read the drawer.',
                     })
                   }

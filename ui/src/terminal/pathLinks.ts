@@ -674,7 +674,7 @@ export function attachPathLinks(
         // The scan itself failed — a disposed terminal, or a probe that threw. The press is
         // already swallowed, so silence here would be the dead gesture this file exists to
         // avoid.
-        notify('cide could not read the line under the pointer.', { kind: 'info' })
+        notify('cide could not read the line under the pointer.', { kind: 'warn' })
       },
     )
   }
@@ -696,13 +696,13 @@ export function attachPathLinks(
     const miss = scan.misses.find((candidate) => linkAtCell(candidate.range, cell))
     if (miss !== undefined) {
       notify(`${miss.text} does not name a file or folder cide can reach from this pane.`, {
-        kind: 'info',
+        kind: 'warn',
         hint: 'Paths resolve against the pane’s working directory and the project’s roots.',
       })
       return
     }
     notify('There is no file path under the pointer.', {
-      kind: 'info',
+      kind: 'warn',
       hint: 'Ctrl+click a path in terminal output to open it, or a folder to show it in the tree.',
     })
   }
@@ -722,7 +722,7 @@ export function attachPathLinks(
     // A drag that selected the path is not a click that missed; staying silent there is the
     // whole reason this is on `click` and reads the selection.
     if (term.getSelection() !== '') return
-    notify('Ctrl+click a path in a terminal to open it.', { kind: 'info' })
+    notify('Ctrl+click a path in a terminal to open it.', { kind: 'warn' })
   }
 
   el.addEventListener('mousedown', onMouseDown, true)
@@ -770,7 +770,7 @@ function activate(
       `${candidate.text} names ${resolution.paths.length} ${what} in this project, so cide will ` +
         'not guess which one you meant.',
       {
-        kind: 'info',
+        kind: 'warn',
         detail: resolution.paths.join('\n'),
         hint: 'Open the one you want from the file tree, or with Ctrl+P.',
       },
